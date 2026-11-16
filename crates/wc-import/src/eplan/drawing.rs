@@ -229,7 +229,8 @@ pub fn symbol_for(f: &EplanFunction) -> Option<Symbol> {
         let make = if f.kind == KIND_BUTTON_CONTACT {
             f.detail != 2
         } else {
-            !names.iter().all(|p| matches!(last_digit(p), Some(1 | 2)))
+            !(names.iter().all(|p| matches!(last_digit(p), Some(1 | 2)))
+                || names.iter().all(|p| matches!(last_digit(p), Some(5 | 6))))
         };
         contact(&mut g, 0.0, make);
         pins.push(pin(&names[0], 0.0, 0.0, PinDir::Up));
@@ -248,13 +249,13 @@ pub fn symbol_for(f: &EplanFunction) -> Option<Symbol> {
         (kind, role, Point::new(-10.0, 4.5))
     } else if contacts && n == 3 {
         // Break (top left), common (bottom right), make (top right); Eplan lists them in
-        // that order, and their last digits are 2, 1 and 4.
+        // that order. Their last digits are 2, 1 and 4, or 6, 5 and 8 on timed contacts.
         let mut slots: [Option<String>; 3] = [None, None, None];
         for p in &names {
             let slot = match last_digit(p) {
-                Some(2) => 0,
-                Some(1) => 1,
-                Some(4) => 2,
+                Some(2 | 6) => 0,
+                Some(1 | 5) => 1,
+                Some(4 | 8) => 2,
                 _ => continue,
             };
             if slots[slot].is_none() {

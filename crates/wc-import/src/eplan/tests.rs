@@ -552,3 +552,29 @@ fn hostile_tables_never_panic() {
     assert!(read(&Tables::new()).is_err());
     assert!(tables_from_zip(b"not a zip").is_err());
 }
+
+#[test]
+fn timed_contacts_read_their_pin_numbers() {
+    let contact = |pins: &[&str]| {
+        let f = EplanFunction {
+            tag: "-K10".into(),
+            kind: drawing::KIND_CONTACTS.start,
+            pins: pins.iter().map(|p| (*p).to_owned()).collect(),
+            ..Default::default()
+        };
+        drawing::symbol_for(&f).unwrap()
+    };
+    // A timed changeover lists 16, 18, 15 as often as 16, 15, 18; either way 16 is the break, 15
+    // the common and 18 the make.
+    for order in [["16", "18", "15"], ["16", "15", "18"], ["15", "16", "18"]] {
+        let s = contact(&order);
+        let at = |name: &str| s.pins.iter().find(|p| p.name == name).map(|p| p.at).unwrap();
+        assert_eq!(s.id, "eplan.changeover.16-15-18", "{order:?}");
+        assert_eq!(at("16"), Point::new(0.0, 0.0));
+        assert_eq!(at("15").y, 8.0);
+        assert_eq!(at("18"), Point::new(4.0, 0.0));
+    }
+    assert!(contact(&["15", "16"]).id.starts_with("eplan.break."));
+    assert!(contact(&["17", "18"]).id.starts_with("eplan.make."));
+    assert!(contact(&["11", "12"]).id.starts_with("eplan.break."));
+}
