@@ -50,6 +50,16 @@ enum Cmd {
         #[arg(long)]
         mirror: bool,
     },
+    /// Number the wires by rule. Every wire of one connection gets the same number.
+    /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
+    /// where the connection starts) or `potential` (the potential's name, else sequential).
+    NumberWires {
+        #[arg(long, default_value = "page-column")]
+        rule: String,
+        /// Renumber connections that already have a number too.
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// Draw a wire. Ends are `item:pin` (e.g. `s1:13`) or a point `x,y`.
     Wire {
         page: String,
@@ -92,7 +102,7 @@ enum Cmd {
         pages: Vec<String>,
         #[arg(long, default_value = "")]
         date: String,
-        /// Append report pages: parts, devices, wires, nets, terminals, or all.
+        /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, or all.
         #[arg(long = "report")]
         reports: Vec<String>,
     },
@@ -110,7 +120,7 @@ enum Cmd {
         #[arg(long, default_value = "")]
         date: String,
     },
-    /// Print a report (parts, devices, wires, nets, terminals) as a table, CSV or Markdown.
+    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc) as a table, CSV or Markdown.
     Report {
         kind: String,
         #[arg(long, default_value = "text")]
@@ -577,6 +587,34 @@ fn run(cli: Cli) -> Res<()> {
                 eprintln!("warning: {w}");
             }
             println!("wrote {} {ext} file(s) to {}", drawings.len(), out.display());
+        }
+        Cmd::NumberWires { rule, overwrite } => {
+            let rule = wc_core::numbering::Rule::parse(&rule)
+                .ok_or_else(|| format!("unknown rule {rule:?} (sequential, page-column, potential)"))?;
+            let mut p = load(dir)?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let done = wc_core::numbering::number_wires(
+                &mut p,
+                rule,
+                overwrite,
+                |id| {
+                    symbols
+                        .get(id)
+                        .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
+                },
+                |page, end| match end {
+                    wc_core::Endpoint::Point { at } => Some(*at),
+                    wc_core::Endpoint::Pin { item, pin } => {
+                        let placed = page.symbol(item)?;
+                        wc_pdf::pin_position(placed, symbols.get(&placed.symbol)?, pin)
+                    }
+                },
+            );
+            save(dir, &p)?;
+            println!(
+                "numbered {} connection(s); {} wire(s) changed",
+                done.connections, done.wires
+            );
         }
         Cmd::Check { all } => {
             let p = load(dir)?;
@@ -1209,8 +1247,9 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
             out.extend(wc_report::Kind::ALL);
             continue;
         }
-        let k = wc_report::Kind::parse(n)
-            .ok_or_else(|| format!("unknown report {n:?} (parts, devices, wires, nets, terminals, all)"))?;
+        let k = wc_report::Kind::parse(n).ok_or_else(|| {
+            format!("unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, all)")
+        })?;
         out.push(k);
     }
     Ok(out)

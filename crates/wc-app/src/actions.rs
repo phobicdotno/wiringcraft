@@ -39,6 +39,7 @@ pub enum Action {
     ExportPdf,
     ExportDrawings,
     ExportAml,
+    NumberWires,
     Reports,
     Check,
     Commit,
@@ -157,6 +158,12 @@ impl Action {
                 Icon::Reports,
                 "",
             ),
+            Action::NumberWires => i(
+                "Number wires",
+                "Give every connection without a number one, from its page and column (3.4)",
+                Icon::Wire,
+                "",
+            ),
             Action::ExportDrawings => i(
                 "SVG/DXF",
                 "Export every page as an SVG and a DXF drawing for other tools",
@@ -171,7 +178,7 @@ impl Action {
             ),
             Action::Reports => i(
                 "Reports",
-                "Parts, devices, wires, nets, terminals and cables as tables",
+                "Contents, parts, devices, wires, nets, terminals, cables and PLC I/O as tables",
                 Icon::Reports,
                 "Ctrl+R",
             ),

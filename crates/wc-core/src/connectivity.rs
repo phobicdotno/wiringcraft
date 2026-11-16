@@ -55,8 +55,18 @@ pub fn nets(project: &Project) -> Vec<Net> {
 /// Like [`nets`], and also joins interruption points: every placed symbol for which
 /// `is_interruption(symbol id)` holds is connected to the others with the same device tag.
 pub fn nets_linked(project: &Project, is_interruption: impl Fn(&str) -> bool) -> Vec<Net> {
+    wire_nets(project, is_interruption).0
+}
+
+/// A wire: (page id, wire id).
+pub type WireRef = (String, String);
+
+/// Like [`nets_linked`], and also says which net each wire belongs to (an index into the nets).
+/// A wire that touches no pin, directly or through other wires, belongs to no net.
+pub fn wire_nets(project: &Project, is_interruption: impl Fn(&str) -> bool) -> (Vec<Net>, BTreeMap<WireRef, usize>) {
     let mut ids: BTreeMap<Node, usize> = BTreeMap::new();
     let mut dsu = Dsu { parent: Vec::new() };
+    let mut wire_nodes: Vec<(WireRef, usize)> = Vec::new();
     let mut id_of = |n: Node, dsu: &mut Dsu| -> usize {
         let next = ids.len();
         *ids.entry(n).or_insert_with(|| {
@@ -75,6 +85,7 @@ pub fn nets_linked(project: &Project, is_interruption: impl Fn(&str) -> bool) ->
         };
         for w in &page.wires {
             let a = id_of(node(&w.from), &mut dsu);
+            wire_nodes.push(((page.id.clone(), w.id.clone()), a));
             let b = id_of(node(&w.to), &mut dsu);
             dsu.union(a, b);
             if let Some(name) = &w.potential {
@@ -117,7 +128,19 @@ pub fn nets_linked(project: &Project, is_interruption: impl Fn(&str) -> bool) ->
             Node::Point(..) | Node::Link(_) => {}
         }
     }
-    groups.into_values().filter(|n| !n.pins.is_empty()).collect()
+    let mut index_of_root: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut nets = Vec::new();
+    for (root, net) in groups {
+        if !net.pins.is_empty() {
+            index_of_root.insert(root, nets.len());
+            nets.push(net);
+        }
+    }
+    let wires = wire_nodes
+        .into_iter()
+        .filter_map(|(w, node)| index_of_root.get(&dsu.find(node)).map(|n| (w, *n)))
+        .collect();
+    (nets, wires)
 }
 
 #[cfg(test)]
