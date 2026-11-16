@@ -1,0 +1,7 @@
+Manufacturer;Order number;Description;Symbol;Coil voltage;Rated current
+Example;EX-MCB-1P-C10;Circuit breaker 1-pole C10 (example data);wc.breaker.1p;;10 A
+Example;EX-CT-9-24DC;Contactor 3-pole 9 A, 1 NO auxiliary, 24 V DC coil (example data);wc.coil;24 V DC;9 A
+Example;EX-PB-RED-NC;Push button red, 1 NC (example data);wc.button.nc;;
+Example;EX-PB-GRN-NO;Push button green, 1 NO (example data);wc.button.no;;
+Example;EX-LAMP-24-GN;Indicator lamp green 24 V (example data);wc.lamp;24 V;
+Example;EX-TB-2.5;Feed-through terminal 2.5 mm² (example data);wc.terminal;;24 A

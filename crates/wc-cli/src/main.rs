@@ -85,6 +85,18 @@ enum Cmd {
         pages: Vec<String>,
         #[arg(long, default_value = "")]
         date: String,
+        /// Append report pages: parts, devices, wires, nets, terminals, or all.
+        #[arg(long = "report")]
+        reports: Vec<String>,
+    },
+    /// Print a report (parts, devices, wires, nets, terminals) as a table, CSV or Markdown.
+    Report {
+        kind: String,
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Write to a file instead of standard output.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// List the potentials (connected pins) across all pages.
     Nets,
@@ -434,12 +446,27 @@ fn run(cli: Cli) -> Res<()> {
         }
         Cmd::Lib(lc) => lib_cmd(dir, lc)?,
         Cmd::Import(ic) => import_cmd(dir, ic)?,
-        Cmd::Pdf { out, pages, date } => {
+        Cmd::Pdf {
+            out,
+            pages,
+            date,
+            reports,
+        } => {
             let p = load(dir)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
+            let parts = vendored_parts(dir, &p);
+            let inputs = wc_report::Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            let tables = report_kinds(&reports)?
+                .into_iter()
+                .map(|k| wc_report::build(k, &inputs))
+                .collect();
             let (bytes, report) = wc_pdf::export(
                 &p,
                 &symbols,
@@ -447,6 +474,7 @@ fn run(cli: Cli) -> Res<()> {
                     pages,
                     date,
                     wire_labels: true,
+                    reports: tables,
                 },
             );
             std::fs::write(&out, bytes).map_err(e)?;
@@ -454,6 +482,31 @@ fn run(cli: Cli) -> Res<()> {
                 eprintln!("warning: {w}");
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
+        }
+        Cmd::Report { kind, format, out } => {
+            let p = load(dir)?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let parts = vendored_parts(dir, &p);
+            let inputs = wc_report::Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            let mut text = String::new();
+            for k in report_kinds(std::slice::from_ref(&kind))? {
+                let t = wc_report::build(k, &inputs);
+                text.push_str(&match format.as_str() {
+                    "csv" => t.to_csv(),
+                    "md" | "markdown" => t.to_markdown(),
+                    "text" => plain_table(&t),
+                    other => return Err(format!("unknown format {other:?} (text, csv, md)")),
+                });
+                text.push('\n');
+            }
+            match out {
+                Some(path) => std::fs::write(&path, text).map_err(e)?,
+                None => print!("{text}"),
+            }
         }
         Cmd::Nets => {
             let p = load(dir)?;
@@ -958,4 +1011,52 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse report names; `all` means every report.
+fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
+    let mut out = Vec::new();
+    for n in names {
+        if n == "all" {
+            out.extend(wc_report::Kind::ALL);
+            continue;
+        }
+        let k = wc_report::Kind::parse(n)
+            .ok_or_else(|| format!("unknown report {n:?} (parts, devices, wires, nets, terminals, all)"))?;
+        out.push(k);
+    }
+    Ok(out)
+}
+
+/// The project's vendored parts by id (parts referenced by devices).
+fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
+    p.devices
+        .values()
+        .filter_map(|d| d.part.as_ref())
+        .filter_map(|id| store::read_vendored_part(dir, id).ok().map(|part| (id.clone(), part)))
+        .collect()
+}
+
+/// A report as aligned plain text for the terminal.
+fn plain_table(t: &wc_report::Table) -> String {
+    let mut w: Vec<usize> = t.columns.iter().map(|c| c.chars().count()).collect();
+    for r in &t.rows {
+        for (i, c) in r.iter().enumerate() {
+            if let Some(x) = w.get_mut(i) {
+                *x = (*x).max(c.chars().count());
+            }
+        }
+    }
+    let line = |cells: &[String]| {
+        let parts: Vec<String> = cells.iter().zip(&w).map(|(c, n)| format!("{c:<n$}")).collect();
+        parts.join("  ").trim_end().to_owned()
+    };
+    let mut out = format!("{}\n{}\n", t.title, line(&t.columns));
+    out.push_str(&w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("  "));
+    out.push('\n');
+    for r in &t.rows {
+        out.push_str(&line(r));
+        out.push('\n');
+    }
+    out
 }
