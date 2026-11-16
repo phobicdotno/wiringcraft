@@ -50,6 +50,8 @@ pub enum Action {
     Commit,
     NewBranch,
     History,
+    CommentTool,
+    PageHistory,
     ToggleChrome,
     ToggleTheme,
 }
@@ -116,6 +118,18 @@ impl Action {
                 "Write a text on the sheet: click where it goes",
                 Icon::Text,
                 "T",
+            ),
+            Action::CommentTool => i(
+                "Comment",
+                "Pin a review comment on the sheet: click where it goes",
+                Icon::Comment,
+                "C",
+            ),
+            Action::PageHistory => i(
+                "Page history",
+                "Who changed this page, when, and what they changed",
+                Icon::History,
+                "",
             ),
             Action::LineTool => i("Line", "Draw a line: click both ends", Icon::Line, "L"),
             Action::RectTool => i("Rectangle", "Draw a rectangle: click two corners", Icon::Rect, ""),
@@ -259,6 +273,7 @@ pub const TOOLBAR: &[&[Action]] = &[
     &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
     &[Action::LibraryStatus, Action::LibraryUpdate],
     &[Action::Commit, Action::NewBranch, Action::History],
+    &[Action::CommentTool, Action::PageHistory],
     &[Action::Check, Action::Reports, Action::ExportPdf],
 ];
 
@@ -333,7 +348,10 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
     ),
     (
         "Versions",
-        &[("Versions", &[Action::Commit, Action::NewBranch, Action::History])],
+        &[
+            ("Versions", &[Action::Commit, Action::NewBranch, Action::History]),
+            ("Review", &[Action::CommentTool, Action::PageHistory]),
+        ],
     ),
     ("View", &[("Appearance", &[Action::ToggleChrome, Action::ToggleTheme])]),
 ];

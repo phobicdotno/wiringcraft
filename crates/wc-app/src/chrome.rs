@@ -98,7 +98,14 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
     ("Library", &[Some(Action::LibraryStatus), Some(Action::LibraryUpdate)]),
     (
         "Versions",
-        &[Some(Action::Commit), Some(Action::NewBranch), Some(Action::History)],
+        &[
+            Some(Action::Commit),
+            Some(Action::NewBranch),
+            Some(Action::History),
+            None,
+            Some(Action::CommentTool),
+            Some(Action::PageHistory),
+        ],
     ),
 ];
 
