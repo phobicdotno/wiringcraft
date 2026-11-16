@@ -92,7 +92,7 @@ enum Cmd {
         pages: Vec<String>,
         #[arg(long, default_value = "")]
         date: String,
-        /// Append report pages: parts, devices, wires, nets, terminals, or all.
+        /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, or all.
         #[arg(long = "report")]
         reports: Vec<String>,
     },
@@ -110,7 +110,7 @@ enum Cmd {
         #[arg(long, default_value = "")]
         date: String,
     },
-    /// Print a report (parts, devices, wires, nets, terminals) as a table, CSV or Markdown.
+    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc) as a table, CSV or Markdown.
     Report {
         kind: String,
         #[arg(long, default_value = "text")]
@@ -1182,8 +1182,9 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
             out.extend(wc_report::Kind::ALL);
             continue;
         }
-        let k = wc_report::Kind::parse(n)
-            .ok_or_else(|| format!("unknown report {n:?} (parts, devices, wires, nets, terminals, all)"))?;
+        let k = wc_report::Kind::parse(n).ok_or_else(|| {
+            format!("unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, all)")
+        })?;
         out.push(k);
     }
     Ok(out)

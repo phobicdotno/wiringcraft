@@ -81,16 +81,20 @@ pub enum Kind {
     Nets,
     Terminals,
     Cables,
+    Plc,
+    Contents,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [
+    pub const ALL: [Kind; 8] = [
+        Kind::Contents,
         Kind::Parts,
         Kind::Devices,
         Kind::Wires,
         Kind::Nets,
         Kind::Terminals,
         Kind::Cables,
+        Kind::Plc,
     ];
 
     pub fn name(self) -> &'static str {
@@ -101,6 +105,8 @@ impl Kind {
             Kind::Nets => "nets",
             Kind::Terminals => "terminals",
             Kind::Cables => "cables",
+            Kind::Plc => "plc",
+            Kind::Contents => "contents",
         }
     }
 
@@ -126,6 +132,8 @@ pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
         Kind::Nets => net_list(i),
         Kind::Terminals => terminal_plan(i),
         Kind::Cables => cable_list(i),
+        Kind::Plc => plc_io_list(i),
+        Kind::Contents => contents(i),
     }
 }
 
@@ -527,5 +535,105 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             ]);
         }
     }
+    t
+}
+
+/// Table of contents: every schematic page with its title and what is drawn on it.
+pub fn contents(i: &Inputs<'_>) -> Table {
+    let mut t = Table::new("Table of contents", &["Page", "Title", "Devices", "Wires"]);
+    for page in &i.project.pages {
+        let tags: BTreeSet<String> = page
+            .symbols
+            .iter()
+            .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
+            .collect();
+        t.rows.push(vec![
+            page.number.clone(),
+            page.title.clone(),
+            tags.len().to_string(),
+            page.wires.len().to_string(),
+        ]);
+    }
+    t
+}
+
+/// Whether a symbol is a PLC input or output, from its library category and name or pin.
+fn plc_kind(sym: &Symbol) -> Option<&'static str> {
+    let category = sym.category.to_ascii_lowercase();
+    let id = sym.id.to_ascii_lowercase();
+    if category != "plc" && !id.contains(".plc.") {
+        return None;
+    }
+    let name = format!("{} {}", sym.name, sym.id).to_ascii_lowercase();
+    let pins: Vec<&str> = sym.pins.iter().map(|p| p.name.as_str()).collect();
+    if name.contains("input") || pins == ["I"] {
+        Some("Input")
+    } else if name.contains("output") || pins == ["Q"] {
+        Some("Output")
+    } else {
+        None
+    }
+}
+
+/// PLC I/O list: every PLC input and output drawn, with its address, the device it belongs to
+/// and what it is wired to. The address is the device property `Address` (or `PLC address`);
+/// points without one sort last so the gaps are visible.
+pub fn plc_io_list(i: &Inputs<'_>) -> Table {
+    let mut t = Table::new(
+        "PLC I/O list",
+        &["Address", "Type", "Device", "Description", "Connected to", "Page"],
+    );
+    let (nets, _) = net_names(i);
+    let mut net_of: BTreeMap<PinRef, usize> = BTreeMap::new();
+    for (n, net) in nets.iter().enumerate() {
+        for pin in &net.pins {
+            net_of.insert(pin.clone(), n);
+        }
+    }
+    // (no address, address sort key, row)
+    type Row = (bool, Vec<(String, u64)>, Vec<String>);
+    let mut rows: Vec<Row> = Vec::new();
+    for page in &i.project.pages {
+        for s in &page.symbols {
+            let Some(sym) = i.symbols.get(&s.symbol) else { continue };
+            let Some(kind) = plc_kind(sym) else { continue };
+            let dev = s.tag.as_ref().and_then(|tag| i.project.devices.get(tag));
+            let address = dev
+                .and_then(|d| {
+                    d.properties
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("address") || k.eq_ignore_ascii_case("plc address"))
+                        .map(|(_, v)| v.trim().to_owned())
+                })
+                .unwrap_or_default();
+            let mut others: BTreeSet<String> = BTreeSet::new();
+            for p in &sym.pins {
+                let key = (page.id.clone(), s.id.clone(), p.name.clone());
+                let Some(n) = net_of.get(&key) else { continue };
+                for other in nets.get(*n).map(|net| net.pins.as_slice()).unwrap_or(&[]) {
+                    if *other != key {
+                        let (pg, item, pin) = other;
+                        others.insert(pin_label(i.project, pg, item, pin));
+                    }
+                }
+            }
+            let mut others: Vec<String> = others.into_iter().collect();
+            others.sort_by_key(|o| natural_key(o));
+            let row = vec![
+                address.clone(),
+                kind.to_owned(),
+                s.tag
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("{} (no tag)", s.id)),
+                dev.map(|d| d.description.clone()).unwrap_or_default(),
+                others.join(", "),
+                page.number.clone(),
+            ];
+            rows.push((address.is_empty(), natural_key(&address), row));
+        }
+    }
+    rows.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    t.rows = rows.into_iter().map(|(_, _, r)| r).collect();
     t
 }

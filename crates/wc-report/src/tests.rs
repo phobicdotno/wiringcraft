@@ -286,3 +286,50 @@ fn project_check_finds_the_usual_mistakes() {
     assert!(found.iter().filter(|f| f.page_id.is_some()).all(|f| f.item.is_some()));
     assert_eq!(check_table(&i).rows.len(), found.len());
 }
+
+#[test]
+fn plc_io_list_and_contents() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    input.name = "PLC digital input".into();
+    let mut output = sym("wc.plc.output", SymbolRole::Standalone, &["Q"]);
+    output.category = "plc".into();
+    for y in [input, output] {
+        s.insert(y.id.clone(), y);
+    }
+    let page = &mut p.pages[0];
+    page.symbols.push(place("i2", "wc.plc.input", 300.0, Some("-A1.I2")));
+    page.symbols.push(place("i1", "wc.plc.input", 310.0, Some("-A1.I1")));
+    page.symbols.push(place("q1", "wc.plc.output", 320.0, Some("-A1.Q1")));
+    page.symbols.push(place("u1", "wc.plc.input", 330.0, None));
+    page.wires.push(wire("w9", pin("s6", "X2"), pin("q1", "Q"), None, None));
+    for (tag, addr) in [("-A1.I2", "%I0.10"), ("-A1.I1", "%I0.2"), ("-A1.Q1", "%Q0.0")] {
+        p.devices.insert(
+            DeviceTag::parse(tag).unwrap(),
+            Device {
+                description: format!("point {tag}"),
+                properties: [("Address".to_string(), addr.to_string())].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::Plc, &i);
+    let col = |n: usize| t.rows.iter().map(|r| r[n].as_str()).collect::<Vec<_>>();
+    // Natural address order (0.2 before 0.10), points without an address last.
+    assert_eq!(col(0), ["%I0.2", "%I0.10", "%Q0.0", ""]);
+    assert_eq!(col(1), ["Input", "Input", "Output", "Input"]);
+    assert_eq!(t.rows[2][2], "-A1.Q1");
+    assert_eq!(t.rows[2][4], "-P1:X2");
+    assert_eq!(t.rows[3][2], "u1 (no tag)");
+
+    let c = build(Kind::Contents, &i);
+    assert_eq!(c.columns, ["Page", "Title", "Devices", "Wires"]);
+    // K1 counts once for its coil and contact; the untagged input has no device.
+    assert_eq!(c.rows, [["2", "Control", "8", "5"]]);
+}
