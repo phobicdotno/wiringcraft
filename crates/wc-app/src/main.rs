@@ -752,6 +752,7 @@ impl App {
                                         text: text.trim().to_owned(),
                                         height: 3.5,
                                         align: wc_core::geom::Align::Left,
+                                        angle: 0.0,
                                     },
                                 )
                             {

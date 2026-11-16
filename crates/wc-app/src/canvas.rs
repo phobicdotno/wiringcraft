@@ -183,7 +183,12 @@ fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
             text,
             height,
             align,
+            angle,
         } => {
+            if *angle != 0.0 && angle.is_finite() {
+                turned_text_mm(p, xf, *at, *height, *align, *angle, text, stroke.color);
+                return;
+            }
             let a = match align {
                 Align::Left => Align2::LEFT_BOTTOM,
                 Align::Center => Align2::CENTER_BOTTOM,
@@ -203,6 +208,39 @@ fn text_mm(p: &egui::Painter, xf: &Xf, at: Point, height: f64, align: Align2, te
     // egui places the text box; nudge down so the baseline, not the box bottom, sits on `at`.
     let pos = xf.s(at) + Vec2::new(0.0, size * 0.22);
     p.text(pos, align, text, FontId::proportional(size), c);
+}
+
+/// Text turned `angle` degrees counter-clockwise around its baseline anchor `at`.
+#[allow(clippy::too_many_arguments)]
+fn turned_text_mm(
+    p: &egui::Painter,
+    xf: &Xf,
+    at: Point,
+    height: f64,
+    align: Align,
+    angle: f64,
+    text: &str,
+    c: Color32,
+) {
+    let size = xf.len(height) * 1.15;
+    if size < 3.0 {
+        return;
+    }
+    let galley = p.layout_no_wrap(text.to_owned(), FontId::proportional(size), c);
+    let (w, h) = (galley.size().x, galley.size().y);
+    let shift = match align {
+        Align::Left => 0.0,
+        Align::Center => -w / 2.0,
+        Align::Right => -w,
+    };
+    // Galley top left in the text's own frame (baseline at 0), turned onto the screen; egui
+    // turns clockwise on screen, which is counter-clockwise on paper negated.
+    let theta = -(angle as f32).to_radians();
+    let (sin, cos) = theta.sin_cos();
+    let (ox, oy) = (shift, -0.8 * h);
+    let offset = Vec2::new(ox * cos - oy * sin, ox * sin + oy * cos);
+    let pos = xf.s(at) + offset;
+    p.add(egui::epaint::TextShape::new(pos, galley, c).with_angle(theta));
 }
 
 /// Distance from `p` to the segment `a`-`b`.

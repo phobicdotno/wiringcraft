@@ -114,11 +114,18 @@ pub enum Shape {
         height: f64,
         #[serde(default, skip_serializing_if = "is_left")]
         align: Align,
+        /// Reading direction in degrees, counter-clockwise on paper: 90 reads bottom to top.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        angle: f64,
     },
 }
 
 fn default_text_height() -> f64 {
     2.5
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 fn is_left(a: &Align) -> bool {
@@ -172,16 +179,19 @@ impl Shape {
                     end: e + quarter,
                 }
             }
+            // Text keeps its reading direction when its symbol turns, so it stays readable.
             Shape::Text {
                 at,
                 text,
                 height,
                 align,
+                angle,
             } => Shape::Text {
                 at: t(*at),
                 text: text.clone(),
                 height: *height,
                 align: *align,
+                angle: *angle,
             },
         }
     }

@@ -357,6 +357,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                     text: d.name.clone(),
                     height: 2.5,
                     align: Align::Center,
+                    angle: 0.0,
                 },
             ];
             let mut pins = Vec::new();
@@ -371,6 +372,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                     text: iface.clone(),
                     height: 1.8,
                     align: Align::Left,
+                    angle: 0.0,
                 });
                 // Duplicate interface names would make pins ambiguous: suffix them.
                 let mut name = iface.clone();

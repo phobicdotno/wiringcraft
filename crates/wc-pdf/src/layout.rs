@@ -193,13 +193,14 @@ fn draw_shape(pen: &mut Pen, s: &Shape) {
             text,
             height,
             align,
+            angle,
         } => {
             let a = match align {
                 Align::Left => 0,
                 Align::Center => 1,
                 Align::Right => 2,
             };
-            pen.text(tuple(*at), *height, a, text);
+            pen.text_at_angle(tuple(*at), *height, a, *angle, text);
         }
     }
 }
@@ -246,6 +247,7 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
                     text: t.to_owned(),
                     height,
                     align,
+                    angle: 0.0,
                 },
                 ink,
             });

@@ -250,6 +250,8 @@ fn shapes(
                     text,
                     height: (e.f_or(40, 2.5) * r_scale).max(0.5),
                     align,
+                    // Code 50: rotation in degrees, counter-clockwise.
+                    angle: normal_angle(e.f(50)),
                 })
             }
             "POINT" => {
@@ -434,6 +436,15 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     Ok(out)
 }
 
+/// Degrees in (-180, 180], 0 for anything unusable.
+fn normal_angle(a: f64) -> f64 {
+    if !a.is_finite() {
+        return 0.0;
+    }
+    let r = a.rem_euclid(360.0);
+    if r > 180.0 { r - 360.0 } else { r }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +501,28 @@ mod tests {
         assert!(r.is_ok());
         // Truncated pair list and garbage numbers.
         let _ = symbol("0\nSECTION\n2\nENTITIES\n0\nLINE\n10\nNaN\n20", "x", "x");
+    }
+
+    #[test]
+    fn text_rotation_is_kept() -> Result<()> {
+        let ents = "0\nTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n50\n450\n1\nUP\n\
+                    0\nTEXT\n8\n0\n10\n5\n20\n9\n40\n2\n50\n270\n1\nDOWN\n\
+                    0\nTEXT\n8\n0\n10\n9\n20\n9\n40\n2\n1\nFLAT\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let angles: Vec<f64> = p
+            .graphics
+            .iter()
+            .filter_map(|g| {
+                if let Shape::Text { angle, .. } = g {
+                    Some(*angle)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(angles, [90.0, -90.0, 0.0]);
+        assert_eq!(normal_angle(f64::NAN), 0.0);
+        Ok(())
     }
 
     #[test]

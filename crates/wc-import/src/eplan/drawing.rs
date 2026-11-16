@@ -132,6 +132,7 @@ fn label(x: f64, y: f64, text: &str) -> Shape {
         text: text.to_owned(),
         height: 1.8,
         align: Align::Left,
+        angle: 0.0,
     }
 }
 
@@ -393,11 +394,13 @@ fn shape_to_page(s: &Shape, scale: f64) -> Option<Shape> {
             text,
             height,
             align,
+            angle,
         } => Shape::Text {
             at: to_page(*at, scale),
             text: text.clone(),
             height: (height / scale).clamp(1.0, 20.0),
             align: *align,
+            angle: *angle,
         },
         _ => return None,
     })
@@ -457,6 +460,7 @@ pub fn pages(p: &EplanProject, first_page_number: usize) -> Drawing {
                         text: f.tag.clone(),
                         height: 2.5,
                         align: Align::Left,
+                        angle: 0.0,
                     });
                 }
                 continue;

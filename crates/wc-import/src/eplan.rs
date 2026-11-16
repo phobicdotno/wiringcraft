@@ -72,6 +72,7 @@ const F_LINE_TO: u16 = 60532;
 const F_CIRCLE_CENTER: u16 = 60555;
 const F_CIRCLE_RADIUS: u16 = 60556;
 const F_TEXT_HEIGHT: u16 = 60961;
+const F_TEXT_ANGLE: u16 = 60962;
 const F_SYMBOL_NUMBER: u16 = 61262;
 const F_VARIANT: u16 = 61263;
 const F_FUNCTION_KIND: u16 = 61381;
@@ -656,6 +657,11 @@ fn read_graphics(data: &[u8], p: &mut EplanProject) {
                 };
                 let text = pick_language(&text);
                 let height = f64_field(r, F_TEXT_HEIGHT, 0.5..50.0).unwrap_or(2.5);
+                // Radians, counter-clockwise; whole degrees are all a drawing needs.
+                let angle = f64_field(r, F_TEXT_ANGLE, -7.0..7.0)
+                    .map(|a| a.to_degrees().round())
+                    .unwrap_or(0.0);
+                let (sin, cos) = angle.to_radians().sin_cos();
                 // One text per line, each line below the last (Eplan's y runs up).
                 for (k, line) in text.lines().enumerate() {
                     let line = line.trim_end_matches('\r');
@@ -665,10 +671,15 @@ fn read_graphics(data: &[u8], p: &mut EplanProject) {
                     p.graphics.push(EplanGraphic {
                         page,
                         shape: Shape::Text {
-                            at: Point::new(at.x, at.y - 1.5 * height * k as f64),
+                            // Each line one line-height further, square to the reading direction.
+                            at: Point::new(
+                                at.x + 1.5 * height * k as f64 * sin,
+                                at.y - 1.5 * height * k as f64 * cos,
+                            ),
                             text: line.to_owned(),
                             height,
                             align: Align::Left,
+                            angle,
                         },
                     });
                 }

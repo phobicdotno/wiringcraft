@@ -290,6 +290,13 @@ fn drawn_sample() -> Tables {
     label.extend(text(F_TEXT, "??_??@FIRST\nSECOND;"));
     label.extend(f64_bytes(F_TEXT_HEIGHT, 2.0));
     inst.extend(record(CLASS_TEXT, 103, &label));
+    // A text turned a quarter (radians in the table), on its own page so the counts above
+    // stay as they are.
+    let mut turned = on_page(31);
+    turned.extend(point(F_TEXT_AT, 30.0, 50.0));
+    turned.extend(text(F_TEXT, "??_??@UP;"));
+    turned.extend(f64_bytes(F_TEXT_ANGLE, std::f64::consts::FRAC_PI_2));
+    inst.extend(record(CLASS_TEXT, 107, &turned));
     let mut circle = on_page(30);
     circle.extend(point(F_CIRCLE_CENTER, 60.0, 60.0));
     circle.extend(f64_bytes(F_CIRCLE_RADIUS, 3.0));
@@ -316,11 +323,13 @@ fn reads_symbols_variants_and_page_graphics() {
     let x = p.functions.iter().find(|f| f.tag == "X1").unwrap();
     assert_eq!((x.terminal.as_str(), x.variant, x.pins.len()), ("7", 0, 4));
     // The frame line is left out; the text is split into its lines.
-    assert_eq!(p.graphics.len(), 4);
-    assert!(p.graphics.iter().all(|g| g.page == 30));
+    assert_eq!(p.graphics.iter().filter(|g| g.page == 30).count(), 4);
+    let up = p.graphics.iter().find(|g| g.page == 31).unwrap();
+    assert!(matches!(&up.shape, wc_core::geom::Shape::Text { angle, .. } if *angle == 90.0));
     let texts: Vec<(&str, f64)> = p
         .graphics
         .iter()
+        .filter(|g| g.page == 30)
         .filter_map(|g| match &g.shape {
             wc_core::geom::Shape::Text { text, at, .. } => Some((text.as_str(), at.y)),
             _ => None,

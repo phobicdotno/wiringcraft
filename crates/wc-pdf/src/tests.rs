@@ -133,3 +133,22 @@ fn columns() {
     assert_eq!(column_of(wc_core::PageSize::A3, 215.0), 6);
     assert_eq!(column_of(wc_core::PageSize::A3, 1e9), 10);
 }
+
+#[test]
+fn turned_text_gets_a_text_matrix() {
+    let mut pen = crate::writer::Pen::new(297.0);
+    pen.text_at_angle((100.0, 100.0), 2.5, 0, 0.0, "flat");
+    assert!(pen.ops.contains(" Td ") && !pen.ops.contains(" Tm "));
+    pen.text_at_angle((100.0, 100.0), 2.5, 0, 90.0, "up");
+    // Reading upward: the matrix is a quarter turn counter-clockwise.
+    assert!(pen.ops.contains("0.00000 1.00000 -1.00000 0.00000"), "{}", pen.ops);
+    // Centred text moves its start back along the reading direction (down the page for 90).
+    let mut c = crate::writer::Pen::new(297.0);
+    c.text_at_angle((100.0, 100.0), 2.5, 1, 90.0, "centred");
+    let mut l = crate::writer::Pen::new(297.0);
+    l.text_at_angle((100.0, 100.0), 2.5, 0, 90.0, "centred");
+    assert_ne!(c.ops, l.ops);
+    let mut n = crate::writer::Pen::new(297.0);
+    n.text_at_angle((1.0, 1.0), 2.5, 0, f64::NAN, "nan");
+    assert!(n.ops.contains(" Td "));
+}
