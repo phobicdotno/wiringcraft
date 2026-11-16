@@ -501,10 +501,12 @@ pub fn pages(p: &EplanProject, first_page_number: usize) -> Drawing {
             let EplanNode {
                 at, symbol, variant, ..
             } = node;
-            let Some(dirs) = node_directions(*symbol, *variant) else {
+            // A node of a kind not known here still joins wires: in every direction where a
+            // pin or node facing it lines up, which is how a cross or T reads on the page.
+            let dirs = node_directions(*symbol, *variant).unwrap_or_else(|| {
                 unknown_nodes += 1;
-                continue;
-            };
+                [true; 4]
+            });
             let at = to_page(*at, scale);
             ends.push(End {
                 at,
@@ -531,7 +533,8 @@ pub fn pages(p: &EplanProject, first_page_number: usize) -> Drawing {
     }
     if unknown_nodes > 0 {
         out.warnings.push(format!(
-            "{unknown_nodes} wire corner(s) or junction(s) of an unknown kind were left out"
+            "{unknown_nodes} wire corner(s) or junction(s) of an unknown kind were joined in every direction a \
+             wire lines up; check them"
         ));
     }
     out.symbols = symbols.into_values().collect();
