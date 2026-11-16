@@ -1,0 +1,121 @@
+{
+  "category": "loads",
+  "description": "Socket outlet with protective earth.",
+  "graphics": [
+    {
+      "a": {
+        "x": -3.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": -3.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 3.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 3.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -5.0,
+        "y": 4.0
+      },
+      "b": {
+        "x": 5.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 4.0
+      },
+      "end": 180.0,
+      "kind": "arc",
+      "radius": 5.0,
+      "start": 0.0
+    },
+    {
+      "at": {
+        "x": -5.5,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "L"
+    },
+    {
+      "at": {
+        "x": 0.6,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "N"
+    },
+    {
+      "at": {
+        "x": 3.6,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "PE"
+    }
+  ],
+  "id": "wc.socket",
+  "letter_code": "X",
+  "name": "Socket outlet",
+  "pins": [
+    {
+      "at": {
+        "x": -3.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "L"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "N"
+    },
+    {
+      "at": {
+        "x": 3.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "PE"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -8.0,
+    "y": 6.0
+  }
+}

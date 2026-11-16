@@ -1,0 +1,105 @@
+{
+  "category": "relays",
+  "description": "Coil of an on-delay timer relay; its contacts carry the same tag.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "kind": "rect",
+      "max": {
+        "x": 4.0,
+        "y": 11.0
+      },
+      "min": {
+        "x": -4.0,
+        "y": 4.0
+      }
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 11.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "kind": "rect",
+      "max": {
+        "x": -2.0,
+        "y": 11.0
+      },
+      "min": {
+        "x": -4.0,
+        "y": 4.0
+      }
+    },
+    {
+      "a": {
+        "x": -4.0,
+        "y": 4.0
+      },
+      "b": {
+        "x": -2.0,
+        "y": 11.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "A1"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "A2"
+    }
+  ],
+  "id": "wc.coil.ondelay",
+  "letter_code": "K",
+  "name": "Timer coil, on-delay",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "A1"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "A2"
+    }
+  ],
+  "role": "main",
+  "tag_at": {
+    "x": -12.0,
+    "y": 8.0
+  }
+}

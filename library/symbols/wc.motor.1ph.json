@@ -1,0 +1,139 @@
+{
+  "category": "loads",
+  "description": "Single-phase AC motor with protective earth.",
+  "graphics": [
+    {
+      "a": {
+        "x": -2.5,
+        "y": 0.0
+      },
+      "b": {
+        "x": -2.5,
+        "y": 4.3
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 2.5,
+        "y": 0.0
+      },
+      "b": {
+        "x": 2.5,
+        "y": 4.3
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 9.0
+      },
+      "kind": "circle",
+      "radius": 5.0
+    },
+    {
+      "align": "center",
+      "at": {
+        "x": 0.0,
+        "y": 10.3
+      },
+      "height": 3.5,
+      "kind": "text",
+      "text": "M"
+    },
+    {
+      "align": "center",
+      "at": {
+        "x": 0.0,
+        "y": 13.0
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1~"
+    },
+    {
+      "a": {
+        "x": 7.0,
+        "y": 2.0
+      },
+      "b": {
+        "x": 7.0,
+        "y": 7.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 7.0,
+        "y": 7.0
+      },
+      "b": {
+        "x": 4.6,
+        "y": 7.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": -5.0,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "L"
+    },
+    {
+      "at": {
+        "x": 3.4,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "N"
+    },
+    {
+      "at": {
+        "x": 7.8,
+        "y": 4.0
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "PE"
+    }
+  ],
+  "id": "wc.motor.1ph",
+  "letter_code": "M",
+  "name": "Motor, single-phase",
+  "pins": [
+    {
+      "at": {
+        "x": -2.5,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "L"
+    },
+    {
+      "at": {
+        "x": 2.5,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "N"
+    },
+    {
+      "at": {
+        "x": 7.0,
+        "y": 2.0
+      },
+      "dir": "up",
+      "name": "PE"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -9.0,
+    "y": 9.0
+  }
+}

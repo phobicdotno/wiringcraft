@@ -1,0 +1,144 @@
+{
+  "category": "power",
+  "description": "Single-phase control transformer: primary 1-2, secondary 3-4.",
+  "graphics": [
+    {
+      "a": {
+        "x": -4.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": -4.0,
+        "y": 5.44
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 4.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 4.0,
+        "y": 5.44
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 7.5
+      },
+      "kind": "circle",
+      "radius": 4.5
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 12.5
+      },
+      "kind": "circle",
+      "radius": 4.5
+    },
+    {
+      "a": {
+        "x": -4.0,
+        "y": 14.56
+      },
+      "b": {
+        "x": -4.0,
+        "y": 20.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 4.0,
+        "y": 14.56
+      },
+      "b": {
+        "x": 4.0,
+        "y": 20.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": -6.8,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1"
+    },
+    {
+      "at": {
+        "x": 5.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2"
+    },
+    {
+      "at": {
+        "x": -6.8,
+        "y": 19.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "3"
+    },
+    {
+      "at": {
+        "x": 5.2,
+        "y": 19.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "4"
+    }
+  ],
+  "id": "wc.transformer.1ph",
+  "letter_code": "T",
+  "name": "Control transformer",
+  "pins": [
+    {
+      "at": {
+        "x": -4.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1"
+    },
+    {
+      "at": {
+        "x": 4.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "2"
+    },
+    {
+      "at": {
+        "x": -4.0,
+        "y": 20.0
+      },
+      "dir": "down",
+      "name": "3"
+    },
+    {
+      "at": {
+        "x": 4.0,
+        "y": 20.0
+      },
+      "dir": "down",
+      "name": "4"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -9.0,
+    "y": 10.0
+  }
+}

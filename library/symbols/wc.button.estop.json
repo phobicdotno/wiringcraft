@@ -1,0 +1,126 @@
+{
+  "category": "operators",
+  "description": "Emergency stop push button, break contact with a latching mushroom head.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "b": {
+        "x": 2.5,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 3.0,
+        "y": 4.2
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 1.5,
+        "y": 7.0
+      },
+      "b": {
+        "x": -4.0,
+        "y": 7.0
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": -5.5,
+        "y": 7.0
+      },
+      "end": 270.0,
+      "kind": "arc",
+      "radius": 1.5,
+      "start": 90.0
+    },
+    {
+      "a": {
+        "x": -5.5,
+        "y": 5.5
+      },
+      "b": {
+        "x": -5.5,
+        "y": 8.5
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "11"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "12"
+    }
+  ],
+  "id": "wc.button.estop",
+  "letter_code": "S",
+  "name": "Emergency stop",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "11"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "12"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -12.0,
+    "y": 8.0
+  }
+}
