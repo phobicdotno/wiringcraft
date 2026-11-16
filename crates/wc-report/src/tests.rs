@@ -372,4 +372,14 @@ fn plc_io_list_and_contents() {
     assert_eq!(c.columns, ["Page", "Title", "Devices", "Wires"]);
     // K1 counts once for its coil and contact; the untagged input has no device.
     assert_eq!(c.rows, [["2", "Control", "8", "5"]]);
+
+    let v = plc_variables(&i);
+    assert_eq!((v.variables, v.unlocated), (4, 1));
+    let lines: Vec<&str> = v.text.lines().collect();
+    assert_eq!(lines[1], "VAR_GLOBAL");
+    assert!(lines[2].starts_with("    A1_I1 AT %IX0.2 : BOOL; (* -A1.I1, point -A1.I1, address %I0.2"));
+    assert!(lines[3].starts_with("    A1_I2 AT %IX0.10 : BOOL;"));
+    assert!(lines[4].starts_with("    A1_Q1 AT %QX0.0 : BOOL; (* -A1.Q1, point -A1.Q1, address %Q0.0, to -P1:X2"));
+    assert!(lines[5].starts_with("    u1 AT %I* : BOOL;"));
+    assert_eq!(lines[6], "END_VAR");
 }

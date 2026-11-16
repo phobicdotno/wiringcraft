@@ -13,12 +13,14 @@ use wc_core::{DeviceTag, Endpoint, Part, Project, Symbol};
 
 pub mod aml;
 pub mod check;
+pub mod plc;
 pub mod step;
 #[cfg(test)]
 mod tests;
 
 pub use aml::{AmlCounts, automationml};
 pub use check::{Finding, Severity, check, check_table};
+pub use plc::{PlcVariables, plc_variables};
 
 /// A finished report: a title, column headings and rows of text.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
