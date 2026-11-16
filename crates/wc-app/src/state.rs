@@ -41,6 +41,18 @@ pub enum Selection {
     Graphic(usize),
 }
 
+/// A macro found in the project or a library source.
+#[derive(Debug, Clone)]
+pub struct MacroEntry {
+    /// `project` or the library source's name.
+    pub source: String,
+    pub path: PathBuf,
+    pub name: String,
+    pub description: String,
+    /// Why the file could not be read, if it could not.
+    pub error: Option<String>,
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
@@ -372,6 +384,51 @@ impl Open {
 
     /// Copy a page as a new last page. Devices on the copy get the next free tags (one new device
     /// per original device, keeping description and part) and wire numbers are cleared.
+    /// Macros of the project (`macros/`) and of its library sources, project first.
+    pub fn macros(&self) -> Vec<MacroEntry> {
+        let mut found: Vec<(String, String, PathBuf)> = wc_core::macros::list_macros(&self.dir)
+            .into_iter()
+            .map(|(id, path)| ("project".to_owned(), id, path))
+            .collect();
+        if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
+            found.extend(lib.macros());
+        }
+        found
+            .into_iter()
+            .map(|(source, id, path)| {
+                let (name, description, error) = match wc_core::macros::read_macro(&path) {
+                    Ok(m) => (m.name, m.description, None),
+                    Err(e) => (id.clone(), String::new(), Some(e.to_string())),
+                };
+                MacroEntry {
+                    source,
+                    path,
+                    name,
+                    description,
+                    error,
+                }
+            })
+            .collect()
+    }
+
+    /// Save a copied group as a macro of this project. Returns the file written.
+    pub fn save_macro(&self, clip: &crate::edit::Clipboard, name: &str, description: &str) -> Result<PathBuf, String> {
+        if name.trim().is_empty() {
+            return Err("Give the macro a name.".into());
+        }
+        let id = wc_core::macros::macro_id(name);
+        wc_core::macros::write_macro(&self.dir, &id, &clip.to_macro(name, description)).map_err(|e| e.to_string())
+    }
+
+    /// Insert a macro on a page where it was drawn (its anchor), like a paste. Returns the
+    /// inserted items, selected so they can be moved into place.
+    pub fn insert_macro(&mut self, page: usize, path: &Path) -> Result<Vec<Selection>, String> {
+        let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
+        let clip = crate::edit::Clipboard::from(m);
+        let at = clip.anchor;
+        Ok(self.paste(page, &clip, at))
+    }
+
     /// Number the wires by `rule`, keeping numbers already given. One undo step; nothing is
     /// recorded when no number changes.
     pub fn number_wires(&mut self, rule: wc_core::numbering::Rule) -> wc_core::numbering::Numbered {

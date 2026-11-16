@@ -98,6 +98,18 @@ impl Library {
         out
     }
 
+    /// Macros in the sources' `macros/` folders: (source name, macro id, file), in source order.
+    pub fn macros(&self) -> Vec<(String, String, PathBuf)> {
+        self.sources
+            .iter()
+            .flat_map(|s| {
+                wc_core::macros::list_macros(&s.root)
+                    .into_iter()
+                    .map(|(id, path)| (s.name.clone(), id, path))
+            })
+            .collect()
+    }
+
     /// Case-insensitive search over symbol and part ids, names and descriptions, and part
     /// manufacturer, order number and properties.
     pub fn search(&self, query: &str) -> Vec<SearchHit> {

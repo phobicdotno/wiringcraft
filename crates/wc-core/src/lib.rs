@@ -8,6 +8,7 @@ pub mod error;
 pub mod geom;
 pub mod hash;
 pub mod lock;
+pub mod macros;
 pub mod numbering;
 pub mod part;
 pub mod project;

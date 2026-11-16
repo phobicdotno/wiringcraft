@@ -155,3 +155,43 @@ fn search_finds_by_category() -> Result<()> {
     assert!(lib.locate(ItemKind::Symbol, "../coil").is_none());
     Ok(())
 }
+
+#[test]
+fn macros_are_listed_per_source_in_order() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let m = wc_core::macros::Macro {
+        name: "Lamp".into(),
+        graphics: vec![wc_core::Shape::Circle {
+            center: wc_core::Point::new(0.0, 0.0),
+            radius: 2.0,
+            filled: false,
+        }],
+        ..Default::default()
+    };
+    let (a, b) = (tmp.path().join("company"), tmp.path().join("personal"));
+    wc_core::macros::write_macro(&a, "lamp", &m)?;
+    wc_core::macros::write_macro(&b, "lamp", &m)?;
+    wc_core::macros::write_macro(&b, "alarm", &m)?;
+    let lib = Library {
+        sources: vec![
+            Source {
+                name: "company".into(),
+                root: a,
+            },
+            Source {
+                name: "personal".into(),
+                root: b,
+            },
+        ],
+    };
+    let found: Vec<(String, String)> = lib.macros().into_iter().map(|(s, id, _)| (s, id)).collect();
+    assert_eq!(
+        found,
+        [
+            ("company".to_string(), "lamp".to_string()),
+            ("personal".to_string(), "alarm".to_string()),
+            ("personal".to_string(), "lamp".to_string())
+        ]
+    );
+    Ok(())
+}

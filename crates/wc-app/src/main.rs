@@ -61,6 +61,15 @@ enum Dialog {
     History(Vec<wc_vcs::subway::Row>),
     Library(Vec<wc_library::ItemStatus>),
     Message(String),
+    /// Name and description for a macro made from the copied selection.
+    SaveMacro {
+        clip: edit::Clipboard,
+        name: String,
+        description: String,
+        error: Option<String>,
+    },
+    /// Macros to insert.
+    Macros(Vec<state::MacroEntry>),
 }
 
 /// Work a dialog asks for after it closes.
@@ -114,7 +123,7 @@ impl chrome::Status for StatusView<'_> {
             Action::Save => self.open.is_some_and(|o| o.dirty),
             Action::Undo => self.open.is_some_and(Open::can_undo),
             Action::Redo => self.open.is_some_and(Open::can_redo),
-            Action::Delete | Action::Copy | Action::Cut => has && !self.ed.selection.is_empty(),
+            Action::Delete | Action::Copy | Action::Cut | Action::SaveMacro => has && !self.ed.selection.is_empty(),
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
             }
@@ -328,6 +337,18 @@ impl App {
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
+            Action::SaveMacro => {
+                let clip = open.copy(page, &self.ed.selection);
+                if !clip.is_empty() {
+                    self.dialog = Some(Dialog::SaveMacro {
+                        clip,
+                        name: String::new(),
+                        description: String::new(),
+                        error: None,
+                    });
+                }
+            }
+            Action::InsertMacro => self.dialog = Some(Dialog::Macros(open.macros())),
             Action::ExportDrawings => self.dialog = Some(Dialog::Message(export_drawings(open))),
             Action::ExportAml => self.dialog = Some(Dialog::Message(export_aml(open))),
             Action::NumberWires => {
@@ -464,6 +485,8 @@ impl App {
             Dialog::History(_) => "History",
             Dialog::Library(_) => "Library status",
             Dialog::Message(_) => "WiringCraft",
+            Dialog::SaveMacro { .. } => "Save as macro",
+            Dialog::Macros(_) => "Insert macro",
         };
         let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_));
         let screen = ctx.screen_rect();
@@ -473,6 +496,90 @@ impl App {
             .min_width(if wide { (screen.width() * 0.75).min(1100.0) } else { 0.0 })
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| match &mut dialog {
+                Dialog::SaveMacro {
+                    clip,
+                    name,
+                    description,
+                    error,
+                } => {
+                    ui.label(format!(
+                        "{} symbols, {} wires and {} drawings. Saved in the project's macros folder; copy the \
+                         file to a library's macros folder to share it.",
+                        clip.symbols.len(),
+                        clip.wires.len(),
+                        clip.graphics.len()
+                    ));
+                    egui::Grid::new("macro")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Name");
+                            ui.add(
+                                egui::TextEdit::singleline(name)
+                                    .hint_text("Motor starter DOL")
+                                    .desired_width(320.0),
+                            );
+                            ui.end_row();
+                            ui.label("Description");
+                            ui.add(egui::TextEdit::singleline(description).desired_width(320.0));
+                            ui.end_row();
+                        });
+                    if let Some(e) = error {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
+                            .clicked()
+                            && let Some(open) = &self.open
+                        {
+                            match open.save_macro(clip, name, description) {
+                                Ok(path) => {
+                                    self.ed.message = format!("Saved macro {}", path.display());
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::Macros(list) => {
+                    if list.is_empty() {
+                        ui.label(
+                            "No macros yet. Select symbols and wires, then Insert > Save as macro. Library \
+                             sources can hold macros in a macros folder too.",
+                        );
+                    }
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        egui::Grid::new("macros").striped(true).num_columns(3).show(ui, |ui| {
+                            for m in list.iter() {
+                                ui.vertical(|ui| {
+                                    ui.set_min_width(320.0);
+                                    ui.strong(m.name.as_str());
+                                    if let Some(e) = &m.error {
+                                        ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
+                                    } else if !m.description.is_empty() {
+                                        ui.label(m.description.as_str());
+                                    }
+                                });
+                                ui.label(m.source.as_str());
+                                if ui.add_enabled(m.error.is_none(), egui::Button::new("Insert")).clicked() {
+                                    let path = m.path.clone();
+                                    let name = m.name.clone();
+                                    then = Some(Box::new(move |app: &mut App| app.insert_macro(&path, &name)));
+                                    keep = false;
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    if ui.button("Close").clicked() {
+                        keep = false;
+                    }
+                }
                 Dialog::Message(m) => {
                     ui.label(m.as_str());
                     if ui.button("OK").clicked() {
@@ -924,6 +1031,21 @@ impl App {
         let mut prefs = std::mem::take(&mut self.prefs);
         self.open_dir(dir, &mut prefs);
         self.prefs = prefs;
+    }
+
+    /// Insert a macro on the current page, selected so it can be dragged into place.
+    fn insert_macro(&mut self, path: &std::path::Path, name: &str) {
+        let page = self.ed.page;
+        let Some(open) = self.open.as_mut() else { return };
+        match open.insert_macro(page, path) {
+            Ok(items) if !items.is_empty() => {
+                self.ed.tool = Tool::Select;
+                self.ed.message = format!("Inserted macro {name}: drag it into place.");
+                self.ed.selection = items;
+            }
+            Ok(_) => self.ed.message = format!("Macro {name} is empty."),
+            Err(e) => self.dialog = Some(Dialog::Message(format!("Could not insert {name}:\n{e}"))),
+        }
     }
 
     fn commit(&mut self, msg: &str) {

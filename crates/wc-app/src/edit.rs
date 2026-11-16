@@ -20,7 +20,41 @@ pub struct Clipboard {
     pub anchor: Point,
 }
 
+impl From<wc_core::macros::Macro> for Clipboard {
+    fn from(m: wc_core::macros::Macro) -> Self {
+        Self {
+            symbols: m.symbols,
+            wires: m.wires,
+            devices: m.devices,
+            graphics: m.graphics,
+            anchor: m.anchor,
+        }
+    }
+}
+
 impl Clipboard {
+    /// The copied group as a macro to save.
+    pub fn to_macro(&self, name: &str, description: &str) -> wc_core::macros::Macro {
+        wc_core::macros::Macro {
+            name: name.trim().to_owned(),
+            description: description.trim().to_owned(),
+            symbols: self.symbols.clone(),
+            wires: self
+                .wires
+                .iter()
+                .cloned()
+                .map(|mut w| {
+                    // Numbers belong to a drawing, not to the reusable group.
+                    w.number = None;
+                    w
+                })
+                .collect(),
+            graphics: self.graphics.clone(),
+            devices: self.devices.clone(),
+            anchor: self.anchor,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty() && self.wires.is_empty() && self.graphics.is_empty()
     }
@@ -532,6 +566,40 @@ mod tests {
         // Undo removes the whole paste.
         assert!(o.undo());
         assert_eq!(o.project.pages[page].symbols.len(), 2);
+    }
+
+    #[test]
+    fn macros_save_list_and_insert_like_a_paste() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        o.project.pages[page].wires[0].number = Some("7".into());
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        assert!(o.save_macro(&clip, "  ", "").is_err(), "a macro needs a name");
+        let path = o.save_macro(&clip, "Two coils", "Coils sharing A2").unwrap();
+        assert!(path.ends_with("macros/two-coils.json"));
+        let found = o.macros();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (
+                found[0].source.as_str(),
+                found[0].name.as_str(),
+                found[0].description.as_str()
+            ),
+            ("project", "Two coils", "Coils sharing A2")
+        );
+        // Inserting lands where the group was drawn, with new tags, and the wire loses its number.
+        let inserted = o.insert_macro(page, &path).unwrap();
+        assert_eq!(inserted.len(), 3);
+        let p = &o.project.pages[page];
+        let tags: BTreeSet<_> = p.symbols.iter().map(|s| s.tag.clone().unwrap()).collect();
+        assert_eq!(tags.len(), 4);
+        assert_eq!(p.symbols[2].at, p.symbols[0].at);
+        assert_eq!(p.wires.last().unwrap().number, None);
+        // A broken file is listed with its error instead of hiding the others.
+        std::fs::write(path.with_file_name("broken.json"), "{").unwrap();
+        let found = o.macros();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|m| m.error.is_some()));
     }
 
     #[test]
