@@ -313,8 +313,12 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
 #[test]
 fn underlay_pictures_go_under_the_page_on_their_own_layer() {
     let mut png = Vec::new();
-    let img = image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(2, 2, vec![0, 255, 255, 0]).unwrap_or_default());
-    assert!(img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).is_ok());
+    let img =
+        image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(2, 2, vec![0, 255, 255, 0]).unwrap_or_default());
+    assert!(
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+    );
     let mut project = Project::new("x");
     let mut p1 = Page::new("p1", "1", "Scanned");
     p1.underlay = Some(wc_core::Underlay {
