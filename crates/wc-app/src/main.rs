@@ -329,6 +329,7 @@ impl App {
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
             Action::ExportDrawings => self.dialog = Some(Dialog::Message(export_drawings(open))),
+            Action::ExportAml => self.dialog = Some(Dialog::Message(export_aml(open))),
             Action::Reports => self.dialog = Some(Dialog::Reports(wc_report::Kind::Parts)),
             Action::Check => {
                 let found = run_check(open);
@@ -1110,6 +1111,45 @@ fn export_pdf(open: &Open) -> String {
             if !report.warnings.is_empty() {
                 m.push_str("\n\nWarnings:\n");
                 m.push_str(&report.warnings.join("\n"));
+            }
+            m
+        }
+        Err(e) => format!("Export failed: {e}"),
+    }
+}
+
+/// Devices and connections as AutomationML in `export/<project>.aml`.
+fn export_aml(open: &Open) -> String {
+    let name: String = open
+        .project
+        .meta
+        .name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    let dir = open.dir.join("export");
+    let path = dir.join(format!("{}.aml", if name.is_empty() { "project" } else { &name }));
+    let inputs = wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    };
+    // A fixed time stamp keeps repeated exports of the same project identical, so they diff
+    // cleanly in git.
+    let (text, counts) = wc_report::automationml(&inputs, "");
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, text)) {
+        Ok(()) => {
+            let mut m = format!(
+                "Exported {} devices and {} connections to\n{}",
+                counts.devices,
+                counts.links,
+                path.display()
+            );
+            if counts.untagged_pins > 0 {
+                m.push_str(&format!(
+                    "\n\n{} connected pin(s) on symbols without a tag were left out.",
+                    counts.untagged_pins
+                ));
             }
             m
         }
