@@ -574,4 +574,103 @@ mod tests {
         assert!(parse("<html/>").is_err());
         assert!(parse("<CAEXFile><InternalElement>").is_ok());
     }
+
+    #[test]
+    fn reads_back_its_own_export() -> Result<()> {
+        // Export a small project with the report crate's AutomationML writer and import it:
+        // devices, part data and connections survive the trip.
+        let sym = |id: &str, pins: &[&str]| Symbol {
+            id: id.into(),
+            name: id.into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role: SymbolRole::Standalone,
+            graphics: vec![],
+            pins: pins
+                .iter()
+                .map(|p| Pin {
+                    name: (*p).into(),
+                    at: Point::default(),
+                    dir: PinDir::Down,
+                })
+                .collect(),
+            tag_at: Point::default(),
+            description: String::new(),
+        };
+        let tag = |t: &str| DeviceTag::parse(t).map_err(|_| Error::Format(t.into()));
+        let mut project = wc_core::Project::new("Round & trip");
+        let mut page = Page::new("p1", "1", "Control");
+        for (id, s, t) in [("s1", "relay", "=A-K1"), ("s2", "lamp", "=A-P1")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: s.into(),
+                at: Point::default(),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag(t)?),
+            });
+        }
+        let end = |item: &str, pin: &str| Endpoint::Pin {
+            item: item.into(),
+            pin: pin.into(),
+        };
+        page.wires.push(Wire {
+            id: "w1".into(),
+            from: end("s1", "14"),
+            to: end("s2", "X1"),
+            via: vec![],
+            number: None,
+            potential: Some("L+".into()),
+            cable: None,
+        });
+        project.pages.push(page);
+        let part = wc_core::Part {
+            id: "acme.r24".into(),
+            manufacturer: "Acme".into(),
+            order_number: "R-24".into(),
+            ..Default::default()
+        };
+        project.devices.insert(
+            tag("=A-K1")?,
+            Device {
+                part: Some(part.id.clone()),
+                description: "Pump relay".into(),
+                properties: BTreeMap::new(),
+            },
+        );
+        let symbols: BTreeMap<String, Symbol> = [sym("relay", &["13", "14"]), sym("lamp", &["X1", "X2"])]
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+        let parts = [(part.id.clone(), part)].into_iter().collect();
+        let (xml, _) = wc_report::automationml(
+            &wc_report::Inputs {
+                project: &project,
+                symbols: &symbols,
+                parts: &parts,
+            },
+            "",
+        );
+        let imp = parse(&xml)?;
+        let k1_tag = tag("=A-K1")?;
+        let k1 = imp.devices.iter().find(|d| d.tag.as_ref() == Some(&k1_tag));
+        let k1 = k1.ok_or_else(|| Error::Format(xml.clone()))?;
+        assert_eq!(k1.interfaces, ["13", "14"]);
+        let mut parts_out = Vec::new();
+        let (_, dev) = device_entry(k1, &mut parts_out).ok_or_else(|| Error::Format("no device".into()))?;
+        assert_eq!(dev.description, "Pump relay");
+        assert_eq!(
+            (parts_out[0].manufacturer.as_str(), parts_out[0].order_number.as_str()),
+            ("Acme", "R-24")
+        );
+        assert_eq!(imp.links.len(), 1);
+        let l = &imp.links[0];
+        assert_eq!(l.name, "L+");
+        let ends = [
+            (imp.devices[l.a.0].name.as_str(), l.a.1.as_str()),
+            (imp.devices[l.b.0].name.as_str(), l.b.1.as_str()),
+        ];
+        assert_eq!(ends, [("=A-K1", "14"), ("=A-P1", "X1")]);
+        Ok(())
+    }
 }

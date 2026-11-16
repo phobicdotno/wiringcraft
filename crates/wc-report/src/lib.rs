@@ -11,10 +11,12 @@ use wc_core::connectivity::{self, PinRef};
 use wc_core::symbol::SymbolRole;
 use wc_core::{DeviceTag, Endpoint, Part, Project, Symbol};
 
+pub mod aml;
 pub mod check;
 #[cfg(test)]
 mod tests;
 
+pub use aml::{AmlCounts, automationml};
 pub use check::{Finding, Severity, check, check_table};
 
 /// A finished report: a title, column headings and rows of text.

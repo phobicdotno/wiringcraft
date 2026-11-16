@@ -288,6 +288,46 @@ fn project_check_finds_the_usual_mistakes() {
 }
 
 #[test]
+fn automationml_has_devices_pins_and_one_link_per_join() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    p.pages[0].symbols.push(place("s10", "lamp", 220.0, None));
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s6", "X2"), pin("s10", "X1"), None, None));
+    p.devices
+        .get_mut(&DeviceTag::parse("=A+C1-K1").unwrap())
+        .unwrap()
+        .properties = [("Coil <voltage>".to_string(), "24 V & more".to_string())]
+        .into_iter()
+        .collect();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z");
+    // K1, -P1, -X1.1, -X1.2, -X2; not the interruption point.
+    assert_eq!(counts.devices, 5, "{xml}");
+    assert!(!xml.contains("-L1"));
+    // w2, w3, w4 each join two device pins; w1 has one, w5 ends on an untagged lamp.
+    assert_eq!(counts.links, 3);
+    assert_eq!(counts.untagged_pins, 1);
+    assert!(xml.contains("<InternalLink Name=\"0V\""));
+    assert!(xml.contains("<Value>R-24, DC</Value>") && xml.contains("<Value>Acme</Value>"));
+    assert!(xml.contains("Name=\"Coil &lt;voltage&gt;\"") && xml.contains("<Value>24 V &amp; more</Value>"));
+    assert!(xml.contains("LastWritingDateTime=\"2026-11-16T22:00:00Z\""));
+    // The coil and the contact are one device with all four connection points.
+    let k1 = xml.split("<InternalElement Name=\"=A+C1-K1\"").nth(1).unwrap();
+    let k1 = k1.split("</InternalElement>").next().unwrap();
+    assert_eq!(k1.matches("<ExternalInterface").count(), 4);
+    // The same project gives the same file.
+    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z").0, xml);
+}
+
+#[test]
 fn plc_io_list_and_contents() {
     let (mut p, mut s, parts) = fixture();
     let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
