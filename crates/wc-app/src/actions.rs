@@ -43,6 +43,7 @@ pub enum Action {
     NewBranch,
     History,
     ToggleChrome,
+    ToggleTheme,
 }
 
 pub struct Info {
@@ -169,6 +170,12 @@ impl Action {
                 Icon::Layout,
                 "",
             ),
+            Action::ToggleTheme => i(
+                "Dark mode",
+                "Switch between the light and dark interface",
+                Icon::Theme,
+                "",
+            ),
         }
     }
 }
@@ -270,5 +277,5 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
         "Versions",
         &[("Versions", &[Action::Commit, Action::NewBranch, Action::History])],
     ),
-    ("View", &[("Layout", &[Action::ToggleChrome])]),
+    ("View", &[("Appearance", &[Action::ToggleChrome, Action::ToggleTheme])]),
 ];

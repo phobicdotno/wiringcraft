@@ -17,6 +17,8 @@ pub enum Chrome {
 #[serde(default)]
 pub struct Prefs {
     pub chrome: Chrome,
+    /// Light or dark interface.
+    pub theme: crate::theme::Mode,
     pub show_grid: bool,
     /// Snap step in mm.
     pub snap: f64,
@@ -27,6 +29,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             chrome: Chrome::Classic,
+            theme: crate::theme::Mode::Light,
             show_grid: true,
             snap: 2.5,
             recent: Vec::new(),

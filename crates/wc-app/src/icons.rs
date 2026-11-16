@@ -41,16 +41,20 @@ pub enum Icon {
     Branch,
     History,
     Layout,
+    Theme,
 }
 
-/// Draw `icon` inside `rect` (a square) with colour `c`.
-pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
+/// Draw `icon` inside `rect` (a square) with colour `c`; `accent` picks out the part that says
+/// what the command does (the plus of "add", the ends of a wire, the tick of a check).
+pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
     let s = rect.width() / 24.0;
     let o = rect.min;
     let at = |x: f32, y: f32| -> Pos2 { pos2(o.x + x * s, o.y + y * s) };
     let st = Stroke::new(1.6 * s, c);
     let thin = Stroke::new(1.1 * s, c);
+    let ast = Stroke::new(1.9 * s, accent);
     let line = |a: (f32, f32), b: (f32, f32)| p.line_segment([at(a.0, a.1), at(b.0, b.1)], st);
+    let aline = |a: (f32, f32), b: (f32, f32)| p.line_segment([at(a.0, a.1), at(b.0, b.1)], ast);
     let poly = |pts: &[(f32, f32)], closed: bool| {
         let v: Vec<Pos2> = pts.iter().map(|(x, y)| at(*x, *y)).collect();
         p.add(if closed {
@@ -125,13 +129,13 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             line((12.0, 2.0), (12.0, 8.0));
             line((12.0, 16.0), (12.0, 22.0));
             line((12.0, 16.0), (7.0, 8.5));
-            p.circle_filled(at(12.0, 8.0), 1.4 * s, c);
-            p.circle_filled(at(12.0, 16.0), 1.4 * s, c);
+            p.circle_filled(at(12.0, 8.0), 1.6 * s, accent);
+            p.circle_filled(at(12.0, 16.0), 1.6 * s, accent);
         }
         Icon::Wire => {
             poly(&[(3.0, 18.0), (10.0, 18.0), (10.0, 6.0), (21.0, 6.0)], false);
-            p.circle_filled(at(3.0, 18.0), 2.0 * s, c);
-            p.circle_filled(at(21.0, 6.0), 2.0 * s, c);
+            p.circle_filled(at(3.0, 18.0), 2.3 * s, accent);
+            p.circle_filled(at(21.0, 6.0), 2.3 * s, accent);
         }
         Icon::Delete => {
             poly(&[(6.0, 7.0), (7.5, 21.0), (16.5, 21.0), (18.0, 7.0)], false);
@@ -146,12 +150,12 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
         }
         Icon::PageAdd => {
             poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
-            line((12.0, 10.0), (12.0, 18.0));
-            line((8.0, 14.0), (16.0, 14.0));
+            aline((12.0, 10.0), (12.0, 18.0));
+            aline((8.0, 14.0), (16.0, 14.0));
         }
         Icon::Check => {
             arc(12.0, 12.0, 8.5, 0.0, 360.0);
-            poly(&[(8.0, 12.5), (11.0, 15.5), (16.5, 9.0)], false);
+            p.add(Shape::line(vec![at(8.0, 12.5), at(11.0, 15.5), at(16.5, 9.0)], ast));
         }
         Icon::Reports => {
             p.rect_stroke(
@@ -261,23 +265,23 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
         }
         Icon::PageDelete => {
             poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
-            line((9.0, 11.0), (15.0, 17.0));
-            line((15.0, 11.0), (9.0, 17.0));
+            aline((9.0, 11.0), (15.0, 17.0));
+            aline((15.0, 11.0), (9.0, 17.0));
         }
         Icon::NewProject => {
             poly(&[(2.5, 6.0), (2.5, 19.0), (15.0, 19.0)], false);
             poly(&[(2.5, 6.0), (8.0, 6.0), (10.0, 8.0), (17.0, 8.0), (17.0, 11.0)], false);
-            line((19.0, 13.0), (19.0, 21.0));
-            line((15.0, 17.0), (23.0, 17.0));
+            aline((19.0, 13.0), (19.0, 21.0));
+            aline((15.0, 17.0), (23.0, 17.0));
         }
         Icon::ZoomIn | Icon::ZoomOut | Icon::ZoomFit => {
             arc(10.0, 10.0, 6.5, 0.0, 360.0);
             line((15.0, 15.0), (21.0, 21.0));
             if icon != Icon::ZoomFit {
-                line((7.0, 10.0), (13.0, 10.0));
+                aline((7.0, 10.0), (13.0, 10.0));
             }
             if icon == Icon::ZoomIn {
-                line((10.0, 7.0), (10.0, 13.0));
+                aline((10.0, 7.0), (10.0, 13.0));
             }
             if icon == Icon::ZoomFit {
                 p.rect_stroke(
@@ -313,12 +317,12 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
         Icon::Update => {
             arc(12.0, 12.0, 7.0, 200.0, 340.0);
             arc(12.0, 12.0, 7.0, 20.0, 160.0);
-            poly(&[(17.5, 3.5), (18.6, 7.6), (14.6, 8.4)], false);
-            poly(&[(6.5, 20.5), (5.4, 16.4), (9.4, 15.6)], false);
+            p.add(Shape::line(vec![at(17.5, 3.5), at(18.6, 7.6), at(14.6, 8.4)], ast));
+            p.add(Shape::line(vec![at(6.5, 20.5), at(5.4, 16.4), at(9.4, 15.6)], ast));
         }
         Icon::Pdf => {
             poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
-            poly(&[(14.0, 3.0), (14.0, 8.0), (19.0, 8.0)], false);
+            p.add(Shape::line(vec![at(14.0, 3.0), at(14.0, 8.0), at(19.0, 8.0)], ast));
             line((8.0, 12.0), (16.0, 12.0));
             line((8.0, 15.0), (16.0, 15.0));
             line((8.0, 18.0), (13.0, 18.0));
@@ -326,19 +330,19 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
         Icon::Commit => {
             line((2.0, 12.0), (8.0, 12.0));
             line((16.0, 12.0), (22.0, 12.0));
-            arc(12.0, 12.0, 4.0, 0.0, 360.0);
+            p.circle_stroke(at(12.0, 12.0), 4.0 * s, ast);
         }
         Icon::Branch => {
             // Two subway lines splitting.
             line((6.0, 3.0), (6.0, 21.0));
             poly(&[(6.0, 8.0), (11.0, 13.0), (17.0, 13.0), (17.0, 21.0)], false);
-            p.circle_filled(at(6.0, 4.0), 2.0 * s, c);
-            p.circle_filled(at(17.0, 20.0), 2.0 * s, c);
+            p.circle_filled(at(6.0, 4.0), 2.3 * s, c);
+            p.circle_filled(at(17.0, 20.0), 2.3 * s, accent);
         }
         Icon::History => {
             arc(12.0, 12.0, 8.5, 0.0, 360.0);
-            line((12.0, 7.0), (12.0, 12.0));
-            line((12.0, 12.0), (15.5, 14.5));
+            aline((12.0, 7.0), (12.0, 12.0));
+            aline((12.0, 12.0), (15.5, 14.5));
         }
         Icon::Layout => {
             p.rect_stroke(
@@ -349,6 +353,17 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             );
             line((3.0, 9.0), (21.0, 9.0));
             line((8.0, 9.0), (8.0, 20.0));
+        }
+        Icon::Theme => {
+            // Half-filled disc: light on one side, dark on the other.
+            p.circle_stroke(at(12.0, 12.0), 8.0 * s, st);
+            let half: Vec<Pos2> = (0..=16)
+                .map(|i| {
+                    let t = (-90.0 + 180.0 * i as f32 / 16.0_f32).to_radians();
+                    at(12.0 + 8.0 * t.cos(), 12.0 + 8.0 * t.sin())
+                })
+                .collect();
+            p.add(Shape::convex_polygon(half, accent, Stroke::NONE));
         }
     }
     let _ = vec2;

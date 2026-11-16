@@ -33,15 +33,119 @@ pub struct PanelState {
     tag_error: Option<String>,
 }
 
+/// A panel section title: small capitals in the muted colour, with an optional count on the
+/// right.
+pub fn section(ui: &mut egui::Ui, title: &str, count: Option<usize>) {
+    let t = Theme::of(ui.ctx());
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(title.to_uppercase())
+                .font(crate::theme::strong(10.5))
+                .extra_letter_spacing(0.8)
+                .color(t.muted),
+        );
+        if let Some(n) = count {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(4.0);
+                badge(ui, &n.to_string(), &t);
+            });
+        }
+    });
+    ui.add_space(2.0);
+}
+
+/// A sub-heading inside the properties panel.
+fn subsection(ui: &mut egui::Ui, title: &str) {
+    let t = Theme::of(ui.ctx());
+    ui.add_space(8.0);
+    ui.label(RichText::new(title).font(crate::theme::strong(12.0)).color(t.text));
+}
+
+/// A small rounded count.
+fn badge(ui: &mut egui::Ui, text: &str, t: &Theme) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), egui::FontId::proportional(10.5), t.muted);
+    let size = egui::vec2((galley.size().x + 10.0).max(18.0), 16.0);
+    let (r, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(r, 8.0, t.hover);
+    ui.painter().galley(r.center() - galley.size() / 2.0, galley, t.muted);
+}
+
+/// What sits at the start of a list row.
+pub enum Lead<'a> {
+    /// A page number in a small box.
+    Number(&'a str),
+    /// A coloured dot.
+    Dot(egui::Color32),
+}
+
+/// A full-width list row with hover and selection states. Returns the click response.
+pub fn row(ui: &mut egui::Ui, selected: bool, lead: Lead, text: RichText, mono: bool) -> egui::Response {
+    let t = Theme::of(ui.ctx());
+    let w = ui.available_width();
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(r, 6.0, t.accent_soft);
+        p.rect_filled(
+            egui::Rect::from_min_size(r.min + egui::vec2(0.0, 6.0), egui::vec2(3.0, r.height() - 12.0)),
+            1.5,
+            t.accent,
+        );
+    } else if resp.hovered() {
+        p.rect_filled(r, 6.0, t.hover);
+    }
+    let mut x = r.left() + 10.0;
+    match lead {
+        Lead::Number(n) => {
+            let g = p.layout_no_wrap(n.to_string(), egui::FontId::monospace(11.0), t.muted);
+            let bw = (g.size().x + 10.0).max(24.0);
+            let b = egui::Rect::from_min_size(egui::pos2(x, r.center().y - 9.0), egui::vec2(bw, 18.0));
+            let (fill, fg) = if selected {
+                (t.accent, egui::Color32::WHITE)
+            } else {
+                (t.hover, t.muted)
+            };
+            p.rect_filled(b, 4.0, fill);
+            let g = p.layout_no_wrap(n.to_string(), egui::FontId::monospace(11.0), fg);
+            p.galley(b.center() - g.size() / 2.0, g, fg);
+            x = b.right() + 8.0;
+        }
+        Lead::Dot(c) => {
+            p.circle_filled(egui::pos2(x + 3.0, r.center().y), 3.0, c);
+            x += 14.0;
+        }
+    }
+    let color = if selected { t.text } else { t.text.gamma_multiply(0.92) };
+    let text = if mono { text.monospace() } else { text };
+    let galley = egui::WidgetText::from(text.color(color)).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        r.right() - x - 6.0,
+        egui::TextStyle::Body,
+    );
+    ui.painter()
+        .galley(egui::pos2(x, r.center().y - galley.size().y / 2.0), galley, color);
+    resp
+}
+
 pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<Action>) {
-    ui.heading("Pages");
+    section(ui, "Pages", Some(open.project.pages.len()));
     egui::ScrollArea::vertical()
         .id_salt("pages")
         .max_height(ui.available_height() * 0.5)
         .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
             for (i, p) in open.project.pages.iter().enumerate() {
-                let label = format!("{:>3}  {}", p.number, p.title);
-                let r = ui.selectable_label(ed.page == i, RichText::new(label).monospace());
+                let r = row(
+                    ui,
+                    ed.page == i,
+                    Lead::Number(&p.number),
+                    RichText::new(&p.title),
+                    false,
+                );
                 let pick = |ed: &mut Editor| {
                     if ed.page != i {
                         ed.page = i;
@@ -79,18 +183,27 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
                 });
             }
         });
+    ui.add_space(6.0);
     ui.separator();
-    ui.heading("Devices");
+    let index = open.project.tag_index();
+    section(ui, "Devices", Some(index.len()));
+    let t = Theme::of(ui.ctx());
     egui::ScrollArea::vertical().id_salt("devices").show(ui, |ui| {
-        for (tag, uses) in open.project.tag_index() {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        for (tag, uses) in index {
             let pages: Vec<String> = uses
                 .iter()
                 .filter_map(|(page_id, _)| open.project.page(page_id).map(|p| p.number.clone()))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let r = ui
-                .selectable_label(false, RichText::new(tag.to_string()).monospace())
+            let selected = ed.selection.iter().any(|sel| match sel {
+                Selection::Symbol(id) => uses.iter().any(|(_, item)| item == id),
+                _ => false,
+            }) && uses
+                .iter()
+                .any(|(pid, _)| open.project.pages.get(ed.page).is_some_and(|p| &p.id == pid));
+            let r = row(ui, selected, Lead::Dot(t.muted), RichText::new(tag.to_string()), true)
                 .on_hover_text(format!("On page {}", pages.join(", ")));
             if r.clicked()
                 && let Some((page_id, item)) = uses.first()
@@ -105,13 +218,21 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
 }
 
 pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelState) {
-    ui.heading("Symbols");
-    ui.add(egui::TextEdit::singleline(&mut ps.search).hint_text("Search symbols"));
+    section(ui, "Symbols", Some(open.library.len()));
+    ui.add(
+        egui::TextEdit::singleline(&mut ps.search)
+            .hint_text("🔍  Search symbols")
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin::symmetric(8, 5)),
+    );
+    ui.add_space(2.0);
     let q = ps.search.to_lowercase();
     egui::ScrollArea::vertical()
         .id_salt("library")
         .max_height(ui.available_height() * 0.45)
         .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let t = Theme::of(ui.ctx());
             for (id, name) in &open.library {
                 if !q.is_empty() && !id.to_lowercase().contains(&q) && !name.to_lowercase().contains(&q) {
                     continue;
@@ -119,13 +240,14 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
                 let picked = ed.place_symbol.as_deref() == Some(id.as_str()) && ed.tool == Tool::Place;
                 let vendored = open.symbols.contains_key(id);
                 let text = RichText::new(name);
-                let r = ui
-                    .selectable_label(picked, if vendored { text } else { text.italics() })
-                    .on_hover_text(if vendored {
+                let lead = Lead::Dot(if vendored { t.accent } else { t.border });
+                let r = row(ui, picked, lead, if vendored { text } else { text.italics() }, false).on_hover_text(
+                    if vendored {
                         format!("{id}\nIn this project")
                     } else {
                         format!("{id}\nFrom the library; copied into the project when placed")
-                    });
+                    },
+                );
                 if r.clicked() {
                     ed.place_symbol = Some(id.clone());
                     ed.tool = Tool::Place;
@@ -181,7 +303,7 @@ fn committed(r: &egui::Response) -> bool {
 
 pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState) {
     let t = Theme::of(ui.ctx());
-    ui.heading("Properties");
+    section(ui, "Properties", None);
     load_buffers(open, ed, ps);
     let page_idx = ed.page;
     if ed.selection.len() > 1 {
@@ -292,7 +414,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
             }
             if let Some(sym) = open.symbols.get(&placed.symbol) {
                 ui.add_space(6.0);
-                ui.label(RichText::new("Pins").strong());
+                subsection(ui, "Pins");
                 let names: Vec<&str> = sym.pins.iter().map(|p| p.name.as_str()).collect();
                 ui.label(names.join("  "));
             }
@@ -471,8 +593,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
 
 /// Part and own properties of the selected symbol's device.
 fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: &DeviceTag, t: &Theme) {
-    ui.add_space(6.0);
-    ui.label(RichText::new("Part").strong());
+    subsection(ui, "Part");
     let current = open.project.devices.get(tag).and_then(|d| d.part.clone());
     let label = current
         .as_ref()
@@ -541,8 +662,7 @@ fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: 
         }
     }
 
-    ui.add_space(6.0);
-    ui.label(RichText::new("Device properties").strong());
+    subsection(ui, "Device properties");
     egui::Grid::new("dev-props")
         .num_columns(2)
         .spacing([8.0, 4.0])
@@ -592,7 +712,19 @@ fn rotation_label(r: Rotation) -> &'static str {
 
 pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
     let t = Theme::of(ui.ctx());
+    let sep = |ui: &mut egui::Ui| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, 14.0), egui::Sense::hover());
+        ui.painter().line_segment(
+            [r.center_top(), r.center_bottom()],
+            egui::Stroke::new(1.0_f32, t.border),
+        );
+    };
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        if open.is_none() {
+            ui.label(RichText::new("No project open").color(t.muted));
+            return;
+        }
         let tool = match ed.tool {
             Tool::Select => "Select",
             Tool::Place => "Place symbol",
@@ -601,24 +733,40 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
             Tool::Line => "Line",
             Tool::Rect => "Rectangle",
         };
-        ui.label(RichText::new(tool).strong());
-        ui.separator();
-        match ed.cursor {
-            Some(c) => ui.label(RichText::new(format!("X {:>6.1}  Y {:>6.1} mm", c.x, c.y)).monospace()),
-            None => ui.label(RichText::new("X      –  Y      – mm").monospace()),
+        // The current tool as an accent pill.
+        let g = ui
+            .painter()
+            .layout_no_wrap(tool.to_string(), crate::theme::strong(11.5), t.accent);
+        let (r, _) = ui.allocate_exact_size(egui::vec2(g.size().x + 16.0, 18.0), egui::Sense::hover());
+        ui.painter().rect_filled(r, 9.0, t.accent_soft);
+        ui.painter().galley(r.center() - g.size() / 2.0, g, t.accent);
+        sep(ui);
+        let coords = match ed.cursor {
+            Some(c) => format!("X {:>6.1}   Y {:>6.1}  mm", c.x, c.y),
+            None => "X      –   Y      –  mm".to_string(),
         };
-        ui.separator();
-        ui.label(format!("{:.0} %", ed.view.zoom / 3.78 * 100.0));
-        ui.separator();
-        ui.label(RichText::new(&ed.message).color(t.faint));
+        ui.label(RichText::new(coords).monospace().color(t.muted));
+        sep(ui);
+        ui.label(RichText::new(format!("{:.0} %", ed.view.zoom / 3.78 * 100.0)).color(t.muted));
+        sep(ui);
+        ui.label(RichText::new(&ed.message).color(t.muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(o) = open {
-                if o.dirty {
-                    ui.label(RichText::new("unsaved changes").color(t.selection));
-                }
                 if !o.branch.is_empty() {
-                    ui.label(format!("branch {}", o.branch));
-                    ui.separator();
+                    ui.label(RichText::new(&o.branch).monospace().color(t.text));
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    crate::icons::paint(ui.painter(), r, crate::icons::Icon::Branch, t.muted, t.accent);
+                }
+                if o.dirty {
+                    sep(ui);
+                    ui.label(RichText::new("Unsaved changes").color(t.warning));
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 3.5, t.warning);
+                } else {
+                    sep(ui);
+                    ui.label(RichText::new("Saved").color(t.muted));
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 3.5, t.success);
                 }
             }
         });

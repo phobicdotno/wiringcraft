@@ -305,6 +305,19 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     let painter = ui.painter_at(rect);
     let t = theme::Theme::of(ui.ctx());
     painter.rect_filled(rect, 0.0, t.backdrop);
+    // A faint dot texture on the desk around the sheet, fixed to the screen.
+    {
+        let step = 18.0;
+        let mut y = rect.top() + step / 2.0;
+        while y < rect.bottom() {
+            let mut x = rect.left() + step / 2.0;
+            while x < rect.right() {
+                painter.circle_filled(Pos2::new(x, y), 0.9, t.backdrop_dot);
+                x += step;
+            }
+            y += step;
+        }
+    }
 
     let Some(page) = open.project.pages.get(ed.page).cloned() else {
         painter.text(
@@ -319,13 +332,13 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     let (pw, ph) = page.size.mm();
 
     if ed.view.fit {
-        let z = ((rect.width() - 40.0) / pw as f32)
-            .min((rect.height() - 40.0) / ph as f32)
+        let z = ((rect.width() - 64.0) / pw as f32)
+            .min((rect.height() - 72.0) / ph as f32)
             .max(0.2);
         ed.view.zoom = z;
         ed.view.offset = Vec2::new(
             (rect.width() - pw as f32 * z) / 2.0,
-            (rect.height() - ph as f32 * z) / 2.0,
+            (rect.height() - ph as f32 * z) / 2.0 + 6.0,
         );
         ed.view.fit = false;
     }
@@ -352,17 +365,58 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         zoom: ed.view.zoom,
     };
     let paper = Rect::from_two_pos(xf.s(Point::new(0.0, 0.0)), xf.s(Point::new(pw, ph)));
-    painter.rect_filled(paper.translate(Vec2::new(3.0, 3.0)), 0.0, t.shadow);
-    painter.rect_filled(paper, 0.0, t.paper);
+    // The sheet: a soft drop shadow, the paper, and a hairline edge.
+    painter.add(
+        egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 24,
+            spread: 0,
+            color: t.shadow,
+        }
+        .as_shape(paper, 2.0),
+    );
+    painter.rect_filled(paper, 2.0, t.paper);
+    painter.rect_stroke(
+        paper,
+        2.0,
+        Stroke::new(1.0_f32, t.shadow.gamma_multiply(0.5)),
+        egui::StrokeKind::Outside,
+    );
+    // Page caption above the sheet.
+    if paper.top() - rect.top() > 22.0 {
+        painter.text(
+            paper.left_top() + Vec2::new(0.0, -8.0),
+            Align2::LEFT_BOTTOM,
+            format!("Page {}  ·  {}", page.number, page.title),
+            theme::strong(12.0),
+            t.muted,
+        );
+    }
 
     if show_grid {
+        // Minor dots on the snap-sized grid, with a small cross every 50 mm. Only the part of
+        // the sheet that is on screen is drawn.
         let step = if xf.len(5.0) >= 8.0 { 5.0 } else { 10.0 };
         if xf.len(step) >= 6.0 {
-            let mut y = step;
-            while y < ph {
-                let mut x = step;
-                while x < pw {
-                    painter.circle_filled(xf.s(Point::new(x, y)), 0.7, t.grid);
+            let vis = paper.intersect(rect);
+            let lo = xf.mm(vis.min);
+            let hi = xf.mm(vis.max);
+            let first = |v: f64| ((v / step).floor().max(1.0)) * step;
+            let r = (xf.len(0.35)).clamp(0.6, 1.1);
+            let arm = xf.len(1.2).clamp(2.5, 5.0);
+            let mut y = first(lo.y.min(hi.y));
+            while y < ph && y <= lo.y.max(hi.y) {
+                let mut x = first(lo.x);
+                while x < pw && x <= hi.x {
+                    let at = xf.s(Point::new(x, y));
+                    let major = (x % 50.0).abs() < 1e-6 && (y % 50.0).abs() < 1e-6;
+                    if major {
+                        let st = Stroke::new(1.0_f32, t.grid_major);
+                        painter.line_segment([at - Vec2::new(arm, 0.0), at + Vec2::new(arm, 0.0)], st);
+                        painter.line_segment([at - Vec2::new(0.0, arm), at + Vec2::new(0.0, arm)], st);
+                    } else {
+                        painter.circle_filled(at, r, t.grid);
+                    }
                     x += step;
                 }
                 y += step;
