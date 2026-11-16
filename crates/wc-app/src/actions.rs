@@ -37,6 +37,7 @@ pub enum Action {
     LibraryStatus,
     LibraryUpdate,
     ExportPdf,
+    Reports,
     Commit,
     NewBranch,
     History,
@@ -145,7 +146,13 @@ impl Action {
                 "",
             ),
             Action::LibraryUpdate => i("Update", "Take the newer library versions", Icon::Update, ""),
-            Action::ExportPdf => i("PDF", "Export all pages to PDF", Icon::Pdf, "Ctrl+P"),
+            Action::ExportPdf => i("PDF", "Export all pages and the reports to PDF", Icon::Pdf, "Ctrl+P"),
+            Action::Reports => i(
+                "Reports",
+                "Parts, devices, wires, nets, terminals and cables as tables",
+                Icon::Reports,
+                "Ctrl+R",
+            ),
             Action::Commit => i("Commit", "Record a version of the project", Icon::Commit, "Ctrl+K"),
             Action::NewBranch => i("Branch", "Start a branch from this version", Icon::Branch, ""),
             Action::History => i("History", "Show the version history as a subway map", Icon::History, ""),
@@ -182,7 +189,7 @@ pub const TOOLBAR: &[&[Action]] = &[
     &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
     &[Action::LibraryStatus, Action::LibraryUpdate],
     &[Action::Commit, Action::NewBranch, Action::History],
-    &[Action::ExportPdf],
+    &[Action::Reports, Action::ExportPdf],
 ];
 
 /// A named group of ribbon buttons.
@@ -195,7 +202,13 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
         &[
             (
                 "Project",
-                &[Action::NewProject, Action::Open, Action::Save, Action::ExportPdf],
+                &[
+                    Action::NewProject,
+                    Action::Open,
+                    Action::Save,
+                    Action::Reports,
+                    Action::ExportPdf,
+                ],
             ),
             (
                 "Edit",

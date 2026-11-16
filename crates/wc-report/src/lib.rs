@@ -153,8 +153,28 @@ pub fn natural_key(s: &str) -> Vec<(String, u64)> {
 }
 
 /// Every device tag in the project: drawn ones and ones only listed in `devices.json`.
-fn all_tags(p: &Project) -> BTreeSet<DeviceTag> {
-    p.tag_index().into_keys().chain(p.devices.keys().cloned()).collect()
+/// Every real device: tags drawn on pages or listed in the devices file. Interruption points
+/// carry tags too, but they only name a connection, so a tag used by nothing else is left out.
+fn all_tags(i: &Inputs<'_>) -> BTreeSet<DeviceTag> {
+    let p = i.project;
+    let index = p.tag_index();
+    let only_links = |tag: &DeviceTag| {
+        index.get(tag).is_some_and(|uses| {
+            !uses.is_empty()
+                && uses.iter().all(|(page, item)| {
+                    p.page(page)
+                        .and_then(|pg| pg.symbol(item))
+                        .and_then(|s| i.symbols.get(&s.symbol))
+                        .is_some_and(|sym| sym.role == SymbolRole::Interruption)
+                })
+        })
+    };
+    index
+        .keys()
+        .cloned()
+        .chain(p.devices.keys().cloned())
+        .filter(|t| !only_links(t))
+        .collect()
 }
 
 /// Page numbers where a tag is drawn, as `2, 3`.
@@ -177,7 +197,7 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
     );
     let mut by_part: BTreeMap<String, Vec<DeviceTag>> = BTreeMap::new();
     let mut without: Vec<DeviceTag> = Vec::new();
-    for tag in all_tags(i.project) {
+    for tag in all_tags(i) {
         match i.project.devices.get(&tag).and_then(|d| d.part.clone()) {
             Some(part) => by_part.entry(part).or_default().push(tag),
             None => without.push(tag),
@@ -214,7 +234,7 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
 pub fn device_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Device list", &["Device", "Description", "Part", "Symbols", "Pages"]);
     let index = i.project.tag_index();
-    for tag in all_tags(i.project) {
+    for tag in all_tags(i) {
         let dev = i.project.devices.get(&tag);
         let uses = index.get(&tag).map(Vec::as_slice).unwrap_or(&[]);
         let symbols: BTreeSet<String> = uses
