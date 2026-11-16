@@ -533,6 +533,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-vcs"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "wc-core",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

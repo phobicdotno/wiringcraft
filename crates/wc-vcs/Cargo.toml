@@ -1,0 +1,17 @@
+[package]
+name = "wc-vcs"
+description = "WiringCraft project version control: git commits, branches, merges and a subway-map history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wc-core.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
