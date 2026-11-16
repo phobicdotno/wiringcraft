@@ -138,7 +138,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
         match c.to_ascii_uppercase() {
             'M' => {
                 flush(&mut cur, &mut out, false);
-                for (i, p) in v.chunks_exact(2).enumerate() {
+                for (i, p) in v.as_chunks::<2>().0.iter().enumerate() {
                     let (nx, ny) = if rel && i > 0 {
                         (x + p[0], y + p[1])
                     } else {
@@ -154,7 +154,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                 }
             }
             'L' | 'T' => {
-                for p in v.chunks_exact(2) {
+                for p in v.as_chunks::<2>().0 {
                     let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
                     x = bx + p[0];
                     y = by + p[1];
@@ -310,7 +310,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
             }
             "polyline" | "polygon" => {
                 let v = numbers(&attr(&e, "points").unwrap_or_default());
-                let pts: Vec<Point> = v.chunks_exact(2).map(|p| m.p(p[0], p[1])).collect();
+                let pts: Vec<Point> = v.as_chunks::<2>().0.iter().map(|p| m.p(p[0], p[1])).collect();
                 (pts.len() >= 2).then(|| Shape::Polyline {
                     points: pts,
                     closed: tag == "polygon",
