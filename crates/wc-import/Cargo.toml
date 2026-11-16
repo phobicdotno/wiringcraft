@@ -9,6 +9,7 @@ license.workspace = true
 wc-core.workspace = true
 quick-xml.workspace = true
 miniz_oxide.workspace = true
+zip.workspace = true
 thiserror.workspace = true
 
 [lints]

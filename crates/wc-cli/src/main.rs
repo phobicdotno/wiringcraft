@@ -88,6 +88,8 @@ enum Cmd {
     },
     /// List the potentials (connected pins) across all pages.
     Nets,
+    /// Show what is inside a project archive from another tool (.tewzip, .zw1, .elk, .zip).
+    Inspect { file: PathBuf },
     /// Version control: commit, branches, merge, history.
     #[command(subcommand)]
     Vcs(VcsCmd),
@@ -178,6 +180,13 @@ enum ImportCmd {
         file: PathBuf,
         #[arg(long)]
         lib: PathBuf,
+    },
+    /// The open-format parts of another tool's project archive (PDF pages as trace pages,
+    /// DXF drawings as pages, AutomationML devices and connections).
+    Archive {
+        file: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        first_page: usize,
     },
     /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
     /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
@@ -471,6 +480,24 @@ fn run(cli: Cli) -> Res<()> {
             }
         }
         Cmd::Vcs(vc) => vcs_cmd(dir, vc)?,
+        Cmd::Inspect { file } => {
+            let bytes = std::fs::read(&file).map_err(e)?;
+            let r = wc_import::archive::inspect(&bytes).map_err(e)?;
+            println!("container: {}", r.container);
+            let mut last = None;
+            for en in &r.entries {
+                if last != Some(en.kind) {
+                    println!("{}:", en.kind.label());
+                    last = Some(en.kind);
+                }
+                println!("  {:>12}  {}", en.size, en.name);
+            }
+            let importable = r.entries.iter().filter(|x| x.kind.importable()).count();
+            println!(
+                "{importable} of {} entries can be imported with `wiringcraft import archive`",
+                r.entries.len()
+            );
+        }
     }
     Ok(())
 }
@@ -707,6 +734,76 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 "imported {n_dev} devices, {} connections on {n_pages} page(s)",
                 imp.links.len()
             );
+        }
+        ImportCmd::Archive { file, first_page } => {
+            use wc_import::archive::Kind;
+            let bytes = std::fs::read(&file).map_err(e)?;
+            let entries =
+                wc_import::archive::open_entries(&bytes, &[Kind::Pdf, Kind::Dxf, Kind::AutomationMl]).map_err(e)?;
+            if entries.is_empty() {
+                return Err(
+                    "no importable PDF, DXF or AutomationML inside; run `wiringcraft inspect` to see what is there"
+                        .into(),
+                );
+            }
+            let tmp = std::env::temp_dir().join(format!("wiringcraft-archive-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).map_err(e)?;
+            let mut next = first_page;
+            for (i, (name, kind, data)) in entries.into_iter().enumerate() {
+                let ext = match kind {
+                    Kind::Pdf => "pdf",
+                    Kind::Dxf => "dxf",
+                    _ => "aml",
+                };
+                let path = tmp.join(format!("{i}.{ext}"));
+                std::fs::write(&path, &data).map_err(e)?;
+                println!("{name}:");
+                let r = match kind {
+                    Kind::Pdf => {
+                        let n = wc_import::pdf::pages(&data).map(|p| p.len()).unwrap_or(0);
+                        let r = import_cmd(
+                            dir,
+                            ImportCmd::Pdf {
+                                file: path.clone(),
+                                first_page: next,
+                            },
+                        );
+                        next += n.max(1);
+                        r
+                    }
+                    Kind::Dxf => {
+                        let mut p = load(dir)?;
+                        let id = format!("dxf-{next}");
+                        p.pages.push(Page::new(id.clone(), next.to_string(), name.clone()));
+                        p.sort_pages();
+                        save(dir, &p)?;
+                        next += 1;
+                        import_cmd(
+                            dir,
+                            ImportCmd::PageDxf {
+                                file: path.clone(),
+                                page: id,
+                                scale: 1.0,
+                            },
+                        )
+                    }
+                    _ => {
+                        let r = import_cmd(
+                            dir,
+                            ImportCmd::Aml {
+                                file: path.clone(),
+                                first_page: next,
+                            },
+                        );
+                        next += 10;
+                        r
+                    }
+                };
+                if let Err(err) = r {
+                    eprintln!("warning: {name}: {err}");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
         }
         ImportCmd::PageDwg { file, page, scale } => {
             let dxf = dwg_to_dxf(&file)?;

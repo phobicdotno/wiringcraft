@@ -3,6 +3,7 @@
 //! Input is treated as hostile: malformed files produce errors or are skipped, never panics.
 
 pub mod aml;
+pub mod archive;
 pub mod csv;
 pub mod dxf;
 pub mod pdf;
