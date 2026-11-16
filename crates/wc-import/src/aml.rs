@@ -278,117 +278,155 @@ fn safe(s: &str) -> String {
 /// Lay an import out as connection overview pages. `first_page_number` is where page numbering
 /// starts; page ids are `aml-<n>`.
 pub fn build(imp: &AmlImport, first_page_number: usize) -> Built {
+    let all = Section {
+        title: "AutomationML connections".into(),
+        devices: (0..imp.devices.len()).collect(),
+    };
+    layout(imp, &[all], "aml", first_page_number)
+}
+
+/// A group of devices that starts on a new overview page, such as the devices of one page of
+/// the source project.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Section {
+    pub title: String,
+    /// Indexes into the import's devices. A device listed twice is placed once, in its first
+    /// section.
+    pub devices: Vec<usize>,
+}
+
+/// Lay devices and links out as connection overview pages, one or more pages per section.
+/// Symbol ids are `<prefix>.<n>.<name>`, page ids `<prefix>-<n>`, numbered from
+/// `first_page_number`. Devices in no section are left out, with their links.
+pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_number: usize) -> Built {
     let mut built = Built::default();
     // Device symbols: a box with the device name, pins along the bottom.
-    let mut placements: Vec<(usize, Point)> = Vec::new(); // (page index, position) per device
-    let (mut x, mut row, mut page) = (LEFT, 0usize, 0usize);
-    for (i, d) in imp.devices.iter().enumerate() {
-        let n = d.interfaces.len().max(1);
-        let w = (n as f64 + 1.0) * PIN_STEP;
-        let id = format!("aml.{}.{}", i + 1, safe(&d.name));
-        let mut graphics = vec![
-            Shape::Rect {
-                min: Point::new(0.0, -BOX_H),
-                max: Point::new(w, 0.0),
-            },
-            Shape::Text {
-                at: Point::new(w / 2.0, -BOX_H / 2.0 + 1.2),
-                text: d.name.clone(),
-                height: 2.5,
-                align: Align::Center,
-            },
-        ];
-        let mut pins = Vec::new();
-        for (k, iface) in d.interfaces.iter().enumerate() {
-            let px = PIN_STEP * (k as f64 + 1.0);
-            graphics.push(Shape::Line {
-                a: Point::new(px, 0.0),
-                b: Point::new(px, 3.0),
-            });
-            graphics.push(Shape::Text {
-                at: Point::new(px + 0.8, -1.0),
-                text: iface.clone(),
-                height: 1.8,
-                align: Align::Left,
-            });
-            // Duplicate interface names would make pins ambiguous: suffix them.
-            let mut name = iface.clone();
-            while pins.iter().any(|p: &Pin| p.name == name) {
-                name.push('\'');
+    let mut placements: Vec<Option<(usize, Point)>> = vec![None; imp.devices.len()];
+    let mut symbol_of: Vec<Option<usize>> = vec![None; imp.devices.len()];
+    let mut page_titles: Vec<String> = Vec::new();
+    for section in sections {
+        let (mut x, mut row) = (LEFT, 0usize);
+        page_titles.push(section.title.clone());
+        let mut page = page_titles.len() - 1;
+        for &i in &section.devices {
+            let Some(d) = imp.devices.get(i) else { continue };
+            if placements[i].is_some() {
+                continue;
             }
-            pins.push(Pin {
-                name,
-                at: Point::new(px, 3.0),
-                dir: PinDir::Down,
-            });
-        }
-        let description = d.path.join(" / ");
-        built.symbols.push(Symbol {
-            id: id.clone(),
-            name: format!("{} (imported)", d.name),
-            category: "imported".into(),
-            letter_code: d.tag.as_ref().map(|t| t.letter_code()).unwrap_or_default(),
-            role: SymbolRole::Standalone,
-            graphics,
-            pins,
-            tag_at: Point::new(-2.0, -BOX_H / 2.0),
-            description: description.clone(),
-        });
-        if x + w > RIGHT && x > LEFT {
-            x = LEFT;
-            row += 1;
-            if row == ROWS_PER_PAGE {
-                row = 0;
-                page += 1;
-            }
-        }
-        let at = Point::new(x + 18.0, TOP + BOX_H + ROW_H * row as f64);
-        placements.push((page, at));
-        x += w + 30.0;
-        if let Some(tag) = &d.tag {
-            let (manufacturer, order) = part_fields(&d.properties);
-            let part = order.map(|o| {
-                let p = wc_core::Part {
-                    id: wc_core::Part::make_id(manufacturer.as_deref().unwrap_or(""), &o),
-                    manufacturer: manufacturer.unwrap_or_default(),
-                    order_number: o,
-                    description: d.name.clone(),
-                    symbol: None,
-                    properties: d.properties.clone(),
-                };
-                let id = p.id.clone();
-                if !built.parts.iter().any(|q| q.id == id) {
-                    built.parts.push(p);
-                }
-                id
-            });
-            built.devices.insert(
-                tag.clone(),
-                Device {
-                    part,
-                    description: d.name.clone(),
-                    properties: d.properties.clone(),
+            let n = d.interfaces.len().max(1);
+            let w = (n as f64 + 1.0) * PIN_STEP;
+            let id = format!("{prefix}.{}.{}", i + 1, safe(&d.name));
+            let mut graphics = vec![
+                Shape::Rect {
+                    min: Point::new(0.0, -BOX_H),
+                    max: Point::new(w, 0.0),
                 },
-            );
+                Shape::Text {
+                    at: Point::new(w / 2.0, -BOX_H / 2.0 + 1.2),
+                    text: d.name.clone(),
+                    height: 2.5,
+                    align: Align::Center,
+                },
+            ];
+            let mut pins = Vec::new();
+            for (k, iface) in d.interfaces.iter().enumerate() {
+                let px = PIN_STEP * (k as f64 + 1.0);
+                graphics.push(Shape::Line {
+                    a: Point::new(px, 0.0),
+                    b: Point::new(px, 3.0),
+                });
+                graphics.push(Shape::Text {
+                    at: Point::new(px + 0.8, -1.0),
+                    text: iface.clone(),
+                    height: 1.8,
+                    align: Align::Left,
+                });
+                // Duplicate interface names would make pins ambiguous: suffix them.
+                let mut name = iface.clone();
+                while pins.iter().any(|p: &Pin| p.name == name) {
+                    name.push('\'');
+                }
+                pins.push(Pin {
+                    name,
+                    at: Point::new(px, 3.0),
+                    dir: PinDir::Down,
+                });
+            }
+            let description = d.path.join(" / ");
+            built.symbols.push(Symbol {
+                id: id.clone(),
+                name: format!("{} (imported)", d.name),
+                category: "imported".into(),
+                letter_code: d.tag.as_ref().map(|t| t.letter_code()).unwrap_or_default(),
+                role: SymbolRole::Standalone,
+                graphics,
+                pins,
+                tag_at: Point::new(-2.0, -BOX_H / 2.0),
+                description: description.clone(),
+            });
+            symbol_of[i] = Some(built.symbols.len() - 1);
+            if x + w > RIGHT && x > LEFT {
+                x = LEFT;
+                row += 1;
+                if row == ROWS_PER_PAGE {
+                    row = 0;
+                    page_titles.push(format!("{} (continued)", section.title));
+                    page = page_titles.len() - 1;
+                }
+            }
+            let at = Point::new(x + 18.0, TOP + BOX_H + ROW_H * row as f64);
+            placements[i] = Some((page, at));
+            x += w + 30.0;
+            if let Some(tag) = &d.tag {
+                let (manufacturer, order) = part_fields(&d.properties);
+                let part = order.map(|o| {
+                    let p = wc_core::Part {
+                        id: wc_core::Part::make_id(manufacturer.as_deref().unwrap_or(""), &o),
+                        manufacturer: manufacturer.unwrap_or_default(),
+                        order_number: o,
+                        description: d.name.clone(),
+                        symbol: None,
+                        properties: d.properties.clone(),
+                    };
+                    let id = p.id.clone();
+                    if !built.parts.iter().any(|q| q.id == id) {
+                        built.parts.push(p);
+                    }
+                    id
+                });
+                built.devices.insert(
+                    tag.clone(),
+                    Device {
+                        part,
+                        description: d
+                            .properties
+                            .get("Function text")
+                            .cloned()
+                            .unwrap_or_else(|| d.name.clone()),
+                        properties: d.properties.clone(),
+                    },
+                );
+            }
         }
     }
-    let pages = placements.iter().map(|p| p.0 + 1).max().unwrap_or(0);
-    for n in 0..pages {
+    for (n, title) in page_titles.iter().enumerate() {
         let mut p = Page::new(
-            format!("aml-{}", n + 1),
+            format!("{prefix}-{}", n + 1),
             (first_page_number + n).to_string(),
-            "AutomationML connections",
+            title.clone(),
         );
         p.size = wc_core::PageSize::A3;
         built.pages.push(p);
     }
     for (i, d) in imp.devices.iter().enumerate() {
-        let (page, at) = placements[i];
+        let (Some((page, at)), Some(sym)) = (placements[i], symbol_of[i]) else {
+            continue;
+        };
         let item = format!("d{}", i + 1);
         if let Some(pg) = built.pages.get_mut(page) {
             pg.symbols.push(PlacedSymbol {
                 id: item,
-                symbol: built.symbols[i].id.clone(),
+                symbol: built.symbols[sym].id.clone(),
                 at,
                 rotation: Default::default(),
                 mirror: false,
@@ -398,10 +436,13 @@ pub fn build(imp: &AmlImport, first_page_number: usize) -> Built {
     }
     // Wires: down from each pin into a routing channel under the row, across, and up.
     for (k, l) in imp.links.iter().enumerate() {
-        let (pa, ata) = placements[l.a.0];
-        let (pb, atb) = placements[l.b.0];
+        let (Some(Some((pa, ata))), Some(Some((pb, atb)))) = (placements.get(l.a.0), placements.get(l.b.0)) else {
+            continue;
+        };
+        let (pa, ata, pb, atb) = (*pa, *ata, *pb, *atb);
         let pin_name = |dev: usize, iface: &str| {
-            built.symbols[dev]
+            let sym = symbol_of.get(dev).copied().flatten()?;
+            built.symbols[sym]
                 .pins
                 .iter()
                 .find(|p| p.name == iface)
@@ -437,7 +478,7 @@ pub fn build(imp: &AmlImport, first_page_number: usize) -> Built {
             }
         } else {
             // Across pages: each end gets a stub to a named potential.
-            let potential = Some(format!("AML{}", k + 1));
+            let potential = Some(format!("{}{}", prefix.to_uppercase(), k + 1));
             for (page, end, at, local) in [(pa, a, ata, la), (pb, b, atb, lb)] {
                 let p = at + local;
                 if let Some(pg) = built.pages.get_mut(page) {

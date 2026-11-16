@@ -215,6 +215,13 @@ enum ImportCmd {
         #[arg(long, default_value_t = 200)]
         first_page: usize,
     },
+    /// An Eplan Electric P8 project (.elk, its .edb folder, or a zip of the folder): devices,
+    /// parts and connections as overview pages, one section per Eplan page.
+    Eplan {
+        path: PathBuf,
+        #[arg(long, default_value_t = 400)]
+        first_page: usize,
+    },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
     Aml {
         file: PathBuf,
@@ -733,6 +740,37 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             p.sort_pages();
             save(dir, &p)?;
         }
+        ImportCmd::Eplan { path, first_page } => {
+            let mut p = load(dir)?;
+            let tables = eplan_tables(&path)?;
+            let ep = wc_import::eplan::read(&tables).map_err(e)?;
+            let (built, warnings) = wc_import::eplan::build(&ep, first_page);
+            for w in ep.warnings.iter().chain(&warnings) {
+                eprintln!("warning: {w}");
+            }
+            let source = format!(
+                "import:{}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+            // Customer and project description fill empty title block fields.
+            for (id, key) in [(10015u32, "customer"), (10011, "description")] {
+                if let Some((_, _, v)) = ep.properties.iter().find(|(i, _, _)| *i == id)
+                    && !v.is_empty()
+                {
+                    p.meta.title_block.entry(key.to_owned()).or_insert_with(|| v.clone());
+                }
+            }
+            let (n_dev, n_pages) = (built.devices.len(), built.pages.len());
+            add_built(dir, &mut p, built, &source)?;
+            save(dir, &p)?;
+            println!(
+                "imported {} Eplan pages as {n_pages} overview page(s): {n_dev} devices, {} connections",
+                ep.pages.len(),
+                ep.connections.len()
+            );
+        }
         ImportCmd::Aml { file, first_page } => {
             let mut p = load(dir)?;
             let text = std::fs::read(&file).map_err(e)?;
@@ -1059,4 +1097,73 @@ fn plain_table(t: &wc_report::Table) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The tables of an Eplan project given as an .elk file, an .edb folder or a zip of the folder.
+fn eplan_tables(path: &Path) -> Result<wc_import::eplan::Tables, String> {
+    let e = |x: std::io::Error| format!("{}: {x}", path.display());
+    let folder = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        let bytes = std::fs::read(path).map_err(e)?;
+        if bytes.starts_with(b"PK") {
+            return wc_import::eplan::tables_from_zip(&bytes).map_err(|x| x.to_string());
+        }
+        let name = wc_import::eplan::elk_target(&bytes)
+            .ok_or_else(|| format!("{} is not an Eplan .elk file, .edb folder or zip", path.display()))?;
+        path.with_file_name(name)
+    };
+    let mut tables = wc_import::eplan::Tables::new();
+    for entry in std::fs::read_dir(&folder)
+        .map_err(|x| format!("{}: {x}", folder.display()))?
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if wc_import::eplan::wanted(&name)
+            && let Ok(bytes) = std::fs::read(entry.path())
+        {
+            tables.insert(name, bytes);
+        }
+    }
+    Ok(tables)
+}
+
+/// Add imported symbols, parts, pages and devices to a project, pinning symbols and parts in
+/// the lockfile under `source`.
+fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Result<(), String> {
+    let e = |x: wc_core::Error| x.to_string();
+    for s in &built.symbols {
+        store::write_vendored_symbol(dir, s).map_err(e)?;
+        p.lock.symbols.insert(
+            s.id.clone(),
+            wc_core::LockEntry {
+                source: source.to_owned(),
+                hash: s.hash(),
+            },
+        );
+    }
+    for part in &built.parts {
+        store::write_vendored_part(dir, part).map_err(e)?;
+        p.lock.parts.insert(
+            part.id.clone(),
+            wc_core::LockEntry {
+                source: source.to_owned(),
+                hash: part.hash(),
+            },
+        );
+    }
+    for page in built.pages {
+        if p.page(&page.id).is_some() {
+            return Err(format!(
+                "page {} exists; remove it or import into a fresh project",
+                page.id
+            ));
+        }
+        p.pages.push(page);
+    }
+    p.sort_pages();
+    for (t, d) in built.devices {
+        p.devices.insert(t, d);
+    }
+    Ok(())
 }
