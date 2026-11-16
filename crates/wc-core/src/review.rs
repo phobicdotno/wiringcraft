@@ -38,6 +38,22 @@ pub struct Reply {
     pub text: String,
 }
 
+/// Unix seconds as a UTC date and time, `YYYY-MM-DD hh:mm`.
+pub fn utc_date(secs: i64) -> String {
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days.saturating_add(719_468);
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe.saturating_add(era.saturating_mul(400)) + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}", rest / 3600, rest / 60 % 60)
+}
+
 /// Comment text as kept: trimmed, not empty, not overlong.
 fn clean(text: &str) -> Result<String> {
     let t = text.trim();
@@ -183,5 +199,15 @@ mod tests {
         assert_eq!("x".repeat(MAX_TEXT + 10).len(), MAX_TEXT + 10);
         let long = p.add_comment("p1", None, "x", 1, &"x".repeat(MAX_TEXT + 10)).unwrap();
         assert_eq!(p.comment_mut(&long).unwrap().text.chars().count(), MAX_TEXT);
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(utc_date(0), "1970-01-01 00:00");
+        assert_eq!(utc_date(1_794_870_807), "2026-11-16 23:13");
+        assert_eq!(utc_date(951_782_400), "2000-02-29 00:00");
+        // Hostile times never panic.
+        let _ = utc_date(i64::MAX);
+        let _ = utc_date(i64::MIN);
     }
 }

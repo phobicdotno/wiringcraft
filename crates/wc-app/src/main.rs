@@ -57,6 +57,10 @@ enum Dialog {
     Reports(wc_report::Kind),
     /// Write a new text at this point on the current page.
     Text(wc_core::geom::Point, String, bool),
+    /// Pin a review comment at this point on the current page.
+    Comment(wc_core::geom::Point, String, bool),
+    /// The recorded versions of one page, newest first.
+    PageHistory(String, Vec<wc_vcs::PageVersion>),
     Commit(String),
     NewBranch(String),
     History(Vec<wc_vcs::subway::Row>),
@@ -105,6 +109,7 @@ impl chrome::Status for StatusView<'_> {
             Action::PlaceSymbol => self.ed.tool == Tool::Place,
             Action::DrawWire => self.ed.tool == Tool::Wire,
             Action::TextTool => self.ed.tool == Tool::Text,
+            Action::CommentTool => self.ed.tool == Tool::Comment,
             Action::LineTool => self.ed.tool == Tool::Line,
             Action::RectTool => self.ed.tool == Tool::Rect,
             Action::ToggleGrid => self.prefs.show_grid,
@@ -223,9 +228,10 @@ impl App {
                 self.ed.wire = None;
             }
             Action::DrawWire => self.ed.tool = Tool::Wire,
-            Action::TextTool | Action::LineTool | Action::RectTool => {
+            Action::TextTool | Action::LineTool | Action::RectTool | Action::CommentTool => {
                 self.ed.tool = match a {
                     Action::TextTool => Tool::Text,
+                    Action::CommentTool => Tool::Comment,
                     Action::LineTool => Tool::Line,
                     _ => Tool::Rect,
                 };
@@ -233,6 +239,7 @@ impl App {
                 self.ed.shape_start = None;
                 self.ed.message = match a {
                     Action::TextTool => "Click where the text goes.",
+                    Action::CommentTool => "Click where the comment goes.",
                     _ => "Click the first point.",
                 }
                 .into();
@@ -456,6 +463,15 @@ impl App {
                 Ok(rows) => self.dialog = Some(Dialog::History(rows)),
                 Err(e) => self.dialog = Some(Dialog::Message(format!("No history yet:\n{e}"))),
             },
+            Action::PageHistory => {
+                if let Some(pg) = open.project.pages.get(page) {
+                    let (id, number) = (pg.id.clone(), pg.number.clone());
+                    match wc_vcs::page_history(&wc_vcs::Git::new(&open.dir), &id, 100) {
+                        Ok(v) => self.dialog = Some(Dialog::PageHistory(number, v)),
+                        Err(e) => self.dialog = Some(Dialog::Message(format!("No history yet:\n{e}"))),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -506,6 +522,7 @@ impl App {
                 (Key::R, Action::Rotate),
                 (Key::M, Action::Mirror),
                 (Key::T, Action::TextTool),
+                (Key::C, Action::CommentTool),
                 (Key::L, Action::LineTool),
                 (Key::Delete, Action::Delete),
                 (Key::G, Action::ToggleGrid),
@@ -541,6 +558,8 @@ impl App {
             Dialog::PageProps { .. } => "Page properties",
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
+            Dialog::Comment(..) => "Comment",
+            Dialog::PageHistory(..) => "Page history",
             Dialog::Reports(_) => "Reports",
             Dialog::Check(_) => "Project check",
             Dialog::Commit(_) => "Record a version",
@@ -943,6 +962,81 @@ impl App {
                             keep = false;
                         }
                     });
+                }
+                Dialog::Comment(at, text, focused) => {
+                    ui.label(
+                        RichText::new(format!("As {}", state::author_name())).color(theme::Theme::of(ui.ctx()).faint),
+                    );
+                    let r = ui.add(egui::TextEdit::multiline(text).desired_width(360.0).desired_rows(4));
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!text.trim().is_empty(), egui::Button::new("Add comment"))
+                            .clicked()
+                            && let Some(o) = self.open.as_mut()
+                            && let Some(page) = o.project.pages.get(self.ed.page).map(|p| p.id.clone())
+                        {
+                            let mut next = o.project.clone();
+                            match next.add_comment(&page, Some(*at), &state::author_name(), state::now_secs(), text) {
+                                Ok(id) => {
+                                    o.checkpoint();
+                                    o.project = next;
+                                    self.ed.selection.clear();
+                                    self.ed.message = format!("Comment {id} added.");
+                                    self.ed.comment = Some(id);
+                                    self.ed.tool = Tool::Select;
+                                }
+                                Err(err) => self.ed.message = err.to_string(),
+                            }
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::PageHistory(page, versions) => {
+                    let t = theme::Theme::of(ui.ctx());
+                    if versions.is_empty() {
+                        ui.label(format!("Page {page} has no recorded versions yet."));
+                        ui.label(
+                            RichText::new("Record a version (Versions menu) to start its history.").color(t.faint),
+                        );
+                    }
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        for v in versions.iter() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(&v.commit[..v.commit.len().min(8)])
+                                        .monospace()
+                                        .color(t.faint),
+                                );
+                                ui.label(RichText::new(&v.subject).strong());
+                            });
+                            ui.label(
+                                RichText::new(format!("{}  ·  {}", v.author, wc_core::review::utc_date(v.time)))
+                                    .color(t.muted)
+                                    .small(),
+                            );
+                            for c in &v.changes {
+                                ui.label(RichText::new(format!("   {c}")).small());
+                            }
+                            if v.changes.is_empty() {
+                                ui.label(
+                                    RichText::new("   no changes to symbols or wires")
+                                        .small()
+                                        .color(t.faint),
+                                );
+                            }
+                            ui.add_space(6.0);
+                        }
+                    });
+                    if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        keep = false;
+                    }
                 }
                 Dialog::DeletePage(i) => {
                     let i = *i;
@@ -1469,6 +1563,9 @@ impl eframe::App for App {
         }
         if let Some(at) = self.ed.ask_text.take() {
             self.dialog = Some(Dialog::Text(at, String::new(), false));
+        }
+        if let Some(at) = self.ed.ask_comment.take() {
+            self.dialog = Some(Dialog::Comment(at, String::new(), false));
         }
         self.dialogs(ctx);
 

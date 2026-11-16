@@ -31,6 +31,8 @@ pub struct PanelState {
     /// Edit buffers for the device's own properties, by key.
     props: Vec<(String, String)>,
     tag_error: Option<String>,
+    /// A reply being written to the comment shown.
+    reply: String,
 }
 
 /// A panel section title: small capitals in the muted colour, with an optional count on the
@@ -348,6 +350,12 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
         panel_properties(ui, open, ed, pi);
         return;
     }
+    if ed.selection.is_empty()
+        && let Some(id) = ed.comment.clone()
+    {
+        comment_properties(ui, open, ed, ps, &id, &t);
+        return;
+    }
     load_buffers(open, ed, ps);
     let page_idx = ed.page;
     if ed.selection.len() > 1 {
@@ -363,6 +371,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                 ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.faint));
             }
             ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.faint));
+            page_comments(ui, open, ed, &t);
         }
         Some(Selection::Symbol(id)) => {
             let Some(placed) = open.project.pages.get(page_idx).and_then(|p| p.symbol(&id)).cloned() else {
@@ -745,6 +754,107 @@ fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: 
     );
 }
 
+/// The review comments on the current page, open ones first; clicking one shows it.
+fn page_comments(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, t: &Theme) {
+    let Some(page) = open.project.pages.get(ed.page) else {
+        return;
+    };
+    let mut list: Vec<&wc_core::Comment> = open.project.page_comments(&page.id).collect();
+    if list.is_empty() {
+        return;
+    }
+    list.sort_by_key(|c| c.resolved);
+    ui.add_space(10.0);
+    let open_count = list.iter().filter(|c| !c.resolved).count();
+    section(ui, "Comments", Some(open_count));
+    for c in list {
+        let first: String = c.text.lines().next().unwrap_or_default().chars().take(40).collect();
+        let text = RichText::new(format!("{}  {first}", c.id));
+        let text = if c.resolved { text.color(t.faint) } else { text };
+        if row(
+            ui,
+            false,
+            Lead::Dot(if c.resolved { t.faint } else { t.accent }),
+            text,
+            false,
+        )
+        .on_hover_text(format!("{} · {}", c.author, wc_core::review::utc_date(c.time)))
+        .clicked()
+        {
+            ed.comment = Some(c.id.clone());
+        }
+    }
+}
+
+/// One review comment: who wrote it and when, the text, the replies, and what can be done
+/// with it.
+fn comment_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState, id: &str, t: &Theme) {
+    let Some(c) = open.project.comments.iter().find(|c| c.id == id).cloned() else {
+        ed.comment = None;
+        return;
+    };
+    let number = open.project.page(&c.page).map(|p| p.number.clone()).unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Comment {}", c.id)).strong());
+        badge(ui, if c.resolved { "Resolved" } else { "Open" }, t);
+    });
+    ui.label(RichText::new(format!("Page {number}")).color(t.faint).small());
+    ui.add_space(6.0);
+    let entry = |ui: &mut egui::Ui, author: &str, time: i64, text: &str| {
+        ui.label(
+            RichText::new(format!("{author}  ·  {}", wc_core::review::utc_date(time)))
+                .color(t.muted)
+                .small(),
+        );
+        ui.add(egui::Label::new(text).wrap());
+        ui.add_space(6.0);
+    };
+    entry(ui, &c.author, c.time, &c.text);
+    for r in &c.replies {
+        entry(ui, &r.author, r.time, &r.text);
+    }
+    ui.add(
+        egui::TextEdit::multiline(&mut ps.reply)
+            .hint_text("Reply")
+            .desired_rows(2)
+            .desired_width(f32::INFINITY),
+    );
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!ps.reply.trim().is_empty(), egui::Button::new("Reply"))
+            .clicked()
+        {
+            let mut next = open.project.clone();
+            if next
+                .reply_to_comment(id, &crate::state::author_name(), crate::state::now_secs(), &ps.reply)
+                .is_ok()
+            {
+                open.checkpoint();
+                open.project = next;
+                ps.reply.clear();
+            }
+        }
+        let (label, to) = if c.resolved {
+            ("Reopen", false)
+        } else {
+            ("Resolve", true)
+        };
+        if ui.button(label).clicked() {
+            open.checkpoint();
+            let _ = open.project.resolve_comment(id, to);
+        }
+        if ui.button("Delete").clicked() {
+            open.checkpoint();
+            let _ = open.project.remove_comment(id);
+            ed.comment = None;
+        }
+    });
+    ui.add_space(4.0);
+    if ui.small_button("Back to the page").clicked() {
+        ed.comment = None;
+    }
+}
+
 fn rotation_label(r: Rotation) -> &'static str {
     match r {
         Rotation::R0 => "0°",
@@ -774,6 +884,7 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
             Tool::Place => "Place symbol",
             Tool::Wire => "Draw wire",
             Tool::Text => "Text",
+            Tool::Comment => "Comment",
             Tool::Line => "Line",
             Tool::Rect => "Rectangle",
         };

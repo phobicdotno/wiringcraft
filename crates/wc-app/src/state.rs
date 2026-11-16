@@ -32,6 +32,7 @@ pub enum Tool {
     Text,
     Line,
     Rect,
+    Comment,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -622,6 +623,33 @@ impl Open {
             Endpoint::Pin { item, pin } => self.pin_pos(page, item, pin),
         }
     }
+}
+
+/// The name review comments are signed with: `WIRINGCRAFT_USER`, then git's `user.name`, then
+/// the login name.
+pub fn author_name() -> String {
+    std::env::var("WIRINGCRAFT_USER")
+        .ok()
+        .filter(|a| !a.trim().is_empty())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["config", "user.name"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .filter(|a| !a.is_empty())
+        })
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("USERNAME").ok())
+        .unwrap_or_else(|| "someone".into())
+}
+
+/// Seconds since 1970 (UTC).
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

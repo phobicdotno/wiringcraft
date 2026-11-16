@@ -50,6 +50,10 @@ pub struct Editor {
     pub shape_start: Option<Point>,
     /// The text tool was clicked here; the app asks for the text.
     pub ask_text: Option<Point>,
+    /// The comment tool was clicked here; the app asks for the comment.
+    pub ask_comment: Option<Point>,
+    /// The review comment shown in the properties panel, by id.
+    pub comment: Option<String>,
     pub message: String,
     /// The panel layout shown instead of a page, by index.
     pub panel: Option<usize>,
@@ -73,6 +77,8 @@ impl Default for Editor {
             drag: None,
             shape_start: None,
             ask_text: None,
+            ask_comment: None,
+            comment: None,
             message: String::new(),
             panel: None,
             panel_pick: None,
@@ -653,6 +659,63 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         return;
     }
 
+    // Review comments pinned on the page: a numbered bubble whose tail points at the spot,
+    // greyed once resolved. Hovering shows the start of the text; clicking opens it in the
+    // properties panel.
+    let mut clicked_comment = None;
+    for c in open.project.page_comments(&page.id) {
+        let Some(at) = c.at else { continue };
+        let spot = xf.s(at);
+        let r = 9.0_f32;
+        let center = spot + Vec2::new(r + 2.0, -r - 2.0);
+        let hovered = resp.hover_pos().is_some_and(|h| h.distance(center) <= r + 2.0);
+        let chosen = ed.comment.as_deref() == Some(c.id.as_str());
+        let fill = if c.resolved { t.faint } else { t.accent };
+        painter.add(EShape::convex_polygon(
+            vec![
+                spot,
+                center + Vec2::new(-r * 0.2, r * 0.9),
+                center + Vec2::new(-r * 0.9, r * 0.2),
+            ],
+            fill,
+            Stroke::NONE,
+        ));
+        painter.circle_filled(center, r, fill);
+        if chosen || hovered {
+            painter.circle_stroke(center, r + 2.5, Stroke::new(2.0_f32, t.selection));
+        }
+        painter.text(
+            center,
+            Align2::CENTER_CENTER,
+            c.id.trim_start_matches('c'),
+            FontId::proportional(10.0),
+            Color32::WHITE,
+        );
+        if hovered {
+            let mut preview: String = c.text.lines().next().unwrap_or_default().chars().take(60).collect();
+            if preview.chars().count() < c.text.chars().count() {
+                preview.push('…');
+            }
+            let galley = painter.layout_no_wrap(format!("{}: {preview}", c.author), FontId::proportional(12.0), t.ink);
+            let size = galley.size() + Vec2::splat(10.0);
+            let rect = Rect::from_min_size(center + Vec2::new(r + 6.0, -size.y / 2.0), size);
+            painter.rect_filled(rect, 4.0, t.paper);
+            painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, t.faint), egui::StrokeKind::Inside);
+            painter.galley(rect.min + Vec2::splat(5.0), galley, t.ink);
+            if ed.tool == Tool::Select && resp.clicked_by(egui::PointerButton::Primary) {
+                clicked_comment = Some(c.id.clone());
+            }
+        }
+    }
+    if let Some(id) = clicked_comment {
+        ed.selection.clear();
+        ed.comment = Some(id);
+        return;
+    }
+    if ed.tool == Tool::Select && resp.clicked_by(egui::PointerButton::Primary) {
+        ed.comment = None;
+    }
+
     // Pointer position in page mm, snapped.
     let hover = resp.hover_pos().map(|hp| xf.mm(hp));
     ed.cursor = hover.map(|p| snap(p, snap_step));
@@ -668,6 +731,14 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
                 && on_paper(open, ed.page, at)
             {
                 ed.ask_text = Some(at);
+            }
+        }
+        Tool::Comment => {
+            if resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(at) = hover
+                && on_paper(open, ed.page, at)
+            {
+                ed.ask_comment = Some(at);
             }
         }
         Tool::Line | Tool::Rect => shape_tool(&painter, &resp, open, ed, &xf, &t),

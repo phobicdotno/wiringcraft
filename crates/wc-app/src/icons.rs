@@ -44,6 +44,7 @@ pub enum Icon {
     History,
     Layout,
     Panel,
+    Comment,
     Theme,
 }
 
@@ -401,6 +402,23 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
             line((6.0, 14.0), (18.0, 14.0));
             poly(&[(7.0, 10.0), (10.0, 10.0), (10.0, 18.0), (7.0, 18.0)], true);
             poly(&[(12.0, 11.0), (14.0, 11.0), (14.0, 17.0), (12.0, 17.0)], true);
+        }
+        Icon::Comment => {
+            // A speech bubble with its tail at the bottom left and two lines of text.
+            poly(
+                &[
+                    (4.0, 5.0),
+                    (20.0, 5.0),
+                    (20.0, 16.0),
+                    (11.0, 16.0),
+                    (6.0, 20.0),
+                    (7.0, 16.0),
+                    (4.0, 16.0),
+                ],
+                true,
+            );
+            aline((8.0, 9.0), (16.0, 9.0));
+            aline((8.0, 12.5), (13.5, 12.5));
         }
         Icon::Theme => {
             // Half-filled disc: light on one side, dark on the other.
