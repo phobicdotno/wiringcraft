@@ -179,6 +179,27 @@ enum ImportCmd {
         #[arg(long)]
         lib: PathBuf,
     },
+    /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
+    /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
+    PageDwg {
+        file: PathBuf,
+        #[arg(long)]
+        page: String,
+        #[arg(long, default_value = "1.0")]
+        scale: f64,
+    },
+    /// PDF pages as trace graphics on new pages (vector content; scanned pages have none).
+    Pdf {
+        file: PathBuf,
+        #[arg(long, default_value_t = 200)]
+        first_page: usize,
+    },
+    /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
+    Aml {
+        file: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        first_page: usize,
+    },
     /// A DXF drawing onto a page as graphics; blocks named like library symbols become symbols.
     PageDxf {
         file: PathBuf,
@@ -597,6 +618,109 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             println!("imported {} part(s) into {}", parts.len(), lib.display());
         }
+        ImportCmd::Pdf { file, first_page } => {
+            let mut p = load(dir)?;
+            let bytes = std::fs::read(&file).map_err(e)?;
+            let traced = wc_import::pdf::pages(&bytes).map_err(e)?;
+            let stem = file
+                .file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for (i, t) in traced.into_iter().enumerate() {
+                let id = format!("pdf-{}", first_page + i);
+                if p.page(&id).is_some() {
+                    return Err(format!("page {id} exists; pick another --first-page"));
+                }
+                if t.graphics.is_empty() {
+                    eprintln!(
+                        "warning: page {} of {stem} has no vector content ({} images); scanned pages need OCR/tracing",
+                        i + 1,
+                        t.images
+                    );
+                }
+                let mut page = Page::new(id, (first_page + i).to_string(), format!("{stem} p.{}", i + 1));
+                page.size = if t.size_mm.0 > 500.0 {
+                    PageSize::A2
+                } else if t.size_mm.0 > 350.0 {
+                    PageSize::A3
+                } else {
+                    PageSize::A4
+                };
+                println!("page {}: {} shapes", page.number, t.graphics.len());
+                page.graphics = t.graphics;
+                p.pages.push(page);
+            }
+            p.sort_pages();
+            save(dir, &p)?;
+        }
+        ImportCmd::Aml { file, first_page } => {
+            let mut p = load(dir)?;
+            let text = std::fs::read(&file).map_err(e)?;
+            let imp = wc_import::aml::parse(&String::from_utf8_lossy(&text)).map_err(e)?;
+            for w in &imp.warnings {
+                eprintln!("warning: {w}");
+            }
+            let built = wc_import::aml::build(&imp, first_page);
+            let source = format!(
+                "import:{}",
+                file.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+            for s in &built.symbols {
+                store::write_vendored_symbol(dir, s).map_err(e)?;
+                p.lock.symbols.insert(
+                    s.id.clone(),
+                    wc_core::LockEntry {
+                        source: source.clone(),
+                        hash: s.hash(),
+                    },
+                );
+            }
+            for part in &built.parts {
+                store::write_vendored_part(dir, part).map_err(e)?;
+                p.lock.parts.insert(
+                    part.id.clone(),
+                    wc_core::LockEntry {
+                        source: source.clone(),
+                        hash: part.hash(),
+                    },
+                );
+            }
+            let n_pages = built.pages.len();
+            for page in built.pages {
+                if p.page(&page.id).is_some() {
+                    return Err(format!(
+                        "page {} exists; remove it or import into a fresh project",
+                        page.id
+                    ));
+                }
+                p.pages.push(page);
+            }
+            p.sort_pages();
+            let n_dev = built.devices.len();
+            for (t, d) in built.devices {
+                p.devices.insert(t, d);
+            }
+            save(dir, &p)?;
+            println!(
+                "imported {n_dev} devices, {} connections on {n_pages} page(s)",
+                imp.links.len()
+            );
+        }
+        ImportCmd::PageDwg { file, page, scale } => {
+            let dxf = dwg_to_dxf(&file)?;
+            let r = import_cmd(
+                dir,
+                ImportCmd::PageDxf {
+                    file: dxf.clone(),
+                    page,
+                    scale,
+                },
+            );
+            let _ = std::fs::remove_file(&dxf);
+            r?;
+        }
         ImportCmd::PageDxf { file, page, scale } => {
             let mut p = load(dir)?;
             let lib = wc_library::Library::open(dir, &p).map_err(e)?;
@@ -621,6 +745,66 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// Convert DWG to a temporary DXF with whatever converter is installed. DWG is a closed format;
+/// WiringCraft does not read it itself.
+fn dwg_to_dxf(file: &Path) -> Res<PathBuf> {
+    use std::process::Command;
+    let tmp = std::env::temp_dir().join(format!("wiringcraft-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).map_err(e)?;
+    let stem = file
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "drawing".into());
+    let out = tmp.join(format!("{stem}.dxf"));
+    let input = file.to_string_lossy().into_owned();
+    let output = out.to_string_lossy().into_owned();
+    let ran = |mut c: Command| c.output().map(|o| o.status.success()).unwrap_or(false);
+    if let Ok(template) = std::env::var("WIRINGCRAFT_DWG2DXF") {
+        let parts: Vec<String> = template
+            .split_whitespace()
+            .map(|p| p.replace("{in}", &input).replace("{out}", &output))
+            .collect();
+        if let Some((prog, args)) = parts.split_first() {
+            let mut c = Command::new(prog);
+            c.args(args);
+            if ran(c) && out.exists() {
+                return Ok(out);
+            }
+        }
+        return Err("WIRINGCRAFT_DWG2DXF did not produce a DXF".into());
+    }
+    let mut c = Command::new("dwg2dxf");
+    c.args(["-y", "-o", &output, &input]);
+    if ran(c) && out.exists() {
+        return Ok(out);
+    }
+    // ODA File Converter works on folders: <in dir> <out dir> <version> <type> <recurse> <audit> <filter>.
+    let in_dir = file
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".into());
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for prog in ["ODAFileConverter", "ODAFileConverter.exe"] {
+        let mut c = Command::new(prog);
+        c.args([
+            in_dir.as_str(),
+            tmp.to_string_lossy().as_ref(),
+            "ACAD2018",
+            "DXF",
+            "0",
+            "1",
+            name.as_str(),
+        ]);
+        if ran(c) && out.exists() {
+            return Ok(out);
+        }
+    }
+    Err("no DWG converter found: install ODA File Converter or dwg2dxf, or set WIRINGCRAFT_DWG2DXF".into())
 }
 
 fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {

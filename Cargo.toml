@@ -21,6 +21,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 quick-xml = "0.37"
 tempfile = "3"
+miniz_oxide = "0.8"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
