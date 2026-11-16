@@ -77,6 +77,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             None,
             Some(Action::ToggleGrid),
             Some(Action::ToggleChrome),
+            Some(Action::ToggleTheme),
         ],
     ),
     ("Library", &[Some(Action::LibraryStatus), Some(Action::LibraryUpdate)]),
@@ -86,11 +87,31 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
     ),
 ];
 
+/// WiringCraft's mark: a sheet corner with a wire running through two nodes.
+pub fn logo(p: &egui::Painter, rect: Rect, t: &Theme) {
+    p.rect_filled(rect, CornerRadius::same(5), t.accent);
+    let s = rect.width() / 20.0;
+    let at = |x: f32, y: f32| rect.min + Vec2::new(x * s, y * s);
+    let white = Color32::WHITE;
+    let st = Stroke::new(1.8 * s, white);
+    p.add(egui::Shape::line(
+        vec![at(4.0, 14.0), at(9.0, 14.0), at(9.0, 6.0), at(16.0, 6.0)],
+        st,
+    ));
+    p.circle_filled(at(4.0, 14.0), 2.0 * s, white);
+    p.circle_filled(at(16.0, 6.0), 2.0 * s, white);
+}
+
 pub fn menu_bar(ui: &mut egui::Ui, status: &dyn Status, out: &mut Vec<Action>) {
+    let t = Theme::of(ui.ctx());
     egui::menu::bar(ui, |ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+        logo(ui.painter(), r, &t);
+        ui.label(egui::RichText::new("WiringCraft").font(crate::theme::strong(13.0)));
+        ui.add_space(6.0);
         for (name, items) in MENUS {
             ui.menu_button(*name, |ui| {
-                ui.set_min_width(220.0);
+                ui.set_min_width(230.0);
                 for item in *items {
                     match item {
                         None => {
@@ -123,19 +144,29 @@ fn icon_button(ui: &mut egui::Ui, a: Action, size: f32, status: &dyn Status, t: 
     let enabled = status.enabled(a);
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
-    if status.active(a) {
-        p.rect_filled(rect, CornerRadius::same(3), t.icon_active_bg);
+    let radius = CornerRadius::same(6);
+    let active = enabled && status.active(a);
+    if active {
+        p.rect_filled(rect, radius, t.accent_soft);
         p.rect_stroke(
             rect,
-            CornerRadius::same(3),
-            Stroke::new(1.0_f32, t.selection.gamma_multiply(0.6)),
+            radius,
+            Stroke::new(1.0_f32, t.accent.gamma_multiply(0.55)),
             egui::StrokeKind::Inside,
         );
+    } else if resp.is_pointer_button_down_on() && enabled {
+        p.rect_filled(rect, radius, t.accent_soft);
     } else if resp.hovered() && enabled {
-        p.rect_filled(rect, CornerRadius::same(3), ui.visuals().widgets.hovered.weak_bg_fill);
+        p.rect_filled(rect, radius, t.hover);
     }
-    let c = if enabled { t.icon } else { t.icon.gamma_multiply(0.35) };
-    icons::paint(p, rect.shrink(size * 0.15), info.icon, c);
+    let (c, accent) = if !enabled {
+        (t.icon.gamma_multiply(0.3), t.icon.gamma_multiply(0.3))
+    } else if active {
+        (t.accent, t.accent)
+    } else {
+        (t.icon, t.accent)
+    };
+    icons::paint(p, rect.shrink(size * 0.2), info.icon, c, accent);
     let tip = if info.shortcut.is_empty() {
         format!("{}\n{}", info.label, info.tip)
     } else {
@@ -144,68 +175,118 @@ fn icon_button(ui: &mut egui::Ui, a: Action, size: f32, status: &dyn Status, t: 
     resp.on_hover_text(tip).clicked()
 }
 
+fn divider(ui: &mut egui::Ui, t: &Theme, height: f32) {
+    ui.add_space(4.0);
+    let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, height), Sense::hover());
+    ui.painter()
+        .line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0_f32, t.border));
+    ui.add_space(4.0);
+}
+
 pub fn classic_toolbar(ui: &mut egui::Ui, status: &dyn Status, out: &mut Vec<Action>) {
     let t = Theme::of(ui.ctx());
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         for (i, group) in TOOLBAR.iter().enumerate() {
             if i > 0 {
-                ui.add_space(3.0);
-                let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 22.0), Sense::hover());
-                ui.painter().line_segment(
-                    [r.center_top(), r.center_bottom()],
-                    Stroke::new(1.0_f32, t.faint.gamma_multiply(0.5)),
-                );
-                ui.add_space(3.0);
+                divider(ui, &t, 20.0);
             }
             for a in *group {
-                if icon_button(ui, *a, 26.0, status, &t) {
+                if icon_button(ui, *a, 30.0, status, &t) {
                     out.push(*a);
                 }
             }
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for a in [Action::ToggleChrome, Action::ToggleTheme] {
+                if icon_button(ui, a, 30.0, status, &t) {
+                    out.push(a);
+                }
+            }
+        });
     });
 }
 
 pub fn ribbon(ui: &mut egui::Ui, state: &mut ChromeState, status: &dyn Status, out: &mut Vec<Action>) {
     let t = Theme::of(ui.ctx());
+    // Tabs: plain words with an accent underline under the open one.
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 18.0;
+        ui.add_space(4.0);
         for (i, (name, _)) in RIBBON.iter().enumerate() {
-            if ui.selectable_label(state.ribbon_tab == i, *name).clicked() {
+            let on = state.ribbon_tab == i;
+            let text = egui::RichText::new(*name).color(if on { t.text } else { t.muted });
+            let text = if on {
+                text.font(crate::theme::strong(13.0))
+            } else {
+                text
+            };
+            let r = ui.add(egui::Label::new(text).sense(Sense::click()));
+            if on {
+                ui.painter().line_segment(
+                    [
+                        r.rect.left_bottom() + Vec2::new(0.0, 3.0),
+                        r.rect.right_bottom() + Vec2::new(0.0, 3.0),
+                    ],
+                    Stroke::new(2.0_f32, t.accent),
+                );
+            } else if r.hovered() {
+                ui.painter().line_segment(
+                    [
+                        r.rect.left_bottom() + Vec2::new(0.0, 3.0),
+                        r.rect.right_bottom() + Vec2::new(0.0, 3.0),
+                    ],
+                    Stroke::new(2.0_f32, t.border),
+                );
+            }
+            if r.clicked() {
                 state.ribbon_tab = i;
             }
         }
     });
+    ui.add_space(6.0);
     let Some((_, groups)) = RIBBON.get(state.ribbon_tab) else {
         return;
     };
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
         for (gi, (gname, actions)) in groups.iter().enumerate() {
             if gi > 0 {
-                ui.separator();
+                divider(ui, &t, 62.0);
             }
-            let width = actions.len() as f32 * 58.0;
+            let width = actions.len() as f32 * 66.0;
             ui.allocate_ui_with_layout(
-                Vec2::new(width, 66.0),
+                Vec2::new(width, 70.0),
                 egui::Layout::top_down(egui::Align::Center),
                 |ui| {
                     ui.set_width(width);
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
                         for a in *actions {
                             ui.allocate_ui_with_layout(
-                                Vec2::new(54.0, 52.0),
+                                Vec2::new(66.0, 52.0),
                                 egui::Layout::top_down(egui::Align::Center),
                                 |ui| {
-                                    ui.set_width(54.0);
+                                    ui.set_width(66.0);
+                                    ui.spacing_mut().item_spacing.y = 1.0;
                                     if icon_button(ui, *a, 34.0, status, &t) {
                                         out.push(*a);
                                     }
-                                    ui.label(egui::RichText::new(a.info().label).small());
+                                    let c = if status.enabled(*a) {
+                                        t.text
+                                    } else {
+                                        t.muted.gamma_multiply(0.6)
+                                    };
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(a.info().label).size(11.0).color(c))
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                    );
                                 },
                             );
                         }
                     });
-                    ui.label(egui::RichText::new(*gname).small().color(t.faint));
+                    ui.label(egui::RichText::new(gname.to_uppercase()).size(9.5).color(t.muted));
                 },
             );
         }
@@ -216,13 +297,22 @@ pub fn ribbon(ui: &mut egui::Ui, state: &mut ChromeState, status: &dyn Status, o
 pub fn show(ctx: &egui::Context, chrome: Chrome, state: &mut ChromeState, status: &dyn Status) -> Vec<Action> {
     let mut out = Vec::new();
     let t = Theme::of(ctx);
-    egui::TopBottomPanel::top("menus").show(ctx, |ui| menu_bar(ui, status, &mut out));
+    egui::TopBottomPanel::top("menus")
+        .frame(
+            egui::Frame::new()
+                .fill(t.panel)
+                .inner_margin(egui::Margin::symmetric(8, 4)),
+        )
+        .show_separator_line(false)
+        .show(ctx, |ui| menu_bar(ui, status, &mut out));
     egui::TopBottomPanel::top("commands")
         .frame(
             egui::Frame::new()
                 .fill(t.toolbar_bg)
-                .inner_margin(egui::Margin::symmetric(6, 4)),
+                .stroke(Stroke::new(1.0_f32, t.border))
+                .inner_margin(egui::Margin::symmetric(8, 4)),
         )
+        .show_separator_line(false)
         .show(ctx, |ui| match chrome {
             Chrome::Classic => classic_toolbar(ui, status, &mut out),
             Chrome::Ribbon => ribbon(ui, state, status, &mut out),

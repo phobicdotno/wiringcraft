@@ -77,6 +77,8 @@ struct App {
     /// Text for the system clipboard after a copy, so Ctrl+V reaches the app as a paste even
     /// when the system clipboard was empty.
     copied_text: Option<String>,
+    /// The interface theme currently applied to the context.
+    applied_theme: theme::Mode,
 }
 
 struct StatusView<'a> {
@@ -97,6 +99,7 @@ impl chrome::Status for StatusView<'_> {
             Action::RectTool => self.ed.tool == Tool::Rect,
             Action::ToggleGrid => self.prefs.show_grid,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
+            Action::ToggleTheme => self.prefs.theme == theme::Mode::Dark,
             _ => false,
         }
     }
@@ -104,7 +107,7 @@ impl chrome::Status for StatusView<'_> {
     fn enabled(&self, a: Action) -> bool {
         let has = self.open.is_some();
         match a {
-            Action::NewProject | Action::Open | Action::ToggleChrome | Action::ToggleGrid => true,
+            Action::NewProject | Action::Open | Action::ToggleChrome | Action::ToggleTheme | Action::ToggleGrid => true,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
             Action::PageUp => has && self.ed.page > 0,
             Action::PageDown => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
@@ -123,8 +126,9 @@ impl chrome::Status for StatusView<'_> {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, dir: Option<PathBuf>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
         let mut prefs = Prefs::load();
+        theme::install_fonts(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx, prefs.theme);
         let mut app = Self {
             prefs: Prefs::default(),
             open: None,
@@ -134,6 +138,7 @@ impl App {
             dialog: None,
             clipboard: edit::Clipboard::default(),
             copied_text: None,
+            applied_theme: prefs.theme,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -183,6 +188,13 @@ impl App {
                 self.prefs.chrome = match self.prefs.chrome {
                     Chrome::Classic => Chrome::Ribbon,
                     Chrome::Ribbon => Chrome::Classic,
+                };
+                self.prefs.save();
+            }
+            Action::ToggleTheme => {
+                self.prefs.theme = match self.prefs.theme {
+                    theme::Mode::Light => theme::Mode::Dark,
+                    theme::Mode::Dark => theme::Mode::Light,
                 };
                 self.prefs.save();
             }
@@ -1116,19 +1128,37 @@ impl eframe::App for App {
         for a in actions {
             self.run(a);
         }
+        if self.applied_theme != self.prefs.theme {
+            theme::apply(ctx, self.prefs.theme);
+            self.applied_theme = self.prefs.theme;
+        }
         if let Some(text) = self.copied_text.take() {
             ctx.copy_text(text);
         }
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| panels::status_bar(ui, self.open.as_ref(), &self.ed));
+        let t = theme::Theme::of(ctx);
+        let side = |fill| {
+            egui::Frame::new()
+                .fill(fill)
+                .stroke(Stroke::new(1.0_f32, t.border))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+        };
+        egui::TopBottomPanel::bottom("status")
+            .frame(side(t.toolbar_bg).inner_margin(egui::Margin::symmetric(10, 4)))
+            .show_separator_line(false)
+            .show(ctx, |ui| panels::status_bar(ui, self.open.as_ref(), &self.ed));
 
         let mut page_actions = Vec::new();
         if let Some(open) = self.open.as_mut() {
             egui::SidePanel::left("navigator")
-                .default_width(220.0)
+                .frame(side(t.panel))
+                .show_separator_line(false)
+                .default_width(230.0)
                 .show(ctx, |ui| panels::navigator(ui, open, &mut self.ed, &mut page_actions));
             egui::SidePanel::right("inspector")
-                .default_width(260.0)
+                .frame(side(t.panel))
+                .show_separator_line(false)
+                .default_width(280.0)
                 .max_width(420.0)
                 .show(ctx, |ui| {
                     panels::library(ui, open, &mut self.ed, &mut self.panels);
@@ -1143,23 +1173,17 @@ impl eframe::App for App {
             });
         } else {
             let mut start = None;
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(120.0);
-                    ui.heading("WiringCraft");
-                    ui.label("Open a project folder or create a new one to start.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(ui.available_width() / 2.0 - 110.0);
-                        if ui.button("New project…").clicked() {
-                            start = Some(Action::NewProject);
-                        }
-                        if ui.button("Open…").clicked() {
-                            start = Some(Action::Open);
-                        }
-                    });
+            let mut recent = None;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(t.backdrop))
+                .show(ctx, |ui| {
+                    welcome(ui, &t, &self.prefs.recent, &mut start, &mut recent);
                 });
-            });
+            if let Some(d) = recent {
+                let mut prefs = std::mem::take(&mut self.prefs);
+                self.open_dir(&d, &mut prefs);
+                self.prefs = prefs;
+            }
             if let Some(a) = start {
                 self.run(a);
             }
@@ -1184,11 +1208,75 @@ impl eframe::App for App {
     }
 }
 
+/// The start screen shown when no project is open: a card with the two ways in and the
+/// recently opened projects.
+fn welcome(
+    ui: &mut egui::Ui,
+    t: &theme::Theme,
+    recent: &[PathBuf],
+    start: &mut Option<Action>,
+    open_recent: &mut Option<PathBuf>,
+) {
+    let width = 440.0;
+    ui.add_space((ui.available_height() * 0.18).max(24.0));
+    ui.vertical_centered(|ui| {
+        ui.set_max_width(width);
+        egui::Frame::new()
+            .fill(t.surface)
+            .stroke(Stroke::new(1.0_f32, t.border))
+            .corner_radius(12.0)
+            .shadow(ui.visuals().window_shadow)
+            .inner_margin(egui::Margin::same(28))
+            .show(ui, |ui| {
+                ui.set_width(width - 56.0);
+                ui.vertical_centered(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::hover());
+                    chrome::logo(ui.painter(), r, t);
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("WiringCraft").font(theme::strong(22.0)).color(t.text));
+                    ui.label(RichText::new("Electrical schematics, kept in plain files.").color(t.muted));
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 236.0) / 2.0);
+                        let primary = egui::Button::new(RichText::new("New project").color(egui::Color32::WHITE))
+                            .fill(t.accent)
+                            .min_size(Vec2::new(114.0, 30.0));
+                        if ui.add(primary).clicked() {
+                            *start = Some(Action::NewProject);
+                        }
+                        if ui
+                            .add(egui::Button::new("Open folder…").min_size(Vec2::new(114.0, 30.0)))
+                            .clicked()
+                        {
+                            *start = Some(Action::Open);
+                        }
+                    });
+                });
+                if !recent.is_empty() {
+                    ui.add_space(18.0);
+                    panels::section(ui, "Recent projects", None);
+                    for d in recent.iter().take(6) {
+                        let name = d
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| d.display().to_string());
+                        let r = panels::row(ui, false, panels::Lead::Dot(t.accent), RichText::new(name), false)
+                            .on_hover_text(d.display().to_string());
+                        if r.clicked() {
+                            *open_recent = Some(d.clone());
+                        }
+                    }
+                }
+            });
+    });
+}
+
 fn main() -> eframe::Result {
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 860.0])
+            .with_min_inner_size([900.0, 560.0])
             .with_title("WiringCraft"),
         ..Default::default()
     };

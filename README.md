@@ -38,11 +38,16 @@ cargo run -p wc-app -- path/to/project
 
 Pages on the left, the sheet in the middle, the symbol library and properties on the right.
 Commands sit in classic menus and icon toolbars by default; View → Layout switches to a ribbon
-(the choice is saved). Both show the same commands from one registry.
+(the choice is saved). Both show the same commands from one registry. View → Dark mode (or the
+half-moon button at the right end of the toolbar) switches between the light and dark interface;
+the sheet stays paper-white in both. The interface font is Inter (SIL Open Font License, bundled
+in `crates/wc-app/assets/fonts`).
 
 | Classic toolbars (default) | Ribbon (optional) |
 |---|---|
 | ![classic](docs/screenshots/app-classic.png) | ![ribbon](docs/screenshots/app-ribbon.png) |
+
+![dark mode](docs/screenshots/app-dark.png)
 
 Tools: select and drag (Esc), place symbol (S, pick one in the library), draw wire (W: click a
 pin, click bends, click a pin to finish or double-click a free point), rotate (R), delete (Del).
