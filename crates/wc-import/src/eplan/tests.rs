@@ -164,6 +164,254 @@ fn sample() -> Tables {
     t
 }
 
+fn f64_bytes(field: u16, v: f64) -> Vec<u8> {
+    let mut b = u16le(field);
+    b.extend(v.to_le_bytes());
+    b
+}
+
+fn u16_bytes(field: u16, v: u16) -> Vec<u8> {
+    let mut b = u16le(field);
+    b.extend(u16le(v));
+    b
+}
+
+/// The symbol number, then the variant byte when it is not 0, as Eplan writes them.
+fn symbol_bytes(number: u16, variant: u8) -> Vec<u8> {
+    let mut b = u16_bytes(F_SYMBOL_NUMBER, number);
+    if variant > 0 {
+        b.extend(u16le(F_VARIANT));
+        b.push(variant);
+    }
+    b
+}
+
+struct Drawn<'a> {
+    id: u32,
+    tag: (&'a str, &'a str),
+    pins: &'a [&'a str],
+    kind: (u16, u16),
+    variant: u8,
+    at: (f64, f64),
+    terminal: &'a str,
+}
+
+fn drawn_function(page: u32, d: &Drawn) -> Vec<u8> {
+    let mut body = ref_field_bytes(F_OWNER, CLASS_PAGE, page);
+    for p in d.pins {
+        body.extend(text(F_PINS, p));
+    }
+    body.extend(point(F_POSITION, d.at.0, d.at.1));
+    body.extend(symbol_bytes(1000 + d.id as u16, d.variant));
+    body.extend(u16_bytes(F_FUNCTION_KIND, d.kind.0));
+    body.extend(u16_bytes(F_FUNCTION_DETAIL, d.kind.1));
+    let props: Vec<(u16, u16, &str)> = if d.terminal.is_empty() {
+        vec![]
+    } else {
+        vec![(P_TERMINAL, 0, d.terminal)]
+    };
+    body.extend(block(F_PROPERTIES, &props));
+    body.extend(block(
+        F_TAG_PARTS,
+        &[(P_TAG_ID, 0, d.tag.0), (P_TAG_COUNTER, 0, d.tag.1)],
+    ));
+    record(CLASS_FUNCTION, d.id, &body)
+}
+
+/// The sample plus a schematic page 3 drawn with devices, a wire corner and free graphics.
+fn drawn_sample() -> Tables {
+    let mut t = sample();
+    let mut body = text(F_PAGE_NAME, "3");
+    body.extend(block(
+        F_PROPERTIES,
+        &[(P_PAGE_DESCRIPTION, 0, "??_??@MOTOR CONTROL;"), (P_PAGE_SCALE, 0, "1")],
+    ));
+    if let Some(pages) = t.get_mut("page.eod") {
+        pages.extend(record(CLASS_PAGE, 30, &body));
+    }
+    let drawn = [
+        // A make contact above a coil: the contact's bottom pin faces the coil's top pin.
+        Drawn {
+            id: 11,
+            tag: ("S", "1"),
+            pins: &["13", "14"],
+            kind: (drawing::KIND_BUTTON_CONTACT, 1),
+            variant: 0,
+            at: (100.0, 220.0),
+            terminal: "",
+        },
+        Drawn {
+            id: 12,
+            tag: ("K", "5"),
+            pins: &["A1", "A2"],
+            kind: (0, 0),
+            variant: 0,
+            at: (100.0, 200.0),
+            terminal: "",
+        },
+        // A changeover contact turned a quarter (variant 1), and a terminal.
+        Drawn {
+            id: 13,
+            tag: ("K", "5"),
+            pins: &["22", "21", "24"],
+            kind: (203, 1),
+            variant: 1,
+            at: (200.0, 200.0),
+            terminal: "",
+        },
+        Drawn {
+            id: 14,
+            tag: ("X", "1"),
+            pins: &["", "", "", ""],
+            kind: (drawing::KIND_TERMINAL, 6),
+            variant: 0,
+            at: (150.0, 100.0),
+            terminal: "7",
+        },
+    ];
+    if let Some(f) = t.get_mut("function.eod") {
+        for d in &drawn {
+            f.extend(drawn_function(30, d));
+        }
+    }
+    let on_page = |page: u32| ref_field_bytes(F_GRAPHIC_PAGE, CLASS_PAGE, page);
+    let mut inst = Vec::new();
+    let mut line = on_page(30);
+    line.extend(point(F_LINE_FROM, 10.0, 20.0));
+    line.extend(point(F_LINE_TO, 50.0, 20.0));
+    inst.extend(record(CLASS_LINE, 101, &line));
+    // A line of the page frame (owned by a form, class 51) is not the page's own.
+    let mut frame = ref_field_bytes(F_GRAPHIC_PAGE, 51, 2);
+    frame.extend(point(F_LINE_FROM, 0.0, 0.0));
+    frame.extend(point(F_LINE_TO, 400.0, 0.0));
+    inst.extend(record(CLASS_LINE, 102, &frame));
+    let mut label = on_page(30);
+    label.extend(point(F_TEXT_AT, 20.0, 40.0));
+    label.extend(text(F_TEXT, "??_??@FIRST\nSECOND;"));
+    label.extend(f64_bytes(F_TEXT_HEIGHT, 2.0));
+    inst.extend(record(CLASS_TEXT, 103, &label));
+    let mut circle = on_page(30);
+    circle.extend(point(F_CIRCLE_CENTER, 60.0, 60.0));
+    circle.extend(f64_bytes(F_CIRCLE_RADIUS, 3.0));
+    inst.extend(record(CLASS_CIRCLE, 104, &circle));
+    // A corner above the contact, joining right and down.
+    let mut corner = on_page(30);
+    corner.extend(point(F_POSITION, 100.0, 240.0));
+    corner.extend(symbol_bytes(70, 0));
+    inst.extend(record(CLASS_NODE, 105, &corner));
+    let mut unknown = on_page(30);
+    unknown.extend(point(F_POSITION, 300.0, 240.0));
+    unknown.extend(symbol_bytes(999, 0));
+    inst.extend(record(CLASS_NODE, 106, &unknown));
+    t.insert("instance.eod".into(), inst);
+    t
+}
+
+#[test]
+fn reads_symbols_variants_and_page_graphics() {
+    let p = read(&drawn_sample()).unwrap();
+    let co = p.functions.iter().find(|f| f.pins.len() == 3).unwrap();
+    assert_eq!((co.tag.as_str(), co.variant, co.kind, co.detail), ("K5", 1, 203, 1));
+    assert_eq!(co.pins, ["22", "21", "24"]);
+    let x = p.functions.iter().find(|f| f.tag == "X1").unwrap();
+    assert_eq!((x.terminal.as_str(), x.variant, x.pins.len()), ("7", 0, 4));
+    // The frame line is left out; the text is split into its lines.
+    assert_eq!(p.graphics.len(), 4);
+    assert!(p.graphics.iter().all(|g| g.page == 30));
+    let texts: Vec<(&str, f64)> = p
+        .graphics
+        .iter()
+        .filter_map(|g| match &g.shape {
+            wc_core::geom::Shape::Text { text, at, .. } => Some((text.as_str(), at.y)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, [("FIRST", 40.0), ("SECOND", 37.0)]);
+    assert_eq!(p.nodes.len(), 2);
+    assert_eq!((p.nodes[0].symbol, p.nodes[0].at), (70, Point::new(100.0, 240.0)));
+}
+
+#[test]
+fn rebuilds_drawn_pages_at_original_positions() {
+    use wc_core::geom::Rotation;
+    let p = read(&drawn_sample()).unwrap();
+    let (b, warnings) = build(&p, 100);
+    let titles: Vec<&str> = b.pages.iter().map(|pg| pg.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        [
+            "Eplan page 3: MOTOR CONTROL",
+            "Connections, Eplan page 1: MAIN CIRCUIT",
+            "Connections, Eplan page 2: CONTROL"
+        ]
+    );
+    assert_eq!((b.pages[0].number.as_str(), b.pages[1].number.as_str()), ("100", "101"));
+    let page = &b.pages[0];
+    let placed = |tag: &str| -> Vec<&wc_core::PlacedSymbol> {
+        page.symbols
+            .iter()
+            .filter(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == tag))
+            .collect()
+    };
+    // Eplan's origin is bottom left with y up; WiringCraft's is top left with y down.
+    let coil = placed("-K5").into_iter().find(|s| s.rotation == Rotation::R0).unwrap();
+    assert_eq!(coil.at, Point::new(110.0, 93.0));
+    let changeover = placed("-K5").into_iter().find(|s| s.rotation != Rotation::R0).unwrap();
+    assert_eq!(changeover.rotation, Rotation::R270);
+    assert_eq!(placed("-S1").len(), 1);
+    assert_eq!(placed("-X1.7").len(), 1);
+    let sym = |placed: &wc_core::PlacedSymbol| b.symbols.iter().find(|s| s.id == placed.symbol).unwrap();
+    assert_eq!(sym(coil).role, wc_core::symbol::SymbolRole::Main);
+    assert_eq!(sym(changeover).role, wc_core::symbol::SymbolRole::Auxiliary);
+    let pins: Vec<&str> = sym(changeover).pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(pins, ["22", "21", "24"]);
+    // Wires: corner down to the contact, contact down to the coil. Nothing else faces anything.
+    assert_eq!(page.wires.len(), 2);
+    let s1 = &placed("-S1")[0].id;
+    let joins = |a: &wc_core::Endpoint, b: &wc_core::Endpoint| {
+        page.wires
+            .iter()
+            .any(|w| (&w.from, &w.to) == (a, b) || (&w.from, &w.to) == (b, a))
+    };
+    let pin = |item: &str, pin: &str| wc_core::Endpoint::Pin {
+        item: item.to_owned(),
+        pin: pin.to_owned(),
+    };
+    assert!(joins(&pin(s1, "14"), &pin(&coil.id, "A1")));
+    assert!(joins(
+        &wc_core::Endpoint::Point {
+            at: Point::new(110.0, 53.0)
+        },
+        &pin(s1, "13")
+    ));
+    // Free graphics, moved the same way.
+    assert!(page.graphics.contains(&wc_core::geom::Shape::Line {
+        a: Point::new(20.0, 273.0),
+        b: Point::new(60.0, 273.0)
+    }));
+    // Drawn devices keep their device data and stay off the connection overview.
+    assert!(b.devices.contains_key(&DeviceTag::parse("-K5").unwrap()));
+    assert!(b.pages[1..].iter().all(|pg| placed_tags(pg).iter().all(|t| t != "-K5")));
+    assert!(warnings.iter().any(|w| w.contains("1 wire corner")));
+}
+
+fn placed_tags(pg: &wc_core::Page) -> Vec<String> {
+    pg.symbols
+        .iter()
+        .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
+        .collect()
+}
+
+#[test]
+fn wire_nodes_turn_with_their_variant() {
+    use drawing::node_directions;
+    assert_eq!(node_directions(70, 0), Some([false, true, true, false]));
+    assert_eq!(node_directions(70, 1), Some([true, true, false, false]));
+    assert_eq!(node_directions(70, 3), Some([false, false, true, true]));
+    assert_eq!(node_directions(66, 1), Some([true, true, true, false]));
+    assert_eq!(node_directions(5, 0), None);
+}
+
 #[test]
 fn reads_pages_devices_articles_and_connections() {
     let p = read(&sample()).unwrap();
@@ -206,7 +454,13 @@ fn builds_overview_pages_per_eplan_page() {
     let p = read(&sample()).unwrap();
     let (b, warnings) = build(&p, 100);
     let titles: Vec<&str> = b.pages.iter().map(|pg| pg.title.as_str()).collect();
-    assert_eq!(titles, ["Eplan page 1: MAIN CIRCUIT", "Eplan page 2: CONTROL"]);
+    assert_eq!(
+        titles,
+        [
+            "Connections, Eplan page 1: MAIN CIRCUIT",
+            "Connections, Eplan page 2: CONTROL"
+        ]
+    );
     assert_eq!(b.pages[0].number, "100");
     // K1 is first drawn on page 1; PUMP1-X2 and S9 on page 2.
     let on = |i: usize| -> Vec<String> {
@@ -264,9 +518,9 @@ fn texts_tags_and_elk() {
 #[test]
 fn hostile_tables_never_panic() {
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
-    let base = sample();
-    for round in 0..300 {
-        let mut t = base.clone();
+    let bases = [sample(), drawn_sample()];
+    for round in 0..600 {
+        let mut t = bases[round % 2].clone();
         for data in t.values_mut() {
             for _ in 0..(round % 7 + 1) {
                 seed ^= seed << 13;
