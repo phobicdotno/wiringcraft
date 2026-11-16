@@ -534,7 +534,11 @@ pub fn draw_page(
         });
     }
     pen.colour(0.0, 0.0, 0.0);
-    Drawn { ops: pen.ops, links }
+    Drawn {
+        ops: pen.ops,
+        links,
+        prims: pen.prims,
+    }
 }
 
 /// Points where three or more wire branches meet: wire ends and bends count once per wire
@@ -700,5 +704,6 @@ pub fn draw_table_page(
     Drawn {
         ops: pen.ops,
         links: Vec::new(),
+        prims: pen.prims,
     }
 }

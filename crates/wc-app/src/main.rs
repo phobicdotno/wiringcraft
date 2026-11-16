@@ -328,6 +328,7 @@ impl App {
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
+            Action::ExportDrawings => self.dialog = Some(Dialog::Message(export_drawings(open))),
             Action::Reports => self.dialog = Some(Dialog::Reports(wc_report::Kind::Parts)),
             Action::Check => {
                 let found = run_check(open);
@@ -1106,6 +1107,43 @@ fn export_pdf(open: &Open) -> String {
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes)) {
         Ok(()) => {
             let mut m = format!("Exported {} pages to\n{}", report.pages, path.display());
+            if !report.warnings.is_empty() {
+                m.push_str("\n\nWarnings:\n");
+                m.push_str(&report.warnings.join("\n"));
+            }
+            m
+        }
+        Err(e) => format!("Export failed: {e}"),
+    }
+}
+
+/// Every page as SVG and DXF in `export/drawings`, named by page number.
+fn export_drawings(open: &Open) -> String {
+    let dir = open.dir.join("export").join("drawings");
+    let (pages, report) = wc_pdf::page_drawings(&open.project, &open.symbols, &wc_pdf::Options::default());
+    let mut used = std::collections::BTreeSet::new();
+    let written = std::fs::create_dir_all(&dir).and_then(|()| {
+        for page in &pages {
+            let base = if page.number.trim().is_empty() {
+                &page.id
+            } else {
+                page.number.trim()
+            };
+            let mut stem: String = base
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+                .collect();
+            while !used.insert(stem.clone()) {
+                stem.push('_');
+            }
+            std::fs::write(dir.join(format!("{stem}.svg")), wc_pdf::svg(page))?;
+            std::fs::write(dir.join(format!("{stem}.dxf")), wc_pdf::dxf(page))?;
+        }
+        Ok(())
+    });
+    match written {
+        Ok(()) => {
+            let mut m = format!("Exported {} pages as SVG and DXF to\n{}", pages.len(), dir.display());
             if !report.warnings.is_empty() {
                 m.push_str("\n\nWarnings:\n");
                 m.push_str(&report.warnings.join("\n"));

@@ -96,6 +96,20 @@ enum Cmd {
         #[arg(long = "report")]
         reports: Vec<String>,
     },
+    /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
+    /// drawn like the PDF (frame, title block, symbols, wires, cross-references).
+    Drawing {
+        /// Output folder; files are named `<page number>.<format>`.
+        out: PathBuf,
+        /// `svg` or `dxf`.
+        #[arg(long, default_value = "svg")]
+        format: String,
+        /// Page ids to export (default: all).
+        #[arg(long = "page")]
+        pages: Vec<String>,
+        #[arg(long, default_value = "")]
+        date: String,
+    },
     /// Print a report (parts, devices, wires, nets, terminals) as a table, CSV or Markdown.
     Report {
         kind: String,
@@ -520,6 +534,46 @@ fn run(cli: Cli) -> Res<()> {
                 eprintln!("warning: {w}");
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
+        }
+        Cmd::Drawing {
+            out,
+            format,
+            pages,
+            date,
+        } => {
+            let render: fn(&wc_pdf::PageDrawing) -> String = match format.to_ascii_lowercase().as_str() {
+                "svg" => wc_pdf::svg,
+                "dxf" => wc_pdf::dxf,
+                other => return Err(format!("unknown drawing format {other:?}: use svg or dxf")),
+            };
+            let ext = format.to_ascii_lowercase();
+            let p = load(dir)?;
+            let (symbols, missing) = store::vendored_symbols(dir, &p);
+            for m in missing {
+                eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
+            }
+            let (drawings, report) = wc_pdf::page_drawings(
+                &p,
+                &symbols,
+                &wc_pdf::Options {
+                    pages,
+                    date,
+                    ..Default::default()
+                },
+            );
+            std::fs::create_dir_all(&out).map_err(e)?;
+            let mut used = std::collections::BTreeSet::new();
+            for d in &drawings {
+                let mut stem = file_stem(&d.number, &d.id);
+                while !used.insert(stem.clone()) {
+                    stem.push('_');
+                }
+                std::fs::write(out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
+            }
+            for w in &report.warnings {
+                eprintln!("warning: {w}");
+            }
+            println!("wrote {} {ext} file(s) to {}", drawings.len(), out.display());
         }
         Cmd::Check { all } => {
             let p = load(dir)?;
@@ -1235,4 +1289,22 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
         p.devices.insert(t, d);
     }
     Ok(())
+}
+
+/// A file name for a page: its number, or its id when the number is empty, with anything a file
+/// system might refuse replaced.
+fn file_stem(number: &str, id: &str) -> String {
+    let base = if number.trim().is_empty() { id } else { number.trim() };
+    let stem: String = base
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = stem.trim_start_matches('.').to_owned();
+    if stem.is_empty() { "page".into() } else { stem }
 }
