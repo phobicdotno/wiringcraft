@@ -10,9 +10,6 @@ use wc_core::{Endpoint, Page, Shape};
 use crate::state::{Open, Selection, Tool};
 use crate::theme;
 
-const MARGIN: f64 = 10.0;
-const HEADER: f64 = 6.0;
-const TITLE_H: f64 = 24.0;
 /// How close (in mm) a click must be to a pin to snap a wire to it.
 const PIN_CATCH: f64 = 2.0;
 
@@ -49,6 +46,10 @@ pub struct Editor {
     pub view: View,
     pub cursor: Option<Point>,
     drag: Option<Drag>,
+    /// First corner of a line or rectangle being drawn.
+    pub shape_start: Option<Point>,
+    /// The text tool was clicked here; the app asks for the text.
+    pub ask_text: Option<Point>,
     pub message: String,
 }
 
@@ -63,6 +64,8 @@ impl Default for Editor {
             view: View::default(),
             cursor: None,
             drag: None,
+            shape_start: None,
+            ask_text: None,
             message: String::new(),
         }
     }
@@ -275,120 +278,24 @@ impl Open {
                 return Some(Selection::Wire(w.id.clone()));
             }
         }
-        None
+        page.graphics
+            .iter()
+            .rposition(|g| crate::edit::graphic_hit(g, at, tol))
+            .map(Selection::Graphic)
     }
 }
 
 fn paint_frame(p: &egui::Painter, xf: &Xf, open: &Open, page: &Page, c: Color32, faint: Color32) {
-    let (w, h) = page.size.mm();
-    let (x0, y0, x1, y1) = (MARGIN, MARGIN, w - MARGIN, h - MARGIN);
-    let thick = Stroke::new(xf.len(0.5).max(1.0), c);
-    let thin = Stroke::new(xf.len(0.25).max(0.6), c);
-    p.rect_stroke(
-        Rect::from_two_pos(xf.s(Point::new(x0, y0)), xf.s(Point::new(x1, y1))),
-        0.0,
-        thick,
-        egui::StrokeKind::Middle,
-    );
-    p.line_segment(
-        [xf.s(Point::new(x0, y0 + HEADER)), xf.s(Point::new(x1, y0 + HEADER))],
-        thin,
-    );
-    let cols = wc_pdf::FRAME_COLUMNS;
-    let col_w = (x1 - x0) / cols as f64;
-    for i in 0..cols {
-        let cx = x0 + col_w * i as f64;
-        if i > 0 {
-            p.line_segment([xf.s(Point::new(cx, y0)), xf.s(Point::new(cx, y0 + HEADER))], thin);
-        }
-        text_mm(
-            p,
-            xf,
-            Point::new(cx + col_w / 2.0, y0 + HEADER - 1.8),
-            2.5,
-            Align2::CENTER_BOTTOM,
-            &(i + 1).to_string(),
-            c,
-        );
-    }
-    let ty = y1 - TITLE_H;
-    p.line_segment([xf.s(Point::new(x0, ty)), xf.s(Point::new(x1, ty))], thick);
-    let fx = [x0, x0 + 80.0, x1 - 150.0, x1 - 60.0, x1 - 30.0];
-    for x in fx.iter().skip(1) {
-        p.line_segment([xf.s(Point::new(*x, ty)), xf.s(Point::new(*x, y1))], thin);
-    }
-    p.line_segment(
-        [
-            xf.s(Point::new(fx[2], ty + TITLE_H / 2.0)),
-            xf.s(Point::new(x1, ty + TITLE_H / 2.0)),
-        ],
-        thin,
-    );
-    let tb = &open.project.meta.title_block;
-    let get = |k: &str| tb.get(k).map(String::as_str).unwrap_or("");
-    let label =
-        |x: f64, y: f64, l: &str| text_mm(p, xf, Point::new(x + 1.5, y + 3.0), 1.8, Align2::LEFT_BOTTOM, l, faint);
-    label(fx[0], ty, "Customer");
-    text_mm(
-        p,
-        xf,
-        Point::new(fx[0] + 1.5, ty + 10.0),
-        3.0,
-        Align2::LEFT_BOTTOM,
-        get("customer"),
-        c,
-    );
-    label(fx[1], ty, "Project");
-    text_mm(
-        p,
-        xf,
-        Point::new(fx[1] + 3.0, ty + 11.0),
-        4.0,
-        Align2::LEFT_BOTTOM,
-        &open.project.meta.name,
-        c,
-    );
-    text_mm(
-        p,
-        xf,
-        Point::new(fx[1] + 3.0, ty + 19.5),
-        3.0,
-        Align2::LEFT_BOTTOM,
-        &page.title,
-        c,
-    );
-    label(fx[2], ty, "Revision");
-    text_mm(
-        p,
-        xf,
-        Point::new(fx[2] + 1.5, ty + 9.5),
-        2.5,
-        Align2::LEFT_BOTTOM,
-        get("revision"),
-        c,
-    );
-    label(fx[3], ty, "Page");
-    text_mm(
-        p,
-        xf,
-        Point::new(fx[3] + 15.0, ty + 10.0),
-        4.0,
-        Align2::CENTER_BOTTOM,
-        &page.number,
-        c,
-    );
-    label(fx[4], ty, "Sheet");
     let total = open.project.pages.len();
     let idx = open.project.pages.iter().position(|q| q.id == page.id).unwrap_or(0);
-    text_mm(
-        p,
-        xf,
-        Point::new(fx[4] + 15.0, ty + 10.0),
-        3.0,
-        Align2::CENTER_BOTTOM,
-        &format!("{} / {}", idx + 1, total),
-        c,
-    );
+    for m in wc_pdf::frame_marks(&open.project, page, idx, total, "") {
+        let stroke = match m.ink {
+            wc_pdf::Ink::Thick => Stroke::new(xf.len(0.5).max(1.0), c),
+            wc_pdf::Ink::Thin => Stroke::new(xf.len(0.25).max(0.6), c),
+            wc_pdf::Ink::Label => Stroke::new(1.0_f32, faint),
+        };
+        paint_shape(p, xf, &m.shape, stroke);
+    }
 }
 
 /// Show the canvas for the current page and handle the tools. Returns true when the project
@@ -465,9 +372,15 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
 
     paint_frame(&painter, &xf, open, &page, t.ink, t.faint);
 
-    let graphics_stroke = Stroke::new(xf.len(0.18).max(0.6), t.faint);
-    for g in &page.graphics {
-        paint_shape(&painter, &xf, g, graphics_stroke);
+    for (i, g) in page.graphics.iter().enumerate() {
+        let selected = ed.is_selected(&Selection::Graphic(i));
+        let c = if selected { t.selection } else { t.ink };
+        paint_shape(&painter, &xf, g, Stroke::new(xf.len(0.25).max(0.8), c));
+        if selected {
+            let (a, b) = crate::edit::graphic_bounds(g);
+            let r = Rect::from_two_pos(xf.s(a), xf.s(b)).expand(3.0);
+            painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, t.selection), egui::StrokeKind::Outside);
+        }
     }
 
     for w in &page.wires {
@@ -570,6 +483,15 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         Tool::Select => select_tool(&painter, &resp, open, ed, &page, &xf, tol, snap_step),
         Tool::Place => place_tool(&painter, &resp, open, ed, &xf, &t),
         Tool::Wire => wire_tool(&painter, &resp, open, ed, &page, &xf, &t),
+        Tool::Text => {
+            if resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(at) = ed.cursor
+                && on_paper(open, ed.page, at)
+            {
+                ed.ask_text = Some(at);
+            }
+        }
+        Tool::Line | Tool::Rect => shape_tool(&painter, &resp, open, ed, &xf, &t),
     }
 }
 
@@ -664,6 +586,43 @@ fn select_tool(
     }
     if resp.drag_stopped() {
         ed.drag = None;
+    }
+}
+
+/// Line and rectangle tools: click the first corner, then the second.
+fn shape_tool(
+    painter: &egui::Painter,
+    resp: &egui::Response,
+    open: &mut Open,
+    ed: &mut Editor,
+    xf: &Xf,
+    t: &theme::Theme,
+) {
+    let Some(cur) = ed.cursor else { return };
+    let make = |a: Point, b: Point, tool: Tool| match tool {
+        Tool::Rect => Shape::Rect {
+            min: Point::new(a.x.min(b.x), a.y.min(b.y)),
+            max: Point::new(a.x.max(b.x), a.y.max(b.y)),
+        },
+        _ => Shape::Line { a, b },
+    };
+    if let Some(a) = ed.shape_start {
+        paint_shape(painter, xf, &make(a, cur, ed.tool), Stroke::new(1.5_f32, t.ghost));
+    }
+    if resp.clicked_by(egui::PointerButton::Primary) {
+        match ed.shape_start.take() {
+            None => {
+                ed.shape_start = Some(cur);
+                ed.message = "Click the other end (Esc cancels).".into();
+            }
+            Some(a) if a != cur => {
+                if let Some(sel) = open.add_graphic(ed.page, make(a, cur, ed.tool)) {
+                    ed.select_only(sel);
+                }
+                ed.message.clear();
+            }
+            Some(_) => {}
+        }
     }
 }
 

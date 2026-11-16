@@ -50,6 +50,8 @@ enum Dialog {
         error: Option<String>,
     },
     DeletePage(usize),
+    /// Write a new text at this point on the current page.
+    Text(wc_core::geom::Point, String, bool),
     Commit(String),
     NewBranch(String),
     History(Vec<wc_vcs::subway::Row>),
@@ -86,6 +88,9 @@ impl chrome::Status for StatusView<'_> {
             Action::Select => self.ed.tool == Tool::Select,
             Action::PlaceSymbol => self.ed.tool == Tool::Place,
             Action::DrawWire => self.ed.tool == Tool::Wire,
+            Action::TextTool => self.ed.tool == Tool::Text,
+            Action::LineTool => self.ed.tool == Tool::Line,
+            Action::RectTool => self.ed.tool == Tool::Rect,
             Action::ToggleGrid => self.prefs.show_grid,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
             _ => false,
@@ -190,6 +195,20 @@ impl App {
                 self.ed.wire = None;
             }
             Action::DrawWire => self.ed.tool = Tool::Wire,
+            Action::TextTool | Action::LineTool | Action::RectTool => {
+                self.ed.tool = match a {
+                    Action::TextTool => Tool::Text,
+                    Action::LineTool => Tool::Line,
+                    _ => Tool::Rect,
+                };
+                self.ed.wire = None;
+                self.ed.shape_start = None;
+                self.ed.message = match a {
+                    Action::TextTool => "Click where the text goes.",
+                    _ => "Click the first point.",
+                }
+                .into();
+            }
             Action::ZoomIn => self.zoom(1.25),
             Action::ZoomOut => self.zoom(0.8),
             Action::ZoomFit => self.ed.view.fit = true,
@@ -365,6 +384,8 @@ impl App {
                 (Key::W, Action::DrawWire),
                 (Key::R, Action::Rotate),
                 (Key::M, Action::Mirror),
+                (Key::T, Action::TextTool),
+                (Key::L, Action::LineTool),
                 (Key::Delete, Action::Delete),
                 (Key::G, Action::ToggleGrid),
                 (Key::F, Action::ZoomFit),
@@ -376,7 +397,9 @@ impl App {
                 }
             }
             if i.key_pressed(Key::Escape) {
-                if self.ed.wire.is_some() {
+                if self.ed.shape_start.is_some() {
+                    self.ed.shape_start = None;
+                } else if self.ed.wire.is_some() {
                     self.ed.wire = None;
                 } else {
                     out.push(Action::Select);
@@ -396,6 +419,7 @@ impl App {
             Dialog::ProjectProps { .. } => "Project properties",
             Dialog::PageProps { .. } => "Page properties",
             Dialog::DeletePage(_) => "Delete page",
+            Dialog::Text(..) => "Text",
             Dialog::Commit(_) => "Record a version",
             Dialog::NewBranch(_) => "New branch",
             Dialog::History(_) => "History",
@@ -554,6 +578,40 @@ impl App {
                             }
                         }
                         if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::Text(at, text, focused) => {
+                    let r = ui.add(egui::TextEdit::singleline(text).desired_width(320.0));
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
+                    ui.horizontal(|ui| {
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if (ui
+                            .add_enabled(!text.trim().is_empty(), egui::Button::new("OK"))
+                            .clicked()
+                            || enter)
+                            && !text.trim().is_empty()
+                        {
+                            if let Some(o) = self.open.as_mut()
+                                && let Some(sel) = o.add_graphic(
+                                    self.ed.page,
+                                    wc_core::geom::Shape::Text {
+                                        at: *at,
+                                        text: text.trim().to_owned(),
+                                        height: 3.5,
+                                        align: wc_core::geom::Align::Left,
+                                    },
+                                )
+                            {
+                                self.ed.select_only(sel);
+                            }
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -906,6 +964,9 @@ impl eframe::App for App {
         }
         for a in page_actions {
             self.run(a);
+        }
+        if let Some(at) = self.ed.ask_text.take() {
+            self.dialog = Some(Dialog::Text(at, String::new(), false));
         }
         self.dialogs(ctx);
 

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use wc_core::geom::{Point, Rotation};
+use wc_core::geom::{Align, Point, Rotation, Shape};
 use wc_core::{Device, DeviceTag, Endpoint, Page, PlacedSymbol, Wire};
 
 use crate::state::{Open, Selection};
@@ -14,13 +14,15 @@ pub struct Clipboard {
     pub wires: Vec<Wire>,
     /// Devices of the copied symbols, so a paste into another project keeps descriptions and parts.
     pub devices: BTreeMap<DeviceTag, Device>,
+    /// Free drawings (lines, rectangles, texts).
+    pub graphics: Vec<Shape>,
     /// Top-left corner of what was copied; a paste puts this corner at the pointer.
     pub anchor: Point,
 }
 
 impl Clipboard {
     pub fn is_empty(&self) -> bool {
-        self.symbols.is_empty() && self.wires.is_empty()
+        self.symbols.is_empty() && self.wires.is_empty() && self.graphics.is_empty()
     }
 
     /// A plain-text line for the system clipboard: the copied device tags.
@@ -48,9 +50,83 @@ fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
         match s {
             Selection::Symbol(id) => syms.insert(id.as_str()),
             Selection::Wire(id) => wires.insert(id.as_str()),
+            Selection::Graphic(_) => false,
         };
     }
     (syms, wires)
+}
+
+fn graphic_ids(sel: &[Selection]) -> BTreeSet<usize> {
+    sel.iter()
+        .filter_map(|s| match s {
+            Selection::Graphic(i) => Some(*i),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Rough box of a text: the editor and the PDF use similar sans fonts, about 0.6 em per letter.
+pub fn text_box(at: Point, height: f64, align: Align, text: &str) -> (Point, Point) {
+    let w = 0.6 * height * text.chars().count().max(1) as f64;
+    let x0 = match align {
+        Align::Left => at.x,
+        Align::Center => at.x - w / 2.0,
+        Align::Right => at.x - w,
+    };
+    (Point::new(x0, at.y - height), Point::new(x0 + w, at.y))
+}
+
+/// Bounds of a free drawing, with the real extent of texts.
+pub fn graphic_bounds(g: &Shape) -> (Point, Point) {
+    match g {
+        Shape::Text {
+            at,
+            text,
+            height,
+            align,
+        } => text_box(*at, *height, *align, text),
+        _ => g.bounds(),
+    }
+}
+
+fn seg_dist(p: Point, a: Point, b: Point) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 == 0.0 {
+        0.0
+    } else {
+        (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0)
+    };
+    p.distance(Point::new(a.x + t * dx, a.y + t * dy))
+}
+
+/// Is `at` on the drawing (within `tol` mm of its lines, or inside a text)?
+pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
+    let near_path = |pts: &[Point]| pts.windows(2).any(|ab| seg_dist(at, ab[0], ab[1]) <= tol);
+    match g {
+        Shape::Line { a, b } => seg_dist(at, *a, *b) <= tol,
+        Shape::Polyline { points, closed } => {
+            let mut pts = points.clone();
+            if *closed && let Some(f) = points.first() {
+                pts.push(*f);
+            }
+            near_path(&pts)
+        }
+        Shape::Rect { min, max } => near_path(&[*min, Point::new(max.x, min.y), *max, Point::new(min.x, max.y), *min]),
+        Shape::Circle { center, radius, filled } => {
+            let d = at.distance(*center);
+            if *filled {
+                d <= radius + tol
+            } else {
+                (d - radius).abs() <= tol
+            }
+        }
+        Shape::Arc { center, radius, .. } => (at.distance(*center) - radius).abs() <= tol,
+        Shape::Text { .. } => {
+            let (a, b) = graphic_bounds(g);
+            at.x >= a.x - tol && at.x <= b.x + tol && at.y >= a.y - tol && at.y <= b.y + tol
+        }
+    }
 }
 
 fn pin_item(e: &Endpoint) -> Option<&str> {
@@ -84,6 +160,7 @@ impl Open {
             .iter()
             .map(|s| Selection::Symbol(s.id.clone()))
             .chain(p.wires.iter().map(|w| Selection::Wire(w.id.clone())))
+            .chain((0..p.graphics.len()).map(Selection::Graphic))
             .collect()
     }
 
@@ -110,7 +187,42 @@ impl Open {
                 out.push(Selection::Wire(w.id.clone()));
             }
         }
+        for (i, g) in p.graphics.iter().enumerate() {
+            let (c, d) = graphic_bounds(g);
+            if inside(c) && inside(d) {
+                out.push(Selection::Graphic(i));
+            }
+        }
         out
+    }
+
+    /// Add a free drawing to a page and return its selection.
+    pub fn add_graphic(&mut self, page: usize, g: Shape) -> Option<Selection> {
+        self.project.pages.get(page)?;
+        self.checkpoint();
+        let p = self.project.pages.get_mut(page)?;
+        p.graphics.push(g);
+        Some(Selection::Graphic(p.graphics.len() - 1))
+    }
+
+    /// Change a text's content and height. An empty text is refused.
+    pub fn set_text(&mut self, page: usize, index: usize, new_text: &str, new_height: f64) -> bool {
+        let Some(Shape::Text { text, height, .. }) = self.project.pages.get(page).and_then(|p| p.graphics.get(index))
+        else {
+            return false;
+        };
+        let h = new_height.clamp(0.5, 50.0);
+        if new_text.is_empty() || (text == new_text && *height == h) {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(Shape::Text { text, height, .. }) =
+            self.project.pages.get_mut(page).and_then(|p| p.graphics.get_mut(index))
+        {
+            *text = new_text.to_owned();
+            *height = h;
+        }
+        true
     }
 
     /// Move the selection by `d`. The caller takes the undo checkpoint (once per drag).
@@ -144,6 +256,11 @@ impl Open {
                 }
             }
         }
+        for i in graphic_ids(sel) {
+            if let Some(g) = p.graphics.get_mut(i) {
+                *g = g.translate(d);
+            }
+        }
         self.dirty = true;
     }
 
@@ -163,6 +280,12 @@ impl Open {
                 && ![&w.from, &w.to]
                     .iter()
                     .any(|e| pin_item(e).is_some_and(|i| syms.contains(i)))
+        });
+        let gone = graphic_ids(sel);
+        let mut i = 0;
+        p.graphics.retain(|_| {
+            i += 1;
+            !gone.contains(&(i - 1))
         });
     }
 
@@ -235,6 +358,15 @@ impl Open {
         for w in &out_wires {
             pts.extend(self.wire_points(p, w).unwrap_or_default());
         }
+        let graphics: Vec<Shape> = graphic_ids(sel)
+            .into_iter()
+            .filter_map(|i| p.graphics.get(i).cloned())
+            .collect();
+        for g in &graphics {
+            let (a, b) = graphic_bounds(g);
+            pts.push(a);
+            pts.push(b);
+        }
         let anchor = if pts.is_empty() {
             Point::new(0.0, 0.0)
         } else {
@@ -244,6 +376,7 @@ impl Open {
             symbols,
             wires: out_wires,
             devices,
+            graphics,
             anchor,
         }
     }
@@ -316,6 +449,10 @@ impl Open {
             out.push(Selection::Wire(w.id.clone()));
             p.wires.push(w);
         }
+        for g in &clip.graphics {
+            p.graphics.push(g.translate(d));
+            out.push(Selection::Graphic(p.graphics.len() - 1));
+        }
         out
     }
 }
@@ -382,6 +519,55 @@ mod tests {
         // Undo removes the whole paste.
         assert!(o.undo());
         assert_eq!(o.project.pages[page].symbols.len(), 2);
+    }
+
+    #[test]
+    fn free_drawings_are_hit_selected_moved_copied_and_deleted() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let line = o
+            .add_graphic(
+                page,
+                Shape::Line {
+                    a: Point::new(200.0, 20.0),
+                    b: Point::new(260.0, 20.0),
+                },
+            )
+            .unwrap();
+        let text = o
+            .add_graphic(
+                page,
+                Shape::Text {
+                    at: Point::new(200.0, 40.0),
+                    text: "Pump 1".into(),
+                    height: 3.0,
+                    align: Align::Left,
+                },
+            )
+            .unwrap();
+        let p = &o.project.pages[page];
+        assert!(graphic_hit(&p.graphics[0], Point::new(230.0, 20.5), 1.0));
+        assert!(!graphic_hit(&p.graphics[0], Point::new(230.0, 25.0), 1.0));
+        assert!(graphic_hit(&p.graphics[1], Point::new(203.0, 39.0), 0.5));
+        let boxed = o.select_in(page, Point::new(190.0, 10.0), Point::new(270.0, 45.0));
+        assert_eq!(boxed, vec![line.clone(), text.clone()]);
+        assert!(o.set_text(page, 1, "Pump 2", 5.0));
+        assert!(!o.set_text(page, 1, "", 5.0));
+        o.move_by(page, std::slice::from_ref(&line), Point::new(0.0, 10.0));
+        assert_eq!(
+            o.project.pages[page].graphics[0],
+            Shape::Line {
+                a: Point::new(200.0, 30.0),
+                b: Point::new(260.0, 30.0),
+            }
+        );
+        let clip = o.copy(page, &boxed);
+        assert_eq!(clip.graphics.len(), 2);
+        let pasted = o.paste(page, &clip, Point::new(10.0, 10.0));
+        assert_eq!(pasted, vec![Selection::Graphic(2), Selection::Graphic(3)]);
+        o.delete_many(page, &[line]);
+        let left = &o.project.pages[page].graphics;
+        assert_eq!(left.len(), 3);
+        assert!(matches!(&left[0], Shape::Text { text, .. } if text == "Pump 2"));
     }
 
     #[test]
