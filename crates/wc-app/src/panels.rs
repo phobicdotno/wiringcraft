@@ -344,6 +344,10 @@ fn committed(r: &egui::Response) -> bool {
 pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState) {
     let t = Theme::of(ui.ctx());
     section(ui, "Properties", None);
+    if let Some(pi) = ed.panel {
+        panel_properties(ui, open, ed, pi);
+        return;
+    }
     load_buffers(open, ed, ps);
     let page_idx = ed.page;
     if ed.selection.len() > 1 {
@@ -811,4 +815,68 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
             }
         });
     });
+}
+
+/// The properties of the panel layout shown: plate size, the picked device, and the devices
+/// with a part that are not on the plate yet.
+fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
+    use wc_core::panel::{PanelItem, on_door, part_size};
+    let t = Theme::of(ui.ctx());
+    let Some(panel) = open.project.panels.get(pi) else {
+        return;
+    };
+    ui.label(RichText::new(&panel.name).strong());
+    ui.label(RichText::new(format!("Mounting plate {} x {} mm", panel.width, panel.height)).color(t.faint));
+    ui.add_space(6.0);
+    if let Some(PanelItem::Device { tag, at, width, height }) = ed.panel_pick.and_then(|i| panel.items.get(i)) {
+        let dev = open.project.devices.get(tag);
+        egui::Grid::new("panel-dev")
+            .num_columns(2)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Device").color(t.muted));
+                ui.label(tag.to_string());
+                ui.end_row();
+                ui.label(RichText::new("Description").color(t.muted));
+                ui.label(dev.map(|d| d.description.as_str()).unwrap_or(""));
+                ui.end_row();
+                ui.label(RichText::new("Part").color(t.muted));
+                ui.label(dev.and_then(|d| d.part.as_deref()).unwrap_or("none"));
+                ui.end_row();
+                ui.label(RichText::new("Size").color(t.muted));
+                ui.label(format!("{width} x {height} mm"));
+                ui.end_row();
+                ui.label(RichText::new("Position").color(t.muted));
+                ui.label(format!("x {:.0}, y {:.0} mm", at.x, at.y));
+                ui.end_row();
+            });
+        ui.add_space(6.0);
+    } else {
+        ui.label(RichText::new("Click a device on the plate to see it; drag it to move it.").color(t.faint));
+        ui.add_space(6.0);
+    }
+    // Devices with a part that could go on the plate but are not on it.
+    let on_plate = panel.device_tags();
+    let missing: Vec<String> = open
+        .project
+        .devices
+        .iter()
+        .filter(|(tag, _)| !on_plate.contains(*tag))
+        .filter_map(|(tag, d)| {
+            let part = open.parts.get(d.part.as_ref()?)?;
+            (!on_door(part)).then(|| {
+                let size = part_size(part).map_or_else(|| "no size".to_owned(), |(w, h)| format!("{w} x {h}"));
+                format!("{tag}  ({size})")
+            })
+        })
+        .collect();
+    if missing.is_empty() {
+        ui.label(RichText::new("Every device with a part is on the plate.").color(t.faint));
+    } else {
+        ui.label(RichText::new(format!("Not on the plate yet ({})", missing.len())).color(t.muted));
+        for m in missing {
+            ui.label(RichText::new(m).monospace());
+        }
+        ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+    }
 }
