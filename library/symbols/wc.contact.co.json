@@ -1,0 +1,122 @@
+{
+  "category": "contacts",
+  "description": "Changeover contact of a relay: one common, one break and one make side.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "b": {
+        "x": 3.6,
+        "y": 10.2
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -4.0,
+        "y": 15.0
+      },
+      "b": {
+        "x": -4.0,
+        "y": 9.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -4.0,
+        "y": 9.0
+      },
+      "b": {
+        "x": -1.5,
+        "y": 9.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 4.0,
+        "y": 15.0
+      },
+      "b": {
+        "x": 4.0,
+        "y": 10.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "11"
+    },
+    {
+      "at": {
+        "x": -7.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "12"
+    },
+    {
+      "at": {
+        "x": 5.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "14"
+    }
+  ],
+  "id": "wc.contact.co",
+  "letter_code": "K",
+  "name": "Changeover contact",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "11"
+    },
+    {
+      "at": {
+        "x": -4.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "12"
+    },
+    {
+      "at": {
+        "x": 4.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "14"
+    }
+  ],
+  "role": "auxiliary",
+  "tag_at": {
+    "x": -8.0,
+    "y": 7.0
+  }
+}

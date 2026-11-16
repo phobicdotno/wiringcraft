@@ -1,0 +1,129 @@
+{
+  "category": "sensors",
+  "description": "Inductive or capacitive proximity sensor, 3-wire: supply on BN and BU, output on BK.",
+  "graphics": [
+    {
+      "kind": "rect",
+      "max": {
+        "x": 7.0,
+        "y": 11.0
+      },
+      "min": {
+        "x": -7.0,
+        "y": 4.0
+      }
+    },
+    {
+      "a": {
+        "x": -5.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": -5.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 5.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 11.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "closed": true,
+      "kind": "polyline",
+      "points": [
+        {
+          "x": -2.5,
+          "y": 9.0
+        },
+        {
+          "x": 0.0,
+          "y": 6.0
+        },
+        {
+          "x": 2.5,
+          "y": 9.0
+        }
+      ]
+    },
+    {
+      "at": {
+        "x": -3.8,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "BN"
+    },
+    {
+      "at": {
+        "x": 6.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "BU"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "BK"
+    }
+  ],
+  "id": "wc.sensor.prox3",
+  "letter_code": "B",
+  "name": "Proximity sensor, 3-wire",
+  "pins": [
+    {
+      "at": {
+        "x": -5.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "BN"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "BK"
+    },
+    {
+      "at": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "BU"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -10.0,
+    "y": 8.0
+  }
+}
