@@ -1,0 +1,197 @@
+#![allow(clippy::unwrap_used)]
+
+use super::*;
+use wc_core::geom::{Point, Rotation};
+use wc_core::symbol::{Pin, PinDir};
+use wc_core::{Device, Page, PlacedSymbol, Wire};
+
+fn sym(id: &str, role: SymbolRole, pins: &[&str]) -> Symbol {
+    Symbol {
+        id: id.into(),
+        name: id.into(),
+        category: String::new(),
+        letter_code: String::new(),
+        role,
+        graphics: vec![],
+        pins: pins
+            .iter()
+            .enumerate()
+            .map(|(n, p)| Pin {
+                name: (*p).into(),
+                at: Point::new(0.0, 10.0 * n as f64),
+                dir: PinDir::Down,
+            })
+            .collect(),
+        tag_at: Point::default(),
+        description: String::new(),
+    }
+}
+
+fn place(id: &str, symbol: &str, x: f64, tag: Option<&str>) -> PlacedSymbol {
+    PlacedSymbol {
+        id: id.into(),
+        symbol: symbol.into(),
+        at: Point::new(x, 50.0),
+        rotation: Rotation::R0,
+        mirror: false,
+        tag: tag.map(|t| DeviceTag::parse(t).unwrap()),
+    }
+}
+
+fn pin(item: &str, pin: &str) -> Endpoint {
+    Endpoint::Pin {
+        item: item.into(),
+        pin: pin.into(),
+    }
+}
+
+fn wire(id: &str, from: Endpoint, to: Endpoint, number: Option<&str>, potential: Option<&str>) -> Wire {
+    Wire {
+        id: id.into(),
+        from,
+        to,
+        via: vec![],
+        number: number.map(Into::into),
+        potential: potential.map(Into::into),
+    }
+}
+
+fn fixture() -> (Project, BTreeMap<String, Symbol>, BTreeMap<String, Part>) {
+    let mut p = Project::new("Test");
+    let mut page = Page::new("p2", "2", "Control");
+    page.symbols = vec![
+        place("s1", "coil", 50.0, Some("=A+C1-K1")),
+        place("s2", "no", 80.0, Some("=A+C1-K1")),
+        place("s3", "term", 120.0, Some("-X1.2")),
+        place("s4", "term", 110.0, Some("-X1.1")),
+        place("s5", "term", 130.0, Some("-X2")),
+        place("s6", "lamp", 150.0, Some("-P1")),
+    ];
+    page.wires = vec![
+        wire(
+            "w1",
+            Endpoint::Point {
+                at: Point::new(50.0, 20.0),
+            },
+            pin("s1", "A1"),
+            Some("1"),
+            Some("24V"),
+        ),
+        wire("w2", pin("s2", "14"), pin("s4", "1"), Some("2"), None),
+        wire("w3", pin("s4", "2"), pin("s6", "X1"), Some("3"), None),
+        wire("w4", pin("s1", "A2"), pin("s5", "1"), None, Some("0V")),
+    ];
+    p.pages.push(page);
+    let part = Part {
+        id: "acme.r24".into(),
+        manufacturer: "Acme".into(),
+        order_number: "R-24, DC".into(),
+        description: "Relay 24 V".into(),
+        ..Default::default()
+    };
+    p.devices.insert(
+        DeviceTag::parse("=A+C1-K1").unwrap(),
+        Device {
+            part: Some(part.id.clone()),
+            description: "Pump relay".into(),
+            ..Default::default()
+        },
+    );
+    let symbols = [
+        sym("coil", SymbolRole::Main, &["A1", "A2"]),
+        sym("no", SymbolRole::Auxiliary, &["13", "14"]),
+        sym("term", SymbolRole::Terminal, &["1", "2"]),
+        sym("lamp", SymbolRole::Standalone, &["X1", "X2"]),
+    ]
+    .into_iter()
+    .map(|s| (s.id.clone(), s))
+    .collect();
+    let parts = [(part.id.clone(), part)].into_iter().collect();
+    (p, symbols, parts)
+}
+
+#[test]
+fn parts_list_groups_by_part_and_lists_gaps() {
+    let (p, s, parts) = fixture();
+    let t = parts_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0], ["1", "1", "Acme", "R-24, DC", "Relay 24 V", "=A+C1-K1"]);
+    // -P1, -X1.1, -X1.2, -X2 have no part.
+    assert_eq!(t.rows.len(), 5);
+    assert!(t.rows[1..].iter().all(|r| r[4] == "no part assigned"));
+    // The comma in the order number is quoted in CSV.
+    assert!(t.to_csv().contains("\"R-24, DC\""));
+    assert!(t.to_markdown().starts_with("## Parts list\n\n| Pos | Qty |"));
+}
+
+#[test]
+fn device_list_merges_symbols_of_one_device() {
+    let (p, s, parts) = fixture();
+    let t = device_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let k1 = t.rows.iter().find(|r| r[0] == "=A+C1-K1").unwrap();
+    assert_eq!(k1, &["=A+C1-K1", "Pump relay", "acme.r24", "coil, no", "2"]);
+}
+
+#[test]
+fn wire_list_names_both_ends_and_inherits_potentials() {
+    let (p, s, parts) = fixture();
+    let t = wire_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0], ["2", "1", "24V", "junction 50.0,20.0", "=A+C1-K1:A1"]);
+    assert_eq!(t.rows[1][3..], ["=A+C1-K1:14", "-X1.1:1"]);
+    // w4 carries 0V itself.
+    assert_eq!(t.rows[3][2], "0V");
+}
+
+#[test]
+fn terminal_plan_sorts_numbers_and_shows_both_sides() {
+    let (p, s, parts) = fixture();
+    let t = terminal_plan(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let x1: Vec<&Vec<String>> = t.rows.iter().filter(|r| r[0] == "-X1").collect();
+    assert_eq!(x1.len(), 2);
+    assert_eq!(x1[0][1], "1");
+    assert_eq!(x1[0][2], "=A+C1-K1:14");
+    assert_eq!(x1[0][3], "-P1:X1");
+    assert_eq!(x1[1][1], "2");
+    assert_eq!(x1[1][2], "");
+    // -X2 has no number in its tag: numbered in drawing order, and it is on the 0V net.
+    let x2 = t.rows.iter().find(|r| r[0] == "-X2").unwrap();
+    assert_eq!(
+        (x2[1].as_str(), x2[2].as_str(), x2[4].as_str()),
+        ("1", "=A+C1-K1:A2", "0V")
+    );
+}
+
+#[test]
+fn net_list_joins_across_wires() {
+    let (p, s, parts) = fixture();
+    let t = net_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let zero = t.rows.iter().find(|r| r[0] == "0V").unwrap();
+    assert_eq!(zero[2], "-X2:1, =A+C1-K1:A2");
+    assert!(Kind::ALL.iter().all(|k| Kind::parse(k.name()) == Some(*k)));
+}
+
+#[test]
+fn natural_order() {
+    let mut v = vec!["X10", "X2", "X1"];
+    v.sort_by_key(|s| natural_key(s));
+    assert_eq!(v, ["X1", "X2", "X10"]);
+}

@@ -1,0 +1,743 @@
+//! The schematic canvas: paper, frame, grid, page graphics, wires and symbols, plus the
+//! mouse handling for the select, place and wire tools.
+//!
+//! Page coordinates are millimetres with y pointing down, like the paper and the PDF export.
+
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape as EShape, Stroke, Vec2};
+use wc_core::geom::{Align, Point};
+use wc_core::{Endpoint, Page, Shape};
+
+use crate::state::{Open, Selection, Tool};
+use crate::theme;
+
+const MARGIN: f64 = 10.0;
+const HEADER: f64 = 6.0;
+const TITLE_H: f64 = 24.0;
+/// How close (in mm) a click must be to a pin to snap a wire to it.
+const PIN_CATCH: f64 = 2.0;
+
+/// Pan and zoom: `zoom` is screen points per millimetre, `offset` is where the page origin sits
+/// relative to the canvas' top-left corner.
+#[derive(Debug, Clone, Copy)]
+pub struct View {
+    pub zoom: f32,
+    pub offset: Vec2,
+    /// Fit the page on the next frame (after opening, or when asked).
+    pub fit: bool,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            zoom: 3.0,
+            offset: Vec2::new(20.0, 20.0),
+            fit: true,
+        }
+    }
+}
+
+/// Everything the canvas needs besides the project.
+pub struct Editor {
+    pub page: usize,
+    pub tool: Tool,
+    pub selection: Option<Selection>,
+    /// Library symbol the place tool puts down.
+    pub place_symbol: Option<String>,
+    /// A wire being drawn: its start and the bends so far.
+    pub wire: Option<(Endpoint, Vec<Point>)>,
+    pub view: View,
+    pub cursor: Option<Point>,
+    /// A symbol being dragged and whether the undo checkpoint for the drag was taken.
+    drag: Option<(String, bool)>,
+    pub message: String,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self {
+            page: 0,
+            tool: Tool::Select,
+            selection: None,
+            place_symbol: None,
+            wire: None,
+            view: View::default(),
+            cursor: None,
+            drag: None,
+            message: String::new(),
+        }
+    }
+}
+
+struct Xf {
+    origin: Pos2,
+    zoom: f32,
+}
+
+impl Xf {
+    fn s(&self, p: Point) -> Pos2 {
+        self.origin + Vec2::new(p.x as f32, p.y as f32) * self.zoom
+    }
+    fn mm(&self, p: Pos2) -> Point {
+        let v = (p - self.origin) / self.zoom;
+        Point::new(f64::from(v.x), f64::from(v.y))
+    }
+    fn len(&self, mm: f64) -> f32 {
+        mm as f32 * self.zoom
+    }
+}
+
+fn snap(p: Point, step: f64) -> Point {
+    if step <= 0.0 {
+        return p;
+    }
+    Point::new((p.x / step).round() * step, (p.y / step).round() * step)
+}
+
+fn arc_points(center: Point, r: f64, start: f64, end: f64) -> Vec<Point> {
+    let mut sweep = end - start;
+    if sweep <= 0.0 {
+        sweep += 360.0;
+    }
+    let n = ((sweep / 10.0).ceil() as usize).clamp(2, 72);
+    (0..=n)
+        .map(|i| {
+            let t = (start + sweep * i as f64 / n as f64).to_radians();
+            Point::new(center.x + r * t.cos(), center.y + r * t.sin())
+        })
+        .collect()
+}
+
+fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
+    match s {
+        Shape::Line { a, b } => {
+            p.line_segment([xf.s(*a), xf.s(*b)], stroke);
+        }
+        Shape::Polyline { points, closed } => {
+            let pts: Vec<Pos2> = points.iter().map(|q| xf.s(*q)).collect();
+            if *closed {
+                p.add(EShape::closed_line(pts, stroke));
+            } else {
+                p.add(EShape::line(pts, stroke));
+            }
+        }
+        Shape::Rect { min, max } => {
+            p.rect_stroke(
+                Rect::from_two_pos(xf.s(*min), xf.s(*max)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+        }
+        Shape::Circle { center, radius, filled } => {
+            if *filled {
+                p.circle_filled(xf.s(*center), xf.len(*radius), stroke.color);
+            } else {
+                p.circle_stroke(xf.s(*center), xf.len(*radius), stroke);
+            }
+        }
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => {
+            let pts = arc_points(*center, *radius, *start, *end)
+                .into_iter()
+                .map(|q| xf.s(q))
+                .collect();
+            p.add(EShape::line(pts, stroke));
+        }
+        Shape::Text {
+            at,
+            text,
+            height,
+            align,
+        } => {
+            let a = match align {
+                Align::Left => Align2::LEFT_BOTTOM,
+                Align::Center => Align2::CENTER_BOTTOM,
+                Align::Right => Align2::RIGHT_BOTTOM,
+            };
+            text_mm(p, xf, *at, *height, a, text, stroke.color);
+        }
+    }
+}
+
+/// Text whose baseline sits at `at`, `height` mm tall (the PDF's font size).
+fn text_mm(p: &egui::Painter, xf: &Xf, at: Point, height: f64, align: Align2, text: &str, c: Color32) {
+    let size = xf.len(height) * 1.15;
+    if size < 3.0 {
+        return; // Too small to read: skip rather than smear.
+    }
+    // egui places the text box; nudge down so the baseline, not the box bottom, sits on `at`.
+    let pos = xf.s(at) + Vec2::new(0.0, size * 0.22);
+    p.text(pos, align, text, FontId::proportional(size), c);
+}
+
+/// Distance from `p` to the segment `a`-`b`.
+fn seg_dist(p: Point, a: Point, b: Point) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    p.distance(Point::new(a.x + t * dx, a.y + t * dy))
+}
+
+impl Open {
+    /// The bounding box of a placed symbol in page mm.
+    pub fn symbol_bounds(&self, page: &Page, id: &str) -> Option<(Point, Point)> {
+        let placed = page.symbol(id)?;
+        let Some(sym) = self.symbols.get(&placed.symbol) else {
+            return Some((placed.at + Point::new(-4.0, -4.0), placed.at + Point::new(4.0, 4.0)));
+        };
+        let mut pts = vec![placed.at];
+        for g in &sym.graphics {
+            let (a, b) = g.placed(placed.at, placed.rotation, placed.mirror).bounds();
+            pts.push(a);
+            pts.push(b);
+        }
+        Some(wc_core::geom::bounds_of(&pts))
+    }
+
+    /// Points of a wire, ends resolved; `None` when an end is on a missing symbol.
+    pub fn wire_points(&self, page: &Page, w: &wc_core::Wire) -> Option<Vec<Point>> {
+        let mut pts = vec![self.end_pos(page, &w.from)?];
+        pts.extend(w.via.iter().copied());
+        pts.push(self.end_pos(page, &w.to)?);
+        Some(pts)
+    }
+
+    /// The nearest pin to `at` within `catch` mm.
+    pub fn pin_near(&self, page: &Page, at: Point, catch: f64) -> Option<(String, String, Point)> {
+        let mut best: Option<(f64, (String, String, Point))> = None;
+        for s in &page.symbols {
+            let Some(sym) = self.symbols.get(&s.symbol) else {
+                continue;
+            };
+            for pin in &sym.pins {
+                let pos = pin.at.transform(s.rotation, s.mirror) + s.at;
+                let d = pos.distance(at);
+                if d <= catch && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, (s.id.clone(), pin.name.clone(), pos)));
+                }
+            }
+        }
+        best.map(|(_, b)| b)
+    }
+
+    /// What is under `at` on a page: symbols win over wires.
+    pub fn hit(&self, page: &Page, at: Point, tol: f64) -> Option<Selection> {
+        for s in page.symbols.iter().rev() {
+            if let Some((a, b)) = self.symbol_bounds(page, &s.id)
+                && at.x >= a.x - tol
+                && at.x <= b.x + tol
+                && at.y >= a.y - tol
+                && at.y <= b.y + tol
+            {
+                return Some(Selection::Symbol(s.id.clone()));
+            }
+        }
+        for w in page.wires.iter().rev() {
+            if let Some(pts) = self.wire_points(page, w)
+                && pts.windows(2).any(|ab| seg_dist(at, ab[0], ab[1]) <= tol)
+            {
+                return Some(Selection::Wire(w.id.clone()));
+            }
+        }
+        None
+    }
+}
+
+fn paint_frame(p: &egui::Painter, xf: &Xf, open: &Open, page: &Page, c: Color32, faint: Color32) {
+    let (w, h) = page.size.mm();
+    let (x0, y0, x1, y1) = (MARGIN, MARGIN, w - MARGIN, h - MARGIN);
+    let thick = Stroke::new(xf.len(0.5).max(1.0), c);
+    let thin = Stroke::new(xf.len(0.25).max(0.6), c);
+    p.rect_stroke(
+        Rect::from_two_pos(xf.s(Point::new(x0, y0)), xf.s(Point::new(x1, y1))),
+        0.0,
+        thick,
+        egui::StrokeKind::Middle,
+    );
+    p.line_segment(
+        [xf.s(Point::new(x0, y0 + HEADER)), xf.s(Point::new(x1, y0 + HEADER))],
+        thin,
+    );
+    let cols = wc_pdf::FRAME_COLUMNS;
+    let col_w = (x1 - x0) / cols as f64;
+    for i in 0..cols {
+        let cx = x0 + col_w * i as f64;
+        if i > 0 {
+            p.line_segment([xf.s(Point::new(cx, y0)), xf.s(Point::new(cx, y0 + HEADER))], thin);
+        }
+        text_mm(
+            p,
+            xf,
+            Point::new(cx + col_w / 2.0, y0 + HEADER - 1.8),
+            2.5,
+            Align2::CENTER_BOTTOM,
+            &(i + 1).to_string(),
+            c,
+        );
+    }
+    let ty = y1 - TITLE_H;
+    p.line_segment([xf.s(Point::new(x0, ty)), xf.s(Point::new(x1, ty))], thick);
+    let fx = [x0, x0 + 80.0, x1 - 150.0, x1 - 60.0, x1 - 30.0];
+    for x in fx.iter().skip(1) {
+        p.line_segment([xf.s(Point::new(*x, ty)), xf.s(Point::new(*x, y1))], thin);
+    }
+    p.line_segment(
+        [
+            xf.s(Point::new(fx[2], ty + TITLE_H / 2.0)),
+            xf.s(Point::new(x1, ty + TITLE_H / 2.0)),
+        ],
+        thin,
+    );
+    let tb = &open.project.meta.title_block;
+    let get = |k: &str| tb.get(k).map(String::as_str).unwrap_or("");
+    let label =
+        |x: f64, y: f64, l: &str| text_mm(p, xf, Point::new(x + 1.5, y + 3.0), 1.8, Align2::LEFT_BOTTOM, l, faint);
+    label(fx[0], ty, "Customer");
+    text_mm(
+        p,
+        xf,
+        Point::new(fx[0] + 1.5, ty + 10.0),
+        3.0,
+        Align2::LEFT_BOTTOM,
+        get("customer"),
+        c,
+    );
+    label(fx[1], ty, "Project");
+    text_mm(
+        p,
+        xf,
+        Point::new(fx[1] + 3.0, ty + 11.0),
+        4.0,
+        Align2::LEFT_BOTTOM,
+        &open.project.meta.name,
+        c,
+    );
+    text_mm(
+        p,
+        xf,
+        Point::new(fx[1] + 3.0, ty + 19.5),
+        3.0,
+        Align2::LEFT_BOTTOM,
+        &page.title,
+        c,
+    );
+    label(fx[2], ty, "Revision");
+    text_mm(
+        p,
+        xf,
+        Point::new(fx[2] + 1.5, ty + 9.5),
+        2.5,
+        Align2::LEFT_BOTTOM,
+        get("revision"),
+        c,
+    );
+    label(fx[3], ty, "Page");
+    text_mm(
+        p,
+        xf,
+        Point::new(fx[3] + 15.0, ty + 10.0),
+        4.0,
+        Align2::CENTER_BOTTOM,
+        &page.number,
+        c,
+    );
+    label(fx[4], ty, "Sheet");
+    let total = open.project.pages.len();
+    let idx = open.project.pages.iter().position(|q| q.id == page.id).unwrap_or(0);
+    text_mm(
+        p,
+        xf,
+        Point::new(fx[4] + 15.0, ty + 10.0),
+        3.0,
+        Align2::CENTER_BOTTOM,
+        &format!("{} / {}", idx + 1, total),
+        c,
+    );
+}
+
+/// Show the canvas for the current page and handle the tools. Returns true when the project
+/// changed.
+pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool, snap_step: f64) {
+    let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    let t = theme::Theme::of(ui.ctx());
+    painter.rect_filled(rect, 0.0, t.backdrop);
+
+    let Some(page) = open.project.pages.get(ed.page).cloned() else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "This project has no pages yet. Use Pages → New page.",
+            FontId::proportional(16.0),
+            t.faint,
+        );
+        return;
+    };
+    let (pw, ph) = page.size.mm();
+
+    if ed.view.fit {
+        let z = ((rect.width() - 40.0) / pw as f32)
+            .min((rect.height() - 40.0) / ph as f32)
+            .max(0.2);
+        ed.view.zoom = z;
+        ed.view.offset = Vec2::new(
+            (rect.width() - pw as f32 * z) / 2.0,
+            (rect.height() - ph as f32 * z) / 2.0,
+        );
+        ed.view.fit = false;
+    }
+
+    // Zoom about the pointer with the wheel; pan with the middle or right button.
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.zoom_delta().ln() * 200.0);
+        if scroll.abs() > 0.0
+            && let Some(hp) = resp.hover_pos()
+        {
+            let factor = (scroll / 300.0).exp();
+            let new_zoom = (ed.view.zoom * factor).clamp(0.3, 60.0);
+            let anchor = hp - rect.min - ed.view.offset;
+            ed.view.offset += anchor - anchor * (new_zoom / ed.view.zoom);
+            ed.view.zoom = new_zoom;
+        }
+    }
+    if resp.dragged_by(egui::PointerButton::Middle) || resp.dragged_by(egui::PointerButton::Secondary) {
+        ed.view.offset += resp.drag_delta();
+    }
+
+    let xf = Xf {
+        origin: rect.min + ed.view.offset,
+        zoom: ed.view.zoom,
+    };
+    let paper = Rect::from_two_pos(xf.s(Point::new(0.0, 0.0)), xf.s(Point::new(pw, ph)));
+    painter.rect_filled(paper.translate(Vec2::new(3.0, 3.0)), 0.0, t.shadow);
+    painter.rect_filled(paper, 0.0, t.paper);
+
+    if show_grid {
+        let step = if xf.len(5.0) >= 8.0 { 5.0 } else { 10.0 };
+        if xf.len(step) >= 6.0 {
+            let mut y = step;
+            while y < ph {
+                let mut x = step;
+                while x < pw {
+                    painter.circle_filled(xf.s(Point::new(x, y)), 0.7, t.grid);
+                    x += step;
+                }
+                y += step;
+            }
+        }
+    }
+
+    paint_frame(&painter, &xf, open, &page, t.ink, t.faint);
+
+    let graphics_stroke = Stroke::new(xf.len(0.18).max(0.6), t.faint);
+    for g in &page.graphics {
+        paint_shape(&painter, &xf, g, graphics_stroke);
+    }
+
+    let sel = ed.selection.clone();
+    for w in &page.wires {
+        let Some(pts) = open.wire_points(&page, w) else {
+            continue;
+        };
+        let selected = sel == Some(Selection::Wire(w.id.clone()));
+        let c = if selected { t.selection } else { t.wire };
+        let stroke = Stroke::new(xf.len(0.35).max(1.2) * if selected { 2.0 } else { 1.0 }, c);
+        painter.add(EShape::line(pts.iter().map(|q| xf.s(*q)).collect(), stroke));
+        let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !label.is_empty() && pts.len() >= 2 {
+            let (a, b) = (pts[0], pts[1]);
+            let mid = Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+            if (a.x - b.x).abs() < (a.y - b.y).abs() {
+                text_mm(
+                    &painter,
+                    &xf,
+                    mid + Point::new(-1.0, 0.8),
+                    2.0,
+                    Align2::RIGHT_BOTTOM,
+                    &label.join(" "),
+                    t.wire_label,
+                );
+            } else {
+                text_mm(
+                    &painter,
+                    &xf,
+                    mid + Point::new(0.0, -1.0),
+                    2.0,
+                    Align2::CENTER_BOTTOM,
+                    &label.join(" "),
+                    t.wire_label,
+                );
+            }
+        }
+    }
+
+    for s in &page.symbols {
+        let selected = sel == Some(Selection::Symbol(s.id.clone()));
+        let c = if selected { t.selection } else { t.ink };
+        let stroke = Stroke::new(xf.len(0.3).max(1.0), c);
+        let Some(sym) = open.symbols.get(&s.symbol) else {
+            let r = Rect::from_center_size(xf.s(s.at), Vec2::splat(xf.len(8.0)));
+            painter.rect_stroke(r, 0.0, Stroke::new(1.5_f32, t.error), egui::StrokeKind::Middle);
+            painter.text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                "?",
+                FontId::proportional(xf.len(4.0)),
+                t.error,
+            );
+            continue;
+        };
+        for g in &sym.graphics {
+            paint_shape(&painter, &xf, &g.placed(s.at, s.rotation, s.mirror), stroke);
+        }
+        for pin in &sym.pins {
+            let pos = pin.at.transform(s.rotation, s.mirror) + s.at;
+            painter.circle_filled(xf.s(pos), xf.len(0.45).max(1.5), t.pin);
+        }
+        if let Some(tag) = &s.tag {
+            let ta = sym.tag_at.transform(s.rotation, s.mirror) + s.at;
+            let mut lines = Vec::new();
+            if !tag.function.is_empty() {
+                lines.push(format!("={}", tag.function.join(".")));
+            }
+            if !tag.location.is_empty() {
+                lines.push(format!("+{}", tag.location.join(".")));
+            }
+            lines.push(format!("-{}", tag.product.join(".")));
+            let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
+            for (i, l) in lines.iter().enumerate() {
+                text_mm(
+                    &painter,
+                    &xf,
+                    Point::new(ta.x, top + 3.0 * i as f64),
+                    2.5,
+                    Align2::RIGHT_BOTTOM,
+                    l,
+                    c,
+                );
+            }
+        }
+        if selected && let Some((a, b)) = open.symbol_bounds(&page, &s.id) {
+            let r = Rect::from_two_pos(xf.s(a), xf.s(b)).expand(4.0);
+            painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, t.selection), egui::StrokeKind::Outside);
+        }
+    }
+
+    // Pointer position in page mm, snapped.
+    let hover = resp.hover_pos().map(|hp| xf.mm(hp));
+    ed.cursor = hover.map(|p| snap(p, snap_step));
+    let tol = (6.0 / f64::from(xf.zoom)).max(0.8);
+
+    match ed.tool {
+        Tool::Select => select_tool(&resp, open, ed, &page, &xf, tol, snap_step),
+        Tool::Place => place_tool(&painter, &resp, open, ed, &xf, &t),
+        Tool::Wire => wire_tool(&painter, &resp, open, ed, &page, &xf, &t),
+    }
+}
+
+fn select_tool(
+    resp: &egui::Response,
+    open: &mut Open,
+    ed: &mut Editor,
+    page: &Page,
+    xf: &Xf,
+    tol: f64,
+    snap_step: f64,
+) {
+    if resp.clicked_by(egui::PointerButton::Primary)
+        && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
+    {
+        ed.selection = open.hit(page, at, tol);
+    }
+    if resp.drag_started_by(egui::PointerButton::Primary)
+        && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
+    {
+        ed.drag = match open.hit(page, at, tol) {
+            Some(Selection::Symbol(id)) => {
+                ed.selection = Some(Selection::Symbol(id.clone()));
+                Some((id, false))
+            }
+            _ => None,
+        };
+    }
+    if resp.dragged_by(egui::PointerButton::Primary)
+        && let Some((id, started)) = ed.drag.clone()
+        && let Some(cur) = ed.cursor
+    {
+        let current = page.symbol(&id).map(|s| s.at);
+        if let Some(at) = current {
+            // Move by whole snap steps so pins stay on the grid.
+            let target = snap(cur, snap_step);
+            if target != at {
+                if !started {
+                    open.checkpoint();
+                    ed.drag = Some((id.clone(), true));
+                }
+                if let Some(s) = open
+                    .project
+                    .pages
+                    .get_mut(ed.page)
+                    .and_then(|p| p.symbols.iter_mut().find(|s| s.id == id))
+                {
+                    s.at = target;
+                    open.dirty = true;
+                }
+            }
+        }
+    }
+    if resp.drag_stopped() {
+        ed.drag = None;
+    }
+}
+
+fn on_paper(open: &Open, page: usize, at: Point) -> bool {
+    open.project.pages.get(page).is_some_and(|p| {
+        let (w, h) = p.size.mm();
+        at.x >= 0.0 && at.y >= 0.0 && at.x <= w && at.y <= h
+    })
+}
+
+fn place_tool(
+    painter: &egui::Painter,
+    resp: &egui::Response,
+    open: &mut Open,
+    ed: &mut Editor,
+    xf: &Xf,
+    t: &theme::Theme,
+) {
+    let Some(id) = ed.place_symbol.clone() else {
+        ed.message = "Pick a symbol in the library panel to place it.".into();
+        return;
+    };
+    let Some(at) = ed.cursor else { return };
+    // Ghost preview of the symbol under the pointer.
+    if let Some(sym) = open.symbols.get(&id) {
+        let stroke = Stroke::new(xf.len(0.3).max(1.0), t.ghost);
+        for g in &sym.graphics {
+            paint_shape(painter, xf, &g.placed(at, wc_core::geom::Rotation::R0, false), stroke);
+        }
+    } else {
+        painter.rect_stroke(
+            Rect::from_center_size(xf.s(at), Vec2::splat(xf.len(8.0))),
+            0.0,
+            Stroke::new(1.0_f32, t.ghost),
+            egui::StrokeKind::Middle,
+        );
+    }
+    if resp.clicked_by(egui::PointerButton::Primary) {
+        if !on_paper(open, ed.page, at) {
+            ed.message = "Click on the sheet to place the symbol.".into();
+            return;
+        }
+        match open.place(ed.page, &id, at) {
+            Ok(sid) => {
+                ed.selection = Some(Selection::Symbol(sid));
+                ed.message = format!("Placed {id}.");
+            }
+            Err(e) => ed.message = format!("Could not place {id}: {e}"),
+        }
+    }
+}
+
+fn wire_tool(
+    painter: &egui::Painter,
+    resp: &egui::Response,
+    open: &mut Open,
+    ed: &mut Editor,
+    page: &Page,
+    xf: &Xf,
+    t: &theme::Theme,
+) {
+    let Some(cur) = ed.cursor else { return };
+    let raw = resp.hover_pos().map(|p| xf.mm(p)).unwrap_or(cur);
+    let near = open.pin_near(page, raw, PIN_CATCH);
+    let target = near.as_ref().map(|(_, _, p)| *p).unwrap_or(cur);
+    if let Some((_, _, p)) = &near {
+        painter.circle_stroke(xf.s(*p), 6.0, Stroke::new(1.5_f32, t.selection));
+    }
+    if let Some((start, via)) = &ed.wire {
+        let mut pts = vec![open.end_pos(page, start).unwrap_or(target)];
+        pts.extend(via.iter().copied());
+        // Rubber band: an orthogonal elbow from the last point to the pointer.
+        if let Some(last) = pts.last().copied()
+            && last.x != target.x
+            && last.y != target.y
+        {
+            pts.push(Point::new(last.x, target.y));
+        }
+        pts.push(target);
+        painter.add(EShape::line(
+            pts.iter().map(|q| xf.s(*q)).collect(),
+            Stroke::new(1.5_f32, t.ghost),
+        ));
+    }
+    let end = match &near {
+        Some((item, pin, _)) => Endpoint::Pin {
+            item: item.clone(),
+            pin: pin.clone(),
+        },
+        None => Endpoint::Point { at: cur },
+    };
+    if resp.double_clicked() {
+        if let Some((start, mut via)) = ed.wire.take() {
+            // The first click of the double click already added this point as a bend.
+            if via.last() == Some(&cur) {
+                via.pop();
+            }
+            finish_wire(open, ed, page, start, via, end);
+        }
+        return;
+    }
+    if resp.clicked_by(egui::PointerButton::Primary) {
+        match ed.wire.take() {
+            None => {
+                ed.wire = Some((end, Vec::new()));
+                ed.message =
+                    "Click bends, then a pin to finish (double-click ends on a free point, Esc cancels).".into();
+            }
+            Some((start, mut via)) => {
+                if near.is_some() {
+                    finish_wire(open, ed, page, start, via, end);
+                } else {
+                    let last = via.last().copied().or_else(|| open.end_pos(page, &start));
+                    if let Some(l) = last
+                        && l.x != cur.x
+                        && l.y != cur.y
+                    {
+                        via.push(Point::new(l.x, cur.y));
+                    }
+                    via.push(cur);
+                    ed.wire = Some((start, via));
+                }
+            }
+        }
+    }
+}
+
+fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, mut via: Vec<Point>, end: Endpoint) {
+    // Keep it orthogonal: add an elbow before the end if the last leg is diagonal.
+    let last = via.last().copied().or_else(|| open.end_pos(page, &start));
+    if let (Some(l), Some(e)) = (last, open.end_pos(page, &end))
+        && l.x != e.x
+        && l.y != e.y
+    {
+        via.push(Point::new(l.x, e.y));
+    }
+    if start == end {
+        ed.message = "A wire needs two different ends.".into();
+        return;
+    }
+    open.add_wire(ed.page, start, end, via);
+    ed.message = "Wire added.".into();
+}

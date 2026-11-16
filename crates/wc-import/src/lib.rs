@@ -6,6 +6,7 @@ pub mod aml;
 pub mod archive;
 pub mod csv;
 pub mod dxf;
+pub mod eplan;
 pub mod pdf;
 pub mod svg;
 
