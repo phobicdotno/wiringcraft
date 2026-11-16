@@ -56,7 +56,14 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
     ),
     (
         "Insert",
-        &[Some(Action::Select), Some(Action::PlaceSymbol), Some(Action::DrawWire)],
+        &[
+            Some(Action::Select),
+            Some(Action::PlaceSymbol),
+            Some(Action::DrawWire),
+            None,
+            Some(Action::InsertMacro),
+            Some(Action::SaveMacro),
+        ],
     ),
     (
         "Page",

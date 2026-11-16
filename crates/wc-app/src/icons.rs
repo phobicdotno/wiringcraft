@@ -13,6 +13,7 @@ pub enum Icon {
     Select,
     Symbol,
     Wire,
+    Macro,
     Delete,
     Rotate,
     Mirror,
@@ -132,6 +133,32 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
             line((12.0, 16.0), (7.0, 8.5));
             p.circle_filled(at(12.0, 8.0), 1.6 * s, accent);
             p.circle_filled(at(12.0, 16.0), 1.6 * s, accent);
+        }
+        Icon::Macro => {
+            // Two symbols joined by a wire, inside a dashed group box.
+            for (x, y) in [
+                (3.0, 3.0),
+                (10.0, 3.0),
+                (17.0, 3.0),
+                (21.0, 7.0),
+                (21.0, 14.0),
+                (3.0, 10.0),
+                (3.0, 17.0),
+                (7.0, 21.0),
+                (14.0, 21.0),
+            ] {
+                aline(
+                    (x, y),
+                    (
+                        x + if y == 3.0 || y == 21.0 { 3.0 } else { 0.0 },
+                        y + if x == 3.0 || x == 21.0 { 3.0 } else { 0.0 },
+                    ),
+                );
+            }
+            poly(&[(7.0, 8.0), (11.0, 8.0), (11.0, 12.0), (7.0, 12.0)], true);
+            poly(&[(13.0, 13.0), (17.0, 13.0), (17.0, 17.0), (13.0, 17.0)], true);
+            line((11.0, 10.0), (15.0, 10.0));
+            line((15.0, 10.0), (15.0, 13.0));
         }
         Icon::Wire => {
             poly(&[(3.0, 18.0), (10.0, 18.0), (10.0, 6.0), (21.0, 6.0)], false);

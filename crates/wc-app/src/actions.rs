@@ -14,6 +14,8 @@ pub enum Action {
     Select,
     PlaceSymbol,
     DrawWire,
+    InsertMacro,
+    SaveMacro,
     TextTool,
     LineTool,
     RectTool,
@@ -92,6 +94,18 @@ impl Action {
                 "Draw a wire: click a pin or point, then the other end",
                 Icon::Wire,
                 "W",
+            ),
+            Action::InsertMacro => i(
+                "Macro",
+                "Insert a saved group of symbols and wires from the project or the library",
+                Icon::Macro,
+                "",
+            ),
+            Action::SaveMacro => i(
+                "Save as macro",
+                "Save the selected symbols, wires and drawings as a macro to insert again",
+                Icon::Macro,
+                "",
             ),
             Action::TextTool => i(
                 "Text",
