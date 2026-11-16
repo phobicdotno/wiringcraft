@@ -40,6 +40,7 @@ pub enum Action {
     LibraryUpdate,
     ExportPdf,
     ExportDrawings,
+    ExportAml,
     NumberWires,
     Reports,
     Check,
@@ -165,6 +166,12 @@ impl Action {
             ),
             Action::LibraryUpdate => i("Update", "Take the newer library versions", Icon::Update, ""),
             Action::ExportPdf => i("PDF", "Export all pages and the reports to PDF", Icon::Pdf, "Ctrl+P"),
+            Action::ExportAml => i(
+                "AutomationML",
+                "Export devices, part data and connections as AutomationML for other engineering tools",
+                Icon::Reports,
+                "",
+            ),
             Action::NumberWires => i(
                 "Number wires",
                 "Give every connection without a number one, from its page and column (3.4)",
@@ -252,6 +259,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::Reports,
                     Action::ExportPdf,
                     Action::ExportDrawings,
+                    Action::ExportAml,
                 ],
             ),
             (
