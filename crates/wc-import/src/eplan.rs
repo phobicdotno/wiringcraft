@@ -13,11 +13,16 @@
 //!     C strings such as connection ends (`64003`, `64004`).
 //!
 //! From those: pages (name, description, scale), devices (tag, function text, technical data,
-//! part numbers, page and position), cached article data, and connections (both ends as
-//! `device:pin`, page, colour, cross-section, cable). Symbol graphics live in Eplan's symbol
-//! libraries, not in the project, so drawings are not rebuilt here; [`build`] lays the devices
-//! and connections out as connection overview pages (one section per Eplan page), and a PDF
-//! export of the project can be added as trace pages with the PDF importer.
+//! part numbers, page, position, connection point names, symbol variant), cached article data,
+//! connections (both ends as `device:pin`, page, colour, cross-section, cable), and from
+//! `instance.eod` the pages' own graphics (lines, rectangles, circles, texts) and wire corners.
+//!
+//! [`build`] rebuilds each Eplan page as drawn (see [`drawing`]): Eplan keeps symbol graphics in
+//! its libraries, not in the project, so devices get WiringCraft symbols of the same kind at
+//! their original positions, and wires are traced between facing connection points as Eplan
+//! does. Devices that are not on a drawn page are laid out as connection overview pages (one
+//! section per Eplan page), and a PDF export of the project can be added as trace pages with
+//! the PDF importer.
 //!
 //! Input is hostile: every read is bounds-checked and malformed records are skipped.
 
@@ -38,6 +43,11 @@ const CLASS_FUNCTION: u16 = 17;
 const CLASS_CONNECTION: u16 = 18;
 const CLASS_ARTICLE_REF: u16 = 68;
 const CLASS_ARTICLE: u16 = 117;
+const CLASS_TEXT: u16 = 30;
+const CLASS_LINE: u16 = 31;
+const CLASS_CIRCLE: u16 = 32;
+const CLASS_NODE: u16 = 42;
+const CLASS_RECT: u16 = 89;
 
 /// Field ids.
 const F_PROPERTIES: u16 = 60011;
@@ -53,6 +63,21 @@ const F_TAG_SUB_COUNTER: u16 = 60977;
 const F_PART_NUMBER: u16 = 61273;
 const F_CONNECTION_FROM: u16 = 64003;
 const F_CONNECTION_TO: u16 = 64004;
+const F_PINS: u16 = 60185;
+const F_GRAPHIC_PAGE: u16 = 60402;
+const F_TEXT_AT: u16 = 60501;
+const F_TEXT: u16 = 60511;
+const F_LINE_FROM: u16 = 60531;
+const F_LINE_TO: u16 = 60532;
+const F_CIRCLE_CENTER: u16 = 60555;
+const F_CIRCLE_RADIUS: u16 = 60556;
+const F_TEXT_HEIGHT: u16 = 60961;
+const F_SYMBOL_NUMBER: u16 = 61262;
+const F_VARIANT: u16 = 61263;
+const F_FUNCTION_KIND: u16 = 61381;
+const F_FUNCTION_DETAIL: u16 = 61382;
+const F_RECT_FROM: u16 = 61651;
+const F_RECT_TO: u16 = 61652;
 
 /// Property ids (Eplan's own numbering, also used in `ProjectInfo.xml`).
 const P_PAGE_DESCRIPTION: u16 = 11011;
@@ -63,6 +88,7 @@ const P_TAG_SUB_ID: u16 = 20017;
 const P_TAG_SUB_COUNTER: u16 = 20018;
 const P_FUNCTION_TEXT: u16 = 20025;
 const P_TECHNICAL: u16 = 20027;
+const P_TERMINAL: u16 = 20030;
 const P_CABLE_TYPE: u16 = 20040;
 const P_CABLE_CONDUCTORS: u16 = 20042;
 const P_CABLE_CROSS_SECTION: u16 = 20043;
@@ -102,6 +128,32 @@ pub struct EplanFunction {
     pub parts: Vec<String>,
     /// Other readable properties, named.
     pub properties: BTreeMap<String, String>,
+    /// Connection point names in symbol order (may be empty strings, as on terminals).
+    pub pins: Vec<String>,
+    /// Function category (coil, contact, terminal, ...), see [`drawing`].
+    pub kind: u16,
+    /// Refinement of the category, such as make (1) or break (2) for a contact.
+    pub detail: u16,
+    /// Symbol variant: 0 to 3 turn the symbol in quarter steps, 4 to 7 also mirror it.
+    pub variant: u8,
+    /// Terminal designation, for terminals.
+    pub terminal: String,
+}
+
+/// A free graphic on a page, in Eplan coordinates (millimetres, y up).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EplanGraphic {
+    pub page: u32,
+    pub shape: wc_core::geom::Shape,
+}
+
+/// A wire corner or junction (Eplan draws wires between these and symbol connection points).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EplanNode {
+    pub page: u32,
+    pub at: Point,
+    pub symbol: u16,
+    pub variant: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -135,6 +187,8 @@ pub struct EplanProject {
     /// Article data cached in the project (often only part of what is used).
     pub articles: Vec<EplanArticle>,
     pub connections: Vec<EplanConnection>,
+    pub graphics: Vec<EplanGraphic>,
+    pub nodes: Vec<EplanNode>,
     pub warnings: Vec<String>,
 }
 
@@ -429,7 +483,11 @@ pub fn read(tables: &Tables) -> Result<EplanProject> {
         p.functions.push(EplanFunction {
             id,
             tag,
-            page: ref_field(r, F_OWNER).filter(|(c, _)| *c == CLASS_PAGE).map(|(_, i)| i),
+            // Owned by the page, or by a group (a macro or black box) that sits on the page.
+            page: ref_field(r, F_OWNER)
+                .filter(|(c, _)| *c == CLASS_PAGE)
+                .or_else(|| ref_field(r, F_GRAPHIC_PAGE).filter(|(c, _)| *c == CLASS_PAGE))
+                .map(|(_, i)| i),
             at: point_field(r, F_POSITION),
             text: pick_language(&prop(&props, P_FUNCTION_TEXT)),
             technical: prop(&props, P_TECHNICAL),
@@ -439,6 +497,11 @@ pub fn read(tables: &Tables) -> Result<EplanProject> {
                 .map(|(_, v)| v.clone())
                 .collect(),
             properties: named,
+            pins: pins(r),
+            kind: u16_field(r, F_FUNCTION_KIND).unwrap_or(0),
+            detail: u16_field(r, F_FUNCTION_DETAIL).unwrap_or(0),
+            variant: variant(r),
+            terminal: prop(&props, P_TERMINAL),
         });
     }
 
@@ -502,6 +565,7 @@ pub fn read(tables: &Tables) -> Result<EplanProject> {
             cable,
         });
     }
+    read_graphics(table("instance.eod"), &mut p);
     if empty > 0 {
         p.warnings
             .push(format!("{empty} connection(s) without named ends were skipped"));
@@ -511,6 +575,120 @@ pub fn read(tables: &Tables) -> Result<EplanProject> {
             .push("no pages or devices were recognised; the project may use a newer format".into());
     }
     Ok(p)
+}
+
+fn u16_field(r: &[u8], id: u16) -> Option<u16> {
+    field_offsets(r, id).find_map(|at| u16_at(r, at))
+}
+
+fn f64_field(r: &[u8], id: u16, range: std::ops::Range<f64>) -> Option<f64> {
+    field_offsets(r, id).find_map(|at| f64_at(r, at).filter(|v| range.contains(v)))
+}
+
+/// The symbol variant: a byte field right after the symbol number, absent for variant 0.
+fn variant(r: &[u8]) -> u8 {
+    let next = F_VARIANT.to_le_bytes();
+    field_offsets(r, F_SYMBOL_NUMBER)
+        .find_map(|at| {
+            (r.get(at + 2..at + 4)? == next.as_slice())
+                .then(|| r.get(at + 4).copied())
+                .flatten()
+        })
+        .filter(|v| *v < 8)
+        .unwrap_or(0)
+}
+
+/// Connection point names: a run of `F_PINS` C strings.
+fn pins(r: &[u8]) -> Vec<String> {
+    let mark = F_PINS.to_le_bytes();
+    let Some(mut at) = field_offsets(r, F_PINS).next() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    while let Some(s) = c_string(r, at) {
+        if s.chars().any(char::is_control) || out.len() >= 64 {
+            break;
+        }
+        at += s.len() + 1;
+        out.push(s);
+        if r.get(at..at + 2) != Some(mark.as_slice()) {
+            break;
+        }
+        at += 2;
+    }
+    out
+}
+
+/// Free graphics and wire nodes of pages (not of forms) from the instance table.
+fn read_graphics(data: &[u8], p: &mut EplanProject) {
+    use wc_core::geom::{Align, Shape};
+    for r in records(data) {
+        let Some((class, _)) = self_ref(r) else { continue };
+        let Some((CLASS_PAGE, page)) = ref_field(r, F_GRAPHIC_PAGE) else {
+            continue;
+        };
+        let shape = match class {
+            CLASS_LINE => match (point_field(r, F_LINE_FROM), point_field(r, F_LINE_TO)) {
+                (Some(a), Some(b)) => Shape::Line { a, b },
+                _ => continue,
+            },
+            CLASS_RECT => match (point_field(r, F_RECT_FROM), point_field(r, F_RECT_TO)) {
+                (Some(a), Some(b)) => Shape::Rect {
+                    min: Point::new(a.x.min(b.x), a.y.min(b.y)),
+                    max: Point::new(a.x.max(b.x), a.y.max(b.y)),
+                },
+                _ => continue,
+            },
+            CLASS_CIRCLE => match (
+                point_field(r, F_CIRCLE_CENTER),
+                f64_field(r, F_CIRCLE_RADIUS, 0.01..1e5),
+            ) {
+                (Some(center), Some(radius)) => Shape::Circle {
+                    center,
+                    radius,
+                    filled: false,
+                },
+                _ => continue,
+            },
+            CLASS_TEXT => {
+                let (Some(at), Some(text)) = (point_field(r, F_TEXT_AT), text_field(r, F_TEXT)) else {
+                    continue;
+                };
+                let text = pick_language(&text);
+                let height = f64_field(r, F_TEXT_HEIGHT, 0.5..50.0).unwrap_or(2.5);
+                // One text per line, each line below the last (Eplan's y runs up).
+                for (k, line) in text.lines().enumerate() {
+                    let line = line.trim_end_matches('\r');
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    p.graphics.push(EplanGraphic {
+                        page,
+                        shape: Shape::Text {
+                            at: Point::new(at.x, at.y - 1.5 * height * k as f64),
+                            text: line.to_owned(),
+                            height,
+                            align: Align::Left,
+                        },
+                    });
+                }
+                continue;
+            }
+            CLASS_NODE => {
+                if let (Some(at), Some(symbol)) = (point_field(r, F_POSITION), u16_field(r, F_SYMBOL_NUMBER)) {
+                    p.nodes.push(EplanNode {
+                        page,
+                        at,
+                        symbol,
+                        variant: variant(r),
+                    });
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        p.graphics.push(EplanGraphic { page, shape });
+    }
 }
 
 fn crate_natural(s: &str) -> Vec<(String, u64)> {
@@ -704,22 +882,33 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
         });
     }
 
-    // One section per Eplan page, in page order; devices never placed on a page come last.
+    // Pages as drawn first; a connection overview for devices not placed on any of them.
+    let drawing = drawing::pages(p, first_page_number);
+    warnings.extend(drawing.warnings.iter().cloned());
+    let overview: Vec<usize> = (0..names.len())
+        .filter(|i| !drawing.drawn.contains(&names[*i]))
+        .collect();
     let mut sections: Vec<Section> = Vec::new();
     for pg in &p.pages {
-        let devs: Vec<usize> = (0..names.len()).filter(|i| page_of.get(i) == Some(&pg.id)).collect();
+        let devs: Vec<usize> = overview
+            .iter()
+            .copied()
+            .filter(|i| page_of.get(i) == Some(&pg.id))
+            .collect();
         if devs.is_empty() {
             continue;
         }
         let title = if pg.description.is_empty() {
-            format!("Eplan page {}", pg.name)
+            format!("Connections, Eplan page {}", pg.name)
         } else {
-            format!("Eplan page {}: {}", pg.name, pg.description)
+            format!("Connections, Eplan page {}: {}", pg.name, pg.description)
         };
         sections.push(Section { title, devices: devs });
     }
     let known: BTreeSet<u32> = p.pages.iter().map(|pg| pg.id).collect();
-    let rest: Vec<usize> = (0..names.len())
+    let rest: Vec<usize> = overview
+        .iter()
+        .copied()
         .filter(|i| page_of.get(i).is_none_or(|pg| !known.contains(pg)))
         .collect();
     if !rest.is_empty() {
@@ -728,13 +917,35 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
             devices: rest,
         });
     }
+    let dropped = links
+        .iter()
+        .filter(|l| drawing.drawn.contains(&names[l.a.0]) || drawing.drawn.contains(&names[l.b.0]))
+        .count();
+    if dropped > 0 {
+        warnings.push(format!(
+            "{dropped} connection(s) of the connection list to devices on drawn pages were left out; their wires are \
+             traced from the drawing"
+        ));
+    }
     let imp = AmlImport {
         devices,
         links,
         warnings: Vec::new(),
     };
-    (aml::layout(&imp, &sections, "eplan", first_page_number), warnings)
+    let mut built = aml::layout(&imp, &sections, "eplan", first_page_number + drawing.pages.len());
+    for d in imp.devices.iter().filter(|d| drawing.drawn.contains(&d.name)) {
+        if let Some((tag, device)) = aml::device_entry(d, &mut built.parts) {
+            built.devices.entry(tag).or_insert(device);
+        }
+    }
+    let mut pages = drawing.pages;
+    pages.append(&mut built.pages);
+    built.pages = pages;
+    built.symbols.extend(drawing.symbols);
+    (built, warnings)
 }
+
+pub mod drawing;
 
 #[cfg(test)]
 mod tests;

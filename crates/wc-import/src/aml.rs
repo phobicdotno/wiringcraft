@@ -295,6 +295,37 @@ pub struct Section {
     pub devices: Vec<usize>,
 }
 
+/// The project device for an imported device, adding its part (if it names one) to `parts`.
+pub fn device_entry(d: &AmlDevice, parts: &mut Vec<wc_core::Part>) -> Option<(DeviceTag, Device)> {
+    let tag = d.tag.clone()?;
+    let (manufacturer, order) = part_fields(&d.properties);
+    let part = order.map(|o| {
+        let p = wc_core::Part {
+            id: wc_core::Part::make_id(manufacturer.as_deref().unwrap_or(""), &o),
+            manufacturer: manufacturer.unwrap_or_default(),
+            order_number: o,
+            description: d.name.clone(),
+            symbol: None,
+            properties: d.properties.clone(),
+        };
+        let id = p.id.clone();
+        if !parts.iter().any(|q| q.id == id) {
+            parts.push(p);
+        }
+        id
+    });
+    let device = Device {
+        part,
+        description: d
+            .properties
+            .get("Function text")
+            .cloned()
+            .unwrap_or_else(|| d.name.clone()),
+        properties: d.properties.clone(),
+    };
+    Some((tag, device))
+}
+
 /// Lay devices and links out as connection overview pages, one or more pages per section.
 /// Symbol ids are `<prefix>.<n>.<name>`, page ids `<prefix>-<n>`, numbered from
 /// `first_page_number`. Devices in no section are left out, with their links.
@@ -377,35 +408,8 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
             let at = Point::new(x + 18.0, TOP + BOX_H + ROW_H * row as f64);
             placements[i] = Some((page, at));
             x += w + 30.0;
-            if let Some(tag) = &d.tag {
-                let (manufacturer, order) = part_fields(&d.properties);
-                let part = order.map(|o| {
-                    let p = wc_core::Part {
-                        id: wc_core::Part::make_id(manufacturer.as_deref().unwrap_or(""), &o),
-                        manufacturer: manufacturer.unwrap_or_default(),
-                        order_number: o,
-                        description: d.name.clone(),
-                        symbol: None,
-                        properties: d.properties.clone(),
-                    };
-                    let id = p.id.clone();
-                    if !built.parts.iter().any(|q| q.id == id) {
-                        built.parts.push(p);
-                    }
-                    id
-                });
-                built.devices.insert(
-                    tag.clone(),
-                    Device {
-                        part,
-                        description: d
-                            .properties
-                            .get("Function text")
-                            .cloned()
-                            .unwrap_or_else(|| d.name.clone()),
-                        properties: d.properties.clone(),
-                    },
-                );
+            if let Some((tag, device)) = device_entry(d, &mut built.parts) {
+                built.devices.insert(tag, device);
             }
         }
     }

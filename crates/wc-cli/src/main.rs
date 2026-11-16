@@ -230,8 +230,9 @@ enum ImportCmd {
         #[arg(long, default_value_t = 200)]
         first_page: usize,
     },
-    /// An Eplan Electric P8 project (.elk, its .edb folder, or a zip of the folder): devices,
-    /// parts and connections as overview pages, one section per Eplan page.
+    /// An Eplan Electric P8 project (.elk, its .edb folder, or a zip of the folder): its pages as
+    /// drawn, with devices at their original positions and wires traced, plus devices, parts and
+    /// connections not on a drawn page as overview pages.
     Eplan {
         path: PathBuf,
         #[arg(long, default_value_t = 400)]
@@ -829,10 +830,12 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 }
             }
             let (n_dev, n_pages) = (built.devices.len(), built.pages.len());
+            let n_drawn = built.pages.iter().filter(|pg| pg.id.starts_with("eplan-page-")).count();
             add_built(dir, &mut p, built, &source)?;
             save(dir, &p)?;
             println!(
-                "imported {} Eplan pages as {n_pages} overview page(s): {n_dev} devices, {} connections",
+                "imported {} Eplan pages as {n_pages} page(s), {n_drawn} of them as drawn: {n_dev} devices, {} \
+                 connections",
                 ep.pages.len(),
                 ep.connections.len()
             );
