@@ -164,7 +164,7 @@ impl Action {
             ),
             Action::Reports => i(
                 "Reports",
-                "Parts, devices, wires, nets, terminals and cables as tables",
+                "Contents, parts, devices, wires, nets, terminals, cables and PLC I/O as tables",
                 Icon::Reports,
                 "Ctrl+R",
             ),

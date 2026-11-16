@@ -52,7 +52,7 @@ enum Dialog {
     DeletePage(usize),
     /// Project check findings.
     Check(Vec<wc_report::Finding>),
-    /// Reports (parts, devices, wires, nets, terminals, cables) as tables.
+    /// Reports (parts, devices, wires, nets, terminals, cables, PLC I/O, contents) as tables.
     Reports(wc_report::Kind),
     /// Write a new text at this point on the current page.
     Text(wc_core::geom::Point, String, bool),
@@ -1047,6 +1047,8 @@ fn report_title(k: wc_report::Kind) -> &'static str {
         wc_report::Kind::Nets => "Nets",
         wc_report::Kind::Terminals => "Terminals",
         wc_report::Kind::Cables => "Cables",
+        wc_report::Kind::Plc => "PLC I/O",
+        wc_report::Kind::Contents => "Contents",
     }
 }
 
