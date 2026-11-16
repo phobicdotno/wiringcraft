@@ -23,9 +23,31 @@ See the feature list for the full plan.
 |---|---|
 | `wc-core` | data model, device tags (IEC 81346 style), project folder format, connectivity |
 | `wc-library` | library sources, lockfile, vendoring, update status |
-| `wc-import` | DXF, SVG and CSV import |
+| `wc-import` | DXF, SVG, CSV, AutomationML, PDF trace and project archive import |
 | `wc-pdf` | vector PDF export |
+| `wc-vcs` | git versioning, subway-map history, schematic change lists |
 | `wc-cli` | the `wiringcraft` command |
+| `wc-app` | the desktop editor (`wiringcraft-app`) |
+
+## Desktop app
+
+```sh
+cargo run -p wc-app -- path/to/project
+```
+
+Pages on the left, the sheet in the middle, the symbol library and properties on the right.
+Commands sit in classic menus and icon toolbars by default; View → Layout switches to a ribbon
+(the choice is saved). Both show the same commands from one registry.
+
+| Classic toolbars (default) | Ribbon (optional) |
+|---|---|
+| ![classic](docs/screenshots/app-classic.png) | ![ribbon](docs/screenshots/app-ribbon.png) |
+
+Tools: select and drag (Esc), place symbol (S, pick one in the library), draw wire (W: click a
+pin, click bends, click a pin to finish or double-click a free point), rotate (R), delete (Del).
+Wheel zooms around the pointer, right or middle drag pans, F fits the page, G toggles the grid.
+New devices get the next free tag, with the function and location used on that page.
+Versions → Commit / Branch / History records versions and shows the subway map.
 
 ## Build
 
