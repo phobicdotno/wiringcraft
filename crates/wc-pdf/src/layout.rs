@@ -37,6 +37,8 @@ pub struct Appearance {
     pub column: usize,
     /// The pins, for contact listings such as `13-14`.
     pub pins: Vec<String>,
+    /// The placed symbol's id on its page.
+    pub item: String,
 }
 
 impl Appearance {
@@ -49,6 +51,95 @@ impl Appearance {
 pub struct CrossRefs {
     pub mains: BTreeMap<DeviceTag, Vec<Appearance>>,
     pub auxes: BTreeMap<DeviceTag, Vec<Appearance>>,
+    /// Interruption points by tag.
+    pub links: BTreeMap<DeviceTag, Vec<Appearance>>,
+}
+
+/// A cross-reference text next to a symbol, pointing at another page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XrefMark {
+    /// Baseline anchor in page mm.
+    pub at: Point,
+    pub align: Align,
+    pub text: String,
+    /// The page the reference points to (the first one when it lists several).
+    pub target_page_id: String,
+}
+
+pub const XREF_HEIGHT: f64 = 1.8;
+
+/// Cross-reference texts for a page: a coil lists its contacts with their pins and locations,
+/// a contact points back to its coil, an interruption point lists where the wire continues.
+/// Problems (a contact without a coil, an interruption point without a partner) go to `warnings`.
+pub fn xref_marks(
+    page: &Page,
+    symbols: &BTreeMap<String, Symbol>,
+    xref: &CrossRefs,
+    warnings: &mut Vec<String>,
+) -> Vec<XrefMark> {
+    let mut out = Vec::new();
+    let line_h = 2.6;
+    for s in &page.symbols {
+        let (Some(tag), Some(sym)) = (&s.tag, symbols.get(&s.symbol)) else {
+            continue;
+        };
+        let placed: Vec<Shape> = sym
+            .graphics
+            .iter()
+            .map(|g| g.placed(s.at, s.rotation, s.mirror))
+            .collect();
+        let below = placed.iter().map(|g| g.bounds().1.y).fold(s.at.y, f64::max);
+        let right = placed.iter().map(|g| g.bounds().1.x).fold(s.at.x, f64::max);
+        let ta = sym.tag_at.transform(s.rotation, s.mirror) + s.at;
+        let tag_lines = 1 + usize::from(!tag.function.is_empty()) + usize::from(!tag.location.is_empty());
+        let tag_top = ta.y - (tag_lines as f64 - 1.0) * 1.5 + 1.2;
+        match sym.role {
+            SymbolRole::Main => {
+                for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
+                    out.push(XrefMark {
+                        at: Point::new(s.at.x + 5.0, below + 3.5 + line_h * i as f64),
+                        align: Align::Left,
+                        text: format!("{} {}", a.pins.join("-"), a.location()),
+                        target_page_id: a.page_id.clone(),
+                    });
+                }
+            }
+            SymbolRole::Auxiliary => match xref.mains.get(tag).and_then(|m| m.first()) {
+                Some(main) => out.push(XrefMark {
+                    at: Point::new(ta.x, tag_top + 3.0 * tag_lines as f64),
+                    align: Align::Right,
+                    text: format!("> {}", main.location()),
+                    target_page_id: main.page_id.clone(),
+                }),
+                None => warnings.push(format!("page {}: contact {tag} has no coil", page.number)),
+            },
+            SymbolRole::Interruption => {
+                let others: Vec<&Appearance> = xref
+                    .links
+                    .get(tag)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|a| !(a.page_id == page.id && a.item == s.id))
+                    .collect();
+                match others.first() {
+                    Some(first) => out.push(XrefMark {
+                        at: Point::new(right + 1.5, s.at.y + 0.7 + (below - s.at.y) / 2.0),
+                        align: Align::Left,
+                        text: others
+                            .iter()
+                            .map(|a| format!("/{}", a.location()))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        target_page_id: first.page_id.clone(),
+                    }),
+                    None => warnings.push(format!("page {}: interruption point {tag} has no partner", page.number)),
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 impl CrossRefs {
@@ -64,10 +155,12 @@ impl CrossRefs {
                     page_number: page.number.clone(),
                     column: column_of(page.size, s.at.x),
                     pins: sym.pins.iter().map(|p| p.name.clone()).collect(),
+                    item: s.id.clone(),
                 };
                 match sym.role {
                     SymbolRole::Main => x.mains.entry(tag.clone()).or_default().push(a),
                     SymbolRole::Auxiliary => x.auxes.entry(tag.clone()).or_default().push(a),
+                    SymbolRole::Interruption => x.links.entry(tag.clone()).or_default().push(a),
                     _ => {}
                 }
             }
@@ -408,57 +501,36 @@ pub fn draw_page(
         for (i, l) in lines.iter().enumerate() {
             pen.text((ta.x, top + 3.0 * i as f64), 2.5, 2, l);
         }
-
-        // Cross-references: a main symbol lists its contacts; a contact points back to its main.
-        let line_h = 2.6;
-        match sym.role {
-            SymbolRole::Main => {
-                let auxes = xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]);
-                let below = sym
-                    .graphics
-                    .iter()
-                    .map(|g| g.placed(s.at, s.rotation, s.mirror).bounds().1.y)
-                    .fold(s.at.y, f64::max);
-                for (i, a) in auxes.iter().enumerate() {
-                    let text = format!("{} {}", a.pins.join("-"), a.location());
-                    let at = (s.at.x + 5.0, below + 3.5 + line_h * i as f64);
-                    pen.colour(0.1, 0.3, 0.7);
-                    pen.text(at, 1.8, 0, &text);
-                    pen.colour(0.0, 0.0, 0.0);
-                    let wdt = text_width_mm(&text, 1.8);
-                    links.push(Link {
-                        min: (at.0, at.1 - 2.0),
-                        max: (at.0 + wdt, at.1 + 0.5),
-                        target_page_id: a.page_id.clone(),
-                    });
-                }
-            }
-            SymbolRole::Auxiliary => {
-                if let Some(main) = xref.mains.get(tag).and_then(|m| m.first()) {
-                    let text = format!("> {}", main.location());
-                    let at = (ta.x - text_width_mm(&text, 1.8), top + 3.0 * lines.len() as f64);
-                    pen.colour(0.1, 0.3, 0.7);
-                    pen.text(at, 1.8, 0, &text);
-                    pen.colour(0.0, 0.0, 0.0);
-                    let wdt = text_width_mm(&text, 1.8);
-                    links.push(Link {
-                        min: (at.0, at.1 - 2.0),
-                        max: (at.0 + wdt, at.1 + 0.5),
-                        target_page_id: main.page_id.clone(),
-                    });
-                } else {
-                    warnings.push(format!("page {}: contact {tag} has no coil", page.number));
-                }
-            }
-            _ => {}
-        }
     }
+
+    // Cross-references, as links to the page they point at.
+    pen.colour(0.1, 0.3, 0.7);
+    for m in xref_marks(page, symbols, xref, warnings) {
+        let a = match m.align {
+            Align::Left => 0,
+            Align::Center => 1,
+            Align::Right => 2,
+        };
+        pen.text(tuple(m.at), XREF_HEIGHT, a, &m.text);
+        let w = text_width_mm(&m.text, XREF_HEIGHT);
+        let x0 = match m.align {
+            Align::Left => m.at.x,
+            Align::Center => m.at.x - w / 2.0,
+            Align::Right => m.at.x - w,
+        };
+        links.push(Link {
+            min: (x0, m.at.y - 2.0),
+            max: (x0 + w, m.at.y + 0.5),
+            target_page_id: m.target_page_id,
+        });
+    }
+    pen.colour(0.0, 0.0, 0.0);
     Drawn { ops: pen.ops, links }
 }
 
 /// Points where three or more wire branches meet: wire ends and bends count once per wire
 /// touching them, and a point in the middle of another wire's segment counts twice (a T).
-fn junctions(polylines: &[Vec<(f64, f64)>]) -> Vec<(f64, f64)> {
+pub fn junctions(polylines: &[Vec<(f64, f64)>]) -> Vec<(f64, f64)> {
     const EPS: f64 = 0.01;
     let on_segment = |p: (f64, f64), a: (f64, f64), b: (f64, f64)| {
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);

@@ -37,6 +37,9 @@ pub enum SymbolRole {
     Standalone,
     /// A terminal of a terminal strip.
     Terminal,
+    /// An interruption point: the wire continues at every other interruption point with the
+    /// same tag, usually on another page.
+    Interruption,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

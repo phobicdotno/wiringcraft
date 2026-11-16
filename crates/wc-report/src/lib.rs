@@ -241,8 +241,10 @@ fn pin_label(p: &Project, page_id: &str, item: &str, pin: &str) -> String {
 }
 
 /// The net each pin belongs to, with its potential name (or a generated one).
-fn net_names(p: &Project) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
-    let nets = connectivity::nets(p);
+fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
+    let nets = connectivity::nets_linked(i.project, |id| {
+        i.symbols.get(id).is_some_and(|s| s.role == SymbolRole::Interruption)
+    });
     let mut by_pin = BTreeMap::new();
     for (n, net) in nets.iter().enumerate() {
         let name = net.names.first().cloned().unwrap_or_else(|| format!("N{}", n + 1));
@@ -256,7 +258,7 @@ fn net_names(p: &Project) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) 
 /// Wire list: every drawn wire with both ends. A free end is reported as a junction point.
 pub fn wire_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Wire list", &["Page", "Wire", "Potential", "From", "To"]);
-    let (_, net_of) = net_names(i.project);
+    let (_, net_of) = net_names(i);
     for page in &i.project.pages {
         for w in &page.wires {
             let end = |e: &Endpoint| match e {
@@ -284,7 +286,7 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
 /// Net list: each electrically connected group of pins, across pages.
 pub fn net_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Net list", &["Net", "Pins", "Connections"]);
-    let (nets, _) = net_names(i.project);
+    let (nets, _) = net_names(i);
     let mut rows: Vec<(String, Vec<String>)> = nets
         .iter()
         .enumerate()
@@ -327,7 +329,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             "Page",
         ],
     );
-    let (nets, net_of) = net_names(i.project);
+    let (nets, net_of) = net_names(i);
     // Pins connected to a pin, excluding the pin itself.
     let others = |pin: &PinRef| -> Vec<String> {
         nets.iter()
