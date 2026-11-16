@@ -23,7 +23,7 @@ See the feature list for the full plan.
 |---|---|
 | `wc-core` | data model, device tags (IEC 81346 style), project folder format, connectivity |
 | `wc-library` | library sources, lockfile, vendoring, update status |
-| `wc-import` | DXF, SVG, CSV, AutomationML, PDF trace and project archive import |
+| `wc-import` | DXF, SVG, CSV, AutomationML, PDF trace, Eplan P8 projects and project archive import |
 | `wc-report` | parts list, device list, wire list, net list, terminal plan |
 | `wc-pdf` | vector PDF export (schematic pages plus report pages) |
 | `wc-vcs` | git versioning, subway-map history, schematic change lists |

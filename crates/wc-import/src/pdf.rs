@@ -813,15 +813,29 @@ pub fn pages(bytes: &[u8]) -> Result<Vec<TracePage>> {
     for (page, res, mb) in pages {
         let content = doc.content(&page);
         let (w, h) = ((mb[2] - mb[0]).abs(), (mb[3] - mb[1]).abs());
+        let (ox, oy) = (mb[0].min(mb[2]), mb[1].min(mb[3]));
+        // /Rotate turns the page clockwise for display; draw it the way it is displayed.
+        let rotate = page
+            .get("Rotate")
+            .and_then(|r| doc.get(r).num())
+            .unwrap_or(0.0)
+            .rem_euclid(360.0)
+            .round() as i64;
+        let (start, (dw, dh)) = match rotate {
+            90 => (Ctm([0.0, -1.0, 1.0, 0.0, -oy, w + ox]), (h, w)),
+            180 => (Ctm([-1.0, 0.0, 0.0, -1.0, w + ox, h + oy]), (w, h)),
+            270 => (Ctm([0.0, 1.0, -1.0, 0.0, h + oy, -ox]), (h, w)),
+            _ => (Ctm([1.0, 0.0, 0.0, 1.0, -ox, -oy]), (w, h)),
+        };
         let mut it = Interp {
             doc: &doc,
-            page_h: h,
-            origin: (mb[0], mb[1]),
+            page_h: dh,
+            origin: (0.0, 0.0),
             out: TracePage::default(),
             budget: 5_000_000,
         };
-        it.out.size_mm = (w * MM_PER_PT, h * MM_PER_PT);
-        it.run(&content, &res, Ctm::ID, 0);
+        it.out.size_mm = (dw * MM_PER_PT, dh * MM_PER_PT);
+        it.run(&content, &res, start, 0);
         out.push(it.out);
     }
     Ok(out)
@@ -896,6 +910,39 @@ mod tests {
         let p = pages(&b)?;
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].graphics.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rotated_pages_are_drawn_as_displayed() -> Result<()> {
+        // A portrait A4 page shown rotated 90 degrees clockwise (how many CAD tools print
+        // landscape sheets). A line along the bottom edge of the page ends up on the left edge.
+        let mut b = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec();
+        b.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Rotate 90 /Contents 4 0 R >>\nendobj\n",
+        );
+        let content = "0 0 m 100 0 l S";
+        b.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n%%EOF\n",
+                content.len()
+            )
+            .as_bytes(),
+        );
+        let p = pages(&b)?;
+        assert!(
+            (p[0].size_mm.0 - 297.0).abs() < 0.5 && (p[0].size_mm.1 - 210.0).abs() < 0.5,
+            "{:?}",
+            p[0].size_mm
+        );
+        let Some(Shape::Line { a, b: e }) = p[0].graphics.first() else {
+            return Err(Error::Format(format!("expected a line, got {:?}", p[0].graphics)));
+        };
+        assert!(a.x.abs() < 0.01 && e.x.abs() < 0.01, "{a:?} {e:?}");
+        assert!(
+            (a.y - 0.0).abs() < 0.01 && (e.y - 100.0 * 25.4 / 72.0).abs() < 0.01,
+            "{a:?} {e:?}"
+        );
         Ok(())
     }
 
