@@ -1221,7 +1221,8 @@ fn export_pdf(open: &Open) -> String {
         .collect();
     let dir = open.dir.join("export");
     let path = dir.join(format!("{}.pdf", if name.is_empty() { "project" } else { &name }));
-    // Report pages follow the schematic pages, as in a finished drawing set.
+    // The table of contents goes before the schematic pages and the other reports after them,
+    // as in a finished drawing set.
     let inputs = wc_report::Inputs {
         project: &open.project,
         symbols: &open.symbols,

@@ -690,7 +690,20 @@ pub fn draw_table_page(
     pen.line((x0, y + ROW_H), (x1, y + ROW_H));
     y += ROW_H;
     pen.width(0.12);
-    for r in rows {
+    let mut links = Vec::new();
+    for (ri, r) in rows.enumerate() {
+        // A row that describes a page jumps to it.
+        if let Some(target) = table
+            .row_pages
+            .get(first.saturating_add(ri))
+            .filter(|id| !id.is_empty())
+        {
+            links.push(Link {
+                min: (x0, y),
+                max: (x1, y + ROW_H),
+                target_page_id: target.clone(),
+            });
+        }
         let mut cx = x0;
         for (c, wdt) in r.iter().zip(&widths) {
             pen.text(
@@ -712,7 +725,7 @@ pub fn draw_table_page(
     }
     Drawn {
         ops: pen.ops,
-        links: Vec::new(),
+        links,
         prims: pen.prims,
         layers: pen.layers,
     }

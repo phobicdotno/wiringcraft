@@ -271,3 +271,41 @@ fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
     let (bytes, _) = export(&project, &symbols, &Options::default());
     assert!(!String::from_utf8_lossy(&bytes).contains("/OCProperties"));
 }
+
+#[test]
+fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains"), Page::new("p2", "2", "Control")];
+    let contents = wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows: vec![vec!["1".into(), "Mains".into()], vec!["2".into(), "Control".into()]],
+        row_pages: vec!["p1".into(), "p2".into()],
+        front: true,
+    };
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![parts, contents],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 4);
+    // Bookmarks follow the page order: contents, the two schematic pages, then the parts list.
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    assert!(at("R1 Table of contents") < at("1 Mains"));
+    assert!(at("1 Mains") < at("2 Control"));
+    assert!(at("2 Control") < at("R2 Parts list"));
+    assert!(at("R2 Parts list") < usize::MAX);
+    // The contents rows jump to the schematic pages, which are now the 2nd and 3rd page objects.
+    assert!(text.contains("/Dest [9 0 R /Fit]"), "row 1 -> page 1");
+    assert!(text.contains("/Dest [12 0 R /Fit]"), "row 2 -> page 2");
+    assert_eq!(text.matches("/Subtype /Link").count(), 2);
+}
