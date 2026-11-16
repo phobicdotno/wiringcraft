@@ -12,5 +12,8 @@ miniz_oxide.workspace = true
 zip.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+wc-report.workspace = true
+
 [lints]
 workspace = true

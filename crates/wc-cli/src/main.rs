@@ -107,6 +107,9 @@ enum Cmd {
     },
     /// List the potentials (connected pins) across all pages.
     Nets,
+    /// Export devices, their part data and connection points, and the connections between them
+    /// as AutomationML (CAEX 3.0), for tools that take engineering data rather than drawings.
+    Aml { out: PathBuf },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
     /// potentials, open pins, wires ending in the air, devices without a part. Exits with an
     /// error when an error is found, so it can guard a commit or a CI job.
@@ -575,6 +578,30 @@ fn run(cli: Cli) -> Res<()> {
                 Some(path) => std::fs::write(&path, text).map_err(e)?,
                 None => print!("{text}"),
             }
+        }
+        Cmd::Aml { out } => {
+            let p = load(dir)?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let parts = vendored_parts(dir, &p);
+            let inputs = wc_report::Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            let (text, counts) = wc_report::automationml(&inputs, &utc_now());
+            std::fs::write(&out, text).map_err(e)?;
+            if counts.untagged_pins > 0 {
+                eprintln!(
+                    "warning: {} connected pin(s) on symbols without a tag were left out",
+                    counts.untagged_pins
+                );
+            }
+            println!(
+                "wrote {}: {} devices, {} connections",
+                out.display(),
+                counts.devices,
+                counts.links
+            );
         }
         Cmd::Nets => {
             let p = load(dir)?;
@@ -1235,4 +1262,29 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
         p.devices.insert(t, d);
     }
     Ok(())
+}
+
+/// The current time in UTC as `YYYY-MM-DDThh:mm:ssZ`.
+fn utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest / 60 % 60,
+        rest % 60
+    )
 }
