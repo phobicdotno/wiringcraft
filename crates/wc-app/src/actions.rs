@@ -38,6 +38,7 @@ pub enum Action {
     LibraryUpdate,
     ExportPdf,
     ExportDrawings,
+    NumberWires,
     Reports,
     Check,
     Commit,
@@ -150,6 +151,12 @@ impl Action {
             ),
             Action::LibraryUpdate => i("Update", "Take the newer library versions", Icon::Update, ""),
             Action::ExportPdf => i("PDF", "Export all pages and the reports to PDF", Icon::Pdf, "Ctrl+P"),
+            Action::NumberWires => i(
+                "Number wires",
+                "Give every connection without a number one, from its page and column (3.4)",
+                Icon::Wire,
+                "",
+            ),
             Action::ExportDrawings => i(
                 "SVG/DXF",
                 "Export every page as an SVG and a DXF drawing for other tools",

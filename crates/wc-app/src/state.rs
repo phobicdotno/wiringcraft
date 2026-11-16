@@ -372,6 +372,35 @@ impl Open {
 
     /// Copy a page as a new last page. Devices on the copy get the next free tags (one new device
     /// per original device, keeping description and part) and wire numbers are cleared.
+    /// Number the wires by `rule`, keeping numbers already given. One undo step; nothing is
+    /// recorded when no number changes.
+    pub fn number_wires(&mut self, rule: wc_core::numbering::Rule) -> wc_core::numbering::Numbered {
+        let mut project = self.project.clone();
+        let symbols = &self.symbols;
+        let done = wc_core::numbering::number_wires(
+            &mut project,
+            rule,
+            false,
+            |id| {
+                symbols
+                    .get(id)
+                    .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
+            },
+            |page, end| match end {
+                wc_core::Endpoint::Point { at } => Some(*at),
+                wc_core::Endpoint::Pin { item, pin } => {
+                    let placed = page.symbol(item)?;
+                    wc_pdf::pin_position(placed, symbols.get(&placed.symbol)?, pin)
+                }
+            },
+        );
+        if done.wires > 0 {
+            self.checkpoint();
+            self.project = project;
+        }
+        done
+    }
+
     pub fn duplicate_page(&mut self, page: usize) -> Option<usize> {
         let mut copy = self.project.pages.get(page)?.clone();
         self.checkpoint();

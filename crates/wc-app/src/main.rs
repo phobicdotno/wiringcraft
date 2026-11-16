@@ -329,6 +329,13 @@ impl App {
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
             Action::ExportDrawings => self.dialog = Some(Dialog::Message(export_drawings(open))),
+            Action::NumberWires => {
+                let done = open.number_wires(wc_core::numbering::Rule::PageColumn);
+                self.dialog = Some(Dialog::Message(format!(
+                    "Numbered {} connection(s); {} wire(s) changed.\nExisting numbers were kept.",
+                    done.connections, done.wires
+                )));
+            }
             Action::Reports => self.dialog = Some(Dialog::Reports(wc_report::Kind::Parts)),
             Action::Check => {
                 let found = run_check(open);
