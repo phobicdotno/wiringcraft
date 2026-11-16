@@ -536,6 +536,26 @@ fn decode_stream(d: &BTreeMap<String, Obj>, data: &[u8]) -> Option<Vec<u8>> {
 #[derive(Clone, Copy)]
 struct Ctm([f64; 6]);
 
+/// Whether the current stroke and fill colours are white, which on paper means nothing is drawn.
+#[derive(Clone, Copy, Default)]
+struct Paint {
+    stroke_white: bool,
+    fill_white: bool,
+}
+
+/// Whether the colour operands at the end of the stack are white: one grey, three RGB or four
+/// CMYK numbers. A pattern name or anything else counts as not white.
+fn is_white(stack: &[Obj]) -> bool {
+    let nums: Vec<f64> = stack.iter().rev().map_while(Obj::num).take(5).collect();
+    let near = |v: f64, to: f64| (v - to).abs() < 0.01;
+    match nums.as_slice() {
+        [g] => near(*g, 1.0),
+        [b, g, r] => near(*r, 1.0) && near(*g, 1.0) && near(*b, 1.0),
+        [k, y, m, c] => [c, m, y, k].iter().all(|v| near(**v, 0.0)),
+        _ => false,
+    }
+}
+
 impl Ctm {
     const ID: Ctm = Ctm([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     fn pre(&self, m: [f64; 6]) -> Ctm {
@@ -609,8 +629,9 @@ impl Interp<'_> {
         }
         let mut lx = Lexer::new(content);
         let mut stack: Vec<Obj> = Vec::new();
-        let mut gs: Vec<Ctm> = Vec::new();
+        let mut gs: Vec<(Ctm, Paint)> = Vec::new();
         let mut ctm = ctm;
+        let mut paint = Paint::default();
         let mut sub: Vec<(f64, f64)> = Vec::new();
         let mut path: Vec<(Vec<(f64, f64)>, bool)> = Vec::new();
         let mut cur = (0.0, 0.0);
@@ -641,8 +662,10 @@ impl Interp<'_> {
                     .unwrap_or(0.0)
             };
             match op.as_str() {
-                "q" => gs.push(ctm),
-                "Q" => ctm = gs.pop().unwrap_or(ctm),
+                "q" => gs.push((ctm, paint)),
+                "Q" => (ctm, paint) = gs.pop().unwrap_or((ctm, paint)),
+                "G" | "RG" | "K" | "SC" | "SCN" | "CS" => paint.stroke_white = op != "CS" && is_white(&stack),
+                "g" | "rg" | "k" | "sc" | "scn" | "cs" => paint.fill_white = op != "cs" && is_white(&stack),
                 "cm" => ctm = ctm.pre([n(6), n(5), n(4), n(3), n(2), n(1)]),
                 "m" => {
                     if sub.len() >= 2 {
@@ -695,6 +718,13 @@ impl Interp<'_> {
                     sub.clear();
                     let stroke = matches!(op.as_str(), "S" | "s" | "B" | "B*" | "b" | "b*");
                     let fill_only = matches!(op.as_str(), "f" | "F" | "f*");
+                    // White on white paper is not drawing: Eplan, for one, strokes a large white cross
+                    // over every page.
+                    let filled = fill_only || matches!(op.as_str(), "B" | "B*" | "b" | "b*");
+                    let visible = (stroke && !paint.stroke_white) || (filled && !paint.fill_white);
+                    if !visible {
+                        path.clear();
+                    }
                     for (pts, closed) in path.drain(..) {
                         // Small filled shapes are junction dots or arrowheads: keep them; large
                         // fills are backgrounds: skip.
@@ -1061,6 +1091,20 @@ mod tests {
             );
             assert!(g.iter().any(|s| matches!(s, Shape::Text { text, .. } if text == "K1")));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn white_paint_is_not_drawing() -> Result<()> {
+        // A white cross over the page (as Eplan strokes one), a white fill, then visible black
+        // lines in grey, RGB and CMYK; q/Q restores the colour.
+        let content = "1 1 1 RG 0 0 m 800 800 l S 1 g 10 10 20 20 re f /Cs6 CS 1 1 1 SCN 0 800 m 800 0 l S \
+                       q 0 0 0 1 K 10 10 m 110 10 l S Q 10 20 m 110 20 l S \
+                       0 G 10 30 m 110 30 l S 1 0 0 RG 10 40 m 110 40 l S 0 0 0 0 K 10 50 m 110 50 l S";
+        let p = pages(&simple_pdf(content, false))?;
+        let lines = p[0].graphics.iter().filter(|s| matches!(s, Shape::Line { .. })).count();
+        assert_eq!(lines, 3, "{:?}", p[0].graphics);
+        assert!(!p[0].graphics.iter().any(|s| matches!(s, Shape::Polyline { .. })));
         Ok(())
     }
 
