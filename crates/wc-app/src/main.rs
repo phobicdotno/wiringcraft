@@ -5,6 +5,7 @@
 mod actions;
 mod canvas;
 mod chrome;
+mod edit;
 mod icons;
 mod panels;
 mod prefs;
@@ -66,12 +67,17 @@ struct App {
     chrome: chrome::ChromeState,
     panels: panels::PanelState,
     dialog: Option<Dialog>,
+    clipboard: edit::Clipboard,
+    /// Text for the system clipboard after a copy, so Ctrl+V reaches the app as a paste even
+    /// when the system clipboard was empty.
+    copied_text: Option<String>,
 }
 
 struct StatusView<'a> {
     open: Option<&'a Open>,
     ed: &'a Editor,
     prefs: &'a Prefs,
+    clipboard: &'a edit::Clipboard,
 }
 
 impl chrome::Status for StatusView<'_> {
@@ -96,8 +102,11 @@ impl chrome::Status for StatusView<'_> {
             Action::Save => self.open.is_some_and(|o| o.dirty),
             Action::Undo => self.open.is_some_and(Open::can_undo),
             Action::Redo => self.open.is_some_and(Open::can_redo),
-            Action::Delete => has && self.ed.selection.is_some(),
-            Action::Rotate => has && matches!(self.ed.selection, Some(Selection::Symbol(_))),
+            Action::Delete | Action::Copy | Action::Cut => has && !self.ed.selection.is_empty(),
+            Action::Rotate | Action::Mirror => {
+                has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
+            }
+            Action::Paste => has && !self.clipboard.is_empty(),
             _ => has,
         }
     }
@@ -114,6 +123,8 @@ impl App {
             chrome: Default::default(),
             panels: Default::default(),
             dialog: None,
+            clipboard: edit::Clipboard::default(),
+            copied_text: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -192,33 +203,60 @@ impl App {
             },
             Action::Undo => {
                 if open.undo() {
-                    self.ed.selection = None;
+                    self.ed.selection.clear();
                 }
             }
             Action::Redo => {
                 if open.redo() {
-                    self.ed.selection = None;
+                    self.ed.selection.clear();
                 }
             }
             Action::Delete => {
-                if let Some(sel) = self.ed.selection.take() {
-                    open.delete(page, &sel);
+                let sel = std::mem::take(&mut self.ed.selection);
+                open.delete_many(page, &sel);
+            }
+            Action::Rotate => open.rotate_many(page, &self.ed.selection),
+            Action::Mirror => open.mirror_many(page, &self.ed.selection),
+            Action::SelectAll => {
+                self.ed.tool = Tool::Select;
+                self.ed.selection = open.select_all(page);
+            }
+            Action::Copy | Action::Cut => {
+                let clip = open.copy(page, &self.ed.selection);
+                if !clip.is_empty() {
+                    let n = clip.symbols.len() + clip.wires.len();
+                    self.copied_text = Some(clip.summary());
+                    self.clipboard = clip;
+                    if a == Action::Cut {
+                        let sel = std::mem::take(&mut self.ed.selection);
+                        open.delete_many(page, &sel);
+                        self.ed.message = format!("Cut {n} items.");
+                    } else {
+                        self.ed.message = format!("Copied {n} items.");
+                    }
                 }
             }
-            Action::Rotate => {
-                if let Some(Selection::Symbol(id)) = &self.ed.selection {
-                    open.rotate(page, id);
+            Action::Paste => {
+                // At the pointer when it is over the sheet, otherwise a little below the original.
+                let at = self
+                    .ed
+                    .cursor
+                    .unwrap_or(self.clipboard.anchor + wc_core::geom::Point::new(10.0, 10.0));
+                let pasted = open.paste(page, &self.clipboard, at);
+                if !pasted.is_empty() {
+                    self.ed.tool = Tool::Select;
+                    self.ed.selection = pasted;
                 }
             }
             Action::AddPage => {
                 self.ed.page = open.add_page();
-                self.ed.selection = None;
+                self.ed.selection.clear();
                 self.ed.view.fit = true;
             }
             Action::DuplicatePage => {
                 if let Some(i) = open.duplicate_page(page) {
                     self.ed.page = i;
-                    self.ed.selection = None;
+                    self.ed.selection.clear();
                     self.ed.view.fit = true;
                 }
             }
@@ -300,6 +338,7 @@ impl App {
                 (Key::N, Action::AddPage),
                 (Key::P, Action::ExportPdf),
                 (Key::K, Action::Commit),
+                (Key::A, Action::SelectAll),
             ] {
                 if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
                     out.push(Action::NewProject);
@@ -312,10 +351,20 @@ impl App {
             return out;
         }
         ctx.input(|i| {
+            // The window turns Ctrl+C, Ctrl+X and Ctrl+V into clipboard events, not key presses.
+            for e in &i.events {
+                match e {
+                    egui::Event::Copy => out.push(Action::Copy),
+                    egui::Event::Cut => out.push(Action::Cut),
+                    egui::Event::Paste(_) => out.push(Action::Paste),
+                    _ => {}
+                }
+            }
             for (k, a) in [
                 (Key::S, Action::PlaceSymbol),
                 (Key::W, Action::DrawWire),
                 (Key::R, Action::Rotate),
+                (Key::M, Action::Mirror),
                 (Key::Delete, Action::Delete),
                 (Key::G, Action::ToggleGrid),
                 (Key::F, Action::ZoomFit),
@@ -532,7 +581,7 @@ impl App {
                                 match o.delete_page(i) {
                                     Ok(next) => {
                                         self.ed.page = next;
-                                        self.ed.selection = None;
+                                        self.ed.selection.clear();
                                         self.ed.wire = None;
                                         self.ed.view.fit = true;
                                     }
@@ -804,11 +853,15 @@ impl eframe::App for App {
             open: self.open.as_ref(),
             ed: &self.ed,
             prefs: &self.prefs,
+            clipboard: &self.clipboard,
         };
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
         actions.extend(self.shortcuts(ctx));
         for a in actions {
             self.run(a);
+        }
+        if let Some(text) = self.copied_text.take() {
+            ctx.copy_text(text);
         }
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| panels::status_bar(ui, self.open.as_ref(), &self.ed));

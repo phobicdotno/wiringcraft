@@ -34,7 +34,7 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
                 let pick = |ed: &mut Editor| {
                     if ed.page != i {
                         ed.page = i;
-                        ed.selection = None;
+                        ed.selection.clear();
                         ed.wire = None;
                         ed.view.fit = true;
                     }
@@ -86,7 +86,7 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
                 && let Some(i) = open.project.pages.iter().position(|p| &p.id == page_id)
             {
                 ed.page = i;
-                ed.selection = Some(Selection::Symbol(item.clone()));
+                ed.select_only(Selection::Symbol(item.clone()));
                 ed.view.fit = true;
             }
         }
@@ -125,15 +125,16 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
 }
 
 fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
-    if ps.loaded_for == ed.selection {
+    let one = ed.one().cloned();
+    if ps.loaded_for == one {
         return;
     }
-    ps.loaded_for = ed.selection.clone();
+    ps.loaded_for = one.clone();
     ps.tag_error = None;
     let Some(page) = open.project.pages.get(ed.page) else {
         return;
     };
-    match &ed.selection {
+    match &one {
         Some(Selection::Symbol(id)) => {
             let tag = page.symbol(id).and_then(|s| s.tag.clone());
             ps.tag = tag.as_ref().map(ToString::to_string).unwrap_or_default();
@@ -159,7 +160,13 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
     ui.heading("Properties");
     load_buffers(open, ed, ps);
     let page_idx = ed.page;
-    match ed.selection.clone() {
+    if ed.selection.len() > 1 {
+        let n = ed.selection.len();
+        ui.label(format!("{n} items selected"));
+        ui.label(RichText::new("Move, rotate, mirror, copy or delete them together.").color(t.faint));
+        return;
+    }
+    match ed.one().cloned() {
         None => {
             if let Some(p) = open.project.pages.get(page_idx) {
                 ui.label(format!("Page {} · {}", p.number, p.title));
@@ -169,7 +176,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
         }
         Some(Selection::Symbol(id)) => {
             let Some(placed) = open.project.pages.get(page_idx).and_then(|p| p.symbol(&id)).cloned() else {
-                ed.selection = None;
+                ed.selection.clear();
                 return;
             };
             let sym_name = open
@@ -271,7 +278,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                 .and_then(|p| p.wires.iter().find(|w| w.id == id))
                 .cloned()
             else {
-                ed.selection = None;
+                ed.selection.clear();
                 return;
             };
             egui::Grid::new("wire-props")
