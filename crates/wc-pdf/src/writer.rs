@@ -22,6 +22,25 @@ pub struct Drawn {
     pub prims: Vec<Prim>,
     /// Optional content layers the page draws on.
     pub layers: BTreeSet<Layer>,
+    /// A picture drawn under everything else, on the `Scans` layer.
+    pub underlay: Option<PageImage>,
+}
+
+/// A picture ready to embed: JPEG data as stored, or Flate-compressed samples.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageImage {
+    pub width: u32,
+    pub height: u32,
+    /// `DeviceGray`, `DeviceRGB` or `DeviceCMYK`.
+    pub colour_space: &'static str,
+    /// `DCTDecode` or `FlateDecode`.
+    pub filter: &'static str,
+    /// Extra dictionary entries, such as an inverted `/Decode` for Adobe CMYK JPEGs.
+    pub extra: &'static str,
+    pub data: Vec<u8>,
+    /// Where it goes on the page, in millimetres (y down).
+    pub min: (f64, f64),
+    pub max: (f64, f64),
 }
 
 /// Optional content a reader can hide: PDF layers (optional content groups) and DXF layers.
@@ -33,10 +52,12 @@ pub enum Layer {
     WireLabels,
     /// Cross-references between coils and contacts and to other pages.
     CrossReferences,
+    /// Scanned sheets under the drawing.
+    Scans,
 }
 
 impl Layer {
-    pub const ALL: [Layer; 3] = [Layer::Drawings, Layer::WireLabels, Layer::CrossReferences];
+    pub const ALL: [Layer; 4] = [Layer::Drawings, Layer::WireLabels, Layer::CrossReferences, Layer::Scans];
 
     /// The name a reader shows.
     pub fn title(self) -> &'static str {
@@ -44,6 +65,7 @@ impl Layer {
             Layer::Drawings => "Drawings and notes",
             Layer::WireLabels => "Wire numbers",
             Layer::CrossReferences => "Cross-references",
+            Layer::Scans => "Scanned sheets",
         }
     }
 
@@ -53,6 +75,7 @@ impl Layer {
             Layer::Drawings => "DRAWINGS",
             Layer::WireLabels => "WIRE-NUMBERS",
             Layer::CrossReferences => "CROSS-REFERENCES",
+            Layer::Scans => "SCANS",
         }
     }
 
@@ -61,6 +84,7 @@ impl Layer {
             Layer::Drawings => "OC1",
             Layer::WireLabels => "OC2",
             Layer::CrossReferences => "OC3",
+            Layer::Scans => "OC4",
         }
     }
 }
@@ -158,10 +182,21 @@ impl Doc {
         // Optional content groups (layers) follow the pages, one object each.
         let used: Vec<Layer> = Layer::ALL
             .into_iter()
-            .filter(|l| self.pages.iter().any(|p| p.drawn.layers.contains(l)))
+            .filter(|l| {
+                self.pages
+                    .iter()
+                    .any(|p| p.drawn.layers.contains(l) || (*l == Layer::Scans && p.drawn.underlay.is_some()))
+            })
             .collect();
         let ocg_obj = |k: usize| 6 + 3 * n + k;
         let ocg_refs: Vec<String> = (0..used.len()).map(|k| format!("{} 0 R", ocg_obj(k))).collect();
+        // Underlay pictures follow the layers, one object per page that has one.
+        let mut image_obj: BTreeMap<usize, usize> = BTreeMap::new();
+        for (i, p) in self.pages.iter().enumerate() {
+            if p.drawn.underlay.is_some() {
+                image_obj.insert(i, 6 + 3 * n + used.len() + image_obj.len());
+            }
+        }
         let mut objs: Vec<(usize, Vec<u8>)> = Vec::new();
         let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", page_obj(i))).collect();
         let oc = if used.is_empty() {
@@ -233,16 +268,44 @@ impl Doc {
                     ))
                 })
                 .collect();
+            let mut ops = String::new();
+            let mut xobjects = String::new();
+            if let (Some(img), Some(obj)) = (&p.drawn.underlay, image_obj.get(&i)) {
+                let (x0, x1) = (img.min.0 * PT_PER_MM, img.max.0 * PT_PER_MM);
+                let (y0, y1) = (h - img.max.1 * PT_PER_MM, h - img.min.1 * PT_PER_MM);
+                let _ = writeln!(
+                    ops,
+                    "/OC /{} BDC q {:.3} 0 0 {:.3} {x0:.3} {y0:.3} cm /Im0 Do Q EMC",
+                    Layer::Scans.tag(),
+                    x1 - x0,
+                    y1 - y0
+                );
+                xobjects = format!(" /XObject << /Im0 {obj} 0 R >>");
+                let mut body = format!(
+                    "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{} /BitsPerComponent 8 /Filter /{}{} /Length {} >>\nstream\n",
+                    img.width,
+                    img.height,
+                    img.colour_space,
+                    img.filter,
+                    img.extra,
+                    img.data.len()
+                )
+                .into_bytes();
+                body.extend_from_slice(&img.data);
+                body.extend_from_slice(b"\nendstream");
+                objs.push((*obj, body));
+            }
+            ops.push_str(&p.drawn.ops);
             objs.push((
                 page_obj(i),
                 format!(
-                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w:.2} {h:.2}] /Resources << /Font << /F1 3 0 R >>{properties} >> /Contents {} 0 R /Annots [{}] >>",
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w:.2} {h:.2}] /Resources << /Font << /F1 3 0 R >>{properties}{xobjects} >> /Contents {} 0 R /Annots [{}] >>",
                     page_obj(i) + 1,
                     annots.join(" ")
                 )
                 .into_bytes(),
             ));
-            let stream = p.drawn.ops.as_bytes();
+            let stream = ops.as_bytes();
             let mut content = format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes();
             content.extend_from_slice(stream);
             content.extend_from_slice(b"\nendstream");

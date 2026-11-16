@@ -5,12 +5,14 @@
 //! This is a small, forgiving PDF reader: it finds objects by scanning (so damaged cross-reference
 //! tables do not matter), expands compressed object streams, inflates Flate streams, follows the
 //! page tree and form XObjects, and interprets the path-construction and painting operators.
-//! Scanned (image-only) pages yield no vectors; the caller reports that.
+//! Scanned pages yield their largest picture (`TracePage::scan`), which the caller can put
+//! under the page to trace over.
 
 use std::collections::BTreeMap;
 
 use wc_core::geom::{Align, Point, Shape};
 
+use crate::raster::{Orientation, Raster, RasterFormat, samples_to_png, upright};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -584,6 +586,69 @@ pub struct TracePage {
     pub graphics: Vec<Shape>,
     /// Paths that looked like images or fills only.
     pub images: usize,
+    /// The largest picture that covers a good part of the page (a scanned sheet), turned
+    /// upright, with where it sits on the page in millimetres.
+    pub scan: Option<Scan>,
+    /// Why a large picture could not be read, such as a compression this reader lacks.
+    pub scan_problem: Option<String>,
+}
+
+/// A picture taken from a PDF page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scan {
+    pub raster: Raster,
+    pub min: Point,
+    pub max: Point,
+}
+
+/// A picture must cover at least this share of the page to count as a scanned sheet; smaller
+/// ones are logos and stamps.
+const SCAN_SHARE: f64 = 0.3;
+
+/// Undo PNG predictors (PDF `/Predictor` 10 to 15) on decoded rows.
+fn png_unpredict(data: &[u8], colors: usize, bits: usize, columns: usize) -> Option<Vec<u8>> {
+    let bpp = (colors * bits).div_ceil(8).max(1);
+    let row = (colors.checked_mul(bits)?.checked_mul(columns)?).div_ceil(8);
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut prev = vec![0u8; row];
+    for chunk in data.chunks(row + 1) {
+        let (&kind, line) = chunk.split_first()?;
+        if line.len() < row {
+            break;
+        }
+        let mut cur = line.to_vec();
+        for i in 0..row {
+            let left = if i >= bpp { cur[i - bpp] } else { 0 };
+            let up = prev[i];
+            let up_left = if i >= bpp { prev[i - bpp] } else { 0 };
+            let add = match kind {
+                0 => 0,
+                1 => left,
+                2 => up,
+                3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                4 => {
+                    let p = i16::from(left) + i16::from(up) - i16::from(up_left);
+                    let (pa, pb, pc) = (
+                        (p - i16::from(left)).abs(),
+                        (p - i16::from(up)).abs(),
+                        (p - i16::from(up_left)).abs(),
+                    );
+                    if pa <= pb && pa <= pc {
+                        left
+                    } else if pb <= pc {
+                        up
+                    } else {
+                        up_left
+                    }
+                }
+                _ => return None,
+            };
+            cur[i] = cur[i].wrapping_add(add);
+        }
+        out.extend_from_slice(&cur);
+        prev = cur;
+    }
+    Some(out)
 }
 
 const MM_PER_PT: f64 = 25.4 / 72.0;
@@ -621,6 +686,143 @@ impl Interp<'_> {
             _ => BTreeMap::new(),
         };
         (two_byte || !map.is_empty()).then_some(FontMap { two_byte, map })
+    }
+
+    /// Keep an image XObject as the page's scan when it covers enough of the page and is
+    /// bigger than the one kept so far. The image fills the unit square of `ctm`.
+    fn take_scan(&mut self, d: &BTreeMap<String, Obj>, data: &[u8], ctm: Ctm) {
+        let top_left = self.to_mm(ctm.p(0.0, 1.0));
+        let along_cols = self.to_mm(ctm.p(1.0, 1.0));
+        let along_rows = self.to_mm(ctm.p(0.0, 0.0));
+        let (cx, cy) = (along_cols.x - top_left.x, along_cols.y - top_left.y);
+        let (rx, ry) = (along_rows.x - top_left.x, along_rows.y - top_left.y);
+        let tiny = |v: f64| v.abs() < 1e-6 * (cx.abs() + cy.abs() + rx.abs() + ry.abs()).max(1e-9);
+        let orientation = if tiny(cy) && tiny(rx) {
+            Orientation {
+                transposed: false,
+                flip_x: cx < 0.0,
+                flip_y: ry < 0.0,
+            }
+        } else if tiny(cx) && tiny(ry) {
+            Orientation {
+                transposed: true,
+                flip_x: rx < 0.0,
+                flip_y: cy < 0.0,
+            }
+        } else {
+            return; // Skewed or sheared: not a scanned sheet.
+        };
+        let (w, h) = ((cx + rx).abs(), (cy + ry).abs());
+        let area = w * h;
+        let page_area = self.out.size_mm.0 * self.out.size_mm.1;
+        if !area.is_finite() || area < SCAN_SHARE * page_area {
+            return;
+        }
+        if let Some(old) = &self.out.scan
+            && (old.max.x - old.min.x) * (old.max.y - old.min.y) >= area
+        {
+            return;
+        }
+        let raster = match self.image_raster(d, data) {
+            Ok(r) => r,
+            Err(problem) => {
+                self.out.scan_problem = Some(problem);
+                return;
+            }
+        };
+        let Some(raster) = upright(raster, orientation) else {
+            self.out.scan_problem = Some("the picture could not be decoded".into());
+            return;
+        };
+        let xs = [top_left.x, along_cols.x, along_rows.x, along_cols.x + rx];
+        let ys = [top_left.y, along_cols.y, along_rows.y, along_cols.y + ry];
+        let lo = |v: [f64; 4]| v.into_iter().fold(f64::INFINITY, f64::min);
+        let hi = |v: [f64; 4]| v.into_iter().fold(f64::NEG_INFINITY, f64::max);
+        self.out.scan = Some(Scan {
+            raster,
+            min: Point::new(lo(xs), lo(ys)),
+            max: Point::new(hi(xs), hi(ys)),
+        });
+        self.out.scan_problem = None;
+    }
+
+    /// An image XObject as JPEG (kept as stored) or PNG (from raw samples).
+    fn image_raster(&self, d: &BTreeMap<String, Obj>, data: &[u8]) -> std::result::Result<Raster, String> {
+        let get = |k: &str| d.get(k).map(|o| self.doc.get(o));
+        let filters: Vec<String> = match get("Filter") {
+            None => vec![],
+            Some(Obj::Name(n)) => vec![n.clone()],
+            Some(Obj::Array(a)) => a
+                .iter()
+                .filter_map(|x| self.doc.get(x).name().map(str::to_owned))
+                .collect(),
+            Some(_) => return Err("the picture has a damaged filter list".into()),
+        };
+        let mut bytes = data.to_vec();
+        for (i, f) in filters.iter().enumerate() {
+            match f.as_str() {
+                "FlateDecode" | "Fl" => bytes = inflate(&bytes).ok_or("the picture data is damaged")?,
+                "DCTDecode" | "DCT" if i + 1 == filters.len() => {
+                    return Ok(Raster {
+                        format: RasterFormat::Jpeg,
+                        bytes,
+                    });
+                }
+                other => return Err(format!("pictures compressed as {other} are not supported yet")),
+            }
+        }
+        let num = |k: &str| get(k).and_then(Obj::num);
+        let width = num("Width")
+            .filter(|v| *v >= 1.0 && *v <= 1e6)
+            .ok_or("the picture has no width")? as u32;
+        let height = num("Height")
+            .filter(|v| *v >= 1.0 && *v <= 1e6)
+            .ok_or("the picture has no height")? as u32;
+        let mask = matches!(get("ImageMask"), Some(Obj::Bool(true)));
+        let bits = if mask {
+            1
+        } else {
+            num("BitsPerComponent").unwrap_or(8.0) as u8
+        };
+        let channels: u8 = if mask {
+            1
+        } else {
+            match get("ColorSpace") {
+                Some(Obj::Name(n)) if n == "DeviceGray" || n == "G" || n == "CalGray" => 1,
+                Some(Obj::Name(n)) if n == "DeviceRGB" || n == "RGB" => 3,
+                Some(Obj::Array(a)) => match a.first().and_then(Obj::name) {
+                    Some("CalGray") => 1,
+                    Some("CalRGB") => 3,
+                    Some("ICCBased") => match a.get(1).map(|o| self.doc.get(o)).and_then(Obj::dict) {
+                        Some(icc) => icc.get("N").and_then(Obj::num).unwrap_or(0.0) as u8,
+                        None => 0,
+                    },
+                    _ => 0,
+                },
+                _ => 0,
+            }
+        };
+        if !matches!((channels, bits), (1, 1) | (1, 8) | (3, 8)) {
+            return Err(format!(
+                "pictures with {channels} colour channel(s) at {bits} bit(s) are not supported yet"
+            ));
+        }
+        // Decode [1 0] swaps black and white; an image mask paints its 0 samples by default.
+        let decode_inverted = matches!(get("Decode"), Some(Obj::Array(a))
+            if a.first().and_then(Obj::num) == Some(1.0));
+        if let Some(Obj::Dict(p)) = get("DecodeParms")
+            && p.get("Predictor").and_then(Obj::num).unwrap_or(1.0) >= 10.0
+        {
+            let colors = p.get("Colors").and_then(Obj::num).unwrap_or(1.0) as usize;
+            let bpc = p.get("BitsPerComponent").and_then(Obj::num).unwrap_or(8.0) as usize;
+            let columns = p.get("Columns").and_then(Obj::num).unwrap_or(1.0) as usize;
+            if colors > 4 || bpc > 16 || columns > 1_000_000 {
+                return Err("the picture has impossible predictor settings".into());
+            }
+            bytes = png_unpredict(&bytes, colors, bpc, columns).ok_or("the picture data is damaged")?;
+        }
+        samples_to_png(width, height, channels, bits, decode_inverted, &bytes)
+            .ok_or_else(|| "the picture data is too short or too large".to_owned())
     }
 
     fn run(&mut self, content: &[u8], resources: &Obj, ctm: Ctm, depth: usize) {
@@ -858,7 +1060,10 @@ impl Interp<'_> {
                                     self.run(&data2, &res, ctm.pre(m), depth + 1);
                                 }
                             }
-                            Some("Image") => self.out.images += 1,
+                            Some("Image") => {
+                                self.out.images += 1;
+                                self.take_scan(d, data, ctm);
+                            }
                             _ => {}
                         }
                     }
@@ -1241,5 +1446,86 @@ mod tests {
             "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<",
             false,
         ));
+    }
+
+    /// A one-page PDF that draws image XObject `/Im` with `cm` and maybe a small `/Logo`.
+    fn picture_pdf(rotate: u32, image_dict: &str, samples: &[u8], content: &str) -> Vec<u8> {
+        let mut b = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec();
+        b.extend_from_slice(
+            format!("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Rotate {rotate} /Contents 4 0 R /Resources << /XObject << /Im 5 0 R /Logo 5 0 R >> >> >>\nendobj\n").as_bytes(),
+        );
+        b.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n",
+                content.len()
+            )
+            .as_bytes(),
+        );
+        b.extend_from_slice(
+            format!(
+                "5 0 obj\n<< /Type /XObject /Subtype /Image {image_dict} /Length {} >>\nstream\n",
+                samples.len()
+            )
+            .as_bytes(),
+        );
+        b.extend_from_slice(samples);
+        b.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
+        b
+    }
+
+    fn luma(scan: &Scan) -> Option<(u32, u32, Vec<u8>)> {
+        let img = crate::raster::decode(&scan.raster)?.to_luma8();
+        Some((img.width(), img.height(), img.into_raw()))
+    }
+
+    #[test]
+    fn scanned_sheets_become_upright_pictures() -> Result<()> {
+        // 3 x 2 grey picture: 10 20 30 / 40 50 60, filling the whole page; a small logo too.
+        let grey = "/Width 3 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8";
+        let samples = [10u8, 20, 30, 40, 50, 60];
+        let full = "q 50 0 0 50 10 10 cm /Logo Do Q q 595 0 0 842 0 0 cm /Im Do Q";
+        let p = pages(&picture_pdf(0, grey, &samples, full))?;
+        let Some(scan) = p[0].scan.as_ref() else {
+            return Err(Error::Format(format!("no scan: {:?}", p[0].scan_problem)));
+        };
+        assert_eq!(scan.raster.format, RasterFormat::Png);
+        assert_eq!(luma(scan), Some((3, 2, samples.to_vec())));
+        assert!(scan.min.x.abs() < 0.01 && scan.min.y.abs() < 0.01, "{scan:?}");
+        assert!(
+            (scan.max.x - 209.9).abs() < 0.2 && (scan.max.y - 297.0).abs() < 0.2,
+            "{scan:?}"
+        );
+        assert_eq!(p[0].images, 2);
+
+        // The same sheet shown rotated 90 degrees: the picture turns with it.
+        let p = pages(&picture_pdf(90, grey, &samples, full))?;
+        let turned = p[0].scan.as_ref().and_then(luma);
+        assert_eq!(turned, Some((2, 3, vec![40, 10, 50, 20, 60, 30])));
+
+        // Only a small logo: no scan.
+        let p = pages(&picture_pdf(0, grey, &samples, "q 50 0 0 50 10 10 cm /Logo Do Q"))?;
+        assert!(p[0].scan.is_none());
+
+        // A JPEG is kept byte for byte; a fax-compressed one is reported, not guessed at.
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xD9];
+        let p = pages(&picture_pdf(0, "/Width 3 /Height 2 /Filter /DCTDecode", &jpeg, full))?;
+        assert_eq!(p[0].scan.as_ref().map(|s| s.raster.bytes.clone()), Some(jpeg.to_vec()));
+        let p = pages(&picture_pdf(
+            0,
+            "/Width 3 /Height 2 /Filter /CCITTFaxDecode",
+            &jpeg,
+            full,
+        ))?;
+        assert!(p[0].scan.is_none());
+        assert!(
+            p[0].scan_problem
+                .as_deref()
+                .is_some_and(|m| m.contains("CCITTFaxDecode"))
+        );
+
+        // Short sample data never panics.
+        let p = pages(&picture_pdf(0, grey, &samples[..2], full))?;
+        assert!(p[0].scan.is_none() && p[0].scan_problem.is_some());
+        Ok(())
     }
 }

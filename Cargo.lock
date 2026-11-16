@@ -1214,6 +1214,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2947,6 +2949,7 @@ name = "wc-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "image",
  "serde",
  "tempfile",
  "toml",
@@ -2988,6 +2991,7 @@ dependencies = [
 name = "wc-import"
 version = "0.1.0"
 dependencies = [
+ "image",
  "miniz_oxide 0.8.9",
  "quick-xml 0.37.5",
  "thiserror 2.0.21",
@@ -3012,6 +3016,8 @@ dependencies = [
 name = "wc-pdf"
 version = "0.1.0"
 dependencies = [
+ "image",
+ "miniz_oxide 0.8.9",
  "wc-core",
  "wc-report",
 ]

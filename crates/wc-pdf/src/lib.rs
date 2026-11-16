@@ -6,6 +6,7 @@
 //! also export as SVG and DXF (`vector`).
 
 mod layout;
+mod picture;
 mod vector;
 mod writer;
 
@@ -17,6 +18,7 @@ pub use layout::{
     CrossRefs, FRAME_COLUMNS, FrameMark, Ink, XREF_HEIGHT, XrefMark, column_of, frame_marks, junctions, pin_position,
     xref_marks,
 };
+pub use picture::read_underlays;
 pub use vector::{PageDrawing, dxf, page_drawings, svg};
 pub use writer::{Layer, Prim, Stroke};
 
@@ -30,6 +32,9 @@ pub struct Options {
     pub wire_labels: bool,
     /// Report tables appended after the schematic pages, each starting on a new page.
     pub reports: Vec<wc_report::Table>,
+    /// Underlay picture files by path (see [`read_underlays`]), drawn under their pages on
+    /// a layer of their own.
+    pub underlays: BTreeMap<String, Vec<u8>>,
 }
 
 impl Default for Options {
@@ -39,6 +44,7 @@ impl Default for Options {
             date: String::new(),
             wire_labels: true,
             reports: Vec::new(),
+            underlays: BTreeMap::new(),
         }
     }
 }
@@ -117,7 +123,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     add_reports(&mut doc, front_pages, &mut sheet);
     let offset = sheet;
     for page in &pages {
-        let drawn = layout::draw_page(
+        let mut drawn = layout::draw_page(
             project,
             page,
             sheet,
@@ -127,6 +133,19 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             options,
             &mut report.warnings,
         );
+        if let Some(u) = &page.underlay {
+            match options.underlays.get(&u.file) {
+                Some(bytes) => match picture::page_image(u, bytes) {
+                    Ok(img) => drawn.underlay = Some(img),
+                    Err(why) => report
+                        .warnings
+                        .push(format!("page {}: underlay {}: {why}", page.number, u.file)),
+                },
+                None => report
+                    .warnings
+                    .push(format!("page {}: underlay picture {} is missing", page.number, u.file)),
+            }
+        }
         doc.add_page(page.size.mm(), &format!("{} {}", page.number, page.title), drawn);
         sheet += 1;
     }

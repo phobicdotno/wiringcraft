@@ -9,6 +9,7 @@ pub mod dxf;
 pub mod eplan;
 pub mod kicad;
 pub mod pdf;
+pub mod raster;
 pub mod svg;
 
 #[derive(Debug, thiserror::Error)]

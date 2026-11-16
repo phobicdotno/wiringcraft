@@ -558,6 +558,7 @@ fn run(cli: Cli) -> Res<()> {
                     date,
                     wire_labels: true,
                     reports: tables,
+                    underlays: wc_pdf::read_underlays(dir, &p),
                 },
             );
             std::fs::write(&out, bytes).map_err(e)?;
@@ -983,14 +984,32 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 if p.page(&id).is_some() {
                     return Err(format!("page {id} exists; pick another --first-page"));
                 }
-                if t.graphics.is_empty() {
+                if t.graphics.is_empty() && t.scan.is_none() {
+                    let why = t.scan_problem.as_deref().unwrap_or("no picture covers the page");
                     eprintln!(
-                        "warning: page {} of {stem} has no vector content ({} images); scanned pages need OCR/tracing",
+                        "warning: page {} of {stem} has no vector content and no usable scan ({why})",
                         i + 1,
-                        t.images
                     );
                 }
+                let underlay = match &t.scan {
+                    Some(scan) => {
+                        let file = format!("{}/{id}.{}", wc_core::Underlay::DIR, scan.raster.format.extension());
+                        std::fs::create_dir_all(dir.join(wc_core::Underlay::DIR)).map_err(e)?;
+                        std::fs::write(dir.join(&file), &scan.raster.bytes).map_err(e)?;
+                        println!(
+                            "page {}: scanned sheet saved as {file}, shown under the page",
+                            first_page + i
+                        );
+                        Some(wc_core::Underlay {
+                            file,
+                            min: scan.min,
+                            max: scan.max,
+                        })
+                    }
+                    None => None,
+                };
                 let mut page = Page::new(id, (first_page + i).to_string(), format!("{stem} p.{}", i + 1));
+                page.underlay = underlay;
                 page.size = if t.size_mm.0 > 500.0 {
                     PageSize::A2
                 } else if t.size_mm.0 > 350.0 {

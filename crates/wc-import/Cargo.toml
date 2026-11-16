@@ -10,6 +10,7 @@ wc-core.workspace = true
 quick-xml.workspace = true
 miniz_oxide.workspace = true
 zip.workspace = true
+image.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
