@@ -35,6 +35,7 @@ pub enum Icon {
     Library,
     Update,
     Pdf,
+    Reports,
     Commit,
     Branch,
     History,
@@ -146,6 +147,17 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
             line((12.0, 10.0), (12.0, 18.0));
             line((8.0, 14.0), (16.0, 14.0));
+        }
+        Icon::Reports => {
+            p.rect_stroke(
+                Rect::from_min_max(at(3.0, 4.0), at(21.0, 20.0)),
+                1.0 * s,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
+            line((3.0, 9.0), (21.0, 9.0));
+            p.line_segment([at(3.0, 14.5), at(21.0, 14.5)], thin);
+            p.line_segment([at(10.0, 4.0), at(10.0, 20.0)], thin);
         }
         Icon::Text => {
             line((5.0, 5.0), (19.0, 5.0));

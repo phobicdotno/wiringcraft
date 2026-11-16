@@ -50,6 +50,8 @@ enum Dialog {
         error: Option<String>,
     },
     DeletePage(usize),
+    /// Reports (parts, devices, wires, nets, terminals, cables) as tables.
+    Reports(wc_report::Kind),
     /// Write a new text at this point on the current page.
     Text(wc_core::geom::Point, String, bool),
     Commit(String),
@@ -312,6 +314,7 @@ impl App {
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
+            Action::Reports => self.dialog = Some(Dialog::Reports(wc_report::Kind::Parts)),
             Action::LibraryStatus | Action::LibraryUpdate => {
                 match wc_library::Library::open(&open.dir, &open.project) {
                     Ok(lib) => {
@@ -357,6 +360,7 @@ impl App {
                 (Key::N, Action::AddPage),
                 (Key::P, Action::ExportPdf),
                 (Key::K, Action::Commit),
+                (Key::R, Action::Reports),
                 (Key::A, Action::SelectAll),
             ] {
                 if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
@@ -420,15 +424,19 @@ impl App {
             Dialog::PageProps { .. } => "Page properties",
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
+            Dialog::Reports(_) => "Reports",
             Dialog::Commit(_) => "Record a version",
             Dialog::NewBranch(_) => "New branch",
             Dialog::History(_) => "History",
             Dialog::Library(_) => "Library status",
             Dialog::Message(_) => "WiringCraft",
         };
+        let wide = matches!(dialog, Dialog::Reports(_));
+        let screen = ctx.screen_rect();
         egui::Window::new(title)
             .collapsible(false)
             .resizable(true)
+            .min_width(if wide { (screen.width() * 0.75).min(1100.0) } else { 0.0 })
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| match &mut dialog {
                 Dialog::Message(m) => {
@@ -581,6 +589,47 @@ impl App {
                             keep = false;
                         }
                     });
+                }
+                Dialog::Reports(kind) => {
+                    if let Some(o) = self.open.as_ref() {
+                        let inputs = wc_report::Inputs {
+                            project: &o.project,
+                            symbols: &o.symbols,
+                            parts: &o.parts,
+                        };
+                        ui.horizontal(|ui| {
+                            for k in wc_report::Kind::ALL {
+                                let label = report_title(k);
+                                if ui.selectable_label(*kind == k, label).clicked() {
+                                    *kind = k;
+                                }
+                            }
+                        });
+                        ui.separator();
+                        let table = wc_report::build(*kind, &inputs);
+                        report_table(ui, &table);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Save as CSV").clicked() {
+                                let path = o.dir.join("export").join(format!("{}.csv", kind.name()));
+                                let res = std::fs::create_dir_all(o.dir.join("export"))
+                                    .and_then(|()| std::fs::write(&path, table.to_csv()));
+                                self.ed.message = match res {
+                                    Ok(()) => format!("Saved {}", path.display()),
+                                    Err(e) => format!("Could not save {}: {e}", path.display()),
+                                };
+                            }
+                            if ui.button("Close").clicked() {
+                                keep = false;
+                            }
+                            ui.label(
+                                RichText::new(format!("{} rows", table.rows.len()))
+                                    .color(theme::Theme::of(ui.ctx()).faint),
+                            );
+                        });
+                    } else {
+                        keep = false;
+                    }
                 }
                 Dialog::Text(at, text, focused) => {
                     let r = ui.add(egui::TextEdit::singleline(text).desired_width(320.0));
@@ -881,6 +930,46 @@ fn subway(ui: &mut egui::Ui, rows: &[wc_vcs::subway::Row]) {
     });
 }
 
+fn report_title(k: wc_report::Kind) -> &'static str {
+    match k {
+        wc_report::Kind::Parts => "Parts",
+        wc_report::Kind::Devices => "Devices",
+        wc_report::Kind::Wires => "Wires",
+        wc_report::Kind::Nets => "Nets",
+        wc_report::Kind::Terminals => "Terminals",
+        wc_report::Kind::Cables => "Cables",
+    }
+}
+
+/// A report as a striped grid that scrolls both ways.
+fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
+    let theme = theme::Theme::of(ui.ctx());
+    egui::ScrollArea::both()
+        .max_height(ui.ctx().screen_rect().height() * 0.6)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            if t.rows.is_empty() {
+                ui.label(RichText::new("Nothing to list yet.").color(theme.faint));
+                return;
+            }
+            egui::Grid::new(("report", t.title.as_str()))
+                .striped(true)
+                .spacing([14.0, 4.0])
+                .show(ui, |ui| {
+                    for c in &t.columns {
+                        ui.label(RichText::new(c).strong());
+                    }
+                    ui.end_row();
+                    for r in &t.rows {
+                        for c in r {
+                            ui.label(c);
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
 fn export_pdf(open: &Open) -> String {
     let name: String = open
         .project
@@ -891,7 +980,21 @@ fn export_pdf(open: &Open) -> String {
         .collect();
     let dir = open.dir.join("export");
     let path = dir.join(format!("{}.pdf", if name.is_empty() { "project" } else { &name }));
-    let (bytes, report) = wc_pdf::export(&open.project, &open.symbols, &wc_pdf::Options::default());
+    // Report pages follow the schematic pages, as in a finished drawing set.
+    let inputs = wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    };
+    let options = wc_pdf::Options {
+        reports: wc_report::Kind::ALL
+            .into_iter()
+            .map(|k| wc_report::build(k, &inputs))
+            .filter(|t| !t.rows.is_empty())
+            .collect(),
+        ..Default::default()
+    };
+    let (bytes, report) = wc_pdf::export(&open.project, &open.symbols, &options);
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes)) {
         Ok(()) => {
             let mut m = format!("Exported {} pages to\n{}", report.pages, path.display());

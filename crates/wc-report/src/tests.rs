@@ -129,6 +129,21 @@ fn parts_list_groups_by_part_and_lists_gaps() {
 }
 
 #[test]
+fn interruption_points_are_not_devices() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(!parts_list(&i).rows.iter().any(|r| r[5] == "-L1"));
+    assert!(!device_list(&i).rows.iter().any(|r| r[0] == "-L1"));
+}
+
+#[test]
 fn device_list_merges_symbols_of_one_device() {
     let (p, s, parts) = fixture();
     let t = device_list(&Inputs {

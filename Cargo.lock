@@ -2953,6 +2953,7 @@ dependencies = [
  "wc-core",
  "wc-library",
  "wc-pdf",
+ "wc-report",
  "wc-vcs",
 ]
 
