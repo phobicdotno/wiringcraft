@@ -240,6 +240,8 @@ pub struct Project {
     pub lock: crate::Lockfile,
     /// Cabinet panel layouts, by id order.
     pub panels: Vec<crate::panel::Panel>,
+    /// Review comments on pages, by page then number.
+    pub comments: Vec<crate::review::Comment>,
 }
 
 impl Project {
@@ -250,6 +252,7 @@ impl Project {
             devices: BTreeMap::new(),
             lock: crate::Lockfile::default(),
             panels: Vec::new(),
+            comments: Vec::new(),
         }
     }
 

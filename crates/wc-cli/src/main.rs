@@ -155,6 +155,43 @@ enum Cmd {
     /// Version control: commit, branches, merge, history.
     #[command(subcommand)]
     Vcs(VcsCmd),
+    /// Review comments pinned on pages: add, reply, resolve, list.
+    #[command(subcommand)]
+    Comment(CommentCmd),
+}
+
+#[derive(Subcommand)]
+enum CommentCmd {
+    /// Pin a comment on a page. Prints its id.
+    Add {
+        page: String,
+        text: String,
+        /// Where on the page, in mm, `x,y`; without it the comment is about the whole page.
+        #[arg(long, value_parser = parse_point)]
+        at: Option<Point>,
+        /// Who is writing (default: WIRINGCRAFT_USER, then git's user.name, then the login).
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Answer a comment; this opens a resolved one again.
+    Reply {
+        id: String,
+        text: String,
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Mark a comment resolved.
+    Resolve { id: String },
+    /// Open a resolved comment again.
+    Reopen { id: String },
+    /// Delete a comment and its replies.
+    Remove { id: String },
+    /// List the comments, of one page or all; open ones only unless --all.
+    List {
+        page: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -370,6 +407,12 @@ enum VcsCmd {
         #[arg(default_value = "HEAD")]
         from: String,
         to: Option<String>,
+    },
+    /// One page's history: who changed it, when, and what changed, newest first.
+    PageLog {
+        page: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
 }
 
@@ -895,6 +938,7 @@ fn run(cli: Cli) -> Res<()> {
             }
         }
         Cmd::Vcs(vc) => vcs_cmd(dir, vc)?,
+        Cmd::Comment(cc) => comment_cmd(dir, cc)?,
         Cmd::Inspect { file } => {
             let bytes = std::fs::read(&file).map_err(e)?;
             let r = wc_import::archive::inspect(&bytes).map_err(e)?;
@@ -1473,6 +1517,131 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
                 println!("{c}");
             }
         }
+        VcsCmd::PageLog { page, limit } => {
+            let p = load(dir)?;
+            let page_id = p
+                .pages
+                .iter()
+                .find(|pg| pg.id == page || pg.number == page)
+                .map(|pg| pg.id.clone())
+                .unwrap_or(page);
+            let versions = wc_vcs::page_history(&git, &page_id, limit).map_err(e)?;
+            if versions.is_empty() {
+                println!("no recorded versions of page {page_id}");
+            }
+            for v in versions {
+                println!(
+                    "{}  {}  {}  {}",
+                    &v.commit[..v.commit.len().min(10)],
+                    &utc_date(v.time)[..10],
+                    v.author,
+                    v.subject
+                );
+                for c in &v.changes {
+                    println!("    {c}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Who is writing a comment: the --author option, WIRINGCRAFT_USER, git's user.name, the login.
+fn comment_author(given: Option<String>) -> String {
+    given
+        .or_else(|| std::env::var("WIRINGCRAFT_USER").ok())
+        .filter(|a| !a.trim().is_empty())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["config", "user.name"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .filter(|a| !a.is_empty())
+        })
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("USERNAME").ok())
+        .unwrap_or_default()
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
+    let mut p = load(dir)?;
+    let page_id = |p: &Project, page: &str| {
+        p.pages
+            .iter()
+            .find(|pg| pg.id == page || pg.number == page)
+            .map(|pg| pg.id.clone())
+            .ok_or_else(|| format!("no page {page:?}"))
+    };
+    match cc {
+        CommentCmd::Add { page, text, at, author } => {
+            let page = page_id(&p, &page)?;
+            let id = p
+                .add_comment(&page, at, &comment_author(author), now_secs(), &text)
+                .map_err(e)?;
+            save(dir, &p)?;
+            println!("{id}");
+        }
+        CommentCmd::Reply { id, text, author } => {
+            p.reply_to_comment(&id, &comment_author(author), now_secs(), &text)
+                .map_err(e)?;
+            save(dir, &p)?;
+        }
+        CommentCmd::Resolve { id } => {
+            p.resolve_comment(&id, true).map_err(e)?;
+            save(dir, &p)?;
+        }
+        CommentCmd::Reopen { id } => {
+            p.resolve_comment(&id, false).map_err(e)?;
+            save(dir, &p)?;
+        }
+        CommentCmd::Remove { id } => {
+            p.remove_comment(&id).map_err(e)?;
+            save(dir, &p)?;
+        }
+        CommentCmd::List { page, all } => {
+            let only = page.map(|pg| page_id(&p, &pg)).transpose()?;
+            let (mut open, mut resolved) = (0, 0);
+            for c in &p.comments {
+                if only.as_ref().is_some_and(|o| *o != c.page) {
+                    continue;
+                }
+                if c.resolved {
+                    resolved += 1;
+                } else {
+                    open += 1;
+                }
+                if c.resolved && !all {
+                    continue;
+                }
+                let number = p.page(&c.page).map(|pg| pg.number.as_str()).unwrap_or("?");
+                let at = c.at.map(|a| format!(" at {:.0},{:.0}", a.x, a.y)).unwrap_or_default();
+                println!(
+                    "{} page {number}{at}  {}  {}{}",
+                    c.id,
+                    c.author,
+                    &utc_date(c.time)[..10],
+                    if c.resolved { "  (resolved)" } else { "" }
+                );
+                println!("    {}", c.text.replace('\n', "\n    "));
+                for r in &c.replies {
+                    println!(
+                        "    > {} ({}): {}",
+                        r.author,
+                        &utc_date(r.time)[..10],
+                        r.text.replace('\n', " ")
+                    );
+                }
+            }
+            println!("{open} open, {resolved} resolved");
+        }
     }
     Ok(())
 }
@@ -1607,11 +1776,12 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
 
 /// The current time in UTC as `YYYY-MM-DDThh:mm:ssZ`.
 fn utc_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+    utc_date(now_secs())
+}
+
+/// Unix seconds in UTC as `YYYY-MM-DDThh:mm:ssZ`.
+fn utc_date(secs: i64) -> String {
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
