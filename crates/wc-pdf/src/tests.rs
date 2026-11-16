@@ -222,3 +222,52 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
     assert!(svg(&page).contains("d=\"M60 50 A10 10 0 0 1 50 60\""));
     assert!(dxf(&page).contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"));
 }
+
+#[test]
+fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
+    let mut project = Project::new("Layers");
+    let mut p1 = Page::new("p1", "1", "Control");
+    p1.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    p1.wires.push(Wire {
+        id: "w1".into(),
+        from: Endpoint::Pin {
+            item: "s1".into(),
+            pin: "A1".into(),
+        },
+        to: Endpoint::Point {
+            at: Point::new(50.0, 30.0),
+        },
+        via: vec![],
+        number: Some("101".into()),
+        potential: None,
+        cable: None,
+    });
+    p1.graphics.push(Shape::Line {
+        a: Point::new(200.0, 20.0),
+        b: Point::new(260.0, 20.0),
+    });
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    project.pages = vec![p1];
+    let (bytes, _) = export(&project, &symbols, &Options::default());
+    let pdf = String::from_utf8_lossy(&bytes);
+    assert!(pdf.contains("/OCProperties << /OCGs ["), "layers are declared");
+    assert!(pdf.contains("/Type /OCG /Name"));
+    assert!(pdf.contains("/Properties << /OC1 ") && pdf.contains("/OC2 "));
+    // No cross-references on this page, so that layer is not declared.
+    assert!(!pdf.contains("/OC3 "));
+    // The wire number is drawn inside its layer.
+    let at = pdf.find("/OC /OC2 BDC").unwrap_or(usize::MAX);
+    assert!(at < pdf.len() && pdf[at..].find("Tj").unwrap_or(usize::MAX) < pdf[at..].find("EMC").unwrap_or(0));
+
+    let (pages, _) = page_drawings(&project, &symbols, &Options::default());
+    let d = dxf(&pages[0]);
+    assert!(d.contains("0\nTEXT\n8\nWIRE-NUMBERS\n"));
+    assert!(d.contains("0\nLINE\n8\nDRAWINGS\n"));
+
+    // A page with nothing optional declares no layers.
+    project.pages[0].wires.clear();
+    project.pages[0].graphics.clear();
+    let (bytes, _) = export(&project, &symbols, &Options::default());
+    assert!(!String::from_utf8_lossy(&bytes).contains("/OCProperties"));
+}

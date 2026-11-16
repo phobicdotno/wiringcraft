@@ -1,6 +1,6 @@
 //! A minimal PDF writer: pages with content streams, link annotations and outlines.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 pub const PT_PER_MM: f64 = 72.0 / 25.4;
@@ -20,6 +20,49 @@ pub struct Drawn {
     pub ops: String,
     pub links: Vec<Link>,
     pub prims: Vec<Prim>,
+    /// Optional content layers the page draws on.
+    pub layers: BTreeSet<Layer>,
+}
+
+/// Optional content a reader can hide: PDF layers (optional content groups) and DXF layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Layer {
+    /// Free drawings and texts on the sheet: notes, construction lines, imported graphics.
+    Drawings,
+    /// Wire numbers, potential names and cable cores next to wires.
+    WireLabels,
+    /// Cross-references between coils and contacts and to other pages.
+    CrossReferences,
+}
+
+impl Layer {
+    pub const ALL: [Layer; 3] = [Layer::Drawings, Layer::WireLabels, Layer::CrossReferences];
+
+    /// The name a reader shows.
+    pub fn title(self) -> &'static str {
+        match self {
+            Layer::Drawings => "Drawings and notes",
+            Layer::WireLabels => "Wire numbers",
+            Layer::CrossReferences => "Cross-references",
+        }
+    }
+
+    /// The layer name in DXF files.
+    pub fn dxf_name(self) -> &'static str {
+        match self {
+            Layer::Drawings => "DRAWINGS",
+            Layer::WireLabels => "WIRE-NUMBERS",
+            Layer::CrossReferences => "CROSS-REFERENCES",
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Layer::Drawings => "OC1",
+            Layer::WireLabels => "OC2",
+            Layer::CrossReferences => "OC3",
+        }
+    }
 }
 
 /// One drawn primitive in page millimetres (y down), with the pen state it was drawn with.
@@ -30,6 +73,7 @@ pub enum Prim {
         closed: bool,
         filled: bool,
         ink: Stroke,
+        layer: Option<Layer>,
     },
     /// Arc from `start` to `end` degrees, clockwise on the page from +x; a full turn is a circle.
     Arc {
@@ -39,6 +83,7 @@ pub enum Prim {
         end: f64,
         filled: bool,
         ink: Stroke,
+        layer: Option<Layer>,
     },
     /// Left-aligned text: `at` is the start of the baseline, already shifted for alignment.
     Text {
@@ -47,6 +92,7 @@ pub enum Prim {
         angle: f64,
         text: String,
         ink: Stroke,
+        layer: Option<Layer>,
     },
 }
 
@@ -109,12 +155,41 @@ impl Doc {
         // Object numbers: 1 catalog, 2 pages, 3 font, 4 outlines, 5 info,
         // then per page i: page = 6+3i, content = 7+3i, outline item = 8+3i.
         let page_obj = |i: usize| 6 + 3 * i;
+        // Optional content groups (layers) follow the pages, one object each.
+        let used: Vec<Layer> = Layer::ALL
+            .into_iter()
+            .filter(|l| self.pages.iter().any(|p| p.drawn.layers.contains(l)))
+            .collect();
+        let ocg_obj = |k: usize| 6 + 3 * n + k;
+        let ocg_refs: Vec<String> = (0..used.len()).map(|k| format!("{} 0 R", ocg_obj(k))).collect();
         let mut objs: Vec<(usize, Vec<u8>)> = Vec::new();
         let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", page_obj(i))).collect();
+        let oc = if used.is_empty() {
+            String::new()
+        } else {
+            let refs = ocg_refs.join(" ");
+            format!(" /OCProperties << /OCGs [{refs}] /D << /Order [{refs}] /ON [{refs}] >> >>")
+        };
         objs.push((
             1,
-            b"<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /PageMode /UseOutlines >>".to_vec(),
+            format!("<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /PageMode /UseOutlines{oc} >>").into_bytes(),
         ));
+        for (k, l) in used.iter().enumerate() {
+            objs.push((
+                ocg_obj(k),
+                format!("<< /Type /OCG /Name {} >>", pdf_text(l.title())).into_bytes(),
+            ));
+        }
+        let properties = if used.is_empty() {
+            String::new()
+        } else {
+            let entries: Vec<String> = used
+                .iter()
+                .enumerate()
+                .map(|(k, l)| format!("/{} {} 0 R", l.tag(), ocg_obj(k)))
+                .collect();
+            format!(" /Properties << {} >>", entries.join(" "))
+        };
         objs.push((
             2,
             format!("<< /Type /Pages /Kids [{}] /Count {n} >>", kids.join(" ")).into_bytes(),
@@ -161,7 +236,7 @@ impl Doc {
             objs.push((
                 page_obj(i),
                 format!(
-                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w:.2} {h:.2}] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R /Annots [{}] >>",
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w:.2} {h:.2}] /Resources << /Font << /F1 3 0 R >>{properties} >> /Contents {} 0 R /Annots [{}] >>",
                     page_obj(i) + 1,
                     annots.join(" ")
                 )
@@ -217,6 +292,8 @@ impl Doc {
 pub struct Pen {
     pub ops: String,
     pub prims: Vec<Prim>,
+    pub layers: BTreeSet<Layer>,
+    layer: Option<Layer>,
     ink: Stroke,
     page_h: f64,
 }
@@ -226,6 +303,8 @@ impl Pen {
         Self {
             ops: String::new(),
             prims: Vec::new(),
+            layers: BTreeSet::new(),
+            layer: None,
             ink: Stroke {
                 rgb: (0.0, 0.0, 0.0),
                 width: 0.25,
@@ -270,7 +349,24 @@ impl Pen {
             closed,
             filled,
             ink: self.ink,
+            layer: self.layer,
         });
+    }
+
+    /// Draw what follows on an optional layer, until [`Pen::end_layer`]. Layers do not nest.
+    pub fn begin_layer(&mut self, layer: Layer) {
+        if self.layer.is_some() {
+            self.end_layer();
+        }
+        let _ = writeln!(self.ops, "/OC /{} BDC", layer.tag());
+        self.layers.insert(layer);
+        self.layer = Some(layer);
+    }
+
+    pub fn end_layer(&mut self) {
+        if self.layer.take().is_some() {
+            self.ops.push_str("EMC\n");
+        }
     }
 
     fn corners(min: (f64, f64), max: (f64, f64)) -> Vec<(f64, f64)> {
@@ -312,6 +408,7 @@ impl Pen {
             end: start + sweep,
             filled,
             ink: self.ink,
+            layer: self.layer,
         });
         let segs = ((sweep / 90.0).ceil() as usize).max(1);
         let step = sweep / segs as f64;
@@ -373,6 +470,7 @@ impl Pen {
             angle,
             text: s.to_owned(),
             ink: self.ink,
+            layer: self.layer,
         });
         if angle == 0.0 {
             let (px, py) = self.p(at.0 + shift, at.1);
