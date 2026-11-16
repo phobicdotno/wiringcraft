@@ -19,9 +19,36 @@ use actions::Action;
 use canvas::Editor;
 use prefs::{Chrome, Prefs};
 use state::{Open, Selection, Tool};
+use wc_core::project::PageSize;
+
+/// Title-block fields offered in the project properties, in this order.
+const TITLE_FIELDS: &[(&str, &str)] = &[
+    ("customer", "Customer"),
+    ("project_number", "Project number"),
+    ("plant", "Plant"),
+    ("drawn_by", "Drawn by"),
+    ("checked_by", "Checked by"),
+    ("revision", "Revision"),
+    ("date", "Date"),
+];
 
 enum Dialog {
     OpenPath(String),
+    NewProject {
+        dir: String,
+        name: String,
+    },
+    ProjectProps {
+        name: String,
+        fields: Vec<(String, String)>,
+    },
+    PageProps {
+        number: String,
+        title: String,
+        size: PageSize,
+        error: Option<String>,
+    },
+    DeletePage(usize),
     Commit(String),
     NewBranch(String),
     History(Vec<wc_vcs::subway::Row>),
@@ -62,7 +89,10 @@ impl chrome::Status for StatusView<'_> {
     fn enabled(&self, a: Action) -> bool {
         let has = self.open.is_some();
         match a {
-            Action::Open | Action::ToggleChrome | Action::ToggleGrid => true,
+            Action::NewProject | Action::Open | Action::ToggleChrome | Action::ToggleGrid => true,
+            Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
+            Action::PageUp => has && self.ed.page > 0,
+            Action::PageDown => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
             Action::Save => self.open.is_some_and(|o| o.dirty),
             Action::Undo => self.open.is_some_and(Open::can_undo),
             Action::Redo => self.open.is_some_and(Open::can_redo),
@@ -116,6 +146,18 @@ impl App {
                     .map(|o| o.dir.display().to_string())
                     .unwrap_or_default();
                 self.dialog = Some(Dialog::OpenPath(start));
+            }
+            Action::NewProject => {
+                let parent = self
+                    .open
+                    .as_ref()
+                    .and_then(|o| o.dir.parent())
+                    .map(|d| d.join("new-project").display().to_string())
+                    .unwrap_or_default();
+                self.dialog = Some(Dialog::NewProject {
+                    dir: parent,
+                    name: String::new(),
+                });
             }
             Action::ToggleChrome => {
                 self.prefs.chrome = match self.prefs.chrome {
@@ -173,6 +215,45 @@ impl App {
                 self.ed.selection = None;
                 self.ed.view.fit = true;
             }
+            Action::DuplicatePage => {
+                if let Some(i) = open.duplicate_page(page) {
+                    self.ed.page = i;
+                    self.ed.selection = None;
+                    self.ed.view.fit = true;
+                }
+            }
+            Action::PageUp | Action::PageDown => {
+                if let Some(i) = open.move_page(page, a == Action::PageUp) {
+                    self.ed.page = i;
+                }
+            }
+            Action::PageProps => {
+                if let Some(p) = open.project.pages.get(page) {
+                    self.dialog = Some(Dialog::PageProps {
+                        number: p.number.clone(),
+                        title: p.title.clone(),
+                        size: p.size,
+                        error: None,
+                    });
+                }
+            }
+            Action::DeletePage => self.dialog = Some(Dialog::DeletePage(page)),
+            Action::ProjectProps => {
+                let block = &open.project.meta.title_block;
+                let mut fields: Vec<(String, String)> = TITLE_FIELDS
+                    .iter()
+                    .map(|(k, _)| ((*k).to_owned(), block.get(*k).cloned().unwrap_or_default()))
+                    .collect();
+                for (k, v) in block {
+                    if !TITLE_FIELDS.iter().any(|(f, _)| f == k) {
+                        fields.push((k.clone(), v.clone()));
+                    }
+                }
+                self.dialog = Some(Dialog::ProjectProps {
+                    name: open.project.meta.name.clone(),
+                    fields,
+                });
+            }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
             Action::LibraryStatus | Action::LibraryUpdate => {
                 match wc_library::Library::open(&open.dir, &open.project) {
@@ -220,7 +301,9 @@ impl App {
                 (Key::P, Action::ExportPdf),
                 (Key::K, Action::Commit),
             ] {
-                if i.consume_shortcut(&ctrl(k)) {
+                if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
+                    out.push(Action::NewProject);
+                } else if i.consume_shortcut(&ctrl(k)) {
                     out.push(a);
                 }
             }
@@ -260,6 +343,10 @@ impl App {
         let mut then: Option<Then> = None;
         let title = match &dialog {
             Dialog::OpenPath(_) => "Open project",
+            Dialog::NewProject { .. } => "New project",
+            Dialog::ProjectProps { .. } => "Project properties",
+            Dialog::PageProps { .. } => "Page properties",
+            Dialog::DeletePage(_) => "Delete page",
             Dialog::Commit(_) => "Record a version",
             Dialog::NewBranch(_) => "New branch",
             Dialog::History(_) => "History",
@@ -293,6 +380,165 @@ impl App {
                                 app.open_dir(&p, &mut prefs);
                                 app.prefs = prefs;
                             }));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::NewProject { dir, name } => {
+                    egui::Grid::new("newproj")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Folder");
+                            ui.add(egui::TextEdit::singleline(dir).desired_width(380.0));
+                            ui.end_row();
+                            ui.label("Name");
+                            ui.add(
+                                egui::TextEdit::singleline(name)
+                                    .hint_text("the folder name")
+                                    .desired_width(380.0),
+                            );
+                            ui.end_row();
+                        });
+                    ui.label(
+                        RichText::new("A new folder with one cover page, recorded as a git repository.")
+                            .color(theme::Theme::of(ui.ctx()).faint),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!dir.trim().is_empty(), egui::Button::new("Create"))
+                            .clicked()
+                        {
+                            let d = PathBuf::from(dir.trim());
+                            let n = name.trim().to_owned();
+                            then = Some(Box::new(move |app: &mut App| app.new_project(&d, &n)));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::ProjectProps { name, fields } => {
+                    egui::Grid::new("projprops")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Project name");
+                            ui.add(egui::TextEdit::singleline(name).desired_width(300.0));
+                            ui.end_row();
+                            for (k, v) in fields.iter_mut() {
+                                let label = TITLE_FIELDS.iter().find(|(f, _)| f == k).map_or(k.as_str(), |(_, l)| l);
+                                ui.label(label);
+                                ui.add(egui::TextEdit::singleline(v).desired_width(300.0));
+                                ui.end_row();
+                            }
+                        });
+                    ui.label(
+                        RichText::new("These fields fill the title block on every page.")
+                            .color(theme::Theme::of(ui.ctx()).faint),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!name.trim().is_empty(), egui::Button::new("OK"))
+                            .clicked()
+                        {
+                            let n = name.clone();
+                            let f = fields.clone();
+                            then = Some(Box::new(move |app: &mut App| {
+                                if let Some(o) = app.open.as_mut()
+                                    && let Err(e) = o.set_project_props(&n, &f)
+                                {
+                                    app.ed.message = e;
+                                }
+                            }));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::PageProps {
+                    number,
+                    title,
+                    size,
+                    error,
+                } => {
+                    egui::Grid::new("pageprops")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Number");
+                            ui.add(egui::TextEdit::singleline(number).desired_width(120.0));
+                            ui.end_row();
+                            ui.label("Title");
+                            ui.add(egui::TextEdit::singleline(title).desired_width(300.0));
+                            ui.end_row();
+                            ui.label("Sheet size");
+                            egui::ComboBox::from_id_salt("pagesize")
+                                .selected_text(size_label(*size))
+                                .show_ui(ui, |ui| {
+                                    for s in [PageSize::A4, PageSize::A3, PageSize::A2] {
+                                        ui.selectable_value(size, s, size_label(s));
+                                    }
+                                });
+                            ui.end_row();
+                        });
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked()
+                            && let Some(o) = self.open.as_mut()
+                        {
+                            match o.set_page_props(self.ed.page, number, title, *size) {
+                                Ok(i) => {
+                                    self.ed.page = i;
+                                    self.ed.view.fit = true;
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::DeletePage(i) => {
+                    let i = *i;
+                    let what = self
+                        .open
+                        .as_ref()
+                        .and_then(|o| o.project.pages.get(i))
+                        .map(|p| {
+                            format!(
+                                "page {} \u{201c}{}\u{201d} with {} symbols and {} wires",
+                                p.number,
+                                p.title,
+                                p.symbols.len(),
+                                p.wires.len()
+                            )
+                        })
+                        .unwrap_or_default();
+                    ui.label(format!("Delete {what}? Undo brings it back."));
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            if let Some(o) = self.open.as_mut() {
+                                match o.delete_page(i) {
+                                    Ok(next) => {
+                                        self.ed.page = next;
+                                        self.ed.selection = None;
+                                        self.ed.wire = None;
+                                        self.ed.view.fit = true;
+                                    }
+                                    Err(e) => self.ed.message = e,
+                                }
+                            }
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() {
@@ -384,6 +630,37 @@ impl App {
         }
     }
 
+    fn new_project(&mut self, dir: &std::path::Path, name: &str) {
+        let name = if name.is_empty() {
+            dir.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Project".into())
+        } else {
+            name.to_owned()
+        };
+        if let Err(e) = wc_core::store::create(dir, &name) {
+            self.dialog = Some(Dialog::Message(format!("Could not create the project:\n{e}")));
+            return;
+        }
+        // A starter library next to the app, when there is one, so the symbol picker is not empty.
+        if let Some(lib) = starter_library()
+            && let Ok(mut p) = wc_core::store::load(dir)
+        {
+            p.meta.libraries.push(wc_core::project::LibrarySource {
+                name: "starter".into(),
+                kind: "folder".into(),
+                location: lib.display().to_string(),
+                reference: None,
+            });
+            let _ = wc_core::store::save(dir, &p);
+        }
+        let git = wc_vcs::Git::new(dir);
+        let _ = git.init().and_then(|()| git.commit("New project").map(|_| ()));
+        let mut prefs = std::mem::take(&mut self.prefs);
+        self.open_dir(dir, &mut prefs);
+        self.prefs = prefs;
+    }
+
     fn commit(&mut self, msg: &str) {
         let Some(open) = self.open.as_mut() else { return };
         if let Err(e) = open.save() {
@@ -411,6 +688,28 @@ impl App {
             Err(e) => self.dialog = Some(Dialog::Message(format!("Could not create the branch:\n{e}"))),
         }
     }
+}
+
+fn size_label(s: PageSize) -> &'static str {
+    match s {
+        PageSize::A4 => "A4 landscape",
+        PageSize::A3 => "A3 landscape",
+        PageSize::A2 => "A2 landscape",
+    }
+}
+
+/// The starter symbol library: `library/` beside the executable or in the source tree.
+fn starter_library() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    let candidates = [
+        exe.as_ref().and_then(|e| e.parent()).map(|d| d.join("library")),
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|d| d.join("symbols").is_dir())
+        .and_then(|d| d.canonicalize().ok())
 }
 
 /// The version history drawn as a subway map: one coloured line per branch lane.
@@ -514,10 +813,11 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| panels::status_bar(ui, self.open.as_ref(), &self.ed));
 
+        let mut page_actions = Vec::new();
         if let Some(open) = self.open.as_mut() {
             egui::SidePanel::left("navigator")
                 .default_width(220.0)
-                .show(ctx, |ui| panels::navigator(ui, open, &mut self.ed));
+                .show(ctx, |ui| panels::navigator(ui, open, &mut self.ed, &mut page_actions));
             egui::SidePanel::right("inspector")
                 .default_width(260.0)
                 .show(ctx, |ui| {
@@ -529,14 +829,30 @@ impl eframe::App for App {
                 canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
             });
         } else {
+            let mut start = None;
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(120.0);
                     ui.heading("WiringCraft");
-                    ui.label("Open a project folder to start (File → Open, Ctrl+O).");
-                    ui.label("Create one from the command line with: wiringcraft new <folder>");
+                    ui.label("Open a project folder or create a new one to start.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui.available_width() / 2.0 - 110.0);
+                        if ui.button("New project…").clicked() {
+                            start = Some(Action::NewProject);
+                        }
+                        if ui.button("Open…").clicked() {
+                            start = Some(Action::Open);
+                        }
+                    });
                 });
             });
+            if let Some(a) = start {
+                self.run(a);
+            }
+        }
+        for a in page_actions {
+            self.run(a);
         }
         self.dialogs(ctx);
 
