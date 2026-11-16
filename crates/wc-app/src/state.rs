@@ -1,5 +1,6 @@
 //! The open project and everything the user is doing with it, independent of drawing.
 
+use eframe::egui;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -68,6 +69,8 @@ pub struct Open {
     undo: Vec<Project>,
     redo: Vec<Project>,
     pub branch: String,
+    /// Underlay pictures loaded as textures, by file; `None` when the file cannot be shown.
+    pub underlays: BTreeMap<String, Option<egui::TextureHandle>>,
 }
 
 impl Open {
@@ -85,9 +88,39 @@ impl Open {
             undo: Vec::new(),
             redo: Vec::new(),
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
+            underlays: BTreeMap::new(),
         };
         me.refresh_library();
         Ok(me)
+    }
+
+    /// The texture for a page's underlay picture, loaded on first use. Pictures larger than the
+    /// graphics card takes are scaled down to fit.
+    pub fn underlay_texture(&mut self, ctx: &egui::Context, u: &wc_core::Underlay) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.underlays.get(&u.file) {
+            return t.clone();
+        }
+        let max_side = ctx.input(|i| i.max_texture_side).max(1) as u32;
+        let tex = u
+            .file_is_safe()
+            .then(|| std::fs::read(self.dir.join(&u.file)).ok())
+            .flatten()
+            .and_then(|bytes| image::load_from_memory(&bytes).ok())
+            .map(|img| {
+                if img.width() > max_side || img.height() > max_side {
+                    img.resize(max_side, max_side, image::imageops::FilterType::Triangle)
+                } else {
+                    img
+                }
+            })
+            .map(|img| {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                ctx.load_texture(format!("underlay:{}", u.file), pixels, egui::TextureOptions::LINEAR)
+            });
+        self.underlays.insert(u.file.clone(), tex.clone());
+        tex
     }
 
     pub fn refresh_library(&mut self) {

@@ -8,6 +8,7 @@ pub mod csv;
 pub mod dxf;
 pub mod eplan;
 pub mod pdf;
+pub mod raster;
 pub mod svg;
 
 #[derive(Debug, thiserror::Error)]

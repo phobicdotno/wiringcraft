@@ -24,6 +24,7 @@ quick-xml = "0.37"
 tempfile = "3"
 miniz_oxide = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

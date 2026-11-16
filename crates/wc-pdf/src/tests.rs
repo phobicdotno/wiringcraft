@@ -309,3 +309,46 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
     assert!(text.contains("/Dest [12 0 R /Fit]"), "row 2 -> page 2");
     assert_eq!(text.matches("/Subtype /Link").count(), 2);
 }
+
+#[test]
+fn underlay_pictures_go_under_the_page_on_their_own_layer() {
+    let mut png = Vec::new();
+    let img = image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(2, 2, vec![0, 255, 255, 0]).unwrap_or_default());
+    assert!(img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).is_ok());
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "Scanned");
+    p1.underlay = Some(wc_core::Underlay {
+        file: "underlays/p1.png".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(420.0, 297.0),
+    });
+    let mut p2 = Page::new("p2", "2", "Missing picture");
+    p2.underlay = Some(wc_core::Underlay {
+        file: "underlays/p2.jpg".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(10.0, 10.0),
+    });
+    let mut p3 = Page::new("p3", "3", "Not a picture");
+    p3.underlay = Some(wc_core::Underlay {
+        file: "underlays/p3.jpg".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(10.0, 10.0),
+    });
+    project.pages = vec![p1, p2, p3];
+    let mut underlays = BTreeMap::new();
+    underlays.insert("underlays/p1.png".to_string(), png);
+    underlays.insert("underlays/p3.jpg".to_string(), vec![0xFF, 0xD8, 0xFF]);
+    let opts = Options {
+        underlays,
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(text.matches("/Subtype /Image").count(), 1);
+    assert!(text.contains("/Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode"));
+    assert!(text.contains("/OC /OC4 BDC q 1190.551 0 0 841.890 0.000 0.000 cm /Im0 Do Q EMC"));
+    assert!(text.contains(&format!("/Name {}", writer::pdf_text("Scanned sheets"))));
+    assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+    assert!(report.warnings.iter().any(|w| w.contains("p2.jpg is missing")));
+    assert!(report.warnings.iter().any(|w| w.contains("damaged")));
+}
