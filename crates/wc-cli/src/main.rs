@@ -138,6 +138,10 @@ enum Cmd {
     /// Export devices, their part data and connection points, and the connections between them
     /// as AutomationML (CAEX 3.0), for tools that take engineering data rather than drawings.
     Aml { out: PathBuf },
+    /// Write the PLC inputs and outputs as an IEC 61131-3 global variable list (structured
+    /// text) for TwinCAT, CODESYS and similar tools: one variable per point, named after its
+    /// device tag and located at its address (`%I*`/`%Q*` when it has none).
+    PlcVars { out: PathBuf },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
     /// potentials, open pins, wires ending in the air, devices without a part. Exits with an
     /// error when an error is found, so it can guard a commit or a CI job.
@@ -840,6 +844,25 @@ fn run(cli: Cli) -> Res<()> {
                 counts.devices,
                 counts.links
             );
+        }
+        Cmd::PlcVars { out } => {
+            let p = load(dir)?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let parts = vendored_parts(dir, &p);
+            let inputs = wc_report::Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            let v = wc_report::plc_variables(&inputs);
+            std::fs::write(&out, &v.text).map_err(e)?;
+            if v.unlocated > 0 {
+                eprintln!(
+                    "warning: {} point(s) have no PLC address and are declared at %I* or %Q*",
+                    v.unlocated
+                );
+            }
+            println!("wrote {}: {} variable(s)", out.display(), v.variables);
         }
         Cmd::Nets => {
             let p = load(dir)?;
