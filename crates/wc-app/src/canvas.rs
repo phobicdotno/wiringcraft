@@ -51,6 +51,13 @@ pub struct Editor {
     /// The text tool was clicked here; the app asks for the text.
     pub ask_text: Option<Point>,
     pub message: String,
+    /// The panel layout shown instead of a page, by index.
+    pub panel: Option<usize>,
+    /// The device item picked in the panel view, by index into the panel's items.
+    pub panel_pick: Option<usize>,
+    /// A device being dragged in the panel view: the grab offset and whether the undo
+    /// checkpoint was taken.
+    pub panel_drag: Option<(Point, bool)>,
 }
 
 impl Default for Editor {
@@ -67,6 +74,9 @@ impl Default for Editor {
             shape_start: None,
             ask_text: None,
             message: String::new(),
+            panel: None,
+            panel_pick: None,
+            panel_drag: None,
         }
     }
 }
@@ -339,6 +349,10 @@ fn paint_frame(p: &egui::Painter, xf: &Xf, open: &Open, page: &Page, c: Color32,
 /// Show the canvas for the current page and handle the tools. Returns true when the project
 /// changed.
 pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool, snap_step: f64) {
+    if let Some(panel) = ed.panel {
+        crate::panel_view::show(ui, open, ed, panel, snap_step);
+        return;
+    }
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let t = theme::Theme::of(ui.ctx());

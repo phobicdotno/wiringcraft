@@ -43,6 +43,7 @@ pub enum Icon {
     Branch,
     History,
     Layout,
+    Panel,
     Theme,
 }
 
@@ -387,6 +388,19 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
             );
             line((3.0, 9.0), (21.0, 9.0));
             line((8.0, 9.0), (8.0, 20.0));
+        }
+        Icon::Panel => {
+            // A mounting plate with a duct across the top and two devices on a rail.
+            p.rect_stroke(
+                Rect::from_min_max(at(4.0, 3.0), at(20.0, 21.0)),
+                1.0 * s,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
+            line((4.0, 7.0), (20.0, 7.0));
+            line((6.0, 14.0), (18.0, 14.0));
+            poly(&[(7.0, 10.0), (10.0, 10.0), (10.0, 18.0), (7.0, 18.0)], true);
+            poly(&[(12.0, 11.0), (14.0, 11.0), (14.0, 17.0), (12.0, 17.0)], true);
         }
         Icon::Theme => {
             // Half-filled disc: light on one side, dark on the other.

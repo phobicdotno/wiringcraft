@@ -7,6 +7,7 @@ mod canvas;
 mod chrome;
 mod edit;
 mod icons;
+mod panel_view;
 mod panels;
 mod prefs;
 mod state;
@@ -118,11 +119,13 @@ impl chrome::Status for StatusView<'_> {
         match a {
             Action::NewProject | Action::Open | Action::ToggleChrome | Action::ToggleTheme | Action::ToggleGrid => true,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
+            Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
             Action::PageUp => has && self.ed.page > 0,
             Action::PageDown => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
             Action::Save => self.open.is_some_and(|o| o.dirty),
             Action::Undo => self.open.is_some_and(Open::can_undo),
             Action::Redo => self.open.is_some_and(Open::can_redo),
+            Action::Delete if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
             Action::Delete | Action::Copy | Action::Cut | Action::SaveMacro => has && !self.ed.selection.is_empty(),
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
@@ -253,6 +256,66 @@ impl App {
             Action::Redo => {
                 if open.redo() {
                     self.ed.selection.clear();
+                }
+            }
+            Action::Delete if self.ed.panel.is_some() => {
+                if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick.take()) {
+                    open.checkpoint();
+                    if let Some(panel) = open.project.panels.get_mut(pi)
+                        && item < panel.items.len()
+                    {
+                        panel.items.remove(item);
+                    }
+                }
+            }
+            Action::NewPanel => {
+                open.checkpoint();
+                let n = (1..)
+                    .find(|n| !open.project.panels.iter().any(|p| p.id == format!("panel{n}")))
+                    .unwrap_or(1);
+                let panel = wc_core::panel::Panel::with_rails(format!("panel{n}"), format!("Panel {n}"), 600.0, 800.0);
+                open.project.panels.push(panel);
+                open.project.panels.sort_by(|a, b| a.id.cmp(&b.id));
+                self.ed.panel = open.project.panels.iter().position(|p| p.id == format!("panel{n}"));
+                self.ed.panel_pick = None;
+                self.ed.view.fit = true;
+                self.ed.message = "New panel layout. Page menu → Arrange devices puts the devices on its rails.".into();
+            }
+            Action::ArrangePanel => {
+                if let Some(pi) = self.ed.panel
+                    && pi < open.project.panels.len()
+                {
+                    open.checkpoint();
+                    let mut panels = std::mem::take(&mut open.project.panels);
+                    let done = panels
+                        .get_mut(pi)
+                        .map(|p| wc_core::panel::arrange(p, &open.project, &open.parts, None))
+                        .unwrap_or_default();
+                    open.project.panels = panels;
+                    let mut m = format!("Placed {} device(s) on the rails.", done.placed.len());
+                    if !done.estimated.is_empty() {
+                        m.push_str(&format!(
+                            "\n\nNo Width/Height on the part, drawn 18 x 90 mm:\n{}",
+                            done.estimated.join(", ")
+                        ));
+                    }
+                    if !done.did_not_fit.is_empty() {
+                        m.push_str(&format!(
+                            "\n\nNo room left on the rails for:\n{}",
+                            done.did_not_fit.join(", ")
+                        ));
+                    }
+                    self.dialog = Some(Dialog::Message(m));
+                }
+            }
+            Action::DeletePanel => {
+                if let Some(pi) = self.ed.panel.take()
+                    && pi < open.project.panels.len()
+                {
+                    open.checkpoint();
+                    open.project.panels.remove(pi);
+                    self.ed.panel_pick = None;
+                    self.ed.view.fit = true;
                 }
             }
             Action::Delete => {
