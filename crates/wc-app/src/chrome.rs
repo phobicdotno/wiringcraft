@@ -77,6 +77,10 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::PageDown),
             None,
             Some(Action::DeletePage),
+            None,
+            Some(Action::NewPanel),
+            Some(Action::ArrangePanel),
+            Some(Action::DeletePanel),
         ],
     ),
     (

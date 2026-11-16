@@ -326,6 +326,14 @@ mod tests {
                 ..Default::default()
             },
         );
+        let mut panel = crate::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0);
+        panel.items.push(crate::panel::PanelItem::Device {
+            tag: DeviceTag::parse("+CAB1-K1")?,
+            at: Point::new(50.0, 100.0),
+            width: 45.0,
+            height: 85.0,
+        });
+        p.panels.push(panel);
         Ok(p)
     }
 
@@ -350,6 +358,10 @@ mod tests {
         p.pages.clear();
         save(dir.path(), &p)?;
         assert!(!dir.path().join("pages/p0002.page.json").exists());
+        assert!(dir.path().join("panels/main.panel.json").exists());
+        p.panels.clear();
+        save(dir.path(), &p)?;
+        assert!(!dir.path().join("panels/main.panel.json").exists());
         Ok(())
     }
 
