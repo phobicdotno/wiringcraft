@@ -107,6 +107,14 @@ enum Cmd {
     },
     /// List the potentials (connected pins) across all pages.
     Nets,
+    /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
+    /// potentials, open pins, wires ending in the air, devices without a part. Exits with an
+    /// error when an error is found, so it can guard a commit or a CI job.
+    Check {
+        /// Also list notes (open pins, devices without a part).
+        #[arg(long)]
+        all: bool,
+    },
     /// Show what is inside a project archive from another tool (.tewzip, .zw1, .elk, .zip).
     Inspect { file: PathBuf },
     /// Version control: commit, branches, merge, history.
@@ -511,6 +519,36 @@ fn run(cli: Cli) -> Res<()> {
                 eprintln!("warning: {w}");
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
+        }
+        Cmd::Check { all } => {
+            let p = load(dir)?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let parts = vendored_parts(dir, &p);
+            let inputs = wc_report::Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            let found = wc_report::check(&inputs);
+            let count = |s: wc_report::Severity| found.iter().filter(|f| f.severity == s).count();
+            for f in found.iter().filter(|f| all || f.severity != wc_report::Severity::Note) {
+                let page = f
+                    .page_id
+                    .as_deref()
+                    .and_then(|id| p.page(id))
+                    .map(|pg| format!("page {}: ", pg.number))
+                    .unwrap_or_default();
+                println!("{:<7} {page}{}", f.severity.label(), f.message);
+            }
+            let (errors, warnings, notes) = (
+                count(wc_report::Severity::Error),
+                count(wc_report::Severity::Warning),
+                count(wc_report::Severity::Note),
+            );
+            println!("{errors} errors, {warnings} warnings, {notes} notes");
+            if errors > 0 {
+                return Err(format!("the project check found {errors} errors"));
+            }
         }
         Cmd::Report { kind, format, out } => {
             let p = load(dir)?;

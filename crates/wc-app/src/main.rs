@@ -50,6 +50,8 @@ enum Dialog {
         error: Option<String>,
     },
     DeletePage(usize),
+    /// Project check findings.
+    Check(Vec<wc_report::Finding>),
     /// Reports (parts, devices, wires, nets, terminals, cables) as tables.
     Reports(wc_report::Kind),
     /// Write a new text at this point on the current page.
@@ -315,6 +317,15 @@ impl App {
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
             Action::Reports => self.dialog = Some(Dialog::Reports(wc_report::Kind::Parts)),
+            Action::Check => {
+                let found = run_check(open);
+                let errors = found
+                    .iter()
+                    .filter(|f| f.severity == wc_report::Severity::Error)
+                    .count();
+                self.ed.message = format!("Project check: {errors} errors, {} findings in all.", found.len());
+                self.dialog = Some(Dialog::Check(found));
+            }
             Action::LibraryStatus | Action::LibraryUpdate => {
                 match wc_library::Library::open(&open.dir, &open.project) {
                     Ok(lib) => {
@@ -361,6 +372,7 @@ impl App {
                 (Key::P, Action::ExportPdf),
                 (Key::K, Action::Commit),
                 (Key::R, Action::Reports),
+                (Key::E, Action::Check),
                 (Key::A, Action::SelectAll),
             ] {
                 if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
@@ -425,13 +437,14 @@ impl App {
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
             Dialog::Reports(_) => "Reports",
+            Dialog::Check(_) => "Project check",
             Dialog::Commit(_) => "Record a version",
             Dialog::NewBranch(_) => "New branch",
             Dialog::History(_) => "History",
             Dialog::Library(_) => "Library status",
             Dialog::Message(_) => "WiringCraft",
         };
-        let wide = matches!(dialog, Dialog::Reports(_));
+        let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_));
         let screen = ctx.screen_rect();
         egui::Window::new(title)
             .collapsible(false)
@@ -589,6 +602,80 @@ impl App {
                             keep = false;
                         }
                     });
+                }
+                Dialog::Check(found) => {
+                    let t = theme::Theme::of(ui.ctx());
+                    if found.is_empty() {
+                        ui.label("No problems found.");
+                    }
+                    let mut go: Option<(String, Option<String>)> = None;
+                    egui::ScrollArea::vertical()
+                        .max_height(ui.ctx().screen_rect().height() * 0.6)
+                        .show(ui, |ui| {
+                            egui::Grid::new("check")
+                                .striped(true)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    for f in found.iter() {
+                                        let c = match f.severity {
+                                            wc_report::Severity::Error => t.error,
+                                            wc_report::Severity::Warning => t.selection,
+                                            wc_report::Severity::Note => t.faint,
+                                        };
+                                        ui.label(RichText::new(f.severity.label()).color(c));
+                                        let page = f
+                                            .page_id
+                                            .as_deref()
+                                            .and_then(|id| self.open.as_ref().and_then(|o| o.project.page(id)))
+                                            .map(|pg| pg.number.clone())
+                                            .unwrap_or_default();
+                                        ui.label(page);
+                                        match &f.page_id {
+                                            Some(pid) => {
+                                                if ui.link(&f.message).on_hover_text("Show it").clicked() {
+                                                    go = Some((pid.clone(), f.item.clone()));
+                                                }
+                                            }
+                                            None => {
+                                                ui.label(&f.message);
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Check again").clicked()
+                            && let Some(o) = self.open.as_ref()
+                        {
+                            *found = run_check(o);
+                        }
+                        if ui.button("Close").clicked() {
+                            keep = false;
+                        }
+                    });
+                    if let Some((pid, item)) = go
+                        && let Some(o) = self.open.as_ref()
+                        && let Some(i) = o.project.pages.iter().position(|p| p.id == pid)
+                    {
+                        self.ed.page = i;
+                        self.ed.tool = Tool::Select;
+                        self.ed.view.fit = true;
+                        self.ed.selection = item
+                            .and_then(|it| {
+                                let pg = &o.project.pages[i];
+                                if pg.symbol(&it).is_some() {
+                                    Some(Selection::Symbol(it))
+                                } else if pg.wires.iter().any(|w| w.id == it) {
+                                    Some(Selection::Wire(it))
+                                } else {
+                                    None
+                                }
+                            })
+                            .into_iter()
+                            .collect();
+                    }
                 }
                 Dialog::Reports(kind) => {
                     if let Some(o) = self.open.as_ref() {
@@ -928,6 +1015,14 @@ fn subway(ui: &mut egui::Ui, rows: &[wc_vcs::subway::Row]) {
             p.text(Pos2::new(x, c.y), egui::Align2::LEFT_CENTER, label, font, tc);
         }
     });
+}
+
+fn run_check(open: &Open) -> Vec<wc_report::Finding> {
+    wc_report::check(&wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    })
 }
 
 fn report_title(k: wc_report::Kind) -> &'static str {

@@ -1,0 +1,332 @@
+//! Project check: problems in a schematic that are easy to miss on screen, such as a device
+//! drawn twice, a contact whose coil is missing, a pin left open or two potentials shorted.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use wc_core::geom::Point;
+use wc_core::symbol::SymbolRole;
+use wc_core::{DeviceTag, Endpoint, Page};
+
+use crate::{Inputs, Table, natural_key};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Wrong: the drawing or its reports cannot be trusted until it is fixed.
+    Error,
+    /// Probably a mistake.
+    Warning,
+    /// Worth knowing, often fine (for example a device without a part yet).
+    Note,
+}
+
+impl Severity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Note => "note",
+        }
+    }
+}
+
+/// One problem, with where to find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub severity: Severity,
+    /// The page it is on, when it is on one.
+    pub page_id: Option<String>,
+    /// The placed symbol or wire id on that page, for selecting it.
+    pub item: Option<String>,
+    pub message: String,
+}
+
+fn at(page: &Page, item: &str, severity: Severity, message: String) -> Finding {
+    Finding {
+        severity,
+        page_id: Some(page.id.clone()),
+        item: Some(item.to_owned()),
+        message,
+    }
+}
+
+/// Run every check. Findings come sorted: errors first, then by page.
+pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
+    let p = i.project;
+    let mut out = Vec::new();
+    let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
+
+    // Symbols missing from the project's library copy, and wires on missing symbols or pins.
+    for page in &p.pages {
+        for s in &page.symbols {
+            if !i.symbols.contains_key(&s.symbol) {
+                out.push(at(
+                    page,
+                    &s.id,
+                    Severity::Error,
+                    format!("symbol {} is missing from the project's library copy", s.symbol),
+                ));
+            }
+        }
+        for w in &page.wires {
+            for e in [&w.from, &w.to] {
+                if let Endpoint::Pin { item, pin } = e {
+                    let ok = page
+                        .symbol(item)
+                        .and_then(|s| i.symbols.get(&s.symbol))
+                        .is_some_and(|sym| sym.pin(pin).is_some());
+                    let known = page.symbol(item).is_some_and(|s| i.symbols.contains_key(&s.symbol));
+                    if !ok && (known || page.symbol(item).is_none()) {
+                        out.push(at(
+                            page,
+                            &w.id,
+                            Severity::Error,
+                            format!("wire ends on {item}:{pin}, which does not exist"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Devices drawn twice: one tag on two coils, or on two copies of the same standalone symbol
+    // or terminal. Contacts may repeat (a relay has several).
+    let mut seen: BTreeMap<(DeviceTag, String), Vec<(&Page, &str)>> = BTreeMap::new();
+    let mut mains: BTreeSet<DeviceTag> = BTreeSet::new();
+    for page in &p.pages {
+        for s in &page.symbols {
+            let Some(tag) = &s.tag else { continue };
+            match role(&s.symbol) {
+                Some(SymbolRole::Main) => {
+                    mains.insert(tag.clone());
+                    seen.entry((tag.clone(), "main".into()))
+                        .or_default()
+                        .push((page, &s.id));
+                }
+                Some(SymbolRole::Standalone | SymbolRole::Terminal) => {
+                    seen.entry((tag.clone(), s.symbol.clone()))
+                        .or_default()
+                        .push((page, &s.id));
+                }
+                _ => {}
+            }
+        }
+    }
+    for ((tag, _), uses) in &seen {
+        if uses.len() > 1 {
+            let pages: BTreeSet<&str> = uses.iter().map(|(pg, _)| pg.number.as_str()).collect();
+            for (page, item) in uses {
+                out.push(at(
+                    page,
+                    item,
+                    Severity::Error,
+                    format!(
+                        "{tag} is drawn {} times (pages {})",
+                        uses.len(),
+                        pages.iter().copied().collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Contacts without a coil, interruption points without a partner.
+    let mut links: BTreeMap<DeviceTag, usize> = BTreeMap::new();
+    for page in &p.pages {
+        for s in &page.symbols {
+            if let (Some(tag), Some(SymbolRole::Interruption)) = (&s.tag, role(&s.symbol)) {
+                *links.entry(tag.clone()).or_default() += 1;
+            }
+        }
+    }
+    for page in &p.pages {
+        for s in &page.symbols {
+            match (role(&s.symbol), &s.tag) {
+                (Some(SymbolRole::Auxiliary), Some(tag)) if !mains.contains(tag) => {
+                    out.push(at(page, &s.id, Severity::Warning, format!("contact {tag} has no coil")))
+                }
+                (Some(SymbolRole::Interruption), Some(tag)) if links.get(tag).copied().unwrap_or(0) < 2 => {
+                    out.push(at(
+                        page,
+                        &s.id,
+                        Severity::Warning,
+                        format!("interruption point {tag} has no partner"),
+                    ));
+                }
+                (Some(SymbolRole::Interruption), None) => out.push(at(
+                    page,
+                    &s.id,
+                    Severity::Warning,
+                    "interruption point has no tag, so it joins nothing".into(),
+                )),
+                _ => {}
+            }
+        }
+    }
+
+    // Open pins: a pin no wire reaches.
+    for page in &p.pages {
+        let wired: BTreeSet<(&str, &str)> = page
+            .wires
+            .iter()
+            .flat_map(|w| [&w.from, &w.to])
+            .filter_map(|e| match e {
+                Endpoint::Pin { item, pin } => Some((item.as_str(), pin.as_str())),
+                Endpoint::Point { .. } => None,
+            })
+            .collect();
+        for s in &page.symbols {
+            let Some(sym) = i.symbols.get(&s.symbol) else { continue };
+            let open: Vec<&str> = sym
+                .pins
+                .iter()
+                .map(|pin| pin.name.as_str())
+                .filter(|pin| !wired.contains(&(s.id.as_str(), *pin)))
+                .collect();
+            if !open.is_empty() {
+                let who = s.tag.as_ref().map_or_else(|| sym.name.clone(), ToString::to_string);
+                out.push(at(
+                    page,
+                    &s.id,
+                    Severity::Note,
+                    format!("{who}: pin {} not connected", open.join(", ")),
+                ));
+            }
+        }
+    }
+
+    // Wire ends in the air: a free end that meets no other wire and carries no potential name.
+    for page in &p.pages {
+        let paths: Vec<(&str, Vec<Point>)> = page
+            .wires
+            .iter()
+            .filter_map(|w| {
+                let mut pts = vec![end_pos(i, page, &w.from)?];
+                pts.extend(w.via.iter().copied());
+                pts.push(end_pos(i, page, &w.to)?);
+                Some((w.id.as_str(), pts))
+            })
+            .collect();
+        for w in &page.wires {
+            if w.potential.is_some() {
+                continue;
+            }
+            for e in [&w.from, &w.to] {
+                let Endpoint::Point { at: q } = e else { continue };
+                let touches = paths
+                    .iter()
+                    .filter(|(id, _)| *id != w.id)
+                    .any(|(_, pts)| pts.windows(2).any(|ab| on_segment(*q, ab[0], ab[1])));
+                if !touches {
+                    out.push(at(
+                        page,
+                        &w.id,
+                        Severity::Warning,
+                        format!(
+                            "wire{} ends in the air at {:.1}, {:.1}",
+                            w.number.as_ref().map(|n| format!(" {n}")).unwrap_or_default(),
+                            q.x,
+                            q.y
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Shorts: one net carrying two potential names (for example L1 and L2).
+    let nets = wc_core::connectivity::nets_linked(p, |id| {
+        i.symbols.get(id).is_some_and(|s| s.role == SymbolRole::Interruption)
+    });
+    for n in nets {
+        let names: BTreeSet<&str> = n.names.iter().map(String::as_str).collect();
+        if names.len() > 1 {
+            let (page_id, item) = n
+                .pins
+                .first()
+                .map(|(pg, it, _)| (Some(pg.clone()), Some(it.clone())))
+                .unwrap_or((None, None));
+            out.push(Finding {
+                severity: Severity::Error,
+                page_id,
+                item,
+                message: format!(
+                    "potentials {} are connected to each other",
+                    names.into_iter().collect::<Vec<_>>().join(" and ")
+                ),
+            });
+        }
+    }
+
+    // Devices without a part.
+    for tag in crate::all_tags(i) {
+        if p.devices.get(&tag).and_then(|d| d.part.as_ref()).is_none() {
+            out.push(Finding {
+                severity: Severity::Note,
+                page_id: None,
+                item: None,
+                message: format!("{tag} has no part"),
+            });
+        }
+    }
+
+    let page_order: BTreeMap<&str, usize> = p.pages.iter().enumerate().map(|(n, pg)| (pg.id.as_str(), n)).collect();
+    out.sort_by(|a, b| {
+        a.severity
+            .cmp(&b.severity)
+            .then_with(|| {
+                let pa = a
+                    .page_id
+                    .as_deref()
+                    .and_then(|x| page_order.get(x))
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                let pb = b
+                    .page_id
+                    .as_deref()
+                    .and_then(|x| page_order.get(x))
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                pa.cmp(&pb)
+            })
+            .then_with(|| natural_key(&a.message).cmp(&natural_key(&b.message)))
+    });
+    out.dedup();
+    out
+}
+
+fn end_pos(i: &Inputs<'_>, page: &Page, e: &Endpoint) -> Option<Point> {
+    match e {
+        Endpoint::Point { at } => Some(*at),
+        Endpoint::Pin { item, pin } => {
+            let s = page.symbol(item)?;
+            let p = i.symbols.get(&s.symbol)?.pin(pin)?;
+            Some(p.at.transform(s.rotation, s.mirror) + s.at)
+        }
+    }
+}
+
+fn on_segment(p: Point, a: Point, b: Point) -> bool {
+    const EPS: f64 = 0.05;
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    if len2 < EPS * EPS {
+        return p.distance(a) < EPS;
+    }
+    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+    p.distance(Point::new(a.x + t * dx, a.y + t * dy)) < EPS
+}
+
+/// The findings as a report table.
+pub fn check_table(i: &Inputs<'_>) -> Table {
+    let mut t = Table::new("Project check", &["Severity", "Page", "Problem"]);
+    for f in check(i) {
+        let page = f
+            .page_id
+            .as_deref()
+            .and_then(|id| i.project.page(id))
+            .map(|pg| pg.number.clone())
+            .unwrap_or_default();
+        t.rows.push(vec![f.severity.label().into(), page, f.message]);
+    }
+    t
+}
