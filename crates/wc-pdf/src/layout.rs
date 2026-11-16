@@ -7,7 +7,7 @@ use wc_core::symbol::SymbolRole;
 use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Symbol};
 
 use crate::Options;
-use crate::writer::{Drawn, Link, Pen, text_width_mm};
+use crate::writer::{Drawn, Layer, Link, Pen, text_width_mm};
 
 pub use wc_core::project::FRAME_COLUMNS;
 const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
@@ -417,8 +417,12 @@ pub fn draw_page(
     // Free graphics: texts, lines and rectangles drawn on the sheet, and imported drawings.
     pen.colour(0.0, 0.0, 0.0);
     pen.width(0.25);
-    for g in &page.graphics {
-        draw_shape(&mut pen, g);
+    if !page.graphics.is_empty() {
+        pen.begin_layer(Layer::Drawings);
+        for g in &page.graphics {
+            draw_shape(&mut pen, g);
+        }
+        pen.end_layer();
     }
 
     // Wires under symbols.
@@ -462,11 +466,13 @@ pub fn draw_page(
                 // Left of a vertical first segment, above a horizontal one; pin numbers sit on the right.
                 let (p, q) = (pts[0], pts[1]);
                 let mid = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
+                pen.begin_layer(Layer::WireLabels);
                 if (p.0 - q.0).abs() < (p.1 - q.1).abs() {
                     pen.text((mid.0 - 1.0, mid.1 + 0.8), 2.0, 2, &label.join(" "));
                 } else {
                     pen.text((mid.0, mid.1 - 1.0), 2.0, 1, &label.join(" "));
                 }
+                pen.end_layer();
             }
         }
         polylines.push(pts);
@@ -511,7 +517,11 @@ pub fn draw_page(
 
     // Cross-references, as links to the page they point at.
     pen.colour(0.1, 0.3, 0.7);
-    for m in xref_marks(page, symbols, xref, warnings) {
+    let marks = xref_marks(page, symbols, xref, warnings);
+    if !marks.is_empty() {
+        pen.begin_layer(Layer::CrossReferences);
+    }
+    for m in marks {
         let a = match m.align {
             Align::Left => 0,
             Align::Center => 1,
@@ -530,11 +540,13 @@ pub fn draw_page(
             target_page_id: m.target_page_id,
         });
     }
+    pen.end_layer();
     pen.colour(0.0, 0.0, 0.0);
     Drawn {
         ops: pen.ops,
         links,
         prims: pen.prims,
+        layers: pen.layers,
     }
 }
 
@@ -702,5 +714,6 @@ pub fn draw_table_page(
         ops: pen.ops,
         links: Vec::new(),
         prims: pen.prims,
+        layers: pen.layers,
     }
 }

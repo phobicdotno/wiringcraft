@@ -112,6 +112,7 @@ pub fn svg(page: &PageDrawing) -> String {
                 closed,
                 filled,
                 ink,
+                ..
             } => {
                 if points.len() < 2 {
                     continue;
@@ -132,6 +133,7 @@ pub fn svg(page: &PageDrawing) -> String {
                 end,
                 filled,
                 ink,
+                ..
             } => {
                 let paint = if *filled {
                     format!("fill=\"{}\" stroke=\"none\"", rgb(ink))
@@ -169,6 +171,7 @@ pub fn svg(page: &PageDrawing) -> String {
                 angle,
                 text,
                 ink,
+                ..
             } => {
                 let turn = if *angle == 0.0 {
                     String::new()
@@ -252,6 +255,11 @@ pub fn dxf(page: &PageDrawing) -> String {
     pair(0, "SECTION");
     pair(2, "ENTITIES");
     for p in &page.prims {
+        let layer = match p {
+            Prim::Path { layer, .. } | Prim::Arc { layer, .. } | Prim::Text { layer, .. } => {
+                layer.map_or("0", |l| l.dxf_name())
+            }
+        };
         match p {
             Prim::Path {
                 points, closed, ink, ..
@@ -259,7 +267,7 @@ pub fn dxf(page: &PageDrawing) -> String {
                 let colour = aci(ink).to_string();
                 if points.len() == 2 && !closed {
                     pair(0, "LINE");
-                    pair(8, "0");
+                    pair(8, layer);
                     pair(62, &colour);
                     pair(10, &num(points[0].0));
                     pair(20, &num(y(points[0].1)));
@@ -267,18 +275,18 @@ pub fn dxf(page: &PageDrawing) -> String {
                     pair(21, &num(y(points[1].1)));
                 } else if points.len() >= 2 {
                     pair(0, "POLYLINE");
-                    pair(8, "0");
+                    pair(8, layer);
                     pair(62, &colour);
                     pair(66, "1");
                     pair(70, if *closed { "1" } else { "0" });
                     for (px, py) in points {
                         pair(0, "VERTEX");
-                        pair(8, "0");
+                        pair(8, layer);
                         pair(10, &num(*px));
                         pair(20, &num(y(*py)));
                     }
                     pair(0, "SEQEND");
-                    pair(8, "0");
+                    pair(8, layer);
                 }
             }
             Prim::Arc {
@@ -295,7 +303,7 @@ pub fn dxf(page: &PageDrawing) -> String {
                 } else {
                     pair(0, "ARC");
                 }
-                pair(8, "0");
+                pair(8, layer);
                 pair(62, &colour);
                 pair(10, &num(center.0));
                 pair(20, &num(y(center.1)));
@@ -313,9 +321,10 @@ pub fn dxf(page: &PageDrawing) -> String {
                 angle,
                 text,
                 ink,
+                ..
             } => {
                 pair(0, "TEXT");
-                pair(8, "0");
+                pair(8, layer);
                 pair(62, &aci(ink).to_string());
                 pair(10, &num(at.0));
                 pair(20, &num(y(at.1)));

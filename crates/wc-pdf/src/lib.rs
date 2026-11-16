@@ -18,7 +18,7 @@ pub use layout::{
     xref_marks,
 };
 pub use vector::{PageDrawing, dxf, page_drawings, svg};
-pub use writer::{Prim, Stroke};
+pub use writer::{Layer, Prim, Stroke};
 
 #[derive(Debug, Clone)]
 pub struct Options {
