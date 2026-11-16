@@ -6,7 +6,21 @@ use std::path::{Path, PathBuf};
 use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
 use wc_core::project::PageSize;
-use wc_core::{DeviceTag, Endpoint, Page, PlacedSymbol, Project, Symbol, Wire, store};
+use wc_core::{DeviceTag, Endpoint, Page, Part, PlacedSymbol, Project, Symbol, Wire, store};
+
+/// How a part is listed in the picker: manufacturer, order number and description.
+pub fn part_label(p: &Part) -> String {
+    let head: Vec<&str> = [p.manufacturer.as_str(), p.order_number.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    match (head.is_empty(), p.description.is_empty()) {
+        (true, true) => p.id.clone(),
+        (true, false) => p.description.clone(),
+        (false, true) => head.join(" "),
+        (false, false) => format!("{} \u{2013} {}", head.join(" "), p.description),
+    }
+}
 
 /// What a click on the canvas does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +48,10 @@ pub struct Open {
     pub symbols: BTreeMap<String, Symbol>,
     /// Ids of every symbol in the project's library sources (for the picker).
     pub library: Vec<(String, String)>,
+    /// The project's vendored parts that devices use.
+    pub parts: BTreeMap<String, Part>,
+    /// Every part in the project and its library sources, as (id, label), for the part picker.
+    pub part_library: Vec<(String, String)>,
     pub dirty: bool,
     undo: Vec<Project>,
     redo: Vec<Project>,
@@ -49,6 +67,8 @@ impl Open {
             project,
             symbols,
             library: Vec::new(),
+            parts: BTreeMap::new(),
+            part_library: Vec::new(),
             dirty: false,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -71,6 +91,69 @@ impl Open {
             }
         }
         self.library = items.into_iter().collect();
+
+        self.parts = self
+            .project
+            .devices
+            .values()
+            .filter_map(|d| d.part.as_ref())
+            .filter_map(|id| store::read_vendored_part(&self.dir, id).ok().map(|p| (id.clone(), p)))
+            .collect();
+        let mut parts: BTreeMap<String, String> = self.parts.iter().map(|(k, p)| (k.clone(), part_label(p))).collect();
+        if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
+            for id in lib.index(ItemKind::Part).into_keys() {
+                if !parts.contains_key(&id)
+                    && let Ok((p, _)) = lib.part(&id)
+                {
+                    parts.insert(id, part_label(&p));
+                }
+            }
+        }
+        self.part_library = parts.into_iter().collect();
+    }
+
+    /// Give a device a part (taken from the library into the project when needed), or none.
+    pub fn set_device_part(&mut self, tag: &DeviceTag, part: Option<&str>) -> Result<(), String> {
+        let current = self.project.devices.get(tag).and_then(|d| d.part.as_deref());
+        if current == part {
+            return Ok(());
+        }
+        if let Some(id) = part
+            && !self.parts.contains_key(id)
+        {
+            let p = match store::read_vendored_part(&self.dir, id) {
+                Ok(p) => p,
+                Err(_) => {
+                    let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
+                    wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id)
+                        .map_err(|e| e.to_string())?;
+                    store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?
+                }
+            };
+            self.parts.insert(id.to_owned(), p);
+        }
+        self.checkpoint();
+        self.project.devices.entry(tag.clone()).or_default().part = part.map(str::to_owned);
+        Ok(())
+    }
+
+    /// Set (or with an empty value, remove) one of a device's own properties.
+    pub fn set_device_property(&mut self, tag: &DeviceTag, key: &str, value: &str) {
+        let (key, value) = (key.trim(), value.trim());
+        if key.is_empty() {
+            return;
+        }
+        let current = self.project.devices.get(tag).and_then(|d| d.properties.get(key));
+        if current.map(String::as_str) == Some(value) || (current.is_none() && value.is_empty()) {
+            return;
+        }
+        self.checkpoint();
+        let d = self.project.devices.entry(tag.clone()).or_default();
+        if value.is_empty() {
+            d.properties.remove(key);
+        } else {
+            d.properties.insert(key.to_owned(), value.to_owned());
+        }
     }
 
     /// Take a snapshot before a change, so it can be undone.
@@ -593,6 +676,33 @@ pub(crate) mod tests {
             o.project.pages[page].wires[0].cable.as_ref().map(|c| c.core.as_str()),
             Some("BN")
         );
+    }
+
+    #[test]
+    fn devices_get_parts_from_the_library_and_own_properties() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let a = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        let tag = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        let (id, label) = o
+            .part_library
+            .iter()
+            .find(|(id, _)| id.contains("ct-9"))
+            .cloned()
+            .unwrap();
+        assert!(!label.is_empty());
+        o.set_device_part(&tag, Some(&id)).unwrap();
+        assert_eq!(o.project.devices[&tag].part.as_deref(), Some(id.as_str()));
+        assert!(o.parts.contains_key(&id));
+        assert!(o.set_device_part(&tag, Some("no.such.part")).is_err());
+        o.set_device_property(&tag, "coil voltage", "24 V DC");
+        assert_eq!(o.project.devices[&tag].properties["coil voltage"], "24 V DC");
+        o.set_device_property(&tag, "coil voltage", "");
+        assert!(o.project.devices[&tag].properties.is_empty());
+        o.set_device_part(&tag, None).unwrap();
+        assert_eq!(o.project.devices[&tag].part, None);
+        assert!(o.undo());
+        assert_eq!(o.project.devices[&tag].part.as_deref(), Some(id.as_str()));
     }
 
     #[test]
