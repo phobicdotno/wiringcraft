@@ -35,6 +35,7 @@ pub enum Icon {
     Library,
     Update,
     Pdf,
+    Drawing,
     Reports,
     Check,
     Commit,
@@ -326,6 +327,12 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
             line((8.0, 12.0), (16.0, 12.0));
             line((8.0, 15.0), (16.0, 15.0));
             line((8.0, 18.0), (13.0, 18.0));
+        }
+        Icon::Drawing => {
+            // A sheet with a line and a circle on it: the page as a vector drawing.
+            poly(&[(4.0, 4.0), (20.0, 4.0), (20.0, 20.0), (4.0, 20.0)], true);
+            aline((7.0, 17.0), (12.0, 9.0));
+            arc(15.0, 14.0, 2.6, 0.0, 360.0);
         }
         Icon::Commit => {
             line((2.0, 12.0), (8.0, 12.0));

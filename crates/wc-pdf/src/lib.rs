@@ -2,9 +2,11 @@
 //!
 //! Output is plain PDF 1.7 written by hand (no dependencies): lines and curves stay vectors,
 //! text uses the standard Helvetica font so tags are searchable, every page gets a bookmark,
-//! and cross-references between a coil and its contacts are clickable links.
+//! and cross-references between a coil and its contacts are clickable links. The same pages
+//! also export as SVG and DXF (`vector`).
 
 mod layout;
+mod vector;
 mod writer;
 
 use std::collections::BTreeMap;
@@ -15,6 +17,8 @@ pub use layout::{
     CrossRefs, FRAME_COLUMNS, FrameMark, Ink, XREF_HEIGHT, XrefMark, column_of, frame_marks, junctions, pin_position,
     xref_marks,
 };
+pub use vector::{PageDrawing, dxf, page_drawings, svg};
+pub use writer::{Prim, Stroke};
 
 #[derive(Debug, Clone)]
 pub struct Options {
