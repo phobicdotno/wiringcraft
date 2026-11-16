@@ -65,49 +65,78 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     // Report pages use the size of the first schematic page and are counted in the sheet total.
     let size = pages.first().map(|p| p.size).unwrap_or_default();
     let per_page = layout::rows_per_page(size);
-    let report_pages: Vec<(usize, usize, usize, usize)> = options
-        .reports
-        .iter()
-        .enumerate()
-        .flat_map(|(ti, t)| {
-            let n = t.rows.len().div_ceil(per_page).max(1);
-            (0..n).map(move |k| (ti, k * per_page, k + 1, n))
-        })
-        .collect();
-    let total = pages.len() + report_pages.len();
+    // Each report page: (table, first row, part, parts). Front tables (the table of contents)
+    // come before the schematic pages, the rest after them.
+    let split = |front: bool| -> Vec<(usize, usize, usize, usize)> {
+        options
+            .reports
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.front == front)
+            .flat_map(|(ti, t)| {
+                let n = t.rows.len().div_ceil(per_page).max(1);
+                (0..n).map(move |k| (ti, k * per_page, k + 1, n))
+            })
+            .collect()
+    };
+    let (front_pages, back_pages) = (split(true), split(false));
+    let total = front_pages.len() + pages.len() + back_pages.len();
     report.pages = total;
     let mut doc = writer::Doc::new(&project.meta.name);
-    for (i, page) in pages.iter().enumerate() {
-        let drawn = layout::draw_page(project, page, i, total, symbols, &xref, options, &mut report.warnings);
-        doc.add_page(page.size.mm(), &format!("{} {}", page.number, page.title), drawn);
-    }
-    for (k, (ti, first, part, parts)) in report_pages.into_iter().enumerate() {
-        let Some(table) = options.reports.get(ti) else { continue };
-        let mut page = wc_core::Page::new(
-            format!("report-{ti}-{part}"),
-            format!("R{}", k + 1),
-            table.title.clone(),
-        );
-        page.size = size;
-        let drawn = layout::draw_table_page(
+    let mut sheet = 0;
+    let mut report_no = 0;
+    let mut add_reports = |doc: &mut writer::Doc, list: Vec<(usize, usize, usize, usize)>, sheet: &mut usize| {
+        for (ti, first, part, parts) in list {
+            let Some(table) = options.reports.get(ti) else { continue };
+            report_no += 1;
+            let mut page = wc_core::Page::new(
+                format!("report-{ti}-{part}"),
+                format!("R{report_no}"),
+                table.title.clone(),
+            );
+            page.size = size;
+            let drawn = layout::draw_table_page(
+                project,
+                &page,
+                *sheet,
+                total,
+                table,
+                first,
+                (part, parts),
+                &options.date,
+            );
+            let title = if parts > 1 {
+                format!("{} {} ({part}/{parts})", page.number, table.title)
+            } else {
+                format!("{} {}", page.number, table.title)
+            };
+            doc.add_page(size.mm(), &title, drawn);
+            *sheet += 1;
+        }
+    };
+    add_reports(&mut doc, front_pages, &mut sheet);
+    let offset = sheet;
+    for page in &pages {
+        let drawn = layout::draw_page(
             project,
-            &page,
-            pages.len() + k,
+            page,
+            sheet,
             total,
-            table,
-            first,
-            (part, parts),
-            &options.date,
+            symbols,
+            &xref,
+            options,
+            &mut report.warnings,
         );
-        let title = if parts > 1 {
-            format!("{} {} ({part}/{parts})", page.number, table.title)
-        } else {
-            format!("{} {}", page.number, table.title)
-        };
-        doc.add_page(size.mm(), &title, drawn);
+        doc.add_page(page.size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        sheet += 1;
     }
+    add_reports(&mut doc, back_pages, &mut sheet);
     // Links resolve against the exported page list, so links to pages left out are dropped.
-    let index: BTreeMap<String, usize> = pages.iter().enumerate().map(|(i, p)| (p.id.clone(), i)).collect();
+    let index: BTreeMap<String, usize> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.id.clone(), offset + i))
+        .collect();
     (doc.finish(&index), report)
 }
 

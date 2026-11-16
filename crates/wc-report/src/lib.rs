@@ -25,6 +25,11 @@ pub struct Table {
     pub title: String,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// For each row, the id of the page it describes (empty when it describes none); a PDF
+    /// export makes such rows clickable. Shorter than `rows` when the last rows have none.
+    pub row_pages: Vec<String>,
+    /// Printed before the schematic pages in a PDF, like the table of contents of a drawing set.
+    pub front: bool,
 }
 
 impl Table {
@@ -32,7 +37,7 @@ impl Table {
         Self {
             title: title.into(),
             columns: columns.iter().map(|c| (*c).to_owned()).collect(),
-            rows: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -543,7 +548,9 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
 /// Table of contents: every schematic page with its title and what is drawn on it.
 pub fn contents(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Table of contents", &["Page", "Title", "Devices", "Wires"]);
+    t.front = true;
     for page in &i.project.pages {
+        t.row_pages.push(page.id.clone());
         let tags: BTreeSet<String> = page
             .symbols
             .iter()
