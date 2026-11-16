@@ -301,7 +301,7 @@ fn drawn_sample() -> Tables {
     circle.extend(point(F_CIRCLE_CENTER, 60.0, 60.0));
     circle.extend(f64_bytes(F_CIRCLE_RADIUS, 3.0));
     inst.extend(record(CLASS_CIRCLE, 104, &circle));
-    // A corner above the contact, joining right and down.
+    // A corner above the contact, joining right and down, and a node of an unknown kind to its right.
     let mut corner = on_page(30);
     corner.extend(point(F_POSITION, 100.0, 240.0));
     corner.extend(symbol_bytes(70, 0));
@@ -374,8 +374,9 @@ fn rebuilds_drawn_pages_at_original_positions() {
     assert_eq!(sym(changeover).role, wc_core::symbol::SymbolRole::Auxiliary);
     let pins: Vec<&str> = sym(changeover).pins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(pins, ["22", "21", "24"]);
-    // Wires: corner down to the contact, contact down to the coil. Nothing else faces anything.
-    assert_eq!(page.wires.len(), 2);
+    // Wires: corner down to the contact, contact down to the coil, and the corner right to the
+    // node of an unknown kind, which joins whatever lines up with it.
+    assert_eq!(page.wires.len(), 3);
     let s1 = &placed("-S1")[0].id;
     let joins = |a: &wc_core::Endpoint, b: &wc_core::Endpoint| {
         page.wires
@@ -392,6 +393,14 @@ fn rebuilds_drawn_pages_at_original_positions() {
             at: Point::new(110.0, 53.0)
         },
         &pin(s1, "13")
+    ));
+    assert!(joins(
+        &wc_core::Endpoint::Point {
+            at: Point::new(110.0, 53.0)
+        },
+        &wc_core::Endpoint::Point {
+            at: Point::new(310.0, 53.0)
+        }
     ));
     // Free graphics, moved the same way.
     assert!(page.graphics.contains(&wc_core::geom::Shape::Line {
