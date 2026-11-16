@@ -1341,6 +1341,7 @@ fn utc_now() -> String {
         rest / 60 % 60,
         rest % 60
     )
+}
 
 /// A file name for a page: its number, or its id when the number is empty, with anything a file
 /// system might refuse replaced.
