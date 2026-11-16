@@ -1,0 +1,10 @@
+{
+  "description": "Indicator lamp green 24 V (example data)",
+  "id": "example.ex-lamp-24-gn",
+  "manufacturer": "Example",
+  "order_number": "EX-LAMP-24-GN",
+  "properties": {
+    "Coil voltage": "24 V"
+  },
+  "symbol": "wc.lamp"
+}

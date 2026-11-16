@@ -2967,6 +2967,7 @@ dependencies = [
  "wc-import",
  "wc-library",
  "wc-pdf",
+ "wc-report",
  "wc-vcs",
 ]
 
@@ -3007,6 +3008,14 @@ dependencies = [
 
 [[package]]
 name = "wc-pdf"
+version = "0.1.0"
+dependencies = [
+ "wc-core",
+ "wc-report",
+]
+
+[[package]]
+name = "wc-report"
 version = "0.1.0"
 dependencies = [
  "wc-core",

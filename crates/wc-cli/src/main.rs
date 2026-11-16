@@ -85,6 +85,18 @@ enum Cmd {
         pages: Vec<String>,
         #[arg(long, default_value = "")]
         date: String,
+        /// Append report pages: parts, devices, wires, nets, terminals, or all.
+        #[arg(long = "report")]
+        reports: Vec<String>,
+    },
+    /// Print a report (parts, devices, wires, nets, terminals) as a table, CSV or Markdown.
+    Report {
+        kind: String,
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Write to a file instead of standard output.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// List the potentials (connected pins) across all pages.
     Nets,
@@ -201,6 +213,13 @@ enum ImportCmd {
     Pdf {
         file: PathBuf,
         #[arg(long, default_value_t = 200)]
+        first_page: usize,
+    },
+    /// An Eplan Electric P8 project (.elk, its .edb folder, or a zip of the folder): devices,
+    /// parts and connections as overview pages, one section per Eplan page.
+    Eplan {
+        path: PathBuf,
+        #[arg(long, default_value_t = 400)]
         first_page: usize,
     },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
@@ -434,12 +453,27 @@ fn run(cli: Cli) -> Res<()> {
         }
         Cmd::Lib(lc) => lib_cmd(dir, lc)?,
         Cmd::Import(ic) => import_cmd(dir, ic)?,
-        Cmd::Pdf { out, pages, date } => {
+        Cmd::Pdf {
+            out,
+            pages,
+            date,
+            reports,
+        } => {
             let p = load(dir)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
+            let parts = vendored_parts(dir, &p);
+            let inputs = wc_report::Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            let tables = report_kinds(&reports)?
+                .into_iter()
+                .map(|k| wc_report::build(k, &inputs))
+                .collect();
             let (bytes, report) = wc_pdf::export(
                 &p,
                 &symbols,
@@ -447,6 +481,7 @@ fn run(cli: Cli) -> Res<()> {
                     pages,
                     date,
                     wire_labels: true,
+                    reports: tables,
                 },
             );
             std::fs::write(&out, bytes).map_err(e)?;
@@ -454,6 +489,31 @@ fn run(cli: Cli) -> Res<()> {
                 eprintln!("warning: {w}");
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
+        }
+        Cmd::Report { kind, format, out } => {
+            let p = load(dir)?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let parts = vendored_parts(dir, &p);
+            let inputs = wc_report::Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            let mut text = String::new();
+            for k in report_kinds(std::slice::from_ref(&kind))? {
+                let t = wc_report::build(k, &inputs);
+                text.push_str(&match format.as_str() {
+                    "csv" => t.to_csv(),
+                    "md" | "markdown" => t.to_markdown(),
+                    "text" => plain_table(&t),
+                    other => return Err(format!("unknown format {other:?} (text, csv, md)")),
+                });
+                text.push('\n');
+            }
+            match out {
+                Some(path) => std::fs::write(&path, text).map_err(e)?,
+                None => print!("{text}"),
+            }
         }
         Cmd::Nets => {
             let p = load(dir)?;
@@ -679,6 +739,37 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             p.sort_pages();
             save(dir, &p)?;
+        }
+        ImportCmd::Eplan { path, first_page } => {
+            let mut p = load(dir)?;
+            let tables = eplan_tables(&path)?;
+            let ep = wc_import::eplan::read(&tables).map_err(e)?;
+            let (built, warnings) = wc_import::eplan::build(&ep, first_page);
+            for w in ep.warnings.iter().chain(&warnings) {
+                eprintln!("warning: {w}");
+            }
+            let source = format!(
+                "import:{}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+            // Customer and project description fill empty title block fields.
+            for (id, key) in [(10015u32, "customer"), (10011, "description")] {
+                if let Some((_, _, v)) = ep.properties.iter().find(|(i, _, _)| *i == id)
+                    && !v.is_empty()
+                {
+                    p.meta.title_block.entry(key.to_owned()).or_insert_with(|| v.clone());
+                }
+            }
+            let (n_dev, n_pages) = (built.devices.len(), built.pages.len());
+            add_built(dir, &mut p, built, &source)?;
+            save(dir, &p)?;
+            println!(
+                "imported {} Eplan pages as {n_pages} overview page(s): {n_dev} devices, {} connections",
+                ep.pages.len(),
+                ep.connections.len()
+            );
         }
         ImportCmd::Aml { file, first_page } => {
             let mut p = load(dir)?;
@@ -958,4 +1049,121 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse report names; `all` means every report.
+fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
+    let mut out = Vec::new();
+    for n in names {
+        if n == "all" {
+            out.extend(wc_report::Kind::ALL);
+            continue;
+        }
+        let k = wc_report::Kind::parse(n)
+            .ok_or_else(|| format!("unknown report {n:?} (parts, devices, wires, nets, terminals, all)"))?;
+        out.push(k);
+    }
+    Ok(out)
+}
+
+/// The project's vendored parts by id (parts referenced by devices).
+fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
+    p.devices
+        .values()
+        .filter_map(|d| d.part.as_ref())
+        .filter_map(|id| store::read_vendored_part(dir, id).ok().map(|part| (id.clone(), part)))
+        .collect()
+}
+
+/// A report as aligned plain text for the terminal.
+fn plain_table(t: &wc_report::Table) -> String {
+    let mut w: Vec<usize> = t.columns.iter().map(|c| c.chars().count()).collect();
+    for r in &t.rows {
+        for (i, c) in r.iter().enumerate() {
+            if let Some(x) = w.get_mut(i) {
+                *x = (*x).max(c.chars().count());
+            }
+        }
+    }
+    let line = |cells: &[String]| {
+        let parts: Vec<String> = cells.iter().zip(&w).map(|(c, n)| format!("{c:<n$}")).collect();
+        parts.join("  ").trim_end().to_owned()
+    };
+    let mut out = format!("{}\n{}\n", t.title, line(&t.columns));
+    out.push_str(&w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("  "));
+    out.push('\n');
+    for r in &t.rows {
+        out.push_str(&line(r));
+        out.push('\n');
+    }
+    out
+}
+
+/// The tables of an Eplan project given as an .elk file, an .edb folder or a zip of the folder.
+fn eplan_tables(path: &Path) -> Result<wc_import::eplan::Tables, String> {
+    let e = |x: std::io::Error| format!("{}: {x}", path.display());
+    let folder = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        let bytes = std::fs::read(path).map_err(e)?;
+        if bytes.starts_with(b"PK") {
+            return wc_import::eplan::tables_from_zip(&bytes).map_err(|x| x.to_string());
+        }
+        let name = wc_import::eplan::elk_target(&bytes)
+            .ok_or_else(|| format!("{} is not an Eplan .elk file, .edb folder or zip", path.display()))?;
+        path.with_file_name(name)
+    };
+    let mut tables = wc_import::eplan::Tables::new();
+    for entry in std::fs::read_dir(&folder)
+        .map_err(|x| format!("{}: {x}", folder.display()))?
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if wc_import::eplan::wanted(&name)
+            && let Ok(bytes) = std::fs::read(entry.path())
+        {
+            tables.insert(name, bytes);
+        }
+    }
+    Ok(tables)
+}
+
+/// Add imported symbols, parts, pages and devices to a project, pinning symbols and parts in
+/// the lockfile under `source`.
+fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Result<(), String> {
+    let e = |x: wc_core::Error| x.to_string();
+    for s in &built.symbols {
+        store::write_vendored_symbol(dir, s).map_err(e)?;
+        p.lock.symbols.insert(
+            s.id.clone(),
+            wc_core::LockEntry {
+                source: source.to_owned(),
+                hash: s.hash(),
+            },
+        );
+    }
+    for part in &built.parts {
+        store::write_vendored_part(dir, part).map_err(e)?;
+        p.lock.parts.insert(
+            part.id.clone(),
+            wc_core::LockEntry {
+                source: source.to_owned(),
+                hash: part.hash(),
+            },
+        );
+    }
+    for page in built.pages {
+        if p.page(&page.id).is_some() {
+            return Err(format!(
+                "page {} exists; remove it or import into a fresh project",
+                page.id
+            ));
+        }
+        p.pages.push(page);
+    }
+    p.sort_pages();
+    for (t, d) in built.devices {
+        p.devices.insert(t, d);
+    }
+    Ok(())
 }

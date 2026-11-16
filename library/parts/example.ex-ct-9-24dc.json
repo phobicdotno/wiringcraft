@@ -1,0 +1,11 @@
+{
+  "description": "Contactor 3-pole 9 A, 1 NO auxiliary, 24 V DC coil (example data)",
+  "id": "example.ex-ct-9-24dc",
+  "manufacturer": "Example",
+  "order_number": "EX-CT-9-24DC",
+  "properties": {
+    "Coil voltage": "24 V DC",
+    "Rated current": "9 A"
+  },
+  "symbol": "wc.coil"
+}

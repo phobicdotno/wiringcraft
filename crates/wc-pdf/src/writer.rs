@@ -227,6 +227,16 @@ impl Pen {
         );
     }
 
+    pub fn fill_rect(&mut self, min: (f64, f64), max: (f64, f64)) {
+        let (x, y) = self.p(min.0, max.1);
+        let _ = writeln!(
+            self.ops,
+            "{x:.2} {y:.2} {:.2} {:.2} re f",
+            (max.0 - min.0) * PT_PER_MM,
+            (max.1 - min.1) * PT_PER_MM
+        );
+    }
+
     /// Arc from `start` to `end` degrees, angles measured clockwise on the page from +x.
     pub fn arc(&mut self, c: (f64, f64), r: f64, start: f64, end: f64, filled: bool) {
         let mut sweep = end - start;

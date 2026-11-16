@@ -1,0 +1,7 @@
+{
+  "description": "Push button red, 1 NC (example data)",
+  "id": "example.ex-pb-red-nc",
+  "manufacturer": "Example",
+  "order_number": "EX-PB-RED-NC",
+  "symbol": "wc.button.nc"
+}
