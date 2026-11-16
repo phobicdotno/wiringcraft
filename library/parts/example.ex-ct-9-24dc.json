@@ -5,6 +5,7 @@
   "order_number": "EX-CT-9-24DC",
   "properties": {
     "Coil voltage": "24 V DC",
+    "Depth": "80 mm",
     "Height": "85 mm",
     "Rated current": "9 A",
     "Width": "45 mm"

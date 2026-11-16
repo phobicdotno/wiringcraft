@@ -4,6 +4,7 @@
   "manufacturer": "Example",
   "order_number": "EX-TB-2.5",
   "properties": {
+    "Depth": "42 mm",
     "Height": "47 mm",
     "Rated current": "24 A",
     "Width": "5.2 mm"

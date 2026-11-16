@@ -175,6 +175,12 @@ enum PanelCmd {
         #[arg(long)]
         location: Option<String>,
     },
+    /// Write a layout as a 3D STEP model (plate, rails, ducts and devices as solids, depths
+    /// from the part's `Depth` property) for SolidCraft or any other CAD program.
+    Step {
+        id: String,
+        out: PathBuf,
+    },
     /// List the layouts and what is on them.
     List,
     Remove {
@@ -475,6 +481,20 @@ fn run(cli: Cli) -> Res<()> {
                     if !done.did_not_fit.is_empty() {
                         eprintln!("warning: no room on the rails for: {}", done.did_not_fit.join(", "));
                     }
+                }
+                PanelCmd::Step { id, out } => {
+                    let Some(panel) = p.panels.iter().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    let parts = vendored_parts(dir, &p);
+                    let step = wc_report::step::panel_step(&p, panel, &parts, &utc_now());
+                    std::fs::write(&out, &step).map_err(e)?;
+                    println!(
+                        "wrote {} ({} solids)",
+                        out.display(),
+                        step.matches("MANIFOLD_SOLID_BREP(").count()
+                    );
+                    return Ok(());
                 }
                 PanelCmd::List => {
                     for x in &p.panels {
