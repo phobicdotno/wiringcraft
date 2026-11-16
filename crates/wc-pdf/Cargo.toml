@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 wc-core.workspace = true
 wc-report.workspace = true
+miniz_oxide.workspace = true
+image.workspace = true
 
 [lints]
 workspace = true

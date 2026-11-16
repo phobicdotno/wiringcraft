@@ -462,6 +462,27 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         }
     }
 
+    // A scanned sheet under the page, toned down so what is drawn over it stands out.
+    if let Some(u) = &page.underlay {
+        let area = Rect::from_two_pos(xf.s(u.min), xf.s(u.max));
+        match open.underlay_texture(ui.ctx(), u) {
+            Some(tex) => {
+                let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                painter.image(tex.id(), area, uv, Color32::from_white_alpha(150));
+            }
+            None => {
+                painter.rect_stroke(area, 0.0, Stroke::new(1.0_f32, t.faint), egui::StrokeKind::Inside);
+                painter.text(
+                    area.center(),
+                    Align2::CENTER_CENTER,
+                    format!("Underlay picture {} cannot be shown", u.file),
+                    FontId::proportional(13.0),
+                    t.faint,
+                );
+            }
+        }
+    }
+
     paint_frame(&painter, &xf, open, &page, t.ink, t.faint);
 
     for (i, g) in page.graphics.iter().enumerate() {

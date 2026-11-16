@@ -154,6 +154,37 @@ pub struct Page {
     /// Free graphics and imported drawings (for example a traced PDF or DXF).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graphics: Vec<Shape>,
+    /// A picture drawn under everything else, such as a scanned drawing to trace over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlay: Option<Underlay>,
+}
+
+/// A raster picture under a page: a JPEG or PNG file in the project folder, stretched over a
+/// rectangle of the page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Underlay {
+    /// Path relative to the project folder, with `/` separators, e.g. `underlays/p0003.jpg`.
+    pub file: String,
+    /// Top-left corner on the page, in millimetres.
+    pub min: Point,
+    /// Bottom-right corner on the page, in millimetres.
+    pub max: Point,
+}
+
+impl Underlay {
+    /// Folder in a project that holds underlay pictures.
+    pub const DIR: &'static str = "underlays";
+
+    /// Whether `file` is a plain relative path inside the project (no `..`, no absolute path,
+    /// no backslashes), so reading it can never leave the project folder.
+    pub fn file_is_safe(&self) -> bool {
+        let f = &self.file;
+        !f.is_empty()
+            && !f.starts_with('/')
+            && !f.contains('\\')
+            && !f.contains(':')
+            && f.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+    }
 }
 
 impl Page {
@@ -166,6 +197,7 @@ impl Page {
             symbols: Vec::new(),
             wires: Vec::new(),
             graphics: Vec::new(),
+            underlay: None,
         }
     }
 

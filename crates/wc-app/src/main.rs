@@ -1234,6 +1234,7 @@ fn export_pdf(open: &Open) -> String {
             .map(|k| wc_report::build(k, &inputs))
             .filter(|t| !t.rows.is_empty())
             .collect(),
+        underlays: wc_pdf::read_underlays(&open.dir, &open.project),
         ..Default::default()
     };
     let (bytes, report) = wc_pdf::export(&open.project, &open.symbols, &options);

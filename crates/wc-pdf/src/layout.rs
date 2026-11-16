@@ -547,6 +547,7 @@ pub fn draw_page(
         links,
         prims: pen.prims,
         layers: pen.layers,
+        underlay: None,
     }
 }
 
@@ -728,5 +729,6 @@ pub fn draw_table_page(
         links,
         prims: pen.prims,
         layers: pen.layers,
+        underlay: None,
     }
 }
