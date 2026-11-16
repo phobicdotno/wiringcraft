@@ -490,6 +490,7 @@ dependencies = [
  "wc-import",
  "wc-library",
  "wc-pdf",
+ "wc-vcs",
 ]
 
 [[package]]

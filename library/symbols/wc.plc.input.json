@@ -1,0 +1,64 @@
+{
+  "category": "plc",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "kind": "rect",
+      "max": {
+        "x": 7.0,
+        "y": 12.0
+      },
+      "min": {
+        "x": -7.0,
+        "y": 5.0
+      }
+    },
+    {
+      "align": "center",
+      "at": {
+        "x": 0.0,
+        "y": 9.8
+      },
+      "height": 2.5,
+      "kind": "text",
+      "text": "DI"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "I"
+    }
+  ],
+  "id": "wc.plc.input",
+  "letter_code": "A",
+  "name": "PLC digital input",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "I"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -16.0,
+    "y": 9.0
+  }
+}
