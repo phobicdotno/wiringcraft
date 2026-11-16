@@ -36,6 +36,7 @@ pub enum Icon {
     Update,
     Pdf,
     Reports,
+    Check,
     Commit,
     Branch,
     History,
@@ -147,6 +148,10 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
             line((12.0, 10.0), (12.0, 18.0));
             line((8.0, 14.0), (16.0, 14.0));
+        }
+        Icon::Check => {
+            arc(12.0, 12.0, 8.5, 0.0, 360.0);
+            poly(&[(8.0, 12.5), (11.0, 15.5), (16.5, 9.0)], false);
         }
         Icon::Reports => {
             p.rect_stroke(

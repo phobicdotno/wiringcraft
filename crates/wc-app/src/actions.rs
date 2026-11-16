@@ -38,6 +38,7 @@ pub enum Action {
     LibraryUpdate,
     ExportPdf,
     Reports,
+    Check,
     Commit,
     NewBranch,
     History,
@@ -147,6 +148,12 @@ impl Action {
             ),
             Action::LibraryUpdate => i("Update", "Take the newer library versions", Icon::Update, ""),
             Action::ExportPdf => i("PDF", "Export all pages and the reports to PDF", Icon::Pdf, "Ctrl+P"),
+            Action::Check => i(
+                "Check",
+                "Check the project: devices drawn twice, missing coils, shorts, open pins",
+                Icon::Check,
+                "Ctrl+E",
+            ),
             Action::Reports => i(
                 "Reports",
                 "Parts, devices, wires, nets, terminals and cables as tables",
@@ -189,7 +196,7 @@ pub const TOOLBAR: &[&[Action]] = &[
     &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
     &[Action::LibraryStatus, Action::LibraryUpdate],
     &[Action::Commit, Action::NewBranch, Action::History],
-    &[Action::Reports, Action::ExportPdf],
+    &[Action::Check, Action::Reports, Action::ExportPdf],
 ];
 
 /// A named group of ribbon buttons.
@@ -206,6 +213,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::NewProject,
                     Action::Open,
                     Action::Save,
+                    Action::Check,
                     Action::Reports,
                     Action::ExportPdf,
                 ],

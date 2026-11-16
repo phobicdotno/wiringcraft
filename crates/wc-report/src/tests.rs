@@ -242,3 +242,47 @@ fn cable_list_groups_cores_by_cable() {
     assert_eq!(t.rows[1][..4], ["", "", "", "2"]);
     assert_eq!(wire_list(&i).rows[1][3], "-W1:1");
 }
+
+#[test]
+fn project_check_finds_the_usual_mistakes() {
+    let (mut p, s, parts) = fixture();
+    {
+        let page = &mut p.pages[0];
+        // A second coil with the same tag, and a contact whose coil does not exist.
+        page.symbols.push(place("s10", "coil", 300.0, Some("=A+C1-K1")));
+        page.symbols.push(place("s11", "no", 320.0, Some("-K9")));
+        // 24V and 0V meet on the lamp's X2 pin.
+        page.wires
+            .push(wire("w5", pin("s6", "X2"), pin("s5", "1"), None, Some("24V")));
+        // A wire that ends in the air, and one on a pin that does not exist.
+        page.wires.push(wire(
+            "w6",
+            pin("s6", "X2"),
+            Endpoint::Point {
+                at: Point::new(400.0, 400.0),
+            },
+            Some("9"),
+            None,
+        ));
+        page.wires
+            .push(wire("w7", pin("s1", "A9"), pin("s6", "X2"), None, None));
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found = check(&i);
+    let has = |sev: Severity, text: &str| found.iter().any(|f| f.severity == sev && f.message.contains(text));
+    assert!(has(Severity::Error, "=A+C1-K1 is drawn 2 times"));
+    assert!(has(Severity::Warning, "contact -K9 has no coil"));
+    assert!(has(Severity::Error, "potentials 0V and 24V are connected"));
+    assert!(has(Severity::Warning, "wire 9 ends in the air at 400.0, 400.0"));
+    assert!(has(Severity::Error, "wire ends on s1:A9, which does not exist"));
+    assert!(has(Severity::Note, "pin 13 not connected"));
+    assert!(has(Severity::Note, "-P1 has no part"));
+    // Errors come first, and every finding on a page names the item to select.
+    assert_eq!(found[0].severity, Severity::Error);
+    assert!(found.iter().filter(|f| f.page_id.is_some()).all(|f| f.item.is_some()));
+    assert_eq!(check_table(&i).rows.len(), found.len());
+}
