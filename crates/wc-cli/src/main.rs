@@ -229,6 +229,9 @@ enum ImportCmd {
         #[arg(long, default_value = "")]
         letter_code: String,
     },
+    /// PLC addresses from a CSV list (device and address columns, description optional), as a
+    /// PLC tool or spreadsheet writes it. `report plc --format csv` writes one that reads back.
+    PlcCsv { file: PathBuf },
     /// Parts from a CSV or semicolon-separated export (Excel "Save as CSV").
     PartsCsv {
         file: PathBuf,
@@ -878,6 +881,27 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 path.display(),
                 s.pins.len(),
                 s.graphics.len()
+            );
+        }
+        ImportCmd::PlcCsv { file } => {
+            let mut p = load(dir)?;
+            let bytes = std::fs::read(&file).map_err(e)?;
+            let (rows, warnings) = wc_import::csv::plc_addresses(&wc_import::csv::decode(&bytes)).map_err(e)?;
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+            let applied = wc_import::csv::apply_plc_addresses(&mut p, &rows);
+            for t in &applied.unknown {
+                eprintln!("warning: no symbol carries {t}, skipped");
+            }
+            if applied.changed > 0 {
+                save(dir, &p)?;
+            }
+            println!(
+                "PLC addresses: {} device(s) changed, {} already up to date, {} unknown",
+                applied.changed,
+                applied.unchanged,
+                applied.unknown.len()
             );
         }
         ImportCmd::PartsCsv { file, lib } => {
