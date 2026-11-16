@@ -1,0 +1,24 @@
+[package]
+name = "wc-cli"
+description = "WiringCraft command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wiringcraft"
+path = "src/main.rs"
+
+[dependencies]
+wc-core.workspace = true
+wc-library.workspace = true
+wc-import.workspace = true
+wc-pdf.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

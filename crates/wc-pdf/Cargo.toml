@@ -1,0 +1,12 @@
+[package]
+name = "wc-pdf"
+description = "WiringCraft vector PDF export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wc-core.workspace = true
+
+[lints]
+workspace = true
