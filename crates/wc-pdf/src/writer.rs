@@ -13,11 +13,48 @@ pub struct Link {
     pub target_page_id: String,
 }
 
-/// One page's drawing, already as PDF operators in points (y up).
+/// One page's drawing, already as PDF operators in points (y up), plus the same drawing as
+/// primitives in page millimetres (y down) for the SVG and DXF exports.
 #[derive(Debug, Clone, Default)]
 pub struct Drawn {
     pub ops: String,
     pub links: Vec<Link>,
+    pub prims: Vec<Prim>,
+}
+
+/// One drawn primitive in page millimetres (y down), with the pen state it was drawn with.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Prim {
+    Path {
+        points: Vec<(f64, f64)>,
+        closed: bool,
+        filled: bool,
+        ink: Stroke,
+    },
+    /// Arc from `start` to `end` degrees, clockwise on the page from +x; a full turn is a circle.
+    Arc {
+        center: (f64, f64),
+        radius: f64,
+        start: f64,
+        end: f64,
+        filled: bool,
+        ink: Stroke,
+    },
+    /// Left-aligned text: `at` is the start of the baseline, already shifted for alignment.
+    Text {
+        at: (f64, f64),
+        height: f64,
+        angle: f64,
+        text: String,
+        ink: Stroke,
+    },
+}
+
+/// Pen colour (0..1 RGB) and line width in millimetres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stroke {
+    pub rgb: (f64, f64, f64),
+    pub width: f64,
 }
 
 struct PageData {
@@ -179,6 +216,8 @@ impl Doc {
 /// Builds a content stream in page millimetres (y down), converting to PDF points (y up).
 pub struct Pen {
     pub ops: String,
+    pub prims: Vec<Prim>,
+    ink: Stroke,
     page_h: f64,
 }
 
@@ -186,6 +225,11 @@ impl Pen {
     pub fn new(page_h_mm: f64) -> Self {
         Self {
             ops: String::new(),
+            prims: Vec::new(),
+            ink: Stroke {
+                rgb: (0.0, 0.0, 0.0),
+                width: 0.25,
+            },
             page_h: page_h_mm,
         }
     }
@@ -196,14 +240,17 @@ impl Pen {
 
     pub fn width(&mut self, mm: f64) {
         let _ = writeln!(self.ops, "{:.3} w", mm * PT_PER_MM);
+        self.ink.width = mm;
     }
 
     pub fn colour(&mut self, r: f64, g: f64, b: f64) {
         let _ = writeln!(self.ops, "{r:.3} {g:.3} {b:.3} RG {r:.3} {g:.3} {b:.3} rg");
+        self.ink.rgb = (r, g, b);
     }
 
     pub fn polyline(&mut self, pts: &[(f64, f64)], closed: bool) {
         let Some(first) = pts.first() else { return };
+        self.path(pts.to_vec(), closed, false);
         let (x, y) = self.p(first.0, first.1);
         let _ = writeln!(self.ops, "{x:.2} {y:.2} m");
         for q in &pts[1..] {
@@ -217,7 +264,21 @@ impl Pen {
         self.polyline(&[a, b], false);
     }
 
+    fn path(&mut self, points: Vec<(f64, f64)>, closed: bool, filled: bool) {
+        self.prims.push(Prim::Path {
+            points,
+            closed,
+            filled,
+            ink: self.ink,
+        });
+    }
+
+    fn corners(min: (f64, f64), max: (f64, f64)) -> Vec<(f64, f64)> {
+        vec![min, (max.0, min.1), max, (min.0, max.1)]
+    }
+
     pub fn rect(&mut self, min: (f64, f64), max: (f64, f64)) {
+        self.path(Self::corners(min, max), true, false);
         let (x, y) = self.p(min.0, max.1);
         let _ = writeln!(
             self.ops,
@@ -228,6 +289,7 @@ impl Pen {
     }
 
     pub fn fill_rect(&mut self, min: (f64, f64), max: (f64, f64)) {
+        self.path(Self::corners(min, max), true, true);
         let (x, y) = self.p(min.0, max.1);
         let _ = writeln!(
             self.ops,
@@ -243,6 +305,14 @@ impl Pen {
         if sweep <= 0.0 {
             sweep += 360.0;
         }
+        self.prims.push(Prim::Arc {
+            center: c,
+            radius: r,
+            start,
+            end: start + sweep,
+            filled,
+            ink: self.ink,
+        });
         let segs = ((sweep / 90.0).ceil() as usize).max(1);
         let step = sweep / segs as f64;
         let k = 4.0 / 3.0 * (step.to_radians() / 4.0).tan();
@@ -296,6 +366,14 @@ impl Pen {
             _ => 0.0,
         };
         let angle = if angle.is_finite() { angle } else { 0.0 };
+        let (sin, cos) = angle.to_radians().sin_cos();
+        self.prims.push(Prim::Text {
+            at: (at.0 + shift * cos, at.1 - shift * sin),
+            height: height_mm,
+            angle,
+            text: s.to_owned(),
+            ink: self.ink,
+        });
         if angle == 0.0 {
             let (px, py) = self.p(at.0 + shift, at.1);
             let _ = writeln!(self.ops, "BT /F1 {size:.2} Tf {px:.2} {py:.2} Td {} Tj ET", pdf_text(s));
@@ -303,7 +381,6 @@ impl Pen {
         }
         // The page's y runs down and the PDF's up, so a counter-clockwise turn on paper is a
         // counter-clockwise turn in PDF space too; the alignment shift runs along the text.
-        let (sin, cos) = angle.to_radians().sin_cos();
         let (px, py) = self.p(at.0 + shift * cos, at.1 - shift * sin);
         let _ = writeln!(
             self.ops,

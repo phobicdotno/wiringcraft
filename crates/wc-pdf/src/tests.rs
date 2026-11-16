@@ -152,3 +152,73 @@ fn turned_text_gets_a_text_matrix() {
     n.text_at_angle((1.0, 1.0), 2.5, 0, f64::NAN, "nan");
     assert!(n.ops.contains(" Td "));
 }
+
+#[test]
+fn pages_export_as_svg_and_dxf() {
+    let mut project = Project::new("Pump & <station>");
+    let mut p1 = Page::new("p1", "1", "Control");
+    p1.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    p1.graphics.push(Shape::Circle {
+        center: Point::new(200.0, 100.0),
+        radius: 5.0,
+        filled: false,
+    });
+    p1.graphics.push(Shape::Text {
+        at: Point::new(120.0, 80.0),
+        text: "Ålesund".into(),
+        height: 3.0,
+        align: Default::default(),
+        angle: 90.0,
+    });
+    let p2 = Page::new("p2", "2", "Motor");
+    project.pages = vec![p1, p2];
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let options = Options {
+        pages: vec!["p1".into()],
+        ..Default::default()
+    };
+    let (pages, report) = page_drawings(&project, &symbols, &options);
+    assert_eq!((pages.len(), report.pages, pages[0].id.as_str()), (1, 1, "p1"));
+    let (w, h) = pages[0].size_mm;
+
+    let s = svg(&pages[0]);
+    assert!(s.starts_with("<?xml") && s.trim_end().ends_with("</svg>"));
+    assert!(
+        s.contains(&format!("viewBox=\"0 0 {w} {h}\"")),
+        "one unit per millimetre"
+    );
+    assert!(s.contains("<circle cx=\"200\" cy=\"100\" r=\"5\""));
+    assert!(s.contains(">-K1</text>"));
+    assert!(s.contains("rotate(-90 120 80)") && s.contains(">Ålesund</text>"));
+    // Project name in the title block is escaped.
+    assert!(s.contains("Pump &amp; &lt;station&gt;") && !s.contains("<station>"));
+
+    let d = dxf(&pages[0]);
+    let pairs: Vec<&str> = d.lines().collect();
+    assert_eq!(pairs.len() % 2, 0, "code/value pairs");
+    assert!(d.starts_with("0\nSECTION\n2\nHEADER\n") && d.ends_with("0\nEOF\n"));
+    // y flips: the circle at 100 mm from the top sits at h - 100 from the bottom.
+    let circle = d.find("0\nCIRCLE\n").unwrap_or(d.len());
+    assert!(circle < d.len(), "a CIRCLE entity");
+    assert!(d[circle..].contains(&format!("10\n200\n20\n{}\n40\n5\n", h - 100.0)));
+    assert!(d.contains("1\n\\U+00C5lesund\n50\n90\n"));
+    assert!(d.contains("1\n-K1\n"));
+}
+
+#[test]
+fn arcs_keep_their_side_in_svg_and_dxf() {
+    // A quarter arc from 0 to 90 degrees clockwise on the page: from the right of the centre to
+    // below it. In DXF (y up) that is from 270 to 360 counter-clockwise.
+    let mut pen = crate::writer::Pen::new(100.0);
+    pen.arc((50.0, 50.0), 10.0, 0.0, 90.0, false);
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: pen.prims,
+    };
+    assert!(svg(&page).contains("d=\"M60 50 A10 10 0 0 1 50 60\""));
+    assert!(dxf(&page).contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"));
+}

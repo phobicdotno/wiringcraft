@@ -37,6 +37,7 @@ pub enum Action {
     LibraryStatus,
     LibraryUpdate,
     ExportPdf,
+    ExportDrawings,
     Reports,
     Check,
     Commit,
@@ -149,6 +150,12 @@ impl Action {
             ),
             Action::LibraryUpdate => i("Update", "Take the newer library versions", Icon::Update, ""),
             Action::ExportPdf => i("PDF", "Export all pages and the reports to PDF", Icon::Pdf, "Ctrl+P"),
+            Action::ExportDrawings => i(
+                "SVG/DXF",
+                "Export every page as an SVG and a DXF drawing for other tools",
+                Icon::Drawing,
+                "",
+            ),
             Action::Check => i(
                 "Check",
                 "Check the project: devices drawn twice, missing coils, shorts, open pins",
@@ -223,6 +230,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::Check,
                     Action::Reports,
                     Action::ExportPdf,
+                    Action::ExportDrawings,
                 ],
             ),
             (
