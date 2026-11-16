@@ -47,8 +47,8 @@ $WC wire p0003 160,40 s5:13 --potential 24V
 $WC place p0003 wc.terminal --at 160,125 --tag "=PUMP+CAB1-X1.1"
 $WC place p0003 wc.terminal --at 175,175 --tag "=PUMP+CAB1-X1.2"
 $WC wire p0003 s5:14 s7:1 --number 12
-$WC wire p0003 s7:2 s6:X1 --number 13
-$WC wire p0003 s6:X2 s8:1 --via 160,170 --via 175,170
+$WC wire p0003 s7:2 s6:X1 --number 13 --cable=-W1 --core 1
+$WC wire p0003 s6:X2 s8:1 --via 160,170 --via 175,170 --cable=-W1 --core 2
 $WC wire p0003 s8:2 175,195 --potential 0V
 # The 24 V supply arrives from page 2.
 $WC place p0003 wc.interruption --at 60,40 --rotate 180 --tag=-24V
@@ -61,6 +61,7 @@ $WC device "=PUMP+CAB1-S1" --part example.ex-pb-red-nc --description "Stop"
 $WC device "=PUMP+CAB1-S2" --part example.ex-pb-grn-no --description "Start"
 $WC device "=PUMP+CAB1-P1" --part example.ex-lamp-24-gn --description "Pump running"
 $WC device "=PUMP+CAB1-X1.1" --part example.ex-tb-2-5
+$WC device --description "Lamp cable to the pump" -- -W1
 $WC device "=PUMP+CAB1-X1.2" --part example.ex-tb-2-5
 
 $WC lib lock
@@ -68,4 +69,5 @@ $WC vcs commit -m "Pump starter: main and control circuits"
 $WC pdf pump-station.pdf --date 2026-11-16 --report all
 $WC report parts
 $WC report terminals
+$WC report cables
 $WC vcs log

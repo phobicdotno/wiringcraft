@@ -448,7 +448,14 @@ pub fn draw_page(
         pts.push(tuple(b));
         pen.polyline(&pts, false);
         if options.wire_labels {
-            let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref()]
+            let core = w.cable.as_ref().map(|c| {
+                if c.core.is_empty() {
+                    c.cable.to_string()
+                } else {
+                    format!("{}:{}", c.cable, c.core)
+                }
+            });
+            let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref(), core.as_deref()]
                 .into_iter()
                 .flatten()
                 .collect();

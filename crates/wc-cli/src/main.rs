@@ -62,6 +62,13 @@ enum Cmd {
         number: Option<String>,
         #[arg(long)]
         potential: Option<String>,
+        /// The cable this wire is a core of, e.g. `=PUMP-W1` (use `--cable=-W1` for a tag that
+        /// starts with `-`).
+        #[arg(long)]
+        cable: Option<String>,
+        /// The core's name in the cable, e.g. `1` or `BN`.
+        #[arg(long)]
+        core: Option<String>,
     },
     /// Set a device's part and description.
     Device {
@@ -416,8 +423,22 @@ fn run(cli: Cli) -> Res<()> {
             via,
             number,
             potential,
+            cable,
+            core,
         } => {
             let mut p = load(dir)?;
+            let cable = match cable {
+                Some(c) => {
+                    let tag = DeviceTag::parse(&c).map_err(e)?;
+                    p.devices.entry(tag.clone()).or_default();
+                    Some(wc_core::CableCore {
+                        cable: tag,
+                        core: core.unwrap_or_default(),
+                    })
+                }
+                None if core.is_some() => return Err("--core needs --cable".into()),
+                None => None,
+            };
             let pg = page_mut(&mut p, &page)?;
             let from = parse_end(pg, &from)?;
             let to = parse_end(pg, &to)?;
@@ -429,6 +450,7 @@ fn run(cli: Cli) -> Res<()> {
                 via,
                 number,
                 potential,
+                cable,
             });
             save(dir, &p)?;
             println!("{id}");

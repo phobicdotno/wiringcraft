@@ -134,6 +134,7 @@ mod tests {
             via: vec![],
             number: None,
             potential: potential.map(Into::into),
+            cable: None,
         }
     }
     fn pin(item: &str, pin: &str) -> Endpoint {

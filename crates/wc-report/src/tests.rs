@@ -53,6 +53,7 @@ fn wire(id: &str, from: Endpoint, to: Endpoint, number: Option<&str>, potential:
         via: vec![],
         number: number.map(Into::into),
         potential: potential.map(Into::into),
+        cable: None,
     }
 }
 
@@ -147,8 +148,8 @@ fn wire_list_names_both_ends_and_inherits_potentials() {
         symbols: &s,
         parts: &parts,
     });
-    assert_eq!(t.rows[0], ["2", "1", "24V", "junction 50.0,20.0", "=A+C1-K1:A1"]);
-    assert_eq!(t.rows[1][3..], ["=A+C1-K1:14", "-X1.1:1"]);
+    assert_eq!(t.rows[0], ["2", "1", "24V", "", "junction 50.0,20.0", "=A+C1-K1:A1"]);
+    assert_eq!(t.rows[1][4..], ["=A+C1-K1:14", "-X1.1:1"]);
     // w4 carries 0V itself.
     assert_eq!(t.rows[3][2], "0V");
 }
@@ -194,4 +195,35 @@ fn natural_order() {
     let mut v = vec!["X10", "X2", "X1"];
     v.sort_by_key(|s| natural_key(s));
     assert_eq!(v, ["X1", "X2", "X10"]);
+}
+
+#[test]
+fn cable_list_groups_cores_by_cable() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    p.devices.insert(
+        w1.clone(),
+        Device {
+            description: "Lamp cable".into(),
+            ..Default::default()
+        },
+    );
+    for (id, core) in [("w3", "2"), ("w2", "1")] {
+        if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: w1.clone(),
+                core: core.into(),
+            });
+        }
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = cable_list(&i);
+    assert_eq!(t.rows.len(), 2);
+    assert_eq!(t.rows[0], ["-W1", "", "Lamp cable", "1", "2", "=A+C1-K1:14", "-X1.1:1"]);
+    assert_eq!(t.rows[1][..4], ["", "", "", "2"]);
+    assert_eq!(wire_list(&i).rows[1][3], "-W1:1");
 }

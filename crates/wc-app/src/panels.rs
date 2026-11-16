@@ -21,6 +21,9 @@ pub struct PanelState {
     potential: String,
     text: String,
     text_height: f64,
+    cable: String,
+    core: String,
+    cable_error: Option<String>,
     tag_error: Option<String>,
 }
 
@@ -148,6 +151,10 @@ fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
             let w = page.wires.iter().find(|w| &w.id == id);
             ps.number = w.and_then(|w| w.number.clone()).unwrap_or_default();
             ps.potential = w.and_then(|w| w.potential.clone()).unwrap_or_default();
+            let c = w.and_then(|w| w.cable.clone());
+            ps.cable = c.as_ref().map(|c| c.cable.to_string()).unwrap_or_default();
+            ps.core = c.map(|c| c.core).unwrap_or_default();
+            ps.cable_error = None;
         }
         Some(Selection::Graphic(i)) => {
             if let Some(Shape::Text { text, height, .. }) = page.graphics.get(*i) {
@@ -383,6 +390,65 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                         }
                     }
                     ui.end_row();
+                    ui.label("Cable");
+                    let cables = open.cables();
+                    let r = ui.horizontal(|ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut ps.cable)
+                                .hint_text("e.g. -W1")
+                                .desired_width(110.0),
+                        );
+                        let mut picked = false;
+                        if !cables.is_empty() {
+                            egui::ComboBox::from_id_salt("cables")
+                                .selected_text("")
+                                .width(18.0)
+                                .show_ui(ui, |ui| {
+                                    for c in &cables {
+                                        if ui.selectable_label(false, c.to_string()).clicked() {
+                                            ps.cable = c.to_string();
+                                            picked = true;
+                                        }
+                                    }
+                                });
+                        }
+                        committed(&r) || picked
+                    });
+                    ui.end_row();
+                    ui.label("Core");
+                    let rc = ui.add(
+                        egui::TextEdit::singleline(&mut ps.core)
+                            .hint_text("e.g. 1 or BN")
+                            .desired_width(110.0),
+                    );
+                    ui.end_row();
+                    if r.inner || committed(&rc) {
+                        let cable = ps.cable.trim();
+                        if cable.is_empty() {
+                            ps.cable_error = None;
+                            open.set_wire_cable(page_idx, &id, None);
+                        } else {
+                            match DeviceTag::parse(cable) {
+                                Ok(tag) => {
+                                    ps.cable_error = None;
+                                    open.set_wire_cable(
+                                        page_idx,
+                                        &id,
+                                        Some(wc_core::CableCore {
+                                            cable: tag,
+                                            core: ps.core.trim().to_owned(),
+                                        }),
+                                    );
+                                }
+                                Err(e) => ps.cable_error = Some(e.to_string()),
+                            }
+                        }
+                    }
+                    if let Some(e) = &ps.cable_error {
+                        ui.label("");
+                        ui.label(RichText::new(e).color(t.error).small());
+                        ui.end_row();
+                    }
                     ui.label("Bends");
                     ui.label(wire.via.len().to_string());
                     ui.end_row();

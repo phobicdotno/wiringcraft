@@ -18,6 +18,6 @@ pub use error::{Error, Result};
 pub use geom::{Point, Shape};
 pub use lock::{LockEntry, Lockfile};
 pub use part::Part;
-pub use project::{Device, Endpoint, Page, PageSize, PlacedSymbol, Project, ProjectMeta, Wire};
+pub use project::{CableCore, Device, Endpoint, Page, PageSize, PlacedSymbol, Project, ProjectMeta, Wire};
 pub use symbol::{Pin, Symbol};
 pub use tag::DeviceTag;

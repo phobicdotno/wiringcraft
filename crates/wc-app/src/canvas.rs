@@ -391,7 +391,14 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         let c = if selected { t.selection } else { t.wire };
         let stroke = Stroke::new(xf.len(0.35).max(1.2) * if selected { 2.0 } else { 1.0 }, c);
         painter.add(EShape::line(pts.iter().map(|q| xf.s(*q)).collect(), stroke));
-        let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref()]
+        let core = w.cable.as_ref().map(|c| {
+            if c.core.is_empty() {
+                c.cable.to_string()
+            } else {
+                format!("{}:{}", c.cable, c.core)
+            }
+        });
+        let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref(), core.as_deref()]
             .into_iter()
             .flatten()
             .collect();

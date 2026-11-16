@@ -60,6 +60,7 @@ fn exports_pages_bookmarks_and_links() {
         via: vec![],
         number: Some("101".into()),
         potential: Some("24V".into()),
+        cable: None,
     });
     let mut p2 = Page::new("p2", "2", "Motor");
     p2.symbols.push(place("s1", "no", 200.0, "-K1"));

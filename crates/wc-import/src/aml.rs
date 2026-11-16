@@ -474,6 +474,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                     via,
                     number,
                     potential: None,
+                    cable: None,
                 });
             }
         } else {
@@ -492,6 +493,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                         via: vec![],
                         number: number.clone(),
                         potential: potential.clone(),
+                        cable: None,
                     });
                 }
             }
