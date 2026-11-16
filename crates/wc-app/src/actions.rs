@@ -5,7 +5,9 @@ use crate::icons::Icon;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    NewProject,
     Open,
+    ProjectProps,
     Save,
     Undo,
     Redo,
@@ -15,6 +17,11 @@ pub enum Action {
     Delete,
     Rotate,
     AddPage,
+    DuplicatePage,
+    PageProps,
+    PageUp,
+    PageDown,
+    DeletePage,
     ZoomIn,
     ZoomOut,
     ZoomFit,
@@ -44,7 +51,19 @@ impl Action {
             shortcut,
         };
         match self {
+            Action::NewProject => i(
+                "New project",
+                "Create a new project folder (also a git repository)",
+                Icon::NewProject,
+                "Ctrl+Shift+N",
+            ),
             Action::Open => i("Open", "Open a project folder", Icon::Open, "Ctrl+O"),
+            Action::ProjectProps => i(
+                "Project properties",
+                "Project name and title-block fields",
+                Icon::Properties,
+                "",
+            ),
             Action::Save => i("Save", "Save all changed pages", Icon::Save, "Ctrl+S"),
             Action::Undo => i("Undo", "Undo the last change", Icon::Undo, "Ctrl+Z"),
             Action::Redo => i("Redo", "Redo", Icon::Redo, "Ctrl+Y"),
@@ -64,6 +83,31 @@ impl Action {
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
             Action::Rotate => i("Rotate", "Rotate the selected symbol 90°", Icon::Rotate, "R"),
             Action::AddPage => i("New page", "Add a schematic page", Icon::PageAdd, "Ctrl+N"),
+            Action::DuplicatePage => i(
+                "Duplicate page",
+                "Copy this page; its devices get the next free tags",
+                Icon::PageCopy,
+                "",
+            ),
+            Action::PageProps => i(
+                "Page properties",
+                "Number, title and sheet size of this page",
+                Icon::PageProps,
+                "",
+            ),
+            Action::PageUp => i(
+                "Move page up",
+                "Swap this page's number with the one before",
+                Icon::PageUp,
+                "",
+            ),
+            Action::PageDown => i(
+                "Move page down",
+                "Swap this page's number with the one after",
+                Icon::PageDown,
+                "",
+            ),
+            Action::DeletePage => i("Delete page", "Delete this page", Icon::PageDelete, ""),
             Action::ZoomIn => i("Zoom in", "Zoom in", Icon::ZoomIn, "+"),
             Action::ZoomOut => i("Zoom out", "Zoom out", Icon::ZoomOut, "-"),
             Action::ZoomFit => i("Fit page", "Show the whole page", Icon::ZoomFit, "F"),
@@ -91,7 +135,7 @@ impl Action {
 
 /// Classic toolbars: groups separated by a divider.
 pub const TOOLBAR: &[&[Action]] = &[
-    &[Action::Open, Action::Save],
+    &[Action::NewProject, Action::Open, Action::Save],
     &[Action::Undo, Action::Redo],
     &[
         Action::Select,
@@ -100,7 +144,12 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::Rotate,
         Action::Delete,
     ],
-    &[Action::AddPage],
+    &[
+        Action::AddPage,
+        Action::DuplicatePage,
+        Action::PageProps,
+        Action::DeletePage,
+    ],
     &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
     &[Action::LibraryStatus, Action::LibraryUpdate],
     &[Action::Commit, Action::NewBranch, Action::History],
@@ -115,7 +164,10 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
     (
         "Start",
         &[
-            ("Project", &[Action::Open, Action::Save, Action::ExportPdf]),
+            (
+                "Project",
+                &[Action::NewProject, Action::Open, Action::Save, Action::ExportPdf],
+            ),
             ("Edit", &[Action::Undo, Action::Redo, Action::Delete]),
             (
                 "Draw",
@@ -126,7 +178,17 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
     (
         "Pages",
         &[
-            ("Pages", &[Action::AddPage]),
+            (
+                "Pages",
+                &[
+                    Action::AddPage,
+                    Action::DuplicatePage,
+                    Action::PageProps,
+                    Action::PageUp,
+                    Action::PageDown,
+                    Action::DeletePage,
+                ],
+            ),
             (
                 "View",
                 &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],

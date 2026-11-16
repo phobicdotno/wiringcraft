@@ -23,7 +23,15 @@ pub struct ChromeState {
 const MENUS: &[(&str, &[Option<Action>])] = &[
     (
         "File",
-        &[Some(Action::Open), Some(Action::Save), None, Some(Action::ExportPdf)],
+        &[
+            Some(Action::NewProject),
+            Some(Action::Open),
+            Some(Action::Save),
+            None,
+            Some(Action::ProjectProps),
+            None,
+            Some(Action::ExportPdf),
+        ],
     ),
     (
         "Edit",
@@ -37,12 +45,19 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
     ),
     (
         "Insert",
+        &[Some(Action::Select), Some(Action::PlaceSymbol), Some(Action::DrawWire)],
+    ),
+    (
+        "Page",
         &[
-            Some(Action::Select),
-            Some(Action::PlaceSymbol),
-            Some(Action::DrawWire),
-            None,
             Some(Action::AddPage),
+            Some(Action::DuplicatePage),
+            Some(Action::PageProps),
+            None,
+            Some(Action::PageUp),
+            Some(Action::PageDown),
+            None,
+            Some(Action::DeletePage),
         ],
     ),
     (

@@ -4,7 +4,9 @@ use eframe::egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, pos2, vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
+    NewProject,
     Open,
+    Properties,
     Save,
     Undo,
     Redo,
@@ -14,6 +16,11 @@ pub enum Icon {
     Delete,
     Rotate,
     PageAdd,
+    PageCopy,
+    PageProps,
+    PageUp,
+    PageDown,
+    PageDelete,
     ZoomIn,
     ZoomOut,
     ZoomFit,
@@ -132,6 +139,53 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
             line((12.0, 10.0), (12.0, 18.0));
             line((8.0, 14.0), (16.0, 14.0));
+        }
+        Icon::PageCopy => {
+            poly(&[(3.0, 17.0), (3.0, 3.0), (13.0, 3.0)], false);
+            poly(
+                &[(7.0, 7.0), (16.0, 7.0), (21.0, 12.0), (21.0, 21.0), (7.0, 21.0)],
+                true,
+            );
+        }
+        Icon::PageProps | Icon::Properties => {
+            if icon == Icon::PageProps {
+                poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
+            } else {
+                p.rect_stroke(
+                    Rect::from_min_max(at(4.0, 3.0), at(20.0, 21.0)),
+                    1.0 * s,
+                    st,
+                    eframe::egui::StrokeKind::Inside,
+                );
+            }
+            for y in [10.0, 14.0, 18.0] {
+                p.line_segment([at(8.0, y), at(10.0, y)], thin);
+                p.line_segment([at(11.5, y), at(16.0, y)], thin);
+            }
+        }
+        Icon::PageUp | Icon::PageDown => {
+            poly(&[(4.0, 3.0), (12.0, 3.0), (16.0, 7.0), (16.0, 21.0), (4.0, 21.0)], true);
+            let (a, b) = if icon == Icon::PageUp { (19.0, 7.0) } else { (7.0, 19.0) };
+            line((20.0, a), (20.0, b));
+            poly(
+                &[
+                    (17.5, b + (a - b).signum() * 3.0),
+                    (20.0, b),
+                    (22.5, b + (a - b).signum() * 3.0),
+                ],
+                false,
+            );
+        }
+        Icon::PageDelete => {
+            poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
+            line((9.0, 11.0), (15.0, 17.0));
+            line((15.0, 11.0), (9.0, 17.0));
+        }
+        Icon::NewProject => {
+            poly(&[(2.5, 6.0), (2.5, 19.0), (15.0, 19.0)], false);
+            poly(&[(2.5, 6.0), (8.0, 6.0), (10.0, 8.0), (17.0, 8.0), (17.0, 11.0)], false);
+            line((19.0, 13.0), (19.0, 21.0));
+            line((15.0, 17.0), (23.0, 17.0));
         }
         Icon::ZoomIn | Icon::ZoomOut | Icon::ZoomFit => {
             arc(10.0, 10.0, 6.5, 0.0, 360.0);

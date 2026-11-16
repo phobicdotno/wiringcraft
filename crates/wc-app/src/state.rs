@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
+use wc_core::project::PageSize;
 use wc_core::{DeviceTag, Endpoint, Page, PlacedSymbol, Project, Symbol, Wire, store};
 
 /// What a click on the canvas does.
@@ -238,11 +239,131 @@ impl Open {
 
     pub fn add_page(&mut self) -> usize {
         self.checkpoint();
+        let id = self.free_page_id();
+        let number = self.next_page_number();
+        self.project.pages.push(Page::new(id.clone(), number, "New page"));
+        self.project.sort_pages();
+        self.index_of(&id)
+    }
+
+    fn free_page_id(&self) -> String {
         let mut n = 1;
         while self.project.pages.iter().any(|p| p.id == format!("p{n:04}")) {
             n += 1;
         }
-        let number = self
+        format!("p{n:04}")
+    }
+
+    fn index_of(&self, id: &str) -> usize {
+        self.project.pages.iter().position(|p| p.id == id).unwrap_or(0)
+    }
+
+    /// Change a page's number, title and size. A number another page already uses is refused.
+    pub fn set_page_props(&mut self, page: usize, number: &str, title: &str, size: PageSize) -> Result<usize, String> {
+        let number = number.trim();
+        if number.is_empty() {
+            return Err("The page number cannot be empty.".into());
+        }
+        let Some(current) = self.project.pages.get(page) else {
+            return Err("No such page.".into());
+        };
+        let id = current.id.clone();
+        if self.project.pages.iter().any(|p| p.number == number && p.id != id) {
+            return Err(format!("Page {number} already exists."));
+        }
+        if current.number == number && current.title == title && current.size == size {
+            return Ok(page);
+        }
+        self.checkpoint();
+        if let Some(p) = self.project.pages.get_mut(page) {
+            p.number = number.to_owned();
+            p.title = title.trim().to_owned();
+            p.size = size;
+        }
+        self.project.sort_pages();
+        Ok(self.index_of(&id))
+    }
+
+    /// Delete a page. The last page of a project cannot be deleted. Returns the page to show next.
+    pub fn delete_page(&mut self, page: usize) -> Result<usize, String> {
+        if self.project.pages.len() <= 1 {
+            return Err("A project needs at least one page.".into());
+        }
+        if page >= self.project.pages.len() {
+            return Err("No such page.".into());
+        }
+        self.checkpoint();
+        self.project.pages.remove(page);
+        Ok(page.min(self.project.pages.len() - 1))
+    }
+
+    /// Move a page one place up or down by swapping its number with its neighbour's.
+    /// Returns the page's new index, or `None` when it is already at that end.
+    pub fn move_page(&mut self, page: usize, up: bool) -> Option<usize> {
+        let other = if up { page.checked_sub(1)? } else { page + 1 };
+        if other >= self.project.pages.len() || page >= self.project.pages.len() {
+            return None;
+        }
+        self.checkpoint();
+        let id = self.project.pages[page].id.clone();
+        let a = self.project.pages[page].number.clone();
+        let b = std::mem::replace(&mut self.project.pages[other].number, a);
+        self.project.pages[page].number = b;
+        self.project.sort_pages();
+        Some(self.index_of(&id))
+    }
+
+    /// Copy a page as a new last page. Devices on the copy get the next free tags (one new device
+    /// per original device, keeping description and part) and wire numbers are cleared.
+    pub fn duplicate_page(&mut self, page: usize) -> Option<usize> {
+        let mut copy = self.project.pages.get(page)?.clone();
+        self.checkpoint();
+        copy.id = self.free_page_id();
+        copy.number = self.next_page_number();
+        copy.title = format!("{} (copy)", copy.title);
+        let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
+        for s in &mut copy.symbols {
+            let Some(old) = s.tag.clone() else { continue };
+            let new = match renamed.get(&old) {
+                Some(t) => t.clone(),
+                None => {
+                    let Some(t) = self.free_tag_like(&old) else { continue };
+                    let device = self.project.devices.get(&old).cloned().unwrap_or_default();
+                    self.project.devices.insert(t.clone(), device);
+                    renamed.insert(old, t.clone());
+                    t
+                }
+            };
+            s.tag = Some(new);
+        }
+        for w in &mut copy.wires {
+            w.number = None;
+        }
+        let id = copy.id.clone();
+        self.project.pages.push(copy);
+        self.project.sort_pages();
+        Some(self.index_of(&id))
+    }
+
+    /// A free tag with the same function, location and letter code as `like`.
+    fn free_tag_like(&self, like: &DeviceTag) -> Option<DeviceTag> {
+        let letter = like.letter_code();
+        let used: std::collections::BTreeSet<DeviceTag> = self
+            .project
+            .tag_index()
+            .into_keys()
+            .chain(self.project.devices.keys().cloned())
+            .collect();
+        (1..10_000).find_map(|n| {
+            let mut t = like.clone();
+            let last = t.product.last_mut()?;
+            *last = format!("{letter}{n}");
+            (!used.contains(&t)).then_some(t)
+        })
+    }
+
+    fn next_page_number(&self) -> String {
+        let n = self
             .project
             .pages
             .iter()
@@ -250,15 +371,27 @@ impl Open {
             .max()
             .unwrap_or(0)
             + 1;
-        self.project
-            .pages
-            .push(Page::new(format!("p{n:04}"), number.to_string(), "New page"));
-        self.project.sort_pages();
-        self.project
-            .pages
+        n.to_string()
+    }
+
+    /// Rename the project and set its title-block fields (empty values are dropped).
+    pub fn set_project_props(&mut self, name: &str, fields: &[(String, String)]) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("The project name cannot be empty.".into());
+        }
+        let block: BTreeMap<String, String> = fields
             .iter()
-            .position(|p| p.id == format!("p{n:04}"))
-            .unwrap_or(0)
+            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+            .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+            .collect();
+        if self.project.meta.name == name && self.project.meta.title_block == block {
+            return Ok(());
+        }
+        self.checkpoint();
+        self.project.meta.name = name.to_owned();
+        self.project.meta.title_block = block;
+        Ok(())
     }
 
     /// Position of a pin on a page.
@@ -384,5 +517,55 @@ mod tests {
         let a1 = o.pin_pos(&pg, &a, "A1").unwrap();
         let (item, pin, _) = o.pin_near(&pg, a1 + Point::new(0.5, 0.5), 2.0).unwrap();
         assert_eq!((item.as_str(), pin.as_str()), (a.as_str(), "A1"));
+    }
+
+    #[test]
+    fn pages_can_be_renamed_moved_duplicated_and_deleted() {
+        let (_tmp, mut o) = project();
+        assert_eq!(o.project.pages.len(), 2);
+        // Renumbering resorts; a taken number is refused.
+        assert!(o.set_page_props(0, "2", "Cover", PageSize::A3).is_err());
+        let i = o.set_page_props(0, "10", "Cover sheet", PageSize::A4).unwrap();
+        assert_eq!(i, 1);
+        assert_eq!(o.project.pages[1].title, "Cover sheet");
+        assert_eq!(o.project.pages[1].size, PageSize::A4);
+        // Moving swaps numbers with the neighbour.
+        assert_eq!(o.move_page(1, true), Some(0));
+        assert_eq!(o.project.pages[0].number, "2");
+        assert_eq!(o.project.pages[0].id, "p0001");
+        assert_eq!(o.move_page(0, true), None);
+        // Duplicating gives the copy new tags for the same devices.
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let a = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        let old = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        o.project.devices.get_mut(&old).unwrap().description = "Pump contactor".into();
+        let c = o.duplicate_page(page).unwrap();
+        let new = o.project.pages[c].symbols[0].tag.clone().unwrap();
+        assert_ne!(new, old);
+        assert_eq!(new.letter_code(), old.letter_code());
+        assert_eq!(o.project.devices[&new].description, "Pump contactor");
+        assert_eq!(o.project.pages.len(), 3);
+        // Delete down to one page, which stays.
+        o.delete_page(c).unwrap();
+        o.delete_page(0).unwrap();
+        assert!(o.delete_page(0).is_err());
+        assert_eq!(o.project.pages.len(), 1);
+        o.save().unwrap();
+        assert_eq!(Open::load(&o.dir).unwrap().project.pages.len(), 1);
+    }
+
+    #[test]
+    fn project_props_drop_empty_title_block_fields() {
+        let (_tmp, mut o) = project();
+        assert!(o.set_project_props(" ", &[]).is_err());
+        o.set_project_props(
+            "Pump station",
+            &[("customer".into(), "Acme".into()), ("revision".into(), " ".into())],
+        )
+        .unwrap();
+        assert_eq!(o.project.meta.name, "Pump station");
+        assert_eq!(o.project.meta.title_block.len(), 1);
+        assert!(o.undo());
+        assert_eq!(o.project.meta.name, "Test");
     }
 }

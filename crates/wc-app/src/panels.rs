@@ -5,6 +5,7 @@ use eframe::egui::{self, RichText};
 use wc_core::DeviceTag;
 use wc_core::geom::Rotation;
 
+use crate::actions::Action;
 use crate::canvas::Editor;
 use crate::state::{Open, Selection, Tool};
 use crate::theme::Theme;
@@ -21,7 +22,7 @@ pub struct PanelState {
     tag_error: Option<String>,
 }
 
-pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor) {
+pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<Action>) {
     ui.heading("Pages");
     egui::ScrollArea::vertical()
         .id_salt("pages")
@@ -30,12 +31,41 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor) {
             for (i, p) in open.project.pages.iter().enumerate() {
                 let label = format!("{:>3}  {}", p.number, p.title);
                 let r = ui.selectable_label(ed.page == i, RichText::new(label).monospace());
-                if r.clicked() && ed.page != i {
-                    ed.page = i;
-                    ed.selection = None;
-                    ed.wire = None;
-                    ed.view.fit = true;
+                let pick = |ed: &mut Editor| {
+                    if ed.page != i {
+                        ed.page = i;
+                        ed.selection = None;
+                        ed.wire = None;
+                        ed.view.fit = true;
+                    }
+                };
+                if r.clicked() {
+                    pick(ed);
                 }
+                if r.double_clicked() {
+                    out.push(Action::PageProps);
+                }
+                r.context_menu(|ui| {
+                    pick(ed);
+                    for a in [
+                        Action::PageProps,
+                        Action::DuplicatePage,
+                        Action::PageUp,
+                        Action::PageDown,
+                        Action::DeletePage,
+                    ] {
+                        let enabled = match a {
+                            Action::PageUp => i > 0,
+                            Action::PageDown => i + 1 < open.project.pages.len(),
+                            Action::DeletePage => open.project.pages.len() > 1,
+                            _ => true,
+                        };
+                        if ui.add_enabled(enabled, egui::Button::new(a.info().label)).clicked() {
+                            out.push(a);
+                            ui.close_menu();
+                        }
+                    }
+                });
             }
         });
     ui.separator();
