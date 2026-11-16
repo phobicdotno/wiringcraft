@@ -2992,6 +2992,7 @@ dependencies = [
  "quick-xml 0.37.5",
  "thiserror 2.0.21",
  "wc-core",
+ "wc-report",
  "zip",
 ]
 
