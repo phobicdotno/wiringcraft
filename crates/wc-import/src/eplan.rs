@@ -171,8 +171,10 @@ pub fn wanted(lower_name: &str) -> bool {
 pub fn elk_target(bytes: &[u8]) -> Option<String> {
     let text = if bytes.starts_with(&[0xff, 0xfe]) || (bytes.len() > 1 && bytes.get(1) == Some(&0)) {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         String::from_utf16_lossy(&units)
     } else {
