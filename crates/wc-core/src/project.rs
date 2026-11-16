@@ -238,6 +238,8 @@ pub struct Project {
     pub pages: Vec<Page>,
     pub devices: BTreeMap<DeviceTag, Device>,
     pub lock: crate::Lockfile,
+    /// Cabinet panel layouts, by id order.
+    pub panels: Vec<crate::panel::Panel>,
 }
 
 impl Project {
@@ -247,6 +249,7 @@ impl Project {
             pages: Vec::new(),
             devices: BTreeMap::new(),
             lock: crate::Lockfile::default(),
+            panels: Vec::new(),
         }
     }
 

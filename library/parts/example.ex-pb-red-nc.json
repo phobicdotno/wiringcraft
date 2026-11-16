@@ -3,5 +3,8 @@
   "id": "example.ex-pb-red-nc",
   "manufacturer": "Example",
   "order_number": "EX-PB-RED-NC",
-  "symbol": "wc.button.nc"
+  "symbol": "wc.button.nc",
+  "properties": {
+    "Mounting": "Door"
+  }
 }

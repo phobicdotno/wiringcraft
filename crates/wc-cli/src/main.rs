@@ -35,6 +35,10 @@ enum Cmd {
     /// Pages.
     #[command(subcommand)]
     Page(PageCmd),
+    /// Cabinet panel layouts: mounting plate, DIN rails, wire ducts and device footprints.
+    /// Layouts print after the schematic pages in the PDF.
+    #[command(subcommand)]
+    Panel(PanelCmd),
     /// Place a library symbol on a page.
     Place {
         page: String,
@@ -147,6 +151,35 @@ enum Cmd {
     /// Version control: commit, branches, merge, history.
     #[command(subcommand)]
     Vcs(VcsCmd),
+}
+
+#[derive(Subcommand)]
+enum PanelCmd {
+    /// A new mounting plate with ducts around the edge and a DIN rail in every 125 mm row.
+    New {
+        id: String,
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Plate width in mm.
+        #[arg(long, default_value_t = 600.0)]
+        width: f64,
+        /// Plate height in mm.
+        #[arg(long, default_value_t = 800.0)]
+        height: f64,
+    },
+    /// Put devices that have a part and are not on the plate yet onto its rails, sized by the
+    /// part's `Width` and `Height` properties.
+    Arrange {
+        id: String,
+        /// Only devices in this location, e.g. `+CAB1`.
+        #[arg(long)]
+        location: Option<String>,
+    },
+    /// List the layouts and what is on them.
+    List,
+    Remove {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -393,6 +426,79 @@ fn run(cli: Cli) -> Res<()> {
             }
             println!("created {}", new_dir.display());
         }
+        Cmd::Panel(pc) => {
+            let mut p = load(dir)?;
+            match pc {
+                PanelCmd::New {
+                    id,
+                    name,
+                    width,
+                    height,
+                } => {
+                    store::check_id(&id).map_err(e)?;
+                    if p.panels.iter().any(|x| x.id == id) {
+                        return Err(format!("panel {id:?} exists"));
+                    }
+                    if !(width.is_finite()
+                        && height.is_finite()
+                        && (200.0..=5000.0).contains(&width)
+                        && (200.0..=5000.0).contains(&height))
+                    {
+                        return Err("plate width and height must be 200 to 5000 mm".into());
+                    }
+                    let name = if name.is_empty() { id.clone() } else { name };
+                    let panel = wc_core::panel::Panel::with_rails(id, name, width, height);
+                    let rails = panel
+                        .items
+                        .iter()
+                        .filter(|i| matches!(i, wc_core::panel::PanelItem::Rail { .. }))
+                        .count();
+                    println!("panel {}: {width} x {height} mm, {rails} rail(s)", panel.id);
+                    p.panels.push(panel);
+                    p.panels.sort_by(|a, b| a.id.cmp(&b.id));
+                }
+                PanelCmd::Arrange { id, location } => {
+                    let parts = vendored_parts(dir, &p);
+                    let mut panels = std::mem::take(&mut p.panels);
+                    let Some(panel) = panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    let done = wc_core::panel::arrange(panel, &p, &parts, location.as_deref());
+                    p.panels = panels;
+                    println!("placed {} device(s): {}", done.placed.len(), done.placed.join(", "));
+                    if !done.estimated.is_empty() {
+                        eprintln!(
+                            "warning: no Width/Height on the part, drawn 18 x 90 mm: {}",
+                            done.estimated.join(", ")
+                        );
+                    }
+                    if !done.did_not_fit.is_empty() {
+                        eprintln!("warning: no room on the rails for: {}", done.did_not_fit.join(", "));
+                    }
+                }
+                PanelCmd::List => {
+                    for x in &p.panels {
+                        println!(
+                            "{:<10} {} ({} x {} mm, {} device(s))",
+                            x.id,
+                            x.name,
+                            x.width,
+                            x.height,
+                            x.device_tags().len()
+                        );
+                    }
+                    return Ok(());
+                }
+                PanelCmd::Remove { id } => {
+                    let before = p.panels.len();
+                    p.panels.retain(|x| x.id != id);
+                    if p.panels.len() == before {
+                        return Err(format!("no panel {id:?}"));
+                    }
+                }
+            }
+            save(dir, &p)?;
+        }
         Cmd::Page(pc) => {
             let mut p = load(dir)?;
             match pc {
@@ -559,6 +665,7 @@ fn run(cli: Cli) -> Res<()> {
                     wire_labels: true,
                     reports: tables,
                     underlays: wc_pdf::read_underlays(dir, &p),
+                    panels: p.panels.clone(),
                 },
             );
             std::fs::write(&out, bytes).map_err(e)?;

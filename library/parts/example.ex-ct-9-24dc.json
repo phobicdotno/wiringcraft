@@ -5,7 +5,9 @@
   "order_number": "EX-CT-9-24DC",
   "properties": {
     "Coil voltage": "24 V DC",
-    "Rated current": "9 A"
+    "Height": "85 mm",
+    "Rated current": "9 A",
+    "Width": "45 mm"
   },
   "symbol": "wc.coil"
 }
