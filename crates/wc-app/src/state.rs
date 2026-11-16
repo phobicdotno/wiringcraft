@@ -205,38 +205,6 @@ impl Open {
         }
     }
 
-    pub fn delete(&mut self, page: usize, sel: &Selection) {
-        self.checkpoint();
-        let Some(pg) = self.project.pages.get_mut(page) else {
-            return;
-        };
-        match sel {
-            Selection::Symbol(id) => {
-                pg.symbols.retain(|s| &s.id != id);
-                // Wires on its pins keep their geometry as free ends rather than vanishing.
-                pg.wires.retain(|w| !matches!((&w.from, &w.to), (Endpoint::Pin { item: a, .. }, _) | (_, Endpoint::Pin { item: a, .. }) if a == id));
-            }
-            Selection::Wire(id) => pg.wires.retain(|w| &w.id != id),
-        }
-    }
-
-    pub fn rotate(&mut self, page: usize, id: &str) {
-        self.checkpoint();
-        if let Some(s) = self
-            .project
-            .pages
-            .get_mut(page)
-            .and_then(|p| p.symbols.iter_mut().find(|s| s.id == id))
-        {
-            s.rotation = match s.rotation {
-                Rotation::R0 => Rotation::R90,
-                Rotation::R90 => Rotation::R180,
-                Rotation::R180 => Rotation::R270,
-                Rotation::R270 => Rotation::R0,
-            };
-        }
-    }
-
     pub fn add_page(&mut self) -> usize {
         self.checkpoint();
         let id = self.free_page_id();
@@ -346,7 +314,7 @@ impl Open {
     }
 
     /// A free tag with the same function, location and letter code as `like`.
-    fn free_tag_like(&self, like: &DeviceTag) -> Option<DeviceTag> {
+    pub(crate) fn free_tag_like(&self, like: &DeviceTag) -> Option<DeviceTag> {
         let letter = like.letter_code();
         let used: std::collections::BTreeSet<DeviceTag> = self
             .project
@@ -412,11 +380,11 @@ impl Open {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use wc_core::project::LibrarySource;
 
-    fn project() -> (tempfile::TempDir, Open) {
+    pub(crate) fn project() -> (tempfile::TempDir, Open) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
         let mut p = store::create(&dir, "Test").unwrap();
@@ -475,7 +443,7 @@ mod tests {
             vec![],
         );
         assert_eq!(o.project.pages[page].wires.len(), 1);
-        o.delete(page, &Selection::Symbol(a));
+        o.delete_many(page, &[Selection::Symbol(a)]);
         assert!(o.project.pages[page].symbols.is_empty());
         assert!(o.project.pages[page].wires.is_empty());
         assert!(o.undo());

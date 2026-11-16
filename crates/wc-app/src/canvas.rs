@@ -40,15 +40,15 @@ impl Default for View {
 pub struct Editor {
     pub page: usize,
     pub tool: Tool,
-    pub selection: Option<Selection>,
+    /// Selected items; the properties panel edits the item when exactly one is selected.
+    pub selection: Vec<Selection>,
     /// Library symbol the place tool puts down.
     pub place_symbol: Option<String>,
     /// A wire being drawn: its start and the bends so far.
     pub wire: Option<(Endpoint, Vec<Point>)>,
     pub view: View,
     pub cursor: Option<Point>,
-    /// A symbol being dragged and whether the undo checkpoint for the drag was taken.
-    drag: Option<(String, bool)>,
+    drag: Option<Drag>,
     pub message: String,
 }
 
@@ -57,7 +57,7 @@ impl Default for Editor {
         Self {
             page: 0,
             tool: Tool::Select,
-            selection: None,
+            selection: Vec::new(),
             place_symbol: None,
             wire: None,
             view: View::default(),
@@ -65,6 +65,34 @@ impl Default for Editor {
             drag: None,
             message: String::new(),
         }
+    }
+}
+
+/// What a primary-button drag in the select tool is doing.
+#[derive(Debug, Clone, Copy)]
+enum Drag {
+    /// Moving the selection: the grab point (snapped, page mm) and whether the undo checkpoint
+    /// for this drag was taken.
+    Move { from: Point, checkpoint: bool },
+    /// Drawing a selection box from this corner.
+    Box { from: Point },
+}
+
+impl Editor {
+    /// The selected item when exactly one is selected.
+    pub fn one(&self) -> Option<&Selection> {
+        match self.selection.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+
+    pub fn select_only(&mut self, s: Selection) {
+        self.selection = vec![s];
+    }
+
+    pub fn is_selected(&self, s: &Selection) -> bool {
+        self.selection.contains(s)
     }
 }
 
@@ -442,12 +470,11 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         paint_shape(&painter, &xf, g, graphics_stroke);
     }
 
-    let sel = ed.selection.clone();
     for w in &page.wires {
         let Some(pts) = open.wire_points(&page, w) else {
             continue;
         };
-        let selected = sel == Some(Selection::Wire(w.id.clone()));
+        let selected = ed.is_selected(&Selection::Wire(w.id.clone()));
         let c = if selected { t.selection } else { t.wire };
         let stroke = Stroke::new(xf.len(0.35).max(1.2) * if selected { 2.0 } else { 1.0 }, c);
         painter.add(EShape::line(pts.iter().map(|q| xf.s(*q)).collect(), stroke));
@@ -483,7 +510,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     }
 
     for s in &page.symbols {
-        let selected = sel == Some(Selection::Symbol(s.id.clone()));
+        let selected = ed.is_selected(&Selection::Symbol(s.id.clone()));
         let c = if selected { t.selection } else { t.ink };
         let stroke = Stroke::new(xf.len(0.3).max(1.0), c);
         let Some(sym) = open.symbols.get(&s.symbol) else {
@@ -540,13 +567,15 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     let tol = (6.0 / f64::from(xf.zoom)).max(0.8);
 
     match ed.tool {
-        Tool::Select => select_tool(&resp, open, ed, &page, &xf, tol, snap_step),
+        Tool::Select => select_tool(&painter, &resp, open, ed, &page, &xf, tol, snap_step),
         Tool::Place => place_tool(&painter, &resp, open, ed, &xf, &t),
         Tool::Wire => wire_tool(&painter, &resp, open, ed, &page, &xf, &t),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_tool(
+    painter: &egui::Painter,
     resp: &egui::Response,
     open: &mut Open,
     ed: &mut Editor,
@@ -555,46 +584,83 @@ fn select_tool(
     tol: f64,
     snap_step: f64,
 ) {
+    let t = theme::Theme::of(&resp.ctx);
+    let shift = resp.ctx.input(|i| i.modifiers.shift || i.modifiers.command);
     if resp.clicked_by(egui::PointerButton::Primary)
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
-        ed.selection = open.hit(page, at, tol);
+        match (open.hit(page, at, tol), shift) {
+            (Some(h), true) => {
+                if let Some(i) = ed.selection.iter().position(|s| *s == h) {
+                    ed.selection.remove(i);
+                } else {
+                    ed.selection.push(h);
+                }
+            }
+            (Some(h), false) => ed.select_only(h),
+            (None, true) => {}
+            (None, false) => ed.selection.clear(),
+        }
     }
     if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
         ed.drag = match open.hit(page, at, tol) {
-            Some(Selection::Symbol(id)) => {
-                ed.selection = Some(Selection::Symbol(id.clone()));
-                Some((id, false))
+            Some(h) => {
+                if !ed.is_selected(&h) {
+                    if shift {
+                        ed.selection.push(h);
+                    } else {
+                        ed.select_only(h);
+                    }
+                }
+                Some(Drag::Move {
+                    from: snap(at, snap_step),
+                    checkpoint: false,
+                })
             }
-            _ => None,
+            None => Some(Drag::Box { from: at }),
         };
     }
-    if resp.dragged_by(egui::PointerButton::Primary)
-        && let Some((id, started)) = ed.drag.clone()
-        && let Some(cur) = ed.cursor
-    {
-        let current = page.symbol(&id).map(|s| s.at);
-        if let Some(at) = current {
-            // Move by whole snap steps so pins stay on the grid.
-            let target = snap(cur, snap_step);
-            if target != at {
-                if !started {
-                    open.checkpoint();
-                    ed.drag = Some((id.clone(), true));
-                }
-                if let Some(s) = open
-                    .project
-                    .pages
-                    .get_mut(ed.page)
-                    .and_then(|p| p.symbols.iter_mut().find(|s| s.id == id))
-                {
-                    s.at = target;
-                    open.dirty = true;
+    match ed.drag {
+        Some(Drag::Move { from, checkpoint }) if resp.dragged_by(egui::PointerButton::Primary) => {
+            if let Some(cur) = ed.cursor {
+                // Move by whole snap steps so pins stay on the grid.
+                let target = snap(cur, snap_step);
+                if target != from {
+                    if !checkpoint {
+                        open.checkpoint();
+                    }
+                    let d = Point::new(target.x - from.x, target.y - from.y);
+                    let sel = ed.selection.clone();
+                    open.move_by(ed.page, &sel, d);
+                    ed.drag = Some(Drag::Move {
+                        from: target,
+                        checkpoint: true,
+                    });
                 }
             }
         }
+        Some(Drag::Box { from }) => {
+            if let Some(cur) = resp.interact_pointer_pos().or(resp.hover_pos()).map(|p| xf.mm(p)) {
+                let r = Rect::from_two_pos(xf.s(from), xf.s(cur));
+                painter.rect_filled(r, 0.0, t.selection.gamma_multiply(0.08));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, t.selection), egui::StrokeKind::Middle);
+                if resp.drag_stopped() {
+                    let found = open.select_in(ed.page, from, cur);
+                    if shift {
+                        for f in found {
+                            if !ed.is_selected(&f) {
+                                ed.selection.push(f);
+                            }
+                        }
+                    } else {
+                        ed.selection = found;
+                    }
+                }
+            }
+        }
+        _ => {}
     }
     if resp.drag_stopped() {
         ed.drag = None;
@@ -642,7 +708,7 @@ fn place_tool(
         }
         match open.place(ed.page, &id, at) {
             Ok(sid) => {
-                ed.selection = Some(Selection::Symbol(sid));
+                ed.select_only(Selection::Symbol(sid));
                 ed.message = format!("Placed {id}.");
             }
             Err(e) => ed.message = format!("Could not place {id}: {e}"),

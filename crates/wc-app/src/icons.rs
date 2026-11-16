@@ -15,6 +15,10 @@ pub enum Icon {
     Wire,
     Delete,
     Rotate,
+    Mirror,
+    Copy,
+    Cut,
+    Paste,
     PageAdd,
     PageCopy,
     PageProps,
@@ -139,6 +143,47 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
             line((12.0, 10.0), (12.0, 18.0));
             line((8.0, 14.0), (16.0, 14.0));
+        }
+        Icon::Mirror => {
+            p.line_segment([at(12.0, 2.0), at(12.0, 22.0)], thin);
+            poly(&[(9.5, 5.0), (3.0, 18.0), (9.5, 18.0)], true);
+            poly(&[(14.5, 5.0), (21.0, 18.0), (14.5, 18.0)], true);
+        }
+        Icon::Copy => {
+            poly(&[(4.0, 16.0), (4.0, 3.0), (14.0, 3.0)], false);
+            p.rect_stroke(
+                Rect::from_min_max(at(8.0, 7.0), at(20.0, 21.0)),
+                1.0 * s,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
+        }
+        Icon::Cut => {
+            arc(7.0, 17.5, 3.0, 0.0, 360.0);
+            arc(17.0, 17.5, 3.0, 0.0, 360.0);
+            line((9.0, 15.0), (17.0, 3.0));
+            line((15.0, 15.0), (7.0, 3.0));
+        }
+        Icon::Paste => {
+            poly(
+                &[
+                    (8.0, 4.0),
+                    (5.0, 4.0),
+                    (5.0, 21.0),
+                    (19.0, 21.0),
+                    (19.0, 4.0),
+                    (16.0, 4.0),
+                ],
+                false,
+            );
+            p.rect_stroke(
+                Rect::from_min_max(at(8.0, 2.5), at(16.0, 6.5)),
+                1.0 * s,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
+            p.line_segment([at(8.5, 11.0), at(15.5, 11.0)], thin);
+            p.line_segment([at(8.5, 15.0), at(15.5, 15.0)], thin);
         }
         Icon::PageCopy => {
             poly(&[(3.0, 17.0), (3.0, 3.0), (13.0, 3.0)], false);
