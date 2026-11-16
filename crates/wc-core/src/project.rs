@@ -107,6 +107,18 @@ pub struct Wire {
     /// Signal name: wires with the same potential name are connected across pages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub potential: Option<String>,
+    /// The cable this wire runs in, when it is a cable core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cable: Option<CableCore>,
+}
+
+/// A wire's place in a cable: the cable device (for example `-W1`) and the core's name
+/// (a number or a colour such as `BN`). A cable is an ordinary device; its part says the type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CableCore {
+    pub cable: DeviceTag,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub core: String,
 }
 
 /// A schematic page. Stored as one file each so edits on different pages never conflict.

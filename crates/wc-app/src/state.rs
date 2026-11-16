@@ -289,6 +289,7 @@ impl Open {
                 via,
                 number: None,
                 potential: None,
+                cable: None,
             });
         }
     }
@@ -450,6 +451,44 @@ impl Open {
         Ok(())
     }
 
+    /// Put a wire into a cable as a core, or take it out (`None`). The cable device is created
+    /// when it does not exist yet.
+    pub fn set_wire_cable(&mut self, page: usize, wire: &str, cable: Option<wc_core::CableCore>) {
+        let current = self
+            .project
+            .pages
+            .get(page)
+            .and_then(|p| p.wires.iter().find(|w| w.id == wire))
+            .map(|w| w.cable.clone());
+        if current.is_none() || current == Some(cable.clone()) {
+            return;
+        }
+        self.checkpoint();
+        if let Some(c) = &cable {
+            self.project.devices.entry(c.cable.clone()).or_default();
+        }
+        if let Some(w) = self
+            .project
+            .pages
+            .get_mut(page)
+            .and_then(|p| p.wires.iter_mut().find(|w| w.id == wire))
+        {
+            w.cable = cable;
+        }
+    }
+
+    /// Cables used anywhere in the project, for the cable picker.
+    pub fn cables(&self) -> Vec<DeviceTag> {
+        let set: std::collections::BTreeSet<DeviceTag> = self
+            .project
+            .pages
+            .iter()
+            .flat_map(|p| p.wires.iter())
+            .filter_map(|w| w.cable.as_ref().map(|c| c.cable.clone()))
+            .collect();
+        set.into_iter().collect()
+    }
+
     /// Position of a pin on a page.
     pub fn pin_pos(&self, page: &Page, item: &str, pin: &str) -> Option<Point> {
         let placed = page.symbol(item)?;
@@ -608,6 +647,35 @@ pub(crate) mod tests {
         assert_eq!(o.project.pages.len(), 1);
         o.save().unwrap();
         assert_eq!(Open::load(&o.dir).unwrap().project.pages.len(), 1);
+    }
+
+    #[test]
+    fn wires_join_and_leave_cables() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let free = |x| Endpoint::Point {
+            at: Point::new(x, 10.0),
+        };
+        o.add_wire(page, free(10.0), free(20.0), vec![]);
+        let id = o.project.pages[page].wires[0].id.clone();
+        let w1 = DeviceTag::parse("-W1").unwrap();
+        o.set_wire_cable(
+            page,
+            &id,
+            Some(wc_core::CableCore {
+                cable: w1.clone(),
+                core: "BN".into(),
+            }),
+        );
+        assert!(o.project.devices.contains_key(&w1));
+        assert_eq!(o.cables(), vec![w1]);
+        o.set_wire_cable(page, &id, None);
+        assert!(o.cables().is_empty());
+        assert!(o.undo());
+        assert_eq!(
+            o.project.pages[page].wires[0].cable.as_ref().map(|c| c.core.as_str()),
+            Some("BN")
+        );
     }
 
     #[test]

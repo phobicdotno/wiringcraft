@@ -271,6 +271,7 @@ mod tests {
             via: vec![],
             number: None,
             potential: Some("24V".into()),
+            cable: None,
         });
         p.pages.push(page);
         p.devices.insert(

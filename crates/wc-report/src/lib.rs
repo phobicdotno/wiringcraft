@@ -77,10 +77,18 @@ pub enum Kind {
     Wires,
     Nets,
     Terminals,
+    Cables,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [Kind::Parts, Kind::Devices, Kind::Wires, Kind::Nets, Kind::Terminals];
+    pub const ALL: [Kind; 6] = [
+        Kind::Parts,
+        Kind::Devices,
+        Kind::Wires,
+        Kind::Nets,
+        Kind::Terminals,
+        Kind::Cables,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -89,6 +97,7 @@ impl Kind {
             Kind::Wires => "wires",
             Kind::Nets => "nets",
             Kind::Terminals => "terminals",
+            Kind::Cables => "cables",
         }
     }
 
@@ -113,6 +122,7 @@ pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
         Kind::Wires => wire_list(i),
         Kind::Nets => net_list(i),
         Kind::Terminals => terminal_plan(i),
+        Kind::Cables => cable_list(i),
     }
 }
 
@@ -257,7 +267,7 @@ fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
 
 /// Wire list: every drawn wire with both ends. A free end is reported as a junction point.
 pub fn wire_list(i: &Inputs<'_>) -> Table {
-    let mut t = Table::new("Wire list", &["Page", "Wire", "Potential", "From", "To"]);
+    let mut t = Table::new("Wire list", &["Page", "Wire", "Potential", "Cable", "From", "To"]);
     let (_, net_of) = net_names(i);
     for page in &i.project.pages {
         for w in &page.wires {
@@ -275,8 +285,72 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
                 page.number.clone(),
                 w.number.clone().unwrap_or_default(),
                 potential.unwrap_or_default(),
+                w.cable.as_ref().map(cable_core_label).unwrap_or_default(),
                 end(&w.from),
                 end(&w.to),
+            ]);
+        }
+    }
+    t
+}
+
+fn cable_core_label(c: &wc_core::CableCore) -> String {
+    if c.core.is_empty() {
+        c.cable.to_string()
+    } else {
+        format!("{}:{}", c.cable, c.core)
+    }
+}
+
+/// Cable list: every cable with its type, then one row per core with the wire's two ends.
+pub fn cable_list(i: &Inputs<'_>) -> Table {
+    let mut t = Table::new(
+        "Cable list",
+        &["Cable", "Type", "Description", "Core", "Page", "From", "To"],
+    );
+    let mut cores: BTreeMap<DeviceTag, Vec<(String, String, String, String)>> = BTreeMap::new();
+    for page in &i.project.pages {
+        for w in &page.wires {
+            let Some(c) = &w.cable else { continue };
+            let end = |e: &Endpoint| match e {
+                Endpoint::Pin { item, pin } => pin_label(i.project, &page.id, item, pin),
+                Endpoint::Point { at } => format!("junction {:.1},{:.1}", at.x, at.y),
+            };
+            cores.entry(c.cable.clone()).or_default().push((
+                c.core.clone(),
+                page.number.clone(),
+                end(&w.from),
+                end(&w.to),
+            ));
+        }
+    }
+    for (cable, mut list) in cores {
+        list.sort_by_key(|a| natural_key(&a.0));
+        let device = i.project.devices.get(&cable);
+        let part = device.and_then(|d| d.part.as_ref()).and_then(|id| i.parts.get(id));
+        let kind = part
+            .map(|p| {
+                [p.manufacturer.as_str(), p.order_number.as_str()]
+                    .join(" ")
+                    .trim()
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        let description = device
+            .map(|d| d.description.clone())
+            .filter(|d| !d.is_empty())
+            .or_else(|| part.map(|p| p.description.clone()))
+            .unwrap_or_default();
+        for (n, (core, page, from, to)) in list.into_iter().enumerate() {
+            let first = n == 0;
+            t.rows.push(vec![
+                if first { cable.to_string() } else { String::new() },
+                if first { kind.clone() } else { String::new() },
+                if first { description.clone() } else { String::new() },
+                core,
+                page,
+                from,
+                to,
             ]);
         }
     }
