@@ -10,6 +10,7 @@ pub mod hash;
 pub mod lock;
 pub mod macros;
 pub mod numbering;
+pub mod panel;
 pub mod part;
 pub mod project;
 pub mod store;

@@ -4,7 +4,9 @@
   "manufacturer": "Example",
   "order_number": "EX-MCB-1P-C10",
   "properties": {
-    "Rated current": "10 A"
+    "Height": "90 mm",
+    "Rated current": "10 A",
+    "Width": "18 mm"
   },
   "symbol": "wc.breaker.1p"
 }

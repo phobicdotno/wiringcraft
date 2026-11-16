@@ -32,6 +32,8 @@ pub const LOCK_FILE: &str = "library.lock";
 pub const PAGES_DIR: &str = "pages";
 pub const VENDOR_DIR: &str = "vendor";
 const PAGE_SUFFIX: &str = ".page.json";
+pub const PANELS_DIR: &str = "panels";
+const PANEL_SUFFIX: &str = ".panel.json";
 
 /// Ids become file names, so they are restricted to a portable set.
 pub fn check_id(id: &str) -> Result<()> {
@@ -151,11 +153,37 @@ pub fn load(dir: &Path) -> Result<Project> {
             pages.push(page);
         }
     }
+    let mut panels: Vec<crate::panel::Panel> = Vec::new();
+    let panels_dir = dir.join(PANELS_DIR);
+    if panels_dir.exists() {
+        let entries = fs::read_dir(&panels_dir).map_err(|e| Error::io(&panels_dir, e))?;
+        for entry in entries {
+            let path = entry.map_err(|e| Error::io(&panels_dir, e))?.path();
+            let Some(stem) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(PANEL_SUFFIX))
+            else {
+                continue;
+            };
+            let panel: crate::panel::Panel = read_json(&path)?;
+            if panel.id != stem {
+                return Err(Error::Invalid(format!(
+                    "{} holds panel id {:?}; the file name and id must match",
+                    path.display(),
+                    panel.id
+                )));
+            }
+            panels.push(panel);
+        }
+    }
+    panels.sort_by(|a, b| a.id.cmp(&b.id));
     let mut project = Project {
         meta,
         pages,
         devices,
         lock,
+        panels,
     };
     project.sort_pages();
     Ok(project)
@@ -187,6 +215,23 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.ends_with(PAGE_SUFFIX) && !keep.contains(&name) {
+                fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
+            }
+        }
+    }
+    let panels_dir = dir.join(PANELS_DIR);
+    let mut keep = std::collections::BTreeSet::new();
+    for panel in &project.panels {
+        check_id(&panel.id)?;
+        let name = format!("{}{PANEL_SUFFIX}", panel.id);
+        put(panels_dir.join(&name), to_json(panel)?)?;
+        keep.insert(name);
+    }
+    if panels_dir.exists() {
+        let entries = fs::read_dir(&panels_dir).map_err(|e| Error::io(&panels_dir, e))?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(PANEL_SUFFIX) && !keep.contains(&name) {
                 fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
             }
         }

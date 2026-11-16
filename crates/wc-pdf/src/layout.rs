@@ -732,3 +732,97 @@ pub fn draw_table_page(
         underlay: None,
     }
 }
+
+/// One panel layout page: frame and title block, the mounting plate scaled to fit the drawing
+/// area with its ducts (hatched grey), DIN rails and device footprints labelled with their
+/// tags, and the scale and plate size under it.
+pub fn draw_panel_page(
+    project: &Project,
+    page: &Page,
+    index: usize,
+    total: usize,
+    panel: &wc_core::panel::Panel,
+    date: &str,
+) -> Drawn {
+    use wc_core::panel::PanelItem;
+    let (w, h) = page.size.mm();
+    let mut pen = Pen::new(h);
+    pen.ops.push_str("1 J 1 j\n");
+    pen.colour(0.0, 0.0, 0.0);
+    frame(&mut pen, project, page, index, total, date);
+    // Drawing area inside the frame, above the title block, with room for the caption.
+    let (ax0, ay0) = (MARGIN + 10.0, MARGIN + HEADER + 10.0);
+    let (ax1, ay1) = (w - MARGIN - 10.0, h - MARGIN - TITLE_H - 14.0);
+    let (pw, ph) = (panel.width.max(1.0), panel.height.max(1.0));
+    let fit = ((ax1 - ax0) / pw).min((ay1 - ay0) / ph);
+    // A standard reduction (1:2, 1:5, 1:10, ...) that fits.
+    let scale = [1.0, 2.0, 2.5, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0]
+        .into_iter()
+        .find(|d| 1.0 / d <= fit)
+        .unwrap_or(100.0);
+    let k = 1.0 / scale;
+    let ox = ax0 + ((ax1 - ax0) - pw * k) / 2.0;
+    let oy = ay0 + ((ay1 - ay0) - ph * k) / 2.0;
+    let p = |x: f64, y: f64| (ox + x * k, oy + y * k);
+    pen.width(0.5);
+    pen.rect(p(0.0, 0.0), p(pw, ph));
+    pen.width(0.18);
+    for item in &panel.items {
+        match item {
+            PanelItem::Duct { min, max } => {
+                pen.colour(0.86, 0.87, 0.89);
+                pen.fill_rect(p(min.x, min.y), p(max.x, max.y));
+                pen.colour(0.45, 0.45, 0.45);
+                pen.rect(p(min.x, min.y), p(max.x, max.y));
+            }
+            PanelItem::Rail { at, length } => {
+                // A 35 mm rail, drawn with its two flanges.
+                pen.colour(0.3, 0.3, 0.3);
+                pen.rect(p(at.x, at.y - 17.5), p(at.x + length, at.y + 17.5));
+                pen.line(p(at.x, at.y - 12.5), p(at.x + length, at.y - 12.5));
+                pen.line(p(at.x, at.y + 12.5), p(at.x + length, at.y + 12.5));
+            }
+            PanelItem::Device { .. } => {}
+        }
+    }
+    pen.colour(0.0, 0.0, 0.0);
+    pen.width(0.35);
+    for item in &panel.items {
+        if let PanelItem::Device { tag, at, width, height } = item {
+            let (width, height) = (*width, *height);
+            pen.colour(1.0, 1.0, 1.0);
+            pen.fill_rect(p(at.x, at.y), p(at.x + width, at.y + height));
+            pen.colour(0.0, 0.0, 0.0);
+            pen.rect(p(at.x, at.y), p(at.x + width, at.y + height));
+            // The product aspect is what fits on a narrow device; the full tag is in the list.
+            let label = tag.product.join(".");
+            let label = format!("-{label}");
+            let per_char = label.chars().count().max(1) as f64 * 0.62;
+            let across = (width * k / per_char).min(height * k * 0.5).min(2.5);
+            let along = (height * k / per_char).min(width * k * 0.6).min(2.5);
+            let (cx, cy) = p(at.x + width / 2.0, at.y + height / 2.0);
+            if across >= along.min(1.2) {
+                pen.text((cx, cy + across / 2.0), across.max(0.6), 1, &label);
+            } else {
+                pen.text_at_angle((cx + along / 2.0, cy), along.max(0.6), 1, 90.0, &label);
+            }
+        }
+    }
+    let devices = panel.device_tags().len();
+    pen.text(
+        (ax0, h - MARGIN - TITLE_H - 5.0),
+        2.5,
+        0,
+        &format!(
+            "{}  ·  plate {} x {} mm  ·  scale 1:{}  ·  {} device(s)",
+            panel.name, panel.width, panel.height, scale, devices
+        ),
+    );
+    Drawn {
+        ops: pen.ops,
+        links: Vec::new(),
+        prims: pen.prims,
+        layers: pen.layers,
+        underlay: None,
+    }
+}

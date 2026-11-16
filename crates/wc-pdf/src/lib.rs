@@ -35,6 +35,8 @@ pub struct Options {
     /// Underlay picture files by path (see [`read_underlays`]), drawn under their pages on
     /// a layer of their own.
     pub underlays: BTreeMap<String, Vec<u8>>,
+    /// Panel layouts printed after the schematic pages, one sheet each.
+    pub panels: Vec<wc_core::panel::Panel>,
 }
 
 impl Default for Options {
@@ -45,6 +47,7 @@ impl Default for Options {
             wire_labels: true,
             reports: Vec::new(),
             underlays: BTreeMap::new(),
+            panels: Vec::new(),
         }
     }
 }
@@ -86,7 +89,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             .collect()
     };
     let (front_pages, back_pages) = (split(true), split(false));
-    let total = front_pages.len() + pages.len() + back_pages.len();
+    let total = front_pages.len() + pages.len() + options.panels.len() + back_pages.len();
     report.pages = total;
     let mut doc = writer::Doc::new(&project.meta.name);
     let mut sheet = 0;
@@ -147,6 +150,14 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             }
         }
         doc.add_page(page.size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        sheet += 1;
+    }
+    // Panel layouts follow the schematic pages, one sheet each.
+    for (k, panel) in options.panels.iter().enumerate() {
+        let mut page = wc_core::Page::new(format!("panel-{}", panel.id), format!("P{}", k + 1), panel.name.clone());
+        page.size = size;
+        let drawn = layout::draw_panel_page(project, &page, sheet, total, panel, &options.date);
+        doc.add_page(size.mm(), &format!("{} {}", page.number, panel.name), drawn);
         sheet += 1;
     }
     add_reports(&mut doc, back_pages, &mut sheet);

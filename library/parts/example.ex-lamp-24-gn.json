@@ -4,7 +4,8 @@
   "manufacturer": "Example",
   "order_number": "EX-LAMP-24-GN",
   "properties": {
-    "Coil voltage": "24 V"
+    "Coil voltage": "24 V",
+    "Mounting": "Door"
   },
   "symbol": "wc.lamp"
 }

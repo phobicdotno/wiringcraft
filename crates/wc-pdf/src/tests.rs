@@ -356,3 +356,43 @@ fn underlay_pictures_go_under_the_page_on_their_own_layer() {
     assert!(report.warnings.iter().any(|w| w.contains("p2.jpg is missing")));
     assert!(report.warnings.iter().any(|w| w.contains("damaged")));
 }
+
+#[test]
+fn panel_layouts_print_after_the_schematic_pages() {
+    use wc_core::panel::{Panel, PanelItem};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let mut panel = Panel::with_rails("main", "Cabinet CAB1", 600.0, 800.0);
+    if let Ok(tag) = DeviceTag::parse("+CAB1-K1") {
+        panel.items.push(PanelItem::Device {
+            tag,
+            at: Point::new(50.0, 100.0),
+            width: 45.0,
+            height: 85.0,
+        });
+    }
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        ..Default::default()
+    };
+    let opts = Options {
+        panels: vec![panel],
+        reports: vec![parts],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 3);
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    assert!(at("1 Mains") < at("P1 Cabinet CAB1"));
+    assert!(at("P1 Cabinet CAB1") < at("R1 Parts list"));
+    assert!(at("R1 Parts list") < usize::MAX);
+    // The caption names the plate, scale and device count; the device carries its tag.
+    assert!(text.contains(&writer::pdf_text("-K1")));
+    assert!(text.contains(&writer::pdf_text(
+        "Cabinet CAB1  ·  plate 600 x 800 mm  ·  scale 1:5  ·  1 device(s)"
+    )));
+}
