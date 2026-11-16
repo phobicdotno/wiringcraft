@@ -1,4 +1,5 @@
-//! PDF schematics as a trace layer: vector paths (and simple text) from each page become page
+//! PDF schematics as a trace layer: vector paths and text (simple fonts, and composite fonts
+//! through their ToUnicode map, as Eplan and most CAD exports embed them) from each page become page
 //! graphics in millimetres, to redraw over or keep as reference.
 //!
 //! This is a small, forgiving PDF reader: it finds objects by scanning (so damaged cross-reference
@@ -583,6 +584,25 @@ impl Interp<'_> {
         )
     }
 
+    /// The text decoding of a font resource, when it needs one: composite (two-byte) fonts and
+    /// fonts with a ToUnicode map.
+    fn font_map(&self, resources: &Obj, name: &str) -> Option<FontMap> {
+        let font = resources
+            .dict()
+            .and_then(|r| r.get("Font"))
+            .map(|f| self.doc.get(f))
+            .and_then(Obj::dict)
+            .and_then(|f| f.get(name))
+            .map(|f| self.doc.get(f))
+            .and_then(Obj::dict)?;
+        let two_byte = font.get("Subtype").and_then(Obj::name) == Some("Type0");
+        let map = match font.get("ToUnicode").map(|t| self.doc.get(t)) {
+            Some(Obj::Stream(d, data)) => decode_stream(d, data).map(|c| parse_cmap(&c)).unwrap_or_default(),
+            _ => BTreeMap::new(),
+        };
+        (two_byte || !map.is_empty()).then_some(FontMap { two_byte, map })
+    }
+
     fn run(&mut self, content: &[u8], resources: &Obj, ctm: Ctm, depth: usize) {
         if depth > 8 {
             return;
@@ -598,6 +618,7 @@ impl Interp<'_> {
         let mut tm = Ctm::ID;
         let mut tlm = Ctm::ID;
         let mut font_size = 10.0;
+        let mut font: Option<FontMap> = None;
         let mut leading = 0.0;
         while let Some(tok) = lx.next(0) {
             self.budget = self.budget.saturating_sub(1);
@@ -698,7 +719,16 @@ impl Interp<'_> {
                     tm = Ctm::ID;
                     tlm = Ctm::ID;
                 }
-                "Tf" => font_size = n(1),
+                "Tf" => {
+                    font_size = n(1);
+                    let name = stack
+                        .len()
+                        .checked_sub(2)
+                        .and_then(|i| stack.get(i))
+                        .and_then(Obj::name)
+                        .unwrap_or("");
+                    font = self.font_map(resources, name);
+                }
                 "TL" => leading = n(1),
                 "Td" | "TD" => {
                     if op == "TD" {
@@ -729,13 +759,21 @@ impl Interp<'_> {
                             .collect(),
                         _ => Vec::new(),
                     };
-                    // Simple fonts only: keep printable single-byte text.
-                    let text: String = bytes
-                        .iter()
-                        .filter(|b| (0x20..0x7f).contains(*b) || **b >= 0xa0)
-                        .map(|b| *b as char)
-                        .collect();
-                    if !text.trim().is_empty() && text.chars().count() * 2 >= bytes.len() {
+                    // Through the font's ToUnicode map when it has one (composite fonts always
+                    // need it); otherwise printable single-byte text.
+                    let (text, plausible) = match &font {
+                        Some(f) => (f.decode(&bytes), true),
+                        None => {
+                            let t: String = bytes
+                                .iter()
+                                .filter(|b| (0x20..0x7f).contains(*b) || **b >= 0xa0)
+                                .map(|b| *b as char)
+                                .collect();
+                            let ok = t.chars().count() * 2 >= bytes.len();
+                            (t, ok)
+                        }
+                    };
+                    if !text.trim().is_empty() && plausible {
                         let full = tm.pre([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
                         let at_pt = ctm.pre(full.0).p(0.0, 0.0);
                         let scale = (ctm.pre(full.0).0[2].powi(2) + ctm.pre(full.0).0[3].powi(2)).sqrt();
@@ -841,6 +879,148 @@ pub fn pages(bytes: &[u8]) -> Result<Vec<TracePage>> {
     Ok(out)
 }
 
+/// How a font's string bytes become text.
+#[derive(Debug, Clone, Default)]
+struct FontMap {
+    /// Composite fonts use two-byte codes (Identity-H and the like).
+    two_byte: bool,
+    /// Code to text, from the ToUnicode map.
+    map: BTreeMap<u32, String>,
+}
+
+impl FontMap {
+    fn decode(&self, bytes: &[u8]) -> String {
+        let codes: Vec<u32> = if self.two_byte {
+            bytes
+                .chunks(2)
+                .map(|c| (u32::from(c[0]) << 8) | u32::from(c.get(1).copied().unwrap_or(0)))
+                .collect()
+        } else {
+            bytes.iter().map(|b| u32::from(*b)).collect()
+        };
+        let mut out = String::new();
+        for code in codes {
+            match self.map.get(&code) {
+                Some(t) => out.push_str(t),
+                // A simple font's code without a mapping is most likely plain text.
+                None if !self.two_byte && ((0x20..0x7f).contains(&code) || code >= 0xa0) => {
+                    out.extend(char::from_u32(code));
+                }
+                None => {}
+            }
+        }
+        out.chars().filter(|c| !c.is_control()).collect()
+    }
+}
+
+/// Hex tokens of a CMap section, with `[` and `]` as tokens of their own.
+fn cmap_tokens(s: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        match s[i] {
+            b'<' => {
+                let end = s[i + 1..]
+                    .iter()
+                    .position(|&b| b == b'>')
+                    .map_or(s.len(), |e| i + 1 + e);
+                let hex: Vec<u8> = s[i + 1..end].iter().copied().filter(u8::is_ascii_hexdigit).collect();
+                let bytes = hex
+                    .chunks(2)
+                    .filter_map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
+                    .collect();
+                out.push(Some(bytes));
+                i = end + 1;
+            }
+            b'[' | b']' => {
+                out.push(None);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+fn code_of(b: &[u8]) -> u32 {
+    b.iter().take(4).fold(0, |a, x| (a << 8) | u32::from(*x))
+}
+
+fn utf16(b: &[u8]) -> String {
+    let units: Vec<u16> = b
+        .chunks(2)
+        .map(|c| (u16::from(c[0]) << 8) | u16::from(c.get(1).copied().unwrap_or(0)))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// The bfchar and bfrange sections of a ToUnicode CMap.
+fn parse_cmap(data: &[u8]) -> BTreeMap<u32, String> {
+    const MAX_RANGE: u32 = 65536;
+    let mut map = BTreeMap::new();
+    let text = String::from_utf8_lossy(data);
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find("begin") {
+        let after = &rest[start + 5..];
+        let kind = if after.starts_with("bfchar") {
+            "bfchar"
+        } else if after.starts_with("bfrange") {
+            "bfrange"
+        } else {
+            rest = after;
+            continue;
+        };
+        let body_start = kind.len();
+        let Some(end) = after.find(&format!("end{kind}")) else {
+            break;
+        };
+        let toks = cmap_tokens(&after.as_bytes()[body_start.min(end)..end]);
+        if kind == "bfchar" {
+            for pair in toks.chunks(2) {
+                if let [Some(src), Some(dst)] = pair {
+                    map.insert(code_of(src), utf16(dst));
+                }
+            }
+        } else {
+            let mut k = 0;
+            while k + 2 < toks.len() + 1 {
+                let (Some(Some(lo)), Some(Some(hi))) = (toks.get(k), toks.get(k + 1)) else {
+                    break;
+                };
+                let (lo, hi) = (code_of(lo), code_of(hi));
+                match toks.get(k + 2) {
+                    Some(Some(dst)) => {
+                        let base = code_of(dst);
+                        let width = dst.len();
+                        for (n, code) in (lo..=hi).take(MAX_RANGE as usize).enumerate() {
+                            let v = base.wrapping_add(n as u32);
+                            let bytes: Vec<u8> = (0..width).rev().map(|s| (v >> (8 * s)) as u8).collect();
+                            map.insert(code, utf16(&bytes));
+                        }
+                        k += 3;
+                    }
+                    Some(None) => {
+                        // An array of destinations, one per code.
+                        let mut j = k + 3;
+                        let mut code = lo;
+                        while let Some(Some(dst)) = toks.get(j) {
+                            if code <= hi {
+                                map.insert(code, utf16(dst));
+                            }
+                            code = code.saturating_add(1);
+                            j += 1;
+                        }
+                        k = j + 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        rest = &after[end..];
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,6 +1061,52 @@ mod tests {
             );
             assert!(g.iter().any(|s| matches!(s, Shape::Text { text, .. } if text == "K1")));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn composite_font_text_through_to_unicode() -> Result<()> {
+        // Glyph codes 0x31.. map to "No" by a range, and code 3 to a space by a single entry, as
+        // subset fonts do; the bytes alone are not text.
+        let cmap = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n1 begincodespacerange <0000> <ffff> endcodespacerange\n1 beginbfchar\n<0003> <0020>\nendbfchar\n2 beginbfrange\n<0031> <0032> <004E>\n<0050> <0051> [<006F> <00C5>]\nendbfrange\nendcmap\n";
+        let content = "BT /F1 12 Tf 72 72 Td <003100500003003200510003FFFF> Tj ET BT /F2 10 Tf 72 300 Td (K1) Tj ET";
+        let mut b = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 1190.55 841.89] >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> >>\nendobj\n".to_vec();
+        b.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n",
+                content.len()
+            )
+            .as_bytes(),
+        );
+        b.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 6 0 R >>\nendobj\n",
+        );
+        b.extend_from_slice(
+            format!(
+                "6 0 obj\n<< /Length {} >>\nstream\n{cmap}\nendstream\nendobj\n",
+                cmap.len()
+            )
+            .as_bytes(),
+        );
+        b.extend_from_slice(b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
+        let p = pages(&b)?;
+        let texts: Vec<&str> = p[0]
+            .graphics
+            .iter()
+            .filter_map(|g| {
+                if let Shape::Text { text, .. } = g {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Code 0xFFFF has no mapping and is dropped; a simple font without a map reads as before.
+        assert_eq!(texts, ["No OÅ", "K1"]);
+        let m = parse_cmap(cmap.as_bytes());
+        assert_eq!(m.get(&0x32).map(String::as_str), Some("O"));
+        assert!(parse_cmap(b"beginbfrange <0000> <ffffffff> <0041> endbfrange").len() <= 65536);
+        assert!(parse_cmap(b"beginbfchar <00").is_empty());
         Ok(())
     }
 
