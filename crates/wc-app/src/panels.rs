@@ -21,6 +21,12 @@ pub struct PanelState {
     potential: String,
     text: String,
     text_height: f64,
+    part_search: String,
+    part_error: Option<String>,
+    new_key: String,
+    new_value: String,
+    /// Edit buffers for the device's own properties, by key.
+    props: Vec<(String, String)>,
     tag_error: Option<String>,
 }
 
@@ -140,9 +146,12 @@ fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
         Some(Selection::Symbol(id)) => {
             let tag = page.symbol(id).and_then(|s| s.tag.clone());
             ps.tag = tag.as_ref().map(ToString::to_string).unwrap_or_default();
-            ps.description = tag
-                .and_then(|t| open.project.devices.get(&t).map(|d| d.description.clone()))
+            let device = tag
+                .and_then(|t| open.project.devices.get(&t).cloned())
                 .unwrap_or_default();
+            ps.description = device.description;
+            ps.props = device.properties.into_iter().collect();
+            ps.part_error = None;
         }
         Some(Selection::Wire(id)) => {
             let w = page.wires.iter().find(|w| &w.id == id);
@@ -271,6 +280,9 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                     ui.label(format!("{:.1}, {:.1} mm", placed.at.x, placed.at.y));
                     ui.end_row();
                 });
+            if let Some(tag) = placed.tag.clone() {
+                device_section(ui, open, ps, &tag, &t);
+            }
             if let Some(sym) = open.symbols.get(&placed.symbol) {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Pins").strong());
@@ -389,6 +401,118 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                 });
         }
     }
+}
+
+/// Part and own properties of the selected symbol's device.
+fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: &DeviceTag, t: &Theme) {
+    ui.add_space(6.0);
+    ui.label(RichText::new("Part").strong());
+    let current = open.project.devices.get(tag).and_then(|d| d.part.clone());
+    let label = current
+        .as_ref()
+        .map(|id| {
+            open.part_library
+                .iter()
+                .find(|(p, _)| p == id)
+                .map_or(id.clone(), |(_, l)| l.clone())
+        })
+        .unwrap_or_else(|| "none".into());
+    let mut pick: Option<Option<String>> = None;
+    let short: String = if label.chars().count() > 34 {
+        format!("{}\u{2026}", label.chars().take(33).collect::<String>())
+    } else {
+        label.clone()
+    };
+    egui::ComboBox::from_id_salt("part")
+        .width(ui.available_width().min(240.0))
+        .selected_text(short)
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut ps.part_search).hint_text("Search parts"));
+            if ui
+                .selectable_label(current.is_none(), RichText::new("none").italics())
+                .clicked()
+            {
+                pick = Some(None);
+            }
+            let q = ps.part_search.to_lowercase();
+            for (id, l) in &open.part_library {
+                if !q.is_empty() && !id.to_lowercase().contains(&q) && !l.to_lowercase().contains(&q) {
+                    continue;
+                }
+                if ui
+                    .selectable_label(current.as_deref() == Some(id.as_str()), l)
+                    .on_hover_text(id)
+                    .clicked()
+                {
+                    pick = Some(Some(id.clone()));
+                }
+            }
+        });
+    if let Some(choice) = pick {
+        ps.part_error = open.set_device_part(tag, choice.as_deref()).err();
+    }
+    if let Some(e) = &ps.part_error {
+        ui.label(RichText::new(e).color(t.error).small());
+    }
+    if let Some(part) = current.as_ref().and_then(|id| open.parts.get(id)) {
+        let rows = [
+            ("Manufacturer", part.manufacturer.as_str()),
+            ("Order number", part.order_number.as_str()),
+            ("Description", part.description.as_str()),
+        ];
+        for (k, v) in rows
+            .into_iter()
+            .chain(part.properties.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        {
+            if !v.is_empty() {
+                let mut job = egui::text::LayoutJob::default();
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                job.append(&format!("{k}  "), 0.0, egui::TextFormat::simple(font.clone(), t.faint));
+                job.append(v, 0.0, egui::TextFormat::simple(font, ui.visuals().text_color()));
+                ui.add(egui::Label::new(job).wrap());
+            }
+        }
+    }
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Device properties").strong());
+    egui::Grid::new("dev-props")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for (k, v) in &mut ps.props {
+                ui.label(k.as_str());
+                let r = ui.add(egui::TextEdit::singleline(v).desired_width(140.0));
+                if committed(&r) {
+                    open.set_device_property(tag, k, v);
+                }
+                ui.end_row();
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut ps.new_key)
+                    .hint_text("new property")
+                    .desired_width(90.0),
+            );
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut ps.new_value)
+                    .hint_text("value")
+                    .desired_width(140.0),
+            );
+            if committed(&r) && !ps.new_key.trim().is_empty() && !ps.new_value.trim().is_empty() {
+                open.set_device_property(tag, &ps.new_key, &ps.new_value);
+                ps.props
+                    .push((ps.new_key.trim().to_owned(), ps.new_value.trim().to_owned()));
+                ps.new_key.clear();
+                ps.new_value.clear();
+            }
+            ui.end_row();
+        });
+    ui.label(
+        RichText::new("Shared by every symbol with this tag. Clear a value to remove it.")
+            .color(t.faint)
+            .small(),
+    );
 }
 
 fn rotation_label(r: Rotation) -> &'static str {

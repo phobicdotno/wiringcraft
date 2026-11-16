@@ -931,10 +931,14 @@ impl eframe::App for App {
                 .show(ctx, |ui| panels::navigator(ui, open, &mut self.ed, &mut page_actions));
             egui::SidePanel::right("inspector")
                 .default_width(260.0)
+                .max_width(420.0)
                 .show(ctx, |ui| {
                     panels::library(ui, open, &mut self.ed, &mut self.panels);
                     ui.separator();
-                    panels::properties(ui, open, &mut self.ed, &mut self.panels);
+                    egui::ScrollArea::vertical().id_salt("properties").show(ui, |ui| {
+                        ui.set_max_width(ui.available_width());
+                        panels::properties(ui, open, &mut self.ed, &mut self.panels);
+                    });
                 });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
