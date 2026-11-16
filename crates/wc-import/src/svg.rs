@@ -242,6 +242,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                             text: s,
                             height: h,
                             align,
+                            angle: 0.0,
                         });
                     }
                 }

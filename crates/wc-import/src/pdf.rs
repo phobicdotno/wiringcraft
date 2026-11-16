@@ -774,15 +774,28 @@ impl Interp<'_> {
                         }
                     };
                     if !text.trim().is_empty() && plausible {
-                        let full = tm.pre([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-                        let at_pt = ctm.pre(full.0).p(0.0, 0.0);
-                        let scale = (ctm.pre(full.0).0[2].powi(2) + ctm.pre(full.0).0[3].powi(2)).sqrt();
+                        let placed = ctm.pre(tm.0);
+                        let at_pt = placed.p(0.0, 0.0);
+                        let [a, b, c, d, _, _] = placed.0;
+                        let scale = (c.powi(2) + d.powi(2)).sqrt();
+                        // The text's baseline direction on paper; PDF space is y up, as the angle is.
+                        let angle = if a == 0.0 && b == 0.0 {
+                            0.0
+                        } else {
+                            b.atan2(a).to_degrees().round()
+                        };
+                        let angle = if angle == -0.0 || !angle.is_finite() {
+                            0.0
+                        } else {
+                            angle.rem_euclid(360.0)
+                        };
                         let h = (font_size * scale * MM_PER_PT * 0.72).clamp(0.5, 50.0);
                         self.out.graphics.push(Shape::Text {
                             at: self.to_mm(at_pt),
                             text: text.trim().to_owned(),
                             height: h,
                             align: Align::Left,
+                            angle,
                         });
                     }
                 }
@@ -1069,7 +1082,7 @@ mod tests {
         // Glyph codes 0x31.. map to "No" by a range, and code 3 to a space by a single entry, as
         // subset fonts do; the bytes alone are not text.
         let cmap = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n1 begincodespacerange <0000> <ffff> endcodespacerange\n1 beginbfchar\n<0003> <0020>\nendbfchar\n2 beginbfrange\n<0031> <0032> <004E>\n<0050> <0051> [<006F> <00C5>]\nendbfrange\nendcmap\n";
-        let content = "BT /F1 12 Tf 72 72 Td <003100500003003200510003FFFF> Tj ET BT /F2 10 Tf 72 300 Td (K1) Tj ET";
+        let content = "BT /F1 12 Tf 72 72 Td <003100500003003200510003FFFF> Tj ET BT /F2 10 Tf 72 300 Td (K1) Tj ET BT /F2 10 Tf 0 1 -1 0 200 100 Tm (UP) Tj ET";
         let mut b = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 1190.55 841.89] >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> >>\nendobj\n".to_vec();
         b.extend_from_slice(
             format!(
@@ -1090,19 +1103,20 @@ mod tests {
         );
         b.extend_from_slice(b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
         let p = pages(&b)?;
-        let texts: Vec<&str> = p[0]
+        let texts: Vec<(&str, f64)> = p[0]
             .graphics
             .iter()
             .filter_map(|g| {
-                if let Shape::Text { text, .. } = g {
-                    Some(text.as_str())
+                if let Shape::Text { text, angle, .. } = g {
+                    Some((text.as_str(), *angle))
                 } else {
                     None
                 }
             })
             .collect();
-        // Code 0xFFFF has no mapping and is dropped; a simple font without a map reads as before.
-        assert_eq!(texts, ["No OÅ", "K1"]);
+        // Code 0xFFFF has no mapping and is dropped; a simple font without a map reads as before, and
+        // a text matrix turned a quarter keeps that turn.
+        assert_eq!(texts, [("No OÅ", 0.0), ("K1", 0.0), ("UP", 90.0)]);
         let m = parse_cmap(cmap.as_bytes());
         assert_eq!(m.get(&0x32).map(String::as_str), Some("O"));
         assert!(parse_cmap(b"beginbfrange <0000> <ffffffff> <0041> endbfrange").len() <= 65536);

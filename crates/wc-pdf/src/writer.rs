@@ -280,18 +280,37 @@ impl Pen {
 
     /// Text with its baseline at `at`. `align`: 0 left, 1 centre, 2 right.
     pub fn text(&mut self, at: (f64, f64), height_mm: f64, align: u8, s: &str) {
+        self.text_at_angle(at, height_mm, align, 0.0, s);
+    }
+
+    /// Text turned by `angle` degrees counter-clockwise around its anchor.
+    pub fn text_at_angle(&mut self, at: (f64, f64), height_mm: f64, align: u8, angle: f64, s: &str) {
         if s.is_empty() {
             return;
         }
         let size = height_mm * PT_PER_MM / 0.72; // cap height to font size
         let w = text_width_mm(s, height_mm);
-        let x = match align {
-            1 => at.0 - w / 2.0,
-            2 => at.0 - w,
-            _ => at.0,
+        let shift = match align {
+            1 => -w / 2.0,
+            2 => -w,
+            _ => 0.0,
         };
-        let (px, py) = self.p(x, at.1);
-        let _ = writeln!(self.ops, "BT /F1 {size:.2} Tf {px:.2} {py:.2} Td {} Tj ET", pdf_text(s));
+        let angle = if angle.is_finite() { angle } else { 0.0 };
+        if angle == 0.0 {
+            let (px, py) = self.p(at.0 + shift, at.1);
+            let _ = writeln!(self.ops, "BT /F1 {size:.2} Tf {px:.2} {py:.2} Td {} Tj ET", pdf_text(s));
+            return;
+        }
+        // The page's y runs down and the PDF's up, so a counter-clockwise turn on paper is a
+        // counter-clockwise turn in PDF space too; the alignment shift runs along the text.
+        let (sin, cos) = angle.to_radians().sin_cos();
+        let (px, py) = self.p(at.0 + shift * cos, at.1 - shift * sin);
+        let _ = writeln!(
+            self.ops,
+            "BT /F1 {size:.2} Tf {cos:.5} {sin:.5} {:.5} {cos:.5} {px:.2} {py:.2} Tm {} Tj ET",
+            -sin,
+            pdf_text(s)
+        );
     }
 }
 

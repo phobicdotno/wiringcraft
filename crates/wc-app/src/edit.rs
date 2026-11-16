@@ -84,7 +84,20 @@ pub fn graphic_bounds(g: &Shape) -> (Point, Point) {
             text,
             height,
             align,
-        } => text_box(*at, *height, *align, text),
+            angle,
+        } => {
+            let (a, b) = text_box(*at, *height, *align, text);
+            if *angle == 0.0 || !angle.is_finite() {
+                return (a, b);
+            }
+            // Turn the box's corners around the anchor (counter-clockwise on paper, y down).
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let corners = [a, b, Point::new(a.x, b.y), Point::new(b.x, a.y)].map(|q| {
+                let (dx, dy) = (q.x - at.x, q.y - at.y);
+                Point::new(at.x + dx * cos + dy * sin, at.y - dx * sin + dy * cos)
+            });
+            wc_core::geom::bounds_of(&corners)
+        }
         _ => g.bounds(),
     }
 }
@@ -541,6 +554,7 @@ mod tests {
                     text: "Pump 1".into(),
                     height: 3.0,
                     align: Align::Left,
+                    angle: 0.0,
                 },
             )
             .unwrap();
