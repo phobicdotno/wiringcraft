@@ -8,6 +8,8 @@
 //!   pages/<id>.page.json    one file per page
 //!   vendor/symbols/<id>.json  copies of the library items in use
 //!   vendor/parts/<id>.json
+//!   panels/<id>.panel.json  cabinet panel layouts
+//!   comments/<page id>.comments.json  review comments on a page
 //! ```
 //!
 //! Every file is written deterministically (sorted keys, fixed indentation, trailing newline),
@@ -34,6 +36,8 @@ pub const VENDOR_DIR: &str = "vendor";
 const PAGE_SUFFIX: &str = ".page.json";
 pub const PANELS_DIR: &str = "panels";
 const PANEL_SUFFIX: &str = ".panel.json";
+pub const COMMENTS_DIR: &str = "comments";
+const COMMENTS_SUFFIX: &str = ".comments.json";
 
 /// Ids become file names, so they are restricted to a portable set.
 pub fn check_id(id: &str) -> Result<()> {
@@ -178,14 +182,37 @@ pub fn load(dir: &Path) -> Result<Project> {
         }
     }
     panels.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut comments: Vec<crate::review::Comment> = Vec::new();
+    let comments_dir = dir.join(COMMENTS_DIR);
+    if comments_dir.exists() {
+        let entries = fs::read_dir(&comments_dir).map_err(|e| Error::io(&comments_dir, e))?;
+        for entry in entries {
+            let path = entry.map_err(|e| Error::io(&comments_dir, e))?.path();
+            let Some(stem) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(COMMENTS_SUFFIX))
+            else {
+                continue;
+            };
+            let mut list: Vec<crate::review::Comment> = read_json(&path)?;
+            // The file says which page; a comment that claims another is moved back to it.
+            for c in &mut list {
+                c.page = stem.to_owned();
+            }
+            comments.extend(list);
+        }
+    }
     let mut project = Project {
         meta,
         pages,
         devices,
         lock,
         panels,
+        comments,
     };
     project.sort_pages();
+    project.sort_comments();
     Ok(project)
 }
 
@@ -232,6 +259,28 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.ends_with(PANEL_SUFFIX) && !keep.contains(&name) {
+                fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
+            }
+        }
+    }
+    let comments_dir = dir.join(COMMENTS_DIR);
+    let mut by_page: BTreeMap<&str, Vec<&crate::review::Comment>> = BTreeMap::new();
+    // Comments on a page that was deleted go with it.
+    for c in project.comments.iter().filter(|c| project.page(&c.page).is_some()) {
+        by_page.entry(c.page.as_str()).or_default().push(c);
+    }
+    let mut keep = std::collections::BTreeSet::new();
+    for (page, list) in &by_page {
+        check_id(page)?;
+        let name = format!("{page}{COMMENTS_SUFFIX}");
+        put(comments_dir.join(&name), to_json(list)?)?;
+        keep.insert(name);
+    }
+    if comments_dir.exists() {
+        let entries = fs::read_dir(&comments_dir).map_err(|e| Error::io(&comments_dir, e))?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(COMMENTS_SUFFIX) && !keep.contains(&name) {
                 fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
             }
         }
@@ -334,6 +383,16 @@ mod tests {
             height: 85.0,
         });
         p.panels.push(panel);
+        p.add_comment(
+            "p0002",
+            Some(Point::new(40.0, 60.0)),
+            "Kari",
+            1_700_000_000,
+            "Is K1 rated for 24 V?",
+        )?;
+        p.reply_to_comment("c1", "Ola", 1_700_000_100, "Yes, coil is 24 V DC")?;
+        p.add_comment("p0002", None, "Ola", 1_700_000_200, "Page title should say control")?;
+        p.resolve_comment("c2", true)?;
         Ok(p)
     }
 
@@ -355,10 +414,12 @@ mod tests {
         let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
         let mut p = sample()?;
         save(dir.path(), &p)?;
+        assert!(dir.path().join("comments/p0002.comments.json").exists());
         p.pages.clear();
         save(dir.path(), &p)?;
         assert!(!dir.path().join("pages/p0002.page.json").exists());
         assert!(dir.path().join("panels/main.panel.json").exists());
+        assert!(!dir.path().join("comments/p0002.comments.json").exists());
         p.panels.clear();
         save(dir.path(), &p)?;
         assert!(!dir.path().join("panels/main.panel.json").exists());

@@ -56,6 +56,29 @@ fn branch_edit_merge_and_map() -> Result<()> {
     // Semantic change list between two commits.
     let ch = changes(&git, "HEAD~1", Some("HEAD"))?;
     assert!(ch.iter().any(|c| c.to_string().contains("page 2 added")), "{ch:?}");
+
+    // One page's own history: only the commits that touched it, newest first.
+    let mut p = store::load(dir)?;
+    if let Some(page) = p.page_mut("p0002") {
+        place(page, "s2", "-K2", 80.0)?;
+    }
+    store::save(dir, &p)?;
+    git.commit("Add K2")?;
+    let h = page_history(&git, "p0002", 10)?;
+    let subjects: Vec<&str> = h.iter().map(|v| v.subject.as_str()).collect();
+    assert_eq!(subjects, ["Add K2", "Add motor page"]);
+    assert!(
+        h[0].changes.iter().any(|c| c.to_string().contains("-K2")),
+        "{:?}",
+        h[0].changes
+    );
+    assert!(
+        matches!(h[1].changes.first(), Some(Change::PageAdded { .. })),
+        "{:?}",
+        h[1].changes
+    );
+    assert_eq!(page_history(&git, "p0001", 10)?.len(), 2);
+    assert!(page_history(&git, "../x", 10).is_err());
     Ok(())
 }
 
