@@ -232,6 +232,21 @@ enum ImportCmd {
     /// PLC addresses from a CSV list (device and address columns, description optional), as a
     /// PLC tool or spreadsheet writes it. `report plc --format csv` writes one that reads back.
     PlcCsv { file: PathBuf },
+    /// Every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later). Ids are
+    /// `<prefix>.<symbol name>`; the first pin becomes the origin.
+    SymbolKicad {
+        file: PathBuf,
+        #[arg(long)]
+        lib: PathBuf,
+        /// Id prefix (default: `kicad.<file name>`).
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Multiply coordinates, e.g. 2 to put KiCad's 2.54 mm pin grid near a 5 mm grid.
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+        #[arg(long, default_value = "")]
+        category: String,
+    },
     /// Parts from a CSV or semicolon-separated export (Excel "Save as CSV").
     PartsCsv {
         file: PathBuf,
@@ -883,6 +898,46 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 s.pins.len(),
                 s.graphics.len()
             );
+        }
+        ImportCmd::SymbolKicad {
+            file,
+            lib,
+            prefix,
+            scale,
+            category,
+        } => {
+            let text = std::fs::read_to_string(&file).map_err(e)?;
+            let prefix = prefix.unwrap_or_else(|| {
+                let stem: String = file
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                format!("kicad.{stem}")
+            });
+            let (symbols, warnings) = wc_import::kicad::symbols(&text, &prefix, scale).map_err(e)?;
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+            for mut imp in symbols {
+                imp.symbol.category = category.clone();
+                let path = wc_library::write_symbol(&lib, &imp.symbol).map_err(e)?;
+                println!(
+                    "{} -> {} ({} pins, {} shapes)",
+                    imp.kicad_name,
+                    path.display(),
+                    imp.symbol.pins.len(),
+                    imp.symbol.graphics.len()
+                );
+            }
         }
         ImportCmd::PlcCsv { file } => {
             let mut p = load(dir)?;

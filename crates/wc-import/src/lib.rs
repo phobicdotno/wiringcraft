@@ -7,6 +7,7 @@ pub mod archive;
 pub mod csv;
 pub mod dxf;
 pub mod eplan;
+pub mod kicad;
 pub mod pdf;
 pub mod raster;
 pub mod svg;
