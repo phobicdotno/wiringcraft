@@ -141,12 +141,15 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
             for (i, p) in open.project.pages.iter().enumerate() {
                 let r = row(
                     ui,
-                    ed.page == i,
+                    ed.page == i && ed.panel.is_none(),
                     Lead::Number(&p.number),
                     RichText::new(&p.title),
                     false,
                 );
                 let pick = |ed: &mut Editor| {
+                    if ed.panel.take().is_some() {
+                        ed.view.fit = true;
+                    }
                     if ed.page != i {
                         ed.page = i;
                         ed.selection.clear();
@@ -183,6 +186,43 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
                 });
             }
         });
+    if !open.project.panels.is_empty() {
+        ui.add_space(6.0);
+        ui.separator();
+        section(ui, "Panels", Some(open.project.panels.len()));
+        ui.spacing_mut().item_spacing.y = 1.0;
+        let t = Theme::of(ui.ctx());
+        for (i, p) in open.project.panels.iter().enumerate() {
+            let r = row(
+                ui,
+                ed.panel == Some(i),
+                Lead::Dot(t.accent),
+                RichText::new(&p.name),
+                false,
+            )
+            .on_hover_text(format!(
+                "{} x {} mm, {} device(s)",
+                p.width,
+                p.height,
+                p.device_tags().len()
+            ));
+            if r.clicked() && ed.panel != Some(i) {
+                ed.panel = Some(i);
+                ed.panel_pick = None;
+                ed.selection.clear();
+                ed.view.fit = true;
+            }
+            r.context_menu(|ui| {
+                for a in [Action::ArrangePanel, Action::DeletePanel] {
+                    if ui.button(a.info().label).clicked() {
+                        ed.panel = Some(i);
+                        out.push(a);
+                        ui.close_menu();
+                    }
+                }
+            });
+        }
+    }
     ui.add_space(6.0);
     ui.separator();
     let index = open.project.tag_index();
