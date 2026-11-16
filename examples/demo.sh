@@ -26,6 +26,9 @@ $WC wire p0002 s2:2 s3:U --number 2
 $WC wire p0002 s2:4 s3:V --number 3
 $WC wire p0002 s2:6 s3:W --number 4
 $WC wire p0002 s3:PE s4:PE --via 150,150 --via 190,150
+# The 24 V control supply continues on page 3 through an interruption point.
+$WC place p0002 wc.interruption --at 230,60 --tag=-24V
+$WC wire p0002 230,40 s5:1 --potential 24V
 
 # Page 3: start/stop with self-hold, coil, lamp.
 $WC place p0003 wc.button.nc --at 60,60 --tag "=PUMP+CAB1-S1"
@@ -34,7 +37,6 @@ $WC place p0003 wc.contact.no --at 110,100 --tag "=PUMP+CAB1-K1"
 $WC place p0003 wc.coil --at 60,150 --tag "=PUMP+CAB1-K1"
 $WC place p0003 wc.contact.no --at 160,100 --tag "=PUMP+CAB1-K1"
 $WC place p0003 wc.lamp --at 160,150 --tag "=PUMP+CAB1-P1"
-$WC wire p0003 60,40 s1:11 --potential 24V
 $WC wire p0003 s1:12 s2:13 --number 10
 $WC wire p0003 s1:12 s3:13 --via 60,85 --via 110,85
 $WC wire p0003 s2:14 s4:A1 --number 11
@@ -48,6 +50,9 @@ $WC wire p0003 s5:14 s7:1 --number 12
 $WC wire p0003 s7:2 s6:X1 --number 13
 $WC wire p0003 s6:X2 s8:1 --via 160,170 --via 175,170
 $WC wire p0003 s8:2 175,195 --potential 0V
+# The 24 V supply arrives from page 2.
+$WC place p0003 wc.interruption --at 60,40 --rotate 180 --tag=-24V
+$WC wire p0003 s9:1 s1:11
 
 # Parts from the example parts list in the starter library.
 $WC device "=PUMP+CAB1-Q1" --part example.ex-mcb-1p-c10 --description "Pump supply"

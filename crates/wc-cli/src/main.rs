@@ -517,7 +517,13 @@ fn run(cli: Cli) -> Res<()> {
         }
         Cmd::Nets => {
             let p = load(dir)?;
-            for (i, n) in wc_core::connectivity::nets(&p).iter().enumerate() {
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let linked = wc_core::connectivity::nets_linked(&p, |id| {
+                symbols
+                    .get(id)
+                    .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
+            });
+            for (i, n) in linked.iter().enumerate() {
                 let pins: Vec<String> = n
                     .pins
                     .iter()

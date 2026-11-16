@@ -43,10 +43,18 @@ enum Node {
     /// A free point, in hundredths of a millimetre.
     Point(String, i64, i64),
     Potential(String),
+    /// Interruption points sharing a device tag.
+    Link(String),
 }
 
 /// Group every connected pin into nets. Pins with no wire are left out.
 pub fn nets(project: &Project) -> Vec<Net> {
+    nets_linked(project, |_| false)
+}
+
+/// Like [`nets`], and also joins interruption points: every placed symbol for which
+/// `is_interruption(symbol id)` holds is connected to the others with the same device tag.
+pub fn nets_linked(project: &Project, is_interruption: impl Fn(&str) -> bool) -> Vec<Net> {
     let mut ids: BTreeMap<Node, usize> = BTreeMap::new();
     let mut dsu = Dsu { parent: Vec::new() };
     let mut id_of = |n: Node, dsu: &mut Dsu| -> usize {
@@ -74,6 +82,30 @@ pub fn nets(project: &Project) -> Vec<Net> {
                 dsu.union(a, p);
             }
         }
+        for s in &page.symbols {
+            let Some(tag) = &s.tag else { continue };
+            if !is_interruption(&s.symbol) {
+                continue;
+            }
+            // Only interruption points that are wired take part; their pins join under the tag.
+            let link = Node::Link(tag.to_string());
+            let wired: Vec<usize> = page
+                .wires
+                .iter()
+                .flat_map(|w| [&w.from, &w.to])
+                .filter_map(|e| match e {
+                    Endpoint::Pin { item, pin } if item == &s.id => {
+                        Some(Node::Pin((page.id.clone(), item.clone(), pin.clone())))
+                    }
+                    _ => None,
+                })
+                .map(|n| id_of(n, &mut dsu))
+                .collect();
+            for n in wired {
+                let l = id_of(link.clone(), &mut dsu);
+                dsu.union(n, l);
+            }
+        }
     }
     let mut groups: BTreeMap<usize, Net> = BTreeMap::new();
     for (node, id) in &ids {
@@ -82,7 +114,7 @@ pub fn nets(project: &Project) -> Vec<Net> {
         match node {
             Node::Pin(p) => net.pins.push(p.clone()),
             Node::Potential(n) => net.names.push(n.clone()),
-            Node::Point(..) => {}
+            Node::Point(..) | Node::Link(_) => {}
         }
     }
     groups.into_values().filter(|n| !n.pins.is_empty()).collect()
@@ -135,5 +167,30 @@ mod tests {
         assert_eq!(nets.len(), 2);
         let big = nets.iter().find(|n| n.names == ["L1"]);
         assert_eq!(big.map(|n| n.pins.len()), Some(3));
+    }
+
+    #[test]
+    fn interruption_points_with_the_same_tag_join() {
+        use crate::project::PlacedSymbol;
+        let arrow = |id: &str, tag: &str| PlacedSymbol {
+            id: id.into(),
+            symbol: "arrow".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: crate::DeviceTag::parse(tag).ok(),
+        };
+        let mut p = Project::new("t");
+        let mut a = Page::new("a", "1", "");
+        a.symbols.push(arrow("s9", "-L1"));
+        a.wires.push(wire("w1", pin("s1", "1"), pin("s9", "1"), None));
+        let mut b = Page::new("b", "2", "");
+        b.symbols.push(arrow("s9", "-L1"));
+        b.wires.push(wire("w1", pin("s9", "1"), pin("s2", "1"), None));
+        p.pages = vec![a, b];
+        assert_eq!(nets(&p).len(), 2);
+        let linked = nets_linked(&p, |s| s == "arrow");
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].pins.len(), 4);
     }
 }

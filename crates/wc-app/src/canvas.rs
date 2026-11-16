@@ -474,6 +474,51 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         }
     }
 
+    // Junction dots where three or more wire branches meet.
+    let polylines: Vec<Vec<(f64, f64)>> = page
+        .wires
+        .iter()
+        .filter_map(|w| open.wire_points(&page, w))
+        .map(|pts| pts.iter().map(|q| (q.x, q.y)).collect())
+        .collect();
+    for (x, y) in wc_pdf::junctions(&polylines) {
+        painter.circle_filled(xf.s(Point::new(x, y)), xf.len(0.6).max(2.0), t.wire);
+    }
+
+    // Cross-references (coil to contacts, contact to coil, interruption points). Clicking one
+    // opens the page it points at.
+    let xref = wc_pdf::CrossRefs::build(&open.project, &open.symbols);
+    let mut xref_warnings = Vec::new();
+    let marks = wc_pdf::xref_marks(&page, &open.symbols, &xref, &mut xref_warnings);
+    let mut jump = None;
+    for m in &marks {
+        let (a, b) = crate::edit::text_box(m.at, wc_pdf::XREF_HEIGHT, m.align, &m.text);
+        let r = Rect::from_two_pos(xf.s(a), xf.s(b));
+        let hovered = resp.hover_pos().is_some_and(|h| r.contains(h));
+        let c = if hovered { t.selection } else { t.wire_label };
+        let al = match m.align {
+            Align::Left => Align2::LEFT_BOTTOM,
+            Align::Center => Align2::CENTER_BOTTOM,
+            Align::Right => Align2::RIGHT_BOTTOM,
+        };
+        text_mm(&painter, &xf, m.at, wc_pdf::XREF_HEIGHT, al, &m.text, c);
+        if hovered {
+            painter.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0_f32, c));
+            if ed.tool == Tool::Select && resp.clicked_by(egui::PointerButton::Primary) {
+                jump = Some(m.target_page_id.clone());
+            }
+        }
+    }
+    if let Some(target) = jump
+        && let Some(i) = open.project.pages.iter().position(|p| p.id == target)
+    {
+        ed.page = i;
+        ed.selection.clear();
+        ed.view.fit = true;
+        ed.message = format!("Page {}", open.project.pages[i].number);
+        return;
+    }
+
     // Pointer position in page mm, snapped.
     let hover = resp.hover_pos().map(|hp| xf.mm(hp));
     ed.cursor = hover.map(|p| snap(p, snap_step));
