@@ -13,6 +13,7 @@ use wc_core::{DeviceTag, Endpoint, Part, Project, Symbol};
 
 pub mod aml;
 pub mod check;
+pub mod step;
 #[cfg(test)]
 mod tests;
 
