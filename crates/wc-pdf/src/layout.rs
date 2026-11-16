@@ -111,62 +111,197 @@ fn draw_shape(pen: &mut Pen, s: &Shape) {
     }
 }
 
-fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
+/// How a frame mark is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ink {
+    /// Heavy outline.
+    Thick,
+    /// Normal lines and values.
+    Thin,
+    /// Small grey field labels.
+    Label,
+}
+
+/// One line or text of the page frame and title block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameMark {
+    pub shape: Shape,
+    pub ink: Ink,
+}
+
+/// The page frame: border, numbered column strip and title block, filled from the project's
+/// title-block fields. The editor and the PDF both draw this list, so they always match.
+/// `date` is shown when the project has no `date` field of its own.
+pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, date: &str) -> Vec<FrameMark> {
     let (w, h) = page.size.mm();
     let (x0, y0, x1, y1) = (MARGIN, MARGIN, w - MARGIN, h - MARGIN);
-    pen.width(0.5);
-    pen.rect((x0, y0), (x1, y1));
-    pen.width(0.25);
+    let mut out = Vec::new();
+    let line = |a: (f64, f64), b: (f64, f64), ink: Ink, out: &mut Vec<FrameMark>| {
+        out.push(FrameMark {
+            shape: Shape::Line {
+                a: Point::new(a.0, a.1),
+                b: Point::new(b.0, b.1),
+            },
+            ink,
+        });
+    };
+    let text = |at: (f64, f64), height: f64, align: Align, t: &str, ink: Ink, out: &mut Vec<FrameMark>| {
+        if !t.is_empty() {
+            out.push(FrameMark {
+                shape: Shape::Text {
+                    at: Point::new(at.0, at.1),
+                    text: t.to_owned(),
+                    height,
+                    align,
+                },
+                ink,
+            });
+        }
+    };
+    out.push(FrameMark {
+        shape: Shape::Rect {
+            min: Point::new(x0, y0),
+            max: Point::new(x1, y1),
+        },
+        ink: Ink::Thick,
+    });
     // Column strip along the top.
-    pen.line((x0, y0 + HEADER), (x1, y0 + HEADER));
+    line((x0, y0 + HEADER), (x1, y0 + HEADER), Ink::Thin, &mut out);
     let col_w = (x1 - x0) / FRAME_COLUMNS as f64;
     for c in 0..FRAME_COLUMNS {
         let cx = x0 + col_w * c as f64;
         if c > 0 {
-            pen.line((cx, y0), (cx, y0 + HEADER));
+            line((cx, y0), (cx, y0 + HEADER), Ink::Thin, &mut out);
         }
-        pen.text((cx + col_w / 2.0, y0 + HEADER - 1.8), 2.5, 1, &(c + 1).to_string());
+        text(
+            (cx + col_w / 2.0, y0 + HEADER - 1.8),
+            2.5,
+            Align::Center,
+            &(c + 1).to_string(),
+            Ink::Thin,
+            &mut out,
+        );
     }
     // Title block: a full-width band at the bottom, divided into fields.
     let ty = y1 - TITLE_H;
-    pen.width(0.5);
-    pen.line((x0, ty), (x1, ty));
-    pen.width(0.25);
-    let field_x = [x0, x0 + 80.0, x1 - 150.0, x1 - 60.0, x1 - 30.0];
-    for fx in field_x.iter().skip(1) {
-        pen.line((*fx, ty), (*fx, y1));
+    let mid = ty + TITLE_H / 2.0;
+    line((x0, ty), (x1, ty), Ink::Thick, &mut out);
+    let fx = [x0, x0 + 80.0, x1 - 150.0, x1 - 60.0, x1 - 30.0];
+    for x in fx.iter().skip(1) {
+        line((*x, ty), (*x, y1), Ink::Thin, &mut out);
     }
-    pen.line((field_x[2], ty + TITLE_H / 2.0), (x1, ty + TITLE_H / 2.0));
+    line((fx[0], mid), (fx[1], mid), Ink::Thin, &mut out);
+    line((fx[0] + 40.0, mid), (fx[0] + 40.0, y1), Ink::Thin, &mut out);
+    line((fx[2], mid), (x1, mid), Ink::Thin, &mut out);
     let tb = &project.meta.title_block;
     let get = |k: &str| tb.get(k).map(String::as_str).unwrap_or("");
-    let label = |pen: &mut Pen, x: f64, y: f64, l: &str| {
-        pen.colour(0.45, 0.45, 0.45);
-        pen.text((x + 1.5, y + 3.0), 1.8, 0, l);
-        pen.colour(0.0, 0.0, 0.0);
+    let field = |x: f64, y: f64, label: &str, value: &str, height: f64, out: &mut Vec<FrameMark>| {
+        text((x + 1.5, y + 3.0), 1.8, Align::Left, label, Ink::Label, out);
+        text((x + 1.5, y + 9.5), height, Align::Left, value, Ink::Thin, out);
     };
-    label(pen, field_x[0], ty, "Customer");
-    pen.text((field_x[0] + 1.5, ty + 10.0), 3.0, 0, get("customer"));
-    label(pen, field_x[0], ty + 12.0, "Drawn by");
-    pen.text((field_x[0] + 1.5, ty + 21.0), 2.5, 0, get("drawn_by"));
-    label(pen, field_x[1], ty, "Project");
-    pen.text((field_x[1] + 3.0, ty + 11.0), 4.0, 0, &project.meta.name);
-    pen.text((field_x[1] + 3.0, ty + 19.5), 3.0, 0, &page.title);
-    label(pen, field_x[2], ty, "Revision");
-    pen.text((field_x[2] + 1.5, ty + 9.5), 2.5, 0, get("revision"));
-    label(pen, field_x[2], ty + 12.0, "Date");
-    pen.text((field_x[2] + 1.5, ty + 21.5), 2.5, 0, date);
-    label(pen, field_x[3], ty, "Page");
-    pen.text((field_x[3] + 15.0, ty + 10.0), 4.0, 1, &page.number);
-    label(pen, field_x[3], ty + 12.0, "Location");
-    pen.text((field_x[3] + 15.0, ty + 21.5), 2.5, 1, get("location"));
-    label(pen, field_x[4], ty, "Sheet");
-    pen.text(
-        (field_x[4] + 15.0, ty + 10.0),
-        3.0,
-        1,
-        &format!("{} / {}", index + 1, total),
+    field(fx[0], ty, "Customer", get("customer"), 3.0, &mut out);
+    field(fx[0], mid, "Drawn by", get("drawn_by"), 2.5, &mut out);
+    field(fx[0] + 40.0, mid, "Checked by", get("checked_by"), 2.5, &mut out);
+    text(
+        (fx[1] + 1.5, ty + 3.0),
+        1.8,
+        Align::Left,
+        "Project",
+        Ink::Label,
+        &mut out,
     );
-    pen.text((field_x[4] + 15.0, ty + 21.5), 2.0, 1, "WiringCraft");
+    text(
+        (fx[1] + 3.0, ty + 11.0),
+        4.0,
+        Align::Left,
+        &project.meta.name,
+        Ink::Thin,
+        &mut out,
+    );
+    text(
+        (fx[1] + 3.0, ty + 19.5),
+        3.0,
+        Align::Left,
+        &page.title,
+        Ink::Thin,
+        &mut out,
+    );
+    let numbers: Vec<&str> = [get("project_number"), get("plant")]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    text(
+        (fx[2] - 2.0, ty + 22.0),
+        2.2,
+        Align::Right,
+        &numbers.join("  \u{b7}  "),
+        Ink::Thin,
+        &mut out,
+    );
+    field(fx[2], ty, "Revision", get("revision"), 2.5, &mut out);
+    let d = if get("date").is_empty() { date } else { get("date") };
+    field(fx[2], mid, "Date", d, 2.5, &mut out);
+    text((fx[3] + 1.5, ty + 3.0), 1.8, Align::Left, "Page", Ink::Label, &mut out);
+    text(
+        (fx[3] + 15.0, ty + 10.5),
+        4.0,
+        Align::Center,
+        &page.number,
+        Ink::Thin,
+        &mut out,
+    );
+    text(
+        (fx[3] + 1.5, mid + 3.0),
+        1.8,
+        Align::Left,
+        "Location",
+        Ink::Label,
+        &mut out,
+    );
+    text(
+        (fx[3] + 15.0, mid + 9.5),
+        2.5,
+        Align::Center,
+        get("location"),
+        Ink::Thin,
+        &mut out,
+    );
+    text((fx[4] + 1.5, ty + 3.0), 1.8, Align::Left, "Sheet", Ink::Label, &mut out);
+    text(
+        (fx[4] + 15.0, ty + 10.0),
+        3.0,
+        Align::Center,
+        &format!("{} / {}", index + 1, total),
+        Ink::Thin,
+        &mut out,
+    );
+    text(
+        (fx[4] + 15.0, mid + 9.5),
+        2.0,
+        Align::Center,
+        "WiringCraft",
+        Ink::Thin,
+        &mut out,
+    );
+    out
+}
+
+fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
+    for m in frame_marks(project, page, index, total, date) {
+        match m.ink {
+            Ink::Thick => {
+                pen.colour(0.0, 0.0, 0.0);
+                pen.width(0.5);
+            }
+            Ink::Thin => {
+                pen.colour(0.0, 0.0, 0.0);
+                pen.width(0.25);
+            }
+            Ink::Label => pen.colour(0.45, 0.45, 0.45),
+        }
+        draw_shape(pen, &m.shape);
+    }
+    pen.colour(0.0, 0.0, 0.0);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -187,9 +322,9 @@ pub fn draw_page(
     pen.colour(0.0, 0.0, 0.0);
     frame(&mut pen, project, page, index, total, &options.date);
 
-    // Free graphics (imported drawings) in grey so the schematic stands out.
-    pen.colour(0.35, 0.35, 0.35);
-    pen.width(0.18);
+    // Free graphics: texts, lines and rectangles drawn on the sheet, and imported drawings.
+    pen.colour(0.0, 0.0, 0.0);
+    pen.width(0.25);
     for g in &page.graphics {
         draw_shape(&mut pen, g);
     }

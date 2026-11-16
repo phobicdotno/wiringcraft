@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, RichText};
 use wc_core::DeviceTag;
-use wc_core::geom::Rotation;
+use wc_core::geom::{Rotation, Shape};
 
 use crate::actions::Action;
 use crate::canvas::Editor;
@@ -19,6 +19,8 @@ pub struct PanelState {
     description: String,
     number: String,
     potential: String,
+    text: String,
+    text_height: f64,
     tag_error: Option<String>,
 }
 
@@ -147,6 +149,12 @@ fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
             ps.number = w.and_then(|w| w.number.clone()).unwrap_or_default();
             ps.potential = w.and_then(|w| w.potential.clone()).unwrap_or_default();
         }
+        Some(Selection::Graphic(i)) => {
+            if let Some(Shape::Text { text, height, .. }) = page.graphics.get(*i) {
+                ps.text = text.clone();
+                ps.text_height = *height;
+            }
+        }
         None => {}
     }
 }
@@ -172,7 +180,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                 ui.label(format!("Page {} · {}", p.number, p.title));
                 ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.faint));
             }
-            ui.label(RichText::new("Select a symbol or wire to edit it.").color(t.faint));
+            ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.faint));
         }
         Some(Selection::Symbol(id)) => {
             let Some(placed) = open.project.pages.get(page_idx).and_then(|p| p.symbol(&id)).cloned() else {
@@ -270,6 +278,66 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                 ui.label(names.join("  "));
             }
         }
+        Some(Selection::Graphic(i)) => {
+            let Some(g) = open
+                .project
+                .pages
+                .get(page_idx)
+                .and_then(|p| p.graphics.get(i))
+                .cloned()
+            else {
+                ed.selection.clear();
+                return;
+            };
+            let kind = match &g {
+                Shape::Line { .. } => "Line",
+                Shape::Polyline { .. } => "Polyline",
+                Shape::Rect { .. } => "Rectangle",
+                Shape::Circle { .. } => "Circle",
+                Shape::Arc { .. } => "Arc",
+                Shape::Text { .. } => "Text",
+            };
+            egui::Grid::new("gfx-props")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Drawing");
+                    ui.label(kind);
+                    ui.end_row();
+                    if let Shape::Text { at, .. } = &g {
+                        ui.label("Text");
+                        let r = ui.text_edit_singleline(&mut ps.text);
+                        ui.end_row();
+                        ui.label("Height");
+                        let h = ui.add(
+                            egui::DragValue::new(&mut ps.text_height)
+                                .range(0.5..=50.0)
+                                .speed(0.1)
+                                .suffix(" mm"),
+                        );
+                        ui.end_row();
+                        if committed(&r) || h.drag_stopped() || h.lost_focus() {
+                            if ps.text.trim().is_empty() {
+                                // An empty text would vanish; put the old one back.
+                                ps.loaded_for = None;
+                            } else {
+                                open.set_text(page_idx, i, ps.text.trim(), ps.text_height);
+                            }
+                        }
+                        ui.label("Position");
+                        ui.label(format!("{:.1}, {:.1} mm", at.x, at.y));
+                        ui.end_row();
+                    } else {
+                        let (a, b) = g.bounds();
+                        ui.label("From");
+                        ui.label(format!("{:.1}, {:.1} mm", a.x, a.y));
+                        ui.end_row();
+                        ui.label("To");
+                        ui.label(format!("{:.1}, {:.1} mm", b.x, b.y));
+                        ui.end_row();
+                    }
+                });
+        }
         Some(Selection::Wire(id)) => {
             let Some(wire) = open
                 .project
@@ -339,6 +407,9 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
             Tool::Select => "Select",
             Tool::Place => "Place symbol",
             Tool::Wire => "Draw wire",
+            Tool::Text => "Text",
+            Tool::Line => "Line",
+            Tool::Rect => "Rectangle",
         };
         ui.label(RichText::new(tool).strong());
         ui.separator();

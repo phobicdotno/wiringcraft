@@ -14,12 +14,17 @@ pub enum Tool {
     Select,
     Place,
     Wire,
+    Text,
+    Line,
+    Rect,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Selection {
     Symbol(String),
     Wire(String),
+    /// A free drawing on the page (line, rectangle, circle, text), by its index in `graphics`.
+    Graphic(usize),
 }
 
 pub struct Open {

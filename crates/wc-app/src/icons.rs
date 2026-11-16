@@ -16,6 +16,9 @@ pub enum Icon {
     Delete,
     Rotate,
     Mirror,
+    Text,
+    Line,
+    Rect,
     Copy,
     Cut,
     Paste,
@@ -143,6 +146,24 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
             line((12.0, 10.0), (12.0, 18.0));
             line((8.0, 14.0), (16.0, 14.0));
+        }
+        Icon::Text => {
+            line((5.0, 5.0), (19.0, 5.0));
+            line((12.0, 5.0), (12.0, 20.0));
+            line((9.0, 20.0), (15.0, 20.0));
+        }
+        Icon::Line => {
+            line((4.0, 20.0), (20.0, 4.0));
+            p.circle_filled(at(4.0, 20.0), 1.8 * s, c);
+            p.circle_filled(at(20.0, 4.0), 1.8 * s, c);
+        }
+        Icon::Rect => {
+            p.rect_stroke(
+                Rect::from_min_max(at(3.0, 6.0), at(21.0, 18.0)),
+                0.0,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
         }
         Icon::Mirror => {
             p.line_segment([at(12.0, 2.0), at(12.0, 22.0)], thin);

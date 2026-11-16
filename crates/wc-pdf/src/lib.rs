@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use wc_core::{Project, Symbol};
 
-pub use layout::{FRAME_COLUMNS, column_of, pin_position};
+pub use layout::{FRAME_COLUMNS, FrameMark, Ink, column_of, frame_marks, pin_position};
 
 #[derive(Debug, Clone)]
 pub struct Options {
