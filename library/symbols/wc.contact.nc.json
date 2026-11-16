@@ -1,0 +1,94 @@
+{
+  "category": "contacts",
+  "description": "Auxiliary break contact, driven by the coil with the same tag.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "b": {
+        "x": 2.5,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 3.0,
+        "y": 4.2
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "11"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "12"
+    }
+  ],
+  "id": "wc.contact.nc",
+  "letter_code": "K",
+  "name": "Normally closed contact",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "11"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "12"
+    }
+  ],
+  "role": "auxiliary",
+  "tag_at": {
+    "x": -6.0,
+    "y": 8.0
+  }
+}

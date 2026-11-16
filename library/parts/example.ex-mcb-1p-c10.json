@@ -1,0 +1,10 @@
+{
+  "description": "Circuit breaker 1-pole C10 (example data)",
+  "id": "example.ex-mcb-1p-c10",
+  "manufacturer": "Example",
+  "order_number": "EX-MCB-1P-C10",
+  "properties": {
+    "Rated current": "10 A"
+  },
+  "symbol": "wc.breaker.1p"
+}

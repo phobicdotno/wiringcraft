@@ -1,0 +1,80 @@
+use super::*;
+use wc_core::geom::Point;
+use wc_core::{DeviceTag, Page, PlacedSymbol, store};
+
+fn place(page: &mut Page, id: &str, tag: &str, x: f64) -> std::result::Result<(), wc_core::Error> {
+    page.symbols.push(PlacedSymbol {
+        id: id.into(),
+        symbol: "coil".into(),
+        at: Point::new(x, 50.0),
+        rotation: Default::default(),
+        mirror: false,
+        tag: Some(DeviceTag::parse(tag)?),
+    });
+    Ok(())
+}
+
+#[test]
+fn branch_edit_merge_and_map() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let mut p = store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    assert_eq!(git.current_branch().as_deref(), Some("main"));
+    assert!(git.commit("nothing")?.is_none(), "no empty commits");
+
+    git.create_branch("motor-circuit")?;
+    let mut page = Page::new("p0002", "2", "Motor");
+    place(&mut page, "s1", "-K1", 40.0)?;
+    p.pages.push(page);
+    store::save(dir, &p)?;
+    let ch = changes(&git, "HEAD", None)?;
+    assert!(ch.iter().any(|c| matches!(c, Change::PageAdded { .. })), "{ch:?}");
+    git.commit("Add motor page")?;
+
+    git.switch("main")?;
+    let mut p_main = store::load(dir)?;
+    if let Some(cover) = p_main.page_mut("p0001") {
+        cover.title = "Cover sheet".into();
+    }
+    store::save(dir, &p_main)?;
+    git.commit("Rename cover")?;
+
+    // Different pages: merges cleanly.
+    assert_eq!(git.merge("motor-circuit")?, MergeOutcome::Merged);
+    let merged = store::load(dir)?;
+    assert_eq!(merged.pages.len(), 2);
+    assert_eq!(merged.page("p0001").map(|p| p.title.as_str()), Some("Cover sheet"));
+
+    let rows = history(&git, 50)?;
+    assert_eq!(rows.len(), 4);
+    assert!(rows[0].commit.head && rows[0].commit.parents.len() == 2);
+    assert!(rows.iter().any(|r| r.lane == 1), "the branch gets its own line");
+    assert!(subway_svg(&rows).contains("motor-circuit"));
+
+    // Semantic change list between two commits.
+    let ch = changes(&git, "HEAD~1", Some("HEAD"))?;
+    assert!(ch.iter().any(|c| c.to_string().contains("page 2 added")), "{ch:?}");
+    Ok(())
+}
+
+#[test]
+fn symbol_level_changes() -> std::result::Result<(), wc_core::Error> {
+    let mut a = Page::new("p", "3", "X");
+    place(&mut a, "s1", "-K1", 10.0)?;
+    place(&mut a, "s2", "-K2", 20.0)?;
+    let mut b = a.clone();
+    b.symbols[0].at.x = 15.0;
+    b.symbols[1].tag = Some(DeviceTag::parse("-K5")?);
+    b.symbols.push(b.symbols[0].clone());
+    b.symbols[2].id = "s3".into();
+    let ch: Vec<String> = changes::page_changes(Some(&a), Some(&b))
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(ch.contains(&"page 3: coil -K1 moved".to_string()), "{ch:?}");
+    assert!(ch.contains(&"page 3: s2 tag -K2 -> -K5".to_string()), "{ch:?}");
+    assert!(ch.iter().any(|c| c.ends_with("added")), "{ch:?}");
+    Ok(())
+}

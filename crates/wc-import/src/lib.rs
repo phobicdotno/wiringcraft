@@ -1,14 +1,87 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! Importers: symbols from DXF and SVG, parts from CSV, schematic drawings from DXF.
+//!
+//! Input is treated as hostile: malformed files produce errors or are skipped, never panics.
+
+pub mod aml;
+pub mod archive;
+pub mod csv;
+pub mod dxf;
+pub mod eplan;
+pub mod pdf;
+pub mod svg;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{0}")]
+    Format(String),
+    #[error(transparent)]
+    Core(#[from] wc_core::Error),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub type Result<T> = std::result::Result<T, Error>;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+use wc_core::geom::{Point, Shape, bounds_of};
+use wc_core::symbol::{Pin, PinDir};
+
+/// Turn raw shapes and pin positions into a symbol: origin at the first pin (or the top-left
+/// corner), pins named in order when no name was found, wire direction guessed from which edge
+/// of the drawing a pin is nearest.
+pub(crate) fn make_symbol(
+    id: &str,
+    name: &str,
+    shapes: Vec<Shape>,
+    pins: Vec<(Option<String>, Point)>,
+) -> Result<wc_core::Symbol> {
+    wc_core::store::check_id(id)?;
+    if shapes.is_empty() && pins.is_empty() {
+        return Err(Error::Format("the drawing is empty".into()));
     }
+    let mut pts: Vec<Point> = shapes
+        .iter()
+        .flat_map(|s| {
+            let (a, b) = s.bounds();
+            [a, b]
+        })
+        .collect();
+    pts.extend(pins.iter().map(|p| p.1));
+    let (min, max) = bounds_of(&pts);
+    let origin = pins.first().map(|p| p.1).unwrap_or(min);
+    let shift = Point::new(-origin.x, -origin.y);
+    let snap = |v: f64| (v * 1000.0).round() / 1000.0;
+    let fix = |p: Point| Point::new(snap(p.x + shift.x), snap(p.y + shift.y));
+    let graphics = shapes.iter().map(|s| s.translate(shift)).collect();
+    let mut used = std::collections::BTreeSet::new();
+    let mut out_pins = Vec::new();
+    for (i, (n, at)) in pins.iter().enumerate() {
+        let mut name = n
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| (i + 1).to_string());
+        while !used.insert(name.clone()) {
+            name.push('\'');
+        }
+        let d = [
+            (at.y - min.y, PinDir::Up),
+            (max.y - at.y, PinDir::Down),
+            (at.x - min.x, PinDir::Left),
+            (max.x - at.x, PinDir::Right),
+        ];
+        let dir = d.iter().fold(d[0], |best, c| if c.0 < best.0 { *c } else { best }).1;
+        out_pins.push(Pin {
+            name,
+            at: fix(*at),
+            dir,
+        });
+    }
+    Ok(wc_core::Symbol {
+        id: id.into(),
+        name: name.into(),
+        category: String::new(),
+        letter_code: String::new(),
+        role: Default::default(),
+        graphics,
+        pins: out_pins,
+        tag_at: Point::new(snap(min.x + shift.x - 3.0), snap((min.y + max.y) / 2.0 + shift.y)),
+        description: String::new(),
+    })
 }

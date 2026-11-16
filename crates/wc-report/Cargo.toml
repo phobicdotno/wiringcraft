@@ -1,0 +1,12 @@
+[package]
+name = "wc-report"
+description = "WiringCraft reports: parts list, device list, wire list, net list and terminal plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wc-core.workspace = true
+
+[lints]
+workspace = true
