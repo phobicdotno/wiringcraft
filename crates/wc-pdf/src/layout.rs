@@ -9,17 +9,14 @@ use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Symbol
 use crate::Options;
 use crate::writer::{Drawn, Link, Pen, text_width_mm};
 
-/// Number of reference columns across the drawing area.
-pub const FRAME_COLUMNS: usize = 10;
-const MARGIN: f64 = 10.0;
+pub use wc_core::project::FRAME_COLUMNS;
+const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
 const HEADER: f64 = 6.0;
 const TITLE_H: f64 = 24.0;
 
 /// The column (1-based) a point falls into.
 pub fn column_of(size: PageSize, x: f64) -> usize {
-    let (w, _) = size.mm();
-    let col_w = (w - 2.0 * MARGIN) / FRAME_COLUMNS as f64;
-    (((x - MARGIN) / col_w).floor() as i64 + 1).clamp(1, FRAME_COLUMNS as i64) as usize
+    size.column_of(x)
 }
 
 /// A pin's position on the page.

@@ -63,7 +63,23 @@ impl PageSize {
             PageSize::A2 => (594.0, 420.0),
         }
     }
+
+    /// The reference column (1-based, 1 to [`FRAME_COLUMNS`]) that `x` millimetres falls into.
+    pub fn column_of(self, x: f64) -> usize {
+        let (w, _) = self.mm();
+        let col_w = (w - 2.0 * FRAME_MARGIN) / FRAME_COLUMNS as f64;
+        let col = ((x - FRAME_MARGIN) / col_w).floor();
+        if col.is_nan() {
+            return 1;
+        }
+        (col as i64).saturating_add(1).clamp(1, FRAME_COLUMNS as i64) as usize
+    }
 }
+
+/// Number of reference columns across a page's drawing area.
+pub const FRAME_COLUMNS: usize = 10;
+/// Distance from the paper edge to the page frame, in millimetres.
+pub const FRAME_MARGIN: f64 = 10.0;
 
 /// A symbol placed on a page as part of a device.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

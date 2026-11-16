@@ -50,6 +50,8 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Rotate),
             Some(Action::Mirror),
             Some(Action::Delete),
+            None,
+            Some(Action::NumberWires),
         ],
     ),
     (
