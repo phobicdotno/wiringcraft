@@ -363,3 +363,126 @@ fn junctions(polylines: &[Vec<(f64, f64)>]) -> Vec<(f64, f64)> {
     }
     out
 }
+
+const TABLE_TEXT: f64 = 2.2;
+const ROW_H: f64 = 4.6;
+const CELL_PAD: f64 = 1.5;
+
+/// How many table rows fit on one report page of this size (below the heading and header row).
+pub fn rows_per_page(size: PageSize) -> usize {
+    let (_, h) = size.mm();
+    let usable = h - 2.0 * MARGIN - HEADER - TITLE_H - 14.0 - ROW_H;
+    ((usable / ROW_H).floor() as usize).max(1)
+}
+
+/// Column widths for a table that must fit `avail` mm: natural widths, shrunk proportionally
+/// when they do not fit.
+fn column_widths(t: &wc_report::Table, avail: f64) -> Vec<f64> {
+    let mut w: Vec<f64> = t
+        .columns
+        .iter()
+        .map(|c| text_width_mm(c, TABLE_TEXT) + 2.0 * CELL_PAD)
+        .collect();
+    for r in &t.rows {
+        for (i, c) in r.iter().enumerate() {
+            if let Some(slot) = w.get_mut(i) {
+                *slot = slot.max((text_width_mm(c, TABLE_TEXT) + 2.0 * CELL_PAD).min(avail * 0.6));
+            }
+        }
+    }
+    let total: f64 = w.iter().sum();
+    if total > avail && total > 0.0 {
+        w.iter_mut().for_each(|x| *x *= avail / total);
+    } else if total > 0.0 {
+        // Spread the spare room over the last column so the table spans the frame.
+        if let Some(last) = w.last_mut() {
+            *last += avail - total;
+        }
+    }
+    w
+}
+
+/// Cut text to fit a width, marking the cut with "...".
+fn fit(s: &str, width: f64) -> String {
+    if text_width_mm(s, TABLE_TEXT) <= width {
+        return s.to_owned();
+    }
+    let mut out: String = s.to_owned();
+    while !out.is_empty() && text_width_mm(&format!("{out}..."), TABLE_TEXT) > width {
+        out.pop();
+    }
+    format!("{out}...")
+}
+
+/// One report page: frame and title block like a schematic page, the report title, and a slice
+/// of the table's rows starting at `first`.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_table_page(
+    project: &Project,
+    page: &Page,
+    index: usize,
+    total: usize,
+    table: &wc_report::Table,
+    first: usize,
+    part: (usize, usize),
+    date: &str,
+) -> Drawn {
+    let (w, h) = page.size.mm();
+    let mut pen = Pen::new(h);
+    pen.ops.push_str("1 J 1 j\n");
+    pen.colour(0.0, 0.0, 0.0);
+    frame(&mut pen, project, page, index, total, date);
+    let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
+    let mut y = MARGIN + HEADER + 10.0;
+    let heading = if part.1 > 1 {
+        format!("{} ({} / {})", table.title, part.0, part.1)
+    } else {
+        table.title.clone()
+    };
+    pen.text((x0, y), 4.0, 0, &heading);
+    y += 4.0;
+    let widths = column_widths(table, x1 - x0);
+    let rows = table.rows.iter().skip(first).take(rows_per_page(page.size));
+    // Header row on a grey band.
+    pen.colour(0.88, 0.89, 0.91);
+    pen.fill_rect((x0, y), (x1, y + ROW_H));
+    pen.colour(0.0, 0.0, 0.0);
+    let mut cx = x0;
+    for (c, wdt) in table.columns.iter().zip(&widths) {
+        pen.text(
+            (cx + CELL_PAD, y + ROW_H - 1.4),
+            TABLE_TEXT,
+            0,
+            &fit(c, wdt - 2.0 * CELL_PAD),
+        );
+        cx += wdt;
+    }
+    pen.width(0.35);
+    pen.line((x0, y + ROW_H), (x1, y + ROW_H));
+    y += ROW_H;
+    pen.width(0.12);
+    for r in rows {
+        let mut cx = x0;
+        for (c, wdt) in r.iter().zip(&widths) {
+            pen.text(
+                (cx + CELL_PAD, y + ROW_H - 1.4),
+                TABLE_TEXT,
+                0,
+                &fit(c, wdt - 2.0 * CELL_PAD),
+            );
+            cx += wdt;
+        }
+        y += ROW_H;
+        pen.colour(0.7, 0.7, 0.7);
+        pen.line((x0, y), (x1, y));
+        pen.colour(0.0, 0.0, 0.0);
+    }
+    if table.rows.is_empty() {
+        pen.colour(0.45, 0.45, 0.45);
+        pen.text((x0 + CELL_PAD, y + ROW_H - 1.4), TABLE_TEXT, 0, "Nothing to list.");
+    }
+    Drawn {
+        ops: pen.ops,
+        links: Vec::new(),
+    }
+}

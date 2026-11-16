@@ -1,0 +1,961 @@
+//! PDF schematics as a trace layer: vector paths (and simple text) from each page become page
+//! graphics in millimetres, to redraw over or keep as reference.
+//!
+//! This is a small, forgiving PDF reader: it finds objects by scanning (so damaged cross-reference
+//! tables do not matter), expands compressed object streams, inflates Flate streams, follows the
+//! page tree and form XObjects, and interprets the path-construction and painting operators.
+//! Scanned (image-only) pages yield no vectors; the caller reports that.
+
+use std::collections::BTreeMap;
+
+use wc_core::geom::{Align, Point, Shape};
+
+use crate::{Error, Result};
+
+#[derive(Debug, Clone, PartialEq)]
+enum Obj {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Name(String),
+    Str(Vec<u8>),
+    Array(Vec<Obj>),
+    Dict(BTreeMap<String, Obj>),
+    Ref(u32),
+    Stream(BTreeMap<String, Obj>, Vec<u8>),
+    Op(String),
+}
+
+impl Obj {
+    fn dict(&self) -> Option<&BTreeMap<String, Obj>> {
+        match self {
+            Obj::Dict(d) | Obj::Stream(d, _) => Some(d),
+            _ => None,
+        }
+    }
+    fn num(&self) -> Option<f64> {
+        match self {
+            Obj::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+    fn name(&self) -> Option<&str> {
+        match self {
+            Obj::Name(n) => Some(n),
+            _ => None,
+        }
+    }
+}
+
+struct Lexer<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+fn is_delim(c: u8) -> bool {
+    matches!(c, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
+}
+
+fn is_ws(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0')
+}
+
+impl<'a> Lexer<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, i: 0 }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.i < self.b.len() {
+            let c = self.b[self.i];
+            if is_ws(c) {
+                self.i += 1;
+            } else if c == b'%' {
+                while self.i < self.b.len() && self.b[self.i] != b'\n' && self.b[self.i] != b'\r' {
+                    self.i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn word(&mut self) -> &'a [u8] {
+        let s = self.i;
+        while self.i < self.b.len() && !is_ws(self.b[self.i]) && !is_delim(self.b[self.i]) {
+            self.i += 1;
+        }
+        &self.b[s..self.i]
+    }
+
+    /// One object or operator. `depth` stops runaway nesting.
+    fn next(&mut self, depth: usize) -> Option<Obj> {
+        if depth > 64 {
+            return None;
+        }
+        self.skip_ws();
+        let c = *self.b.get(self.i)?;
+        match c {
+            b'/' => {
+                self.i += 1;
+                let w = self.word();
+                let mut name = String::new();
+                let mut k = 0;
+                while k < w.len() {
+                    if w[k] == b'#' && k + 2 < w.len() {
+                        let hex = std::str::from_utf8(&w[k + 1..k + 3])
+                            .ok()
+                            .and_then(|h| u8::from_str_radix(h, 16).ok());
+                        if let Some(h) = hex {
+                            name.push(h as char);
+                            k += 3;
+                            continue;
+                        }
+                    }
+                    name.push(w[k] as char);
+                    k += 1;
+                }
+                Some(Obj::Name(name))
+            }
+            b'(' => {
+                self.i += 1;
+                let mut out = Vec::new();
+                let mut level = 1;
+                while self.i < self.b.len() {
+                    let c = self.b[self.i];
+                    self.i += 1;
+                    match c {
+                        b'\\' => {
+                            let Some(&n) = self.b.get(self.i) else { break };
+                            self.i += 1;
+                            match n {
+                                b'n' => out.push(b'\n'),
+                                b'r' => out.push(b'\r'),
+                                b't' => out.push(b'\t'),
+                                b'b' => out.push(8),
+                                b'f' => out.push(12),
+                                b'0'..=b'7' => {
+                                    let mut v = (n - b'0') as u32;
+                                    for _ in 0..2 {
+                                        match self.b.get(self.i) {
+                                            Some(&d @ b'0'..=b'7') => {
+                                                v = v * 8 + (d - b'0') as u32;
+                                                self.i += 1;
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    out.push(v as u8);
+                                }
+                                b'\r' | b'\n' => {}
+                                other => out.push(other),
+                            }
+                        }
+                        b'(' => {
+                            level += 1;
+                            out.push(c);
+                        }
+                        b')' => {
+                            level -= 1;
+                            if level == 0 {
+                                break;
+                            }
+                            out.push(c);
+                        }
+                        _ => out.push(c),
+                    }
+                }
+                Some(Obj::Str(out))
+            }
+            b'<' if self.b.get(self.i + 1) == Some(&b'<') => {
+                self.i += 2;
+                let mut toks = Vec::new();
+                loop {
+                    self.skip_ws();
+                    if self.i >= self.b.len() {
+                        break;
+                    }
+                    if self.b.get(self.i..self.i + 2) == Some(b">>") {
+                        self.i += 2;
+                        break;
+                    }
+                    match self.next(depth + 1) {
+                        Some(t) => toks.push(t),
+                        None => break,
+                    }
+                    if toks.len() > 1_000_000 {
+                        break;
+                    }
+                }
+                let mut d = BTreeMap::new();
+                let mut it = fold_refs(toks).into_iter();
+                while let Some(k) = it.next() {
+                    if let Obj::Name(k) = k {
+                        d.insert(k, it.next().unwrap_or(Obj::Null));
+                    }
+                }
+                // A stream follows its dictionary.
+                let save = self.i;
+                self.skip_ws();
+                if self.b[self.i.min(self.b.len())..].starts_with(b"stream") {
+                    self.i += 6;
+                    if self.b.get(self.i) == Some(&b'\r') {
+                        self.i += 1;
+                    }
+                    if self.b.get(self.i) == Some(&b'\n') {
+                        self.i += 1;
+                    }
+                    let start = self.i;
+                    let declared = d.get("Length").and_then(Obj::num).map(|n| n as usize);
+                    let end = match declared {
+                        Some(n)
+                            if start + n <= self.b.len()
+                                && self.b[start + n..].windows(9).take(20).any(|w| w == b"endstream") =>
+                        {
+                            start + n
+                        }
+                        _ => find(&self.b[start..], b"endstream")
+                            .map(|p| start + p)
+                            .unwrap_or(self.b.len()),
+                    };
+                    self.i = end;
+                    if let Some(p) = find(&self.b[self.i..], b"endstream") {
+                        self.i += p + 9;
+                    }
+                    let mut data = self.b[start..end].to_vec();
+                    if declared.is_none() || end != start + declared.unwrap_or(0) {
+                        // Found by searching: drop the one end-of-line that precedes `endstream`.
+                        if data.ends_with(b"\r\n") {
+                            data.truncate(data.len() - 2);
+                        } else if data.ends_with(b"\n") || data.ends_with(b"\r") {
+                            data.truncate(data.len() - 1);
+                        }
+                    }
+                    return Some(Obj::Stream(d, data));
+                }
+                self.i = save;
+                Some(Obj::Dict(d))
+            }
+            b'<' => {
+                self.i += 1;
+                let mut hex = Vec::new();
+                while self.i < self.b.len() && self.b[self.i] != b'>' {
+                    if self.b[self.i].is_ascii_hexdigit() {
+                        hex.push(self.b[self.i]);
+                    }
+                    self.i += 1;
+                }
+                self.i += 1;
+                if hex.len() % 2 == 1 {
+                    hex.push(b'0');
+                }
+                let bytes = hex
+                    .chunks(2)
+                    .filter_map(|p| std::str::from_utf8(p).ok().and_then(|h| u8::from_str_radix(h, 16).ok()))
+                    .collect();
+                Some(Obj::Str(bytes))
+            }
+            b'[' => {
+                self.i += 1;
+                let mut a = Vec::new();
+                loop {
+                    self.skip_ws();
+                    match self.b.get(self.i) {
+                        None => break,
+                        Some(b']') => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => match self.next(depth + 1) {
+                            Some(o) => a.push(o),
+                            None => break,
+                        },
+                    }
+                }
+                Some(Obj::Array(fold_refs(a)))
+            }
+            b']' | b'>' | b')' | b'{' | b'}' => {
+                self.i += 1;
+                Some(Obj::Op((c as char).to_string()))
+            }
+            _ => {
+                let w = self.word();
+                if w.is_empty() {
+                    self.i += 1;
+                    return Some(Obj::Op(String::new()));
+                }
+                let s = String::from_utf8_lossy(w);
+                if let Ok(n) = s.parse::<f64>() {
+                    return Some(Obj::Num(if n.is_finite() { n } else { 0.0 }));
+                }
+                Some(match s.as_ref() {
+                    "true" => Obj::Bool(true),
+                    "false" => Obj::Bool(false),
+                    "null" => Obj::Null,
+                    _ => Obj::Op(s.into_owned()),
+                })
+            }
+        }
+    }
+}
+
+/// `12 0 R` inside arrays arrives as three tokens; fold them into references.
+fn fold_refs(a: Vec<Obj>) -> Vec<Obj> {
+    let mut out: Vec<Obj> = Vec::with_capacity(a.len());
+    for o in a {
+        if let Obj::Op(op) = &o
+            && op == "R"
+            && out.len() >= 2
+            && let (Some(Obj::Num(n)), Some(Obj::Num(_))) = (out.get(out.len() - 2), out.last())
+        {
+            let n = *n as u32;
+            out.truncate(out.len() - 2);
+            out.push(Obj::Ref(n));
+            continue;
+        }
+        out.push(o);
+    }
+    out
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+struct Doc {
+    objs: BTreeMap<u32, Obj>,
+}
+
+const MAX_INFLATE: usize = 64 * 1024 * 1024;
+
+fn inflate(data: &[u8]) -> Option<Vec<u8>> {
+    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(data, MAX_INFLATE)
+        .ok()
+        .or_else(|| miniz_oxide::inflate::decompress_to_vec_with_limit(data, MAX_INFLATE).ok())
+}
+
+impl Doc {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        if !bytes.starts_with(b"%PDF") && find(&bytes[..bytes.len().min(1024)], b"%PDF").is_none() {
+            return Err(Error::Format("not a PDF file".into()));
+        }
+        let mut objs = BTreeMap::new();
+        // Scan for "<num> <gen> obj".
+        let mut i = 0;
+        while let Some(p) = find(&bytes[i..], b" obj") {
+            let at = i + p;
+            i = at + 4;
+            // Walk back over "<num> <gen>".
+            let head = &bytes[at.saturating_sub(24)..at];
+            let text = String::from_utf8_lossy(head);
+            let mut parts = text.split_whitespace().rev();
+            let (Some(g), Some(n)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let (Ok(_), Ok(n)) = (
+                g.parse::<u32>(),
+                n.trim_start_matches(|c: char| !c.is_ascii_digit()).parse::<u32>(),
+            ) else {
+                continue;
+            };
+            if let Some(o) = parse_object_dict_aware(&bytes[i..]) {
+                objs.insert(n, o);
+            }
+        }
+        // Stream lengths given as references are only known now.
+        let lengths: BTreeMap<u32, usize> = objs
+            .iter()
+            .filter_map(|(n, o)| match o {
+                Obj::Stream(d, _) => match d.get("Length") {
+                    Some(Obj::Ref(r)) => objs.get(r).and_then(Obj::num).map(|l| (*n, l as usize)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        for (n, len) in lengths {
+            if let Some(Obj::Stream(_, data)) = objs.get_mut(&n)
+                && len <= data.len()
+            {
+                data.truncate(len);
+            }
+        }
+        // Expand object streams.
+        let streams: Vec<Obj> = objs
+            .values()
+            .filter(|o| matches!(o.dict().and_then(|d| d.get("Type")).and_then(Obj::name), Some("ObjStm")))
+            .cloned()
+            .collect();
+        for s in streams {
+            let Obj::Stream(d, data) = &s else { continue };
+            let Some(data) = decode_stream(d, data) else { continue };
+            let n = d.get("N").and_then(Obj::num).unwrap_or(0.0) as usize;
+            let first = d.get("First").and_then(Obj::num).unwrap_or(0.0) as usize;
+            let mut lx = Lexer::new(&data);
+            let mut index = Vec::new();
+            for _ in 0..n.min(100_000) {
+                match (lx.next(0), lx.next(0)) {
+                    (Some(Obj::Num(num)), Some(Obj::Num(off))) => index.push((num as u32, off as usize)),
+                    _ => break,
+                }
+            }
+            for (num, off) in index {
+                if let Some(slice) = data.get(first + off..)
+                    && let Some(o) = parse_object_dict_aware(slice)
+                {
+                    objs.entry(num).or_insert(o);
+                }
+            }
+        }
+        Ok(Self { objs })
+    }
+
+    fn get<'a>(&'a self, o: &'a Obj) -> &'a Obj {
+        let mut cur = o;
+        for _ in 0..16 {
+            match cur {
+                Obj::Ref(n) => cur = self.objs.get(n).unwrap_or(&Obj::Null),
+                _ => return cur,
+            }
+        }
+        &Obj::Null
+    }
+
+    /// Pages in document order with their inherited resources and media box.
+    fn pages(&self) -> Vec<(BTreeMap<String, Obj>, Obj, [f64; 4])> {
+        let root = self.objs.values().find(|o| {
+            matches!(
+                o.dict().and_then(|d| d.get("Type")).and_then(Obj::name),
+                Some("Catalog")
+            )
+        });
+        let mut out = Vec::new();
+        if let Some(pages) = root.and_then(|r| r.dict()).and_then(|d| d.get("Pages")) {
+            self.walk(self.get(pages), None, None, &mut out, 0);
+        }
+        if out.is_empty() {
+            // Damaged tree: fall back to every page object in object order.
+            for o in self.objs.values() {
+                if let Some(d) = o.dict()
+                    && d.get("Type").and_then(Obj::name) == Some("Page")
+                {
+                    let mb = self.media_box(d.get("MediaBox")).unwrap_or([0.0, 0.0, 595.0, 842.0]);
+                    out.push((
+                        d.clone(),
+                        d.get("Resources").map(|r| self.get(r).clone()).unwrap_or(Obj::Null),
+                        mb,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    fn media_box(&self, o: Option<&Obj>) -> Option<[f64; 4]> {
+        match self.get(o?) {
+            Obj::Array(a) if a.len() == 4 => {
+                let v: Vec<f64> = a.iter().filter_map(|x| self.get(x).num()).collect();
+                (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+            }
+            _ => None,
+        }
+    }
+
+    fn walk(
+        &self,
+        node: &Obj,
+        res: Option<&Obj>,
+        mb: Option<[f64; 4]>,
+        out: &mut Vec<(BTreeMap<String, Obj>, Obj, [f64; 4])>,
+        depth: usize,
+    ) {
+        if depth > 32 || out.len() > 10_000 {
+            return;
+        }
+        let Some(d) = node.dict() else { return };
+        let res = d.get("Resources").map(|r| self.get(r)).or(res);
+        let mb = self.media_box(d.get("MediaBox")).or(mb);
+        match d.get("Type").and_then(Obj::name) {
+            Some("Page") => out.push((
+                d.clone(),
+                res.cloned().unwrap_or(Obj::Null),
+                mb.unwrap_or([0.0, 0.0, 595.0, 842.0]),
+            )),
+            _ => {
+                if let Some(Obj::Array(kids)) = d.get("Kids").map(|k| self.get(k)) {
+                    for k in kids {
+                        self.walk(self.get(k), res, mb, out, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    fn content(&self, page: &BTreeMap<String, Obj>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let parts: Vec<&Obj> = match page.get("Contents").map(|c| self.get(c)) {
+            Some(Obj::Array(a)) => a.iter().map(|x| self.get(x)).collect(),
+            Some(o) => vec![o],
+            None => vec![],
+        };
+        for p in parts {
+            if let Obj::Stream(d, data) = p
+                && let Some(bytes) = decode_stream(d, data)
+            {
+                out.extend_from_slice(&bytes);
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+}
+
+/// Lex one object.
+fn parse_object_dict_aware(b: &[u8]) -> Option<Obj> {
+    Lexer::new(b).next(0)
+}
+
+fn decode_stream(d: &BTreeMap<String, Obj>, data: &[u8]) -> Option<Vec<u8>> {
+    let filters: Vec<String> = match d.get("Filter") {
+        None => vec![],
+        Some(Obj::Name(n)) => vec![n.clone()],
+        Some(Obj::Array(a)) => a.iter().filter_map(|x| x.name().map(str::to_owned)).collect(),
+        _ => return None,
+    };
+    let mut cur = data.to_vec();
+    for f in filters {
+        cur = match f.as_str() {
+            "FlateDecode" | "Fl" => inflate(&cur)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+#[derive(Clone, Copy)]
+struct Ctm([f64; 6]);
+
+impl Ctm {
+    const ID: Ctm = Ctm([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    fn pre(&self, m: [f64; 6]) -> Ctm {
+        let [a, b, c, d, e, f] = m;
+        let [a2, b2, c2, d2, e2, f2] = self.0;
+        Ctm([
+            a * a2 + b * c2,
+            a * b2 + b * d2,
+            c * a2 + d * c2,
+            c * b2 + d * d2,
+            e * a2 + f * c2 + e2,
+            e * b2 + f * d2 + f2,
+        ])
+    }
+    fn p(&self, x: f64, y: f64) -> (f64, f64) {
+        let [a, b, c, d, e, f] = self.0;
+        (a * x + c * y + e, b * x + d * y + f)
+    }
+}
+
+/// One imported page.
+#[derive(Debug, Default)]
+pub struct TracePage {
+    /// Page size in millimetres.
+    pub size_mm: (f64, f64),
+    pub graphics: Vec<Shape>,
+    /// Paths that looked like images or fills only.
+    pub images: usize,
+}
+
+const MM_PER_PT: f64 = 25.4 / 72.0;
+
+struct Interp<'a> {
+    doc: &'a Doc,
+    page_h: f64,
+    origin: (f64, f64),
+    out: TracePage,
+    budget: usize,
+}
+
+impl Interp<'_> {
+    fn to_mm(&self, p: (f64, f64)) -> Point {
+        Point::new(
+            (p.0 - self.origin.0) * MM_PER_PT,
+            (self.page_h - (p.1 - self.origin.1)) * MM_PER_PT,
+        )
+    }
+
+    fn run(&mut self, content: &[u8], resources: &Obj, ctm: Ctm, depth: usize) {
+        if depth > 8 {
+            return;
+        }
+        let mut lx = Lexer::new(content);
+        let mut stack: Vec<Obj> = Vec::new();
+        let mut gs: Vec<Ctm> = Vec::new();
+        let mut ctm = ctm;
+        let mut sub: Vec<(f64, f64)> = Vec::new();
+        let mut path: Vec<(Vec<(f64, f64)>, bool)> = Vec::new();
+        let mut cur = (0.0, 0.0);
+        // Text state: matrix origin and font size are enough for positioned labels.
+        let mut tm = Ctm::ID;
+        let mut tlm = Ctm::ID;
+        let mut font_size = 10.0;
+        let mut leading = 0.0;
+        while let Some(tok) = lx.next(0) {
+            self.budget = self.budget.saturating_sub(1);
+            if self.budget == 0 {
+                return;
+            }
+            let Obj::Op(op) = tok else {
+                stack.push(tok);
+                if stack.len() > 4096 {
+                    stack.clear();
+                }
+                continue;
+            };
+            let n = |k: usize| -> f64 {
+                stack
+                    .len()
+                    .checked_sub(k)
+                    .and_then(|i| stack.get(i))
+                    .and_then(Obj::num)
+                    .unwrap_or(0.0)
+            };
+            match op.as_str() {
+                "q" => gs.push(ctm),
+                "Q" => ctm = gs.pop().unwrap_or(ctm),
+                "cm" => ctm = ctm.pre([n(6), n(5), n(4), n(3), n(2), n(1)]),
+                "m" => {
+                    if sub.len() >= 2 {
+                        path.push((std::mem::take(&mut sub), false));
+                    }
+                    sub.clear();
+                    cur = ctm.p(n(2), n(1));
+                    sub.push(cur);
+                }
+                "l" => {
+                    cur = ctm.p(n(2), n(1));
+                    sub.push(cur);
+                }
+                "c" | "v" | "y" => {
+                    // Cubic curve flattened in 6 steps.
+                    let (p0, (c1, c2, p3)) = match op.as_str() {
+                        "c" => (cur, (ctm.p(n(6), n(5)), ctm.p(n(4), n(3)), ctm.p(n(2), n(1)))),
+                        "v" => (cur, (cur, ctm.p(n(4), n(3)), ctm.p(n(2), n(1)))),
+                        _ => (cur, (ctm.p(n(4), n(3)), ctm.p(n(2), n(1)), ctm.p(n(2), n(1)))),
+                    };
+                    for k in 1..=6 {
+                        let t = k as f64 / 6.0;
+                        let u = 1.0 - t;
+                        let x = u * u * u * p0.0 + 3.0 * u * u * t * c1.0 + 3.0 * u * t * t * c2.0 + t * t * t * p3.0;
+                        let y = u * u * u * p0.1 + 3.0 * u * u * t * c1.1 + 3.0 * u * t * t * c2.1 + t * t * t * p3.1;
+                        sub.push((x, y));
+                    }
+                    cur = p3;
+                }
+                "h" => {
+                    if sub.len() >= 2 {
+                        path.push((std::mem::take(&mut sub), true));
+                    }
+                }
+                "re" => {
+                    let (x, y, w, h) = (n(4), n(3), n(2), n(1));
+                    if sub.len() >= 2 {
+                        path.push((std::mem::take(&mut sub), false));
+                    }
+                    sub.clear();
+                    path.push((
+                        vec![ctm.p(x, y), ctm.p(x + w, y), ctm.p(x + w, y + h), ctm.p(x, y + h)],
+                        true,
+                    ));
+                }
+                "S" | "s" | "B" | "B*" | "b" | "b*" | "f" | "F" | "f*" | "n" => {
+                    if sub.len() >= 2 {
+                        path.push((std::mem::take(&mut sub), matches!(op.as_str(), "s" | "b" | "b*")));
+                    }
+                    sub.clear();
+                    let stroke = matches!(op.as_str(), "S" | "s" | "B" | "B*" | "b" | "b*");
+                    let fill_only = matches!(op.as_str(), "f" | "F" | "f*");
+                    for (pts, closed) in path.drain(..) {
+                        // Small filled shapes are junction dots or arrowheads: keep them; large
+                        // fills are backgrounds: skip.
+                        if !stroke && !fill_only {
+                            continue;
+                        }
+                        let mm: Vec<Point> = pts.iter().map(|p| self.to_mm(*p)).collect();
+                        if fill_only {
+                            let (a, b) = wc_core::geom::bounds_of(&mm);
+                            if (b.x - a.x) > 3.0 || (b.y - a.y) > 3.0 {
+                                continue;
+                            }
+                        }
+                        if mm.len() == 2 {
+                            self.out.graphics.push(Shape::Line { a: mm[0], b: mm[1] });
+                        } else {
+                            self.out.graphics.push(Shape::Polyline { points: mm, closed });
+                        }
+                    }
+                }
+                "BT" => {
+                    tm = Ctm::ID;
+                    tlm = Ctm::ID;
+                }
+                "Tf" => font_size = n(1),
+                "TL" => leading = n(1),
+                "Td" | "TD" => {
+                    if op == "TD" {
+                        leading = -n(1);
+                    }
+                    tlm = tlm.pre([1.0, 0.0, 0.0, 1.0, n(2), n(1)]);
+                    tm = tlm;
+                }
+                "Tm" => {
+                    tlm = Ctm([n(6), n(5), n(4), n(3), n(2), n(1)]);
+                    tm = tlm;
+                }
+                "T*" => {
+                    tlm = tlm.pre([1.0, 0.0, 0.0, 1.0, 0.0, -leading]);
+                    tm = tlm;
+                }
+                "Tj" | "TJ" | "'" | "\"" => {
+                    if op == "'" || op == "\"" {
+                        tlm = tlm.pre([1.0, 0.0, 0.0, 1.0, 0.0, -leading]);
+                        tm = tlm;
+                    }
+                    let bytes: Vec<u8> = match stack.last() {
+                        Some(Obj::Str(s)) => s.clone(),
+                        Some(Obj::Array(a)) => a
+                            .iter()
+                            .filter_map(|x| if let Obj::Str(s) = x { Some(s.clone()) } else { None })
+                            .flatten()
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    // Simple fonts only: keep printable single-byte text.
+                    let text: String = bytes
+                        .iter()
+                        .filter(|b| (0x20..0x7f).contains(*b) || **b >= 0xa0)
+                        .map(|b| *b as char)
+                        .collect();
+                    if !text.trim().is_empty() && text.chars().count() * 2 >= bytes.len() {
+                        let full = tm.pre([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+                        let at_pt = ctm.pre(full.0).p(0.0, 0.0);
+                        let scale = (ctm.pre(full.0).0[2].powi(2) + ctm.pre(full.0).0[3].powi(2)).sqrt();
+                        let h = (font_size * scale * MM_PER_PT * 0.72).clamp(0.5, 50.0);
+                        self.out.graphics.push(Shape::Text {
+                            at: self.to_mm(at_pt),
+                            text: text.trim().to_owned(),
+                            height: h,
+                            align: Align::Left,
+                        });
+                    }
+                }
+                "Do" => {
+                    let name = stack.last().and_then(Obj::name).unwrap_or("").to_owned();
+                    let xo = resources
+                        .dict()
+                        .and_then(|r| r.get("XObject"))
+                        .map(|x| self.doc.get(x))
+                        .and_then(|x| x.dict())
+                        .and_then(|x| x.get(&name))
+                        .map(|x| self.doc.get(x));
+                    if let Some(Obj::Stream(d, data)) = xo {
+                        match d.get("Subtype").and_then(Obj::name) {
+                            Some("Form") => {
+                                let m = match d.get("Matrix").map(|m| self.doc.get(m)) {
+                                    Some(Obj::Array(a)) if a.len() == 6 => {
+                                        let v: Vec<f64> = a.iter().map(|x| x.num().unwrap_or(0.0)).collect();
+                                        [v[0], v[1], v[2], v[3], v[4], v[5]]
+                                    }
+                                    _ => Ctm::ID.0,
+                                };
+                                let res = d
+                                    .get("Resources")
+                                    .map(|r| self.doc.get(r).clone())
+                                    .unwrap_or_else(|| resources.clone());
+                                if let Some(bytes) = decode_stream(d, data) {
+                                    let (d2, data2) = (d.clone(), bytes);
+                                    let _ = d2;
+                                    self.run(&data2, &res, ctm.pre(m), depth + 1);
+                                }
+                            }
+                            Some("Image") => self.out.images += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                "BI" => {
+                    // Inline image: skip to EI.
+                    if let Some(p) = find(&content[lx.i..], b"EI") {
+                        lx.i += p + 2;
+                    }
+                    self.out.images += 1;
+                }
+                _ => {}
+            }
+            stack.clear();
+        }
+    }
+}
+
+/// Read every page of a PDF as trace graphics.
+pub fn pages(bytes: &[u8]) -> Result<Vec<TracePage>> {
+    let doc = Doc::parse(bytes)?;
+    let pages = doc.pages();
+    if pages.is_empty() {
+        return Err(Error::Format("no pages found (encrypted or damaged PDF?)".into()));
+    }
+    if doc.objs.values().any(|o| {
+        o.dict()
+            .is_some_and(|d| d.contains_key("Filter") && d.get("Filter").and_then(Obj::name) == Some("Standard"))
+    }) {
+        return Err(Error::Format("the PDF is encrypted".into()));
+    }
+    let mut out = Vec::new();
+    for (page, res, mb) in pages {
+        let content = doc.content(&page);
+        let (w, h) = ((mb[2] - mb[0]).abs(), (mb[3] - mb[1]).abs());
+        let (ox, oy) = (mb[0].min(mb[2]), mb[1].min(mb[3]));
+        // /Rotate turns the page clockwise for display; draw it the way it is displayed.
+        let rotate = page
+            .get("Rotate")
+            .and_then(|r| doc.get(r).num())
+            .unwrap_or(0.0)
+            .rem_euclid(360.0)
+            .round() as i64;
+        let (start, (dw, dh)) = match rotate {
+            90 => (Ctm([0.0, -1.0, 1.0, 0.0, -oy, w + ox]), (h, w)),
+            180 => (Ctm([-1.0, 0.0, 0.0, -1.0, w + ox, h + oy]), (w, h)),
+            270 => (Ctm([0.0, 1.0, -1.0, 0.0, h + oy, -ox]), (h, w)),
+            _ => (Ctm([1.0, 0.0, 0.0, 1.0, -ox, -oy]), (w, h)),
+        };
+        let mut it = Interp {
+            doc: &doc,
+            page_h: dh,
+            origin: (0.0, 0.0),
+            out: TracePage::default(),
+            budget: 5_000_000,
+        };
+        it.out.size_mm = (dw * MM_PER_PT, dh * MM_PER_PT);
+        it.run(&content, &res, start, 0);
+        out.push(it.out);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn simple_pdf(content: &str, compress: bool) -> Vec<u8> {
+        let stream: Vec<u8> = if compress {
+            miniz_oxide::deflate::compress_to_vec_zlib(content.as_bytes(), 6)
+        } else {
+            content.as_bytes().to_vec()
+        };
+        let filter = if compress { "/Filter /FlateDecode " } else { "" };
+        let mut b = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 1190.55 841.89] >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n".to_vec();
+        b.extend_from_slice(format!("4 0 obj\n<< {filter}/Length {} >>\nstream\n", stream.len()).as_bytes());
+        b.extend_from_slice(&stream);
+        b.extend_from_slice(b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
+        b
+    }
+
+    #[test]
+    fn lines_rects_curves_and_text() -> Result<()> {
+        let content = "q 2 0 0 2 0 0 cm 10 10 m 110 10 l S Q 100 100 50 20 re S 0 0 m 10 0 20 10 30 30 c S BT /F1 12 Tf 72 72 Td (K1) Tj ET";
+        for compress in [false, true] {
+            let p = pages(&simple_pdf(content, compress))?;
+            assert_eq!(p.len(), 1);
+            let g = &p[0].graphics;
+            assert!((p[0].size_mm.0 - 420.0).abs() < 0.5, "A3 landscape");
+            let Some(Shape::Line { a, b }) = g.first() else {
+                return Err(Error::Format(format!("{g:?}")));
+            };
+            assert!(
+                (a.x - 20.0 * MM_PER_PT).abs() < 1e-6 && (b.x - 220.0 * MM_PER_PT).abs() < 1e-6,
+                "cm applied"
+            );
+            assert!((a.y - (841.89 - 20.0) * MM_PER_PT).abs() < 1e-6, "y flipped");
+            assert!(
+                g.iter()
+                    .any(|s| matches!(s, Shape::Polyline { closed: true, points } if points.len() == 4))
+            );
+            assert!(g.iter().any(|s| matches!(s, Shape::Text { text, .. } if text == "K1")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn object_streams_and_indirect_lengths() -> Result<()> {
+        // Catalog and page tree inside a compressed object stream; content length by reference.
+        let a = "<< /Type /Catalog /Pages 2 0 R >>\n";
+        let b2 = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+        let header = format!("1 0 2 {} ", a.len());
+        let body2 = format!("{header}{a}{b2}");
+        let first2 = header.len();
+        let packed2 = miniz_oxide::deflate::compress_to_vec_zlib(body2.as_bytes(), 6);
+        let content = miniz_oxide::deflate::compress_to_vec_zlib(b"0 0 m 72 72 l S", 6);
+        let mut b = b"%PDF-1.5\n".to_vec();
+        b.extend_from_slice(
+            format!("9 0 obj\n<< /Type /ObjStm /N 2 /First {first2} /Length 10 0 R /Filter /FlateDecode >>\nstream\n")
+                .as_bytes(),
+        );
+        b.extend_from_slice(&packed2);
+        b.extend_from_slice(format!("\nendstream\nendobj\n10 0 obj\n{}\nendobj\n", packed2.len()).as_bytes());
+        b.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n",
+        );
+        b.extend_from_slice(b"4 0 obj\n<< /Length 5 0 R /Filter /FlateDecode >>\nstream\n");
+        b.extend_from_slice(&content);
+        b.extend_from_slice(format!("\nendstream\nendobj\n5 0 obj\n{}\nendobj\n%%EOF\n", content.len()).as_bytes());
+        let p = pages(&b)?;
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].graphics.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rotated_pages_are_drawn_as_displayed() -> Result<()> {
+        // A portrait A4 page shown rotated 90 degrees clockwise (how many CAD tools print
+        // landscape sheets). A line along the bottom edge of the page ends up on the left edge.
+        let mut b = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec();
+        b.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Rotate 90 /Contents 4 0 R >>\nendobj\n",
+        );
+        let content = "0 0 m 100 0 l S";
+        b.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n%%EOF\n",
+                content.len()
+            )
+            .as_bytes(),
+        );
+        let p = pages(&b)?;
+        assert!(
+            (p[0].size_mm.0 - 297.0).abs() < 0.5 && (p[0].size_mm.1 - 210.0).abs() < 0.5,
+            "{:?}",
+            p[0].size_mm
+        );
+        let Some(Shape::Line { a, b: e }) = p[0].graphics.first() else {
+            return Err(Error::Format(format!("expected a line, got {:?}", p[0].graphics)));
+        };
+        assert!(a.x.abs() < 0.01 && e.x.abs() < 0.01, "{a:?} {e:?}");
+        assert!(
+            (a.y - 0.0).abs() < 0.01 && (e.y - 100.0 * 25.4 / 72.0).abs() < 0.01,
+            "{a:?} {e:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hostile() {
+        assert!(pages(b"").is_err());
+        assert!(pages(b"hello").is_err());
+        assert!(pages(b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 9 0 R >> endobj").is_err());
+        let _ = pages(b"%PDF-1.4\n3 0 obj\n<< /Type /Page /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 999999 /Filter /FlateDecode >>\nstream\nxx\nendstream\nendobj");
+        let _ = pages(&simple_pdf("q q q Q Q Q Q Q 1 2 3 4 5 6 cm m l c re S ( ((( ", false));
+        let _ = pages(&simple_pdf(
+            "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<",
+            false,
+        ));
+    }
+}

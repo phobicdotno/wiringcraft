@@ -1,0 +1,10 @@
+{
+  "description": "Feed-through terminal 2.5 mm² (example data)",
+  "id": "example.ex-tb-2-5",
+  "manufacturer": "Example",
+  "order_number": "EX-TB-2.5",
+  "properties": {
+    "Rated current": "24 A"
+  },
+  "symbol": "wc.terminal"
+}

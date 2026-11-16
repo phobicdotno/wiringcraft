@@ -41,11 +41,26 @@ $WC wire p0003 s2:14 s4:A1 --number 11
 $WC wire p0003 s3:14 s4:A1 --via 110,125 --via 60,125
 $WC wire p0003 s4:A2 60,190 --potential 0V
 $WC wire p0003 160,40 s5:13 --potential 24V
-$WC wire p0003 s5:14 s6:X1 --number 12
-$WC wire p0003 s6:X2 160,190 --potential 0V
+# The lamp sits in the field: it is wired through terminals -X1.1 and -X1.2.
+$WC place p0003 wc.terminal --at 160,125 --tag "=PUMP+CAB1-X1.1"
+$WC place p0003 wc.terminal --at 175,175 --tag "=PUMP+CAB1-X1.2"
+$WC wire p0003 s5:14 s7:1 --number 12
+$WC wire p0003 s7:2 s6:X1 --number 13
+$WC wire p0003 s6:X2 s8:1 --via 160,170 --via 175,170
+$WC wire p0003 s8:2 175,195 --potential 0V
+
+# Parts from the example parts list in the starter library.
+$WC device "=PUMP+CAB1-Q1" --part example.ex-mcb-1p-c10 --description "Pump supply"
+$WC device "=PUMP+CAB1-K1" --part example.ex-ct-9-24dc --description "Pump contactor"
+$WC device "=PUMP+CAB1-S1" --part example.ex-pb-red-nc --description "Stop"
+$WC device "=PUMP+CAB1-S2" --part example.ex-pb-grn-no --description "Start"
+$WC device "=PUMP+CAB1-P1" --part example.ex-lamp-24-gn --description "Pump running"
+$WC device "=PUMP+CAB1-X1.1" --part example.ex-tb-2-5
+$WC device "=PUMP+CAB1-X1.2" --part example.ex-tb-2-5
 
 $WC lib lock
 $WC vcs commit -m "Pump starter: main and control circuits"
-$WC pdf pump-station.pdf --date 2026-11-16
-$WC nets
+$WC pdf pump-station.pdf --date 2026-11-16 --report all
+$WC report parts
+$WC report terminals
 $WC vcs log
