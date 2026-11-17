@@ -360,6 +360,35 @@ impl Open {
         }
     }
 
+    /// Draw a wire between each pair of pins that line up or touch, for the symbols in `items`
+    /// (just placed or moved). Part of the caller's undo step: no checkpoint is taken here.
+    /// Returns how many wires were added.
+    pub fn auto_wire(&mut self, page: usize, items: &std::collections::BTreeSet<String>) -> usize {
+        let Some(pg) = self.project.pages.get(page) else {
+            return 0;
+        };
+        let pairs = wc_core::autowire::suggest(pg, |id| self.symbols.get(id), items);
+        let Some(pg) = self.project.pages.get_mut(page) else {
+            return 0;
+        };
+        for (from, to) in &pairs {
+            let id = pg.next_id("w");
+            pg.wires.push(Wire {
+                id,
+                from: from.clone(),
+                to: to.clone(),
+                via: Vec::new(),
+                number: None,
+                potential: None,
+                cable: None,
+            });
+        }
+        if !pairs.is_empty() {
+            self.dirty = true;
+        }
+        pairs.len()
+    }
+
     pub fn add_page(&mut self) -> usize {
         self.checkpoint();
         let id = self.free_page_id();
@@ -701,6 +730,34 @@ pub(crate) mod tests {
         store::save(&dir, &p).unwrap();
         let open = Open::load(&dir).unwrap();
         (tmp, open)
+    }
+
+    #[test]
+    fn auto_wiring_is_part_of_the_placing_undo_step() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.contact.no", Point::new(50.0, 20.0)).unwrap();
+        let before = o.project.pages.clone();
+        let coil = o.place(page, "wc.coil", Point::new(50.0, 60.0)).unwrap();
+        let items = std::iter::once(coil.clone()).collect();
+        assert_eq!(o.auto_wire(page, &items), 1);
+        let w = &o.project.pages[page].wires[0];
+        assert_eq!(
+            (&w.from, &w.to),
+            (
+                &Endpoint::Pin {
+                    item: coil,
+                    pin: "A1".into()
+                },
+                &Endpoint::Pin {
+                    item: "s1".into(),
+                    pin: "14".into()
+                }
+            )
+        );
+        assert_eq!(o.auto_wire(page, &items), 0, "a wired pin is not wired again");
+        assert!(o.undo());
+        assert_eq!(o.project.pages, before, "one undo removes the symbol and its wire");
     }
 
     #[test]
