@@ -1051,6 +1051,8 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         };
         let mut page = Page::new(format!("swe-page-{}", pg.id), numbers[i].clone(), title);
         page.size = size;
+        // A line diagram repeats devices the schematics draw in detail.
+        page.overview = pg.kind == KIND_LINE_DIAGRAM;
 
         // Pin positions on this page (y down) for joining wire ends.
         let mut pin_at: Vec<(Point, String, String)> = Vec::new();
