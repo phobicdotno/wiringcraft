@@ -1,4 +1,4 @@
-// Tests for claim.js. Run: node --test .github/scripts/
+// Tests for claim.js. Run: node --test .github/scripts/claim.test.js
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
