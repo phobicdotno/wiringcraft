@@ -48,6 +48,21 @@ pub struct Location {
 }
 
 impl ProjectMeta {
+    /// Fill title-block fields from `fields` (for example an import). A field the project has
+    /// with a value is kept; a missing, empty or blank one takes the new value. Returns how many
+    /// fields were filled.
+    pub fn fill_title_block(&mut self, fields: BTreeMap<String, String>) -> usize {
+        let mut filled = 0;
+        for (k, v) in fields {
+            let have = self.title_block.entry(k).or_default();
+            if have.trim().is_empty() && !v.trim().is_empty() {
+                *have = v;
+                filled += 1;
+            }
+        }
+        filled
+    }
+
     /// Add a location, or fill in the description of one the project already has. A description
     /// already there is kept. Returns whether anything changed.
     pub fn merge_location(&mut self, loc: Location) -> bool {
@@ -466,6 +481,34 @@ mod tests {
         assert!(!page.overview);
         assert!(!serde_json::to_string(&page)?.contains("overview"));
         Ok(())
+    }
+
+    #[test]
+    fn imported_title_block_fields_fill_only_what_the_project_has_not_set() {
+        let mut m = ProjectMeta::new("t");
+        m.title_block.insert("customer".into(), "Typed in".into());
+        m.title_block.insert("date".into(), String::new());
+        m.title_block.insert("drawn_by".into(), "   ".into());
+        let new: BTreeMap<String, String> = [
+            ("customer", "Imported"),
+            ("date", "2024-01-02"),
+            ("drawn_by", "designer"),
+            ("project_number", "1042"),
+            ("description", "  "),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        assert_eq!(m.fill_title_block(new), 3);
+        let tb = &m.title_block;
+        assert_eq!(tb["customer"], "Typed in", "a value typed in is kept");
+        assert_eq!(tb["date"], "2024-01-02", "an empty field is filled");
+        assert_eq!(tb["drawn_by"], "designer", "a blank field is filled");
+        assert_eq!(tb["project_number"], "1042", "a missing field is added");
+        assert!(
+            tb.get("description").is_none_or(|d| d.trim().is_empty()),
+            "a blank import fills nothing"
+        );
     }
 
     #[test]

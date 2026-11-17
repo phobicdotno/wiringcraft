@@ -1086,3 +1086,172 @@ fn a_line_diagram_does_not_join_what_the_schematics_keep_apart() {
         ends.note
     );
 }
+
+/// An archive project list (`Database/tew_app_project.sqlite`) with two projects.
+fn project_list() -> Vec<u8> {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0 TEXT);
+         INSERT INTO tew_project VALUES
+           (1, 'Pump station', '3', 'Example Water Ltd', 'Harbour Road 1', '', 'Sample Town', 'Drawing Office A',
+            NULL, NULL, NULL, 'P-1042', 'designer', 'checker', '20240131 08:15:00 ', '20250203 10:00:00 '),
+           (2, 'Other', '12', '', '', '', '', '', '', '', '', '', '', '', '', '');
+         INSERT INTO tew_translatedtext VALUES (1, -1, 'de', 'Pumpwerk'), (1, -1, 'en', 'Pump station control');",
+    )
+    .unwrap();
+    c.serialize(rusqlite::MAIN_DB).unwrap().to_vec()
+}
+
+#[test]
+fn the_project_list_gives_the_title_block_fields() {
+    let list = project_list();
+    let info = project_info(&open(&list).unwrap(), "3").unwrap().unwrap();
+    assert_eq!(info.name, "Pump station");
+    assert_eq!(
+        info.customer_address,
+        ["Harbour Road 1", "Sample Town"],
+        "blank lines dropped"
+    );
+    assert_eq!(
+        (info.created.as_str(), info.modified.as_str()),
+        ("2024-01-31", "2025-02-03")
+    );
+    let tb = info.title_block();
+    assert_eq!(tb["customer"], "Example Water Ltd");
+    assert_eq!(tb["customer_address"], "Harbour Road 1, Sample Town");
+    assert_eq!(tb["project_number"], "P-1042");
+    assert_eq!(tb["drawn_by"], "designer");
+    assert_eq!(tb["date"], "2024-01-31");
+    assert_eq!(tb["description"], "Pump station control", "English wins");
+    assert!(!tb.contains_key("drawing_office_address"), "empty fields are left out");
+    let other = project_info(&open(&list).unwrap(), "12").unwrap().unwrap();
+    assert!(other.title_block().is_empty());
+    assert!(project_info(&open(&list).unwrap(), "99").unwrap().is_none());
+}
+
+#[test]
+fn an_archive_import_carries_the_project_fields_into_the_title_block() {
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    let list = project_list();
+    let buf = archive(&[
+        ("Projects/3/Database/tew_project_data.sqlite", &db),
+        ("Database/tew_app_project.sqlite", &list),
+    ]);
+    let got = database_from_archive(buf, 1).unwrap();
+    assert!(got.info_warning.is_none());
+    let mut p = read(&open(&got.bytes).unwrap()).unwrap();
+    p.info = got.info;
+    let (built, _, _) = build(&p, None);
+    assert_eq!(built.title_block["customer"], "Example Water Ltd");
+    assert_eq!(built.title_block["project_number"], "P-1042");
+    // Without the project list (a bare database, or an older archive) nothing is guessed.
+    let bare = archive(&[("Projects/3/Database/tew_project_data.sqlite", &db)]);
+    let got = database_from_archive(bare, 1).unwrap();
+    assert!(got.info.is_none() && got.info_warning.is_none());
+}
+
+#[test]
+fn the_project_fields_come_across_without_a_description_table_and_with_numbers() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb INTEGER,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         INSERT INTO tew_project VALUES (1, 'P', '1', 'Customer', '', '', '', '', '', '', '', 1042,
+           'designer', '', '', '');",
+    )
+    .unwrap();
+    let info = project_info(&c, "1").unwrap().unwrap();
+    assert_eq!(
+        info.contract_number, "1042",
+        "a number stored as an integer is read as text"
+    );
+    assert_eq!(info.customer, "Customer");
+    assert!(info.description.is_empty());
+    assert!(
+        info.warnings
+            .iter()
+            .any(|w| w.starts_with("the project description was not read")),
+        "{:?}",
+        info.warnings
+    );
+}
+
+#[test]
+fn an_unreadable_description_row_is_reported_with_its_reason() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         INSERT INTO tew_project VALUES (1, 'P', '1', 'Customer', '', '', '', '', '', '', '', '7',
+           '', '', '20240102 10:00:00', 'not a date');
+         CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0);
+         INSERT INTO tew_translatedtext VALUES (1, -1, 'en', 42.5);",
+    )
+    .unwrap();
+    let info = project_info(&c, "1").unwrap().unwrap();
+    assert_eq!(info.customer, "Customer", "the other fields still come across");
+    assert!(info.description.is_empty());
+    assert!(
+        info.warnings
+            .iter()
+            .any(|w| w.contains("text row(s) could not be read")),
+        "{:?}",
+        info.warnings
+    );
+    assert_eq!(info.created, "2024-01-02");
+    assert_eq!(info.modified, "not a date", "a date in another form is kept as written");
+}
+
+#[test]
+fn a_project_list_that_cannot_be_opened_is_a_warning_not_silence() {
+    use std::io::Write;
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        let opt = zip::write::SimpleFileOptions::default();
+        z.start_file("Projects/1/Database/tew_project_data.sqlite", opt)
+            .unwrap();
+        z.write_all(&db).unwrap();
+        use zip::unstable::write::FileOptionsExt;
+        let locked = opt.with_deprecated_encryption(b"secret");
+        z.start_file("Database/tew_app_project.sqlite", locked).unwrap();
+        z.write_all(&db).unwrap();
+        z.finish().unwrap();
+    }
+    buf.set_position(0);
+    let got = database_from_archive(buf, 1).unwrap();
+    assert!(got.info.is_none());
+    let w = got.info_warning.unwrap();
+    assert!(w.contains("tew_app_project.sqlite"), "{w}");
+
+    // Without a project list there are simply no fields, and no warning.
+    let got = database_from_archive(archive(&[("Projects/1/Database/tew_project_data.sqlite", &db)]), 1).unwrap();
+    assert!(got.info.is_none() && got.info_warning.is_none());
+}
+
+#[test]
+fn a_blank_english_translation_does_not_hide_another_language() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         INSERT INTO tew_project VALUES (1, 'P', '1', '', '', '', '', '', '', '', '', '', '', '', '', '');
+         CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0 TEXT);
+         INSERT INTO tew_translatedtext VALUES (1, -1, 'de', ' Beschreibung '), (1, -1, 'en', char(9) || char(10));",
+    )
+    .unwrap();
+    let info = project_info(&c, "1").unwrap().unwrap();
+    assert_eq!(info.description, "Beschreibung");
+    assert!(info.warnings.is_empty(), "{:?}", info.warnings);
+}

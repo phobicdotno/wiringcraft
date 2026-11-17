@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use wc_core::connectivity::{PinRef, nets_linked};
 use wc_core::geom::{Point, Shape};
 use wc_core::symbol::{Pin, PinDir, SymbolRole};
@@ -165,7 +165,123 @@ pub struct SweProject {
     pub cables: BTreeMap<i64, SweCable>,
     pub components: BTreeMap<i64, SweComponent>,
     pub locations: Vec<SweLocation>,
+    /// The project's own fields (name, customer, ...), from the archive's project list. Not in
+    /// the project database itself, so a bare database import has none.
+    pub info: Option<SweProjectInfo>,
     pub warnings: Vec<String>,
+}
+
+/// A project's own fields, from `tew_project` in the archive's `Database/tew_app_project.sqlite`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SweProjectInfo {
+    pub name: String,
+    /// The project description (translated text, English first).
+    pub description: String,
+    pub customer: String,
+    /// The customer's address lines that are filled.
+    pub customer_address: Vec<String>,
+    pub drawing_office: String,
+    pub drawing_office_address: Vec<String>,
+    pub contract_number: String,
+    pub created_by: String,
+    pub modified_by: String,
+    /// `YYYY-MM-DD`, from the source's `YYYYMMDD hh:mm:ss`.
+    pub created: String,
+    pub modified: String,
+    /// What could not be read, with the reason (the other fields still came across).
+    pub warnings: Vec<String>,
+}
+
+impl SweProjectInfo {
+    /// The WiringCraft title-block fields these fill. Empty values are left out.
+    pub fn title_block(&self) -> BTreeMap<String, String> {
+        let fields = [
+            ("description", self.description.clone()),
+            ("customer", self.customer.clone()),
+            ("customer_address", self.customer_address.join(", ")),
+            ("drawing_office", self.drawing_office.clone()),
+            ("drawing_office_address", self.drawing_office_address.join(", ")),
+            ("project_number", self.contract_number.clone()),
+            ("drawn_by", self.created_by.clone()),
+            ("modified_by", self.modified_by.clone()),
+            ("date", self.created.clone()),
+            ("modified", self.modified.clone()),
+        ];
+        fields
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
+            .filter(|(_, v)| !v.is_empty())
+            .collect()
+    }
+}
+
+/// `YYYYMMDD hh:mm:ss` as `YYYY-MM-DD`; anything else is kept as written.
+fn source_date(s: &str) -> String {
+    let d = s.trim();
+    let day: String = d.chars().take(8).collect();
+    if !day.chars().all(|c| c.is_ascii_digit()) {
+        return d.to_owned();
+    }
+    match (day.get(..4), day.get(4..6), day.get(6..8)) {
+        (Some(y), Some(m), Some(dd)) => format!("{y}-{m}-{dd}"),
+        _ => d.to_owned(),
+    }
+}
+
+/// The fields of the project in archive folder `Projects/<directory>`, read from the archive's
+/// project list database. `Ok(None)` when the list has no row for it.
+pub fn project_info(conn: &Connection, directory: &str) -> Result<Option<SweProjectInfo>> {
+    let mut st = conn
+        .prepare(
+            "SELECT pro_id, COALESCE(CAST(pro_name AS TEXT), ''), COALESCE(CAST(pro_customername AS TEXT), ''), COALESCE(CAST(pro_custaddress1 AS TEXT), ''), \
+             COALESCE(CAST(pro_custaddress2 AS TEXT), ''), COALESCE(CAST(pro_custaddress3 AS TEXT), ''), COALESCE(CAST(pro_drawingofficename AS TEXT), ''), \
+             COALESCE(CAST(pro_doaddress1 AS TEXT), ''), COALESCE(CAST(pro_doaddress2 AS TEXT), ''), COALESCE(CAST(pro_doaddress3 AS TEXT), ''), \
+             COALESCE(CAST(pro_contractnb AS TEXT), ''), COALESCE(CAST(pro_createdby AS TEXT), ''), COALESCE(CAST(pro_modifiedby AS TEXT), ''), \
+             COALESCE(CAST(pro_creationdate AS TEXT), ''), COALESCE(CAST(pro_modificationdate AS TEXT), '') \
+             FROM tew_project WHERE TRIM(pro_directory) = ?1",
+        )
+        .map_err(sql)?;
+    // Address lines that are filled, trimmed.
+    let lines = |a: [String; 3]| -> Vec<String> {
+        a.into_iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let row = st
+        .query_row([directory.trim()], |r| {
+            let text = |i: usize| r.get::<_, String>(i).map(|s| s.trim().to_owned());
+            Ok((
+                r.get::<_, i64>(0)?,
+                SweProjectInfo {
+                    name: text(1)?,
+                    description: String::new(),
+                    customer: text(2)?,
+                    customer_address: lines([text(3)?, text(4)?, text(5)?]),
+                    drawing_office: text(6)?,
+                    drawing_office_address: lines([text(7)?, text(8)?, text(9)?]),
+                    contract_number: text(10)?,
+                    created_by: text(11)?,
+                    modified_by: text(12)?,
+                    created: source_date(&text(13)?),
+                    modified: source_date(&text(14)?),
+                    warnings: Vec::new(),
+                },
+            ))
+        })
+        .optional()
+        .map_err(sql)?;
+    let Some((id, mut info)) = row else {
+        return Ok(None);
+    };
+    // The description is a nice-to-have: without it the other fields still come across, and
+    // why it is missing is kept.
+    // Text rows that cannot be read are reported too (`texts` counts them with the reason).
+    match texts(conn, &mut info.warnings) {
+        Ok(mut t) => info.description = t.remove(&id).unwrap_or_default().trim().to_owned(),
+        Err(e) => info.warnings.push(format!("the project description was not read: {e}")),
+    }
+    Ok(Some(info))
 }
 
 /// A location (`tew_location`): a cabinet, room or panel.
@@ -233,6 +349,10 @@ pub struct ArchiveDatabase {
     /// How many projects the archive holds.
     pub count: usize,
     pub bytes: Vec<u8>,
+    /// The project's own fields from the archive's project list, when it has them.
+    pub info: Option<SweProjectInfo>,
+    /// Why the project's own fields could not be read, when they could not.
+    pub info_warning: Option<String>,
 }
 
 /// Take project number `pick` (counted from 1, in project folder order) out of an archive. Only
@@ -266,7 +386,43 @@ pub fn database_from_archive<R: Read + std::io::Seek>(reader: R, pick: usize) ->
         )));
     }
     let folder = name.rsplitn(3, '/').nth(2).unwrap_or_default().to_owned();
-    Ok(ArchiveDatabase { folder, count, bytes })
+    // The project's own fields live in the archive's project list, keyed by folder number.
+    let directory = folder.rsplit('/').next().unwrap_or_default().to_owned();
+    let (info, info_warning) = match read_project_list(&mut zip, &directory) {
+        Ok(info) => (info, None),
+        Err(e) => (
+            None,
+            Some(format!("the project's name, customer and dates were not read: {e}")),
+        ),
+    };
+    Ok(ArchiveDatabase {
+        folder,
+        count,
+        bytes,
+        info,
+        info_warning,
+    })
+}
+
+/// The archive's project list (`Database/tew_app_project.sqlite`), row for `directory`.
+fn read_project_list<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    directory: &str,
+) -> Result<Option<SweProjectInfo>> {
+    const LIST: &str = "Database/tew_app_project.sqlite";
+    let f = match zip.by_name(LIST) {
+        Ok(f) => f,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(Error::Format(format!("{LIST}: {e}"))),
+    };
+    let mut bytes = Vec::new();
+    f.take(MAX_DATABASE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::Format(format!("{LIST}: {e}")))?;
+    if bytes.len() as u64 > MAX_DATABASE_BYTES {
+        return Err(Error::Format(format!("{LIST} is too large")));
+    }
+    project_info(&open(&bytes)?, directory)
 }
 
 /// The project database paths in an archive, in project folder order.
@@ -313,10 +469,11 @@ fn texts(conn: &Connection, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, 
     let rows = st
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
         .map_err(sql)?;
-    // English sorts last, so it wins.
+    // English sorts last, so it wins. A blank translation (only tabs or line breaks, which SQL
+    // TRIM keeps) never replaces a real one.
     for (id, text) in readable(rows, "text", warnings) {
-        if let Some(t) = text {
-            out.insert(id, t);
+        if let Some(t) = text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            out.insert(id, t.to_owned());
         }
     }
     Ok(out)
@@ -989,6 +1146,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         pages: Vec::new(),
         devices: BTreeMap::new(),
         locations: Vec::new(),
+        title_block: p.info.as_ref().map(SweProjectInfo::title_block).unwrap_or_default(),
     };
     // Locations, with their descriptions. One without a usable tag path cannot be named.
     let mut locations_untagged = 0;
@@ -1654,7 +1812,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 (covers, "cover page(s)"),
                 (
                     others.saturating_sub(covers),
-                    "report, layout or other non-schematic page(s)",
+                    "report, layout or other non-schematic page(s) (WiringCraft makes its own reports)",
                 ),
             ]),
         },
@@ -1778,6 +1936,30 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             ]),
         },
     ];
+    // The project's own fields: which ones print, and which are only kept in the project.
+    let mut report = report;
+    if let Some(info) = &p.info {
+        let fields = info.title_block();
+        let printed = ["customer", "project_number", "drawn_by", "date"];
+        let kept: Vec<&str> = fields
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !printed.contains(k))
+            .collect();
+        report.push(Count {
+            what: "project fields",
+            source: fields.len(),
+            imported: fields.len(),
+            note: if kept.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{} kept in Project Properties but not printed on any page yet (the title block prints customer, project number, drawn by and date)",
+                    kept.join(", ")
+                )
+            },
+        });
+    }
     (built, warnings, report)
 }
 

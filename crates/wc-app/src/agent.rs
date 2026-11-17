@@ -22,6 +22,7 @@ use crate::actions::Action;
 use crate::screenshot::{self, Shot};
 use crate::state::{Open, Selection};
 use crate::{App, Dialog};
+use wc_agent::{Pending, Started};
 
 /// Instructions for the model. Kept fixed so the API can cache it with the tools.
 pub const SYSTEM: &str = "You are the assistant built into WiringCraft, an electrical schematic and wiring CAD \
@@ -90,6 +91,9 @@ pub struct Assistant {
     /// The latest screenshots of this conversation, for a request the assistant files.
     pub shared: Vec<Shot>,
     pub clipboard: screenshot::Clipboard,
+    /// The project folder and project when a `run_command` started on its worker thread, so
+    /// its end can tell the command's changes from the user's edits made meanwhile.
+    command_base: Option<(PathBuf, wc_core::Project)>,
 }
 
 impl Default for Assistant {
@@ -114,6 +118,7 @@ impl Assistant {
             sent: Vec::new(),
             shared: Vec::new(),
             clipboard: screenshot::Clipboard::default(),
+            command_base: None,
         }
     }
 
@@ -140,7 +145,15 @@ impl Assistant {
 
     /// Working on a message, with either backend.
     pub fn busy(&self) -> bool {
-        self.session.busy() || self.acp.as_ref().is_some_and(wc_agent::acp::Acp::busy)
+        self.session.busy()
+            || self.acp.as_ref().is_some_and(wc_agent::acp::Acp::busy)
+            || self.bridge.as_ref().is_some_and(wc_agent::bridge::Bridge::working)
+    }
+
+    /// A `run_command` is running on its worker thread. The window does not save meanwhile,
+    /// so whatever changes on disk is the command's.
+    pub fn command_running(&self) -> bool {
+        self.command_base.is_some()
     }
 }
 
@@ -790,6 +803,20 @@ impl wc_agent::Tools for AppTools<'_> {
         r
     }
 
+    fn start(&mut self, name: &str, input: &Value) -> Started {
+        let r = self.0.agent_start(name, input);
+        if matches!(r, Started::Done(_)) {
+            self.0.prune_selection();
+        }
+        r
+    }
+
+    fn finish(&mut self, name: &str, input: &Value, result: Result<String, String>) -> Result<String, String> {
+        let r = self.0.agent_finish(name, input, result);
+        self.0.prune_selection();
+        r
+    }
+
     fn describe(&self, name: &str, input: &Value) -> String {
         let page = s(input, "page").map(|p| format!(" on page {p}")).unwrap_or_default();
         match name {
@@ -1316,8 +1343,13 @@ impl App {
                     msg
                 })
             }
-            "run_command" => self.tool_command(v),
-            "todo" => self.tool_todo(v),
+            "run_command" | "todo" => match self.agent_start(name, v) {
+                Started::Done(r) => r,
+                Started::Running(p) => {
+                    let r = p.wait();
+                    self.agent_finish(name, v, r)
+                }
+            },
             other => Err(format!("Unknown tool {other}.")),
         }
     }
@@ -1893,23 +1925,49 @@ impl App {
         }
     }
 
-    /// Search the todo list, or put a request on it.
-    fn tool_todo(&mut self, v: &Value) -> Result<String, String> {
-        use crate::feedback::{self, Kind, Request};
-        match need_s(v, "action")? {
-            "search" => feedback::search(need_s(v, "query")?),
-            "file" => {
-                let kind = Kind::parse(need_s(v, "kind")?).ok_or("`kind` is problem, function or missing.")?;
-                let r = Request {
-                    title: need_s(v, "title")?.trim().to_owned(),
-                    what: need_s(v, "what")?.trim().to_owned(),
-                    detail: s(v, "detail").unwrap_or_default().trim().to_owned(),
-                    done: s(v, "done").unwrap_or_default().trim().to_owned(),
-                };
-                if r.title.is_empty() || r.what.is_empty() {
-                    return Err("`title` and `what` must not be empty.".into());
+    /// Start a tool. Tools that wait on another program (`run_command`, and the `todo` tool's
+    /// `gh` calls) run on a worker thread, so the window keeps drawing; [`App::agent_finish`]
+    /// applies their result on the window thread. Every other tool runs here and now.
+    pub(crate) fn agent_start(&mut self, name: &str, v: &Value) -> Started {
+        match name {
+            "run_command" => match self.command_start(v) {
+                Ok(p) => Started::Running(p),
+                Err(e) => Started::Done(Err(e)),
+            },
+            "todo" => self.todo_start(v),
+            _ => Started::Done(self.agent_tool(name, v)),
+        }
+    }
+
+    /// Complete a tool that [`App::agent_start`] sent to a worker thread.
+    pub(crate) fn agent_finish(&mut self, name: &str, v: &Value, r: Result<String, String>) -> Result<String, String> {
+        match name {
+            "run_command" => self.command_finish(r),
+            "todo" => self.todo_finish(v, r),
+            _ => r,
+        }
+    }
+
+    /// Search the todo list, or put a request on it. The `gh` calls run on a worker thread.
+    fn todo_start(&mut self, v: &Value) -> Started {
+        use crate::feedback;
+        let action = match need_s(v, "action") {
+            Ok(a) => a,
+            Err(e) => return Started::Done(Err(e)),
+        };
+        match action {
+            "search" => match need_s(v, "query") {
+                Ok(q) => {
+                    let q = q.to_owned();
+                    Started::Running(Pending::spawn(move || feedback::search(&q)))
                 }
-                let confirmed = v["confirmed"].as_bool().unwrap_or(false);
+                Err(e) => Started::Done(Err(e)),
+            },
+            "file" => {
+                let (kind, r, confirmed) = match todo_request(v) {
+                    Ok(x) => x,
+                    Err(e) => return Started::Done(Err(e)),
+                };
                 // gh cannot attach pictures, so with a screenshot the form opens and the latest
                 // screenshot goes on the clipboard, ready to paste into it.
                 if let Some(shot) = self.assistant.shared.last().cloned() {
@@ -1922,76 +1980,148 @@ impl App {
                         }
                         Err(_) => "Opened the request on GitHub; drag the screenshot into its Screenshots box.".into(),
                     };
-                    return Ok(match pasted {
+                    return Started::Done(Ok(match pasted {
                         Ok(()) => "Opened the filled-in form in the user's browser and put the latest screenshot on their clipboard. Tell them to click the form's Screenshots box, press Ctrl+V (Cmd+V on a Mac), then Submit.".into(),
                         Err(e) => format!("Opened the filled-in form in the user's browser. The screenshot could not go on the clipboard ({e}); tell them to drag their screenshot file into the form's Screenshots box, then Submit."),
-                    });
+                    }));
                 }
-                if confirmed && feedback::gh_ready() {
-                    let url = feedback::file(kind, &r)?;
-                    self.ed.message = format!("Filed {url}");
-                    return Ok(format!("Filed on the todo list: {url}"));
+                if confirmed {
+                    return Started::Running(Pending::spawn(move || {
+                        if feedback::gh_ready() {
+                            feedback::file(kind, &r)
+                        } else {
+                            Ok(GH_NOT_READY.to_owned())
+                        }
+                    }));
                 }
-                self.open_url.push(feedback::form_url(kind, &r));
-                self.ed.message = "Opened a filled-in request on GitHub in your browser.".into();
-                Ok(
-                    "Opened the filled-in form in the user's browser; it is on the todo list once they press Submit."
-                        .into(),
-                )
+                Started::Done(self.todo_open_form(kind, &r))
             }
-            other => Err(format!("Unknown action {other:?} (search, file).")),
+            other => Started::Done(Err(format!("Unknown action {other:?} (search, file)."))),
         }
     }
 
-    fn tool_command(&mut self, v: &Value) -> Result<String, String> {
+    /// The `todo` tool's `gh` call is done: note a filed request, or open the form when `gh`
+    /// could not be used.
+    fn todo_finish(&mut self, v: &Value, r: Result<String, String>) -> Result<String, String> {
+        if s(v, "action") != Some("file") {
+            return r;
+        }
+        let url = r?;
+        if url == GH_NOT_READY {
+            let (kind, req, _) = todo_request(v)?;
+            return self.todo_open_form(kind, &req);
+        }
+        self.ed.message = format!("Filed {url}");
+        Ok(format!("Filed on the todo list: {url}"))
+    }
+
+    fn todo_open_form(&mut self, kind: crate::feedback::Kind, r: &crate::feedback::Request) -> Result<String, String> {
+        self.open_url.push(crate::feedback::form_url(kind, r));
+        self.ed.message = "Opened a filled-in request on GitHub in your browser.".into();
+        Ok("Opened the filled-in form in the user's browser; it is on the todo list once they press Submit.".into())
+    }
+
+    /// Save the project, then start the `wiringcraft` command on a worker thread.
+    fn command_start(&mut self, v: &Value) -> Result<Pending, String> {
         let args = strings(v, "args");
         if args.is_empty() {
             return Err("`args` is empty.".into());
         }
         let bin = cli_path();
         let mut cmd = std::process::Command::new(&bin);
+        self.assistant.command_base = None;
         if let Some(open) = self.open.as_mut() {
             if open.dirty {
                 open.save()
                     .map_err(|e| format!("Saving before the command failed: {e}"))?;
             }
             cmd.arg("-C").arg(&open.dir);
+            self.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
         }
-        let out = cmd
-            .args(&args)
-            .output()
-            .map_err(|e| format!("Could not run {}: {e}", bin.display()))?;
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        let err = String::from_utf8_lossy(&out.stderr);
-        if !err.trim().is_empty() {
-            text.push_str(&format!("\n[stderr]\n{err}"));
-        }
-        self.reload_from_disk()?;
-        let text = clip_text(text, 30_000);
-        if out.status.success() {
-            Ok(if text.trim().is_empty() { "Done.".into() } else { text })
-        } else {
-            Err(format!("The command failed ({}):\n{text}", out.status))
-        }
+        cmd.args(&args);
+        Ok(Pending::spawn(move || {
+            let out = cmd
+                .output()
+                .map_err(|e| format!("Could not run {}: {e}", bin.display()))?;
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.trim().is_empty() {
+                text.push_str(&format!("\n[stderr]\n{err}"));
+            }
+            let text = clip_text(text, 30_000);
+            if out.status.success() {
+                Ok(if text.trim().is_empty() { "Done.".into() } else { text })
+            } else {
+                Err(format!("The command failed ({}):\n{text}", out.status))
+            }
+        }))
     }
 
-    /// Read the open project again after something changed its files, as one undo step.
-    fn reload_from_disk(&mut self) -> Result<(), String> {
+    /// The command is done: read what it changed. The window does not save while a command
+    /// runs, so a change on disk is the command's. Edits the user made in the window meanwhile
+    /// always win: if both changed the project, the command's changes are not loaded and the
+    /// answer says so, so the assistant can ask before running it again.
+    fn command_finish(&mut self, r: Result<String, String>) -> Result<String, String> {
+        let base = self.assistant.command_base.take();
         let Some(open) = self.open.as_mut() else {
-            return Ok(());
+            return r;
         };
+        let Some((dir, base)) = base else {
+            return r;
+        };
+        if open.dir != dir {
+            // Another project was opened meanwhile; the command worked on the old one.
+            return r;
+        }
         let fresh = Open::load(&open.dir)?;
-        if fresh.project != open.project {
+        // Symbols the command added or changed come in; symbols the window vendored meanwhile
+        // (not saved yet, so not on disk) stay.
+        open.symbols.extend(fresh.symbols);
+        open.branch = fresh.branch;
+        let by_command = fresh.project != base;
+        let by_window = open.project != base;
+        let mut note = None;
+        if by_command && by_window {
+            note = Some(
+                "The project was edited in the window while the command ran, so the command's changes were \
+                 not loaded: the window's edits are kept, and saving writes them over the command's result.",
+            );
+        } else if by_command {
             open.checkpoint();
             open.project = fresh.project;
             open.dirty = false;
         }
-        open.symbols = fresh.symbols;
-        open.branch = fresh.branch;
         open.refresh_library();
         self.prune_selection();
-        Ok(())
+        match note {
+            Some(n) => {
+                self.ed.message = n.into();
+                Err(match r {
+                    Ok(t) | Err(t) => format!("{t}\n\n{n} Ask the user before running it again."),
+                })
+            }
+            None => r,
+        }
     }
+}
+
+/// What the worker answers when `gh` cannot be used, so the form opens instead.
+const GH_NOT_READY: &str = "\u{0}gh not ready";
+
+/// The `todo` tool's request to file: its kind, text, and whether the user confirmed it.
+fn todo_request(v: &Value) -> Result<(crate::feedback::Kind, crate::feedback::Request, bool), String> {
+    use crate::feedback::{Kind, Request};
+    let kind = Kind::parse(need_s(v, "kind")?).ok_or("`kind` is problem, function or missing.")?;
+    let r = Request {
+        title: need_s(v, "title")?.trim().to_owned(),
+        what: need_s(v, "what")?.trim().to_owned(),
+        detail: s(v, "detail").unwrap_or_default().trim().to_owned(),
+        done: s(v, "done").unwrap_or_default().trim().to_owned(),
+    };
+    if r.title.is_empty() || r.what.is_empty() {
+        return Err("`title` and `what` must not be empty.".into());
+    }
+    Ok((kind, r, v["confirmed"].as_bool().unwrap_or(false)))
 }
 
 fn stem(p: &Path) -> String {
@@ -2397,5 +2527,101 @@ mod tests {
         assert_eq!(page2(&a).symbols.len(), 2, "the command's change is loaded back");
         let help = call(&mut a, "run_command", json!({"args": ["--help"]})).unwrap();
         assert!(help.contains("plc-vars"));
+    }
+
+    /// Start `run_command` (it fails fast when the command-line program is not built, which is
+    /// fine here), let `meanwhile` act as the window and the command, then finish it.
+    fn command_around(a: &mut App, meanwhile: impl FnOnce(&mut App)) -> Result<String, String> {
+        let args = json!({"args": ["--help"]});
+        let started = a.agent_start("run_command", &args);
+        assert!(
+            matches!(started, Started::Running(_)),
+            "run_command should run on a worker thread"
+        );
+        let Started::Running(p) = started else {
+            return Err("not started".into());
+        };
+        meanwhile(a);
+        let r = p.wait();
+        a.agent_finish("run_command", &args, r)
+    }
+
+    fn customer(a: &App) -> Option<String> {
+        a.open.as_ref()?.project.meta.title_block.get("customer").cloned()
+    }
+
+    /// The command writes a customer into the project on disk, as `wiringcraft` would.
+    fn command_writes_customer(a: &App, name: &str) {
+        let mut disk = Open::load(&a.open.as_ref().unwrap().dir).unwrap();
+        disk.project.meta.title_block.insert("customer".into(), name.into());
+        disk.dirty = true;
+        disk.save().unwrap();
+    }
+
+    #[test]
+    fn a_command_does_not_hold_up_the_window() {
+        let (_tmp, mut a) = app(vec![]);
+        let started = std::time::Instant::now();
+        let r = command_around(&mut a, |a| {
+            // The window thread is free while the command runs: it can still edit.
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            call(a, "set_project", json!({"title_block": {"customer": "Window"}})).unwrap();
+        });
+        // The command left the project alone, so the edit made meanwhile stays.
+        assert_eq!(customer(&a).as_deref(), Some("Window"), "{r:?}");
+    }
+
+    #[test]
+    fn a_command_s_changes_are_read_back() {
+        let (_tmp, mut a) = app(vec![]);
+        let r = command_around(&mut a, |a| command_writes_customer(a, "Disk"));
+        assert_eq!(customer(&a).as_deref(), Some("Disk"));
+        assert!(!format!("{r:?}").contains("not loaded"));
+    }
+
+    #[test]
+    fn when_both_changed_the_project_the_window_s_edits_win() {
+        let (_tmp, mut a) = app(vec![]);
+        let r = command_around(&mut a, |a| {
+            call(a, "set_project", json!({"title_block": {"customer": "Window"}})).unwrap();
+            command_writes_customer(a, "Disk");
+        });
+        assert_eq!(customer(&a).as_deref(), Some("Window"));
+        assert!(
+            a.open.as_ref().unwrap().dirty,
+            "the window's edits are still to be saved"
+        );
+        let e = r.unwrap_err();
+        assert!(e.contains("not loaded"), "{e}");
+    }
+
+    #[test]
+    fn the_window_does_not_save_while_a_command_runs() {
+        let (_tmp, mut a) = app(vec![]);
+        let r = command_around(&mut a, |a| {
+            assert!(a.assistant.command_running());
+            call(a, "set_project", json!({"title_block": {"customer": "First"}})).unwrap();
+            let _ = call(a, "run_action", json!({"action": "Save"}));
+            let dir = a.open.as_ref().unwrap().dir.clone();
+            let disk = Open::load(&dir).unwrap();
+            assert_eq!(disk.project.meta.title_block.get("customer"), None, "nothing saved");
+            call(a, "set_project", json!({"title_block": {"customer": "Second"}})).unwrap();
+        });
+        // A read-only command: the latest window edit stays, with no conflict reported.
+        assert_eq!(customer(&a).as_deref(), Some("Second"));
+        assert!(!format!("{r:?}").contains("not loaded"), "{r:?}");
+        assert!(!a.assistant.command_running());
+    }
+
+    #[test]
+    fn todo_searches_run_on_a_worker_thread() {
+        let (_tmp, mut a) = app(vec![]);
+        let v = json!({"action": "search", "query": "relay"});
+        assert!(matches!(a.agent_start("todo", &v), Started::Running(_)));
+        // Bad input is answered straight away.
+        assert!(matches!(
+            a.agent_start("todo", &json!({"action": "file"})),
+            Started::Done(Err(_))
+        ));
     }
 }
