@@ -20,6 +20,7 @@ use wc_core::{Page, Project, store};
 use wc_share::discovery::{Announcer, Beacon, Browser};
 use wc_share::net::{self, Listener};
 use wc_share::transport::{GuestLink, Hub};
+use wc_share::{ChangeInfo, ChangeKind, redo_target, undo_target};
 use wc_share::{GitJournal, Guest, GuestMsg, GuestStatus, HOST, Host, Peer, PeerId, ProjectEdit, apply_edit};
 
 use crate::state::Open;
@@ -168,6 +169,154 @@ pub fn outgoing(
     out
 }
 
+/// Parts changed both in this window and in the session since the last sync (`base`): the
+/// session's version wins on them, in `local` and in `base`, so what is sent next is not built
+/// on content an undo has just put back. A part is a page (also one removed on either side),
+/// the project properties, one device, the comments of one page, or one panel; a change to a
+/// part the session did not touch is kept and sent as usual. Returns the parts whose local
+/// change was dropped, named for the person.
+pub fn yield_to_session(local: &mut Project, base: &mut Project, auth: &Project) -> Vec<String> {
+    let mut dropped = Vec::new();
+
+    if local.meta != base.meta && auth.meta != base.meta {
+        dropped.push("the project properties".to_owned());
+        local.meta = auth.meta.clone();
+        base.meta = auth.meta.clone();
+    }
+
+    // Pages, by id, including one this window removed or the session removed.
+    let ids: Vec<String> = base.pages.iter().map(|p| p.id.clone()).collect();
+    for id in ids {
+        let Some(pos) = base.pages.iter().position(|p| p.id == id) else {
+            continue;
+        };
+        // The number on its own: both gave the page another number, the session's stays.
+        if let (Some(a), Some(l)) = (auth.page(&id), local.page_mut(&id)) {
+            let was = &base.pages[pos].number;
+            if a.number != *was && l.number != *was && l.number != a.number {
+                dropped.push(format!("the number of page {was}"));
+                l.number = a.number.clone();
+                base.pages[pos].number = a.number.clone();
+            }
+        }
+        let b = &base.pages[pos];
+        let a = auth.page(&id);
+        let l = local.page(&id);
+        let differs = |x: Option<&Page>| x.is_none_or(|x| !same_content(x, b));
+        // A renumbering goes out on its own, so a content change here does not clash with
+        // one; a page removed here does, as removing it would take the number back too.
+        let session_changed = match l {
+            Some(_) => differs(a),
+            None => a != Some(b),
+        };
+        if !session_changed || !differs(l) {
+            continue;
+        }
+        dropped.push(format!("page {}", b.number));
+        match a {
+            Some(a) => {
+                match local.page_mut(&id) {
+                    // A number only this window changed goes out on its own, as a renumbering.
+                    Some(p) => {
+                        let number = if p.number != b.number {
+                            p.number.clone()
+                        } else {
+                            a.number.clone()
+                        };
+                        *p = a.clone();
+                        p.number = number;
+                    }
+                    None => {
+                        let at = pos.min(local.pages.len());
+                        local.pages.insert(at, a.clone());
+                    }
+                }
+                base.pages[pos] = a.clone();
+            }
+            None => {
+                local.pages.retain(|p| p.id != id);
+                base.pages.remove(pos);
+            }
+        }
+    }
+
+    // Devices, by tag.
+    let tags: std::collections::BTreeSet<_> = base.devices.keys().chain(auth.devices.keys()).cloned().collect();
+    for tag in tags {
+        let b = base.devices.get(&tag);
+        let a = auth.devices.get(&tag);
+        if a == b || local.devices.get(&tag) == b {
+            continue;
+        }
+        dropped.push(format!("device {tag}"));
+        match a.cloned() {
+            Some(d) => {
+                local.devices.insert(tag.clone(), d.clone());
+                base.devices.insert(tag, d);
+            }
+            None => {
+                local.devices.remove(&tag);
+                base.devices.remove(&tag);
+            }
+        }
+    }
+
+    // Comments, by page.
+    let pages: std::collections::BTreeSet<String> = base
+        .comments
+        .iter()
+        .chain(&auth.comments)
+        .map(|c| c.page.clone())
+        .collect();
+    for page in pages {
+        let of = |p: &Project| {
+            p.comments
+                .iter()
+                .filter(|c| c.page == page)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = (of(auth), of(base));
+        if a == b || of(local) == b {
+            continue;
+        }
+        dropped.push(format!("the comments on page {}", number_of(auth, &page)));
+        for p in [&mut *local, &mut *base] {
+            p.comments.retain(|c| c.page != page);
+            p.comments.extend(a.iter().cloned());
+        }
+    }
+
+    // Panels, by id.
+    let ids: std::collections::BTreeSet<String> =
+        base.panels.iter().chain(&auth.panels).map(|p| p.id.clone()).collect();
+    for id in ids {
+        let find = |p: &Project| p.panels.iter().find(|x| x.id == id).cloned();
+        let (a, b) = (find(auth), find(base));
+        if a == b || find(local) == b {
+            continue;
+        }
+        let name = a.as_ref().or(b.as_ref()).map_or_else(|| id.clone(), |p| p.name.clone());
+        dropped.push(format!("panel {name}"));
+        for p in [&mut *local, &mut *base] {
+            match (&a, p.panels.iter().position(|x| x.id == id)) {
+                (Some(a), Some(i)) => p.panels[i] = a.clone(),
+                (Some(a), None) => p.panels.push(a.clone()),
+                (None, Some(i)) => {
+                    p.panels.remove(i);
+                }
+                (None, None) => {}
+            }
+        }
+    }
+    dropped
+}
+
+/// A page's number for a message, or its id when the page is gone.
+fn number_of(p: &Project, page: &str) -> String {
+    p.page(page).map_or_else(|| page.to_owned(), |p| p.number.clone())
+}
+
 /// Make `local` the session's project `auth`, changing only what differs. The symbol lock stays
 /// local: each person's copy keeps its own symbol files. Returns whether anything changed.
 pub fn incoming(local: &mut Project, auth: &Project) -> bool {
@@ -255,6 +404,14 @@ impl Role {
         match self {
             Role::Host(h) => Some(h.host.project()),
             Role::Guest(j) => j.guest.project.as_ref(),
+        }
+    }
+
+    /// Whether an undo, redo or revert of this person's is still on its way to the host.
+    fn taking_back(&self) -> bool {
+        match self {
+            Role::Host(_) => false,
+            Role::Guest(j) => j.guest.taking_back(),
         }
     }
 
@@ -378,6 +535,46 @@ impl Role {
         }
     }
 
+    fn history(&self) -> Vec<ChangeInfo> {
+        match self {
+            Role::Host(h) => h.host.history(),
+            Role::Guest(j) => j.guest.history.clone(),
+        }
+    }
+
+    /// Undo, redo, or take back one change from the list (`Some(id)` with `redo` false).
+    /// Ask for a change to be taken back. The host answers at once, so its refusal comes back
+    /// here; a guest's request is answered with a later sync.
+    fn take_back(&mut self, redo: bool, change: Option<u64>, notes: &mut Vec<String>) -> Result<(), String> {
+        match self {
+            Role::Host(h) => {
+                let result = match (redo, change) {
+                    (_, Some(id)) => h.host.revert(id),
+                    (true, None) => h.host.redo(),
+                    (false, None) => h.host.undo(),
+                };
+                h.hub.flush(&mut h.host);
+                result.map_err(|e| {
+                    let e = format!("Nothing was taken back: {e}");
+                    notes.push(e.clone());
+                    e
+                })
+            }
+            Role::Guest(j) => {
+                let msg = match (redo, change) {
+                    (_, Some(id)) => j.guest.revert(id),
+                    (true, None) => j.guest.redo(),
+                    (false, None) => j.guest.undo(),
+                };
+                j.link.send(msg).map_err(|_| {
+                    let e = "The connection to the host closed.".to_owned();
+                    notes.push(e.clone());
+                    e
+                })
+            }
+        }
+    }
+
     /// Leave (a guest) or end (the host) the session.
     fn stop(&mut self) {
         match self {
@@ -451,11 +648,24 @@ pub struct Share {
     form: Option<Form>,
     /// Messages for the status line, oldest first.
     notes: Vec<String>,
+    /// An undo, redo or revert was asked for since the last sync: its restoration wins over
+    /// local changes made in the meantime to the same pages.
+    took_back: bool,
 }
 
 impl Share {
     pub fn active(&self) -> bool {
         self.role.is_some()
+    }
+
+    /// While an assistant command owns the project folder, a host refuses guests' Undo, Redo
+    /// and "Undo this change": each would write the folder through the session's history.
+    pub fn set_command_running(&mut self, running: bool) {
+        if let Some(Role::Host(h)) = self.role.as_mut() {
+            h.host.hold_take_backs(running.then(|| {
+                "the host's assistant is running a command on the project; try again once it has finished".to_owned()
+            }));
+        }
     }
 
     /// Show the share form, or the session window when a session is running.
@@ -478,6 +688,56 @@ impl Share {
                 Err(e) => form.browse_error = Some(e.to_string()),
             }
         }
+    }
+
+    /// Whether Undo in the session has a change of this person's to take back.
+    pub fn can_undo(&self) -> bool {
+        self.role
+            .as_ref()
+            .and_then(|r| Some(undo_target(&r.history(), r.me()?)))
+            .is_some_and(|t| t.is_some())
+    }
+
+    /// Whether this window hosts the session.
+    pub fn is_host(&self) -> bool {
+        matches!(self.role, Some(Role::Host(_)))
+    }
+
+    /// Whether Redo in the session has an undo of this person's to take back.
+    pub fn can_redo(&self) -> bool {
+        self.role
+            .as_ref()
+            .and_then(|r| Some(redo_target(&r.history(), r.me()?)))
+            .is_some_and(|t| t.is_some())
+    }
+
+    /// Take back this person's own last change in the session. The host puts back only the
+    /// parts that change touched, so other people's work stays; the result reaches this
+    /// window with the next frame's sync.
+    pub fn undo(&mut self) -> Result<(), String> {
+        self.take_back(false, None)
+    }
+
+    /// Take back this person's own last undo in the session.
+    pub fn redo(&mut self) -> Result<(), String> {
+        self.take_back(true, None)
+    }
+
+    /// Take back one change from the session's list, also someone else's.
+    pub fn revert(&mut self, change: u64) -> Result<(), String> {
+        self.take_back(false, Some(change))
+    }
+
+    fn take_back(&mut self, redo: bool, change: Option<u64>) -> Result<(), String> {
+        let role = self.role.as_mut().ok_or("Not in a shared session.")?;
+        // Changes made since wait in the window until the first answer is back: a second undo
+        // sent now would reach the host ahead of them and take back an older change instead.
+        if role.taking_back() {
+            return Err("Your last undo is still on its way to the session; try again once it has come back.".into());
+        }
+        role.take_back(redo, change, &mut self.notes)?;
+        self.took_back = true;
+        Ok(())
     }
 
     pub fn take_notes(&mut self) -> Vec<String> {
@@ -577,6 +837,7 @@ impl Share {
         }
         self.base = None;
         self.opened = None;
+        self.took_back = false;
         if self.view == View::Status {
             self.view = View::Closed;
         }
@@ -625,7 +886,9 @@ impl Share {
             return None;
         }
         role.project()?;
-        if busy {
+        // Until the host's answer to an undo is here, a page built from this copy would still
+        // hold what the undo puts back: changes wait in the window, unsent.
+        if busy || role.taking_back() {
             return None;
         }
         // Open the shown page in the session; a page someone else held is asked for again once
@@ -642,6 +905,17 @@ impl Share {
             self.asked_at = Some(std::time::Instant::now());
         }
         let base = self.base.get_or_insert_with(|| open.project.clone());
+        if std::mem::take(&mut self.took_back)
+            && let Some(auth) = role.project()
+        {
+            let lost = yield_to_session(&mut open.project, base, auth);
+            if !lost.is_empty() {
+                self.notes.push(format!(
+                    "Your change to {} was not kept: the session changed it while your undo was on its way.",
+                    lost.join(", ")
+                ));
+            }
+        }
         let mine = page.as_deref().filter(|p| role.holds(p));
         let me = role.me().unwrap_or(HOST);
         let mut out = outgoing(&open.project, base, mine, &role.locks(), me);
@@ -680,13 +954,27 @@ impl Share {
     }
 
     /// The session windows: the share and join forms, the participants, and join requests.
-    pub fn windows(&mut self, ctx: &egui::Context, open: Option<&mut Open>) {
+    /// `busy`: an assistant command owns the project files, so nothing is taken back now.
+    pub fn windows(&mut self, ctx: &egui::Context, open: Option<&mut Open>, busy: bool) {
         self.requests(ctx);
         match self.view {
             View::Closed => {}
             View::Share => self.share_window(ctx, open),
             View::Join => self.join_window(ctx),
-            View::Status => self.status_window(ctx),
+            View::Status => self.status_window(ctx, busy),
+        }
+    }
+
+    /// "Undo this change" from the session window. Refused while an assistant command owns the
+    /// project files: the host's restore writes them. A refusal goes to the notes.
+    pub(crate) fn ask_revert(&mut self, change: u64, busy: bool) {
+        let r = if busy {
+            Err("Undo waits until the assistant's command has finished.".to_owned())
+        } else {
+            self.revert(change)
+        };
+        if let Err(e) = r {
+            self.notes.push(e);
         }
     }
 
@@ -840,13 +1128,15 @@ impl Share {
         }
     }
 
-    fn status_window(&mut self, ctx: &egui::Context) {
+    fn status_window(&mut self, ctx: &egui::Context, busy: bool) {
         let Some(role) = self.role.as_ref() else {
             self.view = View::Closed;
             return;
         };
         let mut keep = true;
         let mut stop = false;
+        let mut revert = None;
+        let history = role.history();
         let pages: BTreeMap<String, String> = role
             .project()
             .map(|p| p.pages.iter().map(|pg| (pg.id.clone(), pg.number.clone())).collect())
@@ -886,12 +1176,43 @@ impl Share {
                     ui.label(format!("{}{you}{page}", p.name));
                 }
                 ui.separator();
+                ui.label(RichText::new("Changes").strong());
+                if history.is_empty() {
+                    ui.label("No changes yet.");
+                }
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    for c in history.iter().rev() {
+                        ui.horizontal(|ui| {
+                            let text = format!("{} · {}", c.name, c.message);
+                            if c.undone_by.is_some() {
+                                ui.label(RichText::new(text).strikethrough().weak());
+                            } else {
+                                ui.label(text);
+                                let tip = match c.kind {
+                                    ChangeKind::Edit => "Put back what this change touched, for everyone",
+                                    _ => "Take this undo or redo back, for everyone",
+                                };
+                                let button = ui
+                                    .add_enabled(!busy, egui::Button::new("Undo this change").small())
+                                    .on_hover_text(tip)
+                                    .on_disabled_hover_text("Waits until the assistant's command has finished");
+                                if button.clicked() {
+                                    revert = Some(c.id);
+                                }
+                            }
+                        });
+                    }
+                });
+                ui.separator();
                 let label = match role {
                     Role::Host(_) => "Stop sharing",
                     Role::Guest(_) => "Leave",
                 };
                 stop = ui.button(label).clicked();
             });
+        if let Some(id) = revert {
+            self.ask_revert(id, busy);
+        }
         if stop {
             self.stop();
         } else if !keep {

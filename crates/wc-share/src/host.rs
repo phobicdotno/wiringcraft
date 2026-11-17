@@ -6,6 +6,7 @@ use wc_core::{Page, Project};
 
 use crate::protocol::check_edit;
 use crate::{Change, GuestMsg, HostMsg, Journal, Peer, PeerId, ProjectEdit, Refusal, Snapshot, apply_edit};
+use crate::{ChangeInfo, ChangeKind, Parts, redo_target, undo_target};
 
 /// The host's own participant id.
 pub const HOST: PeerId = 0;
@@ -46,6 +47,20 @@ pub struct Host {
     journal: Box<dyn Journal>,
     /// Changes that could not be recorded (and so were undone), with the reason.
     journal_errors: Vec<(Change, String)>,
+    /// The recorded changes, oldest first, with what each changed, for undo.
+    history: Vec<Entry>,
+    next_change: u64,
+    /// Why guests' Undo, Redo and "Undo this change" are refused for now, if they are: the
+    /// host's project folder belongs to something else meanwhile (an assistant command).
+    take_backs_held: Option<String>,
+}
+
+/// A recorded change and the parts of the project it changed, before and after.
+#[derive(Debug, Clone)]
+struct Entry {
+    info: ChangeInfo,
+    before: Parts,
+    after: Parts,
 }
 
 /// Keep a name or email usable in a git author line (`Name <email>`).
@@ -83,6 +98,9 @@ impl Host {
             outbox: Vec::new(),
             journal,
             journal_errors: Vec::new(),
+            history: Vec::new(),
+            next_change: 1,
+            take_backs_held: None,
         }
     }
 
@@ -166,6 +184,7 @@ impl Host {
             project: Box::new(Snapshot::from(&self.project)),
             locks: self.locks.clone(),
             peers: self.peers(),
+            history: self.history(),
         };
         self.outbox.push((id, welcome));
         self.broadcast_presence_except(id);
@@ -212,6 +231,33 @@ impl Host {
         self.do_edit_project(HOST, edit)
     }
 
+    /// The session's recorded changes, oldest first (at most [`crate::MAX_HISTORY`]).
+    pub fn history(&self) -> Vec<ChangeInfo> {
+        self.history.iter().map(|e| e.info.clone()).collect()
+    }
+
+    /// The host's own user takes back their last change. Only the parts that change touched
+    /// are put back, so other people's work stays.
+    pub fn undo(&mut self) -> Result<(), Refusal> {
+        self.do_undo(HOST)
+    }
+
+    /// The host's own user takes back their last undo.
+    pub fn redo(&mut self) -> Result<(), Refusal> {
+        self.do_redo(HOST)
+    }
+
+    /// The host's own user takes back one change from the list, whoever made it.
+    pub fn revert(&mut self, change: u64) -> Result<(), Refusal> {
+        self.do_revert(HOST, change, ChangeKind::Undo)
+    }
+
+    /// Refuse guests' Undo, Redo and "Undo this change" with `reason` while it is set; `None`
+    /// takes them again.
+    pub fn hold_take_backs(&mut self, reason: Option<String>) {
+        self.take_backs_held = reason;
+    }
+
     /// Handle one message from a guest. A refusal is also sent back to that guest.
     pub fn receive(&mut self, from: PeerId, msg: GuestMsg) -> Result<(), Refusal> {
         if from == HOST {
@@ -222,6 +268,7 @@ impl Host {
         let Some(status) = self.peers.get(&from).map(|p| p.status.clone()) else {
             return Err(Refusal::NotApproved);
         };
+        let take_back = matches!(msg, GuestMsg::Undo | GuestMsg::Redo | GuestMsg::Revert { .. });
         let result = match (status, msg) {
             (Status::Connected, GuestMsg::Join { name, email }) => {
                 if let Some(p) = self.peers.get_mut(&from) {
@@ -258,6 +305,16 @@ impl Host {
                 result
             }
             (Status::Joined, GuestMsg::EditProject { edit }) => self.do_edit_project(from, edit),
+            (Status::Joined, GuestMsg::Undo | GuestMsg::Redo | GuestMsg::Revert { .. })
+                if self.take_backs_held.is_some() =>
+            {
+                Err(Refusal::Invalid {
+                    reason: self.take_backs_held.clone().unwrap_or_default(),
+                })
+            }
+            (Status::Joined, GuestMsg::Undo) => self.do_undo(from),
+            (Status::Joined, GuestMsg::Redo) => self.do_redo(from),
+            (Status::Joined, GuestMsg::Revert { change }) => self.do_revert(from, change, ChangeKind::Undo),
             _ => Err(Refusal::NotApproved),
         };
         if let Err(refusal) = &result {
@@ -265,6 +322,7 @@ impl Host {
                 from,
                 HostMsg::Refused {
                     refusal: refusal.clone(),
+                    take_back,
                 },
             ));
         }
@@ -324,7 +382,7 @@ impl Host {
         }
         let before = std::mem::replace(current, page.clone());
         let message = format!("Edit page {} {}", page.number, page.title);
-        if let Err(refusal) = self.record(by, Some(page.id.clone()), message) {
+        if let Err(refusal) = self.record(by, Some(page.id.clone()), message.clone()) {
             if let Some(p) = self.project.page_mut(&page.id) {
                 *p = before;
             }
@@ -333,22 +391,39 @@ impl Host {
         }
         // Everyone gets the page, the author too: a refusal of an earlier edit sent the author
         // the old page, and this puts the accepted one back after it, in order.
+        let id = page.id.clone();
+        let parts = |p: Page| Parts {
+            pages: [(id.clone(), Some(p))].into(),
+            ..Parts::default()
+        };
+        let (before, after) = (parts(before), parts(page.clone()));
         self.send_others(HOST, HostMsg::PageChanged { page, by });
+        self.remember(by, Some(id.clone()), message, ChangeKind::Edit, None, before, after);
         Ok(())
     }
 
     fn do_edit_project(&mut self, by: PeerId, edit: ProjectEdit) -> Result<(), Refusal> {
+        // A restore is made only by the host's own undo (`do_revert`), after it checked that
+        // every part is still as the undone change left it.
+        if matches!(edit, ProjectEdit::Restore { .. }) {
+            return Err(Refusal::Invalid {
+                reason: "a restore comes only from Undo; use Undo or \"Undo this change\"".into(),
+            });
+        }
         check_edit(&self.project, &self.locks, by, &edit)?;
         let before = self.project.clone();
         apply_edit(&mut self.project, &edit);
         if self.project == before {
             return Ok(());
         }
-        if let Err(refusal) = self.record(by, edit.page().map(str::to_owned), edit.describe()) {
+        let message = edit.describe();
+        let page = edit.page().map(str::to_owned);
+        if let Err(refusal) = self.record(by, page.clone(), message.clone()) {
             self.project = before;
             self.restore_files(by);
             return Err(refusal);
         }
+        let (was, now) = Parts::delta(&before, &self.project);
         if let ProjectEdit::RemovePage { id } = &edit
             && self.locks.remove(id).is_some()
         {
@@ -364,7 +439,140 @@ impl Host {
             self.outbox
                 .push((id, HostMsg::ProjectChanged { edit: edit.clone(), by }));
         }
+        self.remember(by, page, message, ChangeKind::Edit, None, was, now);
         Ok(())
+    }
+
+    fn do_undo(&mut self, by: PeerId) -> Result<(), Refusal> {
+        let Some(id) = undo_target(&self.infos(), by) else {
+            return Err(Refusal::Invalid {
+                reason: "there is no change of yours to undo".into(),
+            });
+        };
+        self.do_revert(by, id, ChangeKind::Undo)
+    }
+
+    fn do_redo(&mut self, by: PeerId) -> Result<(), Refusal> {
+        let Some(id) = redo_target(&self.infos(), by) else {
+            return Err(Refusal::Invalid {
+                reason: "there is no undo of yours to redo".into(),
+            });
+        };
+        self.do_revert(by, id, ChangeKind::Redo)
+    }
+
+    fn infos(&self) -> Vec<ChangeInfo> {
+        self.history()
+    }
+
+    /// Take back recorded change `id`: put back the parts it changed, as long as nobody has
+    /// changed them since. Recorded as a change of its own, by `by`.
+    fn do_revert(&mut self, by: PeerId, id: u64, kind: ChangeKind) -> Result<(), Refusal> {
+        let invalid = |reason: String| Err(Refusal::Invalid { reason });
+        let Some(entry) = self.history.iter().find(|e| e.info.id == id).cloned() else {
+            return invalid(format!("change {id} is no longer in the session's history"));
+        };
+        if entry.info.undone_by.is_some() {
+            return invalid(format!("\"{}\" was already taken back", entry.info.message));
+        }
+        if Parts::read(&self.project, &entry.after) != entry.after {
+            return invalid(format!(
+                "\"{}\" cannot be taken back: what it changed was changed again since; take back the later change first",
+                entry.info.message
+            ));
+        }
+        let edit = ProjectEdit::Restore {
+            parts: Box::new(entry.before.clone()),
+        };
+        check_edit(&self.project, &self.locks, by, &edit)?;
+        let before = self.project.clone();
+        apply_edit(&mut self.project, &edit);
+        // The message names the edit itself: a redo of "Undo X" is "Redo X".
+        let what = match kind {
+            ChangeKind::Redo => entry
+                .info
+                .reverts
+                .and_then(|r| self.history.iter().find(|e| e.info.id == r))
+                .map_or_else(|| entry.info.message.clone(), |e| e.info.message.clone()),
+            _ => entry.info.message.clone(),
+        };
+        let message = match kind {
+            ChangeKind::Redo => format!("Redo: {what}"),
+            _ => format!("Undo: {what}"),
+        };
+        if let Err(refusal) = self.record(by, entry.info.page.clone(), message.clone()) {
+            self.project = before;
+            self.restore_files(by);
+            return Err(refusal);
+        }
+        // A page that is gone now cannot stay open.
+        let gone: Vec<String> = self
+            .locks
+            .keys()
+            .filter(|p| self.project.page(p).is_none())
+            .cloned()
+            .collect();
+        if !gone.is_empty() {
+            for p in &gone {
+                self.locks.remove(p);
+            }
+            for p in self.peers.values_mut() {
+                if p.page.as_ref().is_some_and(|id| gone.contains(id)) {
+                    p.page = None;
+                }
+            }
+            self.broadcast_presence();
+        }
+        let ids: Vec<PeerId> = self.joined_guests().collect();
+        for g in ids {
+            self.outbox
+                .push((g, HostMsg::ProjectChanged { edit: edit.clone(), by }));
+        }
+        self.remember(by, entry.info.page, message, kind, Some(id), entry.after, entry.before);
+        Ok(())
+    }
+
+    /// Keep a recorded change for undo and tell everyone it is in the list.
+    #[allow(clippy::too_many_arguments)]
+    fn remember(
+        &mut self,
+        by: PeerId,
+        page: Option<String>,
+        message: String,
+        kind: ChangeKind,
+        reverts: Option<u64>,
+        before: Parts,
+        after: Parts,
+    ) {
+        let info = ChangeInfo {
+            id: self.next_change,
+            by,
+            name: self.peers.get(&by).map(|p| p.name.clone()).unwrap_or_default(),
+            message,
+            page,
+            kind,
+            reverts,
+            undone_by: None,
+        };
+        self.next_change += 1;
+        if let Some(r) = reverts
+            && let Some(e) = self.history.iter_mut().find(|e| e.info.id == r)
+        {
+            e.info.undone_by = Some(info.id);
+        }
+        self.history.push(Entry {
+            info: info.clone(),
+            before,
+            after,
+        });
+        if self.history.len() > crate::MAX_HISTORY {
+            let extra = self.history.len() - crate::MAX_HISTORY;
+            self.history.drain(..extra);
+        }
+        let ids: Vec<PeerId> = self.joined_guests().collect();
+        for g in ids {
+            self.outbox.push((g, HostMsg::Recorded { change: info.clone() }));
+        }
     }
 
     /// Record an applied change. When that fails the caller undoes the change, so a later

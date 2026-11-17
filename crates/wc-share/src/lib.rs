@@ -17,6 +17,9 @@
 //! - **One commit per change.** Every applied change is handed to a [`Journal`]; [`GitJournal`]
 //!   saves the project and commits it with the participant as the author, so any change can be
 //!   reverted from the history.
+//! - **Undo per change.** The host keeps what each change touched ([`Parts`]). Undo takes back
+//!   the person's own last change only, and any change can be taken back from the list, as long
+//!   as nobody changed the same parts since; each is a commit of its own.
 //!
 //! The host and guests are plain state machines with no I/O; [`transport`] connects them
 //! in-process and [`net`] over TCP; [`discovery`] finds sessions on the local network.
@@ -24,6 +27,7 @@
 
 pub mod discovery;
 mod guest;
+mod history;
 mod host;
 mod journal;
 pub mod net;
@@ -31,6 +35,7 @@ mod protocol;
 pub mod transport;
 
 pub use guest::{Guest, GuestStatus};
+pub use history::{ChangeInfo, ChangeKind, MAX_HISTORY, Parts, note, redo_target, undo_target};
 pub use host::{HOST, Host};
 pub use journal::{Change, GitJournal, Journal, MemoryJournal};
 pub use protocol::{GuestMsg, HostMsg, Peer, PeerId, ProjectEdit, Refusal, Snapshot, apply_edit, same_but_number};

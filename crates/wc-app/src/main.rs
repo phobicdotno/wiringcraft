@@ -137,6 +137,9 @@ struct StatusView<'a> {
     prefs: &'a Prefs,
     clipboard: &'a edit::Clipboard,
     sharing: bool,
+    /// Undo and Redo in a shared session: whether this person has something to take back.
+    share_undo: bool,
+    share_redo: bool,
 }
 
 impl chrome::Status for StatusView<'_> {
@@ -173,8 +176,9 @@ impl chrome::Status for StatusView<'_> {
             | Action::ReportMissing
             | Action::JoinSession => true,
             Action::ShareSession => has || self.sharing,
-            // Undo swaps the whole project, which would take back other people's work too.
-            Action::Undo | Action::Redo if self.sharing => false,
+            // In a session, undo takes back this person's own changes through the host.
+            Action::Undo if self.sharing => self.share_undo,
+            Action::Redo if self.sharing => self.share_redo,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
             Action::PageUp => has && self.ed.page > 0,
@@ -210,6 +214,18 @@ impl App {
         let busy = ctx.input(|i| i.pointer.any_down())
             || matches!(self.dialog, Some(Dialog::Cover { .. }))
             || self.assistant.command_running();
+        self.share.set_command_running(self.assistant.command_running());
+        self.sync_session_now(busy);
+        // Others' changes arrive without any input here.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// The work of `sync_session`, also used by the assistant's undo so the changes it made
+    /// earlier in the same answer are in the session's history first.
+    fn sync_session_now(&mut self, busy: bool) {
+        if !self.share.active() {
+            return;
+        }
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
@@ -256,8 +272,6 @@ impl App {
             applog::info(&format!("shared session: {note}"));
             self.ed.message = note;
         }
-        // Others' changes arrive without any input here.
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     fn new(cc: &eframe::CreationContext<'_>, dir: Option<PathBuf>) -> Self {
@@ -339,11 +353,6 @@ impl App {
             }
             Action::JoinSession => {
                 self.share.show_join();
-                return;
-            }
-            Action::Undo | Action::Redo if self.share.active() => {
-                self.ed.message =
-                    "Undo is off in a shared session: it would take back other people's work too. Use the page history.".into();
                 return;
             }
             _ => {}
@@ -433,6 +442,31 @@ impl App {
             Action::ZoomIn => self.zoom(1.25),
             Action::ZoomOut => self.zoom(0.8),
             Action::ZoomFit => self.ed.view.fit = true,
+            // Undoing in a shared session takes back only this person's own change: the whole
+            // project is not swapped, so other people's work stays.
+            Action::Undo | Action::Redo if self.share.active() => {
+                // The host's undo writes the project folder, and a guest's sync would send a
+                // command's half-written work: neither while a command owns the files.
+                if self.assistant.command_running() {
+                    self.ed.message = "Undo and Redo wait until the assistant's command has finished.".into();
+                    return;
+                }
+                // Changes not synced yet (an assistant's, made with no frame in between) go into
+                // the session's history first, so Undo takes back the latest one.
+                self.sync_session_now(false);
+                let r = if a == Action::Undo {
+                    self.share.undo()
+                } else {
+                    self.share.redo()
+                };
+                // The host's refusal comes back in the session's notes, which the status line
+                // shows; one made here is shown now.
+                if let Err(e) = r {
+                    self.ed.message = e;
+                }
+                self.ed.selection.clear();
+                return;
+            }
             _ => {}
         }
         let Some(open) = self.open.as_mut() else { return };
@@ -1456,13 +1490,8 @@ impl App {
                             )
                         })
                         .unwrap_or_default();
-                    // Undo is off in a shared session, so it is not promised there.
-                    let undo = if self.share.active() {
-                        " It cannot be undone in a shared session."
-                    } else {
-                        " Undo brings it back."
-                    };
-                    ui.label(format!("Delete {what}?{undo}"));
+                    // In a shared session too: undo there takes back this person's own change.
+                    ui.label(format!("Delete {what}? Undo brings it back."));
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
                             if let Some(o) = self.open.as_mut() {
@@ -2074,6 +2103,8 @@ impl eframe::App for App {
             prefs: &self.prefs,
             clipboard: &self.clipboard,
             sharing: self.share.active(),
+            share_undo: self.share.can_undo(),
+            share_redo: self.share.can_redo(),
         };
         for url in std::mem::take(&mut self.open_url) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
@@ -2167,7 +2198,8 @@ impl eframe::App for App {
             self.dialog = Some(Dialog::Comment(at, String::new(), false));
         }
         self.dialogs(ctx);
-        self.share.windows(ctx, self.open.as_mut());
+        self.share
+            .windows(ctx, self.open.as_mut(), self.assistant.command_running());
         self.sync_session(ctx);
 
         let title = match &self.open {

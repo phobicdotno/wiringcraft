@@ -1298,12 +1298,33 @@ impl App {
             }
             "versions" => self.tool_versions(v),
             "undo" => {
-                // Undo swaps the whole project, which would take back other people's work too.
+                let redo = v.get("redo").and_then(Value::as_bool).unwrap_or(false);
+                // In a session the host takes back only this person's own change; swapping the
+                // whole project here would take back other people's work too.
                 if self.share.active() {
-                    return Err("Undo and redo are off in a shared session; use the page history.".into());
+                    // Changes made earlier in this answer go into the session's history first.
+                    self.sync_session_now(false);
+                    let can = if redo {
+                        self.share.can_redo()
+                    } else {
+                        self.share.can_undo()
+                    };
+                    // The host's list is complete here. A guest's may not yet hold the change
+                    // just sent: the host, which gets the undo after that change, decides, and
+                    // says so in the session's notes when there is nothing to take back.
+                    if !can && self.share.is_host() {
+                        return Ok("Nothing to undo or redo.".into());
+                    }
+                    if redo { self.share.redo() } else { self.share.undo() }?;
+                    self.ed.selection.clear();
+                    return Ok(if can {
+                        "Sent to the session; it shows with the next sync."
+                    } else {
+                        "Sent to the session. Your latest change may not be in the session's list yet; if there is nothing of yours to take back, the session says so with the next sync."
+                    }
+                    .into());
                 }
                 let open = need_open(self.open.as_mut())?;
-                let redo = v.get("redo").and_then(Value::as_bool).unwrap_or(false);
                 let done = if redo { open.redo() } else { open.undo() };
                 self.ed.selection.clear();
                 Ok(if done { "Done." } else { "Nothing to undo or redo." }.into())
@@ -1407,7 +1428,8 @@ impl App {
             "open_comments": open.project.comments.iter().filter(|c| !c.resolved).count(),
             "shown": shown,
             "selection": self.ed.selection.iter().map(selection_id).collect::<Vec<_>>(),
-            "can_undo": open.can_undo(),
+            // In a session, Undo takes back only this person's changes made in it.
+            "can_undo": if self.share.active() { self.share.can_undo() } else { open.can_undo() },
         })))
     }
 
@@ -2221,6 +2243,53 @@ mod tests {
     }
 
     #[test]
+    fn undo_in_a_shared_session_goes_through_the_host() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let tag = wc_core::DeviceTag::parse("-K7").unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.devices.insert(tag.clone(), wc_core::Device::default());
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(a.share.can_undo());
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["can_undo"], json!(true), "get_state asks the session");
+        a.run(Action::Undo);
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(!a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        assert!(a.share.can_redo());
+        a.run(Action::Redo);
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        // The assistant's undo tool goes the same way.
+        assert_eq!(
+            call(&mut a, "undo", json!({})),
+            Ok("Sent to the session; it shows with the next sync.".into())
+        );
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(!a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        call(&mut a, "undo", json!({"redo": true})).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        // A change the assistant made earlier in the same answer (no frame in between) is the
+        // one its undo takes back.
+        let k8 = wc_core::DeviceTag::parse("-K8").unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.devices.insert(k8.clone(), wc_core::Device::default());
+        call(&mut a, "undo", json!({})).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        let devices = &a.open.as_ref().unwrap().project.devices;
+        assert!(!devices.contains_key(&k8) && devices.contains_key(&tag));
+        // The host's refusal comes back to the caller.
+        call(&mut a, "undo", json!({"redo": true})).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(a.share.redo().is_err_and(|e| e.starts_with("Nothing was taken back")));
+        a.share.stop();
+    }
+
+    #[test]
     fn a_message_box_is_logged_again_after_it_closed() {
         let (_tmp, mut a) = app(vec![]);
         let fail = || Some(Dialog::Message("Saving failed:\ndisk full".into()));
@@ -2446,7 +2515,84 @@ mod tests {
     }
 
     #[test]
-    fn undo_is_refused_in_a_shared_session() {
+    fn undo_from_the_toolbar_first_sends_what_was_not_synced() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let k7 = wc_core::DeviceTag::parse("-K7").unwrap();
+        let k8 = wc_core::DeviceTag::parse("-K8").unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.project.devices.insert(k7.clone(), wc_core::Device::default());
+        a.share.frame(a.open.as_mut(), None, false);
+        // -K8 is made with no frame before Undo: Undo takes back -K8, not -K7.
+        let open = a.open.as_mut().unwrap();
+        open.project.devices.insert(k8.clone(), wc_core::Device::default());
+        a.run(Action::Undo);
+        a.share.frame(a.open.as_mut(), None, false);
+        let devices = &a.open.as_ref().unwrap().project.devices;
+        assert!(!devices.contains_key(&k8) && devices.contains_key(&k7));
+        a.share.stop();
+    }
+
+    #[test]
+    fn undo_in_a_session_waits_while_an_assistant_command_owns_the_files() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let k7 = wc_core::DeviceTag::parse("-K7").unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.project.devices.insert(k7.clone(), wc_core::Device::default());
+        a.share.frame(a.open.as_mut(), None, false);
+        let open = a.open.as_ref().unwrap();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let on_disk = std::fs::read_dir(&open.dir).unwrap().count();
+        let dir = open.dir.clone();
+        for action in [Action::Undo, Action::Redo] {
+            a.run(action);
+            assert!(a.ed.message.contains("wait"), "{}", a.ed.message);
+        }
+        assert!(!a.share.take_notes().iter().any(|n| n.contains("Undo")));
+        assert!(
+            a.open.as_ref().unwrap().project.devices.contains_key(&k7),
+            "nothing taken back"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), on_disk);
+        a.assistant.command_base = None;
+        a.run(Action::Undo);
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(
+            !a.open.as_ref().unwrap().project.devices.contains_key(&k7),
+            "taken back once free"
+        );
+        a.share.stop();
+    }
+
+    #[test]
+    fn a_page_edit_made_right_after_an_undo_does_not_bring_back_what_it_took_back() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let shown = Some("p0002".to_owned());
+        a.share.frame(a.open.as_mut(), shown.clone(), false);
+        let original = page2(&a).title.clone();
+        a.open.as_mut().unwrap().project.page_mut("p0002").unwrap().title = "First".into();
+        a.share.frame(a.open.as_mut(), shown.clone(), false);
+        assert!(a.share.undo().is_ok());
+        // Edited before the frame that brings the undo's result: built on the old page.
+        a.open.as_mut().unwrap().project.page_mut("p0002").unwrap().title = "First, then more".into();
+        a.share.frame(a.open.as_mut(), shown.clone(), false);
+        assert_eq!(page2(&a).title, original, "the undo is kept");
+        a.share.frame(a.open.as_mut(), shown, false);
+        assert_eq!(page2(&a).title, original, "and not sent over afterwards");
+        assert!(
+            a.share.take_notes().iter().any(|n| n.contains("was not kept")),
+            "the dropped change is reported"
+        );
+        a.share.stop();
+    }
+
+    #[test]
+    fn undo_in_a_shared_session_does_not_take_back_work_from_before_it() {
         let (_tmp, mut a) = app(vec![]);
         call(
             &mut a,
@@ -2458,8 +2604,17 @@ mod tests {
         a.share.start_host(&mut open, "Hanna", "hanna@example.com").unwrap();
         a.open = Some(open);
         let before = a.open.as_ref().unwrap().project.clone();
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(
+            state["can_undo"],
+            json!(false),
+            "work from before the session is not undone"
+        );
         for redo in [false, true] {
-            assert!(call(&mut a, "undo", json!({"redo": redo})).is_err());
+            assert_eq!(
+                call(&mut a, "undo", json!({"redo": redo})),
+                Ok("Nothing to undo or redo.".into())
+            );
             assert_eq!(a.open.as_ref().unwrap().project, before, "nothing was undone");
         }
         a.share.stop();
