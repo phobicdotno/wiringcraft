@@ -2258,7 +2258,14 @@ mod tests {
             msg.starts_with("Symbol bad could not be opened from the library: "),
             "{msg}"
         );
-        assert!(!msg.contains("not found"), "the read error is kept: {msg}");
+        let open = a.open.as_ref().unwrap();
+        let read_error = wc_library::Library::open(&open.dir, &open.project)
+            .unwrap()
+            .symbol("bad")
+            .unwrap_err()
+            .to_string();
+        assert!(!read_error.is_empty());
+        assert!(msg.ends_with(&read_error), "the read error is kept: {msg}");
 
         a.symbol_editor = None;
         a.open.as_mut().unwrap().project.meta.libraries[0].kind = "bogus".into();
@@ -2266,6 +2273,45 @@ mod tests {
         let msg = &a.symbol_editor.as_ref().unwrap().message;
         assert!(msg.starts_with("The project's library could not be opened: "), "{msg}");
         assert!(msg.contains("bogus"), "{msg}");
+    }
+
+    #[test]
+    fn editing_keys_go_to_the_symbol_editor_while_it_is_open() {
+        let (_tmp, mut a) = app(vec![]);
+        let keys = vec![Action::Undo, Action::Delete, Action::Redo, Action::ZoomIn];
+        assert_eq!(
+            a.route_to_symbol_editor(keys.clone()),
+            keys,
+            "closed: the project gets them"
+        );
+
+        let mut ed = crate::symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(crate::symbol_editor::Tool::Line);
+        ed.click(wc_core::geom::Point::new(0.0, 0.0));
+        ed.click(wc_core::geom::Point::new(10.0, 0.0));
+        ed.set_tool(crate::symbol_editor::Tool::Select);
+        ed.click(wc_core::geom::Point::new(5.0, 0.0));
+        assert!(ed.selected.is_some());
+        a.symbol_editor = Some(ed);
+        let before = a.open.as_ref().unwrap().project.clone();
+        assert_eq!(
+            a.route_to_symbol_editor(vec![Action::Delete, Action::ZoomIn]),
+            vec![Action::ZoomIn]
+        );
+        assert!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.is_empty(),
+            "the editor deleted"
+        );
+        assert_eq!(
+            a.route_to_symbol_editor(vec![Action::Undo, Action::Redo]),
+            Vec::<Action>::new()
+        );
+        assert_eq!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.len(),
+            1,
+            "the editor undid"
+        );
+        assert_eq!(a.open.as_ref().unwrap().project, before, "the project was not touched");
     }
 
     #[test]
