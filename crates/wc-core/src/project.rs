@@ -351,13 +351,18 @@ impl ProjectMeta {
                     (t.clone(), to.map_or(Went::Deleted, |(s, n)| Went::To(s, n)))
                 })
                 .collect();
-            let strips: std::collections::BTreeSet<&DeviceTag> = went
+            let mut strips: std::collections::BTreeSet<&DeviceTag> = went
                 .iter()
                 .filter_map(|(_, w)| match w {
                     Went::To(s, _) => Some(s),
                     _ => None,
                 })
                 .collect();
+            // Terminals that are not drawn stay on their strip, so the jumper only moves when
+            // every member went to the same other strip.
+            if went.iter().any(|(_, w)| matches!(w, Went::NotDrawn)) {
+                strips.insert(&j.strip);
+            }
             let strip = match strips.iter().next() {
                 Some(only) if strips.len() == 1 => (*only).clone(),
                 _ => j.strip.clone(),
@@ -370,8 +375,18 @@ impl ProjectMeta {
                     Went::Deleted => None,
                 })
                 .collect();
-            // Jumpers that now share a terminal become one; one terminal left is no jumper.
-            let _ = self.add_jumper(&strip, &terminals);
+            // One terminal left is no jumper.
+            let mut distinct = terminals.clone();
+            distinct.sort();
+            distinct.dedup();
+            if distinct.len() < 2 {
+                continue;
+            }
+            // Jumpers that now share a terminal become one. A number that cannot be a terminal
+            // of the strip is refused there; the jumper is then kept as it was, not dropped.
+            if self.add_jumper(&strip, &terminals).is_err() {
+                self.jumpers.push(j.clone());
+            }
         }
         self.jumpers != old
     }
@@ -992,6 +1007,15 @@ mod tests {
         assert_eq!(
             (&m.jumpers[0].strip, m.jumpers[0].terminals.clone()),
             (&x1, s(&["4", "5"]))
+        );
+        // Only one member drawn, and it moved to another strip: the undrawn ones stay on X1.
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&["3", "8", "9"]))?;
+        m.follow_terminals(&nums(&[("a", "-X1", "3")])?, &nums(&[("a", "-X9", "1")])?);
+        assert_eq!(m.jumpers.len(), 1);
+        assert_eq!(
+            (&m.jumpers[0].strip, m.jumpers[0].terminals.clone()),
+            (&x1, s(&["8", "9"]))
         );
         // Nothing changed: nothing to do; a terminal that is not drawn stays.
         let mut m = ProjectMeta::new("t");

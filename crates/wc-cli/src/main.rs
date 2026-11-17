@@ -547,9 +547,10 @@ fn load(dir: &Path) -> Res<Project> {
 /// deleted is found by comparing with the project as it is on disk.
 fn save(dir: &Path, p: &Project) -> Res<()> {
     let mut p = p.clone();
-    if !p.meta.jumpers.is_empty()
-        && let Ok(old) = store::load(dir)
-    {
+    // A new project has nothing on disk to compare with; any other load failure is reported.
+    let on_disk = dir.join(store::PROJECT_FILE).exists();
+    if !p.meta.jumpers.is_empty() && on_disk {
+        let old = store::load(dir).map_err(|err| format!("jumpers not updated: {}", e(err)))?;
         let (old_symbols, _) = store::vendored_symbols(dir, &old);
         let before = wc_core::project::terminal_numbers(&old, |id| old_symbols.get(id).map(|s| s.role));
         let (symbols, _) = store::vendored_symbols(dir, &p);
