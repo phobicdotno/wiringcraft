@@ -970,7 +970,10 @@ mod network {
                 Ok(0) => return Ok(true),
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(true),
-                Err(_) => return Ok(false),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
             }
         }
     }

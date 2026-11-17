@@ -10,7 +10,7 @@
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, sync_channel};
 use std::thread;
 use std::time::Duration;
 
@@ -24,6 +24,14 @@ use crate::{Error, Host, PeerId, Result};
 /// joining, while a bad peer cannot fill the memory.
 pub const MAX_LINE: usize = 64 * 1024 * 1024;
 
+/// How many received messages wait in a link before the reader stops reading the socket. A
+/// peer that sends faster than the window takes messages is then held back by TCP itself.
+pub const INBOUND_CAP: usize = 256;
+
+/// How long one write to a peer may block. A peer that stops reading is dropped after this, so
+/// the writer and its socket never hang.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long [`connect`] tries each address of the host.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -32,6 +40,7 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Listener {
     inner: TcpListener,
     max_line: usize,
+    errors: Vec<Error>,
 }
 
 impl Listener {
@@ -42,6 +51,7 @@ impl Listener {
         Ok(Self {
             inner,
             max_line: MAX_LINE,
+            errors: Vec::new(),
         })
     }
 
@@ -57,21 +67,32 @@ impl Listener {
 
     /// Take every connection that has arrived since the last call and add it to the hub.
     /// Returns the new participant ids; each may ask to join next. Never blocks.
+    ///
+    /// A connection that fails while it is being set up, or an accept error, does not stop the
+    /// listener: it tries again next call, and the reason is kept for [`Self::take_errors`].
     pub fn accept(&mut self, hub: &mut Hub, host: &mut Host) -> Vec<PeerId> {
         let mut new = Vec::new();
         loop {
             match self.inner.accept() {
-                Ok((stream, _)) => {
-                    if let Ok(link) = spawn_link(stream, self.max_line) {
-                        new.push(hub.add(host, link));
-                    }
-                }
+                Ok((stream, _)) => match spawn_link(stream, self.max_line) {
+                    Ok(link) => new.push(hub.add(host, link)),
+                    Err(e) => self.errors.push(e),
+                },
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                // WouldBlock: nothing more waiting. Anything else: try again next frame.
-                Err(_) => break,
+                // Nothing more waiting: the normal end of a poll.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    self.errors.push(Error::Io(e));
+                    break;
+                }
             }
         }
         new
+    }
+
+    /// Why connections failed since the last call, oldest first, for the log or the window.
+    pub fn take_errors(&mut self) -> Vec<Error> {
+        std::mem::take(&mut self.errors)
     }
 }
 
@@ -99,12 +120,24 @@ where
     S: Serialize + Send + 'static,
     R: DeserializeOwned + Send + 'static,
 {
+    spawn_link_with_cap(stream, max_line, INBOUND_CAP)
+}
+
+/// [`spawn_link`] with the size of the inbound queue.
+fn spawn_link_with_cap<S, R>(stream: TcpStream, max_line: usize, cap: usize) -> Result<Link<S, R>>
+where
+    S: Serialize + Send + 'static,
+    R: DeserializeOwned + Send + 'static,
+{
     // An accepted socket can inherit non-blocking mode from the listener on some systems.
     stream.set_nonblocking(false)?;
     // Small messages (a page lock) should not wait for more data.
     stream.set_nodelay(true)?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let read_half = stream.try_clone()?;
-    let (to_link, from_net) = channel::<R>();
+    // Kept to close the socket if the writer cannot be started.
+    let control = stream.try_clone()?;
+    let (to_link, from_net) = sync_channel::<R>(cap);
     let (to_net, from_link) = channel::<S>();
 
     thread::Builder::new().name("wc-share-read".into()).spawn(move || {
@@ -129,7 +162,7 @@ where
     })?;
 
     let mut write_half = stream;
-    thread::Builder::new().name("wc-share-write".into()).spawn(move || {
+    let writer = thread::Builder::new().name("wc-share-write".into()).spawn(move || {
         for msg in from_link.iter() {
             let ok = encode(&msg)
                 .ok()
@@ -138,8 +171,14 @@ where
                 break;
             }
         }
+        // A failed or timed-out write ends here too, which also ends the reader.
         let _ = write_half.shutdown(Shutdown::Both);
-    })?;
+    });
+    if let Err(e) = writer {
+        // The reader is already running: close the socket so it stops.
+        let _ = control.shutdown(Shutdown::Both);
+        return Err(e.into());
+    }
 
     Ok(Link::from_channels(to_net, from_net))
 }
@@ -190,6 +229,67 @@ mod tests {
 
         let mut r = io::Cursor::new(b"abcde\n".to_vec());
         assert!(read_line(&mut r, &mut buf, 4).is_err());
+        Ok(())
+    }
+
+    /// A connected pair of sockets on this computer.
+    fn socket_pair() -> io::Result<(TcpStream, TcpStream)> {
+        let l = TcpListener::bind("127.0.0.1:0")?;
+        let a = TcpStream::connect(l.local_addr()?)?;
+        let (b, _) = l.accept()?;
+        Ok((a, b))
+    }
+
+    #[test]
+    fn a_fast_sender_is_held_back() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut peer, ours) = socket_pair()?;
+        let link: Link<String, String> = spawn_link_with_cap(ours, 2 * 1024 * 1024, 2)?;
+        // 32 lines of 1 MiB: far more than the queue (2) plus every socket buffer can hold.
+        let lines = 32;
+        let mut line = vec![b'"'];
+        line.extend(std::iter::repeat_n(b'x', 1024 * 1024));
+        line.extend_from_slice(b"\"\n");
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let sender = thread::spawn(move || {
+            for _ in 0..lines {
+                if peer.write_all(&line).is_err() {
+                    break;
+                }
+            }
+            flag.store(true, Ordering::SeqCst);
+            peer
+        });
+        thread::sleep(Duration::from_millis(500));
+        assert!(!done.load(Ordering::SeqCst), "the sender was not held back");
+
+        // Taking messages lets the rest through.
+        let mut total = 0;
+        let start = std::time::Instant::now();
+        while total < lines && start.elapsed() < Duration::from_secs(20) {
+            total += link.drain().len();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(total, lines);
+        assert!(done.load(Ordering::SeqCst));
+        let _ = sender.join();
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_the_link_closes_the_socket() -> Result<()> {
+        let (mut peer, ours) = socket_pair()?;
+        let link: Link<String, String> = spawn_link(ours, MAX_LINE)?;
+        link.send("hello".into())?;
+        drop(link);
+        peer.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut got = Vec::new();
+        // Everything sent arrives, then the end of the stream (not a timeout).
+        io::Read::read_to_end(&mut peer, &mut got)?;
+        assert_eq!(got, b"\"hello\"\n");
         Ok(())
     }
 }
