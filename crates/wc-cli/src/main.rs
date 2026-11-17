@@ -1651,14 +1651,21 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let (symbols, entries): (Vec<_>, Vec<_>) = entries
                 .into_iter()
                 .partition(|(_, kind, _)| *kind == Kind::KicadSymbols);
+            // Two entries with the same file name would write the same ids over each other.
+            let mut prefixes = std::collections::BTreeSet::new();
             for (name, _, data) in symbols {
                 println!("{name}:");
                 let Some(lib) = &lib else {
                     eprintln!("warning: {name}: KiCad symbols, not imported: pass --lib <folder>");
                     continue;
                 };
+                let prefix = kicad_prefix(&name);
+                if !prefixes.insert(prefix.clone()) {
+                    eprintln!("warning: {name}: skipped, an earlier entry already imports as {prefix}");
+                    continue;
+                }
                 let text = String::from_utf8_lossy(&data);
-                if let Err(err) = import_kicad(&text, lib, &kicad_prefix(&name), 1.0, "") {
+                if let Err(err) = import_kicad(&text, lib, &prefix, 1.0, "") {
                     eprintln!("warning: {name}: {err}");
                 }
             }
@@ -2121,17 +2128,7 @@ fn import_swe_library(
 fn kicad_prefix(name: &str) -> String {
     let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
-    let stem: String = stem
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("kicad.{stem}")
+    format!("kicad.{}", wc_import::id_segment(stem))
 }
 
 /// Import every symbol (one per unit) of a KiCad library text into `lib`, printing each.
@@ -2168,19 +2165,12 @@ fn import_qet(
     // Two files whose names give the same id would overwrite each other: the later one fails.
     let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for file in files {
-        let stem: String = file
-            .file_stem()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    c.to_ascii_lowercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let stem = wc_import::id_segment(
+            &file
+                .file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
         let id = format!("{}.{stem}", prefix.trim_end_matches('.'));
         let read = match ids.get(&id) {
             Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
@@ -2998,6 +2988,10 @@ mod tests {
     (symbol "K_2_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "11")))))"#,
             )
             .unwrap();
+            // Same file name elsewhere: it would write kicad.my_relays.k_a over the first one.
+            z.start_file("zz/My Relays.kicad_sym", opt).unwrap();
+            z.write_all(br#"(kicad_symbol_lib (symbol "K" (symbol "K_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "Z")))))"#)
+                .unwrap();
             z.finish().unwrap();
         }
         let lib = tmp.path().join("lib");
@@ -3018,6 +3012,12 @@ mod tests {
         let symbols = lib.join("symbols");
         assert!(symbols.join("kicad.my_relays.k_a.json").exists());
         assert!(symbols.join("kicad.my_relays.k_b.json").exists());
+        assert!(
+            !symbols.join("kicad.my_relays.k.json").exists(),
+            "the second entry was skipped"
+        );
+        let a = std::fs::read_to_string(symbols.join("kicad.my_relays.k_a.json")).unwrap();
+        assert!(a.contains("\"A1\""), "{a}");
         assert_eq!(kicad_prefix("a/b\\Std Relays.v2.kicad_sym"), "kicad.std_relays_v2");
     }
 

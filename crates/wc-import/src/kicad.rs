@@ -147,6 +147,11 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
     let by_name: BTreeMap<&str, &Sexp> = lib.all("symbol").filter_map(|s| Some((s.arg(1)?, s))).collect();
     let mut out = Vec::new();
     let mut warnings = Vec::new();
+    let id_of = |name: &str| format!("{}.{}", prefix.trim_end_matches('.'), crate::id_segment(name));
+    // Every source symbol's own id is taken first, so a unit of `Relay` (`relay_a`) never
+    // replaces a symbol the library itself calls `Relay_A`.
+    let reserved: std::collections::BTreeSet<String> = by_name.keys().map(|n| id_of(n)).collect();
+    let mut used = std::collections::BTreeSet::new();
     for (name, sym) in &by_name {
         // A derived symbol draws like its parent but keeps its own properties.
         let body = match sym.first("extends").and_then(|e| e.arg(1)) {
@@ -172,6 +177,11 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
             } else {
                 (*name).to_owned()
             };
+            let id = id_of(&unit_name);
+            if (several && reserved.contains(&id)) || !used.insert(id.clone()) {
+                warnings.push(format!("{unit_name}: its id {id} is another symbol's, skipped"));
+                continue;
+            }
             match convert(&unit_name, sym, body, base, unit, prefix, scale) {
                 Ok(symbol) => out.push(Imported {
                     symbol,
@@ -227,18 +237,6 @@ fn unit_letter(mut unit: u32) -> String {
     s.iter().rev().collect()
 }
 
-fn id_part(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 fn property<'a>(sym: &'a Sexp, key: &str) -> Option<&'a str> {
     sym.all("property")
         .find(|p| p.arg(1) == Some(key))
@@ -248,7 +246,7 @@ fn property<'a>(sym: &'a Sexp, key: &str) -> Option<&'a str> {
 
 /// One unit of a symbol: the common unit's drawing and pins plus those of `wanted`.
 fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix: &str, scale: f64) -> Result<Symbol> {
-    let id = format!("{}.{}", prefix.trim_end_matches('.'), id_part(name));
+    let id = format!("{}.{}", prefix.trim_end_matches('.'), crate::id_segment(name));
     store::check_id(&id)?;
     // KiCad y points up; the page's points down.
     let pt = |x: f64, y: f64| Point::new(x * scale, -y * scale);
@@ -557,6 +555,25 @@ mod tests {
         assert_eq!(derived.description, "24 V coil");
         assert_eq!(derived.pins.len(), 2);
         assert_eq!(syms[3].symbol.id, "kicad.relays.relay_coil_24v_b");
+        Ok(())
+    }
+
+    #[test]
+    fn a_unit_never_takes_the_id_of_another_symbol() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "Relay"
+    (symbol "Relay_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "A1")))
+    (symbol "Relay_2_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "11"))))
+  (symbol "Relay_A"
+    (symbol "Relay_A_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "X")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        let ids: Vec<&str> = syms.iter().map(|s| s.symbol.id.as_str()).collect();
+        assert_eq!(ids, ["k.relay_b", "k.relay_a"], "{warnings:?}");
+        assert_eq!(syms[1].symbol.pins[0].name, "X", "the library's own Relay_A is kept");
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Relay_A: its id k.relay_a")),
+            "{warnings:?}"
+        );
         Ok(())
     }
 
