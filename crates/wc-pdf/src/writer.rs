@@ -560,7 +560,8 @@ pub fn text_width_mm(s: &str, height_mm: f64) -> f64 {
         .map(|c| match c {
             'i' | 'j' | 'l' | '.' | ',' | ':' | ';' | '\'' | '!' | '|' => 250.0,
             'f' | 't' | 'r' | 'I' | ' ' | '-' | '(' | ')' | '[' | ']' | '/' => 320.0,
-            'm' | 'w' | 'M' | 'W' => 850.0,
+            'W' => 944.0,
+            'm' | 'w' | 'M' => 850.0,
             c if c.is_ascii_uppercase() => 680.0,
             c if c.is_ascii_digit() => 556.0,
             _ => 540.0,

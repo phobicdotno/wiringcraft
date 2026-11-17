@@ -685,16 +685,29 @@ impl Open {
         if !name_changes && self.project.meta.title_block == block {
             return;
         }
-        if self.undo_mark() == since {
-            self.checkpoint();
-        } else {
+        // Keep adding to the form's own undo step only while it is the last one; after any
+        // other change (a page added meanwhile) the form starts a new step.
+        if self.undo_mark() > since && self.last_step_changed_only_props() {
             self.redo.clear();
             self.dirty = true;
+        } else {
+            self.checkpoint();
         }
         if name_changes {
             self.project.meta.name = name.to_owned();
         }
         self.project.meta.title_block = block;
+    }
+
+    /// Whether the last undo step differs from the project only in its name and title-block
+    /// fields (it is a properties form's step, with nothing else in it).
+    fn last_step_changed_only_props(&self) -> bool {
+        self.undo.last().is_some_and(|prev| {
+            let mut p = prev.clone();
+            p.meta.name.clone_from(&self.project.meta.name);
+            p.meta.title_block.clone_from(&self.project.meta.title_block);
+            p == self.project
+        })
     }
 
     /// The project name and fields as they are, for [`Open::revert_live`].
@@ -712,12 +725,11 @@ impl Open {
     /// own) only the name and fields are put back, as a new undo step.
     pub fn revert_live(&mut self, since: usize, before: &PropsSnapshot) {
         let only_the_form = self.undo_mark() == since + 1
-            && self.undo.last().is_some_and(|prev| {
-                let mut p = prev.clone();
-                p.meta.name.clone_from(&self.project.meta.name);
-                p.meta.title_block.clone_from(&self.project.meta.title_block);
-                p == self.project
-            });
+            && self.last_step_changed_only_props()
+            && self
+                .undo
+                .last()
+                .is_some_and(|prev| prev.meta.name == before.name && prev.meta.title_block == before.title_block);
         if only_the_form {
             if self.undo() {
                 self.redo.clear();
@@ -929,6 +941,21 @@ pub(crate) mod tests {
         assert!(!o.can_redo());
         o.revert_live(since, &before);
         assert!(!o.can_undo(), "nothing changed, nothing undone");
+    }
+
+    #[test]
+    fn a_form_edit_after_another_change_is_its_own_undo_step() {
+        let (_tmp, mut o) = project();
+        let since = o.undo_mark();
+        o.set_project_props_live(since, "Test", &fields(&[("customer", "A")]));
+        // Another change while the form is open.
+        o.checkpoint();
+        o.project.pages[0].title = "Added meanwhile".into();
+        o.set_project_props_live(since, "Test", &fields(&[("customer", "B")]));
+        // OK, then Undo: only the second form edit goes back.
+        assert!(o.undo());
+        assert_eq!(o.project.meta.title_block["customer"], "A");
+        assert_eq!(o.project.pages[0].title, "Added meanwhile");
     }
 
     #[test]
