@@ -18,7 +18,7 @@ pub use layout::{
     CrossRefs, FRAME_COLUMNS, FrameMark, Ink, XREF_HEIGHT, XrefMark, column_of, cover_logo_box, cover_logo_default,
     fit_picture, frame_marks, junctions, logo_boxes, pin_position, title_logo_box, xref_marks,
 };
-pub use picture::read_underlays;
+pub use picture::{Pictures, read_picture, read_pictures};
 pub use vector::{PageDrawing, dxf, page_drawings, svg};
 pub use writer::{Layer, Prim, Stroke};
 
@@ -32,9 +32,11 @@ pub struct Options {
     pub wire_labels: bool,
     /// Report tables appended after the schematic pages, each starting on a new page.
     pub reports: Vec<wc_report::Table>,
-    /// Picture files by path (see [`read_underlays`]): underlays, drawn under their pages on
+    /// Picture files by path (see [`read_pictures`]): underlays, drawn under their pages on
     /// a layer of their own, and the project logo.
     pub underlays: BTreeMap<String, Vec<u8>>,
+    /// Why pictures that exist could not be read, by path (see [`Pictures::unreadable`]).
+    pub unreadable: BTreeMap<String, String>,
     /// Panel layouts printed after the schematic pages, one sheet each.
     pub panels: Vec<wc_core::panel::Panel>,
 }
@@ -47,6 +49,7 @@ impl Default for Options {
             wire_labels: true,
             reports: Vec::new(),
             underlays: BTreeMap::new(),
+            unreadable: BTreeMap::new(),
             panels: Vec::new(),
         }
     }
@@ -74,7 +77,10 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     let logo = project.meta.logo.as_ref().and_then(|l| {
         let found = match options.underlays.get(&l.file) {
             Some(bytes) => picture::decode(bytes).map_err(|why| format!("logo {}: {why}", l.file)),
-            None => Err(format!("logo picture {} is missing", l.file)),
+            None => Err(match options.unreadable.get(&l.file) {
+                Some(why) => format!("logo picture {} cannot be read: {why}", l.file),
+                None => format!("logo picture {} is missing", l.file),
+            }),
         };
         found.map_err(|w| report.warnings.push(w)).ok().map(std::sync::Arc::new)
     });
@@ -165,9 +171,13 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
                         .warnings
                         .push(format!("page {}: underlay {}: {why}", page.number, u.file)),
                 },
-                None => report
-                    .warnings
-                    .push(format!("page {}: underlay picture {} is missing", page.number, u.file)),
+                None => report.warnings.push(match options.unreadable.get(&u.file) {
+                    Some(why) => format!(
+                        "page {}: underlay picture {} cannot be read: {why}",
+                        page.number, u.file
+                    ),
+                    None => format!("page {}: underlay picture {} is missing", page.number, u.file),
+                }),
             }
         }
         place_logo(&mut drawn, page);

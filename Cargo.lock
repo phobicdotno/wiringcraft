@@ -3823,6 +3823,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "miniz_oxide 0.8.9",
+ "tempfile",
  "wc-core",
  "wc-report",
 ]

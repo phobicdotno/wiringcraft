@@ -2055,13 +2055,15 @@ fn export_pdf(open: &Open) -> String {
         symbols: &open.symbols,
         parts: &open.parts,
     };
+    let pictures = wc_pdf::read_pictures(&open.dir, &open.project);
     let options = wc_pdf::Options {
         reports: wc_report::Kind::ALL
             .into_iter()
             .map(|k| wc_report::build(k, &inputs))
             .filter(|t| !t.rows.is_empty())
             .collect(),
-        underlays: wc_pdf::read_underlays(&open.dir, &open.project),
+        underlays: pictures.files,
+        unreadable: pictures.unreadable,
         panels: open.project.panels.clone(),
         ..Default::default()
     };

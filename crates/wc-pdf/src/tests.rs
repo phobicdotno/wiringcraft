@@ -436,6 +436,116 @@ fn a_missing_logo_is_a_warning_and_the_export_still_works() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)]
+fn a_transparent_logo_keeps_its_transparency_through_a_soft_mask() {
+    let mut png = Vec::new();
+    let mut rgba = image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 0, 0, 0]));
+    rgba.put_pixel(1, 0, image::Rgba([10, 20, 30, 255]));
+    assert!(
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+    );
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains"), Page::new("p2", "2", "More")];
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    let mut underlays = BTreeMap::new();
+    underlays.insert("pictures/logo.png".to_string(), png);
+    let opts = Options {
+        underlays,
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(
+        text.matches("/SMask ").count(),
+        1,
+        "one mask for the one shared picture"
+    );
+    assert!(
+        text.contains("/Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length")
+    );
+    // The mask holds the alpha samples: transparent, then opaque.
+    let mask = picture::decode(&opts.underlays["pictures/logo.png"])
+        .unwrap()
+        .alpha
+        .unwrap();
+    assert_eq!(miniz_oxide::inflate::decompress_to_vec_zlib(&mask).unwrap(), [0, 255]);
+    // Every object the cross-reference table lists is in the file.
+    let objs = text.matches(" 0 obj\n").count();
+    assert!(text.contains(&format!("/Size {}", objs + 1)));
+}
+
+#[test]
+fn a_jpeg_cut_short_after_its_header_is_a_warning_for_the_logo_and_an_underlay() {
+    // A frame header and nothing else: no scan, no end marker.
+    let cut = vec![
+        0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
+    ];
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "Scan");
+    p1.underlay = Some(wc_core::Underlay {
+        file: "underlays/cut.jpg".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(10.0, 10.0),
+    });
+    project.pages = vec![p1];
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/cut.jpg".into(),
+        cover: None,
+    });
+    let mut underlays = BTreeMap::new();
+    underlays.insert("underlays/cut.jpg".to_string(), cut.clone());
+    underlays.insert("pictures/cut.jpg".to_string(), cut);
+    let opts = Options {
+        underlays,
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    assert!(!String::from_utf8_lossy(&pdf).contains("/Subtype /Image"));
+    assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+    assert!(report.warnings.iter().all(|w| w.contains("damaged")));
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn pictures_that_cannot_be_read_say_why_and_links_out_of_the_project_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("p");
+    std::fs::create_dir_all(dir.join("pictures")).unwrap();
+    std::fs::write(dir.join("pictures/in.png"), b"x").unwrap();
+    std::fs::write(tmp.path().join("secret.png"), b"s").unwrap();
+    assert_eq!(read_picture(&dir, "pictures/in.png"), Ok(Some(b"x".to_vec())));
+    assert_eq!(read_picture(&dir, "pictures/gone.png"), Ok(None));
+    assert!(read_picture(&dir, "../secret.png").is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(tmp.path().join("secret.png"), dir.join("pictures/link.png")).unwrap();
+        assert!(read_picture(&dir, "pictures/link.png").unwrap_err().contains("outside"));
+        let mut project = Project::new("x");
+        project.pages = vec![Page::new("p1", "1", "Mains")];
+        project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/link.png".into(),
+            cover: None,
+        });
+        let pictures = read_pictures(&dir, &project);
+        assert!(pictures.files.is_empty());
+        let opts = Options {
+            underlays: pictures.files,
+            unreadable: pictures.unreadable,
+            ..Default::default()
+        };
+        let (_, report) = export(&project, &BTreeMap::new(), &opts);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("cannot be read") && report.warnings[0].contains("outside"));
+    }
+}
+
+#[test]
 fn a_logo_keeps_its_proportions_in_its_box() {
     let (min, max) = fit_picture((Point::new(0.0, 0.0), Point::new(30.0, 10.0)), (100, 100));
     assert_eq!((min, max), (Point::new(10.0, 0.0), Point::new(20.0, 10.0)));

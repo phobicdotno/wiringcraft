@@ -68,7 +68,9 @@ impl Logo {
 }
 
 /// Whether `file` is a plain relative path inside the project (no `..`, no absolute path,
-/// no backslashes or drive letters), so reading it can never leave the project folder.
+/// no backslashes or drive letters). This checks the text only: a link inside the project can
+/// still lead out of it, so readers also check where the path really goes
+/// (`wc_pdf::read_picture`).
 pub fn relative_file_is_safe(f: &str) -> bool {
     !f.is_empty()
         && !f.starts_with('/')
@@ -736,8 +738,7 @@ impl Underlay {
     /// Folder in a project that holds underlay pictures.
     pub const DIR: &'static str = "underlays";
 
-    /// Whether `file` is a plain relative path inside the project (no `..`, no absolute path,
-    /// no backslashes), so reading it can never leave the project folder.
+    /// Whether `file` is a plain relative path inside the project (see [`relative_file_is_safe`]).
     pub fn file_is_safe(&self) -> bool {
         relative_file_is_safe(&self.file)
     }

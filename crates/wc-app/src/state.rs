@@ -227,8 +227,8 @@ impl Open {
             return t.clone();
         }
         let max_side = ctx.input(|i| i.max_texture_side).max(1) as u32;
-        let tex = wc_core::project::relative_file_is_safe(file)
-            .then(|| std::fs::read(self.dir.join(file)).ok())
+        let tex = wc_pdf::read_picture(&self.dir, file)
+            .ok()
             .flatten()
             .and_then(|bytes| image::load_from_memory(&bytes).ok())
             .map(|img| {
@@ -289,10 +289,20 @@ impl Open {
             match std::fs::read(&path) {
                 Ok(have) if have == bytes => break name,
                 Ok(_) => n += 1,
-                Err(_) => {
-                    std::fs::write(&path, &bytes).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
-                    break name;
+                // Only a name nobody uses is written, and never over a file made meanwhile.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let made = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes));
+                    match made {
+                        Ok(()) => break name,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                        Err(e) => return Err(format!("Cannot write {}: {e}", path.display())),
+                    }
                 }
+                Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
             }
         };
         let file = format!("{}/{file}", wc_core::Logo::DIR);

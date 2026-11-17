@@ -49,6 +49,9 @@ pub struct PageImage {
     /// Extra dictionary entries, such as an inverted `/Decode` for Adobe CMYK JPEGs.
     pub extra: &'static str,
     pub data: Vec<u8>,
+    /// Transparency: one Flate-compressed 8-bit alpha sample per pixel, written as the image's
+    /// soft mask. `None` for an opaque picture.
+    pub alpha: Option<Vec<u8>>,
     /// Where it goes on the page, in millimetres (y down).
     pub min: (f64, f64),
     pub max: (f64, f64),
@@ -217,7 +220,18 @@ impl Doc {
                 if !shared.iter().any(|(k, _)| *k == key) {
                     let obj = 6 + 3 * n + used.len() + image_obj.len() + shared.len();
                     shared.push((key, obj));
-                    objs.push((obj, image_object(&placed.image)));
+                }
+            }
+        }
+        // Soft masks of transparent pictures come last, numbered as they are needed.
+        let mut next_free = 6 + 3 * n + used.len() + image_obj.len() + shared.len();
+        for p in &self.pages {
+            for placed in &p.drawn.pictures {
+                let key = std::sync::Arc::as_ptr(&placed.image);
+                if let Some((_, obj)) = shared.iter().find(|(k, _)| *k == key)
+                    && !objs.iter().any(|(o, _)| o == obj)
+                {
+                    objs.extend(image_objects(&placed.image, *obj, &mut next_free));
                 }
             }
         }
@@ -304,7 +318,7 @@ impl Doc {
                     y1 - y0
                 );
                 xobjects = format!("/Im0 {obj} 0 R");
-                objs.push((*obj, image_object(img)));
+                objs.extend(image_objects(img, *obj, &mut next_free));
             }
             ops.push_str(&p.drawn.ops);
             for (k, placed) in p.drawn.pictures.iter().enumerate() {
@@ -382,21 +396,43 @@ impl Doc {
     }
 }
 
-/// An image XObject holding `img`'s samples.
-fn image_object(img: &PageImage) -> Vec<u8> {
-    let mut body = format!(
-        "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{} /BitsPerComponent 8 /Filter /{}{} /Length {} >>\nstream\n",
-        img.width,
-        img.height,
-        img.colour_space,
-        img.filter,
-        img.extra,
-        img.data.len()
-    )
-    .into_bytes();
-    body.extend_from_slice(&img.data);
-    body.extend_from_slice(b"\nendstream");
-    body
+/// The image XObject holding `img`'s samples as object `obj`, and its soft mask (numbered from
+/// `next_free`, which moves past it) when the picture is transparent.
+fn image_objects(img: &PageImage, obj: usize, next_free: &mut usize) -> Vec<(usize, Vec<u8>)> {
+    let stream = |dict: String, data: &[u8]| {
+        let mut body = format!("{dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\nendstream");
+        body
+    };
+    let mut out = Vec::new();
+    let mut smask = String::new();
+    if let Some(alpha) = &img.alpha {
+        let m = *next_free;
+        *next_free += 1;
+        smask = format!(" /SMask {m} 0 R");
+        out.push((
+            m,
+            stream(
+                format!(
+                    "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                    img.width, img.height
+                ),
+                alpha,
+            ),
+        ));
+    }
+    out.push((
+        obj,
+        stream(
+            format!(
+                "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{} /BitsPerComponent 8 /Filter /{}{}{smask}",
+                img.width, img.height, img.colour_space, img.filter, img.extra
+            ),
+            &img.data,
+        ),
+    ));
+    out
 }
 
 /// Builds a content stream in page millimetres (y down), converting to PDF points (y up).

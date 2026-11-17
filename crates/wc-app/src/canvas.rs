@@ -952,7 +952,9 @@ fn select_tool(
             size,
             checkpoint,
         }) if resp.dragged_by(egui::PointerButton::Primary) => {
-            if let Some(cur) = ed.cursor {
+            // The raw pointer, like `from`: `ed.cursor` is snapped to the grid, and mixing the
+            // two would jump the logo on the first move.
+            if let Some(cur) = resp.interact_pointer_pos().map(|p| xf.mm(p)) {
                 let (a, b) = logo_dragged(start, size, Point::new(cur.x - from.x, cur.y - from.y));
                 let now = wc_pdf::cover_logo_box(&open.project, page);
                 if now != Some((a, b)) {
