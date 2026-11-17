@@ -2415,6 +2415,19 @@ mod tests {
             .unwrap();
         std::fs::write(&file, w.finish().unwrap().into_inner()).unwrap();
         let lib = tmp.path().join("lib");
+        cli(
+            tmp.path(),
+            &[
+                "import",
+                "parts-edz",
+                file.to_str().unwrap(),
+                "--lib",
+                lib.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(lib.join("parts").join("sie.3rt2015.json").exists());
+        std::fs::remove_dir_all(&lib).unwrap();
         let (n, report, warnings) = import_edz(&file, &lib).unwrap();
         assert_eq!(n, 1, "{warnings:?}");
         assert_eq!(report.macros, 1);
@@ -2424,6 +2437,18 @@ mod tests {
 
         std::fs::write(&file, "not an archive").unwrap();
         assert!(import_edz(&file, &lib).is_err());
+        let err = cli(
+            tmp.path(),
+            &[
+                "import",
+                "parts-edz",
+                file.to_str().unwrap(),
+                "--lib",
+                lib.to_str().unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("not an EDZ archive"), "{err}");
     }
 
     #[test]

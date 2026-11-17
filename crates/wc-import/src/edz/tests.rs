@@ -142,3 +142,115 @@ fn texts_in_several_languages_prefer_english() {
     assert_eq!(pick_language("Plain text"), "Plain text");
     assert_eq!(pick_language("de_DE@;"), "");
 }
+
+#[test]
+fn plain_text_with_an_at_sign_is_kept_whole() {
+    assert_eq!(
+        pick_language("Contact support@example.com"),
+        "Contact support@example.com"
+    );
+    assert_eq!(pick_language("ORD@12;34"), "ORD@12;34");
+    assert_eq!(pick_language("de-DE@Schütz;"), "Schütz");
+}
+
+#[test]
+fn a_variant_fills_a_text_that_is_empty_in_every_language() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_ORDERNR="K1" P_ARTICLE_MANUFACTURER="ACME" P_ARTICLE_DESCR1="de_DE@;"><variant P_ARTICLE_DESCR1="en_US@Contactor;"/></part></partsmanagement>"#;
+    let parts = part_xml(xml)?.ok_or("not part data")?;
+    assert_eq!(parts[0].description, "Contactor");
+    Ok(())
+}
+
+const SMALL: Limits = Limits {
+    entry: 1024,
+    entries: 3,
+    total: 2048,
+    unpacked: 8 * 1024,
+};
+
+#[test]
+fn an_xml_file_over_the_entry_limit_is_skipped_and_reported() -> TestResult {
+    let mut big = PARTS.to_owned();
+    big.push_str(&" ".repeat(2000));
+    for edz in [
+        seven_zip(&[("big.xml", big.as_bytes()), ("parts.xml", PARTS.as_bytes())])?,
+        zip(&[("big.xml", big.as_bytes()), ("parts.xml", PARTS.as_bytes())])?,
+    ] {
+        let (parts, report, _) = read_with(&edz, SMALL)?;
+        assert_eq!(report.too_large, 1);
+        assert_eq!(report.part_files, 1);
+        assert_eq!(parts.len(), 2);
+        assert!(
+            report
+                .lines()
+                .contains(&"1 XML file(s) over the size limit: skipped".to_owned())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn part_xml_past_the_total_limit_is_skipped() -> TestResult {
+    let edz = zip(&[
+        ("a.xml", PARTS.as_bytes()),
+        ("b.xml", PARTS.as_bytes()),
+        ("c.xml", PARTS.as_bytes()),
+    ])?;
+    let size = PARTS.len() as u64;
+    let limits = Limits {
+        entry: size,
+        total: size * 2 + size / 2,
+        ..SMALL
+    };
+    let (_, report, _) = read_with(&edz, limits)?;
+    assert_eq!((report.part_files, report.too_large), (2, 1));
+    Ok(())
+}
+
+#[test]
+fn an_archive_with_too_many_files_is_refused_not_cut_short() -> TestResult {
+    let files: Vec<(&str, &[u8])> = vec![("a.ema", b"m"), ("b.ema", b"m"), ("c.ema", b"m"), ("d.ema", b"m")];
+    for edz in [seven_zip(&files)?, zip(&files)?] {
+        let err = read_with(&edz, SMALL).err().ok_or("four files were taken")?;
+        assert!(err.to_string().contains("more than 3 files"), "{err}");
+        assert!(read_with(&edz, Limits { entries: 4, ..SMALL }).is_ok());
+    }
+    Ok(())
+}
+
+#[test]
+fn a_seven_zip_archive_that_unpacks_too_large_is_refused() -> TestResult {
+    let filler = vec![0u8; 6 * 1024];
+    let edz = seven_zip(&[("one.bin", &filler), ("two.bin", &filler)])?;
+    let err = read_with(&edz, SMALL)
+        .err()
+        .ok_or("the archive was unpacked past the budget")?;
+    assert!(err.to_string().contains("unpacks to more than"), "{err}");
+    assert!(
+        read_with(
+            &edz,
+            Limits {
+                unpacked: 16 * 1024,
+                ..SMALL
+            }
+        )
+        .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn xml_nested_too_deeply_is_an_error() {
+    let xml = format!(
+        "<partsmanagement>{}{}</partsmanagement>",
+        "<a>".repeat(70),
+        "</a>".repeat(70)
+    );
+    assert!(part_xml(&xml).is_err());
+    let ok = format!(
+        "<partsmanagement>{}{}</partsmanagement>",
+        "<a>".repeat(10),
+        "</a>".repeat(10)
+    );
+    assert!(part_xml(&ok).is_ok());
+}

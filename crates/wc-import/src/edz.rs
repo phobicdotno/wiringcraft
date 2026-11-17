@@ -21,10 +21,34 @@ use crate::{Error, Result};
 
 /// The largest entry read, in bytes; a larger one is skipped and counted.
 pub const MAX_ENTRY: u64 = 64 * 1024 * 1024;
-/// The most entries looked at.
+/// The most files an archive may hold; one with more is refused.
 pub const MAX_ENTRIES: usize = 100_000;
 /// The most part XML read in all, in bytes, so an archive cannot fill the memory.
 pub const MAX_TOTAL: u64 = 512 * 1024 * 1024;
+/// The most a 7-Zip archive may unpack to in all, in bytes. Skipped entries are still unpacked
+/// on the way to the next one, so this bounds the work a hostile archive can cause.
+pub const MAX_UNPACKED: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The limits [`read_with`] applies; [`read`] uses [`LIMITS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The largest entry read, in bytes.
+    pub entry: u64,
+    /// The most files an archive may hold.
+    pub entries: usize,
+    /// The most part XML read in all, in bytes.
+    pub total: u64,
+    /// The most a 7-Zip archive may unpack to in all, in bytes.
+    pub unpacked: u64,
+}
+
+/// The limits for reading EDZ files.
+pub const LIMITS: Limits = Limits {
+    entry: MAX_ENTRY,
+    entries: MAX_ENTRIES,
+    total: MAX_TOTAL,
+    unpacked: MAX_UNPACKED,
+};
 /// Deepest XML nesting accepted.
 const MAX_DEPTH: usize = 64;
 
@@ -49,7 +73,7 @@ pub struct Report {
     pub pictures: usize,
     /// Everything else (other XML, documents, folders' contents), not imported.
     pub other: usize,
-    /// Entries larger than [`MAX_ENTRY`], skipped.
+    /// Part XML entries over the size limits, skipped.
     pub too_large: usize,
 }
 
@@ -67,11 +91,7 @@ impl Report {
             out.push(format!("{} other file(s): not imported", self.other));
         }
         if self.too_large > 0 {
-            out.push(format!(
-                "{} file(s) larger than {} MiB: skipped",
-                self.too_large,
-                MAX_ENTRY / 1024 / 1024
-            ));
+            out.push(format!("{} XML file(s) over the size limit: skipped", self.too_large));
         }
         out
     }
@@ -98,6 +118,12 @@ fn entry_kind(name: &str) -> Entry {
 /// Read an EDZ archive's parts. Returns the parts (sorted by id), what the archive held, and
 /// warnings. A damaged archive or part file is an error, never a panic.
 pub fn read(bytes: &[u8]) -> Result<(Vec<Part>, Report, Vec<String>)> {
+    read_with(bytes, LIMITS)
+}
+
+/// [`read`] with other limits.
+pub fn read_with(bytes: &[u8], limits: Limits) -> Result<(Vec<Part>, Report, Vec<String>)> {
+    let too_many = || Error::Format(format!("the archive holds more than {} files", limits.entries));
     let mut report = Report::default();
     let mut xml: Vec<(String, Vec<u8>)> = Vec::new();
     let mut total = 0u64;
@@ -106,13 +132,13 @@ pub fn read(bytes: &[u8]) -> Result<(Vec<Part>, Report, Vec<String>)> {
             Entry::Macro => report.macros += 1,
             Entry::Picture => report.pictures += 1,
             Entry::Other => report.other += 1,
-            Entry::Xml if size > MAX_ENTRY || total.saturating_add(size) > MAX_TOTAL => report.too_large += 1,
+            Entry::Xml if size > limits.entry || total.saturating_add(size) > limits.total => report.too_large += 1,
             Entry::Xml => {
                 let mut buf = Vec::new();
-                data.take(MAX_ENTRY + 1)
+                data.take(limits.entry + 1)
                     .read_to_end(&mut buf)
                     .map_err(|e| Error::Format(format!("{name} cannot be read from the archive: {e}")))?;
-                if buf.len() as u64 > MAX_ENTRY {
+                if buf.len() as u64 > limits.entry || total.saturating_add(buf.len() as u64) > limits.total {
                     report.too_large += 1;
                 } else {
                     total += buf.len() as u64;
@@ -127,14 +153,28 @@ pub fn read(bytes: &[u8]) -> Result<(Vec<Part>, Report, Vec<String>)> {
         let mut reader = sevenz_rust2::ArchiveReader::new(Cursor::new(bytes), sevenz_rust2::Password::empty())
             .map_err(|e| Error::Format(format!("not a readable EDZ (7-Zip) archive: {e}")))?;
         let mut seen = 0usize;
+        let mut unpacked = 0u64;
         let mut failed: Option<Error> = None;
         reader
             .for_each_entries(|entry, data| {
+                // Once refused, every later block is skipped without unpacking it.
+                if failed.is_some() {
+                    return Ok(false);
+                }
                 if entry.is_directory {
                     return Ok(true);
                 }
                 seen += 1;
-                if seen > MAX_ENTRIES {
+                unpacked = unpacked.saturating_add(entry.size);
+                if seen > limits.entries {
+                    failed = Some(too_many());
+                    return Ok(false);
+                }
+                if unpacked > limits.unpacked {
+                    failed = Some(Error::Format(format!(
+                        "the archive unpacks to more than {} MiB; it is refused",
+                        limits.unpacked / 1024 / 1024
+                    )));
                     return Ok(false);
                 }
                 match take(&entry.name, entry.size, data, &mut report) {
@@ -152,7 +192,10 @@ pub fn read(bytes: &[u8]) -> Result<(Vec<Part>, Report, Vec<String>)> {
     } else if bytes.starts_with(ZIP) {
         let mut z = zip::ZipArchive::new(Cursor::new(bytes))
             .map_err(|e| Error::Format(format!("not a readable EDZ (zip) archive: {e}")))?;
-        for i in 0..z.len().min(MAX_ENTRIES) {
+        if z.len() > limits.entries {
+            return Err(too_many());
+        }
+        for i in 0..z.len() {
             let mut f = z
                 .by_index(i)
                 .map_err(|e| Error::Format(format!("the EDZ archive is damaged: {e}")))?;
@@ -285,12 +328,16 @@ pub fn part_xml(text: &str) -> Result<Option<Vec<Part>>> {
 /// The text for one language out of `de_DE@Schütz;en_US@Contactor;`: English first, then the
 /// first one given. Plain text is returned as it is.
 pub fn pick_language(value: &str) -> String {
-    if !value.contains('@') {
+    let segments: Vec<&str> = value.split(';').filter(|t| !t.trim().is_empty()).collect();
+    let split: Option<Vec<(&str, &str)>> = segments
+        .iter()
+        .map(|t| t.split_once('@').filter(|(lang, _)| is_language(lang.trim())))
+        .collect();
+    let Some(split) = split.filter(|s| !s.is_empty()) else {
         return value.trim().to_owned();
-    }
-    let texts: Vec<(&str, &str)> = value
-        .split(';')
-        .filter_map(|t| t.split_once('@'))
+    };
+    let texts: Vec<(&str, &str)> = split
+        .into_iter()
         .map(|(lang, text)| (lang.trim(), text.trim()))
         .filter(|(_, text)| !text.is_empty())
         .collect();
@@ -303,14 +350,35 @@ pub fn pick_language(value: &str) -> String {
         .unwrap_or_default()
 }
 
+/// A language name as EPLAN writes it: `en`, `en_US`, `de-DE`, `zh_Hans`.
+fn is_language(s: &str) -> bool {
+    let (lang, region) = match s.split_once(['_', '-']) {
+        Some((l, r)) => (l, Some(r)),
+        None => (s, None),
+    };
+    (2..=3).contains(&lang.len())
+        && lang.bytes().all(|b| b.is_ascii_alphabetic())
+        && region.is_none_or(|r| (2..=4).contains(&r.len()) && r.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// The properties with one language picked and empty texts left out.
+fn picked(props: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    props
+        .into_iter()
+        .map(|(k, v)| (k, pick_language(&v)))
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
+}
+
 fn part_of(raw: Raw) -> Option<Part> {
-    let mut props = raw.props;
+    // Languages are picked first, so a part text empty in every language is filled from the variant.
+    let mut props = picked(raw.props);
     if let Some(variant) = raw.variant {
-        for (k, v) in variant {
+        for (k, v) in picked(variant) {
             props.entry(k).or_insert(v);
         }
     }
-    let mut get = |k: &str| props.remove(k).map(|v| pick_language(&v)).unwrap_or_default();
+    let mut get = |k: &str| props.remove(k).unwrap_or_default();
     let partnr = get("P_ARTICLE_PARTNR");
     let manufacturer = get("P_ARTICLE_MANUFACTURER");
     let ordernr = get("P_ARTICLE_ORDERNR");
@@ -332,12 +400,7 @@ fn part_of(raw: Raw) -> Option<Part> {
     if !typenr.is_empty() && typenr != order_number {
         properties.insert(PROP_TYPE.to_owned(), typenr);
     }
-    for (k, v) in props {
-        let v = pick_language(&v);
-        if !v.is_empty() {
-            properties.insert(k, v);
-        }
-    }
+    properties.extend(props);
     Some(Part {
         id: Part::make_id(&manufacturer, &order_number),
         manufacturer,
