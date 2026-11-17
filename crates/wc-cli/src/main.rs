@@ -1538,6 +1538,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let mut sw = wc_import::swe::read(&conn).map_err(e)?;
             sw.info = info;
             let choice = swe_symbol_choice(dir, &p, symbol_map.as_deref())?;
+            for w in &choice.2 {
+                eprintln!("warning: {w}");
+            }
             let (built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);
             for w in sw.warnings.iter().chain(&warnings) {
                 eprintln!("warning: {w}");
@@ -2134,12 +2137,17 @@ fn eplan_tables(path: &Path) -> Result<wc_import::eplan::Tables, String> {
 /// the lockfile under `source`.
 /// The library symbols a SolidWorks import may draw, with the library each comes from: the
 /// project's own copy where it has one (so a repeated import matches it), otherwise the
-/// project's libraries. With `map`, the user's block map from that file.
+/// project's libraries. With `map`, the user's block map from that file. Also returns the
+/// warnings to show: copies or library symbols that cannot be read, mapped symbols no library has.
 fn swe_symbol_choice(
     dir: &Path,
     p: &Project,
     map: Option<&Path>,
-) -> Res<(wc_import::swe::SymbolChoice, std::collections::BTreeMap<String, String>)> {
+) -> Res<(
+    wc_import::swe::SymbolChoice,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+)> {
     let mut choice = wc_import::swe::SymbolChoice::default();
     if let Some(path) = map {
         let text = std::fs::read_to_string(path).map_err(|x| format!("{}: {x}", path.display()))?;
@@ -2149,6 +2157,7 @@ fn swe_symbol_choice(
     wanted.extend(wc_import::swe::BUILTIN_BY_PINS.iter().map(|(_, id)| (*id).to_owned()));
     let lib = readable_libraries(dir, p);
     let mut sources = std::collections::BTreeMap::new();
+    let mut warnings = Vec::new();
     for id in wanted {
         // The project's own copy first, used on a page or not.
         if p.lock.symbols.contains_key(&id) {
@@ -2160,25 +2169,29 @@ fn swe_symbol_choice(
                     continue;
                 }
                 Ok(None) => {}
-                Err(why) => eprintln!("warning: {why}; trying the libraries"),
+                Err(why) => warnings.push(format!("{why}; trying the libraries")),
             }
         }
-        let found = match lib.as_ref().map(|l| l.symbol(&id)) {
-            Some(Ok(found)) => Some(found),
-            Some(Err(wc_library::Error::NotFound { .. })) | None => None,
-            Some(Err(why)) => {
-                eprintln!("warning: library symbol {id} cannot be read, blocks it would match stay boxes: {why}");
-                None
+        match lib.as_ref().map(|l| l.symbol(&id)) {
+            Some(Ok((s, source))) => {
+                sources.insert(id.clone(), source);
+                choice.library.insert(id, s);
             }
-        };
-        if let Some((s, source)) = found {
-            sources.insert(id.clone(), source);
-            choice.library.insert(id, s);
-        } else if map.is_some() && choice.by_block.values().any(|v| *v == id) {
-            eprintln!("warning: symbol map names {id}, which no library has; those blocks stay boxes");
+            // Only a symbol that is really missing is "no library has"; one that cannot be read
+            // was reported with its reason.
+            Some(Err(wc_library::Error::NotFound { .. })) | None => {
+                if choice.by_block.values().any(|v| *v == id) {
+                    warnings.push(format!(
+                        "symbol map names {id}, which no library has; those blocks stay boxes"
+                    ));
+                }
+            }
+            Some(Err(why)) => warnings.push(format!(
+                "library symbol {id} cannot be read, blocks it would match stay boxes: {why}"
+            )),
         }
     }
-    Ok((choice, sources))
+    Ok((choice, sources, warnings))
 }
 
 /// The project's libraries that can be opened, in their order. A source that cannot be opened (a
@@ -2449,12 +2462,12 @@ mod tests {
                 .all(|pg| pg.symbols.iter().all(|s| s.symbol != "wc.coil")),
             "no page uses the pinned symbol"
         );
-        let (choice, sources) = swe_symbol_choice(&dir, &p, None).unwrap();
+        let (choice, sources, _) = swe_symbol_choice(&dir, &p, None).unwrap();
         assert_eq!(choice.library["wc.coil"].name, "Pinned coil", "the project copy wins");
         assert_eq!(sources["wc.coil"], source, "it stays pinned to its library");
         // A library that is gone does not lose the pinned copy either.
         p.meta.libraries.clear();
-        let (choice, _) = swe_symbol_choice(&dir, &p, None).unwrap();
+        let (choice, _, _) = swe_symbol_choice(&dir, &p, None).unwrap();
         assert_eq!(choice.library["wc.coil"].name, "Pinned coil");
     }
 
@@ -2489,12 +2502,51 @@ mod tests {
             wc_library::Library::open(&dir, &p).is_err(),
             "the source list as a whole fails"
         );
-        let (choice, sources) = swe_symbol_choice(&dir, &p, None).unwrap();
+        let (choice, sources, _) = swe_symbol_choice(&dir, &p, None).unwrap();
         assert!(
             choice.library.contains_key("wc.coil"),
             "the readable library is still used"
         );
         assert_eq!(sources["wc.coil"], "starter");
+    }
+
+    #[test]
+    fn an_unreadable_mapped_symbol_says_why_and_not_that_it_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let lib = tmp.path().join("lib");
+        std::fs::create_dir_all(lib.join("symbols")).unwrap();
+        std::fs::write(lib.join("symbols").join("my.coil.json"), "{ not json").unwrap();
+        p.meta.libraries = vec![LibrarySource {
+            name: "mine".into(),
+            kind: "folder".into(),
+            location: lib.to_string_lossy().into_owned(),
+            reference: None,
+        }];
+        let map = tmp.path().join("map.txt");
+        std::fs::write(&map, "Relay = my.coil\nLamp = my.lamp\n").unwrap();
+        let (choice, _, warnings) = swe_symbol_choice(&dir, &p, Some(&map)).unwrap();
+        assert!(!choice.library.contains_key("my.coil"));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("library symbol my.coil cannot be read")),
+            "the reason is given: {warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("names my.coil, which no library has")),
+            "an unreadable symbol is not called missing: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("names my.lamp, which no library has")),
+            "a really missing one still is: {warnings:?}"
+        );
     }
 
     #[test]
