@@ -449,10 +449,11 @@ fn texts(conn: &Connection, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, 
     let rows = st
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
         .map_err(sql)?;
-    // English sorts last, so it wins.
+    // English sorts last, so it wins. A blank translation (only tabs or line breaks, which SQL
+    // TRIM keeps) never replaces a real one.
     for (id, text) in readable(rows, "text", warnings) {
-        if let Some(t) = text {
-            out.insert(id, t);
+        if let Some(t) = text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            out.insert(id, t.to_owned());
         }
     }
     Ok(out)

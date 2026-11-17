@@ -950,7 +950,7 @@ fn the_project_fields_come_across_without_a_description_table_and_with_numbers()
     c.execute_batch(
         "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
            pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
-           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb INTEGER,
            pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
          INSERT INTO tew_project VALUES (1, 'P', '1', 'Customer', '', '', '', '', '', '', '', 1042,
            'designer', '', '', '');",
@@ -959,7 +959,7 @@ fn the_project_fields_come_across_without_a_description_table_and_with_numbers()
     let info = project_info(&c, "1").unwrap().unwrap();
     assert_eq!(
         info.contract_number, "1042",
-        "a number in a text column is read as text"
+        "a number stored as an integer is read as text"
     );
     assert_eq!(info.customer, "Customer");
     assert!(info.description.is_empty());
@@ -1026,4 +1026,22 @@ fn a_project_list_that_cannot_be_opened_is_a_warning_not_silence() {
     // Without a project list there are simply no fields, and no warning.
     let got = database_from_archive(archive(&[("Projects/1/Database/tew_project_data.sqlite", &db)]), 1).unwrap();
     assert!(got.info.is_none() && got.info_warning.is_none());
+}
+
+#[test]
+fn a_blank_english_translation_does_not_hide_another_language() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         INSERT INTO tew_project VALUES (1, 'P', '1', '', '', '', '', '', '', '', '', '', '', '', '', '');
+         CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0 TEXT);
+         INSERT INTO tew_translatedtext VALUES (1, -1, 'de', ' Beschreibung '), (1, -1, 'en', char(9) || char(10));",
+    )
+    .unwrap();
+    let info = project_info(&c, "1").unwrap().unwrap();
+    assert_eq!(info.description, "Beschreibung");
+    assert!(info.warnings.is_empty(), "{:?}", info.warnings);
 }
