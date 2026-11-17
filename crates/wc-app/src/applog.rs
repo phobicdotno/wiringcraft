@@ -2,10 +2,11 @@
 //! files in the user's data folder. When something goes wrong the person can look at it and
 //! choose to send it with a problem report (Help, Report a problem); nothing is sent otherwise.
 //!
-//! Lines are masked before they are written: the home folder becomes `~`, and API keys, tokens
-//! and email addresses are replaced, so a log can be shared without leaking them. Project content
-//! is not saved in the log, but messages WiringCraft shows can name devices or pages, and those
-//! messages are logged, so the report dialog asks the person to look the log over first.
+//! Lines are masked before they are written: the home folder becomes `~`, and API keys, tokens,
+//! email addresses and device tags (`-K1`, `+CAB1-Q1`) are replaced, so a log can be shared
+//! without leaking them or the project's devices. Drawings are never logged; messages WiringCraft
+//! shows are, and they can still name a page, so the report dialog asks the person to look the
+//! log over first.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -244,6 +245,12 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=')
 }
 
+/// A device tag: starts with `=`, `+` or `-` and a letter, like `-K1` or `+CAB1-Q1`.
+fn is_device_tag(word: &str) -> bool {
+    let mut c = word.chars();
+    matches!(c.next(), Some('=' | '+' | '-')) && c.next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
 /// Where a secret value that continues in `rest` ends: at the next white space.
 fn value_end(rest: &str) -> usize {
     rest.find(char::is_whitespace).unwrap_or(rest.len())
@@ -302,6 +309,10 @@ pub fn mask(text: &str, home: Option<&str>) -> String {
             // The value after a key word, whatever its length, up to the next space.
             out.push_str("***");
             rest = &rest[value_end(rest)..];
+            hide_next = false;
+        } else if is_device_tag(word) {
+            // Project content: `-K1`, `+CAB1-Q1`, `=PUMP+CAB1-Q1`.
+            out.push_str("<tag>");
             hide_next = false;
         } else if word.find('@').is_some_and(|at| at > 0 && word[at + 1..].contains('.')) {
             out.push_str("<email>");
@@ -458,6 +469,15 @@ mod tests {
         assert_eq!(m("from ola.nordmann@example.com today"), "from <email> today");
         assert_eq!(m("two\nlines"), "two lines");
         assert_eq!(m("Saved 3 pages"), "Saved 3 pages", "ordinary text stays");
+        assert_eq!(
+            m("Could not insert -K1: placed +CAB1-Q1, =PUMP+A-F2"),
+            "Could not insert <tag>: placed <tag>, <tag>"
+        );
+        assert_eq!(
+            m("run --mcp-bridge x-1 -5"),
+            "run --mcp-bridge x-1 -5",
+            "options and numbers stay"
+        );
         assert_eq!(mask(r"C:\Users\ola\x", Some(r"C:\Users\ola")), "~\\x");
     }
 

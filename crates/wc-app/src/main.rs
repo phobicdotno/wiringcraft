@@ -719,10 +719,10 @@ impl App {
                 }
                 Dialog::Report { log, include } => {
                     ui.label(
-                        "This is WiringCraft's log of what happened recently. Home folders, keys, tokens and \
-                         email addresses are already hidden. Messages WiringCraft showed are in it, and they can \
-                         name devices or pages of your project, so look it over first. Nothing is sent unless \
-                         you choose to.",
+                        "This is WiringCraft's log of what happened recently. Home folders, keys, tokens, \
+                         email addresses and device tags are already hidden, and no drawing is in it. Messages \
+                         WiringCraft showed are in it and can name a page, so look it over first. Nothing is \
+                         sent unless you choose to.",
                     );
                     if let Some(e) = applog::error() {
                         ui.colored_label(
