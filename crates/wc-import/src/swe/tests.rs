@@ -635,3 +635,33 @@ fn a_near_end_of_another_net_does_not_snap_onto_a_taken_pin() {
         "stays off the pin"
     );
 }
+
+#[test]
+fn the_first_net_to_snap_onto_a_free_pin_takes_it() {
+    let c = sample();
+    // K1:A2 (100, 195) is free; nets 202 and 203 both end within 0.5 mm of it, 202 first.
+    c.execute_batch(
+        "INSERT INTO tew_equipotential VALUES (901, '202'), (902, '203');
+         INSERT INTO tew_line VALUES (3, 10, 100.2, 195, 130, 195, 901), (4, 10, 99.7, 195, 70, 195, 902);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    let a2 = Endpoint::Pin {
+        item: "s1".into(),
+        pin: "A2".into(),
+    };
+    let on_a2: Vec<Option<&str>> = built.pages[0]
+        .wires
+        .iter()
+        .filter(|w| w.from == a2 || w.to == a2)
+        .map(|w| w.potential.as_deref())
+        .collect();
+    assert_eq!(on_a2, [Some("202")]);
+}
+
+#[test]
+fn a_fallback_net_name_never_takes_a_source_name() {
+    let taken: BTreeSet<String> = ["net7".to_owned(), "net7_2".to_owned()].into_iter().collect();
+    assert_eq!(fallback_net(7, &taken), "net7_3");
+    assert_eq!(fallback_net(8, &taken), "net8");
+}

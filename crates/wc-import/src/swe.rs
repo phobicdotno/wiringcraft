@@ -810,6 +810,19 @@ fn box_symbol(block: &str, origin: Point, corner: Option<Point>, pins: &[(String
     (graphics, out)
 }
 
+/// The name of an equipotential without a number: `net<id>`, or `net<id>_2`, ... when the source
+/// already uses that as a potential name.
+fn fallback_net(id: i64, taken: &BTreeSet<String>) -> String {
+    let base = format!("net{id}");
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2usize..)
+        .map(|k| format!("{base}_{k}"))
+        .find(|n| !taken.contains(n))
+        .unwrap_or(base)
+}
+
 /// Tags made unique: the second `-K1` becomes `-K1_2`.
 fn unique(tag: DeviceTag, taken: &mut BTreeSet<DeviceTag>) -> DeviceTag {
     if taken.insert(tag.clone()) {
@@ -944,6 +957,8 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     }
 
     let numbers = page_numbers(&drawn, p.books, first_page_number);
+    // Potential names the source uses, so a fallback name never takes one of them.
+    let potential_names: BTreeSet<String> = p.lines.iter().filter_map(|l| l.potential.clone()).collect();
     let mut symbol_ids: BTreeMap<String, String> = BTreeMap::new();
     let mut per_block: BTreeMap<String, usize> = BTreeMap::new();
     let mut no_points = 0;
@@ -1107,9 +1122,13 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                             || pin_nets[*k].is_empty()
                             || net.is_some_and(|n| pin_nets[*k].contains(&n)))
                 })
-                .map(|(_, (at, _, _))| *at)
-                .min_by(|x, y| dist(*x, q).total_cmp(&dist(*y, q)));
-            if let Some(at) = pin {
+                .map(|(k, (at, _, _))| (k, *at))
+                .min_by(|x, y| dist(x.1, q).total_cmp(&dist(y.1, q)));
+            if let Some((k, at)) = pin {
+                // The first net that snaps onto a free pin takes it.
+                if let Some(n) = net {
+                    pin_nets[k].insert(n);
+                }
                 return at;
             }
             if let Some((s, _)) = seen.iter().find(|(s, n)| dist(*s, q) <= JOIN && same_net(*n, net)) {
@@ -1197,7 +1216,10 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 .map(str::to_owned);
             // Without a number the equipotential is still one net: name it after its id, so its
             // wires stay connected and two such nets stay apart.
-            let potential = l.potential.clone().or_else(|| l.net.map(|id| format!("net{id}")));
+            let potential = l
+                .potential
+                .clone()
+                .or_else(|| l.net.map(|id| fallback_net(id, &potential_names)));
             for pair in points.windows(2) {
                 let (from, to) = (pair[0], pair[1]);
                 if near(from, to) {

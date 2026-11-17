@@ -1274,7 +1274,18 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let mut file = std::fs::File::open(&path).map_err(e)?;
             let is_db = std::io::Read::read_exact(&mut file, &mut head).is_ok() && &head == b"SQLite format 3\0";
             let db = if is_db {
-                std::fs::read(&path).map_err(e)?
+                // The same size cap as for a database taken out of an archive.
+                let limit = wc_import::swe::MAX_DATABASE_BYTES;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(std::fs::File::open(&path).map_err(e)?, limit + 1),
+                    &mut bytes,
+                )
+                .map_err(e)?;
+                if bytes.len() as u64 > limit {
+                    return Err(format!("{} is larger than {} MB", path.display(), limit >> 20));
+                }
+                bytes
             } else {
                 let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
                 let got =
@@ -1328,41 +1339,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             );
-            for s in &built.symbols {
-                store::write_vendored_symbol(dir, s).map_err(e)?;
-                p.lock.symbols.insert(
-                    s.id.clone(),
-                    wc_core::LockEntry {
-                        source: source.clone(),
-                        hash: s.hash(),
-                    },
-                );
-            }
-            for part in &built.parts {
-                store::write_vendored_part(dir, part).map_err(e)?;
-                p.lock.parts.insert(
-                    part.id.clone(),
-                    wc_core::LockEntry {
-                        source: source.clone(),
-                        hash: part.hash(),
-                    },
-                );
-            }
-            let n_pages = built.pages.len();
-            for page in built.pages {
-                if p.page(&page.id).is_some() {
-                    return Err(format!(
-                        "page {} exists; remove it or import into a fresh project",
-                        page.id
-                    ));
-                }
-                p.pages.push(page);
-            }
-            p.sort_pages();
-            let n_dev = built.devices.len();
-            for (t, d) in built.devices {
-                p.devices.insert(t, d);
-            }
+            // Through the shared preflight: conflicts are refused before anything is written.
+            let (n_pages, n_dev) = (built.pages.len(), built.devices.len());
+            add_built(dir, &mut p, built, &source)?;
             save(dir, &p)?;
             println!(
                 "imported {n_dev} devices, {} connections on {n_pages} page(s)",
