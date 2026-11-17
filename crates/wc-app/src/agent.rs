@@ -2481,6 +2481,39 @@ mod tests {
         assert_eq!(saved.project.pages[0].title, "Edited in the window");
     }
 
+    #[test]
+    fn a_symbol_waiting_to_be_put_back_survives_taking_another_symbol() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        open.save().unwrap();
+        let old = open.symbols["wc.coil"].clone();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut new = old.clone();
+        new.name = "Coil, from the command".into();
+        wc_core::store::write_vendored_symbol(&open.dir, &new).unwrap();
+        let mut on_disk = open.project.clone();
+        on_disk.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        wc_core::store::save(&open.dir, &on_disk).unwrap();
+        open.project.pages[0].title = "Edited in the window".into();
+        open.fail_symbol_writes = [true].into();
+        assert!(a.command_finish(Ok("Done.".into())).is_err());
+        let open = a.open.as_mut().unwrap();
+        // Another symbol is taken from the library, which reloads the vendored symbols.
+        let lib = wc_library::Library::open(&open.dir, &open.project).unwrap();
+        let other = lib
+            .index(wc_core::lock::ItemKind::Symbol)
+            .into_keys()
+            .find(|id| id != "wc.coil")
+            .unwrap();
+        open.take_saved_symbol(&lib, &other).unwrap();
+        assert_eq!(open.symbols["wc.coil"], old, "the window's version stays loaded");
+        open.save().unwrap();
+        let saved = Open::load(&open.dir).unwrap();
+        assert_eq!(saved.project.lock.symbols["wc.coil"].hash, old.hash());
+        assert_eq!(saved.symbols["wc.coil"], old);
+    }
+
     /// A second library folder after the starter one, holding its own `wc.coil`.
     fn later_library_with_a_coil(a: &mut App, root: &std::path::Path) -> crate::symbol_editor::Saved {
         let open = a.open.as_mut().unwrap();

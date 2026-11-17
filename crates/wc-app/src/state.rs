@@ -480,6 +480,20 @@ impl Open {
                 syms.insert(id.clone(), sym);
             }
         }
+        // A file that could not be put back still holds another version: the loaded one stays
+        // while the lock still names it, so the next save writes it. A lock that now names
+        // the file's version (the symbol was taken again) makes the file right.
+        for id in self.stale_symbol_files.clone() {
+            let wanted = self.project.lock.symbols.get(&id).map(|e| e.hash.clone());
+            match self.symbols.get(&id) {
+                Some(loaded) if wanted.as_ref().is_none_or(|h| *h == loaded.hash()) => {
+                    syms.insert(id.clone(), loaded.clone());
+                }
+                _ => {
+                    self.stale_symbol_files.remove(&id);
+                }
+            }
+        }
         self.symbols = syms;
     }
 
