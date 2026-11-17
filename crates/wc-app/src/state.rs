@@ -552,7 +552,7 @@ impl Open {
         Ok(())
     }
 
-    fn write_symbol_file(&mut self, sym: &Symbol) -> Result<(), String> {
+    pub(crate) fn write_symbol_file(&mut self, sym: &Symbol) -> Result<(), String> {
         #[cfg(test)]
         if self.fail_symbol_writes.pop_front() == Some(true) {
             return Err("test write failure".into());
@@ -604,11 +604,9 @@ impl Open {
             .iter()
             .filter(|(kind, _)| *kind == ItemKind::Part)
             .filter_map(|(kind, id)| store::vendor_path(&self.dir, *kind, id).ok())
-            .map(|path| {
-                let was = std::fs::read(&path).ok();
-                (path, was)
-            })
-            .collect();
+            .map(|path| Ok((path.clone(), snapshot_file(&path)?)))
+            .collect::<Result<_, String>>()
+            .map_err(|e| format!("nothing was updated: {e}"))?;
         self.archive_symbols();
         self.checkpoint();
         let done = match wc_library::update(&self.dir, &mut self.project, lib, only) {
@@ -618,12 +616,9 @@ impl Open {
                 let mut unrestored: Vec<String> = parts
                     .iter()
                     .filter_map(|(path, was)| {
-                        let r = match was {
-                            Some(bytes) => std::fs::write(path, bytes),
-                            None if path.exists() => std::fs::remove_file(path),
-                            None => Ok(()),
-                        };
-                        r.err().map(|err| format!("{} ({err})", path.display()))
+                        restore_file(path, was.as_deref())
+                            .err()
+                            .map(|err| format!("{} ({err})", path.display()))
                     })
                     .collect();
                 self.reload_symbols();
@@ -1445,6 +1440,39 @@ pub fn dangling_pins(project: &wc_core::Project, id: &str, symbol: &wc_core::Sym
     out
 }
 
+/// A file's bytes before it is changed, or `None` when there is no such file. Any other
+/// read error is returned: a file that is there but cannot be read must not be taken for absent
+/// (and then removed when putting things back).
+fn snapshot_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{} cannot be read: {e}", path.display())),
+    }
+}
+
+/// Put a file back as [`snapshot_file`] found it: untouched when it already holds those bytes,
+/// otherwise replaced whole (written next to it, then renamed over it), so a failed write
+/// leaves the file as it was rather than cut short.
+fn restore_file(path: &Path, was: Option<&[u8]>) -> std::io::Result<()> {
+    match was {
+        Some(bytes) => {
+            if std::fs::read(path).is_ok_and(|now| now == bytes) {
+                return Ok(());
+            }
+            let mut tmp = path.as_os_str().to_owned();
+            tmp.push(".tmp");
+            let tmp = PathBuf::from(tmp);
+            std::fs::write(&tmp, bytes)?;
+            std::fs::rename(&tmp, path)
+        }
+        None => match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        },
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
@@ -1466,6 +1494,37 @@ pub(crate) mod tests {
         store::save(&dir, &p).unwrap();
         let open = Open::load(&dir).unwrap();
         (tmp, open)
+    }
+
+    #[test]
+    fn a_part_file_that_cannot_be_read_is_not_taken_for_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing.json");
+        assert_eq!(super::snapshot_file(&missing).unwrap(), None);
+        // A directory where the file should be: there, but not readable as a file.
+        let unreadable = tmp.path().join("part.json");
+        std::fs::create_dir(&unreadable).unwrap();
+        let err = super::snapshot_file(&unreadable).unwrap_err();
+        assert!(err.contains("cannot be read"), "{err}");
+    }
+
+    #[test]
+    fn a_part_file_is_put_back_whole_or_not_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("part.json");
+        std::fs::write(&path, b"new").unwrap();
+        // The replacement cannot be written next to the file: the file keeps what it had.
+        std::fs::create_dir(tmp.path().join("part.json.tmp")).unwrap();
+        assert!(super::restore_file(&path, Some(b"old")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        // A file that already holds the bytes is not written at all.
+        assert!(super::restore_file(&path, Some(b"new")).is_ok());
+        std::fs::remove_dir(tmp.path().join("part.json.tmp")).unwrap();
+        super::restore_file(&path, Some(b"old")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        super::restore_file(&path, None).unwrap();
+        assert!(!path.exists());
+        super::restore_file(&path, None).unwrap();
     }
 
     #[test]

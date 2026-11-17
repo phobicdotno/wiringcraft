@@ -659,20 +659,14 @@ impl App {
                     Ok(l) => (Some(l), None),
                     Err(e) => (None, Some(format!("The project's library could not be opened: {e}"))),
                 };
-                // Only folders: a git source is a cache that the next sync overwrites.
-                let folders: Vec<String> = open
-                    .project
-                    .meta
-                    .libraries
-                    .iter()
-                    .filter(|l| l.kind == "folder")
-                    .map(|l| l.name.clone())
-                    .collect();
+                // Only folders: a git source is a cache that the next sync overwrites. Each
+                // source is paired with its declaration by position (`Library::open` keeps the
+                // order), so a git source sharing a folder's name is never offered.
                 let targets: Vec<symbol_editor::Target> = lib
                     .iter()
-                    .flat_map(|l| &l.sources)
-                    .filter(|s| folders.contains(&s.name))
-                    .map(|s| (s.name.clone(), s.root.clone()))
+                    .flat_map(|l| l.sources.iter().zip(&open.project.meta.libraries))
+                    .filter(|(_, decl)| decl.kind == "folder")
+                    .map(|(s, _)| (s.name.clone(), s.root.clone()))
                     .collect();
                 let selected = self.ed.selection.iter().find_map(|s| match s {
                     Selection::Symbol(item) => open
