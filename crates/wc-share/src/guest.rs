@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use wc_core::{Page, Project};
 
+use crate::{ChangeInfo, note, redo_target, undo_target};
 use crate::{GuestMsg, HostMsg, Peer, PeerId, ProjectEdit, Refusal, apply_edit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +29,8 @@ pub struct Guest {
     pub project: Option<Project>,
     pub locks: BTreeMap<String, PeerId>,
     pub peers: Vec<Peer>,
+    /// The session's recorded changes, oldest first.
+    pub history: Vec<ChangeInfo>,
     /// Refusals from the host not yet shown to the user.
     pub refusals: Vec<Refusal>,
     /// A page switch the host has not answered yet: the page asked for.
@@ -36,6 +39,9 @@ pub struct Guest {
     /// it kept it; only the answer to the last one is applied, so an answer to an older edit
     /// never replaces newer work.
     in_flight: BTreeMap<String, usize>,
+    /// Undo, redo and revert requests sent and not answered yet. The host answers each with
+    /// its restoration (a `Restore` edit by this guest) or a refusal.
+    taking_back: usize,
 }
 
 impl Default for Guest {
@@ -52,9 +58,11 @@ impl Guest {
             project: None,
             locks: BTreeMap::new(),
             peers: Vec::new(),
+            history: Vec::new(),
             refusals: Vec::new(),
             switching: None,
             in_flight: BTreeMap::new(),
+            taking_back: 0,
         }
     }
 
@@ -115,6 +123,40 @@ impl Guest {
         GuestMsg::EditProject { edit }
     }
 
+    /// Whether Undo has a change of this guest's to take back.
+    pub fn can_undo(&self) -> bool {
+        self.me.is_some_and(|me| undo_target(&self.history, me).is_some())
+    }
+
+    /// Whether Redo has an undo of this guest's to take back.
+    pub fn can_redo(&self) -> bool {
+        self.me.is_some_and(|me| redo_target(&self.history, me).is_some())
+    }
+
+    /// Take back this guest's last change. The host puts back only what that change touched
+    /// and sends the result to everyone.
+    pub fn undo(&mut self) -> GuestMsg {
+        self.taking_back += 1;
+        GuestMsg::Undo
+    }
+
+    pub fn redo(&mut self) -> GuestMsg {
+        self.taking_back += 1;
+        GuestMsg::Redo
+    }
+
+    /// Take back one change from the session's list, also someone else's.
+    pub fn revert(&mut self, change: u64) -> GuestMsg {
+        self.taking_back += 1;
+        GuestMsg::Revert { change }
+    }
+
+    /// Whether an undo, redo or revert is on its way and its result has not arrived: a page
+    /// built from this copy now would still hold what the host is putting back.
+    pub fn taking_back(&self) -> bool {
+        self.taking_back > 0
+    }
+
     pub fn handle(&mut self, msg: HostMsg) {
         match msg {
             HostMsg::Waiting => self.status = GuestStatus::Waiting,
@@ -123,7 +165,9 @@ impl Guest {
                 project,
                 locks,
                 peers,
+                history,
             } => {
+                self.history = history;
                 self.status = GuestStatus::Joined;
                 self.me = Some(you);
                 self.project = Some((*project).into());
@@ -134,6 +178,7 @@ impl Guest {
             HostMsg::Closed => {
                 self.status = GuestStatus::Closed;
                 self.locks.clear();
+                self.taking_back = 0;
             }
             HostMsg::PageChanged { page, .. } => {
                 if self.answered(&page.id) {
@@ -143,11 +188,15 @@ impl Guest {
                     *p = page;
                 }
             }
-            HostMsg::ProjectChanged { edit, .. } => {
+            HostMsg::ProjectChanged { edit, by } => {
+                if matches!(edit, ProjectEdit::Restore { .. }) && Some(by) == self.me {
+                    self.taking_back = self.taking_back.saturating_sub(1);
+                }
                 if let Some(p) = self.project.as_mut() {
                     apply_edit(p, &edit);
                 }
             }
+            HostMsg::Recorded { change } => note(&mut self.history, change),
             HostMsg::Locks { locks } => {
                 if let Some(asked) = &self.switching {
                     let done = match asked {
@@ -161,7 +210,12 @@ impl Guest {
                 self.locks = locks;
             }
             HostMsg::Peers { peers } => self.peers = peers,
-            HostMsg::Refused { refusal } => {
+            HostMsg::Refused { refusal, take_back } => {
+                // Only the refusal of an undo, redo or revert answers one: a refusal of an
+                // earlier edit, arriving first, must not end the wait for the restoration.
+                if take_back {
+                    self.taking_back = self.taking_back.saturating_sub(1);
+                }
                 match &refusal {
                     Refusal::PageLocked { page, .. } if self.switching_to(page) => self.switching = None,
                     Refusal::UnknownPage { page } if self.switching_to(page) => self.switching = None,

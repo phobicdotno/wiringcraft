@@ -606,3 +606,270 @@ fn wire_numbering_in_a_session_leaves_pages_others_hold_and_says_so() -> TestRes
     assert_eq!(log.messages()[before..], ["Edit page 1 Cover", "Edit page 2 Motor"]);
     Ok(())
 }
+
+#[test]
+fn a_page_changed_on_both_sides_takes_the_sessions_version() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    base.pages.push(Page::new("p2", "2", "Two"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    // Both changed page 1; only this window changed page 2.
+    auth.pages[0].title = "Restored".into();
+    local.pages[0].title = "Local".into();
+    local.pages[1].title = "Mine".into();
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["page 1"]);
+    assert_eq!(
+        (local.pages[0].title.as_str(), base.pages[0].title.as_str()),
+        ("Restored", "Restored")
+    );
+    assert_eq!(local.pages[1].title, "Mine", "kept");
+}
+
+#[test]
+fn every_part_changed_on_both_sides_takes_the_sessions_version() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    base.pages.push(Page::new("p2", "2", "Two"));
+    base.pages.push(Page::new("p3", "3", "Three"));
+    base.meta.title_block.insert("customer".into(), "New".into());
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    // The session (an undo) put back the customer, changed page 1 and -K1.
+    auth.meta.title_block.insert("customer".into(), "Old".into());
+    auth.pages[0].title = "Restored".into();
+    auth.devices.remove(&k1);
+    // Meanwhile this window changed another title-block field, removed page 1, changed -K1,
+    // added -K2 and removed page 3: only what the session left alone is kept.
+    local.meta.title_block.insert("drawn_by".into(), "Me".into());
+    local.pages.retain(|p| p.id != "p1" && p.id != "p3");
+    local.devices.get_mut(&k1).ok_or("no -K1")?.part = Some("changed".into());
+    local.devices.insert(k2.clone(), wc_core::Device::default());
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["the project properties", "page 1", "device -K1"]);
+    assert_eq!(local.meta, auth.meta, "the undone value is not sent back");
+    assert_eq!(
+        local.pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        ["p1", "p2"],
+        "the restored page is back; page 3's removal still goes out"
+    );
+    assert_eq!(local.pages[0].title, "Restored");
+    assert!(!local.devices.contains_key(&k1) && local.devices.contains_key(&k2));
+    assert_eq!(base.pages[0].title, "Restored");
+    assert!(!base.devices.contains_key(&k1));
+    Ok(())
+}
+
+#[test]
+fn a_page_removed_while_its_renumbering_is_undone_stays() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    base.pages.push(Page::new("p2", "2", "Two"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    // The session (an undo) gave page 1 its old number back; this window removed it.
+    auth.pages[0].number = "7".into();
+    local.pages.retain(|p| p.id != "p1");
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["page 1"]);
+    assert_eq!(local.page("p1").map(|p| p.number.as_str()), Some("7"));
+    assert_eq!(base.page("p1").map(|p| p.number.as_str()), Some("7"));
+    // A renumbering alone does not clash with a content change made here.
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    auth.pages[0].number = "7".into();
+    local.pages[0].title = "Mine".into();
+    assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
+    assert_eq!(local.pages[0].title, "Mine");
+}
+
+#[test]
+fn a_page_numbered_on_both_sides_keeps_the_sessions_number() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    // The undo gave page 1 its old number back; this window gave it another one.
+    auth.pages[0].number = "7".into();
+    local.pages[0].number = "9".into();
+    local.pages[0].title = "Mine".into();
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["the number of page 1"]);
+    assert_eq!(
+        (local.pages[0].number.as_str(), base.pages[0].number.as_str()),
+        ("7", "7")
+    );
+    assert_eq!(
+        local.pages[0].title, "Mine",
+        "the content change is a part of its own and stays"
+    );
+    // The same new number on both sides is no clash.
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let mut auth = base.clone();
+    auth.pages[0].number = "7".into();
+    let mut local = auth.clone();
+    assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
+}
+
+#[test]
+fn a_content_clash_keeps_a_number_only_this_window_changed() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "A"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    auth.pages[0].title = "B".into();
+    local.pages[0].number = "9".into();
+    local.pages[0].title = "C".into();
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["page 1"]);
+    assert_eq!(local.pages[0].title, "B", "the session's content wins");
+    assert_eq!(local.pages[0].number, "9", "the renumbering made here stays");
+    assert_eq!(base.pages[0].number, "1", "and still goes out on its own");
+}
+
+#[test]
+fn a_page_removed_while_its_undo_is_on_its_way_stays_in_the_session() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "First".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    guest_open.project.pages.retain(|p| p.id != "p0003");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for open in [&host_open, &guest_open] {
+        assert_eq!(open.project.page("p0003").map(|p| p.title.as_str()), Some("Valves"));
+    }
+    assert!(
+        g.take_notes()
+            .iter()
+            .any(|n| n.contains("page 3") && n.contains("was not kept"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_title_block_field_changed_while_an_undo_is_on_its_way_does_not_cancel_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let before = guest_open.project.meta.title_block.get("customer").cloned();
+    guest_open
+        .project
+        .meta
+        .title_block
+        .insert("customer".into(), "New".into());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    guest_open
+        .project
+        .meta
+        .title_block
+        .insert("drawn_by".into(), "Guest".into());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for open in [&host_open, &guest_open] {
+        assert_eq!(
+            open.project.meta.title_block.get("customer"),
+            before.as_ref(),
+            "the undo is kept"
+        );
+    }
+    assert!(
+        g.take_notes()
+            .iter()
+            .any(|n| n.contains("project properties") && n.contains("was not kept"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_second_guest_undo_waits_for_the_first_to_come_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "First".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Second".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    // Made while the first undo is on its way, so not sent yet: a second undo now would take
+    // back "Second" ahead of it.
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Third".into();
+    let err = g.undo().err().ok_or("a second undo was sent")?;
+    assert!(err.contains("still on its way"), "{err}");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        log.messages().iter().filter(|m| m.starts_with("Undo")).count(),
+        1,
+        "only one undo reached the host"
+    );
+    Ok(())
+}
+
+#[test]
+fn undo_this_change_waits_while_an_assistant_command_owns_the_files() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let original = host_open.project.page("p0002").ok_or("no page")?.title.clone();
+    host_open.project.page_mut("p0002").ok_or("no page")?.title = "First".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let change = h
+        .role
+        .as_ref()
+        .ok_or("no session")?
+        .history()
+        .last()
+        .map(|c| c.id)
+        .ok_or("no change")?;
+    let before = log.messages().len();
+    h.ask_revert(change, true);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages().len(), before, "nothing was taken back");
+    assert!(h.take_notes().iter().any(|n| n.contains("assistant's command")));
+    assert_eq!(host_open.project.page("p0002").map(|p| p.title.as_str()), Some("First"));
+    h.ask_revert(change, false);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        host_open.project.page("p0002").map(|p| p.title.as_str()),
+        Some(original.as_str()),
+        "taken back once the command is done"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_guest_sends_nothing_until_its_undo_has_come_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "First".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    // Edited before the host answered: this page still holds "First" under the edit.
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "First, then more".into();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert_eq!(
+        guest_open.project.page("p0003").map(|p| p.title.as_str()),
+        Some("First, then more"),
+        "the change waits in the window"
+    );
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for open in [&host_open, &guest_open] {
+        assert_eq!(open.project.page("p0003").map(|p| p.title.as_str()), Some("Valves"));
+    }
+    assert_eq!(
+        log.messages(),
+        ["Edit page 3 First", "Undo: Edit page 3 First"],
+        "the stale page never went out"
+    );
+    assert!(g.take_notes().iter().any(|n| n.contains("was not kept")));
+    Ok(())
+}

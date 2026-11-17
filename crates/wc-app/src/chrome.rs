@@ -48,6 +48,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Copy),
             Some(Action::Paste),
             Some(Action::SelectAll),
+            Some(Action::Find),
             None,
             Some(Action::Rotate),
             Some(Action::Mirror),
@@ -100,7 +101,16 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Assistant),
         ],
     ),
-    ("Library", &[Some(Action::LibraryStatus), Some(Action::LibraryUpdate)]),
+    (
+        "Library",
+        &[
+            Some(Action::LibraryStatus),
+            Some(Action::LibraryUpdate),
+            None,
+            Some(Action::NewSymbol),
+            Some(Action::EditSymbol),
+        ],
+    ),
     (
         "Versions",
         &[

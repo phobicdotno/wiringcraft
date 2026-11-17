@@ -10,6 +10,7 @@ mod canvas;
 mod chrome;
 mod edit;
 mod feedback;
+mod find_window;
 mod icons;
 mod panel_view;
 mod panels;
@@ -17,6 +18,7 @@ mod prefs;
 mod screenshot;
 mod share;
 mod state;
+mod symbol_editor;
 mod theme;
 
 use std::path::{Path, PathBuf};
@@ -129,6 +131,10 @@ struct App {
     logged: (String, String),
     /// The shared work session, when one is running, and its windows.
     share: share::Share,
+    /// The symbol editor window, while it is open.
+    symbol_editor: Option<symbol_editor::SymbolEditor>,
+    /// The find and replace window, while it is open.
+    find: Option<find_window::FindState>,
 }
 
 struct StatusView<'a> {
@@ -137,6 +143,9 @@ struct StatusView<'a> {
     prefs: &'a Prefs,
     clipboard: &'a edit::Clipboard,
     sharing: bool,
+    /// Undo and Redo in a shared session: whether this person has something to take back.
+    share_undo: bool,
+    share_redo: bool,
 }
 
 impl chrome::Status for StatusView<'_> {
@@ -173,8 +182,9 @@ impl chrome::Status for StatusView<'_> {
             | Action::ReportMissing
             | Action::JoinSession => true,
             Action::ShareSession => has || self.sharing,
-            // Undo swaps the whole project, which would take back other people's work too.
-            Action::Undo | Action::Redo if self.sharing => false,
+            // In a session, undo takes back this person's own changes through the host.
+            Action::Undo if self.sharing => self.share_undo,
+            Action::Redo if self.sharing => self.share_redo,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
             Action::PageUp => has && self.ed.page > 0,
@@ -210,6 +220,18 @@ impl App {
         let busy = ctx.input(|i| i.pointer.any_down())
             || matches!(self.dialog, Some(Dialog::Cover { .. }))
             || self.assistant.command_running();
+        self.share.set_command_running(self.assistant.command_running());
+        self.sync_session_now(busy);
+        // Others' changes arrive without any input here.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// The work of `sync_session`, also used by the assistant's undo so the changes it made
+    /// earlier in the same answer are in the session's history first.
+    fn sync_session_now(&mut self, busy: bool) {
+        if !self.share.active() {
+            return;
+        }
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
@@ -256,8 +278,6 @@ impl App {
             applog::info(&format!("shared session: {note}"));
             self.ed.message = note;
         }
-        // Others' changes arrive without any input here.
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     fn new(cc: &eframe::CreationContext<'_>, dir: Option<PathBuf>) -> Self {
@@ -278,6 +298,8 @@ impl App {
             open_url: Vec::new(),
             logged: Default::default(),
             share: Default::default(),
+            symbol_editor: None,
+            find: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -337,13 +359,14 @@ impl App {
                 self.share.show_share();
                 return;
             }
-            Action::JoinSession => {
-                self.share.show_join();
+            Action::Find => {
+                if self.open.is_some() {
+                    self.find.get_or_insert_with(Default::default);
+                }
                 return;
             }
-            Action::Undo | Action::Redo if self.share.active() => {
-                self.ed.message =
-                    "Undo is off in a shared session: it would take back other people's work too. Use the page history.".into();
+            Action::JoinSession => {
+                self.share.show_join();
                 return;
             }
             _ => {}
@@ -433,6 +456,31 @@ impl App {
             Action::ZoomIn => self.zoom(1.25),
             Action::ZoomOut => self.zoom(0.8),
             Action::ZoomFit => self.ed.view.fit = true,
+            // Undoing in a shared session takes back only this person's own change: the whole
+            // project is not swapped, so other people's work stays.
+            Action::Undo | Action::Redo if self.share.active() => {
+                // The host's undo writes the project folder, and a guest's sync would send a
+                // command's half-written work: neither while a command owns the files.
+                if self.assistant.command_running() {
+                    self.ed.message = "Undo and Redo wait until the assistant's command has finished.".into();
+                    return;
+                }
+                // Changes not synced yet (an assistant's, made with no frame in between) go into
+                // the session's history first, so Undo takes back the latest one.
+                self.sync_session_now(false);
+                let r = if a == Action::Undo {
+                    self.share.undo()
+                } else {
+                    self.share.redo()
+                };
+                // The host's refusal comes back in the session's notes, which the status line
+                // shows; one made here is shown now.
+                if let Err(e) = r {
+                    self.ed.message = e;
+                }
+                self.ed.selection.clear();
+                return;
+            }
             _ => {}
         }
         let Some(open) = self.open.as_mut() else { return };
@@ -444,14 +492,12 @@ impl App {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
                 Err(e) => self.dialog = Some(Dialog::Message(format!("Saving failed:\n{e}"))),
             },
-            Action::Undo => {
-                if open.undo() {
+            Action::Undo | Action::Redo => {
+                let done = if a == Action::Undo { open.undo() } else { open.redo() };
+                if done {
                     self.ed.selection.clear();
-                }
-            }
-            Action::Redo => {
-                if open.redo() {
-                    self.ed.selection.clear();
+                } else if let Some(e) = open.take_undo_error() {
+                    self.dialog = Some(Dialog::Message(format!("Undo or redo was not done:\n{e}")));
                 }
             }
             Action::Delete if self.ed.panel.is_some() => {
@@ -652,17 +698,58 @@ impl App {
                 self.ed.message = format!("Project check: {errors} errors, {} findings in all.", found.len());
                 self.dialog = Some(Dialog::Check(found));
             }
+            Action::NewSymbol | Action::EditSymbol => {
+                let (lib, lib_error) = match wc_library::Library::open(&open.dir, &open.project) {
+                    Ok(l) => (Some(l), None),
+                    Err(e) => (None, Some(format!("The project's library could not be opened: {e}"))),
+                };
+                // Only folders: a git source is a cache that the next sync overwrites. Each
+                // source is paired with its declaration by position (`Library::open` keeps the
+                // order), so a git source sharing a folder's name is never offered.
+                let targets: Vec<symbol_editor::Target> = lib
+                    .iter()
+                    .flat_map(|l| l.sources.iter().zip(&open.project.meta.libraries))
+                    .filter(|(_, decl)| decl.kind == "folder")
+                    .map(|(s, _)| (s.name.clone(), s.root.clone()))
+                    .collect();
+                let selected = self.ed.selection.iter().find_map(|s| match s {
+                    Selection::Symbol(item) => open
+                        .project
+                        .pages
+                        .get(self.ed.page)
+                        .and_then(|pg| pg.symbols.iter().find(|p| &p.id == item))
+                        .map(|p| p.symbol.clone()),
+                    _ => None,
+                });
+                let mut ed = match (a, selected, lib.as_ref()) {
+                    (Action::EditSymbol, Some(id), Some(lib)) => match lib.symbol(&id) {
+                        Ok((s, source)) => symbol_editor::SymbolEditor::edit(s, &source, targets),
+                        Err(err) => {
+                            let mut e = symbol_editor::SymbolEditor::new(targets);
+                            e.message = format!("Symbol {id} could not be opened from the library: {err}");
+                            e
+                        }
+                    },
+                    _ => symbol_editor::SymbolEditor::new(targets),
+                };
+                ed.owner = Some(open.dir.clone());
+                if let Some(e) = lib_error {
+                    ed.message = e;
+                }
+                if a == Action::EditSymbol {
+                    ed.choices = open.library.clone();
+                    if ed.opened_as.is_none() && ed.message.is_empty() {
+                        ed.message = "Pick the symbol to change under \"Open a library symbol\".".into();
+                    }
+                }
+                self.symbol_editor = Some(ed);
+            }
             Action::LibraryStatus | Action::LibraryUpdate => {
                 match wc_library::Library::open(&open.dir, &open.project) {
                     Ok(lib) => {
                         if a == Action::LibraryUpdate {
-                            open.checkpoint();
-                            match wc_library::update(&open.dir, &mut open.project, &lib, None) {
-                                Ok(done) => {
-                                    let (syms, _) = wc_core::store::vendored_symbols(&open.dir, &open.project);
-                                    open.symbols = syms;
-                                    self.ed.message = format!("Updated {} library items.", done.len());
-                                }
+                            match open.update_library(&lib, None) {
+                                Ok(done) => self.ed.message = format!("Updated {} library items.", done.len()),
                                 Err(e) => self.ed.message = format!("Update failed: {e}"),
                             }
                         }
@@ -1456,13 +1543,8 @@ impl App {
                             )
                         })
                         .unwrap_or_default();
-                    // Undo is off in a shared session, so it is not promised there.
-                    let undo = if self.share.active() {
-                        " It cannot be undone in a shared session."
-                    } else {
-                        " Undo brings it back."
-                    };
-                    ui.label(format!("Delete {what}?{undo}"));
+                    // In a shared session too: undo there takes back this person's own change.
+                    ui.label(format!("Delete {what}? Undo brings it back."));
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
                             if let Some(o) = self.open.as_mut() {
@@ -1899,6 +1981,7 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
             (Key::R, Action::Reports),
             (Key::E, Action::Check),
             (Key::A, Action::SelectAll),
+            (Key::F, Action::Find),
             (Key::J, Action::Assistant),
         ] {
             if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
@@ -2074,12 +2157,15 @@ impl eframe::App for App {
             prefs: &self.prefs,
             clipboard: &self.clipboard,
             sharing: self.share.active(),
+            share_undo: self.share.can_undo(),
+            share_redo: self.share.can_redo(),
         };
         for url in std::mem::take(&mut self.open_url) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
-        actions.extend(self.shortcuts(ctx));
+        let keys = self.shortcuts(ctx);
+        actions.extend(self.route_to_symbol_editor(keys));
         for a in actions {
             self.run(a);
         }
@@ -2167,7 +2253,10 @@ impl eframe::App for App {
             self.dialog = Some(Dialog::Comment(at, String::new(), false));
         }
         self.dialogs(ctx);
-        self.share.windows(ctx, self.open.as_mut());
+        self.share
+            .windows(ctx, self.open.as_mut(), self.assistant.command_running());
+        self.symbol_editor_window(ctx);
+        self.find_window(ctx);
         self.sync_session(ctx);
 
         let title = match &self.open {
@@ -2179,6 +2268,165 @@ impl eframe::App for App {
             None => "WiringCraft".into(),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+    }
+}
+
+impl App {
+    /// The symbol editor, while open. A saved symbol shows up in the place list at once; when
+    /// the project already uses it, its copy in the project is updated too (one undo step).
+    /// While the symbol editor is open, Undo and Delete work on the symbol being drawn, and
+    /// the shortcuts that change the schematic are held back.
+    fn route_to_symbol_editor(&mut self, keys: Vec<Action>) -> Vec<Action> {
+        let Some(ed) = self.symbol_editor.as_mut() else {
+            return keys;
+        };
+        keys.into_iter()
+            .filter(|a| match a {
+                Action::Undo => {
+                    ed.undo();
+                    false
+                }
+                Action::Delete => {
+                    ed.delete_selected();
+                    false
+                }
+                Action::Redo
+                | Action::Cut
+                | Action::Copy
+                | Action::Paste
+                | Action::Rotate
+                | Action::Mirror
+                | Action::SelectAll => false,
+                _ => true,
+            })
+            .collect()
+    }
+
+    fn find_window(&mut self, ctx: &egui::Context) {
+        let (Some(find), Some(open)) = (self.find.as_mut(), self.open.as_ref()) else {
+            self.find = None;
+            return;
+        };
+        match find.show(ctx, &open.project) {
+            find_window::FindOutcome::None => {}
+            find_window::FindOutcome::Close => self.find = None,
+            find_window::FindOutcome::Go { page, select } => self.show_found(&page, select),
+            find_window::FindOutcome::Replace => self.replace_found(),
+        }
+    }
+
+    /// Show a find hit: open its page and select the item.
+    fn show_found(&mut self, page: &str, select: Option<Selection>) {
+        let Some(o) = self.open.as_ref() else { return };
+        let Some(i) = o.project.pages.iter().position(|p| p.id == page) else {
+            self.ed.message = "That page is gone.".into();
+            return;
+        };
+        self.ed.panel = None;
+        if self.ed.page != i {
+            // A wire started on the other page cannot end on this one.
+            self.ed.wire = None;
+        }
+        self.ed.page = i;
+        self.ed.tool = Tool::Select;
+        self.ed.view.fit = true;
+        self.ed.selection = select.into_iter().collect();
+    }
+
+    /// Replace in the ticked find hits, as one undo step.
+    fn replace_found(&mut self) {
+        let (Some(find), Some(open)) = (self.find.as_mut(), self.open.as_mut()) else {
+            return;
+        };
+        let hits = find.chosen_hits();
+        find.message = match open.replace_found(&hits, &find.query, &find.with, find.options()) {
+            Ok(n) => find_window::replaced_note(n, &hits),
+            Err(e) => e,
+        };
+        // The items replaced may no longer match; what is selected may be gone.
+        self.ed.selection.clear();
+    }
+
+    fn symbol_editor_window(&mut self, ctx: &egui::Context) {
+        let Some(ed) = self.symbol_editor.as_mut() else { return };
+        // The editor belongs to the project it was opened in: its library folders are that
+        // project's. Another project opened since closes it.
+        if ed.owner.as_deref() != self.open.as_ref().map(|o| o.dir.as_path()) {
+            self.symbol_editor = None;
+            return;
+        }
+        let lib = self
+            .open
+            .as_ref()
+            .map(|o| wc_library::Library::open(&o.dir, &o.project).map_err(|e| e.to_string()));
+        let mut read = |id: &str| match &lib {
+            Some(Ok(l)) => l.symbol(id).map_err(|e| e.to_string()),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("no project is open".to_owned()),
+        };
+        let (saved, keep) = ed.show(ctx, &mut read);
+        if !keep {
+            self.symbol_editor = None;
+        }
+        if let Some(saved) = saved {
+            self.symbol_saved(saved);
+        }
+    }
+
+    /// After the symbol editor saved: tell what the project gets, and update its copy when the
+    /// pages use the symbol.
+    fn symbol_saved(&mut self, saved: crate::symbol_editor::Saved) {
+        let Some(open) = self.open.as_mut() else { return };
+        open.refresh_library();
+        let lib = match wc_library::Library::open(&open.dir, &open.project) {
+            Ok(l) => l,
+            Err(e) => {
+                self.ed.message = format!("Symbol {} saved, but the project's copy was not updated: {e}", saved.id);
+                return;
+            }
+        };
+        // The project takes a symbol from the first library that has it: when that is another
+        // folder, the saved file is not what the project gets, now or when it is placed.
+        if let Some(first) = lib.locate(wc_core::lock::ItemKind::Symbol, &saved.id)
+            && first.source != saved.source
+        {
+            // A used symbol stays as the project has it, which may be an older version or a
+            // copy from yet another library; an unused one would come from the first library.
+            let keeps = if open.symbols.contains_key(&saved.id) {
+                "the project keeps the copy it has".to_owned()
+            } else {
+                format!("placing it takes the one from {}", first.source)
+            };
+            self.ed.message = format!(
+                "Symbol {} saved into {}, but library {} comes first and has a symbol with the same id; {keeps}.",
+                saved.id, saved.source, first.source
+            );
+            return;
+        }
+        if !open.symbols.contains_key(&saved.id) {
+            self.ed.message = format!("Symbol {} saved; it is in the place list.", saved.id);
+            return;
+        }
+        // Wires on a pin the new version no longer has would point at nothing: say which, and
+        // leave the project's copy as it is.
+        let dangling = state::dangling_pins(&open.project, &saved.id, &saved.symbol);
+        if !dangling.is_empty() {
+            self.ed.message = format!(
+                "Symbol {} saved, but the project keeps its old version: wires end on pins it no longer has ({}). Rename those pins back, or move the wires, then update the library.",
+                saved.id,
+                dangling.join(", ")
+            );
+            return;
+        }
+        match open.take_saved_symbol(&lib, &saved.id) {
+            Ok(()) => {
+                open.refresh_library();
+                self.ed.message = format!("Symbol {} saved and updated on the pages that use it.", saved.id);
+            }
+            Err(e) => {
+                self.ed.message = format!("Symbol {} saved, but the project's copy was not updated: {e}", saved.id)
+            }
+        }
     }
 }
 
@@ -2464,6 +2712,43 @@ mod renderer_tests {
 #[allow(clippy::unwrap_used)]
 mod library_tests {
     use super::*;
+
+    #[test]
+    fn wires_on_pins_a_new_symbol_version_drops_are_listed() {
+        use wc_core::{Endpoint, Page, PlacedSymbol, Project, Wire};
+        let mut p = Project::new("x");
+        let mut page = Page::new("p1", "3", "Motor");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "my.coil".into(),
+            at: wc_core::geom::Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(wc_core::DeviceTag::parse("-K1").unwrap()),
+        });
+        let pin = |p: &str| Endpoint::Pin {
+            item: "s1".into(),
+            pin: p.into(),
+        };
+        page.wires.push(Wire {
+            id: "w1".into(),
+            from: pin("A1"),
+            to: pin("A2"),
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        p.pages.push(page);
+        let mut ed = symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(symbol_editor::Tool::Pin);
+        ed.pin_name = "A1".into();
+        ed.click(wc_core::geom::Point::new(0.0, -5.0));
+        assert_eq!(state::dangling_pins(&p, "my.coil", &ed.symbol), ["page 3 -K1:A2"]);
+        assert!(state::dangling_pins(&p, "other", &ed.symbol).is_empty());
+    }
 
     /// Makes `<root>/<rel>/symbols` and returns `<root>/<rel>` canonicalized.
     fn lib(root: &Path, rel: &str) -> PathBuf {
