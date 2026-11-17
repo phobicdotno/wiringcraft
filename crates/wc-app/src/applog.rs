@@ -245,10 +245,19 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=')
 }
 
-/// A device tag: starts with `=`, `+` or `-` and a letter, like `-K1` or `+CAB1-Q1`.
+/// A device tag: starts with `=`, `+` or `-` and a letter, like `-K1` or `+CAB1-Q1`, or with a
+/// digit when another level follows, like `+1-K1` or `=1X-K1` (so a number such as `-5` is
+/// left alone).
 fn is_device_tag(word: &str) -> bool {
     let mut c = word.chars();
-    matches!(c.next(), Some('=' | '+' | '-')) && c.next().is_some_and(|c| c.is_ascii_alphabetic())
+    if !matches!(c.next(), Some('=' | '+' | '-')) {
+        return false;
+    }
+    match c.next() {
+        Some(ch) if ch.is_ascii_alphabetic() => true,
+        Some(ch) if ch.is_ascii_digit() => c.any(|ch| matches!(ch, '=' | '+' | '-')),
+        _ => false,
+    }
 }
 
 /// Where a secret value that continues in `rest` ends: at the next white space.
@@ -473,6 +482,12 @@ mod tests {
             m("Could not insert -K1: placed +CAB1-Q1, =PUMP+A-F2"),
             "Could not insert <tag>: placed <tag>, <tag>"
         );
+        assert_eq!(
+            m("Arranged +1-K1 and =1X-K1"),
+            "Arranged <tag> and <tag>",
+            "levels starting with a digit"
+        );
+        assert_eq!(m("moved -5 then -1.5"), "moved -5 then -1.5", "numbers stay");
         assert_eq!(
             m("run --mcp-bridge x-1 -5"),
             "run --mcp-bridge x-1 -5",
