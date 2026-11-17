@@ -274,7 +274,14 @@ impl SymbolEditor {
         let p = snap(p);
         self.message.clear();
         match self.tool {
-            Tool::Select => self.selected = self.pick(raw),
+            Tool::Select => {
+                let picked = self.pick(raw);
+                // Editing another item's properties is a new undo step.
+                if picked != self.selected {
+                    self.props_dirty = false;
+                }
+                self.selected = picked;
+            }
             Tool::Line | Tool::Rect | Tool::Circle => {
                 let Some(&a) = self.clicks.first() else {
                     self.clicks.push(p);
@@ -948,6 +955,20 @@ mod tests {
         e.undo();
         assert_eq!(e.symbol.pins[0].name, "A1");
         assert_eq!(e.symbol.graphics.len(), lines);
+        // Editing one pin, then selecting another and editing it: two steps.
+        e.set_tool(Tool::Select);
+        e.click(Point::new(0.0, -5.0));
+        let before = e.symbol.clone();
+        e.symbol.pins[0].name = "X1".into();
+        e.note_property_edit(before);
+        e.click(Point::new(0.0, 5.0));
+        assert_eq!(e.selected, Some(Item::Pin(1)));
+        let before = e.symbol.clone();
+        e.symbol.pins[1].name = "X2".into();
+        e.note_property_edit(before);
+        e.undo();
+        assert_eq!(e.symbol.pins[0].name, "X1", "the first pin's edit stays");
+        assert_eq!(e.symbol.pins[1].name, "A2");
     }
 
     #[test]

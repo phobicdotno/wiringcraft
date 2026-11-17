@@ -2221,6 +2221,51 @@ mod tests {
     }
 
     #[test]
+    fn the_symbol_editor_says_why_a_symbol_or_the_library_could_not_be_opened() {
+        let (tmp, mut a) = app(vec![]);
+        let lib = tmp.path().join("mine");
+        std::fs::create_dir_all(lib.join("symbols")).unwrap();
+        std::fs::write(lib.join("symbols/bad.json"), "{ not json").unwrap();
+        let id = call(
+            &mut a,
+            "place_symbol",
+            json!({"symbol": "wc.coil", "x": 50, "y": 50, "page": "2"}),
+        )
+        .unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "mine".into(),
+            kind: "folder".into(),
+            location: lib.display().to_string(),
+            reference: None,
+        });
+        let page = open.project.pages.iter().position(|p| p.number == "2").unwrap();
+        let placed = open.project.pages[page]
+            .symbols
+            .iter_mut()
+            .find(|p| id.contains(&p.id))
+            .unwrap();
+        placed.symbol = "bad".into();
+        let item = placed.id.clone();
+        a.ed.page = page;
+        a.ed.selection = vec![Selection::Symbol(item)];
+        a.run(Action::EditSymbol);
+        let msg = &a.symbol_editor.as_ref().unwrap().message;
+        assert!(
+            msg.starts_with("Symbol bad could not be opened from the library: "),
+            "{msg}"
+        );
+        assert!(!msg.contains("not found"), "the read error is kept: {msg}");
+
+        a.symbol_editor = None;
+        a.open.as_mut().unwrap().project.meta.libraries[0].kind = "bogus".into();
+        a.run(Action::NewSymbol);
+        let msg = &a.symbol_editor.as_ref().unwrap().message;
+        assert!(msg.starts_with("The project's library could not be opened: "), "{msg}");
+        assert!(msg.contains("bogus"), "{msg}");
+    }
+
+    #[test]
     fn a_message_box_is_logged_again_after_it_closed() {
         let (_tmp, mut a) = app(vec![]);
         let fail = || Some(Dialog::Message("Saving failed:\ndisk full".into()));
