@@ -5,6 +5,7 @@
 mod actions;
 mod agent;
 mod agent_panel;
+mod applog;
 mod canvas;
 mod chrome;
 mod edit;
@@ -69,6 +70,11 @@ enum Dialog {
     History(Vec<wc_vcs::subway::Row>),
     Library(Vec<wc_library::ItemStatus>),
     Message(String),
+    /// Help, Report a problem: the masked log to look at before anything is sent.
+    Report {
+        log: String,
+        include: bool,
+    },
     /// Name and description for a macro made from the copied selection.
     SaveMacro {
         clip: edit::Clipboard,
@@ -100,6 +106,8 @@ struct App {
     assistant: agent::Assistant,
     /// Web pages to open in the browser on the next frame.
     open_url: Vec<String>,
+    /// The last status message and message box written to the log, so each is logged once.
+    logged: (String, String),
 }
 
 struct StatusView<'a> {
@@ -174,6 +182,7 @@ impl App {
             applied_theme: prefs.theme,
             assistant: agent::Assistant::default(),
             open_url: Vec::new(),
+            logged: Default::default(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -192,14 +201,24 @@ impl App {
                 prefs.remember(dir.to_path_buf());
                 prefs.save();
             }
-            Err(e) => self.dialog = Some(Dialog::Message(format!("Could not open {}:\n{e}", dir.display()))),
+            Err(e) => {
+                applog::warn(&format!("could not open {}: {e}", dir.display()));
+                self.dialog = Some(Dialog::Message(format!("Could not open {}:\n{e}", dir.display())));
+            }
         }
     }
 
     fn run(&mut self, a: Action) {
         let page = self.ed.page;
+        applog::info(&format!("command {a:?}"));
+        if a == Action::ReportProblem {
+            self.dialog = Some(Dialog::Report {
+                log: applog::tail(REPORT_LOG_BYTES),
+                include: false,
+            });
+            return;
+        }
         let kind = match a {
-            Action::ReportProblem => Some(feedback::Kind::Problem),
             Action::RequestFunction => Some(feedback::Kind::Function),
             Action::ReportMissing => Some(feedback::Kind::Missing),
             _ => None,
@@ -604,6 +623,7 @@ impl App {
             Dialog::Message(_) => "WiringCraft",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
+            Dialog::Report { .. } => "Report a problem",
         };
         let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_));
         let screen = ctx.screen_rect();
@@ -696,6 +716,50 @@ impl App {
                     if ui.button("Close").clicked() {
                         keep = false;
                     }
+                }
+                Dialog::Report { log, include } => {
+                    ui.label(
+                        "This is WiringCraft's log of what happened recently. Home folders, keys, tokens and \
+                         email addresses are already hidden, and no drawing content is in it. Nothing is sent \
+                         unless you choose to.",
+                    );
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        let shown = if log.is_empty() {
+                            "(The log is empty.)"
+                        } else {
+                            log.as_str()
+                        };
+                        ui.add(egui::Label::new(RichText::new(shown).monospace().small()).wrap());
+                    });
+                    ui.checkbox(include, "Include this log in my report");
+                    ui.horizontal(|ui| {
+                        if ui.button("Open the report form").clicked() {
+                            let mut request = feedback::Request::default();
+                            if *include && !log.is_empty() {
+                                request.detail = report_detail(log);
+                                self.copied_text = Some(log.clone());
+                                self.ed.message = "The log is on the clipboard: paste it into the report if the \
+                                                   form shows only its end."
+                                    .into();
+                            }
+                            self.open_url
+                                .push(feedback::form_url(feedback::Kind::Problem, &request));
+                            applog::info(if *include {
+                                "report form opened with the log"
+                            } else {
+                                "report form opened without the log"
+                            });
+                            keep = false;
+                        }
+                        if let Some(dir) = applog::dir()
+                            && ui.button("Show the log folder").clicked()
+                        {
+                            self.open_url.push(format!("file://{}", dir.display()));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
                 }
                 Dialog::Message(m) => {
                     ui.label(m.as_str());
@@ -1536,6 +1600,7 @@ impl eframe::App for App {
         for a in actions {
             self.run(a);
         }
+        self.log_messages();
         self.assistant_poll(ctx);
         if self.applied_theme != self.prefs.theme {
             theme::apply(ctx, self.prefs.theme);
@@ -1684,6 +1749,42 @@ fn welcome(
     });
 }
 
+/// How much of the log a problem report shows and copies (GitHub takes about 65 000 characters).
+const REPORT_LOG_BYTES: usize = 60_000;
+/// How much of the log's end goes into the report form itself (the link has a size limit).
+const REPORT_FORM_BYTES: usize = 1_500;
+
+/// The "how to make it happen again" field of a report: the end of the log.
+fn report_detail(log: &str) -> String {
+    let mut start = log.len().saturating_sub(REPORT_FORM_BYTES);
+    while !log.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &log[start..];
+    let tail = if start > 0 {
+        tail.split_once('\n').map_or(tail, |(_, rest)| rest)
+    } else {
+        tail
+    };
+    format!("End of the WiringCraft log (paste the whole log from the clipboard if it helps):\n```\n{tail}```\n")
+}
+
+impl App {
+    /// Write new status messages and message boxes to the log, once each.
+    fn log_messages(&mut self) {
+        if !self.ed.message.is_empty() && self.ed.message != self.logged.0 {
+            self.logged.0 = self.ed.message.clone();
+            applog::info(&self.logged.0);
+        }
+        if let Some(Dialog::Message(m)) = &self.dialog
+            && *m != self.logged.1
+        {
+            self.logged.1 = m.clone();
+            applog::warn(m);
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     // Started by Claude Code as the assistant's MCP server: pass messages to the running app.
     let mut args = std::env::args_os();
@@ -1699,6 +1800,7 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    applog::init();
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

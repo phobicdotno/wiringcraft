@@ -1992,6 +1992,7 @@ mod tests {
             applied_theme: crate::theme::Mode::Light,
             assistant: Assistant::with_transport(Arc::new(Script(Mutex::new(answers)))),
             open_url: Vec::new(),
+            logged: Default::default(),
         };
         (tmp, app)
     }
