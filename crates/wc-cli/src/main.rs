@@ -2775,20 +2775,32 @@ mod tests {
             ..Default::default()
         };
         add_built(&dir, &mut p, built, "import:a.tewzip").unwrap();
-        save(&dir, &p).unwrap();
         let ids = |p: &Project| p.panels.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
-        assert_eq!(ids(&load(&dir).unwrap()), ["swe-layout-a", "swe-layout-b"]);
+        // Sorted by the import itself, before saving (loading sorts too).
+        assert_eq!(ids(&p), ["swe-layout-a", "swe-layout-b"]);
+        save(&dir, &p).unwrap();
 
         // A second import with a taken id is refused before anything changes.
         let mut p = load(&dir).unwrap();
         let before = p.clone();
+        let project_file = std::fs::read(dir.join("project.toml")).unwrap();
+        let part = wc_core::Part {
+            id: "maker.new-part".into(),
+            ..Default::default()
+        };
         let built = wc_import::aml::Built {
             panels: vec![panel("swe-layout-c"), panel("swe-layout-a")],
+            parts: vec![part],
             ..Default::default()
         };
         let err = add_built(&dir, &mut p, built, "import:b.tewzip").unwrap_err();
         assert!(err.contains("panel swe-layout-a exists"), "{err}");
         assert_eq!(p, before);
+        assert!(
+            store::read_vendored_part(&dir, "maker.new-part").is_err(),
+            "no part file written"
+        );
+        assert_eq!(std::fs::read(dir.join("project.toml")).unwrap(), project_file);
     }
 
     #[test]
