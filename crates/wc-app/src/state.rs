@@ -446,7 +446,16 @@ impl Open {
         for sym in self.symbols.values() {
             self.symbol_versions.insert(sym.hash(), sym.clone());
         }
-        let (syms, _) = store::vendored_symbols(&self.dir, &self.project);
+        let (mut syms, _) = store::vendored_symbols(&self.dir, &self.project);
+        // Locked symbols no page uses yet are kept too, so the version the lock names is
+        // known for Redo and for the next placement.
+        for id in self.project.lock.symbols.keys() {
+            if !syms.contains_key(id)
+                && let Ok(sym) = store::read_vendored_symbol(&self.dir, id)
+            {
+                syms.insert(id.clone(), sym);
+            }
+        }
         self.symbols = syms;
     }
 
@@ -1278,6 +1287,26 @@ pub(crate) mod tests {
         assert!(o.redo());
         assert_eq!(o.symbols["wc.coil"], new);
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
+    }
+
+    #[test]
+    fn redo_puts_back_a_new_version_of_a_symbol_no_page_uses() {
+        let (_tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        assert_eq!(o.symbols["wc.coil"], new, "kept though no page uses it");
+        assert!(o.undo());
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert!(o.redo());
+        assert_eq!(o.symbols["wc.coil"], new);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
+        assert_eq!(o.project.lock.symbols["wc.coil"].hash, new.hash());
     }
 
     #[test]
