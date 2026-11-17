@@ -1,6 +1,7 @@
 # Release builds to download and try: the app (`wiringcraft-app`) and the command line
-# (`wiringcraft`) for Windows, Linux and macOS, as one zip per system on the run's page under
-# "Artifacts". Runs on every push to main, on pull requests, and on demand (Actions > Build > Run
+# (`wiringcraft`) for Windows, Linux and macOS, one download per system on the run's page under
+# "Artifacts". Linux and macOS hold a .tar.gz inside, because the artifact zip drops the
+# executable bit and the programs would not start without `chmod +x`. Runs on every push to main, on pull requests, and on demand (Actions > Build > Run
 # workflow). Installers are the next step (#47).
 name: Build
 
@@ -39,15 +40,26 @@ jobs:
           key: release
       - run: cargo build --release -p wc-cli -p wc-app
       - name: Collect
+        id: collect
         shell: bash
         run: |
           d="wiringcraft-${{ matrix.name }}"
           mkdir -p "$d"
           cp "target/release/wiringcraft${{ matrix.exe }}" "target/release/wiringcraft-app${{ matrix.exe }}" "$d/"
           cp README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md "$d/"
-          "$d/wiringcraft${{ matrix.exe }}" --version || "$d/wiringcraft${{ matrix.exe }}" --help > /dev/null
+          "$d/wiringcraft${{ matrix.exe }}" --version
+          if [ -z "${{ matrix.exe }}" ]; then
+            tar -czf "$d.tar.gz" "$d"
+            rm -rf "$d" && mkdir check && tar -xzf "$d.tar.gz" -C check
+            test -x "check/$d/wiringcraft" && test -x "check/$d/wiringcraft-app"
+            "check/$d/wiringcraft" --version
+            echo "upload=$d.tar.gz" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload=$d" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wiringcraft-${{ matrix.name }}
-          path: wiringcraft-${{ matrix.name }}
+          path: ${{ steps.collect.outputs.upload }}
+          if-no-files-found: error
           retention-days: 30
