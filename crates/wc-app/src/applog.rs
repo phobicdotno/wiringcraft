@@ -138,9 +138,9 @@ impl Logger {
     fn rotate(&mut self) -> std::io::Result<()> {
         self.file = None;
         if self.keep == 0 {
-            let _ = fs::remove_file(self.path());
+            remove_if_there(&self.path())?;
         } else {
-            let _ = fs::remove_file(self.rotated(self.keep));
+            remove_if_there(&self.rotated(self.keep))?;
             for n in (1..self.keep).rev() {
                 let from = self.rotated(n);
                 if from.exists() {
@@ -181,6 +181,14 @@ impl Logger {
             Some(i) => all[start + i + 1..].to_owned(),
             None => all[start..].to_owned(),
         }
+    }
+}
+
+/// Delete a file; one that is already gone is fine, any other failure is passed on.
+fn remove_if_there(path: &std::path::Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
