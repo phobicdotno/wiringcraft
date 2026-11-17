@@ -1663,6 +1663,17 @@ fn welcome(
 }
 
 fn main() -> eframe::Result {
+    // Started by Claude Code as the assistant's MCP server: pass messages to the running app.
+    let mut args = std::env::args();
+    if args.nth(1).as_deref() == Some("--mcp-bridge") {
+        let addr = args.next().unwrap_or_default();
+        let token = std::env::var(wc_agent::bridge::TOKEN_VAR).unwrap_or_default();
+        if let Err(e) = wc_agent::bridge::proxy(&addr, &token) {
+            eprintln!("wiringcraft-app --mcp-bridge {addr}: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

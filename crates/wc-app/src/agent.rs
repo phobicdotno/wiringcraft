@@ -55,6 +55,7 @@ see the options.
 and fix what you broke.
 - Do not save, commit, delete pages, or overwrite files unless the user asked for it or it is plainly part of \
 what they asked. Never invent part numbers; use find_parts.
+- Work only through the WiringCraft tools: do not use shell, file or web tools.
 - Answer briefly in plain language: what you did, and anything the user should look at. The user cannot see your \
 tool calls in detail.";
 
@@ -66,6 +67,12 @@ pub struct Assistant {
     /// The project folder and undo mark when the running turn started.
     pub turn: Option<(PathBuf, usize)>,
     specs: Vec<Value>,
+    /// Claude login: WiringCraft's tools as an MCP server, started with the first message.
+    pub bridge: Option<wc_agent::bridge::Bridge>,
+    /// Claude login: the running Claude Code session.
+    pub acp: Option<wc_agent::acp::Acp>,
+    /// Claude login: the conversation as shown.
+    pub login_log: Vec<wc_agent::Entry>,
 }
 
 impl Default for Assistant {
@@ -82,11 +89,19 @@ impl Assistant {
             show_settings: false,
             turn: None,
             specs: specs(),
+            bridge: None,
+            acp: None,
+            login_log: Vec::new(),
         }
     }
 
     pub fn specs(&self) -> &[Value] {
         &self.specs
+    }
+
+    /// Working on a message, with either backend.
+    pub fn busy(&self) -> bool {
+        self.session.busy() || self.acp.as_ref().is_some_and(wc_agent::acp::Acp::busy)
     }
 }
 
@@ -2078,8 +2093,9 @@ mod tests {
         ];
         let (_tmp, mut a) = app(answers);
         let ctx = eframe::egui::Context::default();
+        a.prefs.assistant.backend = wc_agent::Backend::ApiKey;
         a.assistant.input = "Put a coil and a lamp on page 2".into();
-        a.assistant_send();
+        a.assistant_send(&ctx);
         for _ in 0..500 {
             a.assistant_poll(&ctx);
             if !a.assistant.session.busy() {

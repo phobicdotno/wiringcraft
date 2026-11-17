@@ -7,6 +7,9 @@
 //! tools through [`Tools`] and runs them on its own thread, so every change shows up on the
 //! canvas as it happens.
 
+pub mod acp;
+pub mod bridge;
+
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
@@ -56,10 +59,29 @@ pub const MODELS: &[ModelInfo] = &[
 /// Effort levels, least to most thorough.
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
+/// How the assistant reaches Claude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// Claude Code under the user's own Claude login (subscription), like SolidCraft.
+    #[default]
+    ClaudeLogin,
+    /// The Anthropic API with a key.
+    ApiKey,
+}
+
 /// The assistant's settings, kept with the user's preferences (never in a project).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub backend: Backend,
+    /// Claude login: the command that starts Claude Code's ACP adapter, when not the one found.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub agent_command: String,
+    /// Claude login: the model to ask Claude Code for (one it offers); empty keeps its default.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub login_model: String,
+    /// API key: the model.
     pub model: String,
     pub effort: String,
     /// The API key, when it is not given by [`KEY_VAR`].
@@ -72,6 +94,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            backend: Backend::ClaudeLogin,
+            agent_command: String::new(),
+            login_model: String::new(),
             model: MODELS[0].id.into(),
             effort: "high".into(),
             api_key: String::new(),
