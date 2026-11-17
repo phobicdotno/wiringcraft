@@ -374,6 +374,36 @@ pub struct Wire {
     /// The route style its bend points were made with; older files have none (square).
     #[serde(default, skip_serializing_if = "Route::is_square")]
     pub route: Route,
+    /// Cross-section, colour and type, for the wire list. Stored flat in the wire (`section`,
+    /// `colour`, `type`); older files have none.
+    #[serde(default, flatten)]
+    pub spec: WireSpec,
+}
+
+/// What a wire is made of, as a wire list for manufacturing needs it. Each part is free text as
+/// written in the source or typed in.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WireSpec {
+    /// Cross-section with its unit, e.g. `1.5 mm²` or `18 AWG`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// Colour code, e.g. `BU` or `GNYE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colour: Option<String>,
+    /// Wire type, e.g. `H07V-K`.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl WireSpec {
+    pub fn is_empty(&self) -> bool {
+        self.section.is_none() && self.colour.is_none() && self.kind.is_none()
+    }
+
+    /// A value as stored: trimmed, and `None` when empty.
+    pub fn value(text: &str) -> Option<String> {
+        Some(text.trim().to_owned()).filter(|s| !s.is_empty())
+    }
 }
 
 /// A wire's place in a cable: the cable device (for example `-W1`) and the core's name
@@ -706,6 +736,32 @@ mod tests {
         assert!(!m.remove_from_jumper(&x2, "1"));
         let plain = toml::to_string(&ProjectMeta::new("t"))?;
         assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
+    fn a_wire_keeps_its_section_colour_and_type_and_older_files_load() -> Result<(), serde_json::Error> {
+        let old = r#"{"id":"w1","from":{"item":"s1","pin":"1"},"to":{"at":{"x":1.0,"y":2.0}}}"#;
+        let w: Wire = serde_json::from_str(old)?;
+        assert!(w.spec.is_empty());
+        assert_eq!(
+            serde_json::to_string(&w)?,
+            old,
+            "nothing new is written for a plain wire"
+        );
+        let mut w = w;
+        w.spec = WireSpec {
+            section: WireSpec::value(" 1.5 mm² "),
+            colour: WireSpec::value("BU"),
+            kind: WireSpec::value("H07V-K"),
+        };
+        let text = serde_json::to_string(&w)?;
+        assert!(
+            text.contains(r#""section":"1.5 mm²","colour":"BU","type":"H07V-K""#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Wire>(&text)?, w);
+        assert_eq!(WireSpec::value("  "), None);
         Ok(())
     }
 

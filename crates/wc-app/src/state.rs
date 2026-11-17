@@ -44,6 +44,50 @@ pub enum Selection {
     Graphic(usize),
 }
 
+/// One part of a wire's spec, edited on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecPart {
+    Section,
+    Colour,
+    Kind,
+}
+
+impl SpecPart {
+    pub const ALL: [SpecPart; 3] = [SpecPart::Section, SpecPart::Colour, SpecPart::Kind];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SpecPart::Section => "Cross-section",
+            SpecPart::Colour => "Colour",
+            SpecPart::Kind => "Wire type",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            SpecPart::Section => "e.g. 1.5 mm²",
+            SpecPart::Colour => "e.g. BU",
+            SpecPart::Kind => "e.g. H07V-K",
+        }
+    }
+
+    pub fn of(self, s: &wc_core::WireSpec) -> &Option<String> {
+        match self {
+            SpecPart::Section => &s.section,
+            SpecPart::Colour => &s.colour,
+            SpecPart::Kind => &s.kind,
+        }
+    }
+
+    pub fn of_mut(self, s: &mut wc_core::WireSpec) -> &mut Option<String> {
+        match self {
+            SpecPart::Section => &mut s.section,
+            SpecPart::Colour => &mut s.colour,
+            SpecPart::Kind => &mut s.kind,
+        }
+    }
+}
+
 /// A macro found in the project or a library source.
 #[derive(Debug, Clone)]
 pub struct MacroEntry {
@@ -358,6 +402,7 @@ impl Open {
                 potential: None,
                 cable: None,
                 route: Default::default(),
+                spec: Default::default(),
             });
         }
     }
@@ -384,6 +429,7 @@ impl Open {
                 potential: None,
                 cable: None,
                 route: Default::default(),
+                spec: Default::default(),
             });
         }
         if !pairs.is_empty() {
@@ -681,6 +727,30 @@ impl Open {
         self.checkpoint();
         self.project.meta = meta;
         true
+    }
+
+    /// Set one part of the spec (section, colour or type) on wires of a page; `None` clears it.
+    /// One undo step for all of them; nothing happens when no wire changes. Returns how many
+    /// wires changed.
+    pub fn set_wire_spec(&mut self, page: usize, wires: &[String], part: SpecPart, value: Option<String>) -> usize {
+        let Some(p) = self.project.pages.get(page) else {
+            return 0;
+        };
+        let changes = p
+            .wires
+            .iter()
+            .filter(|w| wires.contains(&w.id) && *part.of(&w.spec) != value)
+            .count();
+        if changes == 0 {
+            return 0;
+        }
+        self.checkpoint();
+        if let Some(p) = self.project.pages.get_mut(page) {
+            for w in p.wires.iter_mut().filter(|w| wires.contains(&w.id)) {
+                *part.of_mut(&mut w.spec) = value.clone();
+            }
+        }
+        changes
     }
 
     /// Cables used anywhere in the project, for the cable picker.
@@ -1073,6 +1143,48 @@ pub(crate) mod tests {
         o.add_jumper(&x1, &v(&["1", "2"])).unwrap();
         assert_eq!(o.jumper_offer(&x1, &v(&["1", "2"])), Ok(false), "already jumpered");
         assert_eq!(o.jumper_offer(&x1, &v(&["2", "3"])), Ok(true));
+    }
+
+    #[test]
+    fn several_wires_get_a_section_colour_and_type_in_one_step() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let free = |x| Endpoint::Point {
+            at: Point::new(x, 10.0),
+        };
+        o.add_wire(page, free(10.0), free(20.0), vec![]);
+        o.add_wire(page, free(30.0), free(40.0), vec![]);
+        let ids: Vec<String> = o.project.pages[page].wires.iter().map(|w| w.id.clone()).collect();
+        let mark = o.undo_mark();
+        assert_eq!(o.set_wire_spec(page, &ids, SpecPart::Colour, Some("BU".into())), 2);
+        assert_eq!(o.undo_mark(), mark + 1, "one undo step for both");
+        assert_eq!(
+            o.set_wire_spec(page, &ids, SpecPart::Colour, Some("BU".into())),
+            0,
+            "no change, no step"
+        );
+        assert_eq!(o.undo_mark(), mark + 1);
+        o.set_wire_spec(page, &ids[..1], SpecPart::Section, Some("1.5 mm²".into()));
+        let w = &o.project.pages[page].wires;
+        assert_eq!(
+            (w[0].spec.colour.as_deref(), w[1].spec.colour.as_deref()),
+            (Some("BU"), Some("BU"))
+        );
+        assert_eq!(
+            (w[0].spec.section.as_deref(), w[1].spec.section.as_deref()),
+            (Some("1.5 mm²"), None)
+        );
+        o.save().unwrap();
+        let back = Open::load(&o.dir).unwrap();
+        assert_eq!(
+            back.project.pages[page].wires[0].spec,
+            o.project.pages[page].wires[0].spec
+        );
+        // Clearing a part the wires differ in clears it on all of them.
+        assert_eq!(o.set_wire_spec(page, &ids, SpecPart::Section, None), 1);
+        assert!(o.project.pages[page].wires.iter().all(|w| w.spec.section.is_none()));
+        assert!(o.undo() && o.undo() && o.undo());
+        assert!(o.project.pages[page].wires.iter().all(|w| w.spec.is_empty()));
     }
 
     #[test]

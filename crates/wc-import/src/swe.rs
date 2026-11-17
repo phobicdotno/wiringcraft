@@ -13,6 +13,14 @@
 //! symbol graphics are DWG files and are not read: each placed symbol becomes a box with its
 //! connection points where the database puts them.
 //!
+//! Tag paths come in two forms. Most databases write them with aspect signs (`=F1+L1+L11-CR1`,
+//! location `+L1+L11`). Some write the levels separated by spaces with no signs at all
+//! (`F1 L1 L11 CR1`, location `L1 L11`); there a component's tag is built from its function
+//! (`com_fun_id` -> `tew_function.fun_tagpath`), its location (`com_loc_id` ->
+//! `tew_location.loc_tagpath`) and its product path (`com_parenttagpath`, else `com_tag`). So
+//! `com_fun_id`, `com_loc_id` and `com_parenttagpath` are required columns; `tew_function` and
+//! `tew_location` are optional tables.
+//!
 //! Database coordinates are millimetres with y up. A connection point is an offset in its
 //! symbol's own frame: rotated by the symbol's angle, then scaled by the symbol's scale along the
 //! page axes (a negative scale mirrors), then moved to the symbol's position. The order matters
@@ -29,7 +37,7 @@ use rusqlite::{Connection, OptionalExtension};
 use wc_core::connectivity::{PinRef, nets_linked};
 use wc_core::geom::{Point, Shape};
 use wc_core::symbol::{Pin, PinDir, SymbolRole};
-use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Symbol, Wire};
+use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Symbol, Wire, WireSpec};
 
 use crate::aml::Built;
 use crate::{Error, Result};
@@ -126,6 +134,8 @@ pub struct SweWire {
     /// The component terminal at each end, (`cel_id`, `cte_no`), when the source names it.
     pub from: Option<(i64, i64)>,
     pub to: Option<(i64, i64)>,
+    /// Cross-section (`wir_sectionorgauge` with `wir_sectiontype`) and colour (`wir_color`).
+    pub spec: WireSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -167,6 +177,9 @@ pub struct SweProject {
     pub cables: BTreeMap<i64, SweCable>,
     pub components: BTreeMap<i64, SweComponent>,
     pub locations: Vec<SweLocation>,
+    /// Every wire some source line carries (`tew_linewirepair`), also on lines left out for
+    /// unusable end points: the source draws these wires.
+    pub wires_on_lines: BTreeSet<i64>,
     /// The project's own fields (name, customer, ...), from the archive's project list. Not in
     /// the project database itself, so a bare database import has none.
     pub info: Option<SweProjectInfo>,
@@ -300,9 +313,79 @@ pub struct SweLocation {
 /// location always carries exactly this path (`+Room 1` is `Room_1` on both sides). Empty when
 /// that cleanup gives no valid location.
 fn location_path(tag_path: &str) -> String {
-    device_tag(&format!("{}-X", tag_path.trim()))
+    device_tag(&format!("{}-X", signed(tag_path, '+')))
         .map(|t| t.location.join("."))
         .unwrap_or_default()
+}
+
+/// Whether a stored tag path is in the signed form: it starts with `=`, `+` or `-`. A sign
+/// further in (`Deck-2`, `K-1`) is part of a level name in the space form.
+fn has_signs(path: &str) -> bool {
+    path.trim_start().starts_with(['=', '+', '-'])
+}
+
+/// A path in the space form (`L1 L11`) with `sign` before every level (`+L1+L11`); a sign inside
+/// a level becomes `_` (`Deck-2` is `Deck_2`), so it cannot start another aspect. A path that
+/// already has signs, or is empty, is returned as it is.
+fn signed(path: &str, sign: char) -> String {
+    let path = path.trim();
+    if path.is_empty() || has_signs(path) {
+        return path.to_owned();
+    }
+    path.split_whitespace()
+        .map(|l| {
+            let level: String = l
+                .chars()
+                .map(|c| if matches!(c, '=' | '+' | '-') { '_' } else { c })
+                .collect();
+            format!("{sign}{level}")
+        })
+        .collect()
+}
+
+/// The full tag path of a component stored in the space form: function, location and product,
+/// each in its signed form (`=F1` `+L1+L11` `-CR1`).
+fn composed_path(function: Option<&str>, location: Option<&str>, product: &str) -> String {
+    let mut out = String::new();
+    for (path, sign) in [(function, '='), (location, '+'), (Some(product), '-')] {
+        if let Some(p) = path {
+            out.push_str(&signed(p, sign));
+        }
+    }
+    out
+}
+
+/// Whether the database has a table called `name`.
+fn has_table(conn: &Connection, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .map_err(sql)
+}
+
+/// Tag paths by id from `tew_function` or `tew_location`, when the table is there. An empty path
+/// names no aspect, so its row is left out.
+fn tag_paths(conn: &Connection, table: &str, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, String>> {
+    let (id, path, what) = match table {
+        "tew_function" => ("fun_id", "fun_tagpath", "function"),
+        _ => ("loc_id", "loc_tagpath", "location"),
+    };
+    if !has_table(conn, table)? {
+        return Ok(BTreeMap::new());
+    }
+    let mut st = conn
+        .prepare(&format!("SELECT {id}, COALESCE(CAST({path} AS TEXT), '') FROM {table}"))
+        .map_err(sql)?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(sql)?;
+    Ok(readable(rows, &format!("{what} tag path"), warnings)
+        .into_iter()
+        .filter(|(_, p)| !p.trim().is_empty())
+        .collect())
 }
 
 /// One row of the import report: how many of a kind the source has and how many came in.
@@ -548,25 +631,70 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     let mut st = conn
         .prepare(
             "SELECT com_id, COALESCE(NULLIF(com_tagpath, ''), com_tag, ''), COALESCE(com_type, -1), com_com_id, \
-             COALESCE(com_tagorderno, 0), COALESCE(CAST(com_tag AS TEXT), '') FROM tew_component",
+             COALESCE(com_tagorderno, 0), COALESCE(CAST(com_tag AS TEXT), ''), com_fun_id, com_loc_id, \
+             COALESCE(CAST(com_parenttagpath AS TEXT), '') FROM tew_component",
         )
         .map_err(sql)?;
     let rows = st
         .query_map([], |r| {
-            Ok(SweComponent {
-                id: r.get(0)?,
-                tag: r.get(1)?,
-                kind: r.get(2)?,
-                parent: r.get::<_, Option<i64>>(3)?.filter(|c| *c > 0),
-                order: r.get(4)?,
-                name: r.get(5)?,
-                ..Default::default()
-            })
+            Ok((
+                SweComponent {
+                    id: r.get(0)?,
+                    tag: r.get(1)?,
+                    kind: r.get(2)?,
+                    parent: r.get::<_, Option<i64>>(3)?.filter(|c| *c > 0),
+                    order: r.get(4)?,
+                    name: r.get(5)?,
+                    ..Default::default()
+                },
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, String>(8)?,
+            ))
         })
         .map_err(sql)?;
-    for mut c in readable(rows, "component", &mut warnings) {
+    let functions = tag_paths(conn, "tew_function", &mut warnings)?;
+    let location_paths = tag_paths(conn, "tew_location", &mut warnings)?;
+    let mut space_form = 0usize;
+    for (mut c, fun, loc, product) in readable(rows, "component", &mut warnings) {
         c.description = text.get(&c.id).cloned().unwrap_or_default();
+        // A path without signs: rebuild it from its parts, so function and location survive. A
+        // tag with neither stays as written, spaces and all (`K3`, `X 1/2` is one product name).
+        let function = fun.and_then(|f| functions.get(&f)).map(String::as_str);
+        let location = loc.and_then(|l| location_paths.get(&l)).map(String::as_str);
+        let has_space = |t: &str| t.trim().contains(char::is_whitespace);
+        // Any part written in the space form counts: the stored path, or a function, location or
+        // product path the tag is rebuilt from.
+        let spaced = has_space(&c.tag)
+            || function.is_some_and(has_space)
+            || location.is_some_and(has_space)
+            || has_space(&product);
+        if !has_signs(&c.tag) && (function.is_some() || location.is_some()) {
+            // The product path, else the component's own tag as one level (a name, not a path:
+            // `X 1/2` is `X_1/2`, `+24V` is `_24V`), else the stored path.
+            let name: String = c
+                .name
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("_")
+                .chars()
+                .map(|ch| if matches!(ch, '=' | '+' | '-') { '_' } else { ch })
+                .collect();
+            let product = [product.trim(), name.as_str()]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .map_or_else(|| c.tag.clone(), str::to_owned);
+            if spaced {
+                space_form += 1;
+            }
+            c.tag = composed_path(function, location, &product);
+        }
         p.components.insert(c.id, c);
+    }
+    if space_form > 0 {
+        warnings.push(format!(
+            "{space_form} component tag path(s) are stored with spaces instead of =, + and -; their tags were built from function, location and product"
+        ));
     }
     let mut st = conn
         .prepare(
@@ -630,7 +758,8 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     let mut st = conn
         .prepare(
             "SELECT wir_id, wir_cab_id, COALESCE(wir_caw_no, -1), COALESCE(wir_tag, ''), \
-             wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto FROM tew_wire",
+             wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto, wir_sectiontype, \
+             COALESCE(CAST(wir_sectionorgauge AS TEXT), ''), COALESCE(CAST(wir_color AS TEXT), '') FROM tew_wire",
         )
         .map_err(sql)?;
     // An end is named by its element and terminal number; an element of 0 or less is none.
@@ -644,6 +773,11 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
                 tag: r.get(3)?,
                 from: end(r.get(4)?, r.get(5)?),
                 to: end(r.get(6)?, r.get(7)?),
+                spec: WireSpec {
+                    section: wire_section(r.get(8)?, &r.get::<_, String>(9)?),
+                    colour: WireSpec::value(&r.get::<_, String>(10)?),
+                    kind: None,
+                },
             })
         })
         .map_err(sql)?;
@@ -659,6 +793,7 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         .map_err(sql)?;
     for (line, wire) in readable(rows, "line-wire link", &mut warnings) {
         line_wires.entry(line).or_default().push(wire);
+        p.wires_on_lines.insert(wire);
     }
 
     // Connection points by symbol, named after the component terminal they stand for.
@@ -866,6 +1001,21 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     }
     p.warnings = warnings;
     Ok(p)
+}
+
+/// A wire's cross-section with its unit: `wir_sectiontype` 0 is mm², 1 is AWG (as the test
+/// projects show: 0.75, 1.5, 2.5 against 18, 20, 22). A value of 0 or nothing is no section; an
+/// unknown type keeps the value as written.
+fn wire_section(kind: Option<i64>, value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.parse::<f64>().is_ok_and(|x| x == 0.0) {
+        return None;
+    }
+    Some(match kind {
+        Some(0) => format!("{v} mm²"),
+        Some(1) => format!("{v} AWG"),
+        _ => v.to_owned(),
+    })
 }
 
 /// A terminal number as one product level: letters, digits and `_` kept, everything else
@@ -1353,9 +1503,12 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut cores_not_shown = 0usize;
     let mut multi_number_lines = 0usize;
     let mut numbers_not_shown = 0usize;
+    let mut specs_not_shown = 0usize;
     let mut wires_on_zero_length: BTreeSet<i64> = BTreeSet::new();
     // Component terminal (`cel_id`, `cte_no`) -> the pin drawn for it, and a label for messages.
     let mut drawn_at: BTreeMap<(i64, i64), (PinRef, String)> = BTreeMap::new();
+    // Element (`cel_id`) -> its component, to tell a jumper between terminals of one strip.
+    let mut element_component: BTreeMap<i64, i64> = BTreeMap::new();
 
     for (i, pg) in drawn.iter().enumerate() {
         let syms: Vec<&SweSymbol> = syms_of.remove(&pg.id).unwrap_or_default();
@@ -1460,6 +1613,9 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 // so the pin is taken by position, not by name.
                 for (q, o) in s.pins.iter().zip(&out_pins) {
                     let Some(t) = q.terminal else { continue };
+                    if let Some(c) = s.component {
+                        element_component.insert(t.0, c);
+                    }
                     drawn_at.entry(t).or_insert_with(|| {
                         (
                             (page.id.clone(), item.clone(), o.name.clone()),
@@ -1647,6 +1803,21 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 .map(|w| w.tag.trim())
                 .find(|t| !t.is_empty())
                 .map(str::to_owned);
+            // Section and colour: those of the wire whose cable core the line shows, so core and
+            // spec belong to one wire; without a cable, those of the first wire that has them.
+            let spec = match cored {
+                Some(w) => {
+                    if w.spec.is_empty() && wires.iter().any(|o| !o.spec.is_empty()) {
+                        specs_not_shown += 1;
+                    }
+                    w.spec.clone()
+                }
+                None => wires
+                    .iter()
+                    .map(|w| w.spec.clone())
+                    .find(|s| !s.is_empty())
+                    .unwrap_or_default(),
+            };
             // Without a number the equipotential is still one net: name it after its id, so its
             // wires stay connected and two such nets stay apart.
             let potential = l
@@ -1669,6 +1840,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     potential: potential.clone(),
                     cable: cable.clone(),
                     route: Default::default(),
+                    spec: spec.clone(),
                 });
             }
         }
@@ -1691,6 +1863,19 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut ends_agree = 0usize;
     let mut ends_not_drawn = 0usize;
     let mut ends_apart: Vec<String> = Vec::new();
+    // Wire records no drawn line carries: the source has the connection but not the drawing.
+    let mut jumpers_undrawn = 0usize;
+    // Judged on the source, not on what was imported: a wire whose line collapsed to zero length
+    // or sits on a page left out is still drawn there, and stays a mismatch.
+    let carried = &p.wires_on_lines;
+    let mut records_undrawn = 0usize;
+    let strip_of_element = |el: i64| {
+        element_component
+            .get(&el)
+            .and_then(|c| p.components.get(c))
+            .and_then(&strip_of)
+            .map(|s| s.id)
+    };
     for w in p.wires.values() {
         let (Some(a), Some(b)) = (w.from, w.to) else {
             if w.from.is_some() || w.to.is_some() {
@@ -1705,6 +1890,14 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         };
         match (net_of.get(pa), net_of.get(pb)) {
             (Some(x), Some(y)) if x == y => ends_agree += 1,
+            _ if !carried.contains(&w.id) => {
+                // Not on any drawn line: a jumper made in the terminal strip editor, or a
+                // connection the source keeps only in its wire list.
+                match (strip_of_element(a.0), strip_of_element(b.0)) {
+                    (Some(x), Some(y)) if x == y => jumpers_undrawn += 1,
+                    _ => records_undrawn += 1,
+                }
+            }
             _ => {
                 let name = if w.tag.trim().is_empty() {
                     format!("wire {}", w.id)
@@ -1874,6 +2067,10 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     "other wire number(s) on those lines are left off that line's wire",
                 ),
                 (
+                    specs_not_shown,
+                    "line(s) show a cable core whose wire has no section or colour; another wire's are left off",
+                ),
+                (
                     multi_core_lines,
                     "line(s) carry several cable cores; their wire shows the first core only",
                 ),
@@ -1931,6 +2128,11 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     "join terminals that are not connected on the drawing (see the warnings)",
                 ),
                 (ends_not_drawn, "with a terminal that is not drawn on a schematic page"),
+                (
+                    jumpers_undrawn,
+                    "are jumpers between terminals of one strip that no drawn line carries (WiringCraft has no jumpers yet, #108)",
+                ),
+                (records_undrawn, "are in the source's wire list but on no drawn line"),
                 (one_end_named, "more name only one terminal (not checked)"),
             ]),
         },

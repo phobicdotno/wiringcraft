@@ -330,6 +330,7 @@ mod tests {
             potential: None,
             cable: None,
             route: Default::default(),
+            spec: Default::default(),
         });
         assert!(run(&page, &["b"]).is_empty(), "a wire ends on the line");
     }
@@ -387,6 +388,7 @@ mod tests {
             potential: None,
             cable: None,
             route: Default::default(),
+            spec: Default::default(),
         });
         assert!(run(&page, &["b"]).is_empty());
     }
