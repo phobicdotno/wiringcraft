@@ -27,9 +27,25 @@ Sources (public documentation, per area below):
 - SOLIDWORKS Electrical help (the "SOLIDWORKS Electrical" section): <https://help.solidworks.com/>
   and the product pages under <https://www.solidworks.com/>.
 
-Where to find each area in that documentation (chapter names as the help uses them; search
-the help home for the chapter). Deep links are left out on purpose: both vendors move their help
-pages between releases, and a chapter name survives that better than a URL.
+Documents that cover every area:
+
+- EPLAN Electric P8 performance description (the vendor's full function list, PDF):
+  <https://www.eplan.com/content/dam/eplan/corporate/performance-descriptions/2024/en/performance-description-eplan-electric-p8.pdf>
+- EPLAN Information Portal (online help): <https://www.eplan.help/en-us/Infoportal/Content/htm/portal_home.htm>
+- SOLIDWORKS Electrical help, table of contents: <https://help.solidworks.com/2022/English/swelec/Accueil.htm>
+- SOLIDWORKS Electrical tutorials (one per area: projects, schematics, cables, terminals, PLC,
+  reports, 3D): <https://help.solidworks.com/2024/English/swelec/c_swelec_c-ov.htm>
+
+Pages for single areas, where the help has one:
+
+- 7. Terminals (SWE): terminal strip editor
+  <https://help.solidworks.com/2022/English/swelec/EwUiModelessDialogTerminalStripEditor.htm>,
+  terminal strip drawings <https://help.solidworks.com/2023/English/swelec/c_swelec_DrawTerminalStrip-sb.htm>
+- 8. Cables (SWE): <https://help.solidworks.com/2024/English/swelec/c_swelec_cables.htm>
+- 9. PLC (EPLAN): bus data exchange tech tip
+  <https://www.eplan.help/cs-cz/Infoportal/Content/misc/Techtipps/SPS/TechTipp-SPS-Busdatenaustausch.pdf>
+
+For the other areas, the chapter to read in each help is:
 
 | Area | EPLAN help chapter | SOLIDWORKS Electrical help chapter |
 |---|---|---|
