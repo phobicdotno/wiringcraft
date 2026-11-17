@@ -1327,3 +1327,29 @@ fn signed_paths_and_space_paths_compose_alike() {
     assert_eq!(location_path("L1 L11"), "L1.L11");
     assert_eq!(location_path("+L1+L11"), "L1.L11");
 }
+
+#[test]
+fn space_form_edge_cases_keep_their_levels() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_location VALUES (7, 'Deck-2');
+         INSERT INTO tew_component VALUES (510, 'K-1', 'F1 Deck-2 K-1', -1, NULL, 0, 2, 7, 'K-1'),
+           (511, 'CR9', 'F1 L1 L11 CR9', -1, NULL, 0, 2, 2450, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let (built, _, _) = build(&p, None);
+    for t in ["=F1+Deck_2-K_1", "=F1+L1.L11-CR9"] {
+        assert!(
+            built.devices.contains_key(&DeviceTag::parse(t).unwrap()),
+            "{t}: {:?}",
+            built.devices.keys()
+        );
+    }
+    assert!(
+        built.locations.iter().any(|l| l.path == "Deck_2"),
+        "{:?}",
+        built.locations
+    );
+    assert!(has_signs(" -X1 1") && !has_signs("Deck-2"));
+}

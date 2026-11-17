@@ -17,7 +17,9 @@
 //! location `+L1+L11`). Some write the levels separated by spaces with no signs at all
 //! (`F1 L1 L11 CR1`, location `L1 L11`); there a component's tag is built from its function
 //! (`com_fun_id` -> `tew_function.fun_tagpath`), its location (`com_loc_id` ->
-//! `tew_location.loc_tagpath`) and its product path (`com_parenttagpath`).
+//! `tew_location.loc_tagpath`) and its product path (`com_parenttagpath`, else `com_tag`). So
+//! `com_fun_id`, `com_loc_id` and `com_parenttagpath` are required columns; `tew_function` and
+//! `tew_location` are optional tables.
 //!
 //! Database coordinates are millimetres with y up. A connection point is an offset in its
 //! symbol's own frame: scaled by the symbol's scale (a negative scale mirrors), then rotated by
@@ -309,19 +311,29 @@ fn location_path(tag_path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Whether a stored tag path carries aspect signs (`=`, `+`, `-`).
+/// Whether a stored tag path is in the signed form: it starts with `=`, `+` or `-`. A sign
+/// further in (`Deck-2`, `K-1`) is part of a level name in the space form.
 fn has_signs(path: &str) -> bool {
-    path.contains(['=', '+', '-'])
+    path.trim_start().starts_with(['=', '+', '-'])
 }
 
-/// A path in the space form (`L1 L11`) with `sign` before every level (`+L1+L11`); a path that
+/// A path in the space form (`L1 L11`) with `sign` before every level (`+L1+L11`); a sign inside
+/// a level becomes `_` (`Deck-2` is `Deck_2`), so it cannot start another aspect. A path that
 /// already has signs, or is empty, is returned as it is.
 fn signed(path: &str, sign: char) -> String {
     let path = path.trim();
     if path.is_empty() || has_signs(path) {
         return path.to_owned();
     }
-    path.split_whitespace().map(|l| format!("{sign}{l}")).collect()
+    path.split_whitespace()
+        .map(|l| {
+            let level: String = l
+                .chars()
+                .map(|c| if matches!(c, '=' | '+' | '-') { '_' } else { c })
+                .collect();
+            format!("{sign}{level}")
+        })
+        .collect()
 }
 
 /// The full tag path of a component stored in the space form: function, location and product,
@@ -640,11 +652,11 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         let location = loc.and_then(|l| location_paths.get(&l)).map(String::as_str);
         let spaced = c.tag.trim().contains(char::is_whitespace);
         if !has_signs(&c.tag) && (spaced || function.is_some() || location.is_some()) {
-            let product = if product.trim().is_empty() {
-                c.tag.clone()
-            } else {
-                product
-            };
+            // The product path, else the component's own tag, else the stored path.
+            let product = [product.trim(), c.name.trim()]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .map_or_else(|| c.tag.clone(), str::to_owned);
             if spaced {
                 space_form += 1;
             }
