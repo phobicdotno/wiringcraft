@@ -135,7 +135,7 @@ pub fn read_with(bytes: &[u8], limits: Limits) -> Result<(Vec<Part>, Report, Vec
             Entry::Xml if size > limits.entry || total.saturating_add(size) > limits.total => report.too_large += 1,
             Entry::Xml => {
                 let mut buf = Vec::new();
-                data.take(limits.entry + 1)
+                data.take(limits.entry.saturating_add(1))
                     .read_to_end(&mut buf)
                     .map_err(|e| Error::Format(format!("{name} cannot be read from the archive: {e}")))?;
                 if buf.len() as u64 > limits.entry || total.saturating_add(buf.len() as u64) > limits.total {

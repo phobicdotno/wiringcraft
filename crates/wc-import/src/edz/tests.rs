@@ -254,3 +254,17 @@ fn xml_nested_too_deeply_is_an_error() {
     );
     assert!(part_xml(&ok).is_ok());
 }
+
+#[test]
+fn the_largest_limits_do_not_overflow() -> TestResult {
+    let edz = seven_zip(&[("parts.xml", PARTS.as_bytes())])?;
+    let all = Limits {
+        entry: u64::MAX,
+        entries: usize::MAX,
+        total: u64::MAX,
+        unpacked: u64::MAX,
+    };
+    let (parts, _, _) = read_with(&edz, all)?;
+    assert_eq!(parts.len(), 2);
+    Ok(())
+}
