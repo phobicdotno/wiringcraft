@@ -1439,7 +1439,7 @@ impl Open {
         }
     }
 
-    /// Jumper terminals of a strip together, as one undo step. See [`ProjectMeta::add_jumper`].
+    /// Jumper terminals of a strip together, as one undo step. See [`wc_core::project::ProjectMeta::add_jumper`].
     pub fn add_jumper(&mut self, strip: &DeviceTag, terminals: &[String]) -> Result<(), String> {
         self.follow_terminals();
         let mut meta = self.project.meta.clone();
