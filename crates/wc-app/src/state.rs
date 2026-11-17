@@ -164,6 +164,10 @@ pub struct Open {
     /// Tests: whether each coming symbol file write fails, in order.
     #[cfg(test)]
     fail_symbol_writes: std::collections::VecDeque<bool>,
+    /// Tests: a file that turns into a folder once the update's backups are taken, so the
+    /// update's write of it fails after other items were already written.
+    #[cfg(test)]
+    block_after_snapshot: Option<PathBuf>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
 }
@@ -193,6 +197,8 @@ impl Open {
             stale_symbol_files: Default::default(),
             #[cfg(test)]
             fail_symbol_writes: Default::default(),
+            #[cfg(test)]
+            block_after_snapshot: None,
             undo_error: None,
         };
         // Locked symbols no page uses are loaded too, so Undo can put back the version a
@@ -607,6 +613,11 @@ impl Open {
             .map(|path| Ok((path.clone(), snapshot_file(&path)?)))
             .collect::<Result<_, String>>()
             .map_err(|e| format!("nothing was updated: {e}"))?;
+        #[cfg(test)]
+        if let Some(path) = self.block_after_snapshot.take() {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::create_dir(&path);
+        }
         self.archive_symbols();
         self.checkpoint();
         let done = match wc_library::update(&self.dir, &mut self.project, lib, only) {
@@ -1656,12 +1667,16 @@ pub(crate) mod tests {
         let mut new = old.clone();
         new.name = "Coil, changed".into();
         let lib = library_first(&mut o, tmp.path(), &new);
-        // A folder where the part file goes: symbols are taken first, then this write fails.
+        // Once the backups are taken, a folder where the part file goes: symbols are taken
+        // first, then this write fails.
         let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
-        std::fs::remove_file(&part_file).unwrap();
-        std::fs::create_dir(&part_file).unwrap();
+        o.block_after_snapshot = Some(part_file.clone());
         let lock = o.project.lock.clone();
-        assert!(o.update_library(&lib, None).is_err());
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(
+            !err.starts_with("nothing was updated"),
+            "the update itself failed: {err}"
+        );
         assert_eq!(o.project.lock, lock, "the lock is as before");
         assert_eq!(o.symbols["wc.coil"], old);
         assert_eq!(
@@ -1670,6 +1685,39 @@ pub(crate) mod tests {
             "and the symbol file"
         );
         assert!(!o.can_redo());
+    }
+
+    #[test]
+    fn an_update_whose_part_file_cannot_be_read_changes_nothing_and_keeps_the_file() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        // The part file is there but cannot be read (a folder stands in for it, which also
+        // holds when the tests run as root).
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        std::fs::remove_file(&part_file).unwrap();
+        std::fs::create_dir(&part_file).unwrap();
+        let lock = o.project.lock.clone();
+        let could_undo = o.can_undo();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(
+            err.starts_with("nothing was updated") && err.contains("cannot be read"),
+            "{err}"
+        );
+        assert!(part_file.is_dir(), "the unreadable file is not removed");
+        assert_eq!(o.project.lock, lock);
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "no symbol written"
+        );
+        assert_eq!(o.can_undo(), could_undo, "no undo step");
     }
 
     #[test]
