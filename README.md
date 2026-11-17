@@ -28,7 +28,7 @@ See the feature list for the full plan.
 | `wc-pdf` | vector PDF export (schematic pages plus report pages) |
 | `wc-vcs` | git versioning, subway-map history, schematic change lists |
 | `wc-agent` | the live AI assistant: Claude Code connection (your login), tool bridge, API client |
-| `wc-share` | shared work sessions: join approval, page locks, one commit per change (app and network to follow) |
+| `wc-share` | shared work sessions: join approval, page locks, one commit per change, TCP transport (app to follow) |
 | `wc-cli` | the `wiringcraft` command |
 | `wc-app` | the desktop editor (`wiringcraft-app`) |
 

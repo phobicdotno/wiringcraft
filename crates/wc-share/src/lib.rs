@@ -18,12 +18,13 @@
 //!   saves the project and commits it with the participant as the author, so any change can be
 //!   reverted from the history.
 //!
-//! The host and guests are plain state machines with no I/O; [`transport`] connects them. Tests
-//! run whole sessions in-process.
+//! The host and guests are plain state machines with no I/O; [`transport`] connects them
+//! in-process and [`net`] over TCP. Tests run whole sessions both ways.
 
 mod guest;
 mod host;
 mod journal;
+pub mod net;
 mod protocol;
 pub mod transport;
 
@@ -40,6 +41,8 @@ pub enum Error {
     Vcs(#[from] wc_vcs::Error),
     #[error("bad session message: {0}")]
     Decode(#[from] serde_json::Error),
+    #[error("session network: {0}")]
+    Io(#[from] std::io::Error),
     #[error("the session connection is closed")]
     Closed,
 }
