@@ -2354,8 +2354,55 @@ mod tests {
         );
         assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), old);
         assert!(open.redo());
+        assert_eq!(open.project.lock.symbols["wc.coil"].hash, new.hash());
         assert_eq!(open.symbols["wc.coil"], new);
         assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), new);
+    }
+
+    /// A second library folder after the starter one, holding its own `wc.coil`.
+    fn later_library_with_a_coil(a: &mut App, root: &std::path::Path) -> crate::symbol_editor::Saved {
+        let open = a.open.as_mut().unwrap();
+        let lib = wc_library::Library::open(&open.dir, &open.project).unwrap();
+        let (mut symbol, _) = lib.symbol("wc.coil").unwrap();
+        symbol.name = "Coil, mine".into();
+        let folder = root.join("mine");
+        std::fs::create_dir_all(folder.join("symbols")).unwrap();
+        let path = folder.join("symbols/wc.coil.json");
+        std::fs::write(&path, serde_json::to_string(&symbol).unwrap()).unwrap();
+        open.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "mine".into(),
+            kind: "folder".into(),
+            location: folder.display().to_string(),
+            reference: None,
+        });
+        crate::symbol_editor::Saved {
+            id: "wc.coil".into(),
+            path,
+            source: "mine".into(),
+            symbol,
+        }
+    }
+
+    #[test]
+    fn a_symbol_saved_behind_an_earlier_library_says_so_whether_or_not_it_is_used() {
+        // Not used yet: the place list would give the starter library's coil.
+        let root = tempfile::tempdir().unwrap();
+        let (_tmp, mut a) = app(vec![]);
+        let saved = later_library_with_a_coil(&mut a, root.path());
+        a.symbol_saved(saved);
+        assert!(a.ed.message.contains("comes first"), "{}", a.ed.message);
+        // Used: the project keeps its copy.
+        let (_tmp2, mut a) = app(vec![]);
+        a.open
+            .as_mut()
+            .unwrap()
+            .place(1, "wc.coil", Point::new(20.0, 20.0))
+            .unwrap();
+        let before = a.open.as_ref().unwrap().symbols["wc.coil"].clone();
+        let saved = later_library_with_a_coil(&mut a, root.path());
+        a.symbol_saved(saved);
+        assert!(a.ed.message.contains("comes first"), "{}", a.ed.message);
+        assert_eq!(a.open.as_ref().unwrap().symbols["wc.coil"], before);
     }
 
     #[test]

@@ -2285,14 +2285,16 @@ impl App {
         if !keep {
             self.symbol_editor = None;
         }
-        let (Some(saved), Some(open)) = (saved, self.open.as_mut()) else {
-            return;
-        };
-        open.refresh_library();
-        if !open.symbols.contains_key(&saved.id) {
-            self.ed.message = format!("Symbol {} saved; it is in the place list.", saved.id);
-            return;
+        if let Some(saved) = saved {
+            self.symbol_saved(saved);
         }
+    }
+
+    /// After the symbol editor saved: tell what the project gets, and update its copy when the
+    /// pages use the symbol.
+    fn symbol_saved(&mut self, saved: crate::symbol_editor::Saved) {
+        let Some(open) = self.open.as_mut() else { return };
+        open.refresh_library();
         let lib = match wc_library::Library::open(&open.dir, &open.project) {
             Ok(l) => l,
             Err(e) => {
@@ -2301,14 +2303,23 @@ impl App {
             }
         };
         // The project takes a symbol from the first library that has it: when that is another
-        // folder, the saved file is not what the project would get.
+        // folder, the saved file is not what the project gets, now or when it is placed.
         if let Some(first) = lib.locate(wc_core::lock::ItemKind::Symbol, &saved.id)
             && first.source != saved.source
         {
+            let keeps = if open.symbols.contains_key(&saved.id) {
+                "the project keeps that one"
+            } else {
+                "placing it takes that one"
+            };
             self.ed.message = format!(
-                "Symbol {} saved into {}, but library {} comes first and has a symbol with the same id; the project keeps that one.",
+                "Symbol {} saved into {}, but library {} comes first and has a symbol with the same id; {keeps}.",
                 saved.id, saved.source, first.source
             );
+            return;
+        }
+        if !open.symbols.contains_key(&saved.id) {
+            self.ed.message = format!("Symbol {} saved; it is in the place list.", saved.id);
             return;
         }
         // Wires on a pin the new version no longer has would point at nothing: say which, and

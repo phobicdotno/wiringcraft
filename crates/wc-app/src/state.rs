@@ -550,18 +550,68 @@ impl Open {
         lib: &wc_library::Library,
         only: Option<&[String]>,
     ) -> Result<Vec<(ItemKind, String)>, String> {
+        let todo: Vec<(ItemKind, String)> = wc_library::status(&self.dir, &self.project, lib)
+            .into_iter()
+            .filter(|s| s.state == wc_library::State::Changed)
+            .filter(|s| only.is_none_or(|ids| ids.contains(&s.id)))
+            .map(|s| (s.kind, s.id))
+            .collect();
+        // Checked before anything is written: a new version that drops a wired pin stops the
+        // whole update.
+        let mut dangling: Vec<String> = todo
+            .iter()
+            .filter(|(kind, _)| *kind == ItemKind::Symbol)
+            .filter_map(|(_, id)| Some(dangling_pins(&self.project, id, &lib.symbol(id).ok()?.0)))
+            .flatten()
+            .collect();
+        if !dangling.is_empty() {
+            dangling.sort();
+            return Err(format!(
+                "nothing was updated: wires end on pins the new versions no longer have ({}). Move those wires first.",
+                dangling.join(", ")
+            ));
+        }
+        // Undo puts back the lock and the symbol files; part files are kept here, so a write
+        // that fails halfway leaves none of them changed either.
+        let parts: Vec<(PathBuf, Option<Vec<u8>>)> = todo
+            .iter()
+            .filter(|(kind, _)| *kind == ItemKind::Part)
+            .filter_map(|(kind, id)| store::vendor_path(&self.dir, *kind, id).ok())
+            .map(|path| {
+                let was = std::fs::read(&path).ok();
+                (path, was)
+            })
+            .collect();
         self.archive_symbols();
         self.checkpoint();
         let done = match wc_library::update(&self.dir, &mut self.project, lib, only) {
             Ok(done) => done,
             Err(e) => {
                 // Some items may have been taken already: take them back too.
+                let mut unrestored: Vec<String> = parts
+                    .iter()
+                    .filter_map(|(path, was)| {
+                        let r = match was {
+                            Some(bytes) => std::fs::write(path, bytes),
+                            None if path.exists() => std::fs::remove_file(path),
+                            None => Ok(()),
+                        };
+                        r.err().map(|err| format!("{} ({err})", path.display()))
+                    })
+                    .collect();
                 self.reload_symbols();
                 let undone = self.undo();
                 self.redo.clear();
-                return Err(match (undone, self.take_undo_error()) {
-                    (false, Some(why)) => format!("{e}; what was already updated could not be taken back: {why}"),
-                    _ => e.to_string(),
+                if let (false, Some(why)) = (undone, self.take_undo_error()) {
+                    unrestored.push(why);
+                }
+                return Err(if unrestored.is_empty() {
+                    e.to_string()
+                } else {
+                    format!(
+                        "{e}; what was already updated could not be taken back: {}",
+                        unrestored.join("; ")
+                    )
                 });
             }
         };
@@ -1457,6 +1507,85 @@ pub(crate) mod tests {
         wc_library::Library::open(&o.dir, &o.project).unwrap()
     }
 
+    /// Put a changed copy of a vendored part into the "mine" library folder.
+    fn changed_part_in_mine(o: &Open, root: &Path, pid: &str) -> wc_core::Part {
+        let mut part = store::read_vendored_part(&o.dir, pid).unwrap();
+        part.description = "Changed in the library".into();
+        std::fs::create_dir_all(root.join("mine/parts")).unwrap();
+        std::fs::write(
+            root.join(format!("mine/parts/{pid}.json")),
+            serde_json::to_string(&part).unwrap(),
+        )
+        .unwrap();
+        part
+    }
+
+    #[test]
+    fn an_update_refused_for_a_dropped_pin_writes_no_part_either() {
+        let (tmp, mut o) = project();
+        let s1 = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let s2 = o.place(1, "wc.coil", Point::new(60.0, 20.0)).unwrap();
+        let pin = |item: &str| Endpoint::Pin {
+            item: item.to_owned(),
+            pin: "A2".into(),
+        };
+        o.project.pages[1].wires.push(Wire {
+            id: "w1".into(),
+            from: pin(&s1),
+            to: pin(&s2),
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let part_before = std::fs::read(&part_file).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let mut new = o.symbols["wc.coil"].clone();
+        new.pins.retain(|p| p.name != "A2");
+        let lib = library_first(&mut o, tmp.path(), &new);
+        let lock = o.project.lock.clone();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(err.starts_with("nothing was updated") && err.contains(":A2"), "{err}");
+        assert_eq!(
+            std::fs::read(&part_file).unwrap(),
+            part_before,
+            "the part file is untouched"
+        );
+        assert_eq!(o.project.lock, lock);
+    }
+
+    #[test]
+    fn an_update_whose_later_write_fails_takes_back_the_symbol_written_before_it() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        // A folder where the part file goes: symbols are taken first, then this write fails.
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        std::fs::remove_file(&part_file).unwrap();
+        std::fs::create_dir(&part_file).unwrap();
+        let lock = o.project.lock.clone();
+        assert!(o.update_library(&lib, None).is_err());
+        assert_eq!(o.project.lock, lock, "the lock is as before");
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "and the symbol file"
+        );
+        assert!(!o.can_redo());
+    }
+
     #[test]
     fn undo_after_reopening_puts_back_a_locked_symbol_no_page_uses() {
         let (tmp, mut o) = project();
@@ -1542,7 +1671,10 @@ pub(crate) mod tests {
         std::fs::write(&file, "not a symbol").unwrap();
         assert!(!o.undo());
         let err = o.take_undo_error().unwrap_or_default();
-        assert!(err.contains("cannot be read: "), "{err}");
+        let reason = err.split("cannot be read: ").nth(1).unwrap_or_default();
+        assert!(!reason.trim().is_empty(), "the parse error follows: {err}");
+        let parse = store::read_vendored_symbol(&o.dir, "wc.coil").unwrap_err().to_string();
+        assert!(err.ends_with(&parse), "{err} / {parse}");
     }
 
     #[test]
