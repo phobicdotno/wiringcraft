@@ -363,6 +363,19 @@ enum ImportCmd {
         #[arg(long, default_value_t = 400)]
         first_page: usize,
     },
+    /// A SolidWorks Electrical project archive (.tewzip) or project database
+    /// (tew_project_data.sqlite): its schematic and line-diagram pages, symbols as boxes with
+    /// their connection points at the original positions, wires joined to them, and devices with
+    /// part data. Symbol graphics (DWG) are not read.
+    Swe {
+        path: PathBuf,
+        /// Which project of the archive, counted from 1 (archives can hold several).
+        #[arg(long, default_value_t = 1)]
+        pick: usize,
+        /// Number the pages from here instead of keeping the source's page numbers.
+        #[arg(long)]
+        first_page: Option<usize>,
+    },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
     Aml {
         file: PathBuf,
@@ -1251,6 +1264,67 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 ep.connections.len()
             );
         }
+        ImportCmd::Swe { path, pick, first_page } => {
+            let project = pick;
+            let started = std::time::Instant::now();
+            let mut p = load(dir)?;
+            // A database file directly, or an archive read from disk: only the picked project's
+            // database is unpacked, so a large archive costs little memory.
+            let mut head = [0u8; 16];
+            let mut file = std::fs::File::open(&path).map_err(e)?;
+            let is_db = std::io::Read::read_exact(&mut file, &mut head).is_ok() && &head == b"SQLite format 3\0";
+            let db = if is_db {
+                // The same size cap as for a database taken out of an archive.
+                let limit = wc_import::swe::MAX_DATABASE_BYTES;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(std::fs::File::open(&path).map_err(e)?, limit + 1),
+                    &mut bytes,
+                )
+                .map_err(e)?;
+                if bytes.len() as u64 > limit {
+                    return Err(format!("{} is larger than {} MB", path.display(), limit >> 20));
+                }
+                bytes
+            } else {
+                let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
+                let got =
+                    wc_import::swe::database_from_archive(file, project).map_err(|x| format!("{x} (use --pick)"))?;
+                if got.count > 1 {
+                    eprintln!(
+                        "the archive holds {} projects; importing number {project} ({})",
+                        got.count, got.folder
+                    );
+                }
+                got.bytes
+            };
+            let conn = wc_import::swe::open(&db).map_err(e)?;
+            let sw = wc_import::swe::read(&conn).map_err(e)?;
+            let (built, warnings, report) = wc_import::swe::build(&sw, first_page);
+            for w in sw.warnings.iter().chain(&warnings) {
+                eprintln!("warning: {w}");
+            }
+            let source = format!(
+                "import:{}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+            let n_sym = built.symbols.len();
+            add_built(dir, &mut p, built, &source)?;
+            save(dir, &p)?;
+            println!(
+                "{:<18} {:>8} {:>9}  why the rest is not imported",
+                "", "source", "imported"
+            );
+            for r in &report {
+                println!("{:<18} {:>8} {:>9}  {}", r.what, r.source, r.imported, r.note);
+            }
+            println!(
+                "{n_sym} symbol shape(s) for the boxes; done in {} ms",
+                started.elapsed().as_millis()
+            );
+        }
         ImportCmd::Aml { file, first_page } => {
             let mut p = load(dir)?;
             let text = std::fs::read(&file).map_err(e)?;
@@ -1265,41 +1339,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             );
-            for s in &built.symbols {
-                store::write_vendored_symbol(dir, s).map_err(e)?;
-                p.lock.symbols.insert(
-                    s.id.clone(),
-                    wc_core::LockEntry {
-                        source: source.clone(),
-                        hash: s.hash(),
-                    },
-                );
-            }
-            for part in &built.parts {
-                store::write_vendored_part(dir, part).map_err(e)?;
-                p.lock.parts.insert(
-                    part.id.clone(),
-                    wc_core::LockEntry {
-                        source: source.clone(),
-                        hash: part.hash(),
-                    },
-                );
-            }
-            let n_pages = built.pages.len();
-            for page in built.pages {
-                if p.page(&page.id).is_some() {
-                    return Err(format!(
-                        "page {} exists; remove it or import into a fresh project",
-                        page.id
-                    ));
-                }
-                p.pages.push(page);
-            }
-            p.sort_pages();
-            let n_dev = built.devices.len();
-            for (t, d) in built.devices {
-                p.devices.insert(t, d);
-            }
+            // Through the shared preflight: conflicts are refused before anything is written.
+            let (n_pages, n_dev) = (built.pages.len(), built.devices.len());
+            add_built(dir, &mut p, built, &source)?;
             save(dir, &p)?;
             println!(
                 "imported {n_dev} devices, {} connections on {n_pages} page(s)",
@@ -1738,6 +1780,52 @@ fn eplan_tables(path: &Path) -> Result<wc_import::eplan::Tables, String> {
 /// the lockfile under `source`.
 fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Result<(), String> {
     let e = |x: wc_core::Error| x.to_string();
+    // Refuse before anything is written: a repeated import must not overwrite the symbol files of
+    // an earlier one and then fail half way.
+    if let Some(page) = built.pages.iter().find(|pg| p.page(&pg.id).is_some()) {
+        return Err(format!(
+            "page {} exists; remove it or import into a fresh project",
+            page.id
+        ));
+    }
+    let numbers: std::collections::BTreeSet<&str> = p.pages.iter().map(|pg| pg.number.as_str()).collect();
+    if let Some(page) = built.pages.iter().find(|pg| numbers.contains(pg.number.as_str())) {
+        return Err(format!(
+            "page number {} is taken; import with --first-page to number the pages from a free number",
+            page.number
+        ));
+    }
+    // A library item already in the project may come again only unchanged (same content hash).
+    for s in &built.symbols {
+        if let Some(entry) = p.lock.symbols.get(&s.id)
+            && entry.hash != s.hash()
+        {
+            return Err(format!(
+                "symbol {} exists with other content; import into a fresh project",
+                s.id
+            ));
+        }
+    }
+    for part in &built.parts {
+        if let Some(entry) = p.lock.parts.get(&part.id)
+            && entry.hash != part.hash()
+        {
+            return Err(format!(
+                "part {} exists with other content; import into a fresh project",
+                part.id
+            ));
+        }
+    }
+    // A device the project already has under the same tag may come again only unchanged.
+    if let Some((tag, _)) = built
+        .devices
+        .iter()
+        .find(|(t, d)| p.devices.get(*t).is_some_and(|have| have != *d))
+    {
+        return Err(format!(
+            "device {tag} exists with other data; rename it or import into a fresh project"
+        ));
+    }
     for s in &built.symbols {
         store::write_vendored_symbol(dir, s).map_err(e)?;
         p.lock.symbols.insert(

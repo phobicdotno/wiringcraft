@@ -26,6 +26,7 @@ tempfile = "3"
 miniz_oxide = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rusqlite = { version = "0.37", features = ["bundled", "serialize"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

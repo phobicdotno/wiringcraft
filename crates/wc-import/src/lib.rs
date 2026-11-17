@@ -11,6 +11,7 @@ pub mod kicad;
 pub mod pdf;
 pub mod raster;
 pub mod svg;
+pub mod swe;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
