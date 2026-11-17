@@ -504,7 +504,7 @@ impl App {
                 self.dialog = Some(Dialog::Cover {
                     name: open.project.meta.name.clone(),
                     fields: form_fields(&open.project.meta.title_block),
-                    since: open.undo_mark(),
+                    since: open.start_live_form(),
                     before: open.props_snapshot(),
                 });
             }
@@ -987,7 +987,7 @@ impl App {
                             }
                         });
                     if changed && let Some(o) = self.open.as_mut() {
-                        o.set_project_props_live(*since, name, fields);
+                        o.set_project_props_live(name, fields);
                     }
                     ui.label(
                         RichText::new(

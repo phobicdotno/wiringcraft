@@ -686,10 +686,17 @@ impl Open {
         Ok(self.index_of(&id))
     }
 
+    /// A properties form opens: its live edits will make a fresh undo step. Returns the undo
+    /// mark to pass to [`Open::revert_live`].
+    pub fn start_live_form(&mut self) -> usize {
+        self.form_step = None;
+        self.undo_mark()
+    }
+
     /// Set the project name and fields while a form is open, so the page shows each change at
-    /// once. Every change made since `since` (an [`Open::undo_mark`] taken when the form opened)
-    /// stays one undo step. An empty name is not applied (it is being typed).
-    pub fn set_project_props_live(&mut self, since: usize, name: &str, fields: &[(String, String)]) {
+    /// once. The form's changes since [`Open::start_live_form`] stay one undo step while nothing
+    /// else changes the history. An empty name is not applied (it is being typed).
+    pub fn set_project_props_live(&mut self, name: &str, fields: &[(String, String)]) {
         let name = name.trim();
         let block = title_block_of(fields);
         let name_changes = !name.is_empty() && self.project.meta.name != name;
@@ -699,7 +706,7 @@ impl Open {
         // Keep adding to the form's own undo step only while nothing else has touched the
         // history since; after any other change (a page added, another properties edit, an
         // undo) the form starts a new step.
-        if self.undo_mark() > since && self.form_step == Some(self.history) {
+        if self.form_step == Some(self.history) {
             self.dirty = true;
         } else {
             self.checkpoint();
@@ -926,14 +933,14 @@ pub(crate) mod tests {
         let (_tmp, mut o) = project();
         assert_eq!(o.cover_page(), Ok(0), "a new project's first page is its cover");
         assert!(!o.can_undo(), "nothing to create");
-        let since = o.undo_mark();
+        o.start_live_form();
         for typed in ["A", "AC", "ACME"] {
-            o.set_project_props_live(since, "Test", &fields(&[("customer", typed)]));
+            o.set_project_props_live("Test", &fields(&[("customer", typed)]));
             assert_eq!(o.project.meta.title_block["customer"], typed, "shown at once");
         }
-        o.set_project_props_live(since, "", &fields(&[("customer", "ACME")]));
+        o.set_project_props_live("", &fields(&[("customer", "ACME")]));
         assert_eq!(o.project.meta.name, "Test", "an empty name is still being typed");
-        o.set_project_props_live(since, "Pumps", &fields(&[("customer", "ACME"), ("revision", "")]));
+        o.set_project_props_live("Pumps", &fields(&[("customer", "ACME"), ("revision", "")]));
         assert_eq!(o.project.meta.name, "Pumps");
         assert_eq!(o.project.meta.title_block.len(), 1, "empty fields are dropped");
         assert!(o.undo());
@@ -945,9 +952,9 @@ pub(crate) mod tests {
         assert!(!o.can_undo());
 
         // Cancel takes the typed changes back and leaves nothing to redo.
-        let since = o.undo_mark();
+        let since = o.start_live_form();
         let before = o.props_snapshot();
-        o.set_project_props_live(since, "Test", &fields(&[("customer", "Other")]));
+        o.set_project_props_live("Test", &fields(&[("customer", "Other")]));
         o.revert_live(since, &before);
         assert!(o.project.meta.title_block.is_empty());
         assert!(!o.can_redo());
@@ -956,24 +963,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn form_edits_after_an_undo_stay_one_step() {
+        let (_tmp, mut o) = project();
+        o.checkpoint();
+        o.project.pages[0].title = "Edited".into();
+        o.start_live_form();
+        assert!(o.undo());
+        o.set_project_props_live("Test", &fields(&[("customer", "A")]));
+        o.set_project_props_live("Test", &fields(&[("customer", "B")]));
+        assert!(o.undo());
+        assert!(o.project.meta.title_block.is_empty(), "one Undo takes both edits back");
+        assert!(!o.can_undo());
+    }
+
+    #[test]
     fn a_form_edit_after_another_change_is_its_own_undo_step() {
         let (_tmp, mut o) = project();
-        let since = o.undo_mark();
-        o.set_project_props_live(since, "Test", &fields(&[("customer", "A")]));
+        o.start_live_form();
+        o.set_project_props_live("Test", &fields(&[("customer", "A")]));
         // Another change while the form is open.
         o.checkpoint();
         o.project.pages[0].title = "Added meanwhile".into();
-        o.set_project_props_live(since, "Test", &fields(&[("customer", "B")]));
+        o.set_project_props_live("Test", &fields(&[("customer", "B")]));
         // OK, then Undo: only the second form edit goes back.
         assert!(o.undo());
         assert_eq!(o.project.meta.title_block["customer"], "A");
         assert_eq!(o.project.pages[0].title, "Added meanwhile");
 
         // A properties change made another way in between is its own step too.
-        let since = o.undo_mark();
-        o.set_project_props_live(since, "Test", &fields(&[("customer", "A")]));
+        o.form_step = None;
+        o.start_live_form();
+        o.set_project_props_live("Test", &fields(&[("customer", "A")]));
         o.set_project_props("Test", &fields(&[("customer", "X")])).unwrap();
-        o.set_project_props_live(since, "Test", &fields(&[("customer", "B")]));
+        o.set_project_props_live("Test", &fields(&[("customer", "B")]));
         assert!(o.undo());
         assert_eq!(o.project.meta.title_block["customer"], "X");
     }
@@ -982,9 +1004,9 @@ pub(crate) mod tests {
     fn cancel_puts_the_fields_back_when_the_form_step_is_not_the_last_or_was_folded_away() {
         let (_tmp, mut o) = project();
         // A page edit made while the form is open stays; only the fields go back.
-        let since = o.undo_mark();
+        let since = o.start_live_form();
         let before = o.props_snapshot();
-        o.set_project_props_live(since, "Test", &fields(&[("customer", "ACME")]));
+        o.set_project_props_live("Test", &fields(&[("customer", "ACME")]));
         o.checkpoint();
         o.project.pages[0].title = "Edited meanwhile".into();
         o.revert_live(since, &before);
@@ -995,9 +1017,9 @@ pub(crate) mod tests {
         let turn = o.undo_mark();
         o.checkpoint();
         o.project.pages[0].title = "By the assistant".into();
-        let since = o.undo_mark();
+        let since = o.start_live_form();
         let before = o.props_snapshot();
-        o.set_project_props_live(since, "Test", &fields(&[("customer", "ACME")]));
+        o.set_project_props_live("Test", &fields(&[("customer", "ACME")]));
         o.squash_undo(turn);
         assert!(o.undo_mark() <= since);
         o.revert_live(since, &before);
