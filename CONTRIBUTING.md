@@ -22,7 +22,10 @@ people with write access to the repository; the bot refuses commands from anyone
 | `/unclaim force` | Release whoever holds it (for a person clearing a stuck lock). |
 
 The claim bot (`.github/workflows/claim.yml`) answers every command on the issue, usually within a
-minute and at the latest at its next 10-minute sweep, and adds or removes the `claimed` label. A
+minute, and adds or removes the `claimed` label. If GitHub dropped that run, a later run or the
+10-minute sweep answers; scheduled runs are best effort and can be late, so when `todo.py` times
+out, look for the answer on the issue before claiming anything else. Only people with write access
+to the repository can claim (the bot asks GitHub for the permission, not just the role). A
 lock past its time is free for anyone, and the sweep posts the release. A pull request's claim only
 ever lengthens the agent's lock, never shortens a longer one.
 

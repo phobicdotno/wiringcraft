@@ -59,8 +59,28 @@ function marker(data) {
 }
 
 const CLAIM_BOT = 'github-actions[bot]';
-// Who may use the commands and whose pull requests claim: people with write access.
-const TRUSTED = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+// Who may use the commands and whose pull requests claim: people with write access to the
+// repository. The association only rejects early; the permission itself is asked from GitHub,
+// since a collaborator can have read access only.
+const MAYBE_TRUSTED = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+const WRITE = new Set(['admin', 'maintain', 'write']);
+const permissions = new Map();
+
+/** Whether `login` may write to the repository (cached per run; unknown users have no access). */
+async function canWrite(github, owner, repo, login, association) {
+  if (!login || !MAYBE_TRUSTED.has(association)) return false;
+  if (!permissions.has(login)) {
+    let ok = false;
+    try {
+      const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: login });
+      ok = WRITE.has(data.role_name || data.permission);
+    } catch (e) {
+      if (e.status !== 404) throw e;
+    }
+    permissions.set(login, ok);
+  }
+  return permissions.get(login);
+}
 
 /** Any bot: never a source of commands. */
 function isBot(comment) {
@@ -178,7 +198,7 @@ async function setLabel(github, owner, repo, issue_number, on) {
 async function answer({ github, owner, repo, issue, comment, now }) {
   const cmd = parseCommand(comment.body);
   let result;
-  if (!TRUSTED.has(comment.author_association)) {
+  if (!(await canWrite(github, owner, repo, comment.user && comment.user.login, comment.author_association))) {
     result = { ok: false, state: null, message: 'Refused: claims are for people with write access to the repository.' };
   } else if (cmd.error) {
     result = { ok: false, state: null, message: cmd.error };
@@ -254,7 +274,9 @@ async function noteOnce(github, owner, repo, number, key, text) {
 async function claimForPull({ github, owner, repo, pr, now }) {
   const refs = parseRefs(pr.title, pr.body);
   if (!refs.length) return [];
-  if (!TRUSTED.has(pr.author_association)) return refs.map((n) => `#${n} author without write access`);
+  if (!(await canWrite(github, owner, repo, pr.user && pr.user.login, pr.author_association))) {
+    return refs.map((n) => `#${n} author without write access`);
+  }
   const agent = parseAgent(pr.body) || (AGENT.test(pr.head.ref) ? pr.head.ref : null);
   if (!agent) {
     await noteOnce(github, owner, repo, pr.number, 'no-agent',
