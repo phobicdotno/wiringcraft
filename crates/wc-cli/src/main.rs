@@ -93,6 +93,9 @@ enum Cmd {
         #[arg(long = "type")]
         kind: Option<String>,
     },
+    /// Jumpers (bridges) between terminals of one strip: jumpered terminals are one potential.
+    #[command(subcommand)]
+    Jumper(JumperCmd),
     /// Set a device's part and description.
     Device {
         tag: String,
@@ -252,6 +255,22 @@ enum PanelCmd {
     Remove {
         id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum JumperCmd {
+    /// Jumper terminals of a strip, e.g. `jumper add -- -X1 3 4 5`. A jumper that shares a
+    /// terminal with them becomes one with them.
+    Add {
+        /// The strip, e.g. `-X1` (after `--`, as it starts with `-`).
+        strip: String,
+        /// Terminal numbers, at least two.
+        terminals: Vec<String>,
+    },
+    /// Take terminals out of their jumper, e.g. `jumper remove -- -X1 4`.
+    Remove { strip: String, terminals: Vec<String> },
+    /// List the project's jumpers.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -775,6 +794,32 @@ fn run(cli: Cli) -> Res<()> {
             save(dir, &p)?;
             println!("{id}");
         }
+        Cmd::Jumper(jc) => {
+            let mut p = load(dir)?;
+            match jc {
+                JumperCmd::Add { strip, terminals } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    p.meta.add_jumper(&strip, &terminals)?;
+                    save(dir, &p)?;
+                }
+                JumperCmd::Remove { strip, terminals } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    let mut changed = false;
+                    for t in &terminals {
+                        changed |= p.meta.remove_from_jumper(&strip, t.trim());
+                    }
+                    if !changed {
+                        return Err(format!("no jumper of {strip} has terminal {}", terminals.join(", ")));
+                    }
+                    save(dir, &p)?;
+                }
+                JumperCmd::List => {
+                    for j in &p.meta.jumpers {
+                        println!("{} {}", j.strip, j.terminals.join(" "));
+                    }
+                }
+            }
+        }
         Cmd::Device { tag, part, description } => {
             let mut p = load(dir)?;
             let t = DeviceTag::parse(&tag).map_err(e)?;
@@ -883,11 +928,7 @@ fn run(cli: Cli) -> Res<()> {
                 &mut p,
                 rule,
                 overwrite,
-                |id| {
-                    symbols
-                        .get(id)
-                        .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
-                },
+                |id| symbols.get(id).map(|s| s.role),
                 |page, end| match end {
                     wc_core::Endpoint::Point { at } => Some(*at),
                     wc_core::Endpoint::Pin { item, pin } => {
@@ -1010,11 +1051,7 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Nets => {
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
-            let linked = wc_core::connectivity::nets_linked(&p, |id| {
-                symbols
-                    .get(id)
-                    .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
-            });
+            let linked = wc_core::connectivity::nets_linked(&p, |id| symbols.get(id).map(|s| s.role));
             for (i, n) in linked.iter().enumerate() {
                 let pins: Vec<String> = n
                     .pins
@@ -2143,6 +2180,35 @@ fn file_stem(number: &str, id: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn cli(dir: &Path, args: &[&str]) -> Res<()> {
+        let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
+        all.extend_from_slice(args);
+        run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn jumpers_are_added_listed_and_removed_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let saved = load(&dir).unwrap().meta.jumpers;
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            (&saved[0].strip, saved[0].terminals.as_slice()),
+            (&x1, ["3", "4"].map(String::from).as_slice())
+        );
+        cli(&dir, &["jumper", "list"]).unwrap();
+        cli(&dir, &["jumper", "add", "--", "-X1", "4", "5"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["3", "4", "5"]);
+        cli(&dir, &["jumper", "remove", "--", "-X1", "4"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["3", "5"]);
+        let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
+        assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
+        assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
 
     #[test]
     fn bmecat_parts_land_in_the_library_also_from_latin1_files() {

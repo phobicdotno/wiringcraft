@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::geom::{Point, Rotation, Shape};
 use crate::route::Route;
+use crate::symbol::SymbolRole;
 use crate::tag::DeviceTag;
 
 /// A library source as listed in `project.toml`. Earlier entries win when ids collide.
@@ -36,6 +37,114 @@ pub struct ProjectMeta {
     /// location through the `+` part of its tag, so `+L1.L3-K1` is in the location `L1.L3`.
     #[serde(default, rename = "location", skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
+    /// Jumpers (bridges) between terminals of one strip; jumpered terminals are one potential.
+    #[serde(default, rename = "jumper", skip_serializing_if = "Vec::is_empty")]
+    pub jumpers: Vec<Jumper>,
+}
+
+/// Terminals of one strip bridged together by a jumper: they form one potential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Jumper {
+    /// The strip, e.g. `-X1`.
+    pub strip: DeviceTag,
+    /// Terminal numbers on the strip, in strip order, e.g. `["3", "4", "5"]`. At least two.
+    pub terminals: Vec<String>,
+}
+
+/// The next automatic terminal number after `last`, which it advances; `None` past the largest.
+pub fn next_number(last: &mut u64) -> Option<String> {
+    *last = last.checked_add(1)?;
+    Some(last.to_string())
+}
+
+/// Which terminal of which strip each placed terminal is, keyed by (page id, symbol id).
+pub type TerminalNumbers = BTreeMap<(String, String), (DeviceTag, String)>;
+
+/// The strip and number of every terminal placed on a schematic page: a tag `-X1.3` is
+/// terminal 3 of `-X1`; terminals tagged with only their strip (`-X1`) are numbered after the
+/// highest number of that strip, in drawing order (page, then left to right). This is the
+/// numbering the terminal plan shows and jumpers refer to. `role(symbol id)` tells terminals
+/// apart; when it is not known, a tag with a terminal level (`-X1.3`) is taken as one.
+pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> TerminalNumbers {
+    struct Placed {
+        key: (String, String),
+        number: Option<String>,
+        page: usize,
+        x: f64,
+    }
+    let mut strips: BTreeMap<DeviceTag, Vec<Placed>> = BTreeMap::new();
+    for (pi, page) in project.pages.iter().enumerate().filter(|(_, p)| !p.overview) {
+        for s in &page.symbols {
+            let Some(tag) = &s.tag else { continue };
+            let terminal = match role(&s.symbol) {
+                Some(r) => r == SymbolRole::Terminal,
+                None => tag.product.len() > 1,
+            };
+            if !terminal || tag.product.is_empty() {
+                continue;
+            }
+            let mut strip = tag.clone();
+            let number = if tag.product.len() > 1 {
+                strip.product.pop()
+            } else {
+                None
+            };
+            strips.entry(strip).or_default().push(Placed {
+                key: (page.id.clone(), s.id.clone()),
+                number,
+                page: pi,
+                x: s.at.x,
+            });
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (strip, mut list) in strips {
+        list.sort_by(|a, b| match (&a.number, &b.number) {
+            (Some(x), Some(y)) => natural_key(x).cmp(&natural_key(y)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.page.cmp(&b.page).then(a.x.total_cmp(&b.x)),
+        });
+        let mut next = list
+            .iter()
+            .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        for t in list {
+            // A strip already at the largest number leaves the rest unnumbered.
+            let number = match t.number {
+                Some(n) => n,
+                None => match next_number(&mut next) {
+                    Some(n) => n,
+                    None => continue,
+                },
+            };
+            out.insert(t.key, (strip.clone(), number));
+        }
+    }
+    out
+}
+
+impl Jumper {
+    /// Whether the placed symbol `item` on `page` is one of this jumper's terminals: by its
+    /// number in `numbers` on a schematic page, by its tag elsewhere (an overview draws
+    /// terminals again).
+    pub fn has(&self, numbers: &TerminalNumbers, page: &Page, item: &PlacedSymbol, terminal_role: bool) -> bool {
+        match numbers.get(&(page.id.clone(), item.id.clone())) {
+            Some((strip, n)) => *strip == self.strip && self.terminals.contains(n),
+            None => terminal_role && item.tag.as_ref().is_some_and(|t| self.terminal_of(t).is_some()),
+        }
+    }
+
+    /// The terminal number when `tag` is a terminal of this jumper (`-X1.4` on strip `-X1`).
+    pub fn terminal_of<'a>(&self, tag: &'a DeviceTag) -> Option<&'a str> {
+        let (last, rest) = tag.product.split_last()?;
+        (tag.function == self.strip.function
+            && tag.location == self.strip.location
+            && rest == self.strip.product.as_slice()
+            && self.terminals.contains(last))
+        .then_some(last.as_str())
+    }
 }
 
 /// The project fields the editor offers by key and label, in the order the project properties
@@ -113,7 +222,76 @@ impl ProjectMeta {
             title_block: BTreeMap::new(),
             libraries: Vec::new(),
             locations: Vec::new(),
+            jumpers: Vec::new(),
         }
+    }
+
+    /// Jumper `terminals` of `strip` together. Jumpers of the strip that share a terminal with
+    /// them become one. Refused when fewer than two different terminals result, or when a
+    /// terminal cannot be the last level of a tag of the strip (`1.2` would be two levels).
+    pub fn add_jumper(&mut self, strip: &DeviceTag, terminals: &[String]) -> Result<(), String> {
+        let mut set: Vec<String> = Vec::new();
+        for t in terminals.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            let mut tag = strip.clone();
+            tag.product.push(t.to_owned());
+            if DeviceTag::parse(&tag.to_string()).ok().as_ref() != Some(&tag) {
+                return Err(format!(
+                    "{t:?} cannot be a terminal of {strip}: a terminal is one tag level"
+                ));
+            }
+            if !set.iter().any(|s| s == t) {
+                set.push(t.to_owned());
+            }
+        }
+        if set.len() < 2 {
+            return Err("a jumper needs at least two different terminals of the strip".into());
+        }
+        // Take in every jumper of this strip that shares a terminal.
+        let mut kept = Vec::new();
+        for j in std::mem::take(&mut self.jumpers) {
+            if &j.strip == strip && j.terminals.iter().any(|t| set.contains(t)) {
+                for t in j.terminals {
+                    if !set.contains(&t) {
+                        set.push(t);
+                    }
+                }
+            } else {
+                kept.push(j);
+            }
+        }
+        // Equal natural keys (`1`, `01`) fall back to the text, so the order never depends on
+        // the order given.
+        set.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
+        kept.push(Jumper {
+            strip: strip.clone(),
+            terminals: set,
+        });
+        kept.sort_by(|a, b| {
+            a.strip.to_string().cmp(&b.strip.to_string()).then_with(|| {
+                let first = |j: &Jumper| j.terminals.first().map(|t| (natural_key(t), t.clone()));
+                first(a).cmp(&first(b))
+            })
+        });
+        self.jumpers = kept;
+        Ok(())
+    }
+
+    /// Take `terminal` of `strip` out of its jumper; a jumper left with one terminal goes.
+    /// Returns whether anything changed.
+    pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        let mut changed = false;
+        for j in self.jumpers.iter_mut().filter(|j| &j.strip == strip) {
+            let before = j.terminals.len();
+            j.terminals.retain(|t| t != terminal);
+            changed |= j.terminals.len() != before;
+        }
+        self.jumpers.retain(|j| j.terminals.len() >= 2);
+        changed
+    }
+
+    /// The jumper a terminal (`-X1.4`) is in, if any.
+    pub fn jumper_of(&self, terminal: &DeviceTag) -> Option<&Jumper> {
+        self.jumpers.iter().find(|j| j.terminal_of(terminal).is_some())
     }
 }
 
@@ -574,6 +752,36 @@ mod tests {
     }
 
     #[test]
+    fn jumpers_merge_split_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let x2 = DeviceTag::parse("-X2")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        assert!(m.add_jumper(&x1, &s(&["3", "3"])).is_err(), "one terminal is no jumper");
+        m.add_jumper(&x1, &s(&["10", "9"]))?;
+        m.add_jumper(&x1, &s(&["2", "3"]))?;
+        m.add_jumper(&x2, &s(&["1", "2"]))?;
+        assert_eq!(m.jumpers.len(), 3);
+        // Sharing terminal 3 with one and 9 with the other joins all three of X1's.
+        m.add_jumper(&x1, &s(&["3", "9"]))?;
+        assert_eq!(m.jumpers.len(), 2);
+        assert_eq!(m.jumpers[0].terminals, s(&["2", "3", "9", "10"]), "natural order");
+        assert_eq!(m.jumper_of(&DeviceTag::parse("-X1.9")?).map(|j| &j.strip), Some(&x1));
+        assert!(m.jumper_of(&DeviceTag::parse("-X1.4")?).is_none());
+        assert!(m.jumper_of(&DeviceTag::parse("+A-X1.9")?).is_none(), "another location");
+        let text = toml::to_string(&m)?;
+        assert!(text.contains("[[jumper]]"), "{text}");
+        assert_eq!(toml::from_str::<ProjectMeta>(&text)?.jumpers, m.jumpers);
+        // Taking terminals out: a jumper left with one terminal goes.
+        assert!(m.remove_from_jumper(&x2, "1"));
+        assert_eq!(m.jumpers.len(), 1);
+        assert!(!m.remove_from_jumper(&x2, "1"));
+        let plain = toml::to_string(&ProjectMeta::new("t"))?;
+        assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
     fn a_wire_keeps_its_section_colour_and_type_and_older_files_load() -> Result<(), serde_json::Error> {
         let old = r#"{"id":"w1","from":{"item":"s1","pin":"1"},"to":{"at":{"x":1.0,"y":2.0}}}"#;
         let w: Wire = serde_json::from_str(old)?;
@@ -624,6 +832,24 @@ mod tests {
                 at: Point::new(1.0, 2.0)
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn jumper_terminals_are_one_tag_level_and_keep_a_fixed_order() -> Result<(), String> {
+        let x1 = DeviceTag::parse("-X1").map_err(|e| e.to_string())?;
+        let mut m = ProjectMeta::new("t");
+        let refused = m.add_jumper(&x1, &["1.2".into(), "3.4".into()]);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("one tag level")),
+            "{refused:?}"
+        );
+        assert!(m.jumpers.is_empty(), "nothing saved");
+        m.add_jumper(&x1, &["1".into(), "01".into()])?;
+        let once = m.clone();
+        m.add_jumper(&x1, &["01".into(), "1".into()])?;
+        assert_eq!(m, once, "the same terminals in another order change nothing");
+        assert_eq!(m.jumpers[0].terminals, ["01", "1"]);
         Ok(())
     }
 }

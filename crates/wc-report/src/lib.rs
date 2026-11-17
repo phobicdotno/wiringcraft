@@ -283,9 +283,7 @@ fn pin_label(p: &Project, page_id: &str, item: &str, pin: &str) -> String {
 
 /// The net each pin belongs to, with its potential name (or a generated one).
 fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
-    let nets = connectivity::nets_linked(i.project, |id| {
-        i.symbols.get(id).is_some_and(|s| s.role == SymbolRole::Interruption)
-    });
+    let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
     let mut by_pin = BTreeMap::new();
     for (n, net) in nets.iter().enumerate() {
         let name = net.names.first().cloned().unwrap_or_else(|| format!("N{}", n + 1));
@@ -449,9 +447,19 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             "Lower (pin 2)",
             "Potential",
             "Page",
+            "Jumpered with",
         ],
     );
-    let (nets, net_of) = net_names(i);
+    // The potential column sees jumpers; the Upper and Lower columns show what is wired to that
+    // side of this terminal itself, so they come from the nets without jumpers.
+    let (_, net_of) = net_names(i);
+    let mut unjumpered = i.project.clone();
+    unjumpered.meta.jumpers.clear();
+    let (nets, _) = net_names(&Inputs {
+        project: &unjumpered,
+        symbols: i.symbols,
+        parts: i.parts,
+    });
     // Pins connected to a pin, excluding the pin itself.
     let others = |pin: &PinRef| -> Vec<String> {
         nets.iter()
@@ -476,8 +484,12 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
         item: String,
         pins: Vec<String>,
         x: f64,
+        /// The other terminals of its jumper, e.g. `3, 5`.
+        jumpered: String,
     }
     let mut terms: Vec<Term> = Vec::new();
+    // The numbers jumpers refer to: a terminal tagged with only its strip gets the next one.
+    let numbers = wc_core::project::terminal_numbers(i.project, |id| i.symbols.get(id).map(|s| s.role));
     // An overview (line diagram) draws terminals again; the plan lists each one once.
     for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for s in &page.symbols {
@@ -494,9 +506,30 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 Some(tag) => (tag.to_string(), None),
                 None => ("(untagged)".to_owned(), None),
             };
+            let assigned = numbers.get(&(page.id.clone(), s.id.clone()));
+            let number = assigned.map(|(_, n)| n.clone()).or(number);
+            let jumpered = assigned
+                .and_then(|(strip, n)| {
+                    let j = i
+                        .project
+                        .meta
+                        .jumpers
+                        .iter()
+                        .find(|j| j.strip == *strip && j.terminals.contains(n))?;
+                    Some(
+                        j.terminals
+                            .iter()
+                            .filter(|t| *t != n)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                })
+                .unwrap_or_default();
             terms.push(Term {
                 strip,
                 number,
+                jumpered,
                 page: page.number.clone(),
                 page_id: page.id.clone(),
                 item: s.id.clone(),
@@ -530,10 +563,11 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             .max()
             .unwrap_or(0);
         for term in list {
-            let number = term.number.clone().unwrap_or_else(|| {
-                next += 1;
-                next.to_string()
-            });
+            let number = term
+                .number
+                .clone()
+                .or_else(|| wc_core::project::next_number(&mut next))
+                .unwrap_or_default();
             let side = |n: usize| -> (String, Option<String>) {
                 let Some(pin) = term.pins.get(n) else {
                     return (String::new(), None);
@@ -550,6 +584,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 lower,
                 pa.or(pb).unwrap_or_default(),
                 term.page.clone(),
+                term.jumpered.clone(),
             ]);
         }
     }

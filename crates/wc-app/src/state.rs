@@ -589,11 +589,7 @@ impl Open {
             &mut project,
             rule,
             false,
-            |id| {
-                symbols
-                    .get(id)
-                    .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
-            },
+            |id| symbols.get(id).map(|s| s.role),
             |page, end| match end {
                 wc_core::Endpoint::Point { at } => Some(*at),
                 wc_core::Endpoint::Pin { item, pin } => {
@@ -848,6 +844,36 @@ impl Open {
         {
             w.cable = cable;
         }
+    }
+
+    /// Jumper terminals of a strip together, as one undo step. See [`ProjectMeta::add_jumper`].
+    pub fn add_jumper(&mut self, strip: &DeviceTag, terminals: &[String]) -> Result<(), String> {
+        let mut meta = self.project.meta.clone();
+        meta.add_jumper(strip, terminals)?;
+        if meta != self.project.meta {
+            self.checkpoint();
+            self.project.meta = meta;
+        }
+        Ok(())
+    }
+
+    /// Whether jumpering `terminals` of `strip` is worth offering: `Ok(true)` when it changes the
+    /// jumpers, `Ok(false)` when they are already jumpered together, the reason when refused.
+    pub fn jumper_offer(&self, strip: &DeviceTag, terminals: &[String]) -> Result<bool, String> {
+        let mut after = self.project.meta.clone();
+        after.add_jumper(strip, terminals)?;
+        Ok(after != self.project.meta)
+    }
+
+    /// Take a terminal of a strip out of its jumper, as one undo step. Returns whether it was in one.
+    pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        let mut meta = self.project.meta.clone();
+        if !meta.remove_from_jumper(strip, terminal) {
+            return false;
+        }
+        self.checkpoint();
+        self.project.meta = meta;
+        true
     }
 
     /// Set one part of the spec (section, colour or type) on wires of a page; `None` clears it.
@@ -1445,6 +1471,40 @@ pub(crate) mod tests {
             o.project.pages[page].wires[0].cable.as_ref().map(|c| c.core.as_str()),
             Some("BN")
         );
+    }
+
+    #[test]
+    fn jumpers_are_added_and_removed_in_one_undo_step_each() {
+        let (_tmp, mut o) = project();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mark = o.undo_mark();
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        assert_eq!(o.undo_mark(), mark + 1);
+        o.add_jumper(&x1, &["2".into(), "1".into()]).unwrap();
+        assert_eq!(o.undo_mark(), mark + 1, "the same jumper again is no change");
+        assert!(o.add_jumper(&x1, &["1".into()]).is_err());
+        o.save().unwrap();
+        assert_eq!(Open::load(&o.dir).unwrap().project.meta.jumpers.len(), 1);
+        assert!(o.remove_from_jumper(&x1, "1"));
+        assert!(o.project.meta.jumpers.is_empty());
+        assert!(!o.remove_from_jumper(&x1, "1"));
+        assert!(o.undo());
+        assert_eq!(o.project.meta.jumpers.len(), 1);
+    }
+
+    #[test]
+    fn the_jumper_button_is_offered_only_when_it_changes_something() {
+        let (_tmp, mut o) = project();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let v = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            o.jumper_offer(&x1, &v(&["1", "1"])).is_err(),
+            "two placements of one terminal"
+        );
+        assert_eq!(o.jumper_offer(&x1, &v(&["1", "2"])), Ok(true));
+        o.add_jumper(&x1, &v(&["1", "2"])).unwrap();
+        assert_eq!(o.jumper_offer(&x1, &v(&["1", "2"])), Ok(false), "already jumpered");
+        assert_eq!(o.jumper_offer(&x1, &v(&["2", "3"])), Ok(true));
     }
 
     #[test]

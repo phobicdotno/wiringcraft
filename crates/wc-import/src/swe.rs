@@ -1848,20 +1848,12 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     }
 
     // Each wire record names its two terminals; they must be connected on the drawing too.
-    let interruptions: BTreeSet<&str> = built
-        .symbols
-        .iter()
-        .filter(|s| s.role == SymbolRole::Interruption)
-        .map(|s| s.id.as_str())
-        .collect();
+    let roles: BTreeMap<&str, SymbolRole> = built.symbols.iter().map(|s| (s.id.as_str(), s.role)).collect();
     let mut probe = wc_core::Project::new("");
     // Schematic pages only: a line diagram's potential names could join nets no schematic joins.
     probe.pages = built.pages.iter().filter(|pg| !pg.overview).cloned().collect();
     let mut net_of: BTreeMap<PinRef, usize> = BTreeMap::new();
-    for (n, net) in nets_linked(&probe, |id| interruptions.contains(id))
-        .into_iter()
-        .enumerate()
-    {
+    for (n, net) in nets_linked(&probe, |id| roles.get(id).copied()).into_iter().enumerate() {
         for pin in net.pins {
             net_of.insert(pin, n);
         }

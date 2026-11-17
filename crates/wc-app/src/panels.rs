@@ -128,6 +128,70 @@ fn spec_rows(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[String], ps
     }
 }
 
+/// Jumper controls for selected terminal symbols: several terminals of one strip can be jumpered
+/// together; a jumpered terminal shows what it is jumpered with and can leave its jumper.
+fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[String]) {
+    let Some(p) = open.project.pages.get(page) else {
+        return;
+    };
+    let mut terms: Vec<(DeviceTag, String, DeviceTag)> = Vec::new();
+    for id in ids {
+        let Some(s) = p.symbol(id) else { return };
+        let is_terminal = open
+            .symbols
+            .get(&s.symbol)
+            .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal);
+        let Some(tag) = s.tag.clone().filter(|t| is_terminal && t.product.len() > 1) else {
+            return;
+        };
+        let mut strip = tag.clone();
+        let Some(n) = strip.product.pop() else { return };
+        terms.push((strip, n, tag));
+    }
+    let Some((strip, number, tag)) = terms.first().cloned() else {
+        return;
+    };
+    if terms.iter().any(|(s, _, _)| *s != strip) {
+        return;
+    }
+    if terms.len() == 1 {
+        let others = open.project.meta.jumper_of(&tag).map(|j| {
+            j.terminals
+                .iter()
+                .filter(|t| **t != number)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        if let Some(others) = others {
+            ui.horizontal(|ui| {
+                ui.label(format!("Jumpered with {others}"));
+                if ui.button("Remove from jumper").clicked() {
+                    open.remove_from_jumper(&strip, &number);
+                }
+            });
+        }
+    } else {
+        let numbers: Vec<String> = terms.into_iter().map(|(_, n, _)| n).collect();
+        // Only offered when it changes something; when it cannot be done, say why.
+        match open.jumper_offer(&strip, &numbers) {
+            Ok(true) => {
+                if ui
+                    .button(format!("Jumper these {} terminals of {strip}", numbers.len()))
+                    .clicked()
+                    && let Err(why) = open.add_jumper(&strip, &numbers)
+                {
+                    ui.label(why);
+                }
+            }
+            Ok(false) => {}
+            Err(why) => {
+                ui.weak(format!("No jumper: {why}"));
+            }
+        }
+    }
+}
+
 /// A panel section title: small capitals in the muted colour, with an optional count on the
 /// right.
 pub fn section(ui: &mut egui::Ui, title: &str, count: Option<usize>) {
@@ -482,6 +546,14 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                 _ => None,
             })
             .collect();
+        let symbols: Vec<String> = ed
+            .selection
+            .iter()
+            .filter_map(|s| match s {
+                Selection::Symbol(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
         if wires.len() == n {
             // Only wires: their section, colour and type can be set together.
             ui.label(format!("{n} wires selected"));
@@ -492,6 +564,9 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
             ui.label(RichText::new("A value typed here is set on all of them.").color(t.faint));
         } else {
             ui.label(format!("{n} items selected"));
+        }
+        if symbols.len() == n {
+            jumper_controls(ui, open, page_idx, &symbols);
         }
         ui.label(RichText::new("Move, rotate, mirror, copy or delete them together.").color(t.faint));
         return;
@@ -515,6 +590,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                 .get(&placed.symbol)
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| "missing symbol".into());
+            jumper_controls(ui, open, page_idx, std::slice::from_ref(&id));
             egui::Grid::new("sym-props")
                 .num_columns(2)
                 .spacing([8.0, 6.0])
