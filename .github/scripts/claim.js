@@ -58,8 +58,18 @@ function marker(data) {
   return `<!-- ${MARK} ${JSON.stringify(data)} -->`;
 }
 
+const CLAIM_BOT = 'github-actions[bot]';
+// Who may use the commands and whose pull requests claim: people with write access.
+const TRUSTED = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+
+/** Any bot: never a source of commands. */
 function isBot(comment) {
   return Boolean(comment && comment.user && comment.user.type === 'Bot');
+}
+
+/** Only the claim bot's own comments carry claim state; other bots could be asked to post a marker. */
+function isClaimBot(comment) {
+  return Boolean(comment && comment.user && comment.user.type === 'Bot' && comment.user.login === CLAIM_BOT);
 }
 
 function readMarker(body) {
@@ -75,7 +85,7 @@ function readMarker(body) {
 /** The claim state from an issue's comments (oldest first): `{ agent, until, pr }`. */
 function readState(comments) {
   for (let i = comments.length - 1; i >= 0; i--) {
-    if (!isBot(comments[i])) continue;
+    if (!isClaimBot(comments[i])) continue;
     const data = readMarker(comments[i].body);
     if (data && 'agent' in data) {
       return { agent: data.agent || null, until: data.until || null, pr: data.pr || null, commentId: comments[i].id, kind: data.kind || null };
@@ -168,7 +178,9 @@ async function setLabel(github, owner, repo, issue_number, on) {
 async function answer({ github, owner, repo, issue, comment, now }) {
   const cmd = parseCommand(comment.body);
   let result;
-  if (cmd.error) {
+  if (!TRUSTED.has(comment.author_association)) {
+    result = { ok: false, state: null, message: 'Refused: claims are for people with write access to the repository.' };
+  } else if (cmd.error) {
     result = { ok: false, state: null, message: cmd.error };
   } else if (issue.state === 'closed' && cmd.verb !== 'unclaim') {
     result = { ok: false, state: null, message: 'Refused: the issue is closed.' };
@@ -176,8 +188,9 @@ async function answer({ github, owner, repo, issue, comment, now }) {
     const state = readState(await comments(github, owner, repo, issue.number));
     result = decide(cmd, state, now);
   }
+  // Only a granted command records state: a refusal must not copy (and so shadow) the state it saw.
   const data = { reply_to: comment.id, ok: result.ok };
-  if (result.state) Object.assign(data, result.state);
+  if (result.ok && result.state) Object.assign(data, result.state);
   await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: `${result.message}\n\n${marker(data)}` });
   if (result.ok && result.state) await setLabel(github, owner, repo, issue.number, Boolean(result.state.agent));
   return `#${issue.number}: ${result.message}`;
@@ -197,7 +210,7 @@ async function backlog({ github, context, now = Date.now() }) {
   const all = await github.paginate(github.rest.issues.listCommentsForRepo, { owner, repo, since, sort: 'created', direction: 'asc', per_page: 100 });
   const answered = new Set();
   for (const c of all) {
-    const data = isBot(c) ? readMarker(c.body) : null;
+    const data = isClaimBot(c) ? readMarker(c.body) : null;
     if (data && data.reply_to) answered.add(data.reply_to);
   }
   const commands = all
@@ -229,7 +242,7 @@ async function handleComment({ github, context, now = Date.now() }) {
 /** Post a note on a pull request once: skipped when a bot note with the same key is there. */
 async function noteOnce(github, owner, repo, number, key, text) {
   const tag = `<!-- ${MARK}-note ${key} -->`;
-  if ((await comments(github, owner, repo, number)).some((c) => isBot(c) && String(c.body).includes(tag))) return;
+  if ((await comments(github, owner, repo, number)).some((c) => isClaimBot(c) && String(c.body).includes(tag))) return;
   await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `${text}\n\n${tag}` });
 }
 
@@ -241,6 +254,7 @@ async function noteOnce(github, owner, repo, number, key, text) {
 async function claimForPull({ github, owner, repo, pr, now }) {
   const refs = parseRefs(pr.title, pr.body);
   if (!refs.length) return [];
+  if (!TRUSTED.has(pr.author_association)) return refs.map((n) => `#${n} author without write access`);
   const agent = parseAgent(pr.body) || (AGENT.test(pr.head.ref) ? pr.head.ref : null);
   if (!agent) {
     await noteOnce(github, owner, repo, pr.number, 'no-agent',
@@ -267,7 +281,8 @@ async function claimForPull({ github, owner, repo, pr, now }) {
       continue;
     }
     const mine = state.kind === 'pr' && state.agent === agent && state.pr === pr.number && state.commentId;
-    if (mine && Date.parse(state.until) >= until) {
+    // The pull request only ever lengthens the agent's lock: a longer claim it already holds stays.
+    if (state.agent === agent && isActive(state, now) && Date.parse(state.until) >= until) {
       await setLabel(github, owner, repo, n, true);
       out.push(`#${n} held`);
       continue;
@@ -311,6 +326,7 @@ async function sweep({ github, context, now = Date.now() }) {
   const released = [];
   for (const issue of issues) {
     if (issue.pull_request) continue;
+    if (issue.state === 'closed') continue;
     const state = readState(await comments(github, owner, repo, issue.number));
     if (isActive(state, now)) continue;
     if (state.agent) {
@@ -321,6 +337,13 @@ async function sweep({ github, context, now = Date.now() }) {
     }
     await setLabel(github, owner, repo, issue.number, false);
     released.push(`#${issue.number}`);
+  }
+  // A closed issue needs no lock.
+  const closed = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'closed', labels: LABEL, per_page: 100 });
+  for (const issue of closed) {
+    if (issue.pull_request) continue;
+    await setLabel(github, owner, repo, issue.number, false);
+    released.push(`#${issue.number} (closed)`);
   }
   return released;
 }

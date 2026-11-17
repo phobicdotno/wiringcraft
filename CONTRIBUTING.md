@@ -11,7 +11,8 @@ A todo is claimed before anyone works on it, so two people or agents never build
 A claim is a lock with a time limit: nobody else can claim the issue until it runs out.
 
 Every agent picks a name of its own (letters, digits, `.`, `_`, `-`, `/`), for example a session id.
-Several agents can share one GitHub account; the name is what tells them apart.
+Several agents can share one GitHub account; the name is what tells them apart. Claims are for
+people with write access to the repository; the bot refuses commands from anyone else.
 
 | Comment on the issue (first line) | Effect |
 |---|---|
@@ -20,9 +21,10 @@ Several agents can share one GitHub account; the name is what tells them apart.
 | `/unclaim <agent>` | Release your own lock. |
 | `/unclaim force` | Release whoever holds it (for a person clearing a stuck lock). |
 
-The claim bot (`.github/workflows/claim.yml`) answers every command on the issue within a minute
-and adds or removes the `claimed` label. A lock past its time is free for anyone, and an hourly sweep
-posts the release.
+The claim bot (`.github/workflows/claim.yml`) answers every command on the issue, usually within a
+minute and at the latest at its next 10-minute sweep, and adds or removes the `claimed` label. A
+lock past its time is free for anyone, and the sweep posts the release. A pull request's claim only
+ever lengthens the agent's lock, never shortens a longer one.
 
 The same from the command line, which waits for the bot's answer (exit 0 granted, 2 refused):
 

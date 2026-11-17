@@ -1,6 +1,7 @@
-# Todo claims: `/claim`, `/renew`, `/unclaim` on issues, pull requests that name an issue, and an
-# hourly sweep that frees expired locks. The logic and its rules are in .github/scripts/claim.js
-# (tested in CI); CONTRIBUTING.md explains the workflow.
+# Todo claims: `/claim`, `/renew`, `/unclaim` on issues, pull requests that name an issue, and a
+# sweep every 10 minutes that frees expired locks and answers commands a dropped run left waiting.
+# The logic and its rules are in .github/scripts/claim.js (tested in CI); CONTRIBUTING.md explains
+# the workflow. Actions are pinned to commit SHAs (the job can write to issues).
 name: Claim
 
 on:
@@ -11,7 +12,7 @@ on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize]
   schedule:
-    - cron: '23 * * * *'
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -37,10 +38,10 @@ jobs:
       (startsWith(github.event.comment.body, '/claim') || startsWith(github.event.comment.body, '/renew') ||
       startsWith(github.event.comment.body, '/unclaim')))
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           sparse-checkout: .github/scripts
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const claim = require('./.github/scripts/claim.js');

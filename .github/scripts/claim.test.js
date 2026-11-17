@@ -6,8 +6,8 @@ const c = require('./claim.js');
 
 const T0 = Date.parse('2026-11-17T10:00:00Z');
 const H = 3600 * 1000;
-const bot = (id, data) => ({ id, user: { type: 'Bot' }, body: `text\n\n${c.marker(data)}` });
-const human = (id, body, created = T0 - 60000) => ({ id, user: { type: 'User' }, body, created_at: new Date(created).toISOString() });
+const bot = (id, data) => ({ id, user: { type: 'Bot', login: 'github-actions[bot]' }, body: `text\n\n${c.marker(data)}` });
+const human = (id, body, created = T0 - 60000, assoc = 'OWNER') => ({ id, user: { type: 'User' }, author_association: assoc, body, created_at: new Date(created).toISOString() });
 
 test('parseCommand reads verbs, agents and hours', () => {
   assert.deepEqual(c.parseCommand('/claim agent-1'), { verb: 'claim', agent: 'agent-1', hours: 4 });
@@ -102,11 +102,11 @@ function fakeGithub(issues) {
       listCommentsForRepo: () => Object.entries(issues).flatMap(([n, i]) => i.comments.map((cm) => ({
         ...cm, issue_url: `https://api.github.com/repos/o/r/issues/${n}`, html_url: `https://github.com/o/r/${i.pr ? 'pull' : 'issues'}/${n}#c${cm.id}`,
       }))),
-      listForRepo: () => Object.entries(issues).filter(([, i]) => i.labels.includes(c.LABEL)).map(([n, i]) => ({ number: Number(n), ...i })),
+      listForRepo: (p) => Object.entries(issues).filter(([, i]) => i.labels.includes(c.LABEL) && (i.state || 'open') === (p.state || 'open')).map(([n, i]) => ({ number: Number(n), ...i })),
       get: async (p) => ({ data: { number: p.issue_number, state: issues[p.issue_number].state, pull_request: issues[p.issue_number].pr ? {} : undefined } }),
       createComment: async (p) => {
         calls.push(['comment', p.issue_number, p.body]);
-        (issues[p.issue_number] || (issues[p.issue_number] = { comments: [], labels: [], state: 'open' })).comments.push({ id: nextId++, user: { type: 'Bot' }, body: p.body });
+        (issues[p.issue_number] || (issues[p.issue_number] = { comments: [], labels: [], state: 'open' })).comments.push({ id: nextId++, user: { type: 'Bot', login: 'github-actions[bot]' }, body: p.body });
       },
       updateComment: async (p) => {
         calls.push(['update', p.comment_id, p.body]);
@@ -155,17 +155,17 @@ test('backlog answers commands whose own run was dropped, oldest first, each onc
 test('handlePull refuses a branch name that is not an agent name', async () => {
   const issues = { 5: { comments: [], labels: [], state: 'open' }, 9: { comments: [], labels: [], state: 'open', pr: true } };
   const { github } = fakeGithub(issues);
-  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: '', head: { ref: '_worker' } };
+  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: '', author_association: 'OWNER', head: { ref: '_worker' } };
   assert.deepEqual(await c.handlePull({ github, context: { repo, payload: { pull_request: pr } }, now: T0 }), ['#5 no agent']);
   assert.equal(c.readState(issues[5].comments).agent, null);
   assert.match(issues[9].comments[0].body, /Agent: <name>/);
 });
 
 test('a push never overwrites a command reply, and re-adds a missing label', async () => {
-  const reply = { id: 1, user: { type: 'Bot' }, body: c.marker({ reply_to: 77, ok: true, agent: 'a', until: new Date(T0 + H).toISOString(), pr: 9 }) };
+  const reply = { id: 1, user: { type: 'Bot', login: 'github-actions[bot]' }, body: c.marker({ reply_to: 77, ok: true, agent: 'a', until: new Date(T0 + H).toISOString(), pr: 9 }) };
   const issues = { 5: { comments: [reply], labels: [], state: 'open' }, 9: { comments: [], labels: [], state: 'open', pr: true } };
   const { github, calls } = fakeGithub(issues);
-  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: a', head: { ref: 'x' } };
+  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: a', author_association: 'OWNER', head: { ref: 'x' } };
   assert.deepEqual(await c.handlePull({ github, context: { repo, payload: { pull_request: pr } }, now: T0 }), ['#5 claimed']);
   assert.equal(c.readMarker(issues[5].comments[0].body).reply_to, 77);
   assert.equal(calls.filter((x) => x[0] === 'update').length, 0);
@@ -178,7 +178,7 @@ test('a push never overwrites a command reply, and re-adds a missing label', asy
 test('handlePull claims for the Agent line and a push extends the same comment', async () => {
   const issues = { 5: { comments: [], labels: [], state: 'open' }, 9: { comments: [], labels: [], state: 'open' } };
   const { github, calls } = fakeGithub(issues);
-  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: a', head: { ref: 'x/y' } };
+  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: a', author_association: 'OWNER', head: { ref: 'x/y' } };
   assert.deepEqual(await c.handlePull({ github, context: { repo, payload: { pull_request: pr } }, now: T0 }), ['#5 claimed']);
   assert.deepEqual(await c.handlePull({ github, context: { repo, payload: { pull_request: pr } }, now: T0 + 3 * H }), ['#5 extended']);
   assert.equal(calls.filter((x) => x[0] === 'update').length, 1);
@@ -188,7 +188,7 @@ test('handlePull claims for the Agent line and a push extends the same comment',
 test('handlePull does not take an issue another agent holds', async () => {
   const issues = { 5: { comments: [bot(1, { agent: 'other', until: new Date(T0 + H).toISOString(), pr: null })], labels: ['claimed'], state: 'open' }, 9: { comments: [], labels: [], state: 'open' } };
   const { github } = fakeGithub(issues);
-  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: '', head: { ref: 'mine' } };
+  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: '', author_association: 'OWNER', head: { ref: 'mine' } };
   assert.deepEqual(await c.handlePull({ github, context: { repo, payload: { pull_request: pr } }, now: T0 }), ['#5 held by other']);
   assert.equal(c.readState(issues[5].comments).agent, 'other');
 });
@@ -223,8 +223,8 @@ test('backlog sets a missing label from the claim state without answering again'
 });
 
 test('pulls reconciles every open pull request from its last activity, idempotently', async () => {
-  const prData = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: a', head: { ref: 'x' }, updated_at: new Date(T0 - H).toISOString() };
-  const idle = { number: 10, state: 'open', title: 'Old (#6)', body: 'Agent: b', head: { ref: 'y' }, updated_at: new Date(T0 - 5 * H).toISOString() };
+  const prData = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: a', author_association: 'OWNER', head: { ref: 'x' }, updated_at: new Date(T0 - H).toISOString() };
+  const idle = { number: 10, state: 'open', title: 'Old (#6)', body: 'Agent: b', author_association: 'OWNER', head: { ref: 'y' }, updated_at: new Date(T0 - 5 * H).toISOString() };
   const issues = {
     5: { comments: [], labels: [], state: 'open' }, 6: { comments: [], labels: [], state: 'open' },
     9: { comments: [], labels: [], state: 'open', pr: true, prData }, 10: { comments: [], labels: [], state: 'open', pr: true, prData: idle },
@@ -239,10 +239,59 @@ test('pulls reconciles every open pull request from its last activity, idempoten
 });
 
 test('a note on a pull request is posted once', async () => {
-  const prData = { number: 9, state: 'open', title: 'Thing (#5)', body: '', head: { ref: '_bad' }, updated_at: new Date(T0).toISOString() };
+  const prData = { number: 9, state: 'open', title: 'Thing (#5)', body: '', author_association: 'OWNER', head: { ref: '_bad' }, updated_at: new Date(T0).toISOString() };
   const issues = { 5: { comments: [], labels: [], state: 'open' }, 9: { comments: [], labels: [], state: 'open', pr: true, prData } };
   const { github } = fakeGithub(issues);
   await c.pulls({ github, context: { repo }, now: T0 });
   await c.pulls({ github, context: { repo }, now: T0 + 60000 });
   assert.equal(issues[9].comments.length, 1);
+});
+
+test('commands from people without write access are refused and record nothing', async () => {
+  const issues = { 3: { comments: [human(1, '/claim stranger', T0 - 60000, 'NONE')], labels: [], state: 'open' } };
+  const { github } = fakeGithub(issues);
+  const out = await c.backlog({ github, context: { repo }, now: T0 });
+  assert.match(out[0], /write access/);
+  assert.equal(c.readState(issues[3].comments).agent, null);
+  assert.ok(!issues[3].labels.includes('claimed'));
+});
+
+test('a marker posted by another bot is not claim state', () => {
+  const other = { id: 9, user: { type: 'Bot', login: 'coderabbitai[bot]' }, body: c.marker({ agent: 'forged', until: '2099-01-01T00:00:00Z' }) };
+  assert.equal(c.readState([bot(1, { agent: 'a', until: '2026-11-17T12:00:00Z', pr: null }), other]).agent, 'a');
+});
+
+test('a refused reply carries no state', async () => {
+  const issues = { 3: { comments: [human(1, '/claim a'), human(2, '/claim b')], labels: [], state: 'open' } };
+  const { github } = fakeGithub(issues);
+  await c.backlog({ github, context: { repo }, now: T0 });
+  const refusal = c.readMarker(issues[3].comments.at(-1).body);
+  assert.equal(refusal.ok, false);
+  assert.ok(!('agent' in refusal));
+});
+
+test('a pull request never shortens a longer claim of the same agent', async () => {
+  const prData = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: a', author_association: 'OWNER', head: { ref: 'x' }, updated_at: new Date(T0).toISOString() };
+  const issues = {
+    5: { comments: [bot(1, { agent: 'a', until: new Date(T0 + 20 * H).toISOString(), pr: null })], labels: ['claimed'], state: 'open' },
+    9: { comments: [], labels: [], state: 'open', pr: true, prData },
+  };
+  const { github } = fakeGithub(issues);
+  assert.deepEqual(await c.pulls({ github, context: { repo }, now: T0 }), ['PR #9: #5 held']);
+  assert.equal(Date.parse(c.readState(issues[5].comments).until), T0 + 20 * H);
+});
+
+test('a pull request by someone without write access claims nothing', async () => {
+  const prData = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: z', author_association: 'CONTRIBUTOR', head: { ref: 'x' }, updated_at: new Date(T0).toISOString() };
+  const issues = { 5: { comments: [], labels: [], state: 'open' }, 9: { comments: [], labels: [], state: 'open', pr: true, prData } };
+  const { github } = fakeGithub(issues);
+  assert.deepEqual(await c.pulls({ github, context: { repo }, now: T0 }), ['PR #9: #5 author without write access']);
+  assert.equal(c.readState(issues[5].comments).agent, null);
+});
+
+test('sweep removes the label from closed issues', async () => {
+  const issues = { 7: { comments: [bot(1, { agent: 'a', until: new Date(T0 + H).toISOString(), pr: null })], labels: ['claimed'], state: 'closed' } };
+  const { github } = fakeGithub(issues);
+  assert.deepEqual(await c.sweep({ github, context: { repo }, now: T0 }), ['#7 (closed)']);
+  assert.ok(!issues[7].labels.includes('claimed'));
 });

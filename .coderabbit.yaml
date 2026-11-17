@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# Automatic review of every pull request (CodeRabbit GitHub app). Comment `@coderabbitai review`
-# on a pull request to ask for another pass.
+# Review of pull requests by the CodeRabbit GitHub app. CodeRabbit reviews small public
+# repositories on request only: comment `@coderabbitai review` on a pull request (CONTRIBUTING.md).
 language: en-US
 reviews:
   profile: chill
