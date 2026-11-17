@@ -951,6 +951,12 @@ fn terminal_strips_come_in_with_their_terminals_and_wire_ends_are_checked() {
         "{}",
         ends.note
     );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("terminal strip(s) -X1 have their terminals in another order")),
+        "{warnings:?}"
+    );
     let apart = warnings
         .iter()
         .find(|w| w.contains("not connected on the imported drawing"))
@@ -969,4 +975,41 @@ fn a_terminal_without_a_strip_keeps_its_own_tag() {
     let terms = report.iter().find(|c| c.what == "terminals").unwrap();
     assert_eq!((terms.source, terms.imported), (1, 0));
     assert!(terms.note.starts_with("1 not on a strip"), "{}", terms.note);
+}
+
+#[test]
+fn imported_terminals_show_in_the_terminal_plan_per_strip() {
+    let c = sample_with_strip();
+    // A terminal whose number has a dot, and a wire record with only one end.
+    c.execute_batch(
+        "INSERT INTO tew_component VALUES (203, '3.1', '-X1-3.1', 4, 200, 3);
+         INSERT INTO tew_wire VALUES (84, NULL, -1, '', 60, 0, NULL, NULL);",
+    )
+    .unwrap();
+    let (built, _, report) = build(&read(&c).unwrap(), None);
+    assert!(
+        built.devices.contains_key(&DeviceTag::parse("-X1.3_1").unwrap()),
+        "one level: {:?}",
+        built.devices.keys()
+    );
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(ends.note.contains("1 more name only one terminal"), "{}", ends.note);
+
+    let mut project = wc_core::Project::new("t");
+    project.pages = built.pages.clone();
+    project.devices = built.devices.clone();
+    let symbols: BTreeMap<String, Symbol> = built.symbols.iter().map(|s| (s.id.clone(), s.clone())).collect();
+    let parts = BTreeMap::new();
+    let plan = wc_report::terminal_plan(&wc_report::Inputs {
+        project: &project,
+        symbols: &symbols,
+        parts: &parts,
+    });
+    let rows: Vec<(&str, &str)> = plan.rows.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+    assert_eq!(rows, [("-X1", "1"), ("-X1", "2")], "strip -X1, by number");
+    // X1.1's lower side is wired to K1:A2.
+    assert!(plan.rows[0][3].contains("A2"), "{:?}", plan.rows[0]);
 }

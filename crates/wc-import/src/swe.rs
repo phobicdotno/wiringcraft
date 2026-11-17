@@ -1062,11 +1062,14 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             DeviceTag::parse(&format!("-OD{arrows}")).ok()
         } else if let Some(strip) = strip_of(c) {
             // `-X1` and terminal 3 make `-X1.3`, whatever separator the source's tag path uses.
-            let number = device_tag(&c.name).map(|n| n.product).filter(|n| !n.is_empty());
+            // One level, whatever the number contains: `1.2` must not become a strip `-X1.1`.
+            let number = device_tag(&c.name)
+                .map(|n| n.product.join("_"))
+                .filter(|n| !n.is_empty());
             match (tags.get(&strip.id), number) {
                 (Some(strip_tag), Some(number)) => {
                     let mut t = strip_tag.clone();
-                    t.product.extend(number);
+                    t.product.push(number);
                     strip_terminals += 1;
                     Some(t)
                 }
@@ -1096,20 +1099,30 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             on_strip.entry(s.id).or_default().push(c);
         }
     }
-    let number_key = |name: &str| {
-        let n = name.trim();
-        (n.parse::<u64>().unwrap_or(u64::MAX), n.to_owned())
+    // The terminal plan sorts by the tag's last level with the same natural sort.
+    let number_of = |c: &SweComponent| {
+        tags.get(&c.id)
+            .and_then(|t| t.product.last().cloned())
+            .unwrap_or_default()
     };
-    let strips_out_of_order = on_strip
-        .values()
-        .filter(|list| {
+    let out_of_order: Vec<String> = on_strip
+        .iter()
+        .filter(|(_, list)| {
             let mut by_order: Vec<&SweComponent> = list.to_vec();
             by_order.sort_by_key(|c| (c.order, c.id));
             let mut by_number: Vec<&SweComponent> = list.to_vec();
-            by_number.sort_by_key(|c| (number_key(&c.name), c.id));
+            by_number.sort_by_key(|c| (wc_core::project::natural_key(&number_of(c)), c.id));
             by_order.iter().map(|c| c.id).ne(by_number.iter().map(|c| c.id))
         })
-        .count();
+        .filter_map(|(strip, _)| tags.get(strip).map(ToString::to_string))
+        .collect();
+    let strips_out_of_order = out_of_order.len();
+    if !out_of_order.is_empty() {
+        warnings.push(format!(
+            "terminal strip(s) {} have their terminals in another order in the source than by number; WiringCraft lists them by number",
+            out_of_order.join(", ")
+        ));
+    }
     let mut cable_tags: BTreeMap<i64, DeviceTag> = BTreeMap::new();
     let mut cables_untagged = 0;
     for c in p.cables.values() {
@@ -1503,11 +1516,17 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         }
     }
     let mut wire_ends = 0usize;
+    let mut one_end_named = 0usize;
     let mut ends_agree = 0usize;
     let mut ends_not_drawn = 0usize;
     let mut ends_apart: Vec<String> = Vec::new();
     for w in p.wires.values() {
-        let (Some(a), Some(b)) = (w.from, w.to) else { continue };
+        let (Some(a), Some(b)) = (w.from, w.to) else {
+            if w.from.is_some() || w.to.is_some() {
+                one_end_named += 1;
+            }
+            continue;
+        };
         wire_ends += 1;
         let (Some((pa, la)), Some((pb, lb))) = (drawn_at.get(&a), drawn_at.get(&b)) else {
             ends_not_drawn += 1;
@@ -1728,7 +1747,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             imported: strip_terminals,
             note: note(vec![(
                 loose_terminals,
-                "not on a strip or without a number, kept under their own tag",
+                "not on a strip or without a number (tagged from their own tag path, when it has one)",
             )]),
         },
         Count {
@@ -1741,6 +1760,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     "join terminals that are not connected on the drawing (see the warnings)",
                 ),
                 (ends_not_drawn, "with a terminal that is not drawn on a schematic page"),
+                (one_end_named, "more name only one terminal (not checked)"),
             ]),
         },
         Count {

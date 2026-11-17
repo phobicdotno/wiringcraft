@@ -147,31 +147,7 @@ pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
     }
 }
 
-/// Split into text and number chunks so `X2` sorts before `X10`.
-pub fn natural_key(s: &str) -> Vec<(String, u64)> {
-    let mut out = Vec::new();
-    let (mut text, mut num) = (String::new(), String::new());
-    for c in s.chars() {
-        if c.is_ascii_digit() {
-            num.push(c);
-        } else {
-            if !num.is_empty() {
-                out.push((std::mem::take(&mut text), num.parse().unwrap_or(u64::MAX)));
-                num.clear();
-            }
-            text.push(c);
-        }
-    }
-    out.push((
-        text,
-        if num.is_empty() {
-            0
-        } else {
-            num.parse().unwrap_or(u64::MAX)
-        },
-    ));
-    out
-}
+pub use wc_core::project::natural_key;
 
 /// Every device tag in the project: drawn ones and ones only listed in `devices.json`.
 /// Every real device: tags drawn on pages or listed in the devices file. Interruption points
