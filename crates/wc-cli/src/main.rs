@@ -2155,10 +2155,7 @@ fn swe_symbol_choice(
     }
     let mut wanted: std::collections::BTreeSet<String> = choice.by_block.values().cloned().collect();
     wanted.extend(wc_import::swe::BUILTIN_BY_PINS.iter().map(|(_, id)| (*id).to_owned()));
-    // A library that cannot be opened (a git source not synced yet) only means fewer matches.
-    let lib = wc_library::Library::open(dir, p)
-        .inspect_err(|x| eprintln!("warning: libraries not read, blocks may stay boxes: {x}"))
-        .ok();
+    let lib = readable_libraries(dir, p);
     let mut sources = std::collections::BTreeMap::new();
     for id in wanted {
         // The project's own copy first, used on a page or not.
@@ -2190,6 +2187,22 @@ fn swe_symbol_choice(
         }
     }
     Ok((choice, sources))
+}
+
+/// The project's libraries that can be opened, in their order. A source that cannot be opened (a
+/// git source not synced yet) only means fewer matches, and says so; the others stay usable.
+fn readable_libraries(dir: &Path, p: &Project) -> Option<wc_library::Library> {
+    let mut readable = p.clone();
+    readable.meta.libraries.retain(|source| {
+        let mut one = p.clone();
+        one.meta.libraries = vec![source.clone()];
+        wc_library::Library::open(dir, &one)
+            .inspect_err(|x| eprintln!("warning: library {} not read, blocks may stay boxes: {x}", source.name))
+            .is_ok()
+    });
+    wc_library::Library::open(dir, &readable)
+        .inspect_err(|x| eprintln!("warning: libraries not read, blocks may stay boxes: {x}"))
+        .ok()
 }
 
 /// The project's own copy of symbol `id`: `None` when it has none, the reason when the copy is
@@ -2429,6 +2442,45 @@ mod tests {
         p.meta.libraries.clear();
         let (choice, _) = swe_symbol_choice(&dir, &p, None).unwrap();
         assert_eq!(choice.library["wc.coil"].name, "Pinned coil");
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_opened_leaves_the_others_usable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let folder = |name: &str, location: String| LibrarySource {
+            name: name.into(),
+            kind: "folder".into(),
+            location,
+            reference: None,
+        };
+        p.meta.libraries = vec![
+            LibrarySource {
+                name: "broken".into(),
+                kind: "ftp".into(),
+                location: "x".into(),
+                reference: None,
+            },
+            folder(
+                "starter",
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../library")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ];
+        assert!(
+            wc_library::Library::open(&dir, &p).is_err(),
+            "the source list as a whole fails"
+        );
+        let (choice, sources) = swe_symbol_choice(&dir, &p, None).unwrap();
+        assert!(
+            choice.library.contains_key("wc.coil"),
+            "the readable library is still used"
+        );
+        assert_eq!(sources["wc.coil"], "starter");
     }
 
     #[test]
