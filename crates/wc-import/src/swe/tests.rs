@@ -69,12 +69,23 @@ fn page<'a>(built: &'a Built, n: &str) -> &'a Page {
 }
 
 #[test]
-fn place_scales_then_rotates() {
+fn place_rotates_then_scales() {
+    let near = |p: Point, x: f64, y: f64| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9;
     let p = place(Point::new(10.0, 20.0), 90.0, (1.0, 1.0), Point::new(4.0, 0.0));
-    assert!((p.x - 10.0).abs() < 1e-9 && (p.y - 24.0).abs() < 1e-9);
+    assert!(near(p, 10.0, 24.0), "{p:?}");
     // Mirrored in x, no rotation.
     let p = place(Point::new(10.0, 20.0), 0.0, (-1.0, 1.0), Point::new(4.0, 1.0));
-    assert!((p.x - 6.0).abs() < 1e-9 && (p.y - 21.0).abs() < 1e-9);
+    assert!(near(p, 6.0, 21.0), "{p:?}");
+    // Mirrored in x and turned by 90 degrees: (4, 1) turns to (-1, 4), the mirror makes (1, 4).
+    // Scaling first would give (9, 16).
+    let p = place(Point::new(10.0, 20.0), 90.0, (-1.0, 1.0), Point::new(4.0, 1.0));
+    assert!(near(p, 11.0, 24.0), "{p:?}");
+    // The same at 270 degrees: (4, 1) turns to (1, -4), the mirror makes (-1, -4).
+    let p = place(Point::new(10.0, 20.0), 270.0, (-1.0, 1.0), Point::new(4.0, 1.0));
+    assert!(near(p, 9.0, 16.0), "{p:?}");
+    // A uniform scale of 2 with a turn.
+    let p = place(Point::new(0.0, 0.0), 90.0, (2.0, 2.0), Point::new(1.0, 0.0));
+    assert!(near(p, 0.0, 2.0), "{p:?}");
 }
 
 #[test]

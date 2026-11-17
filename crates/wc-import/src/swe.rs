@@ -11,8 +11,10 @@
 //! connection points where the database puts them.
 //!
 //! Database coordinates are millimetres with y up. A connection point is an offset in its
-//! symbol's own frame: scaled by the symbol's scale (a negative scale mirrors), then rotated by
-//! the symbol's angle, then moved to the symbol's position.
+//! symbol's own frame: rotated by the symbol's angle, then scaled by the symbol's scale along the
+//! page axes (a negative scale mirrors), then moved to the symbol's position. The order matters
+//! for a mirrored symbol turned by 90 or 270 degrees: SolidWorks Electrical mirrors after it
+//! rotates.
 //!
 //! Input is treated as hostile: missing tables or columns are errors; rows that cannot be read,
 //! and everything left out, are counted in the warnings and the report; nothing panics.
@@ -302,12 +304,15 @@ fn texts(conn: &Connection, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, 
     Ok(out)
 }
 
-/// A connection point's page position: offset scaled, rotated by `angle` degrees, moved to `at`.
+/// A connection point's page position: offset rotated by `angle` degrees, then scaled along the
+/// page axes (a negative scale mirrors), then moved to `at`. Mirroring after rotating is what
+/// SolidWorks Electrical does: on test projects every wire line of a mirrored symbol turned by 90
+/// or 270 degrees ends on the point placed this way, and misses it when the scale comes first.
 pub fn place(at: Point, angle: f64, scale: (f64, f64), offset: Point) -> Point {
-    let (x, y) = (offset.x * scale.0, offset.y * scale.1);
     let r = angle.to_radians();
     let (s, c) = r.sin_cos();
-    Point::new(at.x + x * c - y * s, at.y + x * s + y * c)
+    let (x, y) = (offset.x * c - offset.y * s, offset.x * s + offset.y * c);
+    Point::new(at.x + x * scale.0, at.y + y * scale.1)
 }
 
 /// Read the drawable model of one project database.
