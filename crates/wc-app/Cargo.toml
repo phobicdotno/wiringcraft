@@ -31,6 +31,8 @@ arboard.workspace = true
 base64.workspace = true
 # Native open/save dialogs (Windows, macOS, and the desktop portal on Linux).
 rfd = "0.15"
+# rfd reports a picker that could not open only through `log`; the app listens for it.
+log = "0.4"
 # The user's real home and Documents folders (moved by OneDrive, localized on Linux).
 dirs = "6"
 

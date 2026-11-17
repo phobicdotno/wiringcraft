@@ -3743,6 +3743,7 @@ dependencies = [
  "dirs",
  "eframe",
  "image",
+ "log",
  "rfd",
  "serde",
  "serde_json",
