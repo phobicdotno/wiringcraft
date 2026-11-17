@@ -167,6 +167,9 @@ pub struct SweProject {
     pub cables: BTreeMap<i64, SweCable>,
     pub components: BTreeMap<i64, SweComponent>,
     pub locations: Vec<SweLocation>,
+    /// Every wire some source line carries (`tew_linewirepair`), also on lines left out for
+    /// unusable end points: the source draws these wires.
+    pub wires_on_lines: BTreeSet<i64>,
     /// The project's own fields (name, customer, ...), from the archive's project list. Not in
     /// the project database itself, so a bare database import has none.
     pub info: Option<SweProjectInfo>,
@@ -659,6 +662,7 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         .map_err(sql)?;
     for (line, wire) in readable(rows, "line-wire link", &mut warnings) {
         line_wires.entry(line).or_default().push(wire);
+        p.wires_on_lines.insert(wire);
     }
 
     // Connection points by symbol, named after the component terminal they stand for.
@@ -1708,7 +1712,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut jumpers_undrawn = 0usize;
     // Judged on the source, not on what was imported: a wire whose line collapsed to zero length
     // or sits on a page left out is still drawn there, and stays a mismatch.
-    let carried: BTreeSet<i64> = p.lines.iter().flat_map(|l| l.wires.iter().copied()).collect();
+    let carried = &p.wires_on_lines;
     let mut records_undrawn = 0usize;
     let strip_of_element = |el: i64| {
         element_component

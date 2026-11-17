@@ -1389,3 +1389,29 @@ fn a_wire_on_a_zero_length_line_still_counts_as_drawn() {
         .unwrap();
     assert!(apart.contains("wire N9"), "{apart}");
 }
+
+#[test]
+fn a_wire_on_a_line_without_usable_end_points_still_counts_as_drawn() {
+    let c = sample_with_strip();
+    // Its only line has no end point, so the line is left out; the source still draws the wire.
+    c.execute_batch(
+        "INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (93, NULL, -1, 'N8', 61, 1, 50, 1);
+         INSERT INTO tew_line VALUES (13, 10, NULL, 195, 170, 195, NULL);
+         INSERT INTO tew_linewirepair VALUES (13, 93, 1);",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert!(p.wires_on_lines.contains(&93) && !p.lines.iter().any(|l| l.id == 13));
+    let (_, warnings, report) = build(&p, None);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(!ends.note.contains("on no drawn line"), "{}", ends.note);
+    let apart = warnings
+        .iter()
+        .find(|w| w.contains("not connected on the imported drawing"))
+        .unwrap();
+    assert!(apart.contains("wire N8"), "{apart}");
+}
