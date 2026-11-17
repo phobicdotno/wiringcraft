@@ -472,16 +472,20 @@ impl Open {
                 continue;
             }
             // The version the lock names: kept from earlier, or still in the project folder.
-            let known = self.symbol_versions.get(&entry.hash).cloned().or_else(|| {
-                store::read_vendored_symbol(&self.dir, id)
-                    .ok()
-                    .filter(|s| s.hash() == entry.hash)
-            });
-            match known {
-                Some(sym) => wanted.push((id.clone(), sym)),
-                None => {
+            if let Some(sym) = self.symbol_versions.get(&entry.hash) {
+                wanted.push((id.clone(), sym.clone()));
+                continue;
+            }
+            match store::read_vendored_symbol(&self.dir, id) {
+                Ok(sym) if sym.hash() == entry.hash => wanted.push((id.clone(), sym)),
+                Ok(_) => {
                     return Err(format!(
                         "the version of symbol {id} this step names is not known any more"
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "the version of symbol {id} this step names is not known any more, and its file cannot be read: {e}"
                     ));
                 }
             }
@@ -511,6 +515,20 @@ impl Open {
         }
         for (id, want) in wanted {
             if let Some(old) = self.symbols.insert(id, want) {
+                self.symbol_versions.insert(old.hash(), old);
+            }
+        }
+        // A symbol the restored step neither locks nor uses is let go, kept as a version for
+        // Redo: still loaded, it would let the next placement skip pinning it in the lock.
+        let used = self.project.used_symbols();
+        let gone: Vec<String> = self
+            .symbols
+            .keys()
+            .filter(|id| !self.project.lock.symbols.contains_key(*id) && !used.contains(*id))
+            .cloned()
+            .collect();
+        for id in gone {
+            if let Some(old) = self.symbols.remove(&id) {
                 self.symbol_versions.insert(old.hash(), old);
             }
         }
@@ -1488,6 +1506,43 @@ pub(crate) mod tests {
         assert_eq!(o.symbols["wc.coil"], old);
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
         assert!(!o.can_redo(), "no step is left to redo into the broken version");
+    }
+
+    #[test]
+    fn a_symbol_taken_back_by_undo_is_pinned_again_when_it_is_placed() {
+        let (_tmp, mut o) = project();
+        let lib = wc_library::Library::open(&o.dir, &o.project).unwrap();
+        o.take_saved_symbol(&lib, "wc.lamp").unwrap();
+        assert!(o.symbols.contains_key("wc.lamp"));
+        assert!(o.undo());
+        assert!(!o.project.lock.symbols.contains_key("wc.lamp"));
+        assert!(!o.symbols.contains_key("wc.lamp"), "not locked and not used: let go");
+        assert!(o.redo(), "the version is kept for Redo");
+        assert!(o.symbols.contains_key("wc.lamp") && o.project.lock.symbols.contains_key("wc.lamp"));
+        assert!(o.undo());
+        o.place(1, "wc.lamp", Point::new(20.0, 20.0)).unwrap();
+        assert!(
+            o.project.lock.symbols.contains_key("wc.lamp"),
+            "every placed symbol is pinned"
+        );
+    }
+
+    #[test]
+    fn an_undo_whose_symbol_version_is_gone_says_why_the_file_could_not_be_read() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut new = o.symbols["wc.coil"].clone();
+        new.name = "Coil, changed".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        o.symbol_versions.clear();
+        let file = store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap();
+        std::fs::write(&file, "not a symbol").unwrap();
+        assert!(!o.undo());
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(err.contains("cannot be read: "), "{err}");
     }
 
     #[test]
