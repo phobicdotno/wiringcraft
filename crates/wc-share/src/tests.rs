@@ -1604,3 +1604,38 @@ fn only_the_answer_to_a_take_back_ends_the_wait_for_it() {
         "{line}"
     );
 }
+
+#[test]
+fn the_hub_reports_a_dropped_connection_but_not_a_guest_that_left() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let mut hub = Hub::new();
+    let (gone, gone_end) = pair();
+    let gone_id = hub.add(&mut host, gone_end);
+    let (leaver, leaver_end) = pair();
+    hub.add(&mut host, leaver_end);
+    hub.pump(&mut host);
+    assert!(hub.take_closed().is_empty(), "both still open");
+
+    leaver.send(GuestMsg::Leave)?;
+    drop(gone);
+    hub.pump(&mut host);
+    assert_eq!(hub.take_closed(), [(gone_id, transport::CloseReason::Ended)]);
+    assert!(hub.take_closed().is_empty(), "reported once");
+    assert!(hub.is_empty());
+    Ok(())
+}
+
+#[test]
+fn an_in_process_link_reports_an_orderly_end() {
+    let (guest_end, host_end) = pair();
+    assert_eq!(guest_end.close_reason(), None);
+    drop(host_end);
+    assert!(guest_end.close_reason().is_none(), "not known until a receive finds it");
+    assert!(guest_end.try_recv().is_err());
+    assert_eq!(guest_end.close_reason(), Some(transport::CloseReason::Ended));
+}
