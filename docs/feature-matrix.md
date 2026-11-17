@@ -27,8 +27,28 @@ Sources (public documentation, per area below):
 - SOLIDWORKS Electrical help (the "SOLIDWORKS Electrical" section): <https://help.solidworks.com/>
   and the product pages under <https://www.solidworks.com/>.
 
-The links point at the documentation homes; the area names in the tables match the chapter
-names used there (for example "Terminal strips", "Cables", "PLC", "Reports").
+Where to find each area in that documentation (chapter names as the help uses them; search
+the help home for the chapter). Deep links are left out on purpose: both vendors move their help
+pages between releases, and a chapter name survives that better than a URL.
+
+| Area | EPLAN help chapter | SOLIDWORKS Electrical help chapter |
+|---|---|---|
+| 1. Project and pages | Projects; Pages; Structure identifiers | Projects; Books and drawings; Locations |
+| 2. Editing | Graphical editing; Macros; Find | Schematic editing; Macros; Find and replace |
+| 3. Symbols and library | Symbols and symbol libraries | Symbol manager |
+| 4. Devices and parts | Devices; Parts management | Components; Manufacturer parts catalog |
+| 5. Wires and potentials | Connections; Potentials; Numbering | Wires and equipotentials; Wire numbering |
+| 6. Cross-references | Cross-references; Contact images | Cross references |
+| 7. Terminals | Terminal strips | Terminal strips |
+| 8. Cables | Cables | Cables |
+| 9. PLC | PLC and bus engineering | PLC manager |
+| 10. Reports | Reports; Forms | Report manager |
+| 11. Panel layout and 3D | EPLAN Pro Panel | Electrical 3D; 2D cabinet layout |
+| 12. Checks | Check runs; Message management | Design rules check |
+| 13. Data exchange | Import and export; Data Portal | Import and export; Content portal |
+| 14. Revisions and collaboration | Revision management; Multi-user | Revisions; Collaborative work |
+| 15. Automation | Scripts and API | API |
+| 16. Other disciplines | EPLAN Fluid; EPLAN Preplanning; EPLAN Harness proD | Electrical 3D (harness routing) |
 
 ## 1. Project and pages
 
@@ -183,7 +203,8 @@ names used there (for example "Terminal strips", "Cables", "PLC", "Reports").
 | Import SolidWorks Electrical projects | no | - | yes | done; follow-ups #59, #60, #61, #62, #70, #71, #103 |
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |
 | AutomationML export | yes | partly | yes | done |
-| Excel import/export of lists | yes | yes | CSV | done (CSV opens in every spreadsheet) |
+| List exchange as CSV (import and export) | yes | yes | yes | done |
+| Excel workbook (.xlsx) import and export | yes | yes | no: CSV only | later |
 | WAGO and other maker configurator links | add-on | partly | no | todo (#57) |
 
 ## 14. Revisions and collaboration
