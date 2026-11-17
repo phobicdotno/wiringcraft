@@ -915,24 +915,11 @@ fn run(cli: Cli) -> Res<()> {
             }
         }
         Cmd::Export(ExportCmd::WagoMarking { out, kinds }) => {
-            let kinds = kinds
-                .iter()
-                .map(|k| {
-                    wc_report::MarkerKind::parse(k)
-                        .ok_or_else(|| format!("unknown marker kind {k:?} (terminals, wires, devices, cables)"))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            let p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
-            let parts = vendored_parts(dir, &p);
-            let inputs = wc_report::Inputs {
-                project: &p,
-                symbols: &symbols,
-                parts: &parts,
-            };
-            let t = wc_report::marking_list(&inputs, &kinds);
-            std::fs::write(&out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
-            println!("wrote {} ({} markers)", out.display(), t.rows.len());
+            let done = export_wago_marking(dir, &out, &kinds)?;
+            for w in &done.warnings {
+                eprintln!("warning: {w}");
+            }
+            println!("wrote {} ({} markers)", out.display(), done.markers);
         }
         Cmd::Aml { out } => {
             let p = load(dir)?;
@@ -1778,6 +1765,39 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
 }
 
 /// The project's vendored parts by id (parts referenced by devices).
+/// What [`export_wago_marking`] wrote.
+struct Exported {
+    markers: usize,
+    warnings: Vec<String>,
+}
+
+/// Write the WAGO smartScript marker list of the project in `dir` to `out`. Unknown kinds are
+/// refused before anything is written. Symbols without a vendored copy are warned about: their
+/// terminals cannot be recognised and are left out.
+fn export_wago_marking(dir: &Path, out: &Path, kinds: &[String]) -> Res<Exported> {
+    let kinds = wc_report::parse_kinds(kinds)?;
+    let p = load(dir)?;
+    let (symbols, missing) = store::vendored_symbols(dir, &p);
+    let warnings = missing
+        .iter()
+        .map(|m| {
+            format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals are not in the list")
+        })
+        .collect();
+    let parts = vendored_parts(dir, &p);
+    let inputs = wc_report::Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let t = wc_report::marking_list(&inputs, &kinds);
+    std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+    Ok(Exported {
+        markers: t.rows.len(),
+        warnings,
+    })
+}
+
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
     p.devices
         .values()
@@ -1972,4 +1992,46 @@ fn file_stem(number: &str, id: &str) -> String {
         .collect();
     let stem = stem.trim_start_matches('.').to_owned();
     if stem.is_empty() { "page".into() } else { stem }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wago_marking_export_writes_the_list_and_refuses_unknown_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        let mut p = store::create(&dir, "Test").unwrap();
+        p.devices
+            .insert(wc_core::DeviceTag::parse("-W1").unwrap(), Default::default());
+        p.pages[0].symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "no.such.symbol".into(),
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(wc_core::DeviceTag::parse("-X1.1").unwrap()),
+        });
+        store::save(&dir, &p).unwrap();
+
+        let out = tmp.path().join("bad.csv");
+        let err = export_wago_marking(&dir, &out, &["rails".into()]).err().unwrap();
+        assert!(err.contains("rails"), "{err}");
+        assert!(!out.exists(), "nothing written for an unknown kind");
+
+        let out = tmp.path().join("m.csv");
+        let done = export_wago_marking(&dir, &out, &["cables".into(), "devices".into()]).unwrap();
+        assert_eq!(done.markers, 2);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "\u{feff}Type;Group;Marker;Count\r\nDevice;;-X1.1;1\r\nCable;;-W1;2\r\n"
+        );
+        assert!(
+            done.warnings.iter().any(|w| w.contains("no.such.symbol")),
+            "{:?}",
+            done.warnings
+        );
+    }
 }

@@ -83,8 +83,10 @@ pub fn marking_list(i: &Inputs<'_>, kinds: &[MarkerKind]) -> Table {
         let mut rows: Vec<(String, String)> = terminal_plan(i)
             .rows
             .into_iter()
-            .filter(|r| r[0] != "(untagged)")
-            .map(|r| (r[0].clone(), r[1].clone()))
+            .filter_map(|r| match (r.first(), r.get(1)) {
+                (Some(strip), Some(number)) if strip != "(untagged)" => Some((strip.clone(), number.clone())),
+                _ => None,
+            })
             .collect();
         rows.sort_by(|a, b| {
             natural_key(&a.0)
@@ -151,6 +153,7 @@ pub fn marking_list(i: &Inputs<'_>, kinds: &[MarkerKind]) -> Table {
     if wanted(MarkerKind::Cables) {
         // Cables drawn as cores of wires, and cable devices listed without cores yet.
         let mut list: BTreeSet<DeviceTag> = cables;
+        list.extend(crate::all_tags(i).into_iter().filter(is_cable_tag));
         list.extend(i.project.devices.keys().filter(|t| is_cable_tag(t)).cloned());
         let mut list: Vec<DeviceTag> = list.into_iter().collect();
         list.sort_by_key(|t| natural_key(&t.to_string()));
@@ -174,31 +177,29 @@ fn location_of(tag: &DeviceTag) -> String {
 /// Whether a device tag names a cable by its IEC 81346-2 letter code (`-W1`, `-WD3`).
 fn is_cable_tag(tag: &DeviceTag) -> bool {
     tag.product.last().is_some_and(|p| {
-        p.starts_with('W')
-            && p[1..]
-                .chars()
+        p.strip_prefix('W').is_some_and(|rest| {
+            rest.chars()
                 .next()
                 .is_none_or(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+        })
     })
 }
 
 /// The marker list as smartScript reads it: semicolon-separated UTF-8 with a byte-order mark,
 /// a header row and CRLF line ends. Fields are quoted when they contain `;`, `"` or a line end.
 pub fn to_smartscript_csv(t: &Table) -> String {
-    let field = |s: &str| {
-        if s.contains([';', '"', '\n', '\r']) {
-            format!("\"{}\"", s.replace('"', "\"\""))
-        } else {
-            s.to_owned()
-        }
-    };
-    let line = |cells: &[String]| cells.iter().map(|c| field(c)).collect::<Vec<_>>().join(";");
     let mut out = String::from('\u{feff}');
-    out.push_str(&line(&t.columns));
-    out.push_str("\r\n");
-    for r in &t.rows {
-        out.push_str(&line(r));
-        out.push_str("\r\n");
-    }
+    out.push_str(&t.to_csv_with(';'));
     out
+}
+
+/// Parse marker kind names (`terminals`, `wires`, `devices`, `cables`, or singular); an
+/// unknown name is an error that lists the known ones.
+pub fn parse_kinds(names: &[String]) -> Result<Vec<MarkerKind>, String> {
+    names
+        .iter()
+        .map(|k| {
+            MarkerKind::parse(k).ok_or_else(|| format!("unknown marker kind {k:?} (terminals, wires, devices, cables)"))
+        })
+        .collect()
 }

@@ -492,3 +492,23 @@ fn smartscript_csv_is_semicolon_separated_utf8_with_bom() {
         "\u{feff}Type;Group;Marker;Count\r\nDevice;+Kjøkken;\"-K1;A\";1\r\nWire;;2,5;2\r\n"
     );
 }
+
+#[test]
+fn a_cable_drawn_only_as_a_symbol_gets_its_markers() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s9", "lamp", 200.0, Some("-W2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[]);
+    let cables: Vec<String> = t.rows.iter().filter(|r| r[0] == "Cable").map(|r| r.join("|")).collect();
+    assert_eq!(cables, ["Cable||-W2|2"]);
+    assert!(!t.rows.iter().any(|r| r[0] == "Device" && r[2] == "-W2"));
+    assert_eq!(
+        parse_kinds(&["wire".into(), "Cables".into()]),
+        Ok(vec![MarkerKind::Wires, MarkerKind::Cables])
+    );
+    assert!(parse_kinds(&["rails".into()]).is_err());
+}
