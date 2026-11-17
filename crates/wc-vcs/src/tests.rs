@@ -162,3 +162,33 @@ fn a_failed_revert_in_a_linked_worktree_is_undone() -> Result<()> {
     assert_eq!(text.trim_end(), "three");
     Ok(())
 }
+
+#[test]
+fn a_resolved_merge_conflict_can_be_committed() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let write = |text: &str| std::fs::write(dir.join("notes.txt"), text).map_err(|e| wc_core::Error::io("notes", e));
+    write("base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    assert_eq!(git.merge("other")?, MergeOutcome::Conflicts(vec!["notes.txt".into()]));
+    // The index is unmerged here, so no copy of it can be taken; the commit must still work.
+    assert!(git.run(&["write-tree"]).is_err());
+    write("both\n")?;
+    assert!(git.commit("Merge other")?.is_some());
+    assert!(!dir.join(".git").join("MERGE_HEAD").exists());
+    assert_eq!(
+        git.run(&["show", "-s", "--format=%P", "HEAD"])?
+            .split_whitespace()
+            .count(),
+        2
+    );
+    Ok(())
+}

@@ -101,8 +101,10 @@ impl Git {
     }
 
     fn commit_inner(&self, message: &str, author: Option<&str>) -> Result<Option<String>> {
-        // What was staged before, so a failed commit can put the index back as it was.
-        let index_before = self.run(&["write-tree"]).ok().map(|t| t.trim().to_owned());
+        // What was staged before, so a failed commit can put the index back as it was. This can
+        // fail (an unmerged index while resolving a merge has no tree); the commit still goes on,
+        // and the reason is kept for the error if the commit then fails.
+        let index_before = self.run(&["write-tree"]).map(|t| t.trim().to_owned());
         self.run(&["add", "-A"])?;
         let staged = self.run(&["status", "--porcelain"])?;
         let merging = self.git_path("MERGE_HEAD")?.exists();
@@ -120,15 +122,20 @@ impl Git {
             args.push(a);
         }
         if let Err(e) = self.run(&args) {
-            if let Some(tree) = &index_before
-                && let Err(undo) = self.run(&["read-tree", tree])
-            {
-                return Err(Error::Git {
+            let undo = match &index_before {
+                Ok(tree) => self.run(&["read-tree", tree]).err(),
+                Err(snapshot) => Some(Error::Git {
+                    args: "write-tree".into(),
+                    message: format!("no copy of the staged files was taken: {snapshot}"),
+                }),
+            };
+            return Err(match undo {
+                None => e,
+                Some(undo) => Error::Git {
                     args: "commit".into(),
-                    message: format!("{e}; putting the staged files back also failed: {undo}"),
-                });
-            }
-            return Err(e);
+                    message: format!("{e}; the staged files could not be put back: {undo}"),
+                },
+            });
         }
         Ok(self.head())
     }

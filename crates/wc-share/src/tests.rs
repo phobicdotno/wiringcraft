@@ -743,6 +743,11 @@ fn a_failed_commit_leaves_the_folder_as_it_was() -> TestResult {
         .args(["diff", "--cached", "--name-only"])
         .output()?;
     assert!(
+        staged.status.success(),
+        "git diff --cached failed: {}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
+    assert!(
         staged.stdout.is_empty(),
         "nothing of the refused change stays staged: {}",
         String::from_utf8_lossy(&staged.stdout)
