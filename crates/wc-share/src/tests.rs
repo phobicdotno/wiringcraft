@@ -4,7 +4,7 @@ use std::rc::Rc;
 use super::transport::{GuestLink, Hub, decode, encode, pair};
 use super::*;
 use wc_core::geom::Point;
-use wc_core::{Device, Page, PlacedSymbol, Project, store};
+use wc_core::{Comment, Device, Page, PlacedSymbol, Project, store};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -445,5 +445,205 @@ fn every_change_is_a_commit_by_its_author_and_can_be_reverted() -> TestResult {
     let back = store::load(dir)?;
     assert_eq!(back.page("p0002").map(|p| p.symbols.len()), Some(0));
     assert_eq!(back.page("p0001").map(|p| p.title.as_str()), Some("Cover sheet"));
+    Ok(())
+}
+
+#[test]
+fn an_edit_sent_while_switching_pages_is_refused_and_put_right() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(a.can_edit("p0002"));
+
+    // Switching gives the old page up at once: no edit under the old lock.
+    a_link.send(a.open(Some("p0003")))?;
+    let mut page = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place(&mut page, "s1", 10.0);
+    assert!(!a.can_edit("p0002"));
+    assert!(a.edit_page(page.clone()).is_none());
+
+    // An edit that slips through anyway (sent raw, applied to the guest's copy) is refused,
+    // and the host sends its own page back so both copies agree.
+    if let Some(p) = a.project.as_mut().and_then(|p| p.page_mut("p0002")) {
+        *p = page.clone();
+    }
+    a_link.send(GuestMsg::EditPage { page })?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert_eq!(a.refusals, vec![Refusal::NoLock { page: "p0002".into() }]);
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert!(a.can_edit("p0003"));
+    Ok(())
+}
+
+/// Fails the first `fail` records, then keeps the rest.
+struct Flaky {
+    fail: usize,
+    log: Shared,
+}
+
+impl Journal for Flaky {
+    fn record(&mut self, project: &Project, change: &Change) -> Result<()> {
+        if self.fail > 0 {
+            self.fail -= 1;
+            return Err(Error::Closed);
+        }
+        self.log.record(project, change)
+    }
+}
+
+#[test]
+fn a_change_that_cannot_be_recorded_is_undone() -> TestResult {
+    let log = Shared::default();
+    let journal = Flaky {
+        fail: 2,
+        log: log.clone(),
+    };
+    let mut s = Session {
+        host: Host::new(demo(), "Hanna Host", "h@x.no", Box::new(journal)),
+        hub: Hub::new(),
+        log,
+    };
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+
+    // Ola's page edit and device change both fail to record: both are undone.
+    let mut page = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place(&mut page, "s1", 10.0);
+    a_link.send(a.edit_page(page).ok_or("lock")?)?;
+    let tag = wc_core::DeviceTag::parse("-K1")?;
+    a_link.send(a.edit_project(ProjectEdit::SetDevice {
+        tag: tag.clone(),
+        device: Some(Device::default()),
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(s.host.project(), &demo());
+    assert_eq!(a.project.as_ref(), Some(s.host.project()), "Ola's copy is put right");
+    assert_eq!(b.project.as_ref(), Some(s.host.project()));
+    assert!(matches!(
+        a.refusals[..],
+        [Refusal::NotRecorded { .. }, Refusal::NotRecorded { .. }]
+    ));
+    assert_eq!(s.host.take_journal_errors().len(), 2);
+
+    // Kari's next change is recorded on its own, not together with Ola's.
+    b_link.send(b.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0009", "9", "Spare"),
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    let log = s.log.0.borrow().clone();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].author, "Kari <kari@example.com>");
+    assert!(s.host.project().page("p0002").is_some_and(|p| p.symbols.is_empty()));
+    assert!(!s.host.project().devices.contains_key(&tag));
+    Ok(())
+}
+
+#[test]
+fn comments_and_panels_go_through_the_host() -> TestResult {
+    use wc_core::panel::Panel;
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    let comment = |id: &str, page: &str| Comment {
+        id: id.into(),
+        page: page.into(),
+        at: None,
+        author: "Ola".into(),
+        time: 0,
+        text: "check this".into(),
+        resolved: false,
+        replies: Vec::new(),
+    };
+    let panel = |id: &str, name: &str| Panel {
+        id: id.into(),
+        name: name.into(),
+        width: 600.0,
+        height: 800.0,
+        items: Vec::new(),
+    };
+
+    // Comments are put on the page named by the edit, whatever page they claim.
+    a_link.send(a.edit_project(ProjectEdit::SetComments {
+        page: "p0002".into(),
+        comments: vec![comment("c1", "p0003")],
+    }))?;
+    // A comment id used on another page, and one used twice, are refused.
+    b_link.send(b.edit_project(ProjectEdit::SetComments {
+        page: "p0003".into(),
+        comments: vec![comment("c1", "p0003")],
+    }))?;
+    b_link.send(b.edit_project(ProjectEdit::SetComments {
+        page: "p0001".into(),
+        comments: vec![comment("c7", "p0001"), comment("c7", "p0001")],
+    }))?;
+    a_link.send(a.edit_project(ProjectEdit::SetPanel {
+        panel: panel("cab1", "Cabinet"),
+    }))?;
+    a_link.send(a.edit_project(ProjectEdit::SetPanel {
+        panel: panel("cab1", "Main cabinet"),
+    }))?;
+    a_link.send(a.edit_project(ProjectEdit::SetPanel {
+        panel: panel("cab2", "Field box"),
+    }))?;
+    a_link.send(a.edit_project(ProjectEdit::SetPanel {
+        panel: panel("../evil", "Bad"),
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    b_link.send(b.edit_project(ProjectEdit::RemovePanel { id: "cab2".into() }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+
+    let p = s.host.project();
+    assert_eq!(p.comments.len(), 1);
+    assert_eq!(
+        (p.comments[0].id.as_str(), p.comments[0].page.as_str()),
+        ("c1", "p0002")
+    );
+    let panels: Vec<_> = p.panels.iter().map(|x| (x.id.as_str(), x.name.as_str())).collect();
+    assert_eq!(panels, [("cab1", "Main cabinet")]);
+    assert!(matches!(
+        b.refusals[..],
+        [Refusal::Invalid { .. }, Refusal::Invalid { .. }]
+    ));
+    assert!(matches!(a.refusals[..], [Refusal::Invalid { .. }]));
+    assert_eq!(a.project.as_ref(), Some(p));
+    assert_eq!(b.project.as_ref(), Some(p));
+    let messages: Vec<_> = s.log.0.borrow().iter().map(|c| c.message.clone()).collect();
+    assert_eq!(
+        messages,
+        [
+            "Comments on page p0002",
+            "Change panel cab1",
+            "Change panel cab1",
+            "Change panel cab2",
+            "Remove panel cab2"
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn leaving_drops_the_connection() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0001")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    a_link.send(GuestMsg::Leave)?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(s.hub.is_empty());
+    assert!(s.host.locks().is_empty());
+    assert_eq!(s.host.peers().len(), 1);
     Ok(())
 }

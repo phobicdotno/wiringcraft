@@ -129,9 +129,30 @@ impl Git {
         if self.run(&["config", "user.email"]).is_err() {
             args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"]);
         }
+        let git_dir = self.dir.join(".git");
+        let busy = ["REVERT_HEAD", "CHERRY_PICK_HEAD", "MERGE_HEAD", "sequencer"]
+            .iter()
+            .find(|f| git_dir.join(f).exists());
+        if let Some(f) = busy {
+            return Err(Error::Git {
+                args: format!("revert {commit}"),
+                message: format!("another revert, cherry-pick or merge is in progress ({f}); finish or abort it first"),
+            });
+        }
         args.extend(["revert", "--no-edit", commit]);
         if let Err(e) = self.run(&args) {
-            let _ = self.run(&["revert", "--abort"]);
+            // Only this call's revert can be in progress here (checked above), so aborting it
+            // cannot throw away earlier work.
+            if git_dir.join("REVERT_HEAD").exists()
+                && let Err(abort) = self.run(&["revert", "--abort"])
+            {
+                return Err(Error::Git {
+                    args: format!("revert {commit}"),
+                    message: format!(
+                        "{e}; undoing the failed revert also failed, so the folder is mid-revert: {abort}"
+                    ),
+                });
+            }
             return Err(e);
         }
         Ok(self.head())

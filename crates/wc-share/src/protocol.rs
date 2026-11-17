@@ -100,6 +100,9 @@ pub enum Refusal {
     /// The change is not valid (for example a duplicate page id).
     #[error("{reason}")]
     Invalid { reason: String },
+    /// The change could not be written to the project's history, so it was undone.
+    #[error("the change could not be recorded: {reason}")]
+    NotRecorded { reason: String },
 }
 
 /// The whole project as sent to a guest when they join.

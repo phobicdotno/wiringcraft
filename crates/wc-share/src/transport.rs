@@ -106,8 +106,13 @@ impl Hub {
             loop {
                 match link.try_recv() {
                     Ok(Some(msg)) => {
+                        let leaving = matches!(msg, GuestMsg::Leave);
                         // A refusal is already queued for the guest by the host.
                         let _ = host.receive(id, msg);
+                        if leaving {
+                            gone.push(id);
+                            break;
+                        }
                     }
                     Ok(None) => break,
                     Err(_) => {

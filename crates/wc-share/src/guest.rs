@@ -72,8 +72,13 @@ impl Guest {
         self.me.is_some() && self.locks.get(page) == self.me.as_ref()
     }
 
-    /// Ask to open a page. The lock is granted when the host's lock list says so.
-    pub fn open(&self, page: Option<&str>) -> GuestMsg {
+    /// Ask to open a page. The page held so far is given up at once, so nothing is edited
+    /// under the old lock while the switch is on its way; the new lock is granted when the
+    /// host's lock list says so.
+    pub fn open(&mut self, page: Option<&str>) -> GuestMsg {
+        if let Some(me) = self.me {
+            self.locks.retain(|_, holder| *holder != me);
+        }
         GuestMsg::Open {
             page: page.map(str::to_owned),
         }

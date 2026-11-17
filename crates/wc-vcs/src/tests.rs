@@ -101,3 +101,21 @@ fn symbol_level_changes() -> std::result::Result<(), wc_core::Error> {
     assert!(ch.iter().any(|c| c.ends_with("added")), "{ch:?}");
     Ok(())
 }
+
+#[test]
+fn revert_refuses_while_another_operation_is_in_progress() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let head = git.head().unwrap_or_default();
+    std::fs::write(dir.join(".git").join("CHERRY_PICK_HEAD"), &head).map_err(|e| wc_core::Error::io("write", e))?;
+    let err = git.revert(&head).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("in progress"), "{err}");
+    assert!(
+        dir.join(".git").join("CHERRY_PICK_HEAD").exists(),
+        "the other operation is left alone"
+    );
+    Ok(())
+}

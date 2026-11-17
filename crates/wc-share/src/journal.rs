@@ -40,7 +40,7 @@ impl Journal for MemoryJournal {
 /// Saves the project folder and commits each change as its author.
 #[derive(Debug)]
 pub struct GitJournal {
-    pub dir: PathBuf,
+    dir: PathBuf,
     git: Git,
 }
 
@@ -51,6 +51,10 @@ impl GitJournal {
         let git = Git::new(&dir);
         git.init()?;
         Ok(Self { dir, git })
+    }
+
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
     }
 
     pub fn git(&self) -> &Git {

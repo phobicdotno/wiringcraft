@@ -44,7 +44,7 @@ pub struct Host {
     next_id: PeerId,
     outbox: Vec<(PeerId, HostMsg)>,
     journal: Box<dyn Journal>,
-    /// Changes that were applied but could not be recorded, with the reason.
+    /// Changes that could not be recorded (and so were undone), with the reason.
     journal_errors: Vec<(Change, String)>,
 }
 
@@ -122,7 +122,7 @@ impl Host {
         std::mem::take(&mut self.outbox)
     }
 
-    /// Changes that were applied but could not be written to the history.
+    /// Changes that could not be written to the history and were undone, with the reason.
     pub fn take_journal_errors(&mut self) -> Vec<(Change, String)> {
         std::mem::take(&mut self.journal_errors)
     }
@@ -238,7 +238,25 @@ impl Host {
             }
             (Status::Joined, GuestMsg::Join { .. }) => Ok(()),
             (Status::Joined, GuestMsg::Open { page }) => self.do_open(from, page),
-            (Status::Joined, GuestMsg::EditPage { page }) => self.do_edit_page(from, page),
+            (Status::Joined, GuestMsg::EditPage { page }) => {
+                let id = page.id.clone();
+                let result = self.do_edit_page(from, page);
+                // The guest already changed its own copy: send the host's page back so the two
+                // copies agree again.
+                if result.is_err()
+                    && let Some(current) = self.project.page(&id)
+                {
+                    let by = self.locks.get(&id).copied().unwrap_or(HOST);
+                    self.outbox.push((
+                        from,
+                        HostMsg::PageChanged {
+                            page: current.clone(),
+                            by,
+                        },
+                    ));
+                }
+                result
+            }
             (Status::Joined, GuestMsg::EditProject { edit }) => self.do_edit_project(from, edit),
             _ => Err(Refusal::NotApproved),
         };
@@ -293,9 +311,14 @@ impl Host {
         if *current == page {
             return Ok(());
         }
-        *current = page.clone();
+        let before = std::mem::replace(current, page.clone());
         let message = format!("Edit page {} {}", page.number, page.title);
-        self.record(by, Some(page.id.clone()), message);
+        if let Err(refusal) = self.record(by, Some(page.id.clone()), message) {
+            if let Some(p) = self.project.page_mut(&page.id) {
+                *p = before;
+            }
+            return Err(refusal);
+        }
         self.send_others(by, HostMsg::PageChanged { page, by });
         Ok(())
     }
@@ -307,6 +330,10 @@ impl Host {
         if self.project == before {
             return Ok(());
         }
+        if let Err(refusal) = self.record(by, edit.page().map(str::to_owned), edit.describe()) {
+            self.project = before;
+            return Err(refusal);
+        }
         if let ProjectEdit::RemovePage { id } = &edit
             && self.locks.remove(id).is_some()
         {
@@ -317,7 +344,6 @@ impl Host {
             }
             self.broadcast_presence();
         }
-        self.record(by, edit.page().map(str::to_owned), edit.describe());
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for id in ids {
             self.outbox
@@ -326,7 +352,9 @@ impl Host {
         Ok(())
     }
 
-    fn record(&mut self, by: PeerId, page: Option<String>, message: String) {
+    /// Record an applied change. When that fails the caller undoes the change, so a later
+    /// commit never carries it under someone else's name.
+    fn record(&mut self, by: PeerId, page: Option<String>, message: String) -> Result<(), Refusal> {
         let author = self.peers.get(&by).map(Participant::author).unwrap_or_default();
         let change = Change {
             by,
@@ -335,8 +363,11 @@ impl Host {
             message,
         };
         if let Err(e) = self.journal.record(&self.project, &change) {
-            self.journal_errors.push((change, e.to_string()));
+            let reason = e.to_string();
+            self.journal_errors.push((change, reason.clone()));
+            return Err(Refusal::NotRecorded { reason });
         }
+        Ok(())
     }
 
     fn joined_guests(&self) -> impl Iterator<Item = PeerId> + '_ {
