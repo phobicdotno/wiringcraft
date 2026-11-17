@@ -512,3 +512,35 @@ fn the_cover_and_every_title_block_show_the_same_project_fields() {
     assert_eq!(count(&texts(&schematic, &project), "Nordic Water"), 1);
     assert_eq!(count(&texts(&cover, &project), "ACME Water"), 0);
 }
+
+#[test]
+fn a_blank_date_shows_the_export_date_on_the_cover_and_in_the_title_block() -> Result<(), String> {
+    let mut project = wc_core::Project::new("x");
+    project.meta.title_block.insert("date".into(), "  ".into());
+    project
+        .meta
+        .title_block
+        .insert("description".into(), "A very long description ".repeat(30));
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = wc_core::PageSize::A4;
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let dates = marks
+        .iter()
+        .filter(|m| matches!(&m.shape, Shape::Text { text, .. } if text == "2026-11-17"))
+        .count();
+    assert_eq!(dates, 2, "cover table and title block");
+    // The long description is drawn smaller so it fits inside the A4 frame.
+    let desc = marks
+        .iter()
+        .find_map(|m| match &m.shape {
+            Shape::Text { text, height, .. } if text.starts_with("A very long") => Some((text.clone(), *height)),
+            _ => None,
+        })
+        .ok_or("no description on the cover")?;
+    assert!(
+        crate::writer::text_width_mm(&desc.0, desc.1) <= 297.0 - 20.0,
+        "{desc:?}"
+    );
+    Ok(())
+}

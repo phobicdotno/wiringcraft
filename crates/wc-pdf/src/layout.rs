@@ -374,7 +374,11 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
         &mut out,
     );
     field(fx[2], ty, "Revision", get("revision"), 2.5, &mut out);
-    let d = if get("date").is_empty() { date } else { get("date") };
+    let d = if get("date").trim().is_empty() {
+        date
+    } else {
+        get("date")
+    };
     field(fx[2], mid, "Date", d, 2.5, &mut out);
     text((fx[3] + 1.5, ty + 3.0), 1.8, Align::Left, "Page", Ink::Label, &mut out);
     text(
@@ -446,10 +450,17 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
             });
         }
     };
+    // Long texts are drawn smaller so they stay inside the frame (text is never wrapped).
+    let fit = |t: &str, height: f64| {
+        let room = x1 - x0 - 10.0;
+        let w = text_width_mm(t, height);
+        if w > room { height * room / w } else { height }
+    };
     let name_y = y0 + h * 0.2;
-    push_text((cx, name_y), 9.0, Align::Center, &project.meta.name, Ink::Thin, out);
+    let name = &project.meta.name;
+    push_text((cx, name_y), fit(name, 9.0), Align::Center, name, Ink::Thin, out);
     let desc = tb.get("description").map(String::as_str).unwrap_or("");
-    push_text((cx, name_y + 9.0), 4.0, Align::Center, desc, Ink::Thin, out);
+    push_text((cx, name_y + 9.0), fit(desc, 4.0), Align::Center, desc, Ink::Thin, out);
 
     let mut rows: Vec<(&str, &str)> = wc_core::project::TITLE_FIELDS
         .iter()

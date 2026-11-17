@@ -631,34 +631,46 @@ impl Open {
 
     /// The cover page's index. A project without one gets one: an empty first page titled
     /// "Cover" (as new projects started) is marked as the cover, otherwise a new cover page
-    /// goes in front of the others. Creating or marking it is one undo step.
-    pub fn cover_page(&mut self) -> usize {
+    /// numbered `0` goes in front of the others. Creating or marking it is one undo step. Fails,
+    /// changing nothing, when a page already uses a number that sorts as low as `0`.
+    pub fn cover_page(&mut self) -> Result<usize, String> {
         if let Some(i) = self.project.cover_page() {
-            return i;
+            return Ok(i);
         }
-        self.checkpoint();
-        if let Some(first) = self.project.pages.first_mut()
+        if let Some(first) = self.project.pages.first()
             && first.title.trim().eq_ignore_ascii_case("cover")
             && first.symbols.is_empty()
             && first.wires.is_empty()
+            && first.graphics.is_empty()
+            && first.underlay.is_none()
         {
-            first.cover = true;
-            return 0;
+            self.checkpoint();
+            self.project.pages[0].cover = true;
+            return Ok(0);
         }
+        // `0` sorts before every other number unless one sorts as low (`0`, `00`, an empty one).
+        let lowest = wc_core::project::natural_key("0");
+        if let Some(p) = self
+            .project
+            .pages
+            .iter()
+            .find(|p| wc_core::project::natural_key(&p.number) <= lowest)
+        {
+            return Err(format!(
+                "Page {:?} already comes first. Renumber it, then add the cover page in front.",
+                p.number
+            ));
+        }
+        self.checkpoint();
         let id = self.free_page_id();
-        let used = |n: &str| self.project.pages.iter().any(|p| p.number == n);
-        let number = ["0", "0.1", "0.01"]
-            .into_iter()
-            .find(|n| !used(n))
-            .map_or_else(|| self.next_page_number(), str::to_owned);
-        let mut page = Page::new(id.clone(), number, "Cover");
+        let mut page = Page::new(id.clone(), "0", "Cover");
         page.cover = true;
         if let Some(first) = self.project.pages.first() {
             page.size = first.size;
         }
         self.project.pages.push(page);
         self.project.sort_pages();
-        self.index_of(&id)
+        Ok(self.index_of(&id))
     }
 
     /// Set the project name and fields while a form is open, so the page shows each change at
@@ -853,7 +865,7 @@ pub(crate) mod tests {
     #[test]
     fn the_cover_form_shows_changes_as_typed_and_keeps_them_as_one_undo_step() {
         let (_tmp, mut o) = project();
-        assert_eq!(o.cover_page(), 0, "a new project's first page is its cover");
+        assert_eq!(o.cover_page(), Ok(0), "a new project's first page is its cover");
         assert!(!o.can_undo(), "nothing to create");
         let since = o.undo_mark();
         for typed in ["A", "AC", "ACME"] {
@@ -888,24 +900,50 @@ pub(crate) mod tests {
         let (_tmp, mut o) = project();
         o.project.pages[0].cover = false;
         o.project.pages[0].title = "Overview".into();
-        let i = o.cover_page();
+        let i = o.cover_page().unwrap();
         let cover = &o.project.pages[i];
         assert!(cover.cover);
         assert_eq!((i, cover.number.as_str(), cover.title.as_str()), (0, "0", "Cover"));
         assert_eq!(o.project.pages.len(), 3);
-        assert_eq!(o.cover_page(), 0, "found again, not made twice");
+        assert_eq!(o.cover_page(), Ok(0), "found again, not made twice");
         assert!(o.undo());
         assert_eq!(o.project.pages.len(), 2, "making it is one undo step");
 
         // An empty first page titled "Cover" (how projects started) becomes the cover.
         o.project.pages[0].title = "Cover".into();
-        assert_eq!(o.cover_page(), 0);
+        assert_eq!(o.cover_page(), Ok(0));
         assert_eq!(o.project.pages.len(), 2);
         assert!(o.project.pages[0].cover);
 
         // Its copy is a normal page: a project keeps one cover.
         let copy = o.duplicate_page(0).unwrap();
         assert!(!o.project.pages[copy].cover);
+    }
+
+    #[test]
+    fn a_first_page_titled_cover_with_a_drawing_on_it_is_kept_and_a_cover_goes_in_front() {
+        let (_tmp, mut o) = project();
+        o.project.pages[0].cover = false;
+        o.project.pages[0].graphics.push(wc_core::geom::Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(10.0, 0.0),
+        });
+        let i = o.cover_page().unwrap();
+        assert_eq!((i, o.project.pages[i].number.as_str()), (0, "0"));
+        assert!(!o.project.pages[1].cover, "the drawn page stays as it was");
+    }
+
+    #[test]
+    fn a_page_numbered_zero_keeps_its_place_and_no_cover_is_made() {
+        let (_tmp, mut o) = project();
+        o.project.pages[0].cover = false;
+        o.project.pages[0].title = "Index".into();
+        o.project.pages[0].number = "0".into();
+        o.project.sort_pages();
+        let before = o.project.clone();
+        assert!(o.cover_page().unwrap_err().contains("\"0\""));
+        assert_eq!(o.project, before);
+        assert!(!o.can_undo(), "nothing changed");
     }
 
     #[test]

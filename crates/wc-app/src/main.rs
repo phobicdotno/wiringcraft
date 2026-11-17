@@ -483,13 +483,22 @@ impl App {
                 });
             }
             Action::CoverPage => {
-                let i = open.cover_page();
-                if self.ed.page != i || self.ed.panel.is_some() {
+                // Compare page ids: a new cover can take the index the shown page had.
+                let shown = open.project.pages.get(self.ed.page).map(|p| p.id.clone());
+                let i = match open.cover_page() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        self.dialog = Some(Dialog::Message(e));
+                        return;
+                    }
+                };
+                let cover = open.project.pages.get(i).map(|p| p.id.clone());
+                if shown != cover || self.ed.panel.is_some() {
                     self.ed.panel = None;
-                    self.ed.page = i;
                     self.ed.selection.clear();
                     self.ed.wire = None;
                 }
+                self.ed.page = i;
                 self.ed.view.fit = true;
                 self.dialog = Some(Dialog::Cover {
                     name: open.project.meta.name.clone(),
@@ -573,6 +582,11 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut out = Vec::new();
+        // An open dialog takes the keyboard: a shortcut would change the project under it (the
+        // cover form's Cancel takes back only what the form changed).
+        if self.dialog.is_some() {
+            return out;
+        }
         let ctrl = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
         ctx.input_mut(|i| {
             for (k, a) in [
@@ -595,7 +609,7 @@ impl App {
                 }
             }
         });
-        if ctx.wants_keyboard_input() || self.dialog.is_some() {
+        if ctx.wants_keyboard_input() {
             return out;
         }
         ctx.input(|i| {
