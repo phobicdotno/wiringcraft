@@ -24,7 +24,7 @@ From `crates/wc-import`:
 | EDZ (EPLAN Data Exchange archives, 7-Zip or zip) | `edz` | `wiringcraft import parts-edz <file> --lib <folder>`: the part data (EPLAN part XML, `partsmanagement` root) becomes one part per `part`: order number (or type number, or the EPLAN part number without the maker), maker, description (English when given), and every other EPLAN part property; a `variant` fills what the part leaves empty. Macros (`.ema`), pictures and other files are counted in the report, not imported (#144). Built from public format knowledge and synthetic archives; not yet checked against a real portal download. |
 | AutomationML (IEC 62714, CAEX XML) | `aml` | Devices, properties, connection points, links. |
 | EPLAN P8 projects (`.elk` + `.edb`) | `eplan` | Projects. Parts from EDZ files: see `edz` above. |
-| SolidWorks Electrical archives (`.tewzip`) | `swe` | Projects. Content Portal parts also arrive as `.tewzip`; library import is #62. |
+| SolidWorks Electrical archives (`.tewzip`) | `swe` | Projects. Content Portal parts also arrive as `.tewzip`; `import swe-library` reads their parts, cable types and symbol blocks. |
 | Plain zip | `archive` | Opens the container and imports PDF, DXF, AutomationML and CSV entries inside. Other entries (including `.kicad_sym`) are listed, not imported. |
 
 Not read today: EPLAN macros inside EDZ files (#144), **DWG**, **STEP** (3D), ECLASS data
@@ -35,7 +35,7 @@ outside a BMEcat catalogue.
 | Portal | What | Formats | Login / cost | Terms | WiringCraft today |
 |---|---|---|---|---|---|
 | [EPLAN Data Portal](https://www.eplan.com/us-en/products/eplan-data-portal) | 550+ manufacturers, 2.3 million+ components: commercial and technical data, schematic macros, 3D, images | EDZ / EPLAN macros | Free **with a current EPLAN licence subscription and an EPLAN ID**. Viewing without a licence has been allowed since Data Portal 2.1 ([news](https://www.automation.com/article/eplan-updates-data-portal-to-allow-free-viewing)). | Made for use inside EPLAN ([portal terms](https://www.eplan.com.cn/content/dam/eplan/corporate/legal/terms-of-use/eplan-epulse-portal-terms-of-use-10-2020-cn-cn.pdf)) | No (EDZ) |
-| [SOLIDWORKS Electrical Content Portal](https://help.solidworks.com/2025/English/SWElec/r_swelec_UsingECP.htm) | Manufacturer parts, cable references, symbols. TE Connectivity via TraceParts ([blog](https://blogs.solidworks.com/products/solidworks/traceparts-collaboration-integrating-the-te-connectivity-catalog-into-the-electrical-content-portal-ecp)) | `.tewzip` | 3DEXPERIENCE ID plus an active SOLIDWORKS Electrical Schematic subscription ([Javelin](https://www.javelin-tech.com/blog/2025/02/using-the-solidworks-electrical-content-portal/)) | Dassault terms | Container yes; parts library is #62 |
+| [SOLIDWORKS Electrical Content Portal](https://help.solidworks.com/2025/English/SWElec/r_swelec_UsingECP.htm) | Manufacturer parts, cable references, symbols. TE Connectivity via TraceParts ([blog](https://blogs.solidworks.com/products/solidworks/traceparts-collaboration-integrating-the-te-connectivity-catalog-into-the-electrical-content-portal-ecp)) | `.tewzip` | 3DEXPERIENCE ID plus an active SOLIDWORKS Electrical Schematic subscription ([Javelin](https://www.javelin-tech.com/blog/2025/02/using-the-solidworks-electrical-content-portal/)) | Dassault terms | Container yes; parts, cable types and symbol blocks with `import swe-library` |
 | CADENAS PARTcommunity / TraceParts | 2D/3D CAD for thousands of makers, some ECAD macros | 80+ native and neutral formats incl. DXF, DWG, STEP | Free account | Per portal and per maker | DXF yes (ASCII) |
 | [KiCad libraries](https://www.kicad.org/libraries/license/index.html) | Generic and manufacturer-specific symbols (mostly electronics) | `.kicad_sym` | Free, no login (GitLab) | CC-BY-SA 4.0 with the KiCad libraries exception: free to use in any design, closed or commercial; redistributing the libraries as a collection keeps CC-BY-SA | **Yes** |
 | [QElectroTech element collection](https://qelectrotech.org/) and [contrib repo](https://github.com/qelectrotech/qelectrotech-element-contrib) | IEC schematic elements, manufacturer variants (Hager, ABB, Hensel, Shelly, WAGO planned) | `.elmt` (XML) | Free, no login | Contrib repo under GPL-2.0; check the main collection's licence per element | **Yes** (symbols) |
@@ -85,7 +85,7 @@ outside a BMEcat catalogue.
    connection points; check each element's licence before shipping it in a library.
 5. **DWG** is common (Eaton, Mitsubishi, Rockwell) but closed; DXF is usually offered next to it.
 6. **SolidWorks Electrical Content Portal** data needs a SolidWorks subscription; its `.tewzip`
-   parts are covered by the library import in #62.
+   parts, cable types and symbol blocks are read by `wiringcraft import swe-library`.
 
 Follow-up candidates for the todo list: EDZ import.
 
