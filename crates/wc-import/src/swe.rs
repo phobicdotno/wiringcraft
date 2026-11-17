@@ -337,8 +337,10 @@ fn column_named<'a>(columns: &'a [String], names: &[&str]) -> Option<&'a str> {
 /// row). A missing table gives nothing; a table without a page column is reported.
 ///
 /// With an object id column, the latest row for one of `books` is that book's revision; the
-/// first book's (lowest id) is the project's own ([`Revisions::project`]), with a warning when
-/// another book's differs. Rows for any other object are left out.
+/// revision of the first book that has one (lowest id) is the project's own
+/// ([`Revisions::project`]), with a warning when another book's differs. A book without a
+/// revision row has nothing to say about the project's revision, so it is passed over. Rows for
+/// any other object are left out.
 pub fn page_revisions(
     conn: &Connection,
     pages: &BTreeSet<i64>,
@@ -402,7 +404,7 @@ pub fn page_revisions(
     // A `fil_id` column names files only; an object id column also names the book or project.
     let by_object = !page.ends_with("fil_id");
     let mut out = Revisions::default();
-    // Each book's latest revision; the first book's (lowest id) is the project's.
+    // Each book's latest revision; that of the first book with one (lowest id) is the project's.
     let mut by_book: BTreeMap<i64, BTreeMap<String, String>> = BTreeMap::new();
     for (id, values) in readable(rows, "page revision", warnings) {
         let for_page = pages.contains(&id);
