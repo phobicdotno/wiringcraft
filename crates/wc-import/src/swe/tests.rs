@@ -1746,3 +1746,62 @@ fn symbol_maps_are_read_line_by_line() {
     assert!(parse_symbol_map("x\n = wc.coil").unwrap_err().starts_with("line 1"));
     assert!(parse_symbol_map("# c\n = wc.coil").unwrap_err().starts_with("line 2"));
 }
+
+#[test]
+fn a_library_pin_a_little_off_keeps_the_net_the_source_drew_to_it() {
+    let c = sample();
+    // Net 202 ends 0.4 mm beside K1:A1, where net 101 ends exactly.
+    c.execute_batch(
+        "INSERT INTO tew_equipotential VALUES (901, '202');
+         INSERT INTO tew_line VALUES (3, 10, 100.4, 205, 100.4, 240, 901);",
+    )
+    .unwrap();
+    // The library coil's A1 sits at net 202's end, 0.4 mm from the block's point: still a fit.
+    let mut coil = lib_coil("my.coil", 5.0);
+    coil.pins[0].at = Point::new(0.4, -5.0);
+    let (built, _, _) = build_with(&read(&c).unwrap(), None, &choice(&[coil], &[("Coil", "my.coil")]));
+    let pg = page(&built, "01");
+    assert_eq!(pg.symbols.iter().find(|s| s.id == "s1").unwrap().symbol, "my.coil");
+    let on_a1 = |w: &Wire| {
+        [&w.from, &w.to]
+            .iter()
+            .any(|e| matches!(e, Endpoint::Pin { item, pin } if item == "s1" && pin == "A1"))
+    };
+    let nets_on_a1: BTreeSet<Option<&str>> = pg
+        .wires
+        .iter()
+        .filter(|w| on_a1(w))
+        .map(|w| w.potential.as_deref())
+        .collect();
+    assert_eq!(nets_on_a1, BTreeSet::from([Some("101")]));
+}
+
+#[test]
+fn a_box_never_takes_the_id_of_a_library_symbol() {
+    let sw = read(&sample()).unwrap();
+    // A library symbol called like the fuse's box would be, chosen for the coil.
+    let mut taken = lib_coil("swe.fuse.1", 5.0);
+    taken.name = "Coil from an earlier import".into();
+    let (built, _, _) = build_with(&sw, None, &choice(&[taken], &[("Coil", "swe.fuse.1")]));
+    let pg = page(&built, "01");
+    let k1 = pg.symbols.iter().find(|s| s.id == "s1").unwrap();
+    let f1 = pg.symbols.iter().find(|s| s.id == "s2").unwrap();
+    assert_eq!(k1.symbol, "swe.fuse.1");
+    assert_ne!(f1.symbol, "swe.fuse.1");
+    let ids: Vec<&str> = built.symbols.iter().map(|s| s.id.as_str()).collect();
+    let unique: BTreeSet<&str> = ids.iter().copied().collect();
+    assert_eq!(ids.len(), unique.len(), "one definition per id: {ids:?}");
+    let pins = |id: &str| -> Vec<String> {
+        built
+            .symbols
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap()
+            .pins
+            .iter()
+            .map(|p| p.name.clone())
+            .collect()
+    };
+    assert_eq!(pins(&k1.symbol), ["A1", "A2"]);
+    assert_eq!(pins(&f1.symbol).len(), 2);
+}

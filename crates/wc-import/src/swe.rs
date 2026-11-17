@@ -1688,6 +1688,7 @@ pub fn build_with(
                 .map(|(n, at)| (n.clone(), Point::new(at.x - origin.x, at.y - origin.y)))
                 .collect();
             let matched = library_fit(choice, &s.block, role, &local);
+            let from_library = matched.is_some();
             let (graphics, out_pins) = match &matched {
                 Some((_, lib_pins)) => (Vec::new(), lib_pins.clone()),
                 None => box_symbol(&s.block, origin, s.corner.map(flip), &pins),
@@ -1708,8 +1709,16 @@ pub fn build_with(
                         // `Relay-A`) never share an id.
                         let stem = slug(&s.block);
                         let n = per_block.entry(stem.clone()).or_insert(0);
-                        *n += 1;
-                        let id = format!("swe.{stem}.{n}");
+                        // Never an id a library symbol of this import has or may get.
+                        let id = loop {
+                            *n += 1;
+                            let candidate = format!("swe.{stem}.{n}");
+                            if !choice.library.contains_key(&candidate)
+                                && !built.symbols.iter().any(|have| have.id == candidate)
+                            {
+                                break candidate;
+                            }
+                        };
                         built.symbols.push(Symbol {
                             id: id.clone(),
                             name: if s.block.is_empty() {
@@ -1753,12 +1762,15 @@ pub fn build_with(
                     });
                 }
             }
-            for pin in &out_pins {
-                pin_at.push((
-                    Point::new(origin.x + pin.at.x, origin.y + pin.at.y),
-                    item.clone(),
-                    pin.name.clone(),
-                ));
+            // Wire ends find a library symbol's pins where the source drew the points (up to
+            // JOIN away from the symbol's own pins), so which net reaches which pin stays the
+            // source's.
+            for (k, pin) in out_pins.iter().enumerate() {
+                let at = match pins.get(k) {
+                    Some((_, source)) if from_library => *source,
+                    _ => Point::new(origin.x + pin.at.x, origin.y + pin.at.y),
+                };
+                pin_at.push((at, item.clone(), pin.name.clone()));
             }
             let tag = s.component.and_then(|c| tags.get(&c).cloned());
             if let Some(c) = s.component.filter(|c| tags.contains_key(c)) {

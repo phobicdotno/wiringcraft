@@ -1537,19 +1537,14 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .unwrap_or_default()
             );
             let n_sym = built.symbols.iter().filter(|s| !choice.1.contains_key(&s.id)).count();
-            let fresh: Vec<String> = built
+            let from_library: Vec<String> = built
                 .symbols
                 .iter()
-                .filter(|s| choice.1.contains_key(&s.id) && !p.lock.symbols.contains_key(&s.id))
+                .filter(|s| choice.1.contains_key(&s.id))
                 .map(|s| s.id.clone())
                 .collect();
             add_built(dir, &mut p, built, &source)?;
-            // Library symbols are pinned to the library they came from, not to the import.
-            for id in fresh {
-                if let (Some(lib), Some(entry)) = (choice.1.get(&id), p.lock.symbols.get_mut(&id)) {
-                    entry.source = lib.clone();
-                }
-            }
+            keep_library_sources(&mut p, &from_library, &choice.1);
             save(dir, &p)?;
             println!(
                 "{:<18} {:>8} {:>9}  why the rest is not imported",
@@ -2148,18 +2143,30 @@ fn swe_symbol_choice(
     }
     let mut wanted: std::collections::BTreeSet<String> = choice.by_block.values().cloned().collect();
     wanted.extend(wc_import::swe::BUILTIN_BY_PINS.iter().map(|(_, id)| (*id).to_owned()));
-    let (vendored, _) = store::vendored_symbols(dir, p);
     // A library that cannot be opened (a git source not synced yet) only means fewer matches.
     let lib = wc_library::Library::open(dir, p)
         .inspect_err(|x| eprintln!("warning: libraries not read, blocks may stay boxes: {x}"))
         .ok();
     let mut sources = std::collections::BTreeMap::new();
     for id in wanted {
-        if let Some(s) = vendored.get(&id) {
+        // The project's own copy first, used on a page or not.
+        if p.lock.symbols.contains_key(&id)
+            && let Ok(s) = store::read_vendored_symbol(dir, &id)
+        {
             let source = p.lock.symbols.get(&id).map(|l| l.source.clone()).unwrap_or_default();
             sources.insert(id.clone(), source);
-            choice.library.insert(id, s.clone());
-        } else if let Some((s, source)) = lib.as_ref().and_then(|l| l.symbol(&id).ok()) {
+            choice.library.insert(id, s);
+            continue;
+        }
+        let found = match lib.as_ref().map(|l| l.symbol(&id)) {
+            Some(Ok(found)) => Some(found),
+            Some(Err(wc_library::Error::NotFound { .. })) | None => None,
+            Some(Err(why)) => {
+                eprintln!("warning: library symbol {id} cannot be read, blocks it would match stay boxes: {why}");
+                None
+            }
+        };
+        if let Some((s, source)) = found {
             sources.insert(id.clone(), source);
             choice.library.insert(id, s);
         } else if map.is_some() && choice.by_block.values().any(|v| *v == id) {
@@ -2167,6 +2174,18 @@ fn swe_symbol_choice(
         }
     }
     Ok((choice, sources))
+}
+
+/// Library symbols an import used stay pinned to the library they came from (`add_built` pins
+/// everything it adds to the import), whether they were pinned before or not.
+fn keep_library_sources(p: &mut Project, ids: &[String], sources: &std::collections::BTreeMap<String, String>) {
+    for id in ids {
+        if let (Some(lib), Some(entry)) = (sources.get(id), p.lock.symbols.get_mut(id))
+            && !lib.is_empty()
+        {
+            entry.source.clone_from(lib);
+        }
+    }
 }
 
 fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Result<(), String> {
@@ -2311,6 +2330,29 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn an_import_keeps_library_symbols_pinned_to_their_library() {
+        let mut p = Project::new("t");
+        let entry = |source: &str| wc_core::LockEntry {
+            source: source.into(),
+            hash: "h".into(),
+        };
+        // wc.coil was pinned to the starter library before; add_built just re-pinned it, and a
+        // new wc.lamp, to the import, and an import box to the import as well.
+        for id in ["wc.coil", "wc.lamp", "swe.fuse.1"] {
+            p.lock.symbols.insert(id.into(), entry("import:x.db"));
+        }
+        let sources: std::collections::BTreeMap<String, String> = [
+            ("wc.coil".into(), "starter".into()),
+            ("wc.lamp".into(), "starter".into()),
+        ]
+        .into();
+        keep_library_sources(&mut p, &["wc.coil".into(), "wc.lamp".into()], &sources);
+        let src = |id: &str| p.lock.symbols[id].source.clone();
+        assert_eq!((src("wc.coil"), src("wc.lamp")), ("starter".into(), "starter".into()));
+        assert_eq!(src("swe.fuse.1"), "import:x.db");
     }
 
     #[test]
