@@ -96,6 +96,9 @@ enum Cmd {
     /// The project's locations (cabinets, rooms, panels): the `+` part of device tags.
     #[command(subcommand)]
     Location(LocationCmd),
+    /// Jumpers (bridges) between terminals of one strip: jumpered terminals are one potential.
+    #[command(subcommand)]
+    Jumper(JumperCmd),
     /// Set a device's part and description.
     Device {
         tag: String,
@@ -273,6 +276,22 @@ enum LocationCmd {
 }
 
 #[derive(Subcommand)]
+enum JumperCmd {
+    /// Jumper terminals of a strip, e.g. `jumper add -- -X1 3 4 5`. A jumper that shares a
+    /// terminal with them becomes one with them.
+    Add {
+        /// The strip, e.g. `-X1` (after `--`, as it starts with `-`).
+        strip: String,
+        /// Terminal numbers, at least two.
+        terminals: Vec<String>,
+    },
+    /// Take terminals out of their jumper, e.g. `jumper remove -- -X1 4`.
+    Remove { strip: String, terminals: Vec<String> },
+    /// List the project's jumpers.
+    List,
+}
+
+#[derive(Subcommand)]
 enum PageCmd {
     Add {
         id: String,
@@ -378,6 +397,32 @@ enum ImportCmd {
         scale: f64,
         #[arg(long, default_value = "")]
         category: String,
+    },
+    /// Parts from a BMEcat catalogue (XML, version 1.2 or 2005): order number, maker,
+    /// description, the maker's part number, GTIN, and ECLASS class and features as properties.
+    PartsBmecat {
+        file: PathBuf,
+        #[arg(long)]
+        lib: PathBuf,
+    },
+    /// QElectroTech elements (`.elmt`), one symbol per file. Ids are `<prefix>.<file name>`;
+    /// the first terminal becomes the origin.
+    SymbolQet {
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        #[arg(long)]
+        lib: PathBuf,
+        /// Id prefix.
+        #[arg(long, default_value = "qet")]
+        prefix: String,
+        /// Millimetres per QElectroTech pixel; 0.5 puts its 10 px grid on a 5 mm grid.
+        #[arg(long, default_value_t = wc_import::qet::DEFAULT_SCALE)]
+        scale: f64,
+        #[arg(long, default_value = "")]
+        category: String,
+        /// Letter code for new devices, e.g. `K`.
+        #[arg(long, default_value = "")]
+        letter_code: String,
     },
     /// Parts from a CSV or semicolon-separated export (Excel "Save as CSV").
     PartsCsv {
@@ -806,6 +851,32 @@ fn run(cli: Cli) -> Res<()> {
                 }
             }
         }
+        Cmd::Jumper(jc) => {
+            let mut p = load(dir)?;
+            match jc {
+                JumperCmd::Add { strip, terminals } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    p.meta.add_jumper(&strip, &terminals)?;
+                    save(dir, &p)?;
+                }
+                JumperCmd::Remove { strip, terminals } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    let mut changed = false;
+                    for t in &terminals {
+                        changed |= p.meta.remove_from_jumper(&strip, t.trim());
+                    }
+                    if !changed {
+                        return Err(format!("no jumper of {strip} has terminal {}", terminals.join(", ")));
+                    }
+                    save(dir, &p)?;
+                }
+                JumperCmd::List => {
+                    for j in &p.meta.jumpers {
+                        println!("{} {}", j.strip, j.terminals.join(" "));
+                    }
+                }
+            }
+        }
         Cmd::Device { tag, part, description } => {
             let mut p = load(dir)?;
             let t = DeviceTag::parse(&tag).map_err(e)?;
@@ -914,11 +985,7 @@ fn run(cli: Cli) -> Res<()> {
                 &mut p,
                 rule,
                 overwrite,
-                |id| {
-                    symbols
-                        .get(id)
-                        .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
-                },
+                |id| symbols.get(id).map(|s| s.role),
                 |page, end| match end {
                     wc_core::Endpoint::Point { at } => Some(*at),
                     wc_core::Endpoint::Pin { item, pin } => {
@@ -1041,11 +1108,7 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Nets => {
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
-            let linked = wc_core::connectivity::nets_linked(&p, |id| {
-                symbols
-                    .get(id)
-                    .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
-            });
+            let linked = wc_core::connectivity::nets_linked(&p, |id| symbols.get(id).map(|s| s.role));
             for (i, n) in linked.iter().enumerate() {
                 let pins: Vec<String> = n
                     .pins
@@ -1264,6 +1327,22 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 );
             }
         }
+        ImportCmd::SymbolQet {
+            files,
+            lib,
+            prefix,
+            scale,
+            category,
+            letter_code,
+        } => {
+            let (written, failed) = import_qet(&files, &lib, &prefix, scale, &category, &letter_code)?;
+            if failed > 0 {
+                return Err(format!(
+                    "{failed} of {} element(s) could not be imported",
+                    written + failed
+                ));
+            }
+        }
         ImportCmd::PlcCsv { file } => {
             let mut p = load(dir)?;
             let bytes = std::fs::read(&file).map_err(e)?;
@@ -1284,6 +1363,13 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 applied.unchanged,
                 applied.unknown.len()
             );
+        }
+        ImportCmd::PartsBmecat { file, lib } => {
+            let (n, warnings) = import_bmecat(&file, &lib)?;
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+            println!("imported {n} part(s) into {}", lib.display());
         }
         ImportCmd::PartsCsv { file, lib } => {
             let bytes = std::fs::read(&file).map_err(e)?;
@@ -1874,6 +1960,85 @@ fn export_wago_marking(dir: &Path, out: &Path, kinds: &[String]) -> Res<Exported
     })
 }
 
+/// Import a BMEcat catalogue's parts into a library folder. Files that are not UTF-8 are read
+/// as Latin-1, which BMEcat 1.2 catalogues often declare. Returns the count and warnings.
+fn import_bmecat(file: &Path, lib: &Path) -> Res<(usize, Vec<String>)> {
+    let bytes = std::fs::read(file).map_err(e)?;
+    let (parts, warnings) = wc_import::bmecat::parts(&wc_import::csv::decode(&bytes)).map_err(e)?;
+    for p in &parts {
+        wc_library::write_part(lib, p).map_err(e)?;
+    }
+    Ok((parts.len(), warnings))
+}
+
+/// Import QElectroTech elements into a symbol library folder, one symbol per file. A file that
+/// cannot be read is reported and skipped. Returns how many were written and how many failed.
+fn import_qet(
+    files: &[PathBuf],
+    lib: &Path,
+    prefix: &str,
+    scale: f64,
+    category: &str,
+    letter_code: &str,
+) -> Res<(usize, usize)> {
+    use std::io::Read;
+    let (mut written, mut failed) = (0, 0);
+    // Two files whose names give the same id would overwrite each other: the later one fails.
+    let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
+    for file in files {
+        let stem: String = file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let id = format!("{}.{stem}", prefix.trim_end_matches('.'));
+        let read = match ids.get(&id) {
+            Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
+            None => std::fs::File::open(file)
+                .and_then(|f| {
+                    // Read at most one byte past the limit, so a huge file is refused cheaply.
+                    let mut text = String::new();
+                    f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
+                    Ok(text)
+                })
+                .map_err(e)
+                .and_then(|text| wc_import::qet::element(&text, &id, scale).map_err(e)),
+        };
+        let (mut imp, warnings) = match read {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("error: {}: {err}", file.display());
+                failed += 1;
+                continue;
+            }
+        };
+        ids.insert(id, file.clone());
+        for w in warnings {
+            eprintln!("warning: {}: {w}", file.display());
+        }
+        imp.symbol.category = category.to_owned();
+        imp.symbol.letter_code = letter_code.to_owned();
+        let path = wc_library::write_symbol(lib, &imp.symbol).map_err(e)?;
+        println!(
+            "{} -> {} ({} pins, {} shapes)",
+            imp.qet_name,
+            path.display(),
+            imp.symbol.pins.len(),
+            imp.symbol.graphics.len()
+        );
+        written += 1;
+    }
+    Ok((written, failed))
+}
+
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
     p.devices
         .values()
@@ -2119,6 +2284,91 @@ mod tests {
                 .contains("no location")
         );
         assert!(cli(&dir, &["location", "set", "+L1-K1", "x"]).is_err());
+    }
+
+    #[test]
+    fn jumpers_are_added_listed_and_removed_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let saved = load(&dir).unwrap().meta.jumpers;
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            (&saved[0].strip, saved[0].terminals.as_slice()),
+            (&x1, ["3", "4"].map(String::from).as_slice())
+        );
+        cli(&dir, &["jumper", "list"]).unwrap();
+        cli(&dir, &["jumper", "add", "--", "-X1", "4", "5"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["3", "4", "5"]);
+        cli(&dir, &["jumper", "remove", "--", "-X1", "4"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["3", "5"]);
+        let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
+        assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
+        assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn bmecat_parts_land_in_the_library_also_from_latin1_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("cat.xml");
+        let mut bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><BMECAT version=\"1.2\"><T_NEW_CATALOG><ARTICLE><SUPPLIER_AID>K1</SUPPLIER_AID><ARTICLE_DETAILS><DESCRIPTION_SHORT>Sch".to_vec();
+        bytes.push(0xFC); // ü in Latin-1
+        bytes.extend_from_slice(b"tz</DESCRIPTION_SHORT><MANUFACTURER_NAME>Acme</MANUFACTURER_NAME></ARTICLE_DETAILS></ARTICLE></T_NEW_CATALOG></BMECAT>");
+        std::fs::write(&file, bytes).unwrap();
+        let lib = tmp.path().join("lib");
+        let (n, warnings) = import_bmecat(&file, &lib).unwrap();
+        assert_eq!(n, 1, "{warnings:?}");
+        let json = std::fs::read_to_string(lib.join("parts").join("acme.k1.json")).unwrap();
+        let p: wc_core::Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(p.description, "Schütz");
+
+        std::fs::write(&file, "<catalog/>").unwrap();
+        assert!(import_bmecat(&file, &lib).is_err());
+    }
+
+    #[test]
+    fn qet_elements_land_in_the_library_and_bad_files_are_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = tmp.path().join("Lamp Red.elmt");
+        std::fs::write(
+            &good,
+            r#"<definition type="element"><names><name lang="en">Lamp</name></names><description>
+<circle x="-5" y="-5" diameter="10"/><terminal x="-10" y="0" orientation="w"/><terminal x="10" y="0" orientation="e"/>
+</description></definition>"#,
+        )
+        .unwrap();
+        let bad = tmp.path().join("bad.elmt");
+        std::fs::write(&bad, "<svg/>").unwrap();
+        // Same id as the good file once normalised: refused, the first one is kept.
+        let same = tmp.path().join("lamp_red.elmt");
+        std::fs::write(
+            &same,
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>",
+        )
+        .unwrap();
+        // Over the size limit: refused without reading it all.
+        let huge = tmp.path().join("huge.elmt");
+        std::fs::write(&huge, vec![b' '; wc_import::qet::MAX_LEN + 10]).unwrap();
+        let lib = tmp.path().join("lib");
+        let (written, failed) = import_qet(&[good, bad, same, huge], &lib, "qet.", 0.5, "Lamps", "P").unwrap();
+        assert_eq!((written, failed), (1, 3));
+        let json = std::fs::read_to_string(lib.join("symbols").join("qet.lamp_red.json")).unwrap();
+        let s: wc_core::Symbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (s.name.as_str(), s.category.as_str(), s.letter_code.as_str()),
+            ("Lamp", "Lamps", "P")
+        );
+        assert_eq!(s.pins.len(), 2);
+
+        let cli =
+            Cli::try_parse_from(["wiringcraft", "import", "symbol-qet", "a.elmt", "b.elmt", "--lib", "l"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Import(ImportCmd::SymbolQet { ref files, scale, .. }) if files.len() == 2 && scale == 0.5
+        ));
+        assert!(Cli::try_parse_from(["wiringcraft", "import", "symbol-qet", "--lib", "l"]).is_err());
     }
 
     #[test]

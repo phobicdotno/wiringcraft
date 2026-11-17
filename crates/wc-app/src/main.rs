@@ -30,15 +30,7 @@ use state::{Open, Selection, Tool};
 use wc_core::project::PageSize;
 
 /// Title-block fields offered in the project properties, in this order.
-const TITLE_FIELDS: &[(&str, &str)] = &[
-    ("customer", "Customer"),
-    ("project_number", "Project number"),
-    ("plant", "Plant"),
-    ("drawn_by", "Drawn by"),
-    ("checked_by", "Checked by"),
-    ("revision", "Revision"),
-    ("date", "Date"),
-];
+use wc_core::project::TITLE_FIELDS;
 
 enum Dialog {
     /// The folder field, and why the last Browse could not be used.
@@ -58,6 +50,17 @@ enum Dialog {
         /// The locations as the dialog opened with them: when they are unchanged, OK leaves the
         /// project's own (an assistant command may have changed them meanwhile).
         loaded_locations: Vec<(String, String)>,
+    },
+    /// The cover page form: changes show on the page as they are typed; `since` is the undo
+    /// mark from when it opened, so OK keeps them as one undo step and Cancel takes them back.
+    Cover {
+        name: String,
+        fields: Vec<(String, String)>,
+        since: usize,
+        before: state::PropsSnapshot,
+        /// The project's history count the buffer last matched; when it moves without the
+        /// form (an undo, the assistant), the buffer is reloaded from the project.
+        seen: u64,
     },
     PageProps {
         number: String,
@@ -484,16 +487,6 @@ impl App {
             }
             Action::DeletePage => self.dialog = Some(Dialog::DeletePage(page)),
             Action::ProjectProps => {
-                let block = &open.project.meta.title_block;
-                let mut fields: Vec<(String, String)> = TITLE_FIELDS
-                    .iter()
-                    .map(|(k, _)| ((*k).to_owned(), block.get(*k).cloned().unwrap_or_default()))
-                    .collect();
-                for (k, v) in block {
-                    if !TITLE_FIELDS.iter().any(|(f, _)| f == k) {
-                        fields.push((k.clone(), v.clone()));
-                    }
-                }
                 let locations: Vec<(String, String)> = open
                     .project
                     .meta
@@ -503,9 +496,35 @@ impl App {
                     .collect();
                 self.dialog = Some(Dialog::ProjectProps {
                     name: open.project.meta.name.clone(),
-                    fields,
+                    fields: form_fields(&open.project.meta.title_block),
                     loaded_locations: locations.clone(),
                     locations,
+                });
+            }
+            Action::CoverPage => {
+                // Compare page ids: a new cover can take the index the shown page had.
+                let shown = open.project.pages.get(self.ed.page).map(|p| p.id.clone());
+                let i = match open.cover_page() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        self.dialog = Some(Dialog::Message(e));
+                        return;
+                    }
+                };
+                let cover = open.project.pages.get(i).map(|p| p.id.clone());
+                if shown != cover || self.ed.panel.is_some() {
+                    self.ed.panel = None;
+                    self.ed.selection.clear();
+                    self.ed.wire = None;
+                }
+                self.ed.page = i;
+                self.ed.view.fit = true;
+                self.dialog = Some(Dialog::Cover {
+                    name: open.project.meta.name.clone(),
+                    fields: form_fields(&open.project.meta.title_block),
+                    since: open.start_live_form(),
+                    before: open.props_snapshot(),
+                    seen: open.history_count(),
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
@@ -584,30 +603,14 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
-        let mut out = Vec::new();
-        let ctrl = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
-        ctx.input_mut(|i| {
-            for (k, a) in [
-                (Key::S, Action::Save),
-                (Key::Z, Action::Undo),
-                (Key::Y, Action::Redo),
-                (Key::O, Action::Open),
-                (Key::N, Action::AddPage),
-                (Key::P, Action::ExportPdf),
-                (Key::K, Action::Commit),
-                (Key::R, Action::Reports),
-                (Key::E, Action::Check),
-                (Key::A, Action::SelectAll),
-                (Key::J, Action::Assistant),
-            ] {
-                if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
-                    out.push(Action::NewProject);
-                } else if i.consume_shortcut(&ctrl(k)) {
-                    out.push(a);
-                }
-            }
-        });
-        if ctx.wants_keyboard_input() || self.dialog.is_some() {
+        // An open dialog takes the keyboard: a shortcut would change the project under it (the
+        // cover form's Cancel takes back only what the form changed).
+        let dialog_open = self.dialog.is_some();
+        let mut out = ctrl_shortcuts(ctx, dialog_open);
+        if dialog_open {
+            return out;
+        }
+        if ctx.wants_keyboard_input() {
             return out;
         }
         ctx.input(|i| {
@@ -659,6 +662,7 @@ impl App {
             Dialog::OpenPath(..) => "Open project",
             Dialog::NewProject { .. } => "New project",
             Dialog::ProjectProps { .. } => "Project properties",
+            Dialog::Cover { .. } => "Cover page",
             Dialog::PageProps { .. } => "Page properties",
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
@@ -681,7 +685,19 @@ impl App {
             .collapsible(false)
             .resizable(true)
             .min_width(if wide { (screen.width() * 0.75).min(1100.0) } else { 0.0 })
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            // The cover form sits at the side, so the page it changes stays in view.
+            .anchor(
+                if matches!(dialog, Dialog::Cover { .. }) {
+                    egui::Align2::RIGHT_TOP
+                } else {
+                    egui::Align2::CENTER_CENTER
+                },
+                if matches!(dialog, Dialog::Cover { .. }) {
+                    Vec2::new(-16.0, 96.0)
+                } else {
+                    Vec2::ZERO
+                },
+            )
             .show(ctx, |ui| match &mut dialog {
                 Dialog::SaveMacro {
                     clip,
@@ -924,8 +940,7 @@ impl App {
                             ui.add(egui::TextEdit::singleline(name).desired_width(300.0));
                             ui.end_row();
                             for (k, v) in fields.iter_mut() {
-                                let label = TITLE_FIELDS.iter().find(|(f, _)| f == k).map_or(k.as_str(), |(_, l)| l);
-                                ui.label(label);
+                                ui.label(wc_core::project::title_field_label(k));
                                 ui.add(egui::TextEdit::singleline(v).desired_width(300.0));
                                 ui.end_row();
                             }
@@ -990,6 +1005,54 @@ impl App {
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::Cover {
+                    name,
+                    fields,
+                    since,
+                    before,
+                    seen,
+                } => {
+                    if let Some(now) = self.open.as_ref().and_then(|o| o.props_if_changed(seen)) {
+                        *name = now.name;
+                        *fields = form_fields(&now.title_block);
+                    }
+                    let mut changed = false;
+                    egui::Grid::new("cover")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Project name");
+                            changed |= ui.add(egui::TextEdit::singleline(name).desired_width(300.0)).changed();
+                            ui.end_row();
+                            for (k, v) in fields.iter_mut() {
+                                ui.label(wc_core::project::title_field_label(k));
+                                changed |= ui.add(egui::TextEdit::singleline(v).desired_width(300.0)).changed();
+                                ui.end_row();
+                            }
+                        });
+                    if changed && let Some(o) = self.open.as_mut() {
+                        o.set_project_props_live(name, fields);
+                        *seen = o.history_count();
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Shown on the cover and in the title block of every page as you type. \
+                             Add free text on the cover with the Text tool.",
+                        )
+                        .color(theme::Theme::of(ui.ctx()).faint),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            if let Some(o) = self.open.as_mut() {
+                                o.revert_live(*since, before);
+                            }
                             keep = false;
                         }
                     });
@@ -1674,6 +1737,52 @@ fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
         });
 }
 
+/// A project's title-block fields as form rows: the standard fields first (empty when not
+/// set), then any others the project has.
+/// The Ctrl shortcuts pressed this frame, none while a dialog is open.
+fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
+    let mut out = Vec::new();
+    if dialog_open {
+        return out;
+    }
+    let ctrl = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
+    ctx.input_mut(|i| {
+        for (k, a) in [
+            (Key::S, Action::Save),
+            (Key::Z, Action::Undo),
+            (Key::Y, Action::Redo),
+            (Key::O, Action::Open),
+            (Key::N, Action::AddPage),
+            (Key::P, Action::ExportPdf),
+            (Key::K, Action::Commit),
+            (Key::R, Action::Reports),
+            (Key::E, Action::Check),
+            (Key::A, Action::SelectAll),
+            (Key::J, Action::Assistant),
+        ] {
+            if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
+                out.push(Action::NewProject);
+            } else if i.consume_shortcut(&ctrl(k)) {
+                out.push(a);
+            }
+        }
+    });
+    out
+}
+
+fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = TITLE_FIELDS
+        .iter()
+        .map(|(k, _)| ((*k).to_owned(), block.get(*k).cloned().unwrap_or_default()))
+        .collect();
+    for (k, v) in block {
+        if !TITLE_FIELDS.iter().any(|(f, _)| f == k) {
+            fields.push((k.clone(), v.clone()));
+        }
+    }
+    fields
+}
+
 fn export_pdf(open: &Open) -> String {
     let name: String = open
         .project
@@ -2135,6 +2244,29 @@ fn restart_with_wgpu(why: &str, wait: bool) {
 #[cfg(test)]
 mod renderer_tests {
     use super::*;
+
+    #[test]
+    fn ctrl_shortcuts_wait_while_a_dialog_is_open() {
+        let ctx = egui::Context::default();
+        let press = |dialog_open: bool| {
+            let raw = egui::RawInput {
+                modifiers: Modifiers::COMMAND,
+                events: vec![egui::Event::Key {
+                    key: Key::N,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            };
+            let mut got = Vec::new();
+            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, dialog_open));
+            got
+        };
+        assert!(press(true).is_empty(), "Ctrl+N does nothing under a dialog");
+        assert!(matches!(press(false).as_slice(), [Action::AddPage]));
+    }
 
     #[test]
     fn opengl_is_the_default_and_wgpu_can_be_picked() {

@@ -24,6 +24,7 @@ pub enum Icon {
     Cut,
     Paste,
     PageAdd,
+    Cover,
     PageCopy,
     PageProps,
     PageUp,
@@ -257,6 +258,19 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
             );
             p.line_segment([at(8.5, 11.0), at(15.5, 11.0)], thin);
             p.line_segment([at(8.5, 15.0), at(15.5, 15.0)], thin);
+        }
+        Icon::Cover => {
+            // A sheet with a big title line and a small field table under it.
+            p.rect_stroke(
+                Rect::from_min_max(at(4.0, 3.0), at(20.0, 21.0)),
+                1.0 * s,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
+            aline((7.5, 8.0), (16.5, 8.0));
+            for y in [13.0, 16.0] {
+                p.line_segment([at(8.0, y), at(16.0, y)], thin);
+            }
         }
         Icon::PageCopy => {
             poly(&[(3.0, 17.0), (3.0, 3.0), (13.0, 3.0)], false);
