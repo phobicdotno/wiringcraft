@@ -379,8 +379,36 @@ fn messages_survive_a_json_line() -> TestResult {
             name: "H".into(),
             page: Some("p0001".into()),
         }],
+        history: vec![ChangeInfo {
+            id: 1,
+            by: 0,
+            name: "H".into(),
+            message: "Edit page 1 Cover".into(),
+            page: Some("p0001".into()),
+            kind: ChangeKind::Edit,
+            reverts: None,
+            undone_by: None,
+        }],
     };
     assert_eq!(decode::<HostMsg>(&encode(&welcome)?)?, welcome);
+    // A welcome from a host without undo still reads.
+    let old = r#"{"type":"welcome","you":1,"project":"#.to_owned()
+        + &serde_json::to_string(&Snapshot::from(&demo()))?
+        + r#","locks":{},"peers":[]}"#;
+    assert!(matches!(decode::<HostMsg>(&old)?, HostMsg::Welcome { history, .. } if history.is_empty()));
+    for m in [GuestMsg::Undo, GuestMsg::Redo, GuestMsg::Revert { change: 7 }] {
+        assert_eq!(decode::<GuestMsg>(&encode(&m)?)?, m);
+    }
+    let mut parts = Parts::default();
+    parts.pages.insert("p0002".into(), None);
+    parts
+        .devices
+        .insert(wc_core::DeviceTag::parse("-K1")?, Some(Device::default()));
+    let restore = HostMsg::ProjectChanged {
+        edit: ProjectEdit::Restore { parts: Box::new(parts) },
+        by: 2,
+    };
+    assert_eq!(decode::<HostMsg>(&encode(&restore)?)?, restore);
     assert!(decode::<GuestMsg>("{\"type\":\"nope\"}").is_err());
     Ok(())
 }
@@ -1283,4 +1311,192 @@ fn several_pages_change_in_one_commit_unless_someone_else_has_one_open() -> Test
     );
     assert_eq!(s.log.0.borrow().len(), 1);
     Ok(())
+}
+
+#[test]
+fn undo_takes_back_only_your_own_change() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    a_link.send(a.open(Some("p0002")))?;
+    b_link.send(b.open(Some("p0003")))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+
+    let mut pa = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("no page")?;
+    place(&mut pa, "s1", 10.0);
+    a_link.send(a.edit_page(pa).ok_or("not editable")?)?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    let mut pb = b
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0003"))
+        .cloned()
+        .ok_or("no page")?;
+    place(&mut pb, "s2", 20.0);
+    b_link.send(b.edit_page(pb.clone()).ok_or("not editable")?)?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(a.can_undo() && !a.can_redo());
+
+    // Ola's undo takes back Ola's page only; Kari's later change stays.
+    a_link.send(a.undo())?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    let host = s.host.project();
+    assert!(host.page("p0002").is_some_and(|p| p.symbols.is_empty()));
+    assert_eq!(host.page("p0003"), Some(&pb));
+    assert_eq!(a.project.as_ref(), Some(host));
+    assert_eq!(b.project.as_ref(), Some(host));
+    assert!(!a.can_undo() && a.can_redo());
+    assert!(b.can_undo());
+    assert_eq!(a.history, s.host.history());
+    assert_eq!(b.history, s.host.history());
+
+    // Redo puts it back; both are commits by Ola.
+    a_link.send(a.redo())?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(s.host.project().page("p0002").map(|p| p.symbols.len()), Some(1));
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    let log = s.log.0.borrow();
+    let last: Vec<_> = log
+        .iter()
+        .rev()
+        .take(2)
+        .map(|c| (c.message.as_str(), c.author.as_str()))
+        .collect();
+    assert_eq!(
+        last,
+        [
+            ("Redo: Edit page 2 Motor", "Ola <ola@example.com>"),
+            ("Undo: Edit page 2 Motor", "Ola <ola@example.com>"),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn anyones_change_can_be_taken_back_from_the_list() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    let tag = wc_core::DeviceTag::parse("-K1")?;
+    let device = |d: &str| Device {
+        description: d.into(),
+        ..Default::default()
+    };
+    a_link.send(a.edit_project(ProjectEdit::SetDevice {
+        tag: tag.clone(),
+        device: Some(device("Ola's")),
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    let first = b.history.last().map(|c| c.id).ok_or("not in the list")?;
+
+    // Kari takes back Ola's change: the device is gone for everyone, recorded as Kari's.
+    b_link.send(b.revert(first))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(!s.host.project().devices.contains_key(&tag));
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert_eq!(
+        s.log.0.borrow().last().map(|c| (c.message.clone(), c.author.clone())),
+        Some(("Undo: Change device -K1".into(), "Kari <kari@example.com>".into()))
+    );
+    assert!(a.history.iter().any(|c| c.id == first && c.undone_by.is_some()));
+    // Ola has nothing left to undo: the change was taken back already.
+    assert!(!a.can_undo());
+
+    // Taking back a change whose parts were changed again since is refused.
+    a_link.send(a.edit_project(ProjectEdit::SetDevice {
+        tag: tag.clone(),
+        device: Some(device("v1")),
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    let v1 = a.history.last().map(|c| c.id).ok_or("not in the list")?;
+    b_link.send(b.edit_project(ProjectEdit::SetDevice {
+        tag: tag.clone(),
+        device: Some(device("v2")),
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    a_link.send(a.revert(v1))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(matches!(a.refusals.last(), Some(Refusal::Invalid { .. })));
+    assert_eq!(
+        s.host.project().devices.get(&tag).map(|d| d.description.as_str()),
+        Some("v2")
+    );
+    Ok(())
+}
+
+#[test]
+fn undoing_a_removed_page_brings_it_back_with_its_comments_unless_someone_holds_a_page() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    let comment = Comment {
+        id: "c1".into(),
+        page: "p0003".into(),
+        at: Some(Point::new(1.0, 2.0)),
+        author: "Ola".into(),
+        time: 0,
+        text: "check".into(),
+        resolved: false,
+        replies: Vec::new(),
+    };
+    a_link.send(a.edit_project(ProjectEdit::SetComments {
+        page: "p0003".into(),
+        comments: vec![comment],
+    }))?;
+    a_link.send(a.edit_project(ProjectEdit::RemovePage { id: "p0003".into() }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(s.host.project().page("p0003").is_none() && s.host.project().comments.is_empty());
+
+    a_link.send(a.undo())?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(s.host.project().page("p0003").is_some());
+    assert_eq!(s.host.project().comments.len(), 1);
+    assert_eq!(b.project.as_ref(), Some(s.host.project()));
+
+    // An undo that would change a page someone else has open is refused, and nothing changes.
+    a_link.send(a.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0003".into(), "9".into())],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    b_link.send(b.open(Some("p0003")))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    let before = s.host.project().clone();
+    a_link.send(a.undo())?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(matches!(a.refusals.last(), Some(Refusal::PageLocked { .. })));
+    assert_eq!(s.host.project(), &before);
+
+    // The host's own undo works the same way.
+    s.host.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0009", "9.1", "Spare"),
+    })?;
+    s.host.undo()?;
+    assert!(s.host.project().page("p0009").is_none());
+    assert!(s.host.undo().is_err(), "the host has nothing more to undo");
+    s.host.redo()?;
+    assert!(s.host.project().page("p0009").is_some());
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    Ok(())
+}
+
+#[test]
+fn a_change_list_entry_is_kept_in_step_with_the_parts() {
+    let before = demo();
+    let mut after = before.clone();
+    after.pages.retain(|p| p.id != "p0002");
+    after.meta.name = "Other".into();
+    let (was, now) = Parts::delta(&before, &after);
+    assert_eq!(was.pages.len(), 1);
+    assert!(now.pages.values().all(Option::is_none));
+    assert_eq!(Parts::read(&after, &now), now);
+    let mut back = after.clone();
+    was.apply(&mut back);
+    assert_eq!(back, before);
+    assert!(Parts::delta(&before, &before).0.is_empty());
 }

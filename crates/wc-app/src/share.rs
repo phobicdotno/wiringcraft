@@ -20,6 +20,7 @@ use wc_core::{Page, Project, store};
 use wc_share::discovery::{Announcer, Beacon, Browser};
 use wc_share::net::{self, Listener};
 use wc_share::transport::{GuestLink, Hub};
+use wc_share::{ChangeInfo, ChangeKind, redo_target, undo_target};
 use wc_share::{GitJournal, Guest, GuestMsg, GuestStatus, HOST, Host, Peer, PeerId, ProjectEdit, apply_edit};
 
 use crate::state::Open;
@@ -378,6 +379,38 @@ impl Role {
         }
     }
 
+    fn history(&self) -> Vec<ChangeInfo> {
+        match self {
+            Role::Host(h) => h.host.history(),
+            Role::Guest(j) => j.guest.history.clone(),
+        }
+    }
+
+    /// Undo, redo, or take back one change from the list (`Some(id)` with `redo` false).
+    fn take_back(&mut self, redo: bool, change: Option<u64>, notes: &mut Vec<String>) {
+        match self {
+            Role::Host(h) => {
+                let result = match (redo, change) {
+                    (_, Some(id)) => h.host.revert(id),
+                    (true, None) => h.host.redo(),
+                    (false, None) => h.host.undo(),
+                };
+                if let Err(e) = result {
+                    notes.push(format!("Nothing was taken back: {e}"));
+                }
+                h.hub.flush(&mut h.host);
+            }
+            Role::Guest(j) => {
+                let msg = match (redo, change) {
+                    (_, Some(id)) => j.guest.revert(id),
+                    (true, None) => j.guest.redo(),
+                    (false, None) => j.guest.undo(),
+                };
+                send(&j.link, msg, notes);
+            }
+        }
+    }
+
     /// Leave (a guest) or end (the host) the session.
     fn stop(&mut self) {
         match self {
@@ -477,6 +510,45 @@ impl Share {
                 }
                 Err(e) => form.browse_error = Some(e.to_string()),
             }
+        }
+    }
+
+    /// Whether Undo in the session has a change of this person's to take back.
+    pub fn can_undo(&self) -> bool {
+        self.role
+            .as_ref()
+            .and_then(|r| Some(undo_target(&r.history(), r.me()?)))
+            .is_some_and(|t| t.is_some())
+    }
+
+    /// Whether Redo in the session has an undo of this person's to take back.
+    pub fn can_redo(&self) -> bool {
+        self.role
+            .as_ref()
+            .and_then(|r| Some(redo_target(&r.history(), r.me()?)))
+            .is_some_and(|t| t.is_some())
+    }
+
+    /// Take back this person's own last change in the session. The host puts back only the
+    /// parts that change touched, so other people's work stays; the result reaches this
+    /// window with the next frame's sync.
+    pub fn undo(&mut self) {
+        if let Some(role) = self.role.as_mut() {
+            role.take_back(false, None, &mut self.notes);
+        }
+    }
+
+    /// Take back this person's own last undo in the session.
+    pub fn redo(&mut self) {
+        if let Some(role) = self.role.as_mut() {
+            role.take_back(true, None, &mut self.notes);
+        }
+    }
+
+    /// Take back one change from the session's list, also someone else's.
+    pub fn revert(&mut self, change: u64) {
+        if let Some(role) = self.role.as_mut() {
+            role.take_back(false, Some(change), &mut self.notes);
         }
     }
 
@@ -847,6 +919,8 @@ impl Share {
         };
         let mut keep = true;
         let mut stop = false;
+        let mut revert = None;
+        let history = role.history();
         let pages: BTreeMap<String, String> = role
             .project()
             .map(|p| p.pages.iter().map(|pg| (pg.id.clone(), pg.number.clone())).collect())
@@ -886,12 +960,39 @@ impl Share {
                     ui.label(format!("{}{you}{page}", p.name));
                 }
                 ui.separator();
+                ui.label(RichText::new("Changes").strong());
+                if history.is_empty() {
+                    ui.label("No changes yet.");
+                }
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    for c in history.iter().rev() {
+                        ui.horizontal(|ui| {
+                            let text = format!("{} · {}", c.name, c.message);
+                            if c.undone_by.is_some() {
+                                ui.label(RichText::new(text).strikethrough().weak());
+                            } else {
+                                ui.label(text);
+                                let tip = match c.kind {
+                                    ChangeKind::Edit => "Put back what this change touched, for everyone",
+                                    _ => "Take this undo or redo back, for everyone",
+                                };
+                                if ui.small_button("Undo this change").on_hover_text(tip).clicked() {
+                                    revert = Some(c.id);
+                                }
+                            }
+                        });
+                    }
+                });
+                ui.separator();
                 let label = match role {
                     Role::Host(_) => "Stop sharing",
                     Role::Guest(_) => "Leave",
                 };
                 stop = ui.button(label).clicked();
             });
+        if let Some(id) = revert {
+            self.revert(id);
+        }
         if stop {
             self.stop();
         } else if !keep {

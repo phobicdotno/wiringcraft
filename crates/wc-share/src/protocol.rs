@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use wc_core::panel::Panel;
 use wc_core::{Comment, Device, DeviceTag, Page, Project, ProjectMeta};
 
+use crate::{ChangeInfo, Parts};
+
 /// A participant's number in a session. The host is always [`crate::HOST`].
 pub type PeerId = u32;
 
@@ -32,6 +34,12 @@ pub enum GuestMsg {
     EditPage { page: Page },
     /// A change to project-level data.
     EditProject { edit: ProjectEdit },
+    /// Take back this guest's own last change (see [`crate::undo_target`]).
+    Undo,
+    /// Take back this guest's own last undo (see [`crate::redo_target`]).
+    Redo,
+    /// Take back one change from the session's list, whoever made it.
+    Revert { change: u64 },
     /// Leave the session; every lock is released.
     Leave,
 }
@@ -63,6 +71,9 @@ pub enum ProjectEdit {
     /// since, the edit is refused, so a copy that had not yet seen someone else's change cannot
     /// undo it. Also refused as a whole when someone else has one of the pages open.
     SetPages { pages: Vec<Page>, before: Vec<Page> },
+    /// Put parts of the project back as they were: what an undo sends. The host makes it
+    /// only after checking the parts are still as the undone change left them.
+    Restore { parts: Box<Parts> },
 }
 
 impl ProjectEdit {
@@ -82,6 +93,7 @@ impl ProjectEdit {
                 [p] => format!("Edit page {} {}", p.number, p.title),
                 _ => format!("Edit {} pages", pages.len()),
             },
+            Self::Restore { .. } => "Put back an earlier state".to_owned(),
         }
     }
 
@@ -172,6 +184,9 @@ pub enum HostMsg {
         project: Box<Snapshot>,
         locks: BTreeMap<String, PeerId>,
         peers: Vec<Peer>,
+        /// The session's changes so far, for undo and the change list.
+        #[serde(default)]
+        history: Vec<ChangeInfo>,
     },
     /// The host declined the join request. The connection should be closed.
     Declined,
@@ -180,6 +195,8 @@ pub enum HostMsg {
     /// A project-level change was applied (sent to everyone, the author included, so all
     /// copies apply the same edits in the same order).
     ProjectChanged { edit: ProjectEdit, by: PeerId },
+    /// A change was recorded in the history (sent to everyone after the change itself).
+    Recorded { change: ChangeInfo },
     /// Who holds which page now: page id to participant.
     Locks { locks: BTreeMap<String, PeerId> },
     /// Who is in the session now.
@@ -237,6 +254,7 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
             project.sort_pages();
         }
         ProjectEdit::SetMeta { meta } => project.meta = (**meta).clone(),
+        ProjectEdit::Restore { parts } => parts.apply(project),
         ProjectEdit::SetPages { pages, .. } => {
             for page in pages {
                 if let Some(p) = project.page_mut(&page.id) {
@@ -324,6 +342,32 @@ pub(crate) fn check_edit(
             Ok(())
         }
         ProjectEdit::SetMeta { .. } => Ok(()),
+        ProjectEdit::Restore { parts } => {
+            for (id, page) in &parts.pages {
+                if let Some(page) = page
+                    && (page.id != *id || wc_core::store::check_id(id).is_err())
+                {
+                    return invalid(format!("page id {id} is not valid"));
+                }
+                match locks.get(id) {
+                    Some(&holder) if holder != by => {
+                        return Err(Refusal::PageLocked {
+                            page: id.clone(),
+                            by: holder,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            for (id, panel) in &parts.panels {
+                if let Some(panel) = panel
+                    && (panel.id != *id || wc_core::store::check_id(id).is_err())
+                {
+                    return invalid(format!("panel id {id} is not valid"));
+                }
+            }
+            Ok(())
+        }
         ProjectEdit::SetPages { pages, before } => {
             if pages.len() != before.len() || pages.iter().zip(before).any(|(p, b)| p.id != b.id) {
                 return invalid("the pages and what they were before do not match".into());

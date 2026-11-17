@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use wc_core::{Page, Project};
 
+use crate::{ChangeInfo, note, redo_target, undo_target};
 use crate::{GuestMsg, HostMsg, Peer, PeerId, ProjectEdit, Refusal, apply_edit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +29,8 @@ pub struct Guest {
     pub project: Option<Project>,
     pub locks: BTreeMap<String, PeerId>,
     pub peers: Vec<Peer>,
+    /// The session's recorded changes, oldest first.
+    pub history: Vec<ChangeInfo>,
     /// Refusals from the host not yet shown to the user.
     pub refusals: Vec<Refusal>,
     /// A page switch the host has not answered yet: the page asked for.
@@ -52,6 +55,7 @@ impl Guest {
             project: None,
             locks: BTreeMap::new(),
             peers: Vec::new(),
+            history: Vec::new(),
             refusals: Vec::new(),
             switching: None,
             in_flight: BTreeMap::new(),
@@ -115,6 +119,31 @@ impl Guest {
         GuestMsg::EditProject { edit }
     }
 
+    /// Whether Undo has a change of this guest's to take back.
+    pub fn can_undo(&self) -> bool {
+        self.me.is_some_and(|me| undo_target(&self.history, me).is_some())
+    }
+
+    /// Whether Redo has an undo of this guest's to take back.
+    pub fn can_redo(&self) -> bool {
+        self.me.is_some_and(|me| redo_target(&self.history, me).is_some())
+    }
+
+    /// Take back this guest's last change. The host puts back only what that change touched
+    /// and sends the result to everyone.
+    pub fn undo(&self) -> GuestMsg {
+        GuestMsg::Undo
+    }
+
+    pub fn redo(&self) -> GuestMsg {
+        GuestMsg::Redo
+    }
+
+    /// Take back one change from the session's list, also someone else's.
+    pub fn revert(&self, change: u64) -> GuestMsg {
+        GuestMsg::Revert { change }
+    }
+
     pub fn handle(&mut self, msg: HostMsg) {
         match msg {
             HostMsg::Waiting => self.status = GuestStatus::Waiting,
@@ -123,7 +152,9 @@ impl Guest {
                 project,
                 locks,
                 peers,
+                history,
             } => {
+                self.history = history;
                 self.status = GuestStatus::Joined;
                 self.me = Some(you);
                 self.project = Some((*project).into());
@@ -148,6 +179,7 @@ impl Guest {
                     apply_edit(p, &edit);
                 }
             }
+            HostMsg::Recorded { change } => note(&mut self.history, change),
             HostMsg::Locks { locks } => {
                 if let Some(asked) = &self.switching {
                     let done = match asked {
