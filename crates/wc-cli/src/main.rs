@@ -170,7 +170,8 @@ enum Cmd {
     },
     /// Find text in free texts, device tags, wire numbers, potentials and device descriptions
     /// on every page; one hit per line: page, kind, value. With --replace, replace it in every
-    /// hit (a device tag renames the device everywhere it appears).
+    /// hit (a device tag renames the device everywhere it appears). Status lines go to stderr,
+    /// so stdout holds only hits.
     Find {
         query: String,
         /// Replace the found text with this, in every hit.
@@ -1106,9 +1107,9 @@ fn run(cli: Cli) -> Res<()> {
                 if n > 0 {
                     save(dir, &p)?;
                 }
-                println!("replaced {n} value(s)");
+                eprintln!("replaced {n} value(s)");
             } else if hits.is_empty() {
-                println!("nothing found");
+                eprintln!("nothing found");
             }
         }
         Cmd::Check { all } => {
