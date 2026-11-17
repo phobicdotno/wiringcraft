@@ -332,8 +332,8 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
     line((fx[0], mid), (fx[1], mid), Ink::Thin, &mut out);
     line((fx[0] + 40.0, mid), (fx[0] + 40.0, y1), Ink::Thin, &mut out);
     line((fx[2], mid), (x1, mid), Ink::Thin, &mut out);
-    let tb = &project.meta.title_block;
-    let get = |k: &str| tb.get(k).map(String::as_str).unwrap_or("");
+    // The page's own fields (its revision, date, ...) win over the project's.
+    let get = |k: &str| page.title_field(&project.meta, k);
     let field = |x: f64, y: f64, label: &str, value: &str, height: f64, out: &mut Vec<FrameMark>| {
         text((x + 1.5, y + 3.0), 1.8, Align::Left, label, Ink::Label, out);
         text((x + 1.5, y + 9.5), height, Align::Left, value, Ink::Thin, out);

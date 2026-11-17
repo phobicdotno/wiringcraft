@@ -39,7 +39,7 @@ These branches can be deleted once their pull requests are merged.
 |---|---|---|
 | EDZ exchange files: parts are read, EPLAN macros (`.ema`) only counted | `crates/wc-import/src/edz.rs` | #144 |
 | SolidWorks Electrical: symbol and page graphics from DWG | `crates/wc-import/src/swe.rs` | #59 |
-| SolidWorks Electrical: cover page | `crates/wc-import/src/swe.rs` | #61 |
+| SolidWorks Electrical: page revisions are read from `tew_revision` by column name (the layout is not published), checked on synthetic databases only; the project's own revision and checked-by are not read | `crates/wc-import/src/swe.rs` | PR for #61 |
 | SolidWorks Electrical libraries (`import swe-library`): catalog parts bring their terminals as a text property, not as pins of a symbol; library blocks are box symbols until the DWG reader draws them | `crates/wc-import/src/swe/library.rs` | #59 |
 | SolidWorks Electrical: terminal jumpers made in the terminal strip editor are counted in the import report, not imported (WiringCraft has no jumpers yet) | `crates/wc-import/src/swe.rs` | #108 |
 | PDF trace: pictures compressed other than Flate or DCT, or not 1-bit gray, 8-bit gray or 8-bit RGB, are refused ("not supported yet") | `crates/wc-import/src/pdf.rs` | To file next (todo limit per run reached) |
