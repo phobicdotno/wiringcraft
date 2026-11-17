@@ -2391,6 +2391,11 @@ mod tests {
         let saved = later_library_with_a_coil(&mut a, root.path());
         a.symbol_saved(saved);
         assert!(a.ed.message.contains("comes first"), "{}", a.ed.message);
+        assert!(
+            a.ed.message.contains("placing it takes the one from"),
+            "{}",
+            a.ed.message
+        );
         // Used: the project keeps its copy.
         let (_tmp2, mut a) = app(vec![]);
         a.open
@@ -2402,6 +2407,19 @@ mod tests {
         let saved = later_library_with_a_coil(&mut a, root.path());
         a.symbol_saved(saved);
         assert!(a.ed.message.contains("comes first"), "{}", a.ed.message);
+        assert!(a.ed.message.contains("keeps the copy it has"), "{}", a.ed.message);
+        assert_eq!(a.open.as_ref().unwrap().symbols["wc.coil"], before);
+        // Used, with a copy that matches neither library (an older version): the message
+        // still names the project's own copy, not the first library's.
+        let (_tmp3, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        open.symbols.get_mut("wc.coil").unwrap().name = "Coil, older".into();
+        let before = open.symbols["wc.coil"].clone();
+        let saved = later_library_with_a_coil(&mut a, root.path());
+        a.symbol_saved(saved);
+        assert!(a.ed.message.contains("keeps the copy it has"), "{}", a.ed.message);
+        assert!(!a.ed.message.contains("takes the one from"), "{}", a.ed.message);
         assert_eq!(a.open.as_ref().unwrap().symbols["wc.coil"], before);
     }
 

@@ -2307,10 +2307,12 @@ impl App {
         if let Some(first) = lib.locate(wc_core::lock::ItemKind::Symbol, &saved.id)
             && first.source != saved.source
         {
+            // A used symbol stays as the project has it, which may be an older version or a
+            // copy from yet another library; an unused one would come from the first library.
             let keeps = if open.symbols.contains_key(&saved.id) {
-                "the project keeps that one"
+                "the project keeps the copy it has".to_owned()
             } else {
-                "placing it takes that one"
+                format!("placing it takes the one from {}", first.source)
             };
             self.ed.message = format!(
                 "Symbol {} saved into {}, but library {} comes first and has a symbol with the same id; {keeps}.",
