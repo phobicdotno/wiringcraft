@@ -1353,3 +1353,20 @@ fn space_form_edge_cases_keep_their_levels() {
     );
     assert!(has_signs(" -X1 1") && !has_signs("Deck-2"));
 }
+
+#[test]
+fn a_bare_tag_with_spaces_and_no_function_or_location_stays_one_name() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_component VALUES (520, 'X 1/2', 'X 1/2', -1, NULL, 0, NULL, NULL, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.components[&520].tag, "X 1/2", "as written");
+    let (built, _, _) = build(&p, None);
+    assert!(
+        built.devices.contains_key(&DeviceTag::parse("-X_1_2").unwrap()),
+        "one product level: {:?}",
+        built.devices.keys()
+    );
+}

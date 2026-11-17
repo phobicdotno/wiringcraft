@@ -647,11 +647,11 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     for (mut c, fun, loc, product) in readable(rows, "component", &mut warnings) {
         c.description = text.get(&c.id).cloned().unwrap_or_default();
         // A path without signs: rebuild it from its parts, so function and location survive. A
-        // bare tag with neither (`K3`) stays as written.
+        // tag with neither stays as written, spaces and all (`K3`, `X 1/2` is one product name).
         let function = fun.and_then(|f| functions.get(&f)).map(String::as_str);
         let location = loc.and_then(|l| location_paths.get(&l)).map(String::as_str);
         let spaced = c.tag.trim().contains(char::is_whitespace);
-        if !has_signs(&c.tag) && (spaced || function.is_some() || location.is_some()) {
+        if !has_signs(&c.tag) && (function.is_some() || location.is_some()) {
             // The product path, else the component's own tag, else the stored path.
             let product = [product.trim(), c.name.trim()]
                 .into_iter()
