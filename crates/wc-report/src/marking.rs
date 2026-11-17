@@ -385,33 +385,51 @@ fn is_cable_tag(tag: &DeviceTag) -> bool {
     })
 }
 
-/// Warnings for wire numbers in a marking list that a spreadsheet could run as a formula: those
-/// starting with `=`, `+`, `-` or `@` (CWE-1236). The file keeps them as they are, since
-/// smartScript prints the text on the marker; the warning lets the user change the number before
-/// opening the file in a spreadsheet. Device, cable and terminal markers are tags or numbers
-/// that start with these by design, so they give none.
+/// Warnings for marker texts that a spreadsheet could run as a formula: those starting with `=`,
+/// `+`, `-` or `@` (CWE-1236). The file keeps them as they are, since smartScript prints the text
+/// on the marker; the warning lets the user change the text before opening the file in a
+/// spreadsheet. Every text column is checked (all marker lines, not the type, group or count).
+/// A wire number is always warned about. On other rows a text that is exactly a device tag
+/// (`-K1`, `=A+C1-K1`) or a terminal number starts with these by design and gives none; free text
+/// such as a `Marker` property or a description does.
 pub fn formula_warnings(t: &Table) -> Vec<String> {
-    t.rows
-        .iter()
-        .filter(|r| {
-            Language::ALL
-                .iter()
-                .any(|l| r.first().map(String::as_str) == Some(MarkerKind::Wires.label(*l)))
-        })
-        .filter_map(|r| r.get(2))
-        .filter_map(|n| {
-            n.chars()
-                .next()
-                .filter(|c| ['=', '+', '-', '@'].contains(c))
-                .map(|c| (n, c))
-        })
-        .map(|(n, c)| {
-            format!(
-                "wire number {n:?} starts with {c:?}: a spreadsheet opening the file may run it as a formula \
-                 (smartScript prints it as it is)"
-            )
-        })
-        .collect()
+    let is_wire = |r: &Vec<String>| {
+        Language::ALL
+            .iter()
+            .any(|l| r.first().map(String::as_str) == Some(MarkerKind::Wires.label(*l)))
+    };
+    let mut out = Vec::new();
+    for r in &t.rows {
+        let wire = is_wire(r);
+        let texts = r.get(2..r.len().saturating_sub(1)).unwrap_or_default();
+        let mut seen: Vec<&str> = Vec::new();
+        for text in texts {
+            let Some(c) = text.chars().next().filter(|c| ['=', '+', '-', '@'].contains(c)) else {
+                continue;
+            };
+            if seen.contains(&text.as_str()) {
+                continue;
+            }
+            seen.push(text);
+            if wire {
+                out.push(format!(
+                    "wire number {text:?} starts with {c:?}: a spreadsheet opening the file may run it as a \
+                     formula (smartScript prints it as it is)"
+                ));
+            } else if !is_tag(text) {
+                out.push(format!(
+                    "marker text {text:?} starts with {c:?}: a spreadsheet opening the file may run it as a \
+                     formula (smartScript prints it as it is)"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Whether `s` is written exactly as a device tag is (`-K1`, `=A+C1-K1`, a number such as `-1`).
+fn is_tag(s: &str) -> bool {
+    DeviceTag::parse(s).is_ok_and(|t| t.to_string() == s)
 }
 
 /// The marker list as smartScript reads it: semicolon-separated UTF-8 with a byte-order mark,

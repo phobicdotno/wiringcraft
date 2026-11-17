@@ -27,7 +27,7 @@ marker text (or the line columns) and the count need mapping; Type and Group hel
 | Marker kinds | Markers checkboxes | `--kind terminals,wires,devices,cables` | which markers are listed; default all |
 | Text lines | Line 1 to Line 3 | `--line marker,description` | one column per line; default one marker line |
 | Language | Language | `--lang en\|de\|nb` | the header row and the Type column |
-| One terminal strip | Terminal strip, or a terminal's menu in the Devices list | `--strip -X1` | only that strip's terminals |
+| One terminal strip | Terminal strip, or a terminal's menu in the Devices list | `--strip -X1` | limits the terminals to that strip; other kinds chosen as well (such as wires) are listed in full |
 
 A line shows one of:
 
@@ -47,5 +47,7 @@ The app writes `export/wago-marking.csv`, or `export/wago-marking-<strip>.csv` f
 
 WAGO's EPLAN add-in also uses template files for smartScript's MultiImport. Their layout is not
 publicly documented, so they are not written; the CSV import above covers the same print jobs.
-A wire number that starts with `=`, `+`, `-` or `@` is written as it is (smartScript prints it),
-with a warning, since a spreadsheet opening the file may take it for a formula.
+A marker text that starts with `=`, `+`, `-` or `@` is written as it is (smartScript prints it),
+with a warning, since a spreadsheet opening the file may take it for a formula. Every line column
+is checked: wire numbers always warn, and a device's `Marker` text or description warns unless it
+is written exactly like a tag (`-K1`, `=A+C1-K1`), which these markers are by design.

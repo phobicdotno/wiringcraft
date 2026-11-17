@@ -70,6 +70,19 @@ impl DeviceTag {
     }
 
     /// The letter code of the product aspect, e.g. `K` for `-K12`.
+    /// A terminal's strip and number: `-X1.3` is terminal `3` of strip `-X1`. A tag with one
+    /// product level (`-X1`) is the strip itself, without a number (one is given in drawing
+    /// order). Every place that names a terminal's strip uses this, so they agree.
+    pub fn terminal_parts(&self) -> (DeviceTag, Option<String>) {
+        let mut strip = self.clone();
+        let number = if strip.product.len() > 1 {
+            strip.product.pop()
+        } else {
+            None
+        };
+        (strip, number)
+    }
+
     pub fn letter_code(&self) -> String {
         self.product
             .last()
@@ -113,6 +126,15 @@ impl<'de> Deserialize<'de> for DeviceTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_terminal_tag_splits_into_its_strip_and_number() -> Result<()> {
+        let (strip, n) = DeviceTag::parse("=A+C1-X1.3")?.terminal_parts();
+        assert_eq!((strip.to_string(), n.as_deref()), ("=A+C1-X1".to_owned(), Some("3")));
+        let (strip, n) = DeviceTag::parse("-X1")?.terminal_parts();
+        assert_eq!((strip.to_string(), n), ("-X1".to_owned(), None));
+        Ok(())
+    }
 
     #[test]
     fn parses_full_designation() -> Result<()> {

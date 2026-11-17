@@ -766,6 +766,47 @@ fn marker_list_headers_and_types_follow_the_language_and_warnings_still_find_wir
 }
 
 #[test]
+fn formula_warnings_check_every_marker_line_and_free_marker_texts() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].wires[0].number = Some("=1".into());
+    let k1 = DeviceTag::parse("=A+C1-K1").unwrap();
+    let dev = p.devices.entry(k1).or_default();
+    dev.properties
+        .insert(MARKER_PROPERTY.into(), "=HYPERLINK(\"x\")".into());
+    dev.description = "@pump".into();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // The wire number is in the second line column here.
+    let t = marking_list_with(
+        &i,
+        &MarkingOptions {
+            kinds: vec![MarkerKind::Wires],
+            lines: vec![LineField::Description, LineField::Marker],
+            ..MarkingOptions::default()
+        },
+    );
+    let w = formula_warnings(&t);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("\"=1\""));
+    // Free texts warn; tags such as `=A+C1-K1` and `-P1` do not.
+    let t = marking_list_with(
+        &i,
+        &MarkingOptions {
+            kinds: vec![MarkerKind::Devices],
+            lines: vec![LineField::Marker, LineField::Tag, LineField::Description],
+            ..MarkingOptions::default()
+        },
+    );
+    let w = formula_warnings(&t);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("HYPERLINK") && w[1].contains("@pump"), "{w:?}");
+    assert!(to_smartscript_csv(&t).contains("=HYPERLINK"), "the text is kept");
+}
+
+#[test]
 fn one_strips_markers_are_only_that_strips_terminals() {
     let (mut p, s, parts) = fixture();
     p.pages[0].symbols.push(place("s7", "term", 140.0, Some("-X1.10")));

@@ -142,11 +142,10 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
             .symbols
             .get(&s.symbol)
             .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal);
-        let Some(tag) = s.tag.clone().filter(|t| is_terminal && t.product.len() > 1) else {
+        let Some(tag) = s.tag.clone().filter(|_| is_terminal) else {
             return;
         };
-        let mut strip = tag.clone();
-        let Some(n) = strip.product.pop() else { return };
+        let (strip, Some(n)) = tag.terminal_parts() else { return };
         terms.push((strip, n, tag));
     }
     let Some((strip, number, tag)) = terms.first().cloned() else {
@@ -469,11 +468,7 @@ pub fn terminal_strip_of(open: &Open, tag: &DeviceTag, uses: &[(String, String)]
     if !terminal {
         return None;
     }
-    let mut strip = tag.clone();
-    if strip.product.len() > 1 {
-        strip.product.pop();
-    }
-    Some(strip.to_string())
+    Some(tag.terminal_parts().0.to_string())
 }
 
 pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelState) {

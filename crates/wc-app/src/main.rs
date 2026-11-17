@@ -2239,6 +2239,16 @@ fn export_wago_marking(open: &Open, options: &wc_report::MarkingOptions) -> Stri
         symbols: &open.symbols,
         parts: &open.parts,
     };
+    // The strip may have no numbered terminal on a schematic page (only on an overview), or be
+    // gone since the dialog opened: say so instead of writing an empty list.
+    if let Some(s) = &options.strip
+        && !wc_report::terminal_strips(&inputs).contains(s)
+    {
+        return format!(
+            "Nothing exported: terminal strip {s} has no terminals on the schematic pages (terminals drawn \
+             only on an overview page are not listed)."
+        );
+    }
     let t = wc_report::marking_list_with(&inputs, options);
     let csv = wc_report::to_smartscript_csv(&t);
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, csv)) {
@@ -3115,5 +3125,12 @@ mod marking_tests {
             "\u{feff}Typ;Gruppe;Zeile 1;Zeile 2;Anzahl\r\nKlemme;-X1;1;Field terminals;1\r\n"
         );
         assert_eq!(file_stem("=A+C1/X1"), "=A+C1_X1");
+
+        // A strip drawn only on an overview page has nothing to export: no file is written.
+        o.project.pages[1].overview = true;
+        std::fs::remove_file(o.dir.join("export").join("wago-marking--X1.csv")).unwrap();
+        let msg = export_wago_marking(&o, &options);
+        assert!(msg.starts_with("Nothing exported") && msg.contains("-X1"), "{msg}");
+        assert!(!o.dir.join("export").join("wago-marking--X1.csv").exists());
     }
 }

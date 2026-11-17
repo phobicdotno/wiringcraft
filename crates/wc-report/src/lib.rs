@@ -543,12 +543,10 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 continue;
             }
             let (strip, number) = match &s.tag {
-                Some(tag) if tag.product.len() > 1 => {
-                    let mut strip = tag.clone();
-                    let number = strip.product.pop();
+                Some(tag) => {
+                    let (strip, number) = tag.terminal_parts();
                     (strip.to_string(), number)
                 }
-                Some(tag) => (tag.to_string(), None),
                 None => ("(untagged)".to_owned(), None),
             };
             let assigned = numbers.get(&(page.id.clone(), s.id.clone()));
