@@ -123,6 +123,10 @@ def main():
                 print(t["number"])
                 print(msg, file=sys.stderr)
                 return
+            if ok is None:
+                # The command is still on the issue and may yet be granted: stop, never claim a second.
+                print(f"#{t['number']}: {msg}; check it with `todo.py list` before claiming another", file=sys.stderr)
+                sys.exit(3)
         print("no free todo", file=sys.stderr)
         sys.exit(2)
     verb = {"claim": "claim", "renew": "renew", "release": "unclaim"}[args.cmd]

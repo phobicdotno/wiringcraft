@@ -99,8 +99,11 @@ function fakeGithub(issues) {
   const rest = {
     issues: {
       listComments: (p) => issues[p.issue_number].comments,
+      listCommentsForRepo: () => Object.entries(issues).flatMap(([n, i]) => i.comments.map((cm) => ({
+        ...cm, issue_url: `https://api.github.com/repos/o/r/issues/${n}`, html_url: `https://github.com/o/r/${i.pr ? 'pull' : 'issues'}/${n}#c${cm.id}`,
+      }))),
       listForRepo: () => Object.entries(issues).filter(([, i]) => i.labels.includes(c.LABEL)).map(([n, i]) => ({ number: Number(n), ...i })),
-      get: async (p) => ({ data: { number: p.issue_number, state: issues[p.issue_number].state } }),
+      get: async (p) => ({ data: { number: p.issue_number, state: issues[p.issue_number].state, pull_request: issues[p.issue_number].pr ? {} : undefined } }),
       createComment: async (p) => {
         calls.push(['comment', p.issue_number, p.body]);
         (issues[p.issue_number] || (issues[p.issue_number] = { comments: [], labels: [], state: 'open' })).comments.push({ id: nextId++, user: { type: 'Bot' }, body: p.body });
@@ -120,14 +123,55 @@ const repo = { owner: 'o', repo: 'r' };
 test('handleComment grants, then refuses a second agent, and labels the issue', async () => {
   const issues = { 3: { comments: [], labels: ['todo'], state: 'open' } };
   const { github, calls } = fakeGithub(issues);
-  const ctx = (id, body) => ({ repo, payload: { issue: { number: 3, state: 'open' }, comment: { id, body, user: { type: 'User' } } } });
-  await c.handleComment({ github, context: ctx(1, '/claim a'), now: T0 });
+  const ctx = { repo, payload: {} };
+  issues[3].comments.push(human(1, '/claim a'));
+  await c.handleComment({ github, context: ctx, now: T0 });
   assert.ok(issues[3].labels.includes('claimed'));
-  await c.handleComment({ github, context: ctx(2, '/claim b'), now: T0 + H });
+  issues[3].comments.push(human(2, '/claim b'));
+  await c.handleComment({ github, context: ctx, now: T0 + H });
   const last = c.readMarker(calls.filter((x) => x[0] === 'comment').at(-1)[2]);
   assert.equal(last.reply_to, 2);
   assert.equal(last.ok, false);
   assert.equal(c.readState(issues[3].comments).agent, 'a');
+});
+
+test('backlog answers commands whose own run was dropped, oldest first, each once', async () => {
+  const issues = {
+    3: { comments: [human(1, '/claim a'), human(3, '/claim b')], labels: [], state: 'open' },
+    4: { comments: [human(2, '/claim c')], labels: [], state: 'open' },
+    8: { comments: [human(5, '/claim d')], labels: [], state: 'open', pr: true },
+  };
+  const { github, calls } = fakeGithub(issues);
+  const out = await c.backlog({ github, context: { repo }, now: T0 });
+  assert.equal(out.length, 3);
+  assert.match(out[0], /^#3: Claimed by `a`/);
+  assert.match(out[1], /^#4: Claimed by `c`/);
+  assert.match(out[2], /^#3: Refused: locked by `a`/);
+  assert.deepEqual(await c.backlog({ github, context: { repo }, now: T0 }), []);
+  assert.equal(calls.filter((x) => x[0] === 'comment' && x[1] === 8).length, 0);
+});
+
+test('handlePull refuses a branch name that is not an agent name', async () => {
+  const issues = { 5: { comments: [], labels: [], state: 'open' }, 9: { comments: [], labels: [], state: 'open', pr: true } };
+  const { github } = fakeGithub(issues);
+  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: '', head: { ref: '_worker' } };
+  assert.deepEqual(await c.handlePull({ github, context: { repo, payload: { pull_request: pr } }, now: T0 }), ['#5 no agent']);
+  assert.equal(c.readState(issues[5].comments).agent, null);
+  assert.match(issues[9].comments[0].body, /Agent: <name>/);
+});
+
+test('a push never overwrites a command reply, and re-adds a missing label', async () => {
+  const reply = { id: 1, user: { type: 'Bot' }, body: c.marker({ reply_to: 77, ok: true, agent: 'a', until: new Date(T0 + H).toISOString(), pr: 9 }) };
+  const issues = { 5: { comments: [reply], labels: [], state: 'open' }, 9: { comments: [], labels: [], state: 'open', pr: true } };
+  const { github, calls } = fakeGithub(issues);
+  const pr = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: a', head: { ref: 'x' } };
+  assert.deepEqual(await c.handlePull({ github, context: { repo, payload: { pull_request: pr } }, now: T0 }), ['#5 claimed']);
+  assert.equal(c.readMarker(issues[5].comments[0].body).reply_to, 77);
+  assert.equal(calls.filter((x) => x[0] === 'update').length, 0);
+  assert.ok(issues[5].labels.includes('claimed'));
+  issues[5].labels.length = 0;
+  assert.deepEqual(await c.handlePull({ github, context: { repo, payload: { pull_request: pr } }, now: T0 + H }), ['#5 extended']);
+  assert.ok(issues[5].labels.includes('claimed'));
 });
 
 test('handlePull claims for the Agent line and a push extends the same comment', async () => {

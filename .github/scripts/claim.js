@@ -12,7 +12,8 @@
 // also posts the release and removes the `claimed` label.
 //
 // The state lives in the bot's own comments: the newest bot comment carrying the marker below.
-// Workflow runs are serialised per issue, so two claims at the same moment cannot both win.
+// All runs of the claim workflow share one queue, so two claims at the same moment cannot both win,
+// and every run first answers commands whose own run GitHub dropped from that queue (backlog).
 'use strict';
 
 const MARK = 'wc-claim';
@@ -21,6 +22,7 @@ const DEFAULT_HOURS = 4;
 const MAX_HOURS = 24;
 const AGENT = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,59}$/;
 const HOUR = 3600 * 1000;
+const BACKLOG_HOURS = 6;
 
 function parseHours(text) {
   if (text === undefined) return DEFAULT_HOURS;
@@ -76,10 +78,10 @@ function readState(comments) {
     if (!isBot(comments[i])) continue;
     const data = readMarker(comments[i].body);
     if (data && 'agent' in data) {
-      return { agent: data.agent || null, until: data.until || null, pr: data.pr || null, commentId: comments[i].id };
+      return { agent: data.agent || null, until: data.until || null, pr: data.pr || null, commentId: comments[i].id, kind: data.kind || null };
     }
   }
-  return { agent: null, until: null, pr: null, commentId: null };
+  return { agent: null, until: null, pr: null, commentId: null, kind: null };
 }
 
 function isActive(state, now) {
@@ -162,13 +164,9 @@ async function setLabel(github, owner, repo, issue_number, on) {
   }
 }
 
-async function handleComment({ github, context, now = Date.now() }) {
-  const issue = context.payload.issue;
-  const comment = context.payload.comment;
-  if (!issue || issue.pull_request || !comment || isBot(comment)) return 'ignored';
+/** Answer one command comment on an issue. */
+async function answer({ github, owner, repo, issue, comment, now }) {
   const cmd = parseCommand(comment.body);
-  if (!cmd) return 'ignored';
-  const { owner, repo } = context.repo;
   let result;
   if (cmd.error) {
     result = { ok: false, state: null, message: cmd.error };
@@ -182,16 +180,58 @@ async function handleComment({ github, context, now = Date.now() }) {
   if (result.state) Object.assign(data, result.state);
   await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: `${result.message}\n\n${marker(data)}` });
   if (result.ok && result.state) await setLabel(github, owner, repo, issue.number, Boolean(result.state.agent));
-  return result.message;
+  return `#${issue.number}: ${result.message}`;
+}
+
+/**
+ * Answer every command from the last hours that has no bot reply yet, oldest first. Every run does
+ * this first: GitHub keeps only one pending run per concurrency group and cancels the others, so a
+ * command whose own run was cancelled is answered by the next run.
+ */
+async function backlog({ github, context, now = Date.now() }) {
+  const { owner, repo } = context.repo;
+  const since = new Date(now - BACKLOG_HOURS * HOUR).toISOString();
+  const all = await github.paginate(github.rest.issues.listCommentsForRepo, { owner, repo, since, sort: 'created', direction: 'asc', per_page: 100 });
+  const answered = new Set();
+  for (const c of all) {
+    const data = isBot(c) ? readMarker(c.body) : null;
+    if (data && data.reply_to) answered.add(data.reply_to);
+  }
+  const pending = all
+    .filter((c) => !isBot(c) && !/\/pull\/\d+/.test(c.html_url || '') && !answered.has(c.id) && parseCommand(c.body))
+    .sort((a, b) => a.id - b.id);
+  const out = [];
+  for (const comment of pending) {
+    const m = /\/issues\/(\d+)$/.exec(comment.issue_url || '');
+    if (!m) continue;
+    const issue = (await github.rest.issues.get({ owner, repo, issue_number: Number(m[1]) })).data;
+    if (issue.pull_request) continue;
+    out.push(await answer({ github, owner, repo, issue, comment, now }));
+  }
+  return out;
+}
+
+async function handleComment({ github, context, now = Date.now() }) {
+  return backlog({ github, context, now });
 }
 
 async function handlePull({ github, context, now = Date.now() }) {
   const pr = context.payload.pull_request;
   if (!pr || pr.state !== 'open') return [];
   const { owner, repo } = context.repo;
-  const agent = parseAgent(pr.body) || pr.head.ref;
+  const refs = parseRefs(pr.title, pr.body);
+  const agent = parseAgent(pr.body) || (AGENT.test(pr.head.ref) ? pr.head.ref : null);
+  if (!agent) {
+    if (refs.length) {
+      await github.rest.issues.createComment({
+        owner, repo, issue_number: pr.number,
+        body: `The branch name \`${pr.head.ref}\` cannot be an agent name; add a line \`Agent: <name>\` to the description to claim ${refs.map((n) => `#${n}`).join(', ')}.`,
+      });
+    }
+    return refs.map((n) => `#${n} no agent`);
+  }
   const out = [];
-  for (const n of parseRefs(pr.title, pr.body)) {
+  for (const n of refs) {
     let issue;
     try {
       issue = (await github.rest.issues.get({ owner, repo, issue_number: n })).data;
@@ -210,16 +250,18 @@ async function handlePull({ github, context, now = Date.now() }) {
       continue;
     }
     const until = now + DEFAULT_HOURS * HOUR;
-    const next = { agent, until: new Date(until).toISOString(), pr: pr.number };
+    const next = { agent, until: new Date(until).toISOString(), pr: pr.number, kind: 'pr' };
     const body = `Claimed by \`${agent}\` through #${pr.number} until ${stamp(until)}. Each push to #${pr.number} extends it by ${DEFAULT_HOURS} h.\n\n${marker(next)}`;
-    if (state.agent === agent && state.pr === pr.number && state.commentId) {
+    // Extend by editing our own pull-request claim comment, never a reply to a command (the
+    // command line waits for that reply).
+    if (state.kind === 'pr' && state.agent === agent && state.pr === pr.number && state.commentId) {
       await github.rest.issues.updateComment({ owner, repo, comment_id: state.commentId, body });
       out.push(`#${n} extended`);
     } else {
       await github.rest.issues.createComment({ owner, repo, issue_number: n, body });
-      await setLabel(github, owner, repo, n, true);
       out.push(`#${n} claimed`);
     }
+    await setLabel(github, owner, repo, n, true);
   }
   return out;
 }
@@ -247,5 +289,5 @@ async function sweep({ github, context, now = Date.now() }) {
 module.exports = {
   DEFAULT_HOURS, MAX_HOURS, LABEL,
   parseCommand, readState, isActive, decide, parseRefs, parseAgent, marker, readMarker,
-  handleComment, handlePull, sweep,
+  handleComment, handlePull, sweep, backlog,
 };
