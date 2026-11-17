@@ -116,6 +116,11 @@ pub struct Open {
     redo: Vec<Project>,
     /// Snapshots dropped from the front of `undo` because it was full, so marks stay valid.
     undo_dropped: usize,
+    /// Counts every change to the undo history (checkpoint, undo, redo, squash).
+    history: u64,
+    /// The `history` count right after a properties form made its own undo step, so later
+    /// typing in the form joins that step only while nothing else has touched the history.
+    form_step: Option<u64>,
     pub branch: String,
     /// Underlay pictures loaded as textures, by file; `None` when the file cannot be shown.
     pub underlays: BTreeMap<String, Option<egui::TextureHandle>>,
@@ -139,6 +144,8 @@ impl Open {
             undo: Vec::new(),
             redo: Vec::new(),
             undo_dropped: 0,
+            history: 0,
+            form_step: None,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
             terminals_before: None,
@@ -267,6 +274,7 @@ impl Open {
         }
         self.redo.clear();
         self.dirty = true;
+        self.history += 1;
     }
 
     /// Which terminal each placed terminal symbol is, as the terminal plan numbers them.
@@ -306,6 +314,7 @@ impl Open {
         };
         if self.undo.len() > start + 1 {
             self.undo.truncate(start + 1);
+            self.history += 1;
         }
     }
 
@@ -323,6 +332,7 @@ impl Open {
                 self.forget_terminal_change();
                 self.redo.push(std::mem::replace(&mut self.project, prev));
                 self.dirty = true;
+                self.history += 1;
                 true
             }
             None => false,
@@ -335,6 +345,7 @@ impl Open {
                 self.forget_terminal_change();
                 self.undo.push(std::mem::replace(&mut self.project, next));
                 self.dirty = true;
+                self.history += 1;
                 true
             }
             None => false,
@@ -635,6 +646,8 @@ impl Open {
         copy.id = self.free_page_id();
         copy.number = self.next_page_number();
         copy.title = format!("{} (copy)", copy.title);
+        // A project has one cover page; its copy is an ordinary page.
+        copy.cover = false;
         let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
         for s in &mut copy.symbols {
             let Some(old) = s.tag.clone() else { continue };
@@ -694,11 +707,7 @@ impl Open {
         if name.is_empty() {
             return Err("The project name cannot be empty.".into());
         }
-        let block: BTreeMap<String, String> = fields
-            .iter()
-            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-            .filter(|(k, v)| !k.is_empty() && !v.is_empty())
-            .collect();
+        let block = title_block_of(fields);
         if self.project.meta.name == name && self.project.meta.title_block == block {
             return Ok(());
         }
@@ -706,6 +715,144 @@ impl Open {
         self.project.meta.name = name.to_owned();
         self.project.meta.title_block = block;
         Ok(())
+    }
+
+    /// The cover page's index. A project without one gets one: an empty first page titled
+    /// "Cover" (as new projects started) is marked as the cover, otherwise a new cover page
+    /// numbered `0` goes in front of the others. Creating or marking it is one undo step. Fails,
+    /// changing nothing, when a page already uses a number that sorts as low as `0`.
+    pub fn cover_page(&mut self) -> Result<usize, String> {
+        if let Some(i) = self.project.cover_page() {
+            return Ok(i);
+        }
+        if let Some(first) = self.project.pages.first()
+            && first.title.trim().eq_ignore_ascii_case("cover")
+            && first.symbols.is_empty()
+            && first.wires.is_empty()
+            && first.graphics.is_empty()
+            && first.underlay.is_none()
+        {
+            self.checkpoint();
+            if let Some(first) = self.project.pages.first_mut() {
+                first.cover = true;
+            }
+            return Ok(0);
+        }
+        // `0` sorts before every other number unless one sorts as low (`0`, `00`, an empty one).
+        let lowest = wc_core::project::natural_key("0");
+        if let Some(p) = self
+            .project
+            .pages
+            .iter()
+            .find(|p| wc_core::project::natural_key(&p.number) <= lowest)
+        {
+            return Err(format!(
+                "Page {:?} already comes first. Renumber it, then add the cover page in front.",
+                p.number
+            ));
+        }
+        self.checkpoint();
+        let id = self.free_page_id();
+        let mut page = Page::new(id.clone(), "0", "Cover");
+        page.cover = true;
+        if let Some(first) = self.project.pages.first() {
+            page.size = first.size;
+        }
+        self.project.pages.push(page);
+        self.project.sort_pages();
+        Ok(self.index_of(&id))
+    }
+
+    /// A properties form opens: its live edits will make a fresh undo step. Returns the undo
+    /// mark to pass to [`Open::revert_live`].
+    pub fn start_live_form(&mut self) -> usize {
+        self.form_step = None;
+        self.undo_mark()
+    }
+
+    /// Counts every change to the undo history. A form that shows project values compares it
+    /// with the count it last saw to notice changes it did not make (an undo, the assistant).
+    pub fn history_count(&self) -> u64 {
+        self.history
+    }
+
+    /// The project's name and fields when the history moved since `seen` (a change the form
+    /// did not make), updating `seen`; `None` when nothing else changed.
+    pub fn props_if_changed(&self, seen: &mut u64) -> Option<PropsSnapshot> {
+        if *seen == self.history {
+            return None;
+        }
+        *seen = self.history;
+        Some(self.props_snapshot())
+    }
+
+    /// Set the project name and fields while a form is open, so the page shows each change at
+    /// once. The form's changes since [`Open::start_live_form`] stay one undo step while nothing
+    /// else changes the history. An empty name is not applied (it is being typed).
+    pub fn set_project_props_live(&mut self, name: &str, fields: &[(String, String)]) {
+        let name = name.trim();
+        let block = title_block_of(fields);
+        let name_changes = !name.is_empty() && self.project.meta.name != name;
+        if !name_changes && self.project.meta.title_block == block {
+            return;
+        }
+        // Keep adding to the form's own undo step only while nothing else has touched the
+        // history since; after any other change (a page added, another properties edit, an
+        // undo) the form starts a new step.
+        if self.form_step == Some(self.history) {
+            self.dirty = true;
+        } else {
+            self.checkpoint();
+            self.form_step = Some(self.history);
+        }
+        if name_changes {
+            self.project.meta.name = name.to_owned();
+        }
+        self.project.meta.title_block = block;
+    }
+
+    /// Whether the last undo step differs from the project only in its name and title-block
+    /// fields (it is a properties form's step, with nothing else in it).
+    fn last_step_changed_only_props(&self) -> bool {
+        self.undo.last().is_some_and(|prev| {
+            let mut p = prev.clone();
+            p.meta.name.clone_from(&self.project.meta.name);
+            p.meta.title_block.clone_from(&self.project.meta.title_block);
+            p == self.project
+        })
+    }
+
+    /// The project name and fields as they are, for [`Open::revert_live`].
+    pub fn props_snapshot(&self) -> PropsSnapshot {
+        PropsSnapshot {
+            name: self.project.meta.name.clone(),
+            title_block: self.project.meta.title_block.clone(),
+        }
+    }
+
+    /// Take back what [`Open::set_project_props_live`] changed since `since` (the form was
+    /// cancelled), back to `before` (a [`Open::props_snapshot`] taken when the form opened).
+    /// When the form's own undo step is the last one and holds nothing else, it is undone;
+    /// otherwise (the page was edited meanwhile, or the assistant folded the step into its
+    /// own) only the name and fields are put back, as a new undo step.
+    pub fn revert_live(&mut self, since: usize, before: &PropsSnapshot) {
+        let only_the_form = self.undo_mark() == since + 1
+            && self.last_step_changed_only_props()
+            && self
+                .undo
+                .last()
+                .is_some_and(|prev| prev.meta.name == before.name && prev.meta.title_block == before.title_block);
+        if only_the_form {
+            if self.undo() {
+                self.redo.clear();
+            }
+            return;
+        }
+        if self.project.meta.name != before.name || self.project.meta.title_block != before.title_block {
+            self.checkpoint();
+            self.project.meta.name.clone_from(&before.name);
+            self.project.meta.title_block.clone_from(&before.title_block);
+        }
     }
 
     /// Put a wire into a cable as a core, or take it out (`None`). The cable device is created
@@ -858,8 +1005,24 @@ impl Open {
     }
 }
 
+/// The project name and title-block fields at one moment (see [`Open::props_snapshot`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropsSnapshot {
+    pub name: String,
+    pub title_block: std::collections::BTreeMap<String, String>,
+}
+
 /// The name review comments are signed with: `WIRINGCRAFT_USER`, then git's `user.name`, then
 /// the login name.
+/// Title-block fields from a form: trimmed, with empty keys and values dropped.
+fn title_block_of(fields: &[(String, String)]) -> BTreeMap<String, String> {
+    fields
+        .iter()
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .collect()
+}
+
 pub fn author_name() -> String {
     std::env::var("WIRINGCRAFT_USER")
         .ok()
@@ -906,6 +1069,205 @@ pub(crate) mod tests {
         store::save(&dir, &p).unwrap();
         let open = Open::load(&dir).unwrap();
         (tmp, open)
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    #[test]
+    fn the_cover_form_shows_changes_as_typed_and_keeps_them_as_one_undo_step() {
+        let (_tmp, mut o) = project();
+        assert_eq!(o.cover_page(), Ok(0), "a new project's first page is its cover");
+        assert!(!o.can_undo(), "nothing to create");
+        o.start_live_form();
+        for typed in ["A", "AC", "ACME"] {
+            o.set_project_props_live("Test", &fields(&[("customer", typed)]));
+            assert_eq!(o.project.meta.title_block["customer"], typed, "shown at once");
+        }
+        o.set_project_props_live("", &fields(&[("customer", "ACME")]));
+        assert_eq!(o.project.meta.name, "Test", "an empty name is still being typed");
+        o.set_project_props_live("Pumps", &fields(&[("customer", "ACME"), ("revision", "")]));
+        assert_eq!(o.project.meta.name, "Pumps");
+        assert_eq!(o.project.meta.title_block.len(), 1, "empty fields are dropped");
+        assert!(o.undo());
+        assert_eq!(o.project.meta.name, "Test");
+        assert!(
+            o.project.meta.title_block.is_empty(),
+            "one undo takes the whole form back"
+        );
+        assert!(!o.can_undo());
+
+        // Cancel takes the typed changes back and leaves nothing to redo.
+        let since = o.start_live_form();
+        let before = o.props_snapshot();
+        o.set_project_props_live("Test", &fields(&[("customer", "Other")]));
+        o.revert_live(since, &before);
+        assert!(o.project.meta.title_block.is_empty());
+        assert!(!o.can_redo());
+        o.revert_live(since, &before);
+        assert!(!o.can_undo(), "nothing changed, nothing undone");
+    }
+
+    /// The cover form's flow in `main.rs`: it refreshes its buffer when the history count moved
+    /// without it, and records the count after each of its own edits.
+    #[test]
+    fn the_form_buffer_follows_an_undo_so_a_later_edit_keeps_it() {
+        let (_tmp, mut o) = project();
+        o.start_live_form();
+        let mut buffer = fields(&[("customer", "A")]);
+        o.set_project_props_live("Test", &buffer);
+        let mut seen = o.history_count();
+        assert!(
+            o.props_if_changed(&mut seen).is_none(),
+            "the form's own edit is not news"
+        );
+        // Undo from the toolbar while the form is open: the form reloads what it shows.
+        assert!(o.undo());
+        let now = o.props_if_changed(&mut seen).unwrap();
+        buffer = now.title_block.into_iter().collect();
+        // Editing another field now does not bring customer A back.
+        buffer.push(("revision".into(), "B".into()));
+        o.set_project_props_live("Test", &buffer);
+        assert!(!o.project.meta.title_block.contains_key("customer"));
+        assert_eq!(o.project.meta.title_block["revision"], "B");
+    }
+
+    #[test]
+    fn cancel_restores_opening_props_after_undo_and_other_property_edits() {
+        let (_tmp, mut o) = project();
+        o.set_project_props("Opening", &fields(&[("customer", "Opening")]))
+            .unwrap();
+        let since = o.start_live_form();
+        let before = o.props_snapshot();
+        o.set_project_props_live("Form", &fields(&[("customer", "Form")]));
+        assert!(o.undo());
+        assert!(o.undo());
+        o.set_project_props("First", &fields(&[("customer", "First")])).unwrap();
+        o.set_project_props("Second", &fields(&[("customer", "Second")]))
+            .unwrap();
+        // The last step looks like a form step but is not the form's: Cancel still restores
+        // what the form opened with.
+        assert_eq!(o.undo_mark(), since + 1);
+        assert!(o.last_step_changed_only_props());
+        o.revert_live(since, &before);
+        assert_eq!(o.props_snapshot(), before);
+    }
+
+    #[test]
+    fn form_edits_after_an_undo_stay_one_step() {
+        let (_tmp, mut o) = project();
+        o.checkpoint();
+        o.project.pages[0].title = "Edited".into();
+        o.start_live_form();
+        assert!(o.undo());
+        o.set_project_props_live("Test", &fields(&[("customer", "A")]));
+        o.set_project_props_live("Test", &fields(&[("customer", "B")]));
+        assert!(o.undo());
+        assert!(o.project.meta.title_block.is_empty(), "one Undo takes both edits back");
+        assert!(!o.can_undo());
+    }
+
+    #[test]
+    fn a_form_edit_after_another_change_is_its_own_undo_step() {
+        let (_tmp, mut o) = project();
+        o.start_live_form();
+        o.set_project_props_live("Test", &fields(&[("customer", "A")]));
+        // Another change while the form is open.
+        o.checkpoint();
+        o.project.pages[0].title = "Added meanwhile".into();
+        o.set_project_props_live("Test", &fields(&[("customer", "B")]));
+        // OK, then Undo: only the second form edit goes back.
+        assert!(o.undo());
+        assert_eq!(o.project.meta.title_block["customer"], "A");
+        assert_eq!(o.project.pages[0].title, "Added meanwhile");
+
+        // A properties change made another way in between is its own step too.
+        o.form_step = None;
+        o.start_live_form();
+        o.set_project_props_live("Test", &fields(&[("customer", "A")]));
+        o.set_project_props("Test", &fields(&[("customer", "X")])).unwrap();
+        o.set_project_props_live("Test", &fields(&[("customer", "B")]));
+        assert!(o.undo());
+        assert_eq!(o.project.meta.title_block["customer"], "X");
+    }
+
+    #[test]
+    fn cancel_puts_the_fields_back_when_the_form_step_is_not_the_last_or_was_folded_away() {
+        let (_tmp, mut o) = project();
+        // A page edit made while the form is open stays; only the fields go back.
+        let since = o.start_live_form();
+        let before = o.props_snapshot();
+        o.set_project_props_live("Test", &fields(&[("customer", "ACME")]));
+        o.checkpoint();
+        o.project.pages[0].title = "Edited meanwhile".into();
+        o.revert_live(since, &before);
+        assert!(o.project.meta.title_block.is_empty());
+        assert_eq!(o.project.pages[0].title, "Edited meanwhile");
+
+        // An assistant turn that began before the form folds the form's step into its own.
+        let turn = o.undo_mark();
+        o.checkpoint();
+        o.project.pages[0].title = "By the assistant".into();
+        let since = o.start_live_form();
+        let before = o.props_snapshot();
+        o.set_project_props_live("Test", &fields(&[("customer", "ACME")]));
+        o.squash_undo(turn);
+        assert!(o.undo_mark() <= since);
+        o.revert_live(since, &before);
+        assert!(o.project.meta.title_block.is_empty(), "the form's change is taken back");
+        assert_eq!(o.project.pages[0].title, "By the assistant", "the assistant's stays");
+    }
+
+    #[test]
+    fn a_project_without_a_cover_gets_one_in_front() {
+        let (_tmp, mut o) = project();
+        o.project.pages[0].cover = false;
+        o.project.pages[0].title = "Overview".into();
+        let i = o.cover_page().unwrap();
+        let cover = &o.project.pages[i];
+        assert!(cover.cover);
+        assert_eq!((i, cover.number.as_str(), cover.title.as_str()), (0, "0", "Cover"));
+        assert_eq!(o.project.pages.len(), 3);
+        assert_eq!(o.cover_page(), Ok(0), "found again, not made twice");
+        assert!(o.undo());
+        assert_eq!(o.project.pages.len(), 2, "making it is one undo step");
+
+        // An empty first page titled "Cover" (how projects started) becomes the cover.
+        o.project.pages[0].title = "Cover".into();
+        assert_eq!(o.cover_page(), Ok(0));
+        assert_eq!(o.project.pages.len(), 2);
+        assert!(o.project.pages[0].cover);
+
+        // Its copy is a normal page: a project keeps one cover.
+        let copy = o.duplicate_page(0).unwrap();
+        assert!(!o.project.pages[copy].cover);
+    }
+
+    #[test]
+    fn a_first_page_titled_cover_with_a_drawing_on_it_is_kept_and_a_cover_goes_in_front() {
+        let (_tmp, mut o) = project();
+        o.project.pages[0].cover = false;
+        o.project.pages[0].graphics.push(wc_core::geom::Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(10.0, 0.0),
+        });
+        let i = o.cover_page().unwrap();
+        assert_eq!((i, o.project.pages[i].number.as_str()), (0, "0"));
+        assert!(!o.project.pages[1].cover, "the drawn page stays as it was");
+    }
+
+    #[test]
+    fn a_page_numbered_zero_keeps_its_place_and_no_cover_is_made() {
+        let (_tmp, mut o) = project();
+        o.project.pages[0].cover = false;
+        o.project.pages[0].title = "Index".into();
+        o.project.pages[0].number = "0".into();
+        o.project.sort_pages();
+        let before = o.project.clone();
+        assert!(o.cover_page().unwrap_err().contains("\"0\""));
+        assert_eq!(o.project, before);
+        assert!(!o.can_undo(), "nothing changed");
     }
 
     #[test]

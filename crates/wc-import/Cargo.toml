@@ -1,6 +1,6 @@
 [package]
 name = "wc-import"
-description = "WiringCraft importers: DXF, SVG, CSV, EPLAN, AutomationML, KiCad, SolidWorks Electrical"
+description = "WiringCraft importers: DXF, SVG, CSV, EPLAN, AutomationML, KiCad, QElectroTech, BMEcat, SolidWorks Electrical"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
