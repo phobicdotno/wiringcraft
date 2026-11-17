@@ -158,13 +158,13 @@ pub struct SweLocation {
 }
 
 /// A location tag path as WiringCraft writes the location part of a tag: `+L1+L3` is `L1.L3`.
+/// Built with [`device_tag`], the same cleanup a device's tag path gets, so a device in this
+/// location always carries exactly this path (`+Room 1` is `Room_1` on both sides). Empty when
+/// that cleanup gives no valid location.
 fn location_path(tag_path: &str) -> String {
-    tag_path
-        .split(['+', '.'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(".")
+    device_tag(&format!("{}-X", tag_path.trim()))
+        .map(|t| t.location.join("."))
+        .unwrap_or_default()
 }
 
 /// One row of the import report: how many of a kind the source has and how many came in.
@@ -184,17 +184,23 @@ fn sql(e: rusqlite::Error) -> Error {
 /// The rows that could be read; the others are counted under `what`.
 fn readable<T>(rows: impl Iterator<Item = rusqlite::Result<T>>, what: &str, warnings: &mut Vec<String>) -> Vec<T> {
     let mut bad = 0usize;
+    let mut first: Option<String> = None;
     let out: Vec<T> = rows
         .filter_map(|r| match r {
             Ok(v) => Some(v),
-            Err(_) => {
+            Err(e) => {
                 bad += 1;
+                first.get_or_insert_with(|| e.to_string());
                 None
             }
         })
         .collect();
     if bad > 0 {
-        warnings.push(format!("{bad} {what} row(s) could not be read and were left out"));
+        // The first reason names the column and the problem, so the source can be fixed.
+        let why = first.unwrap_or_default();
+        warnings.push(format!(
+            "{bad} {what} row(s) could not be read and were left out (first: {why})"
+        ));
     }
     out
 }
@@ -280,7 +286,7 @@ fn texts(conn: &Connection, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, 
     let mut out: BTreeMap<i64, String> = BTreeMap::new();
     let mut st = conn
         .prepare(
-            "SELECT tra_objectid, tra_0 FROM tew_translatedtext WHERE tra_objectno = -1 AND tra_0 <> '' \
+            "SELECT tra_objectid, tra_0 FROM tew_translatedtext WHERE tra_objectno = -1 AND TRIM(tra_0) <> '' \
              ORDER BY tra_lan_strid = 'en'",
         )
         .map_err(sql)?;
@@ -957,11 +963,12 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             locations_untagged += 1;
             continue;
         }
-        if !built.locations.iter().any(|have| have.path == path) {
-            built.locations.push(wc_core::Location {
-                path,
-                description: l.description.trim().to_owned(),
-            });
+        let description = l.description.trim().to_owned();
+        match built.locations.iter_mut().find(|have| have.path == path) {
+            // A repeat fills in a description the first one lacked, like merge_location.
+            Some(have) if have.description.is_empty() => have.description = description,
+            Some(_) => {}
+            None => built.locations.push(wc_core::Location { path, description }),
         }
     }
     let locations_merged = p.locations.len() - locations_untagged - built.locations.len();

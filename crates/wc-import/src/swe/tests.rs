@@ -820,3 +820,59 @@ fn a_database_without_a_location_table_still_imports() {
     let row = report.iter().find(|r| r.what == "locations").unwrap();
     assert_eq!((row.source, row.imported), (0, 0));
 }
+
+#[test]
+fn a_location_path_is_cleaned_up_like_the_tags_of_its_devices() {
+    let c = sample();
+    c.execute_batch(
+        "CREATE TABLE tew_location (loc_id INTEGER, loc_loc_id INTEGER, loc_tagpath TEXT);
+         INSERT INTO tew_location VALUES (40, -1, '+Room 1'), (41, -1, '+A/B');
+         INSERT INTO tew_component VALUES (105, 'K5', '+Room 1-K5', -1), (106, 'K6', '+A/B-K6', -1);
+         INSERT INTO tew_symbol VALUES (7, 10, 105, 'Coil', 250, 200, 0, 1, 1, NULL, NULL),
+           (8, 10, 106, 'Coil', 280, 200, 0, 1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (7, 0, 0, 0, 5), (8, 0, 0, 0, 5);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    let paths: BTreeSet<String> = built.locations.iter().map(|l| l.path.clone()).collect();
+    for product in ["K5", "K6"] {
+        let tag = built.devices.keys().find(|t| t.product == [product]).unwrap();
+        let loc = tag.location.join(".");
+        assert!(paths.contains(&loc), "{product} is in {loc}, imported: {paths:?}");
+    }
+    assert!(paths.contains("Room_1"), "{paths:?}");
+}
+
+#[test]
+fn location_descriptions_survive_blank_english_and_a_late_repeat_and_bad_rows_say_why() {
+    let c = sample();
+    c.execute_batch(
+        "CREATE TABLE tew_location (loc_id INTEGER, loc_loc_id INTEGER, loc_tagpath TEXT);
+         INSERT INTO tew_location VALUES (50, -1, '+L7'), (51, -1, '+L8'), (52, -1, '+L8'), (NULL, -1, '+L9');
+         INSERT INTO tew_translatedtext VALUES (50, -1, 'de', 'Schrank'), (50, -1, 'en', '   '),
+           (52, -1, 'en', 'Cabinet');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.starts_with("1 location row(s) could not be read") && w.contains("first:")),
+        "{:?}",
+        p.warnings
+    );
+    let (built, _, _) = build(&p, None);
+    let got: Vec<(&str, &str)> = built
+        .locations
+        .iter()
+        .map(|l| (l.path.as_str(), l.description.as_str()))
+        .collect();
+    assert!(
+        got.contains(&("L7", "Schrank")),
+        "blank English does not hide German: {got:?}"
+    );
+    assert!(
+        got.contains(&("L8", "Cabinet")),
+        "a later repeat fills the description: {got:?}"
+    );
+}
