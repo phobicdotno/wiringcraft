@@ -1218,14 +1218,17 @@ fn several_pages_change_in_one_commit_unless_someone_else_has_one_open() -> Test
     let cover = edited("p0001", "99", 10.0)?;
     let motor = edited("p0002", "98", 20.0)?;
     let pump = edited("p0003", "97", 30.0)?;
+    let was = |p: &Project, ids: &[&str]| -> Vec<Page> { ids.iter().filter_map(|id| p.page(id).cloned()).collect() };
 
     // One of the pages is Kari's: nothing of the change is applied.
     a_link.send(a.edit_project(ProjectEdit::SetPages {
         pages: vec![cover.clone(), pump],
+        before: was(s.host.project(), &["p0001", "p0003"]),
     }))?;
     // The same page twice is not a valid change.
     a_link.send(a.edit_project(ProjectEdit::SetPages {
         pages: vec![cover.clone(), cover.clone()],
+        before: was(s.host.project(), &["p0001", "p0001"]),
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     assert_eq!(
@@ -1240,8 +1243,10 @@ fn several_pages_change_in_one_commit_unless_someone_else_has_one_open() -> Test
     assert!(s.log.0.borrow().is_empty());
 
     // Pages nobody else has open: one commit, everyone gets them.
+    let before = was(s.host.project(), &["p0001", "p0002"]);
     a_link.send(a.edit_project(ProjectEdit::SetPages {
-        pages: vec![cover, motor],
+        pages: vec![cover.clone(), motor],
+        before: before.clone(),
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     let numbers: Vec<_> = s.host.project().pages.iter().map(|p| p.number.as_str()).collect();
@@ -1251,5 +1256,31 @@ fn several_pages_change_in_one_commit_unless_someone_else_has_one_open() -> Test
     assert_eq!(b.project.as_ref(), Some(s.host.project()));
     let messages: Vec<_> = s.log.0.borrow().iter().map(|c| c.message.clone()).collect();
     assert_eq!(messages, ["Edit 2 pages"]);
+
+    // A copy that had not yet seen that change cannot undo it: Kari retitles the cover from
+    // the old version, and the host refuses because the cover is no longer what Kari had.
+    let mut stale = before[0].clone();
+    stale.title = "Front".into();
+    b_link.send(b.edit_project(ProjectEdit::SetPages {
+        pages: vec![stale],
+        before: vec![before[0].clone()],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(
+        matches!(&b.refusals[0], Refusal::Invalid { reason } if reason.contains("changed by someone else")),
+        "{:?}",
+        b.refusals
+    );
+    assert_eq!(
+        s.host.project().page("p0001"),
+        Some(&cover)
+            .map(|c| {
+                let mut c = c.clone();
+                c.number = "1".into();
+                c
+            })
+            .as_ref()
+    );
+    assert_eq!(s.log.0.borrow().len(), 1);
     Ok(())
 }

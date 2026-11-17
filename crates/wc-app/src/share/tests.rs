@@ -514,27 +514,56 @@ fn a_joined_copy_waits_while_the_window_is_busy() -> TestResult {
 #[test]
 fn pages_nobody_has_open_go_out_together_as_one_change() -> TestResult {
     let tmp = tempfile::tempdir()?;
-    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.project.pages.push(Page::new("p0004", "4", "Terminals"));
+        Ok(())
+    })?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     let before = log.messages().len();
 
-    // The guest renames -K1 on its own page and on the cover, which nobody has open.
+    // The guest renames -K1 on its own page, on the cover and on page 4, which nobody has open.
     let k1 = DeviceTag::parse("-K1")?;
     guest_open.project.devices.insert(k1.clone(), Device::default());
     guest_open.project.page_mut("p0001").ok_or("no page")?.title = "Cover -K1".into();
+    guest_open.project.page_mut("p0004").ok_or("no page")?.title = "Terminals -K1".into();
     guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves -K1".into();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
 
+    // The two pages nobody holds are one change; the guest's own page is its page edit.
     assert_eq!(
         log.messages()[before..],
-        ["Change device -K1", "Edit page 1 Cover -K1", "Edit page 3 Valves -K1"]
+        ["Change device -K1", "Edit 2 pages", "Edit page 3 Valves -K1"]
     );
     assert!(host_open.project.devices.contains_key(&k1));
     assert_eq!(host_open.project.pages, guest_open.project.pages);
     assert_eq!(
-        host_open.project.page("p0001").map(|p| p.title.as_str()),
-        Some("Cover -K1")
+        host_open.project.page("p0004").map(|p| p.title.as_str()),
+        Some("Terminals -K1")
     );
+    Ok(())
+}
+
+#[test]
+fn a_change_to_a_free_page_made_before_someone_elses_change_arrived_is_not_kept() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let before = log.messages().len();
+
+    // The host retitles the cover; in the same moment, before that reaches the guest, the
+    // guest changes the cover too, from the old version.
+    host_open.project.page_mut("p0001").ok_or("no page")?.title = "Revised".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    guest_open.project.page_mut("p0001").ok_or("no page")?.cover = false;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    assert_eq!(log.messages()[before..], ["Edit page 1 Revised"]);
+    assert!(g.take_notes().iter().any(|n| n.contains("changed by someone else")));
+    for (who, o) in [("host", &host_open), ("guest", &guest_open)] {
+        let cover = o.project.page("p0001").ok_or("no page")?;
+        assert_eq!(cover.title, "Revised", "{who}: the earlier change is kept");
+        assert!(cover.cover, "the stale change is not");
+    }
     Ok(())
 }
 

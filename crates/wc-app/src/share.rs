@@ -77,6 +77,7 @@ pub fn outgoing(
     }
     let mut numbers = Vec::new();
     let mut others = Vec::new();
+    let mut others_before = Vec::new();
     for p in &local.pages {
         let Some(b) = base.page(&p.id) else {
             out.edits.push(ProjectEdit::AddPage { page: p.clone() });
@@ -93,7 +94,10 @@ pub fn outgoing(
                     Some(&holder) if holder != me => out.dropped.push(p.number.clone()),
                     // A page nobody has open, changed by a tool that works on several pages
                     // (wire numbering, a tag renamed everywhere): one edit for all of them.
-                    _ => others.push(p.clone()),
+                    _ => {
+                        others.push(p.clone());
+                        others_before.push(b.clone());
+                    }
                 }
             }
         }
@@ -161,7 +165,10 @@ pub fn outgoing(
 
     // Last, so the devices the pages name are there before them.
     if !others.is_empty() {
-        out.edits.push(ProjectEdit::SetPages { pages: others });
+        out.edits.push(ProjectEdit::SetPages {
+            pages: others,
+            before: others_before,
+        });
     }
     out
 }
@@ -311,8 +318,12 @@ impl Role {
             }
             Role::Guest(j) => {
                 // Applied to this copy at once; the host sends it back in its order, and applying
-                // it again then gives the same result, so every copy ends up the same.
-                if let Some(p) = j.guest.project.as_mut() {
+                // it again then gives the same result, so every copy ends up the same. Whole
+                // pages wait for the host: it refuses them when someone else changed one first,
+                // and applying them here would hide that change until the next join.
+                if !matches!(edit, ProjectEdit::SetPages { .. })
+                    && let Some(p) = j.guest.project.as_mut()
+                {
                     apply_edit(p, &edit);
                 }
                 let msg = j.guest.edit_project(edit);
