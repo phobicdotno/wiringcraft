@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::geom::{Point, Rotation, Shape};
 use crate::route::Route;
+use crate::symbol::SymbolRole;
 use crate::tag::DeviceTag;
 
 /// A library source as listed in `project.toml`. Earlier entries win when ids collide.
@@ -50,7 +51,81 @@ pub struct Jumper {
     pub terminals: Vec<String>,
 }
 
+/// Which terminal of which strip each placed terminal is, keyed by (page id, symbol id).
+pub type TerminalNumbers = BTreeMap<(String, String), (DeviceTag, String)>;
+
+/// The strip and number of every terminal placed on a schematic page: a tag `-X1.3` is
+/// terminal 3 of `-X1`; terminals tagged with only their strip (`-X1`) are numbered after the
+/// highest number of that strip, in drawing order (page, then left to right). This is the
+/// numbering the terminal plan shows and jumpers refer to. `role(symbol id)` tells terminals
+/// apart; when it is not known, a tag with a terminal level (`-X1.3`) is taken as one.
+pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> TerminalNumbers {
+    struct Placed {
+        key: (String, String),
+        number: Option<String>,
+        page: usize,
+        x: f64,
+    }
+    let mut strips: BTreeMap<DeviceTag, Vec<Placed>> = BTreeMap::new();
+    for (pi, page) in project.pages.iter().enumerate().filter(|(_, p)| !p.overview) {
+        for s in &page.symbols {
+            let Some(tag) = &s.tag else { continue };
+            let terminal = match role(&s.symbol) {
+                Some(r) => r == SymbolRole::Terminal,
+                None => tag.product.len() > 1,
+            };
+            if !terminal || tag.product.is_empty() {
+                continue;
+            }
+            let mut strip = tag.clone();
+            let number = if tag.product.len() > 1 {
+                strip.product.pop()
+            } else {
+                None
+            };
+            strips.entry(strip).or_default().push(Placed {
+                key: (page.id.clone(), s.id.clone()),
+                number,
+                page: pi,
+                x: s.at.x,
+            });
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (strip, mut list) in strips {
+        list.sort_by(|a, b| match (&a.number, &b.number) {
+            (Some(x), Some(y)) => natural_key(x).cmp(&natural_key(y)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.page.cmp(&b.page).then(a.x.total_cmp(&b.x)),
+        });
+        let mut next = list
+            .iter()
+            .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        for t in list {
+            let number = t.number.unwrap_or_else(|| {
+                next += 1;
+                next.to_string()
+            });
+            out.insert(t.key, (strip.clone(), number));
+        }
+    }
+    out
+}
+
 impl Jumper {
+    /// Whether the placed symbol `item` on `page` is one of this jumper's terminals: by its
+    /// number in `numbers` on a schematic page, by its tag elsewhere (an overview draws
+    /// terminals again).
+    pub fn has(&self, numbers: &TerminalNumbers, page: &Page, item: &PlacedSymbol, terminal_role: bool) -> bool {
+        match numbers.get(&(page.id.clone(), item.id.clone())) {
+            Some((strip, n)) => *strip == self.strip && self.terminals.contains(n),
+            None => terminal_role && item.tag.as_ref().is_some_and(|t| self.terminal_of(t).is_some()),
+        }
+    }
+
     /// The terminal number when `tag` is a terminal of this jumper (`-X1.4` on strip `-X1`).
     pub fn terminal_of<'a>(&self, tag: &'a DeviceTag) -> Option<&'a str> {
         let (last, rest) = tag.product.split_last()?;

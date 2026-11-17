@@ -126,13 +126,18 @@ pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -
     // Jumpers: the jumper joins the same side of its terminals, on any page: every wired pin `1`
     // of them is one net, every pin `2` another. A terminal's two sides stay apart, as they are
     // without a jumper, so wire numbers and the terminal plan keep telling them apart.
+    // Terminals are known by the numbering the terminal plan shows, so a terminal tagged with
+    // only its strip takes part too. A device drawn with a terminal's tag is no terminal.
+    let numbers = if project.meta.jumpers.is_empty() {
+        Default::default()
+    } else {
+        crate::project::terminal_numbers(project, &role)
+    };
     for (k, j) in project.meta.jumpers.iter().enumerate() {
         for page in &project.pages {
             for s in &page.symbols {
-                // A device drawn with a terminal's tag is no terminal; it stays off the jumper.
-                if !s.tag.as_ref().is_some_and(|t| j.terminal_of(t).is_some())
-                    || role(&s.symbol).is_some_and(|r| r != SymbolRole::Terminal)
-                {
+                let terminal = role(&s.symbol).is_none_or(|r| r == SymbolRole::Terminal);
+                if !j.has(&numbers, page, s, terminal) {
                     continue;
                 }
                 let wired: Vec<(String, usize)> = wired_pins(page, &s.id)
@@ -253,6 +258,41 @@ mod tests {
         };
         assert_eq!(w_net(&nets_linked(&p, role)), Some(2), "the coil's wire is its own net");
         assert_eq!(w_net(&nets(&p)), Some(6), "without roles the tag alone decides");
+    }
+
+    #[test]
+    fn terminals_tagged_with_only_their_strip_are_jumpered_by_their_plan_number() {
+        use crate::project::PlacedSymbol;
+        use crate::tag::DeviceTag;
+        let term = |id: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: "wc.terminal".into(),
+            at: Point::new(x, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: DeviceTag::parse("-X1").ok(),
+        };
+        let mut p = Project::new("t");
+        let mut a = Page::new("a", "1", "");
+        // Drawn right to left: the left one (b) is terminal 1, the right one (a) terminal 2.
+        a.symbols = vec![term("ta", 50.0), term("tb", 10.0)];
+        a.wires = vec![
+            wire("w1", pin("ta", "1"), pin("k1", "A1"), None),
+            wire("w2", pin("tb", "1"), pin("k2", "A1"), None),
+            wire("w3", pin("ta", "2"), pin("k3", "A1"), None),
+            wire("w4", pin("tb", "2"), pin("k4", "A1"), None),
+        ];
+        p.pages = vec![a];
+        let role = |id: &str| (id == "wc.terminal").then_some(SymbolRole::Terminal);
+        let numbers = crate::project::terminal_numbers(&p, role);
+        assert_eq!(numbers[&("a".to_owned(), "tb".to_owned())].1, "1");
+        assert_eq!(numbers[&("a".to_owned(), "ta".to_owned())].1, "2");
+        assert_eq!(nets_linked(&p, role).len(), 4, "no jumper");
+        let x1 = DeviceTag::parse("-X1").unwrap_or_default();
+        assert!(p.meta.add_jumper(&x1, &["1".to_owned(), "2".to_owned()]).is_ok());
+        let joined = nets_linked(&p, role);
+        assert_eq!(joined.len(), 2, "one net per side");
+        assert!(joined.iter().all(|n| n.pins.len() == 4));
     }
 
     #[test]

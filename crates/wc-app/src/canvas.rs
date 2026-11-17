@@ -562,8 +562,13 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     }
 
     // Jumpers: a bar through the jumpered terminals drawn on this page, in strip order.
+    let numbers = if open.project.meta.jumpers.is_empty() {
+        Default::default()
+    } else {
+        wc_core::project::terminal_numbers(&open.project, |id| open.symbols.get(id).map(|s| s.role))
+    };
     for j in &open.project.meta.jumpers {
-        let at = jumper_points(&page, &open.symbols, j);
+        let at = jumper_points(&page, &open.symbols, &numbers, j);
         if at.len() < 2 {
             continue;
         }
@@ -1169,6 +1174,7 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
 fn jumper_points(
     page: &Page,
     symbols: &std::collections::BTreeMap<String, wc_core::symbol::Symbol>,
+    numbers: &wc_core::project::TerminalNumbers,
     j: &wc_core::project::Jumper,
 ) -> Vec<Point> {
     let mut at: Vec<(&str, Point)> = page
@@ -1178,8 +1184,15 @@ fn jumper_points(
             symbols
                 .get(&s.symbol)
                 .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal)
+                && j.has(numbers, page, s, true)
         })
-        .filter_map(|s| Some((j.terminal_of(s.tag.as_ref()?)?, s.at)))
+        .filter_map(|s| {
+            let n = match numbers.get(&(page.id.clone(), s.id.clone())) {
+                Some((_, n)) => n.as_str(),
+                None => j.terminal_of(s.tag.as_ref()?)?,
+            };
+            Some((n, s.at))
+        })
         .collect();
     let key = wc_core::project::natural_key;
     at.sort_by(|a, b| key(a.0).cmp(&key(b.0)).then_with(|| a.0.cmp(b.0)));
@@ -1213,7 +1226,8 @@ mod tests {
         put("wc.coil", Point::new(90.0, 60.0), "-X1.1");
         o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
         let j = &o.project.meta.jumpers[0];
-        let at = jumper_points(&o.project.pages[page], &o.symbols, j);
+        let numbers = wc_core::project::terminal_numbers(&o.project, |id| o.symbols.get(id).map(|s| s.role));
+        let at = jumper_points(&o.project.pages[page], &o.symbols, &numbers, j);
         assert_eq!(
             at,
             [Point::new(20.0, 20.0), Point::new(40.0, 20.0)],

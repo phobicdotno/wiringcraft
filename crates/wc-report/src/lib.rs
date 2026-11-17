@@ -457,6 +457,8 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
         jumpered: String,
     }
     let mut terms: Vec<Term> = Vec::new();
+    // The numbers jumpers refer to: a terminal tagged with only its strip gets the next one.
+    let numbers = wc_core::project::terminal_numbers(i.project, |id| i.symbols.get(id).map(|s| s.role));
     // An overview (line diagram) draws terminals again; the plan lists each one once.
     for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for s in &page.symbols {
@@ -473,16 +475,20 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 Some(tag) => (tag.to_string(), None),
                 None => ("(untagged)".to_owned(), None),
             };
-            let jumpered = s
-                .tag
-                .as_ref()
-                .and_then(|tag| {
-                    let j = i.project.meta.jumper_of(tag)?;
-                    let own = j.terminal_of(tag)?;
+            let assigned = numbers.get(&(page.id.clone(), s.id.clone()));
+            let number = assigned.map(|(_, n)| n.clone()).or(number);
+            let jumpered = assigned
+                .and_then(|(strip, n)| {
+                    let j = i
+                        .project
+                        .meta
+                        .jumpers
+                        .iter()
+                        .find(|j| j.strip == *strip && j.terminals.contains(n))?;
                     Some(
                         j.terminals
                             .iter()
-                            .filter(|t| *t != own)
+                            .filter(|t| *t != n)
                             .cloned()
                             .collect::<Vec<_>>()
                             .join(", "),
