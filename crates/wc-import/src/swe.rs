@@ -168,6 +168,8 @@ pub struct SweProjectInfo {
     /// `YYYY-MM-DD`, from the source's `YYYYMMDD hh:mm:ss`.
     pub created: String,
     pub modified: String,
+    /// What could not be read, with the reason (the other fields still came across).
+    pub warnings: Vec<String>,
 }
 
 impl SweProjectInfo {
@@ -209,11 +211,11 @@ fn source_date(s: &str) -> String {
 pub fn project_info(conn: &Connection, directory: &str) -> Result<Option<SweProjectInfo>> {
     let mut st = conn
         .prepare(
-            "SELECT pro_id, COALESCE(pro_name, ''), COALESCE(pro_customername, ''), COALESCE(pro_custaddress1, ''), \
-             COALESCE(pro_custaddress2, ''), COALESCE(pro_custaddress3, ''), COALESCE(pro_drawingofficename, ''), \
-             COALESCE(pro_doaddress1, ''), COALESCE(pro_doaddress2, ''), COALESCE(pro_doaddress3, ''), \
-             COALESCE(pro_contractnb, ''), COALESCE(pro_createdby, ''), COALESCE(pro_modifiedby, ''), \
-             COALESCE(pro_creationdate, ''), COALESCE(pro_modificationdate, '') \
+            "SELECT pro_id, COALESCE(CAST(pro_name AS TEXT), ''), COALESCE(CAST(pro_customername AS TEXT), ''), COALESCE(CAST(pro_custaddress1 AS TEXT), ''), \
+             COALESCE(CAST(pro_custaddress2 AS TEXT), ''), COALESCE(CAST(pro_custaddress3 AS TEXT), ''), COALESCE(CAST(pro_drawingofficename AS TEXT), ''), \
+             COALESCE(CAST(pro_doaddress1 AS TEXT), ''), COALESCE(CAST(pro_doaddress2 AS TEXT), ''), COALESCE(CAST(pro_doaddress3 AS TEXT), ''), \
+             COALESCE(CAST(pro_contractnb AS TEXT), ''), COALESCE(CAST(pro_createdby AS TEXT), ''), COALESCE(CAST(pro_modifiedby AS TEXT), ''), \
+             COALESCE(CAST(pro_creationdate AS TEXT), ''), COALESCE(CAST(pro_modificationdate AS TEXT), '') \
              FROM tew_project WHERE TRIM(pro_directory) = ?1",
         )
         .map_err(sql)?;
@@ -236,8 +238,16 @@ pub fn project_info(conn: &Connection, directory: &str) -> Result<Option<SweProj
             .filter(|s| !s.is_empty())
             .collect()
     };
-    let mut ignored = Vec::new();
-    let description = texts(conn, &mut ignored)?.remove(&id).unwrap_or_default();
+    // The description is a nice-to-have: without it the other fields still come across, and
+    // why it is missing is kept.
+    let mut warnings = Vec::new();
+    let description = match texts(conn, &mut warnings) {
+        Ok(mut t) => t.remove(&id).unwrap_or_default(),
+        Err(e) => {
+            warnings.push(format!("the project description was not read: {e}"));
+            String::new()
+        }
+    };
     Ok(Some(SweProjectInfo {
         name: v[0].trim().to_owned(),
         description: description.trim().to_owned(),
@@ -250,6 +260,7 @@ pub fn project_info(conn: &Connection, directory: &str) -> Result<Option<SweProj
         modified_by: v[11].trim().to_owned(),
         created: source_date(&v[12]),
         modified: source_date(&v[13]),
+        warnings,
     }))
 }
 

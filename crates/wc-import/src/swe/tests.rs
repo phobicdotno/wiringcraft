@@ -943,3 +943,31 @@ fn an_archive_import_carries_the_project_fields_into_the_title_block() {
     let got = database_from_archive(bare, 1).unwrap();
     assert!(got.info.is_none() && got.info_warning.is_none());
 }
+
+#[test]
+fn the_project_fields_come_across_without_a_description_table_and_with_numbers() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         INSERT INTO tew_project VALUES (1, 'P', '1', 'Customer', '', '', '', '', '', '', '', 1042,
+           'designer', '', '', '');",
+    )
+    .unwrap();
+    let info = project_info(&c, "1").unwrap().unwrap();
+    assert_eq!(
+        info.contract_number, "1042",
+        "a number in a text column is read as text"
+    );
+    assert_eq!(info.customer, "Customer");
+    assert!(info.description.is_empty());
+    assert!(
+        info.warnings
+            .iter()
+            .any(|w| w.starts_with("the project description was not read")),
+        "{:?}",
+        info.warnings
+    );
+}

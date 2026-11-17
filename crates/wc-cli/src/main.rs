@@ -1317,7 +1317,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                         got.count, got.folder
                     );
                 }
-                if let Some(w) = &got.info_warning {
+                let info_warnings = got.info.iter().flat_map(|i| &i.warnings);
+                for w in got.info_warning.iter().chain(info_warnings) {
                     eprintln!("warning: {w}");
                 }
                 (got.bytes, got.info)
