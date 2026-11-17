@@ -1810,3 +1810,153 @@ fn a_box_never_takes_the_id_of_a_library_symbol() {
     assert_eq!(pins(&k1.symbol), ["A1", "A2"]);
     assert_eq!(pins(&f1.symbol).len(), 2);
 }
+
+#[test]
+fn each_page_takes_its_latest_revision_into_its_own_title_block() {
+    let c = sample();
+    c.execute_batch(
+        "
+CREATE TABLE tew_revision (rev_id INTEGER, rev_fil_id INTEGER, rev_orderno INTEGER, rev_tag TEXT,
+  rev_createdby TEXT, rev_creationdate TEXT, rev_checkedby TEXT, rev_checkdate TEXT,
+  rev_approvedby TEXT, rev_approvaldate TEXT);
+-- Written out of order: order number 2 is the latest.
+INSERT INTO tew_revision VALUES (2, 10, 2, 'B', 'Ann', '20240302 10:00:00', 'Bob', '20240303 09:00:00', '', NULL),
+  (1, 10, 1, 'A', 'Ann', '20240101 10:00:00', 'Bob', '20240102 10:00:00', 'Cid', '20240103 10:00:00'),
+  -- A page the project does not have.
+  (3, 999, 1, 'Z', 'Nobody', '', '', '', '', '');
+",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let sch = p.pages.iter().find(|pg| pg.id == 10).unwrap();
+    let want: BTreeMap<String, String> = [
+        ("revision", "B"),
+        ("drawn_by", "Ann"),
+        ("date", "2024-03-02"),
+        ("checked_by", "Bob"),
+        ("checked_date", "2024-03-03"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    assert_eq!(sch.title_block, want, "the latest revision, blank fields left out");
+    let report = p.pages.iter().find(|pg| pg.id == 11).unwrap();
+    assert!(report.title_block.is_empty());
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+
+    let (built, _, _) = build(&p, None);
+    assert_eq!(page(&built, "01").title_block, want);
+}
+
+#[test]
+fn revisions_by_object_id_keep_only_the_pages_ones() {
+    let c = sample();
+    c.execute_batch(
+        "
+CREATE TABLE tew_revision (rev_id INTEGER, rev_objectid INTEGER, rev_tag TEXT);
+-- Object 1 is the book, 10 the schematic page.
+INSERT INTO tew_revision VALUES (1, 1, 'R1'), (2, 10, 'P3');
+",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let sch = p.pages.iter().find(|pg| pg.id == 10).unwrap();
+    assert_eq!(sch.title_block.get("revision").map(String::as_str), Some("P3"));
+    assert_eq!(sch.title_block.len(), 1);
+    // The book's row is the project's revision, in the project's title block.
+    assert_eq!(p.revision.get("revision").map(String::as_str), Some("R1"));
+    let (built, _, _) = build(&p, None);
+    assert_eq!(built.title_block.get("revision").map(String::as_str), Some("R1"));
+}
+
+#[test]
+fn the_projects_latest_revision_and_checker_fill_its_title_block() {
+    let c = sample();
+    c.execute_batch(
+        "
+CREATE TABLE tew_revision (rev_id INTEGER, rev_objectid INTEGER, rev_orderno INTEGER, rev_tag TEXT,
+  rev_checkedby TEXT, rev_createdby TEXT);
+-- Object 1 is the book: order number 2 is its latest revision. Object 77 is neither a page
+-- nor a book (say a page row that could not be read): its later row is not the project's.
+INSERT INTO tew_revision VALUES (2, 1, 2, 'B', 'Bob', 'Dan'), (1, 1, 1, 'A', 'Ann', 'Ann'),
+  (3, 10, 1, 'P1', 'Cid', 'Cid'), (4, 77, 9, 'X', 'Xan', 'Xan');
+",
+    )
+    .unwrap();
+    let mut p = read(&c).unwrap();
+    // The project's own fields win; the revision fills only what they leave.
+    p.info = Some(SweProjectInfo {
+        created_by: "Eve".into(),
+        ..Default::default()
+    });
+    let (built, _, _) = build(&p, None);
+    let field = |k: &str| built.title_block.get(k).map(String::as_str);
+    assert_eq!(field("revision"), Some("B"));
+    assert_eq!(field("checked_by"), Some("Bob"));
+    assert_eq!(field("drawn_by"), Some("Eve"));
+    assert_eq!(
+        page(&built, "01").title_block.get("revision").map(String::as_str),
+        Some("P1")
+    );
+    assert_eq!(p.revision.get("revision").map(String::as_str), Some("B"));
+}
+
+#[test]
+fn with_several_books_the_first_books_revision_is_the_projects() {
+    let c = sample();
+    c.execute_batch(
+        "
+INSERT INTO tew_bundle VALUES (2, '2');
+CREATE TABLE tew_revision (rev_id INTEGER, rev_objectid INTEGER, rev_orderno INTEGER, rev_tag TEXT);
+-- Book 2's row comes last in the table's order, but book 1 is the first book.
+INSERT INTO tew_revision VALUES (1, 1, 1, 'B1'), (2, 2, 5, 'B2');
+",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.revision.get("revision").map(String::as_str), Some("B1"));
+    assert!(
+        p.warnings.iter().any(|w| w.contains("different revisions")),
+        "{:?}",
+        p.warnings
+    );
+}
+
+#[test]
+fn a_revision_table_without_a_page_column_is_reported_not_guessed() {
+    let c = sample();
+    c.execute_batch(
+        "CREATE TABLE tew_revision (rev_id INTEGER, rev_tag TEXT); INSERT INTO tew_revision VALUES (1, 'A');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert!(p.pages.iter().all(|pg| pg.title_block.is_empty()));
+    assert!(
+        p.warnings.iter().any(|w| w.contains("page revisions were not read")),
+        "{:?}",
+        p.warnings
+    );
+}
+
+#[test]
+fn the_first_cover_page_becomes_the_projects_cover_page() {
+    let c = sample();
+    c.execute_batch(
+        "INSERT INTO tew_file (fil_id, fil_orderno, fil_filetype, fil_title, fil_fol_id) VALUES (12, 0, 5, 'Cover', 7), (13, 3, 5, 'Cover 2', 7);
+         -- A text on the cover is not drawn: WiringCraft draws the cover from the project's fields.
+         INSERT INTO tew_symbol VALUES (9, 12, NULL, 'Logo', 10, 10, 0, 1, 1, NULL, NULL);",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let (built, _, report) = build(&p, None);
+    let covers: Vec<&Page> = built.pages.iter().filter(|pg| pg.cover).collect();
+    assert_eq!(covers.len(), 1, "one cover page");
+    assert_eq!(covers[0].id, "swe-page-12");
+    assert!(covers[0].symbols.is_empty() && covers[0].wires.is_empty());
+    assert_eq!(built.pages[0].id, "swe-page-12", "in source order, first");
+    assert_eq!(built.pages.len(), 2);
+    let pages = report.iter().find(|r| r.what == "pages").unwrap();
+    assert_eq!((pages.source, pages.imported), (4, 2));
+    assert!(pages.note.contains("1 further cover page"), "{}", pages.note);
+    assert!(pages.note.contains("1 report"), "{}", pages.note);
+}

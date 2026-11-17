@@ -639,3 +639,35 @@ fn text_widths_are_helvetica_advance_widths() {
         );
     }
 }
+
+#[test]
+fn a_pages_own_title_block_fields_win_over_the_projects_on_that_page() {
+    // Values unlike the frame's row letters.
+    let mut project = wc_core::Project::new("Pump station");
+    project.meta.title_block.insert("revision".into(), "Rev-A".into());
+    project
+        .meta
+        .title_block
+        .insert("checked_by".into(), "Project checker".into());
+    let mut own = Page::new("p1", "1", "Motors");
+    own.title_block.insert("revision".into(), "Rev-C".into());
+    // A blank page value does not hide the project's.
+    own.title_block.insert("checked_by".into(), " ".into());
+    let plain = Page::new("p2", "2", "Supply");
+    let texts = |page: &Page| -> Vec<String> {
+        layout::frame_marks(&project, page, 0, 2, "2026-11-17")
+            .into_iter()
+            .filter_map(|m| match m.shape {
+                Shape::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    };
+    let on_own = texts(&own);
+    assert!(on_own.contains(&"Rev-C".to_owned()), "{on_own:?}");
+    assert!(!on_own.contains(&"Rev-A".to_owned()), "{on_own:?}");
+    assert!(on_own.contains(&"Project checker".to_owned()), "{on_own:?}");
+    let on_plain = texts(&plain);
+    assert!(on_plain.contains(&"Rev-A".to_owned()), "{on_plain:?}");
+    assert!(!on_plain.contains(&"Rev-C".to_owned()), "{on_plain:?}");
+}

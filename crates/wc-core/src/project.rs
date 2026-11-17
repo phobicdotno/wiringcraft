@@ -677,6 +677,11 @@ pub struct Page {
     /// [`ProjectMeta`]), so editing them once updates the cover and every title block.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cover: bool,
+    /// Title-block fields of this page alone (its revision, date, checked by, ...). On this
+    /// page's title block they win over the project's fields of the same name
+    /// ([`ProjectMeta::title_block`]); fields the page does not set come from the project.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub title_block: BTreeMap<String, String>,
 }
 
 /// A raster picture under a page: a JPEG or PNG file in the project folder, stretched over a
@@ -720,7 +725,18 @@ impl Page {
             underlay: None,
             overview: false,
             cover: false,
+            title_block: BTreeMap::new(),
         }
+    }
+
+    /// A title-block field as this page shows it: the page's own value when it has one that
+    /// is not blank, else the project's. Empty when neither has it.
+    pub fn title_field<'a>(&'a self, meta: &'a ProjectMeta, key: &str) -> &'a str {
+        self.title_block
+            .get(key)
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| meta.title_block.get(key))
+            .map_or("", String::as_str)
     }
 
     pub fn symbol(&self, id: &str) -> Option<&PlacedSymbol> {
@@ -1293,6 +1309,26 @@ mod tests {
         m.add_jumper(&x1, &["3".into(), "4".into()])?;
         assert!(!m.follow_terminals(&before, &after));
         assert_eq!(m.jumpers[0].terminals, ["3", "4"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_pages_own_title_field_wins_and_is_kept_out_of_the_file_when_empty()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut meta = Project::new("P").meta;
+        meta.title_block.insert("revision".into(), "A".into());
+        let mut page = Page::new("p1", "1", "");
+        assert_eq!(page.title_field(&meta, "revision"), "A");
+        assert_eq!(page.title_field(&meta, "date"), "");
+        let text = toml::to_string(&page)?;
+        assert!(!text.contains("title_block"), "{text}");
+        page.title_block.insert("revision".into(), "B".into());
+        page.title_block.insert("date".into(), String::new());
+        assert_eq!(page.title_field(&meta, "revision"), "B");
+        assert_eq!(page.title_field(&meta, "date"), "", "a blank page value falls back");
+        let text = toml::to_string(&page)?;
+        let back: Page = toml::from_str(&text)?;
+        assert_eq!(back, page);
         Ok(())
     }
 }

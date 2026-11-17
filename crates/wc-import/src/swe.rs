@@ -87,6 +87,10 @@ pub struct SwePage {
     pub book: String,
     /// The title block (drawing frame) name; it names the sheet size, e.g. `..._A2_...`.
     pub frame: String,
+    /// The page's own title-block fields from its latest revision ([`page_revisions`]):
+    /// `revision`, `drawn_by`, `date`, `checked_by`, `checked_date`, `approved_by`,
+    /// `approved_date`. Blank values are left out.
+    pub title_block: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +191,9 @@ pub struct SweProject {
     /// The project's own fields (name, customer, ...), from the archive's project list. Not in
     /// the project database itself, so a bare database import has none.
     pub info: Option<SweProjectInfo>,
+    /// The project's own latest revision fields (`tew_revision` rows for the book or project,
+    /// not a page). They fill the project's title block where [`Self::info`] leaves a field.
+    pub revision: BTreeMap<String, String>,
     /// The archive's catalog parts ([`library::from_archive`]), set by the caller. Devices and
     /// cables that name one of them are linked to it, and their layout footprints take its size.
     pub catalog: Vec<wc_core::Part>,
@@ -304,6 +311,140 @@ pub fn project_info(conn: &Connection, directory: &str) -> Result<Option<SweProj
         Err(e) => info.warnings.push(format!("the project description was not read: {e}")),
     }
     Ok(Some(info))
+}
+
+/// The columns of `table`, lower case, in table order. Empty when the table is missing.
+fn columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut st = conn.prepare("SELECT name FROM pragma_table_info(?1)").map_err(sql)?;
+    let rows = st.query_map([table], |r| r.get::<_, String>(0)).map_err(sql)?;
+    rows.map(|r| r.map(|c| c.to_lowercase()).map_err(sql)).collect()
+}
+
+/// The first of `columns` whose name, without its table prefix (`rev_` in `rev_createdby`), is
+/// one of `names`, tried in the order of `names`.
+fn column_named<'a>(columns: &'a [String], names: &[&str]) -> Option<&'a str> {
+    let bare = |c: &'a String| c.split_once('_').map_or(c.as_str(), |(_, rest)| rest);
+    names
+        .iter()
+        .find_map(|n| columns.iter().find(|c| bare(c) == *n || c.as_str() == *n))
+        .map(String::as_str)
+}
+
+/// Each page's title-block fields from its latest revision in `tew_revision`, by page id
+/// (`fil_id`). The table's columns are found by name, not position, since the layout is not
+/// published: the page is the `..._fil_id` column, else an object id column whose value is one
+/// of `pages`; the latest revision is the one with the highest order number (else id, else
+/// row). A missing table gives nothing; a table without a page column is reported.
+///
+/// With an object id column, the latest row for one of `books` is that book's revision; the
+/// revision of the first book that has one (lowest id) is the project's own
+/// ([`Revisions::project`]), with a warning when another book's differs. A book without a
+/// revision row has nothing to say about the project's revision, so it is passed over. Rows for
+/// any other object are left out.
+pub fn page_revisions(
+    conn: &Connection,
+    pages: &BTreeSet<i64>,
+    books: &BTreeSet<i64>,
+    warnings: &mut Vec<String>,
+) -> Result<Revisions> {
+    if !has_table(conn, "tew_revision")? {
+        return Ok(Revisions::default());
+    }
+    let cols = columns(conn, "tew_revision")?;
+    let Some(page) = column_named(&cols, &["fil_id", "objectid", "object_id", "obj_id", "objid"]) else {
+        warnings.push("page revisions were not read: tew_revision has no page or object column".into());
+        return Ok(Revisions::default());
+    };
+    // Title-block key, the column names it may have, and whether it is a date.
+    let wanted: [(&str, &[&str], bool); 7] = [
+        ("revision", &["tag", "index", "revindex", "revision", "name"], false),
+        ("drawn_by", &["createdby", "author"], false),
+        ("date", &["creationdate", "createddate", "date"], true),
+        ("checked_by", &["checkedby", "verifiedby"], false),
+        (
+            "checked_date",
+            &["checkdate", "checkeddate", "checkingdate", "verificationdate"],
+            true,
+        ),
+        ("approved_by", &["approvedby"], false),
+        ("approved_date", &["approvaldate", "approveddate"], true),
+    ];
+    let found: Vec<(&str, &str, bool)> = wanted
+        .iter()
+        .filter_map(|(key, names, date)| column_named(&cols, names).map(|c| (*key, c, *date)))
+        .collect();
+    if found.is_empty() {
+        warnings.push("page revisions were not read: tew_revision has no revision, name or date column".into());
+        return Ok(Revisions::default());
+    }
+    let order = column_named(&cols, &["orderno", "no", "id"]).unwrap_or("rowid");
+    let quote = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
+    let fields: Vec<String> = found
+        .iter()
+        .map(|(_, c, _)| format!("COALESCE(CAST({} AS TEXT), '')", quote(c)))
+        .collect();
+    let query = format!(
+        "SELECT {}, {} FROM tew_revision WHERE {} IS NOT NULL ORDER BY {}, rowid",
+        quote(page),
+        fields.join(", "),
+        quote(page),
+        if order == "rowid" {
+            "rowid".to_owned()
+        } else {
+            quote(order)
+        },
+    );
+    let mut st = conn.prepare(&query).map_err(sql)?;
+    let rows = st
+        .query_map([], |r| {
+            let values: rusqlite::Result<Vec<String>> = (0..found.len()).map(|i| r.get::<_, String>(i + 1)).collect();
+            Ok((r.get::<_, i64>(0)?, values?))
+        })
+        .map_err(sql)?;
+    // A `fil_id` column names files only; an object id column also names the book or project.
+    let by_object = !page.ends_with("fil_id");
+    let mut out = Revisions::default();
+    // Each book's latest revision; that of the first book with one (lowest id) is the project's.
+    let mut by_book: BTreeMap<i64, BTreeMap<String, String>> = BTreeMap::new();
+    for (id, values) in readable(rows, "page revision", warnings) {
+        let for_page = pages.contains(&id);
+        // Only a book's row is the project's: an id that is neither a page nor a book (a page
+        // row that could not be read, or another object) is left out.
+        if !for_page && !(by_object && books.contains(&id)) {
+            continue;
+        }
+        // Later rows are later revisions: each replaces the page's fields as a whole.
+        let block: BTreeMap<String, String> = found
+            .iter()
+            .zip(values)
+            .map(|((key, _, date), v)| {
+                let v = v.trim();
+                ((*key).to_owned(), if *date { source_date(v) } else { v.to_owned() })
+            })
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        if for_page {
+            out.pages.insert(id, block);
+        } else {
+            by_book.insert(id, block);
+        }
+    }
+    let mut books_with = by_book.into_values();
+    if let Some(first) = books_with.next() {
+        if books_with.any(|other| other != first) {
+            warnings
+                .push("the books have different revisions: the project's title block takes the first book's".into());
+        }
+        out.project = first;
+    }
+    Ok(out)
+}
+
+/// What [`page_revisions`] read: each page's latest revision fields, and the project's.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Revisions {
+    pub pages: BTreeMap<i64, BTreeMap<String, String>>,
+    pub project: BTreeMap<String, String>,
 }
 
 /// A location (`tew_location`): a cabinet, room or panel.
@@ -620,7 +761,13 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
             ))
         })
         .map_err(sql)?;
-    for (id, order, kind, label, folder_id, folder_name, frame, book) in readable(rows, "page", &mut warnings) {
+    let page_rows = readable(rows, "page", &mut warnings);
+    let page_ids: BTreeSet<i64> = page_rows.iter().map(|r| r.0).collect();
+    let book_ids: BTreeSet<i64> = books.keys().copied().collect();
+    let revisions = page_revisions(conn, &page_ids, &book_ids, &mut warnings)?;
+    p.revision = revisions.project;
+    let mut revisions = revisions.pages;
+    for (id, order, kind, label, folder_id, folder_name, frame, book) in page_rows {
         let folder = folder_id.and_then(|f| text.get(&f).cloned()).unwrap_or(folder_name);
         p.pages.push(SwePage {
             id,
@@ -631,6 +778,7 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
             folder,
             book: book.and_then(|b| books.get(&b).cloned()).unwrap_or_default(),
             frame,
+            title_block: revisions.remove(&id).unwrap_or_default(),
         });
     }
 
@@ -1422,6 +1570,9 @@ pub fn build_with(
         title_block: p.info.as_ref().map(SweProjectInfo::title_block).unwrap_or_default(),
         panels: Vec::new(),
     };
+    for (k, v) in &p.revision {
+        built.title_block.entry(k.clone()).or_insert_with(|| v.clone());
+    }
     // Locations, with their descriptions. One without a usable tag path cannot be named.
     let mut locations_untagged = 0;
     for l in &p.locations {
@@ -1439,9 +1590,16 @@ pub fn build_with(
         }
     }
     let locations_merged = p.locations.len() - locations_untagged - built.locations.len();
-    let drawn: Vec<&SwePage> = p.pages.iter().filter(|pg| DRAWN_KINDS.contains(&pg.kind)).collect();
+    // The first cover page becomes WiringCraft's cover page, which draws the project's fields
+    // itself; further cover pages are left out.
+    let first_cover = p.pages.iter().find(|pg| pg.kind == KIND_COVER).map(|pg| pg.id);
+    let drawn: Vec<&SwePage> = p
+        .pages
+        .iter()
+        .filter(|pg| DRAWN_KINDS.contains(&pg.kind) || Some(pg.id) == first_cover)
+        .collect();
     let others = p.pages.len() - drawn.len();
-    let covers = p.pages.iter().filter(|pg| pg.kind == KIND_COVER).count();
+    let covers = p.pages.iter().filter(|pg| pg.kind == KIND_COVER).count() - usize::from(first_cover.is_some());
 
     // Tags: one per component, made unique if two components give the same tag. Each pair of
     // origin-destination arrows becomes a pair of interruption points with its own tag. A
@@ -1619,7 +1777,17 @@ pub fn build_with(
     // Element (`cel_id`) -> its component, to tell a jumper between terminals of one strip.
     let mut element_component: BTreeMap<i64, i64> = BTreeMap::new();
 
-    for (i, pg) in drawn.iter().enumerate() {
+    for (pg, number) in drawn.iter().zip(&numbers) {
+        if pg.kind == KIND_COVER {
+            // Its source drawing (frame, logo, field texts) is not brought across: WiringCraft
+            // draws the cover from the project's fields, which the import filled.
+            let mut page = Page::new(format!("swe-page-{}", pg.id), number.clone(), pg.title.clone());
+            page.cover = true;
+            page.size = frame_size(&pg.frame).unwrap_or_default();
+            page.title_block = pg.title_block.clone();
+            built.pages.push(page);
+            continue;
+        }
         let syms: Vec<&SweSymbol> = syms_of.remove(&pg.id).unwrap_or_default();
         let lines: Vec<&SweLine> = lines_of.remove(&pg.id).unwrap_or_default();
         symbols_in += syms.len();
@@ -1649,7 +1817,7 @@ pub fn build_with(
         if !fits {
             warnings.push(format!(
                 "page {} reaches beyond A2; content outside the sheet is kept as is",
-                numbers[i]
+                number
             ));
         }
         let height = size.mm().1;
@@ -1661,10 +1829,11 @@ pub fn build_with(
             (true, false) => pg.title.clone(),
             (true, true) => String::new(),
         };
-        let mut page = Page::new(format!("swe-page-{}", pg.id), numbers[i].clone(), title);
+        let mut page = Page::new(format!("swe-page-{}", pg.id), number.clone(), title);
         page.size = size;
         // A line diagram repeats devices the schematics draw in detail.
         page.overview = pg.kind == KIND_LINE_DIAGRAM;
+        page.title_block = pg.title_block.clone();
 
         // Pin positions on this page (y down) for joining wire ends.
         let mut pin_at: Vec<(Point, String, String)> = Vec::new();
@@ -2165,7 +2334,10 @@ pub fn build_with(
             source: p.pages.len(),
             imported: built.pages.len(),
             note: note(vec![
-                (covers, "cover page(s)"),
+                (
+                    covers,
+                    "further cover page(s) (WiringCraft has one cover page, drawn from the project's fields)",
+                ),
                 (
                     layouts.panels.len(),
                     "cabinet layout page(s), imported as panel layouts",

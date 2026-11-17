@@ -2526,8 +2526,46 @@ fn keep_library_sources(p: &mut Project, ids: &[String], sources: &std::collecti
     }
 }
 
-fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Result<(), String> {
+/// A project has one cover page. When the project already has one, imported cover pages are
+/// dropped and their title-block values (the first non-blank one of each field) come back, to
+/// fill the fields the existing cover leaves empty with [`fill_cover`]; otherwise only the first
+/// imported cover is kept. The project itself is not changed, so a refused import leaves it as
+/// it was.
+fn keep_one_cover(p: &Project, pages: &mut Vec<Page>) -> std::collections::BTreeMap<String, String> {
+    let mut kept = p.cover_page().is_some();
+    let mut fields = std::collections::BTreeMap::new();
+    pages.retain(|pg| {
+        if !pg.cover {
+            return true;
+        }
+        if kept {
+            for (k, v) in pg.title_block.iter().filter(|(_, v)| !v.trim().is_empty()) {
+                fields.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            return false;
+        }
+        kept = true;
+        true
+    });
+    fields
+}
+
+/// Fill the project cover's empty title-block fields from `fields` ([`keep_one_cover`]).
+fn fill_cover(p: &mut Project, fields: std::collections::BTreeMap<String, String>) {
+    let Some(cover) = p.cover_page().and_then(|i| p.pages.get_mut(i)) else {
+        return;
+    };
+    for (k, v) in fields {
+        let slot = cover.title_block.entry(k).or_default();
+        if slot.trim().is_empty() {
+            *slot = v;
+        }
+    }
+}
+
+fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, source: &str) -> Result<(), String> {
     let e = |x: wc_core::Error| x.to_string();
+    let cover_fields = keep_one_cover(p, &mut built.pages);
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of
     // an earlier one and then fail half way.
     if let Some(page) = built.pages.iter().find(|pg| p.page(&pg.id).is_some()) {
@@ -2584,6 +2622,7 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
             "device {tag} exists with other data; rename it or import into a fresh project"
         ));
     }
+    fill_cover(p, cover_fields);
     for s in &built.symbols {
         store::write_vendored_symbol(dir, s).map_err(e)?;
         p.lock.symbols.insert(
@@ -3069,9 +3108,13 @@ mod tests {
             id: "maker.new-part".into(),
             ..Default::default()
         };
+        let mut cover = Page::new("swe-0001", "1", "Cover");
+        cover.cover = true;
+        cover.title_block.insert("revision".into(), "C".into());
         let built = wc_import::aml::Built {
             panels: vec![panel("swe-layout-c"), panel("swe-layout-a")],
             parts: vec![part],
+            pages: vec![cover],
             ..Default::default()
         };
         let err = add_built(&dir, &mut p, built, "import:b.tewzip").unwrap_err();
@@ -3082,6 +3125,49 @@ mod tests {
             "no part file written"
         );
         assert_eq!(std::fs::read(dir.join("project.toml")).unwrap(), project_file);
+    }
+
+    #[test]
+    fn an_imported_cover_leaves_the_project_one_cover_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        assert_eq!(
+            p.pages.iter().filter(|pg| pg.cover).count(),
+            1,
+            "a new project has a cover"
+        );
+        let mut cover = Page::new("swe-0001", "1", "Cover");
+        cover.cover = true;
+        // A blank value does not hide a later cover's value.
+        cover.title_block.insert("revision".into(), " ".into());
+        let mut second = Page::new("swe-0002", "2", "Cover 2");
+        second.cover = true;
+        second.title_block.insert("revision".into(), "C".into());
+        let built = wc_import::aml::Built {
+            pages: vec![cover, second, Page::new("swe-0003", "3", "Power")],
+            ..Default::default()
+        };
+        // The imported cover is numbered 1 like the project's own: no clash, it is merged.
+        add_built(&dir, &mut p, built, "import:a.tewzip").unwrap();
+        let covers: Vec<_> = p.pages.iter().filter(|pg| pg.cover).collect();
+        assert_eq!(covers.len(), 1);
+        assert_eq!(covers[0].title_block.get("revision").map(String::as_str), Some("C"));
+        assert!(p.page("swe-0003").is_some());
+        assert!(p.page("swe-0001").is_none() && p.page("swe-0002").is_none());
+
+        // Into a project without a cover only the first imported cover comes.
+        let mut p = Project::new("t");
+        p.pages.retain(|pg| !pg.cover);
+        let mut a = Page::new("swe-0001", "1", "Cover");
+        a.cover = true;
+        let mut b = Page::new("swe-0002", "2", "Cover 2");
+        b.cover = true;
+        let mut pages = vec![a, b];
+        assert!(keep_one_cover(&p, &mut pages).is_empty());
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].id, "swe-0001");
     }
 
     #[test]
