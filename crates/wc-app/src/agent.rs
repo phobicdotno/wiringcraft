@@ -121,16 +121,20 @@ impl Assistant {
     }
 
     /// The last message was not answered: put its words (unless something new was typed) and
-    /// its screenshots back in the box. Screenshots added since stay, after the given-back ones.
-    pub fn give_back(&mut self, text: Option<String>) {
+    /// its screenshots back in the box. Screenshots added since stay, after the given-back ones,
+    /// as far as there is room; returns how many of those did not fit. (Drops are refused while
+    /// a message is on its way, so normally nothing was added.)
+    pub fn give_back(&mut self, text: Option<String>) -> usize {
         let text = text.unwrap_or_else(|| std::mem::take(&mut self.sent_text));
         if self.input.trim().is_empty() {
             self.input = text;
         }
         let newer = std::mem::take(&mut self.waiting);
         self.waiting = std::mem::take(&mut self.sent).into_iter().map(|s| (s, None)).collect();
-        self.waiting.extend(newer);
-        self.waiting.truncate(screenshot::MAX_WAITING);
+        let room = screenshot::MAX_WAITING.saturating_sub(self.waiting.len());
+        let left_out = newer.len().saturating_sub(room);
+        self.waiting.extend(newer.into_iter().take(room));
+        left_out
     }
 
     /// Working on a message, with either backend.
@@ -2288,7 +2292,7 @@ mod tests {
         s.sent = vec![shot(1), shot(2)];
         // A picture dropped while the message was on its way stays, after the given-back ones.
         s.waiting = vec![(shot(3), None)];
-        s.give_back(None);
+        assert_eq!(s.give_back(None), 0);
         let widths: Vec<u32> = s.waiting.iter().map(|(x, _)| x.image.width()).collect();
         assert_eq!(widths, vec![1, 2, 3]);
         assert_eq!(s.input, "look at this");
@@ -2298,6 +2302,12 @@ mod tests {
         s.give_back(Some("old".into()));
         assert_eq!(s.input, "new words");
         assert_eq!(s.waiting.len(), 3);
+        // Full: every given-back screenshot stays, newer ones that do not fit are counted.
+        s.sent = (1..=5).map(shot).collect();
+        s.waiting = vec![(shot(9), None)];
+        assert_eq!(s.give_back(None), 1);
+        let widths: Vec<u32> = s.waiting.iter().map(|(x, _)| x.image.width()).collect();
+        assert_eq!(widths, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]

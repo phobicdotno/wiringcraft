@@ -88,7 +88,17 @@ impl App {
         }
     }
 
-    /// Pictures dropped on the window go to the assistant.
+    /// Put an unanswered message back in the box, saying if screenshots did not fit.
+    fn give_back(&mut self, text: Option<String>) {
+        let left_out = self.assistant.give_back(text);
+        if left_out > 0 {
+            self.assistant_log(Entry::Note(format!(
+                "{left_out} newer screenshot(s) did not fit next to the message given back (at most {MAX_WAITING})."
+            )));
+        }
+    }
+
+    /// Pictures dropped on the window go to the assistant, once it is not working on a message.
     fn take_dropped_pictures(&mut self, ctx: &egui::Context) {
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
@@ -98,6 +108,12 @@ impl App {
                 .filter(|p| screenshot::is_picture(p))
                 .collect()
         });
+        if !dropped.is_empty() && self.assistant.busy() {
+            self.assistant_log(Entry::Note(
+                "The assistant is still working; drop the screenshot again when it has answered.".into(),
+            ));
+            return;
+        }
         for path in dropped {
             match Shot::from_file(&path) {
                 Ok(shot) => self.add_screenshot(shot),
@@ -186,7 +202,7 @@ impl App {
             let p = c.poll(&mut self.assistant.login_log);
             finished |= p.finished;
             if p.unanswered {
-                self.assistant.give_back(None);
+                self.give_back(None);
             }
         }
         // API key.
@@ -197,7 +213,7 @@ impl App {
             self.assistant.session = session;
             finished |= polled.finished;
             if let Some(text) = self.assistant.session.returned.take() {
-                self.assistant.give_back(Some(text));
+                self.give_back(Some(text));
             }
         }
         if finished {
