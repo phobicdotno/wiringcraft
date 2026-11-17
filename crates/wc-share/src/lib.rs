@@ -1,0 +1,50 @@
+//! Shared work sessions: several people edit one open project live over the office network.
+//!
+//! One instance is the **host**: it holds the authoritative project and decides everything.
+//! Others are **guests**: they keep their own copy of the project on their own disk and only
+//! exchange changes with the host (opening a project straight from a file share is about 20
+//! times slower, so the project itself never travels over the network after joining).
+//!
+//! The rules, all enforced by [`Host`]:
+//!
+//! - **Approval.** A guest sends [`GuestMsg::Join`]; the host approves or declines each request.
+//!   Everything a guest sends before approval is refused.
+//! - **Page locks.** The page a person has open is locked to them. Others see it read-only.
+//!   Opening another page, or leaving, releases the lock.
+//! - **Project-level data** (devices, panels, comments, adding, removing and renumbering pages)
+//!   goes through the host one change at a time as a [`ProjectEdit`]. A page's display number is
+//!   project-level too: a page edit never changes it.
+//! - **One commit per change.** Every applied change is handed to a [`Journal`]; [`GitJournal`]
+//!   saves the project and commits it with the participant as the author, so any change can be
+//!   reverted from the history.
+//!
+//! The host and guests are plain state machines with no I/O; [`transport`] connects them. Tests
+//! run whole sessions in-process.
+
+mod guest;
+mod host;
+mod journal;
+mod protocol;
+pub mod transport;
+
+pub use guest::{Guest, GuestStatus};
+pub use host::{HOST, Host};
+pub use journal::{Change, GitJournal, Journal, MemoryJournal};
+pub use protocol::{GuestMsg, HostMsg, Peer, PeerId, ProjectEdit, Refusal, Snapshot, apply_edit};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Core(#[from] wc_core::Error),
+    #[error(transparent)]
+    Vcs(#[from] wc_vcs::Error),
+    #[error("bad session message: {0}")]
+    Decode(#[from] serde_json::Error),
+    #[error("the session connection is closed")]
+    Closed,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests;
