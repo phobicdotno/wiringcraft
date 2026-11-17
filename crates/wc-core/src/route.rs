@@ -68,6 +68,11 @@ impl Axis {
 /// The bend points of a wire from `a` to `b` in `style`. `a_axis` and `b_axis` say which way
 /// the wire leaves each end; `None` (a free point) follows the other end, or the longer
 /// distance when neither end has one.
+///
+/// Ends on one straight line are always joined straight. When their pins point across that
+/// line (two side pins one above the other), a square route would have to leave the line and
+/// come back, and which side is free depends on the drawing round it, so that is left to the
+/// user to draw by hand.
 pub fn via(a: Point, a_axis: Option<Axis>, b: Point, b_axis: Option<Axis>, style: Route) -> Vec<Point> {
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     if style == Route::Straight || dx.abs() < SAME || dy.abs() < SAME {
@@ -85,9 +90,10 @@ pub fn via(a: Point, a_axis: Option<Axis>, b: Point, b_axis: Option<Axis>, style
         (Axis::Horizontal, Axis::Horizontal) => {
             let mx = a.x + dx / 2.0;
             if sloped {
-                // The slope takes as much of the height as the width allows; any rest of the
-                // height is a straight drop after it.
-                let d = dx.abs().min(dy.abs());
+                // The slope takes as much of the height as half the width allows, so both ends
+                // keep a straight run along their axis; any rest of the height is a straight
+                // drop after it.
+                let d = (dx.abs() / 2.0).min(dy.abs());
                 let (sx, sy) = (dx.signum(), dy.signum());
                 vec![
                     Point::new(mx - sx * d / 2.0, a.y),
@@ -101,7 +107,7 @@ pub fn via(a: Point, a_axis: Option<Axis>, b: Point, b_axis: Option<Axis>, style
         (Axis::Vertical, Axis::Vertical) => {
             let my = a.y + dy / 2.0;
             if sloped {
-                let d = dx.abs().min(dy.abs());
+                let d = (dy.abs() / 2.0).min(dx.abs());
                 let (sx, sy) = (dx.signum(), dy.signum());
                 vec![
                     Point::new(a.x, my - sy * d / 2.0),
@@ -197,8 +203,40 @@ mod tests {
     fn sloped_with_more_height_than_width_drops_the_rest() {
         let (a, b) = (p(0.0, 0.0), p(10.0, 30.0));
         let v = via(a, Some(Axis::Horizontal), b, Some(Axis::Horizontal), Route::Sloped);
-        assert_eq!(v, vec![p(10.0, 10.0)]);
+        // Both ends keep a straight run sideways before and after the 5 mm slope.
+        assert_eq!(v, vec![p(2.5, 0.0), p(7.5, 5.0), p(7.5, 30.0)]);
         assert!(legs_ok(a, b, &v, true));
+        // The same turned on its side, for top and bottom pins.
+        let b = p(30.0, 10.0);
+        let v = via(a, Some(Axis::Vertical), b, Some(Axis::Vertical), Route::Sloped);
+        assert_eq!(v, vec![p(0.0, 2.5), p(5.0, 7.5), p(30.0, 7.5)]);
+        assert!(legs_ok(a, b, &v, true));
+    }
+
+    #[test]
+    fn sloped_ends_leave_along_their_axis() {
+        let a = p(0.0, 0.0);
+        for b in [p(10.0, 30.0), p(40.0, 20.0), p(-10.0, -30.0), p(5.0, 50.0)] {
+            let v = via(a, Some(Axis::Horizontal), b, Some(Axis::Horizontal), Route::Sloped);
+            let (first, last) = (v[0], v[v.len() - 1]);
+            assert!(
+                (first.y - a.y).abs() < SAME && (first.x - a.x).abs() > SAME,
+                "{b:?}: {v:?}"
+            );
+            assert!(
+                (last.y - b.y).abs() < SAME && (last.x - b.x).abs() > SAME,
+                "{b:?}: {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn side_pins_on_one_vertical_line_are_joined_straight() {
+        // No square route without a detour; see `via`.
+        let (a, b) = (p(0.0, 0.0), p(0.0, 30.0));
+        for style in Route::ALL {
+            assert!(via(a, Some(Axis::Horizontal), b, Some(Axis::Horizontal), style).is_empty());
+        }
     }
 
     #[test]

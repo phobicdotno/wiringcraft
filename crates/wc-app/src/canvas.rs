@@ -893,7 +893,7 @@ fn route_menu(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor) {
 fn route_note(changed: usize, style: Route) -> String {
     let what = style.label().to_lowercase();
     match changed {
-        0 => format!("Route already {what}."),
+        0 => "No wire routes changed.".to_owned(),
         1 => format!("Route changed to {what} on 1 wire."),
         n => format!("Route changed to {what} on {n} wires."),
     }
