@@ -138,6 +138,9 @@ enum Cmd {
     /// Export devices, their part data and connection points, and the connections between them
     /// as AutomationML (CAEX 3.0), for tools that take engineering data rather than drawings.
     Aml { out: PathBuf },
+    /// Export data for other tools: marker lists for printing marking strips.
+    #[command(subcommand)]
+    Export(ExportCmd),
     /// Write the PLC inputs and outputs as an IEC 61131-3 global variable list (structured
     /// text) for TwinCAT, CODESYS and similar tools: one variable per point, named after its
     /// device tag and located at its address (`%I*`/`%Q*` when it has none).
@@ -158,6 +161,19 @@ enum Cmd {
     /// Review comments pinned on pages: add, reply, resolve, list.
     #[command(subcommand)]
     Comment(CommentCmd),
+}
+
+#[derive(Subcommand)]
+enum ExportCmd {
+    /// Terminal, wire, device and cable markers for WAGO smartScript: a semicolon-separated
+    /// CSV (UTF-8) with one row per marker (type, group, marker text, copies), in natural
+    /// tag order. In smartScript, import it as Excel/CSV data and map the Marker column.
+    WagoMarking {
+        out: PathBuf,
+        /// Only these marker kinds: terminals, wires, devices, cables (default: all).
+        #[arg(long = "kind", value_delimiter = ',')]
+        kinds: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -897,6 +913,26 @@ fn run(cli: Cli) -> Res<()> {
                 Some(path) => std::fs::write(&path, text).map_err(e)?,
                 None => print!("{text}"),
             }
+        }
+        Cmd::Export(ExportCmd::WagoMarking { out, kinds }) => {
+            let kinds = kinds
+                .iter()
+                .map(|k| {
+                    wc_report::MarkerKind::parse(k)
+                        .ok_or_else(|| format!("unknown marker kind {k:?} (terminals, wires, devices, cables)"))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let p = load(dir)?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let parts = vendored_parts(dir, &p);
+            let inputs = wc_report::Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            let t = wc_report::marking_list(&inputs, &kinds);
+            std::fs::write(&out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+            println!("wrote {} ({} markers)", out.display(), t.rows.len());
         }
         Cmd::Aml { out } => {
             let p = load(dir)?;
