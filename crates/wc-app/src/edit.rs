@@ -147,17 +147,32 @@ fn seg_dist(p: Point, a: Point, b: Point) -> f64 {
     p.distance(Point::new(a.x + t * dx, a.y + t * dy))
 }
 
-/// Is `at` on the drawing (within `tol` mm of its lines, or inside a text)?
+/// Whether `at` lies inside a closed outline (even-odd rule).
+fn inside_outline(at: Point, pts: &[Point]) -> bool {
+    let n = pts.len();
+    let mut odd = false;
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + n - 1) % n]);
+        if (a.y > at.y) != (b.y > at.y) && at.x < (b.x - a.x) * (at.y - a.y) / (b.y - a.y) + a.x {
+            odd = !odd;
+        }
+    }
+    odd
+}
+
+/// Is `at` on the drawing (within `tol` mm of its lines, inside a filled shape or a text)?
 pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
     let near_path = |pts: &[Point]| pts.windows(2).any(|ab| seg_dist(at, ab[0], ab[1]) <= tol);
     match g {
         Shape::Line { a, b } => seg_dist(at, *a, *b) <= tol,
-        Shape::Polyline { points, closed } => {
+        Shape::Polyline { points, closed, filled } => {
             let mut pts = points.clone();
-            if *closed && let Some(f) = points.first() {
+            if (*closed || *filled)
+                && let Some(f) = points.first()
+            {
                 pts.push(*f);
             }
-            near_path(&pts)
+            near_path(&pts) || (*filled && inside_outline(at, points))
         }
         Shape::Rect { min, max } => near_path(&[*min, Point::new(max.x, min.y), *max, Point::new(min.x, max.y), *min]),
         Shape::Circle { center, radius, filled } => {
@@ -509,6 +524,27 @@ impl Open {
 mod tests {
     use super::*;
     use crate::state::tests::project;
+
+    #[test]
+    fn a_click_inside_a_filled_outline_hits_it() {
+        let sq = |filled| Shape::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(20.0, 0.0),
+                Point::new(20.0, 20.0),
+                Point::new(0.0, 20.0),
+            ],
+            closed: true,
+            filled,
+        };
+        assert!(graphic_hit(&sq(true), Point::new(10.0, 10.0), 1.0), "inside a fill");
+        assert!(
+            !graphic_hit(&sq(false), Point::new(10.0, 10.0), 1.0),
+            "inside an outline only"
+        );
+        assert!(!graphic_hit(&sq(true), Point::new(30.0, 10.0), 1.0), "outside");
+        assert!(graphic_hit(&sq(true), Point::new(20.5, 10.0), 1.0), "near the edge");
+    }
 
     fn setup() -> (tempfile::TempDir, Open, usize, String, String) {
         let (tmp, mut o) = project();

@@ -88,6 +88,9 @@ pub enum Shape {
         points: Vec<Point>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         closed: bool,
+        /// Filled with the line colour (a solid hatch, an arrow head); a filled polyline is closed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        filled: bool,
     },
     Rect {
         min: Point,
@@ -138,9 +141,10 @@ impl Shape {
         let t = |p: Point| p.transform(rotation, mirror) + offset;
         match self {
             Shape::Line { a, b } => Shape::Line { a: t(*a), b: t(*b) },
-            Shape::Polyline { points, closed } => Shape::Polyline {
+            Shape::Polyline { points, closed, filled } => Shape::Polyline {
                 points: points.iter().map(|p| t(*p)).collect(),
                 closed: *closed,
+                filled: *filled,
             },
             Shape::Rect { min, max } => {
                 let (a, b) = (t(*min), t(*max));

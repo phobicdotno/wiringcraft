@@ -349,7 +349,11 @@ fn shape(
                             .take(ELLIPSE_STEPS)
                             .map(|p| pt(p.x, p.y))
                             .collect();
-                        graphics.push(Shape::Polyline { points, closed: true });
+                        graphics.push(Shape::Polyline {
+                            points,
+                            closed: true,
+                            filled: false,
+                        });
                     }
                 }
                 _ => skip(),
@@ -377,7 +381,11 @@ fn shape(
                         .into_iter()
                         .map(|p| pt(p.x, p.y))
                         .collect();
-                    graphics.push(Shape::Polyline { points, closed: false });
+                    graphics.push(Shape::Polyline {
+                        points,
+                        closed: false,
+                        filled: false,
+                    });
                 }
             }
             _ => skip(),
@@ -396,7 +404,11 @@ fn shape(
             let closed = attr(e, "closed").is_none_or(|c| c != "false");
             match points.as_slice() {
                 [a, b] if !closed => graphics.push(Shape::Line { a: *a, b: *b }),
-                [_, _, ..] => graphics.push(Shape::Polyline { points, closed }),
+                [_, _, ..] => graphics.push(Shape::Polyline {
+                    points,
+                    closed,
+                    filled: false,
+                }),
                 _ => skip(),
             }
         }
@@ -518,7 +530,9 @@ mod tests {
             end: 360.0
         }));
         let ellipse = s.graphics.iter().find_map(|g| match g {
-            Shape::Polyline { points, closed: true } if points.len() == ELLIPSE_STEPS => Some(points),
+            Shape::Polyline {
+                points, closed: true, ..
+            } if points.len() == ELLIPSE_STEPS => Some(points),
             _ => None,
         });
         let Some(ellipse) = ellipse else {
@@ -537,7 +551,7 @@ mod tests {
         assert!(
             s.graphics
                 .iter()
-                .any(|g| matches!(g, Shape::Polyline { points, closed: true } if points.len() == 3))
+                .any(|g| matches!(g, Shape::Polyline { points, closed: true, .. } if points.len() == 3))
         );
         assert!(
             s.graphics

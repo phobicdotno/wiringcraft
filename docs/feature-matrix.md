@@ -213,7 +213,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | PDF export with links and layers | yes | yes | yes | done |
 | DXF / SVG export | yes (DXF/DWG) | yes (DWG/DXF) | yes | done |
-| DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | no | todo (#95) |
+| DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | yes: sampled curves, solid hatches filled | done |
 | DWG read and write | yes | yes | no | not planned: closed format; DXF covers it. SWE DWGs are #59 |
 | Import EPLAN projects | - | yes (some) | yes | done |
 | Import SolidWorks Electrical projects | no | - | yes | done; follow-ups #59, #60, #61, #62, #71, #108 |

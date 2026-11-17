@@ -1256,7 +1256,11 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             letter_code,
         } => {
             let text = std::fs::read(&file).map_err(e)?;
-            let mut s = wc_import::dxf::symbol(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
+            let (mut s, warnings) =
+                wc_import::dxf::symbol_with_warnings(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
+            for w in &warnings {
+                eprintln!("warning: {w}");
+            }
             s.category = category;
             s.letter_code = letter_code;
             let path = wc_library::write_symbol(&lib, &s).map_err(e)?;
@@ -1647,6 +1651,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
             let text = std::fs::read(&file).map_err(e)?;
             let imported = wc_import::dxf::page(&String::from_utf8_lossy(&text), scale, &known).map_err(e)?;
+            for w in &imported.warnings {
+                eprintln!("warning: {w}");
+            }
             for s in &imported.symbols {
                 if store::read_vendored_symbol(dir, &s.symbol).is_err() {
                     wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, &s.symbol).map_err(e)?;

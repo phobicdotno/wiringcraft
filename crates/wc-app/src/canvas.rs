@@ -159,14 +159,98 @@ fn arc_points(center: Point, r: f64, start: f64, end: f64) -> Vec<Point> {
         .collect()
 }
 
+/// Whether an outline turns the same way at every corner (straight corners do not count).
+fn convex(pts: &[Pos2]) -> bool {
+    let n = pts.len();
+    let mut sign = 0.0f32;
+    for i in 0..n {
+        let (a, b, c) = (pts[i], pts[(i + 1) % n], pts[(i + 2) % n]);
+        let t = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        if t.abs() < 1e-6 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = t.signum();
+        } else if t.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+/// Triangles (vertex indexes) covering a simple polygon, by ear clipping. A polygon with a hole
+/// cut in along a bridge (its two sides on top of each other) comes out right too.
+fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
+    let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    let area: f32 = (0..pts.len())
+        .map(|i| cross(Pos2::ZERO, pts[i], pts[(i + 1) % pts.len()]))
+        .sum();
+    let turn = if area >= 0.0 { 1.0 } else { -1.0 };
+    let mut idx: Vec<usize> = (0..pts.len()).collect();
+    let mut out = Vec::new();
+    let mut guard = 0;
+    while idx.len() > 3 && guard < pts.len() * pts.len() {
+        guard += 1;
+        let n = idx.len();
+        let ear = (0..n).find(|&i| {
+            let (a, b, c) = (pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]);
+            if cross(a, b, c) * turn <= 0.0 {
+                return false;
+            }
+            // No other corner strictly inside the triangle.
+            idx.iter().all(|&k| {
+                let q = pts[k];
+                q == a || q == b || q == c || {
+                    let (d1, d2, d3) = (cross(a, b, q) * turn, cross(b, c, q) * turn, cross(c, a, q) * turn);
+                    d1 < 0.0 || d2 < 0.0 || d3 < 0.0
+                }
+            })
+        });
+        match ear {
+            Some(i) => {
+                out.push([idx[(i + n - 1) % n] as u32, idx[i] as u32, idx[(i + 1) % n] as u32]);
+                idx.remove(i);
+            }
+            // Only flat corners left (a bridge, collinear points): drop one and go on.
+            None => {
+                if let Some(i) =
+                    (0..n).find(|&i| cross(pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]).abs() < 1e-6)
+                {
+                    idx.remove(i);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    if let [a, b, c] = idx[..] {
+        out.push([a as u32, b as u32, c as u32]);
+    }
+    out
+}
+
 fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
     match s {
         Shape::Line { a, b } => {
             p.line_segment([xf.s(*a), xf.s(*b)], stroke);
         }
-        Shape::Polyline { points, closed } => {
+        Shape::Polyline { points, closed, filled } => {
             let pts: Vec<Pos2> = points.iter().map(|q| xf.s(*q)).collect();
-            if *closed {
+            // A filled shape is drawn without its outline: the cut that carries a hole would
+            // show as a line.
+            if *filled && convex(&pts) {
+                p.add(EShape::convex_polygon(pts, stroke.color, Stroke::NONE));
+            } else if *filled {
+                // egui fills only convex paths itself, so cut the outline into triangles.
+                let mut mesh = egui::Mesh::default();
+                for p in &pts {
+                    mesh.colored_vertex(*p, stroke.color);
+                }
+                for [a, b, c] in triangulate(&pts) {
+                    mesh.add_triangle(a, b, c);
+                }
+                p.add(EShape::mesh(mesh));
+            } else if *closed {
                 p.add(EShape::closed_line(pts, stroke));
             } else {
                 p.add(EShape::line(pts, stroke));
@@ -1204,6 +1288,92 @@ fn jumper_points(
 mod tests {
     use super::*;
     use crate::state::tests::project;
+
+    #[test]
+    fn a_notched_outline_leaves_the_notch_empty() {
+        let pts: Vec<Pos2> = [
+            (0.0, 0.0),
+            (60.0, 0.0),
+            (60.0, 60.0),
+            (40.0, 60.0),
+            (40.0, 20.0),
+            (20.0, 20.0),
+            (20.0, 60.0),
+            (0.0, 60.0),
+        ]
+        .iter()
+        .map(|(x, y)| Pos2::new(*x, *y))
+        .collect();
+        assert!(!convex(&pts));
+        let inside = |q: Pos2, [a, b, c]: [u32; 3]| {
+            let (a, b, c) = (pts[a as usize], pts[b as usize], pts[c as usize]);
+            let s = |p: Pos2, r: Pos2| (r.x - p.x) * (q.y - p.y) - (r.y - p.y) * (q.x - p.x);
+            let (d1, d2, d3) = (s(a, b), s(b, c), s(c, a));
+            (d1 > 0.0 && d2 > 0.0 && d3 > 0.0) || (d1 < 0.0 && d2 < 0.0 && d3 < 0.0)
+        };
+        let tris = triangulate(&pts);
+        assert!(
+            !tris.iter().any(|t| inside(Pos2::new(30.0, 40.0), *t)),
+            "the notch is not filled"
+        );
+        assert!(tris.iter().any(|t| inside(Pos2::new(7.0, 13.0), *t)));
+        let area: f32 = tris
+            .iter()
+            .map(|[a, b, c]| {
+                let (a, b, c) = (pts[*a as usize], pts[*b as usize], pts[*c as usize]);
+                ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() / 2.0
+            })
+            .sum();
+        assert!((area - 2800.0).abs() < 1e-2, "{area}");
+    }
+
+    #[test]
+    fn a_square_with_a_hole_cut_in_fills_only_the_ring() {
+        // Outer 0..10 counter-clockwise, bridged at (0,0)-(4,4) into the hole 4..6 clockwise.
+        let pts: Vec<Pos2> = [
+            (0.0, 0.0),
+            (4.0, 4.0),
+            (4.0, 6.0),
+            (6.0, 6.0),
+            (6.0, 4.0),
+            (4.0, 4.0),
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+        ]
+        .iter()
+        .map(|(x, y)| Pos2::new(*x, *y))
+        .collect();
+        let area: f32 = triangulate(&pts)
+            .iter()
+            .map(|[a, b, c]| {
+                let (a, b, c) = (pts[*a as usize], pts[*b as usize], pts[*c as usize]);
+                ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() / 2.0
+            })
+            .sum();
+        assert!((area - 96.0).abs() < 1e-3, "the ring only: {area}");
+    }
+
+    #[test]
+    fn a_concave_outline_is_cut_into_triangles_inside_it() {
+        // An L: 0..2 wide at the bottom, 0..1 wide above.
+        let pts: Vec<Pos2> = [(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0)]
+            .iter()
+            .map(|(x, y)| Pos2::new(*x, *y))
+            .collect();
+        let tris = triangulate(&pts);
+        assert_eq!(tris.len(), 4);
+        let area: f32 = tris
+            .iter()
+            .map(|[a, b, c]| {
+                let (a, b, c) = (pts[*a as usize], pts[*b as usize], pts[*c as usize]);
+                ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() / 2.0
+            })
+            .sum();
+        assert!((area - 3.0).abs() < 1e-5, "covers the L exactly: {area}");
+    }
+
     use wc_core::project::Endpoint;
 
     #[test]

@@ -14,7 +14,7 @@ From `crates/wc-import`:
 
 | Format | Module | Notes |
 |---|---|---|
-| ASCII DXF | `dxf` | Symbols and whole drawings, from the entities LINE, CIRCLE, ARC, LWPOLYLINE, POLYLINE, TEXT, MTEXT, POINT and INSERT. Other entities (for example ELLIPSE, SPLINE, HATCH) are skipped, so some graphics can be lost. Binary DXF and DWG are **not** read. |
+| ASCII DXF | `dxf` | Symbols and whole drawings, from the entities LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, LWPOLYLINE, POLYLINE, TEXT, MTEXT, POINT and INSERT. Ellipses and splines become polylines through sampled points; a solid hatch becomes a filled outline, a patterned one its outline. Other entities (for example 3DFACE, SOLID, IMAGE) are skipped, with one warning per kind. Binary DXF and DWG are **not** read. |
 | KiCad symbol libraries (`.kicad_sym`, KiCad 6+) | `kicad` | Graphics and visible pins of the common unit and the first unit (body style 1) become a WiringCraft symbol. Later units are skipped with a warning; alternate body styles and hidden pins are left out without one. |
 | QElectroTech elements (`.elmt`) | `qet` | `wiringcraft import symbol-qet <files> --lib <folder>`: lines, rectangles, circles, ellipses, arcs, polygons and static texts become graphics (ellipses and elliptic arcs as polylines); terminals become pins with their direction; the label's place becomes the tag place; `link_type` sets the role (master, slave, terminal, report). 10 px of QElectroTech is 5 mm by default (`--scale`). Unknown items are counted in a warning. |
 | SVG | `svg` | Graphics. |
