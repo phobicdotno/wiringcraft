@@ -1732,7 +1732,9 @@ fn main() -> eframe::Result {
         std::panic::set_hook(Box::new(move |info| {
             default_hook(info);
             if !STARTED.load(Ordering::SeqCst) {
-                restart_with_wgpu(&format!("{info}"));
+                // Leave at once: waiting here would keep this process's half-made window on
+                // screen while the new one runs.
+                restart_with_wgpu(&format!("{info}"), false);
             }
         }));
     }
@@ -1748,7 +1750,7 @@ fn main() -> eframe::Result {
         && fallback
         && !STARTED.load(Ordering::SeqCst)
     {
-        restart_with_wgpu(&e.to_string());
+        restart_with_wgpu(&e.to_string(), true);
     }
     result
 }
@@ -1773,17 +1775,19 @@ fn falls_back(wanted: Option<&str>) -> bool {
     wanted.is_none()
 }
 
-/// Run this program again on wgpu with the same arguments and leave with its exit code.
-fn restart_with_wgpu(why: &str) {
+/// Run this program again on wgpu with the same arguments, then leave: with the new process's
+/// exit code when `wait`, at once otherwise.
+fn restart_with_wgpu(why: &str, wait: bool) {
     eprintln!("wiringcraft-app: OpenGL could not start ({why}); starting again with wgpu");
-    let status = std::env::current_exe().and_then(|exe| {
+    let child = std::env::current_exe().and_then(|exe| {
         std::process::Command::new(exe)
             .args(std::env::args_os().skip(1))
             .env(RENDERER_VAR, "wgpu")
-            .status()
+            .spawn()
     });
-    match status {
-        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+    match child {
+        Ok(mut c) if wait => std::process::exit(c.wait().ok().and_then(|s| s.code()).unwrap_or(1)),
+        Ok(_) => std::process::exit(0),
         Err(err) => eprintln!("wiringcraft-app: could not start again with wgpu: {err}"),
     }
 }

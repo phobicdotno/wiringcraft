@@ -4,4 +4,4 @@ Name=WiringCraft
 Comment=Electrical schematics and wiring diagrams
 Exec=wiringcraft-app
 Terminal=false
-Categories=Development;Engineering;Electronics;
+Categories=Development;Science;Engineering;Electronics;

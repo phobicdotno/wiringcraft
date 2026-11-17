@@ -96,11 +96,16 @@ Install packages are attached to each [GitHub release](https://github.com/phobic
   adds a Start menu entry and the `wiringcraft` command.
 - **Linux:** `wiringcraft-<version>-linux-amd64.deb`. Install it with `sudo apt install ./<file>.deb`.
 - **macOS:** `wiringcraft-<version>-macos-universal.dmg`. Drag WiringCraft to Applications. The
-  command line program is `WiringCraft.app/Contents/MacOS/wiringcraft`.
+  command line program is `/Applications/WiringCraft.app/Contents/MacOS/wiringcraft`.
 
 The packages are not signed yet. Windows SmartScreen and macOS Gatekeeper warn on the first start,
 and the release notes say how to get past that. Builds of every change on main are under
 Actions > Build > Artifacts.
+
+The app draws with OpenGL. Where only an old OpenGL is available (a remote desktop session, a
+virtual machine, a missing graphics driver) it starts again with wgpu (Direct3D 12 with a
+software fallback on Windows, Metal on macOS, Vulkan on Linux). Set `WIRINGCRAFT_RENDERER=wgpu`
+to use wgpu from the start, or `glow` to use OpenGL only.
 
 ## Build
 
