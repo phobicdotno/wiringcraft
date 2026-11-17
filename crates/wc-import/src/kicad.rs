@@ -178,15 +178,19 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
                 (*name).to_owned()
             };
             let id = id_of(&unit_name);
-            if (several && reserved.contains(&id)) || !used.insert(id.clone()) {
+            if (several && reserved.contains(&id)) || used.contains(&id) {
                 warnings.push(format!("{unit_name}: its id {id} is another symbol's, skipped"));
                 continue;
             }
             match convert(&unit_name, sym, body, base, unit, prefix, scale) {
-                Ok(symbol) => out.push(Imported {
-                    symbol,
-                    kicad_name: unit_name,
-                }),
+                Ok(symbol) => {
+                    // Taken only once there is a symbol: one that draws nothing leaves its id free.
+                    used.insert(id);
+                    out.push(Imported {
+                        symbol,
+                        kicad_name: unit_name,
+                    });
+                }
                 Err(e) => warnings.push(format!("{unit_name}: {e}, skipped")),
             }
         }
@@ -574,6 +578,18 @@ mod tests {
             warnings.iter().any(|w| w.starts_with("Relay_A: its id k.relay_a")),
             "{warnings:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_symbol_that_fails_leaves_its_id_to_the_next() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "A")
+  (symbol "a" (symbol "a_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        let ids: Vec<&str> = syms.iter().map(|s| s.symbol.id.as_str()).collect();
+        assert_eq!(ids, ["k.a"], "{warnings:?}");
+        assert_eq!(syms[0].kicad_name, "a");
         Ok(())
     }
 

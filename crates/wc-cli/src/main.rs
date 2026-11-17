@@ -1660,12 +1660,21 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     continue;
                 };
                 let prefix = kicad_prefix(&name);
-                if !prefixes.insert(prefix.clone()) {
+                if prefixes.contains(&prefix) {
                     eprintln!("warning: {name}: skipped, an earlier entry already imports as {prefix}");
                     continue;
                 }
-                let text = String::from_utf8_lossy(&data);
-                if let Err(err) = import_kicad(&text, lib, &prefix, 1.0, "") {
+                // Read first: an entry that cannot be read writes nothing and keeps its prefix free.
+                let read = match read_kicad(&String::from_utf8_lossy(&data), &prefix, 1.0) {
+                    Ok(symbols) if symbols.is_empty() => continue,
+                    Ok(symbols) => symbols,
+                    Err(err) => {
+                        eprintln!("warning: {name}: {err}");
+                        continue;
+                    }
+                };
+                prefixes.insert(prefix);
+                if let Err(err) = write_kicad(read, lib, "") {
                     eprintln!("warning: {name}: {err}");
                 }
             }
@@ -2133,10 +2142,20 @@ fn kicad_prefix(name: &str) -> String {
 
 /// Import every symbol (one per unit) of a KiCad library text into `lib`, printing each.
 fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str) -> Res<usize> {
+    write_kicad(read_kicad(text, prefix, scale)?, lib, category)
+}
+
+/// Read a KiCad library's symbols, printing its warnings; nothing is written yet.
+fn read_kicad(text: &str, prefix: &str, scale: f64) -> Res<Vec<wc_import::kicad::Imported>> {
     let (symbols, warnings) = wc_import::kicad::symbols(text, prefix, scale).map_err(e)?;
     for w in warnings {
         eprintln!("warning: {w}");
     }
+    Ok(symbols)
+}
+
+/// Write read KiCad symbols into `lib`, printing each.
+fn write_kicad(symbols: Vec<wc_import::kicad::Imported>, lib: &Path, category: &str) -> Res<usize> {
     let n = symbols.len();
     for mut imp in symbols {
         imp.symbol.category = category.to_owned();
@@ -2988,6 +3007,9 @@ mod tests {
     (symbol "K_2_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "11")))))"#,
             )
             .unwrap();
+            // A broken library with the same name first: it writes nothing, so it takes nothing.
+            z.start_file("a/My Relays.kicad_sym", opt).unwrap();
+            z.write_all(b"(kicad_symbol_lib (symbol").unwrap();
             // Same file name elsewhere: it would write kicad.my_relays.k_a over the first one.
             z.start_file("zz/My Relays.kicad_sym", opt).unwrap();
             z.write_all(br#"(kicad_symbol_lib (symbol "K" (symbol "K_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "Z")))))"#)
