@@ -1,34 +1,36 @@
 //! SolidWorks Electrical projects.
 //!
 //! A project archive (`.tewzip`) is a zip. Each project in it has a SQLite database,
-//! `Projects/<n>/Database/tew_project_data.sqlite`, which holds the electrical model: pages
-//! (`tew_file`), placed symbols (`tew_symbol`) and their connection points (`tew_symbolpt`),
-//! components (`tew_component`) with their terminals, wire lines (`tew_line`) with their
-//! potentials (`tew_equipotential`), parts (`tew_buildofmaterial`) and translated texts
-//! (`tew_translatedtext`). Page drawings and symbol graphics are DWG files and are not read: each
-//! placed symbol becomes a box with its connection points where the database puts them.
+//! `Projects/<n>/Database/tew_project_data.sqlite`, which holds the electrical model: books
+//! (`tew_bundle`), folders (`tew_folder`) and pages (`tew_file`), placed symbols (`tew_symbol`)
+//! and their connection points (`tew_symbolpt`), components (`tew_component`) with their
+//! terminals, wire lines (`tew_line`) with their potentials (`tew_equipotential`), the wires they
+//! carry (`tew_linewirepair`, `tew_wire`), cables and their cores (`tew_cable`, `tew_cablewire`),
+//! parts (`tew_buildofmaterial`) and translated texts (`tew_translatedtext`). Page drawings and
+//! symbol graphics are DWG files and are not read: each placed symbol becomes a box with its
+//! connection points where the database puts them.
 //!
 //! Database coordinates are millimetres with y up. A connection point is an offset in its
 //! symbol's own frame: scaled by the symbol's scale (a negative scale mirrors), then rotated by
 //! the symbol's angle, then moved to the symbol's position.
 //!
-//! Input is treated as hostile: missing tables or columns are errors, odd rows are skipped and
-//! counted, nothing panics.
+//! Input is treated as hostile: missing tables or columns are errors; rows that cannot be read,
+//! and everything left out, are counted in the warnings and the report; nothing panics.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
 use rusqlite::Connection;
 use wc_core::geom::{Point, Shape};
-use wc_core::symbol::{Pin, PinDir};
-use wc_core::{Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Symbol, Wire};
+use wc_core::symbol::{Pin, PinDir, SymbolRole};
+use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Symbol, Wire};
 
 use crate::aml::Built;
 use crate::{Error, Result};
 
-/// `tew_file.fil_filetype` values (the product's `EwFileType`) of pages drawn as schematics:
-/// schematic sheet, line diagram, mixed schematic, P&ID, fluid. The others are folders, reports
-/// (bill of materials, terminal tables), cover pages, cabinet layouts and appendices.
+/// `tew_file.fil_filetype` values (the product's `EwFileType`). Drawn as schematics: schematic
+/// sheet, line diagram, mixed schematic, P&ID, fluid. The others are folders, reports (bill of
+/// materials, terminal tables), cover pages, cabinet layouts and appendices.
 pub const KIND_FOLIO: i64 = 0;
 pub const KIND_LINE_DIAGRAM: i64 = 1;
 pub const KIND_COVER: i64 = 5;
@@ -41,8 +43,14 @@ pub const DRAWN_KINDS: [i64; 5] = [KIND_FOLIO, KIND_LINE_DIAGRAM, KIND_MIXED, KI
 /// that carry a wire from one page to another. Imported as interruption points.
 pub const COMPONENT_ARROW: i64 = 5;
 
+/// The largest project database read out of an archive.
+pub const MAX_DATABASE_BYTES: u64 = 1 << 30;
+
 /// Pin and wire ends closer than this (mm) are the same point.
 const SNAP: f64 = 0.05;
+/// Wire ends this close (mm) to a pin, to another wire end or to another wire are joined to it:
+/// the source's drawings are not always exact.
+const JOIN: f64 = 0.5;
 /// Box margin around a symbol's connection points (mm).
 const MARGIN: f64 = 2.5;
 
@@ -51,10 +59,12 @@ pub struct SwePage {
     pub id: i64,
     pub order: i64,
     pub kind: i64,
-    /// The page's own label in its folder, e.g. `03`.
+    /// The page's own label in its book, e.g. `03`.
     pub label: String,
     pub title: String,
     pub folder: String,
+    /// The book's number (`tew_bundle.bun_tag`), e.g. `1`.
+    pub book: String,
     /// The title block (drawing frame) name; it names the sheet size, e.g. `..._A2_...`.
     pub frame: String,
 }
@@ -81,10 +91,35 @@ pub struct SweSymbol {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SweLine {
+    pub id: i64,
     pub page: i64,
     pub a: Point,
     pub b: Point,
     pub potential: Option<String>,
+    /// The line's equipotential (`lin_equ_id`): lines with the same one are one net, also where
+    /// the drawing leaves an end open or the net continues on another page.
+    pub net: Option<i64>,
+    /// The wires this line carries (`tew_wire.wir_id`), in order.
+    pub wires: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SweWire {
+    pub id: i64,
+    pub cable: Option<i64>,
+    /// The core's number in its cable.
+    pub core: i64,
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SweCable {
+    pub id: i64,
+    pub tag: String,
+    pub part_number: String,
+    pub manufacturer: String,
+    /// Core colour by core number (empty when the core has none).
+    pub cores: BTreeMap<i64, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -102,14 +137,46 @@ pub struct SweComponent {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SweProject {
     pub pages: Vec<SwePage>,
+    /// How many books the project has.
+    pub books: usize,
     pub symbols: Vec<SweSymbol>,
     pub lines: Vec<SweLine>,
+    pub wires: BTreeMap<i64, SweWire>,
+    pub cables: BTreeMap<i64, SweCable>,
     pub components: BTreeMap<i64, SweComponent>,
     pub warnings: Vec<String>,
 }
 
+/// One row of the import report: how many of a kind the source has and how many came in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Count {
+    pub what: &'static str,
+    pub source: usize,
+    pub imported: usize,
+    /// Why the two differ, when they do.
+    pub note: String,
+}
+
 fn sql(e: rusqlite::Error) -> Error {
     Error::Format(format!("SolidWorks Electrical database: {e}"))
+}
+
+/// The rows that could be read; the others are counted under `what`.
+fn readable<T>(rows: impl Iterator<Item = rusqlite::Result<T>>, what: &str, warnings: &mut Vec<String>) -> Vec<T> {
+    let mut bad = 0usize;
+    let out: Vec<T> = rows
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(_) => {
+                bad += 1;
+                None
+            }
+        })
+        .collect();
+    if bad > 0 {
+        warnings.push(format!("{bad} {what} row(s) could not be read and were left out"));
+    }
+    out
 }
 
 /// A project database taken out of an archive.
@@ -140,10 +207,18 @@ pub fn database_from_archive<R: Read + std::io::Seek>(reader: R, pick: usize) ->
             "the archive holds {count} project(s); pick one from 1 to {count}"
         )));
     };
-    let mut f = zip.by_name(name).map_err(|e| Error::Format(format!("{name}: {e}")))?;
-    let mut bytes = Vec::with_capacity(usize::try_from(f.size()).unwrap_or(0).min(1 << 30));
-    f.read_to_end(&mut bytes)
+    let f = zip.by_name(name).map_err(|e| Error::Format(format!("{name}: {e}")))?;
+    let mut bytes = Vec::new();
+    // Read at most one byte past the limit, whatever the zip header claims.
+    f.take(MAX_DATABASE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| Error::Format(format!("{name}: {e}")))?;
+    if bytes.len() as u64 > MAX_DATABASE_BYTES {
+        return Err(Error::Format(format!(
+            "{name} is larger than {} MB",
+            MAX_DATABASE_BYTES >> 20
+        )));
+    }
     let folder = name.rsplitn(3, '/').nth(2).unwrap_or_default().to_owned();
     Ok(ArchiveDatabase { folder, count, bytes })
 }
@@ -172,28 +247,6 @@ fn project_databases<R: Read + std::io::Seek>(zip: &zip::ZipArchive<R>) -> Vec<S
     names
 }
 
-/// The databases of all projects in an archive held in memory, by project folder, in order.
-pub fn databases_in_archive(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
-    let names = project_databases(&zip);
-    let mut out = Vec::new();
-    for n in names {
-        let mut f = zip.by_name(&n).map_err(|e| Error::Format(format!("{n}: {e}")))?;
-        let mut data = Vec::new();
-        f.read_to_end(&mut data)
-            .map_err(|e| Error::Format(format!("{n}: {e}")))?;
-        let folder = n.rsplitn(3, '/').nth(2).unwrap_or_default().to_owned();
-        out.push((folder, data));
-    }
-    if out.is_empty() {
-        return Err(Error::Format(
-            "the archive holds no SolidWorks Electrical project database".into(),
-        ));
-    }
-    Ok(out)
-}
-
 /// Open a project database held in memory.
 pub fn open(bytes: &[u8]) -> Result<Connection> {
     let mut conn = Connection::open_in_memory().map_err(sql)?;
@@ -203,7 +256,7 @@ pub fn open(bytes: &[u8]) -> Result<Connection> {
 }
 
 /// Texts by object id, English first, then any language.
-fn texts(conn: &Connection) -> Result<BTreeMap<i64, String>> {
+fn texts(conn: &Connection, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, String>> {
     let mut out: BTreeMap<i64, String> = BTreeMap::new();
     let mut st = conn
         .prepare(
@@ -215,7 +268,7 @@ fn texts(conn: &Connection) -> Result<BTreeMap<i64, String>> {
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
         .map_err(sql)?;
     // English sorts last, so it wins.
-    for (id, text) in rows.flatten() {
+    for (id, text) in readable(rows, "text", warnings) {
         if let Some(t) = text {
             out.insert(id, t);
         }
@@ -234,32 +287,53 @@ pub fn place(at: Point, angle: f64, scale: (f64, f64), offset: Point) -> Point {
 /// Read the drawable model of one project database.
 pub fn read(conn: &Connection) -> Result<SweProject> {
     let mut p = SweProject::default();
-    let text = texts(conn)?;
+    let mut warnings = Vec::new();
+    let text = texts(conn, &mut warnings)?;
+
+    // Books and pages.
+    let mut st = conn
+        .prepare("SELECT bun_id, COALESCE(bun_tag, '') FROM tew_bundle")
+        .map_err(sql)?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(sql)?;
+    let books: BTreeMap<i64, String> = readable(rows, "book", &mut warnings).into_iter().collect();
+    p.books = books.len();
 
     let mut st = conn
         .prepare(
             "SELECT f.fil_id, COALESCE(f.fil_orderno, 0), COALESCE(f.fil_filetype, 0), COALESCE(f.fil_title, ''), \
-             COALESCE(d.fol_name, ''), COALESCE(f.fil_titleblock, '') \
+             f.fil_fol_id, COALESCE(d.fol_name, ''), COALESCE(f.fil_titleblock, ''), f.fil_bun_id \
              FROM tew_file f LEFT JOIN tew_folder d ON d.fol_id = f.fil_fol_id \
              ORDER BY f.fil_orderno, f.fil_id",
         )
         .map_err(sql)?;
     let rows = st
         .query_map([], |r| {
-            Ok(SwePage {
-                id: r.get(0)?,
-                order: r.get(1)?,
-                kind: r.get(2)?,
-                label: r.get(3)?,
-                title: String::new(),
-                folder: r.get(4)?,
-                frame: r.get(5)?,
-            })
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+            ))
         })
         .map_err(sql)?;
-    for mut pg in rows.flatten() {
-        pg.title = text.get(&pg.id).cloned().unwrap_or_default();
-        p.pages.push(pg);
+    for (id, order, kind, label, folder_id, folder_name, frame, book) in readable(rows, "page", &mut warnings) {
+        let folder = folder_id.and_then(|f| text.get(&f).cloned()).unwrap_or(folder_name);
+        p.pages.push(SwePage {
+            id,
+            order,
+            kind,
+            label,
+            title: text.get(&id).cloned().unwrap_or_default(),
+            folder,
+            book: book.and_then(|b| books.get(&b).cloned()).unwrap_or_default(),
+            frame,
+        });
     }
 
     // Components with their tag, description and first part.
@@ -273,7 +347,7 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
         })
         .map_err(sql)?;
-    for (id, tag, kind) in rows.flatten() {
+    for (id, tag, kind) in readable(rows, "component", &mut warnings) {
         p.components.insert(
             id,
             SweComponent {
@@ -296,13 +370,71 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
         })
         .map_err(sql)?;
-    for (id, part, maker) in rows.flatten() {
+    for (id, part, maker) in readable(rows, "part", &mut warnings) {
         if let Some(c) = p.components.get_mut(&id)
             && c.part_number.is_empty()
         {
             c.part_number = part;
             c.manufacturer = maker;
         }
+    }
+
+    // Cables, their cores, and the wires.
+    let mut st = conn
+        .prepare("SELECT cab_id, COALESCE(cab_tag, ''), COALESCE(cab_reference, ''), COALESCE(cab_manufacturer, '') FROM tew_cable")
+        .map_err(sql)?;
+    let rows = st
+        .query_map([], |r| {
+            Ok(SweCable {
+                id: r.get(0)?,
+                tag: r.get(1)?,
+                part_number: r.get(2)?,
+                manufacturer: r.get(3)?,
+                cores: BTreeMap::new(),
+            })
+        })
+        .map_err(sql)?;
+    for c in readable(rows, "cable", &mut warnings) {
+        p.cables.insert(c.id, c);
+    }
+    let mut st = conn
+        .prepare("SELECT caw_cab_id, caw_no, COALESCE(caw_color, '') FROM tew_cablewire")
+        .map_err(sql)?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        })
+        .map_err(sql)?;
+    for (cable, no, colour) in readable(rows, "cable core", &mut warnings) {
+        if let Some(c) = p.cables.get_mut(&cable) {
+            c.cores.insert(no, colour);
+        }
+    }
+    let mut st = conn
+        .prepare("SELECT wir_id, wir_cab_id, COALESCE(wir_caw_no, -1), COALESCE(wir_tag, '') FROM tew_wire")
+        .map_err(sql)?;
+    let rows = st
+        .query_map([], |r| {
+            Ok(SweWire {
+                id: r.get(0)?,
+                cable: r.get::<_, Option<i64>>(1)?.filter(|c| *c > 0),
+                core: r.get(2)?,
+                tag: r.get(3)?,
+            })
+        })
+        .map_err(sql)?;
+    for w in readable(rows, "wire", &mut warnings) {
+        p.wires.insert(w.id, w);
+    }
+    let mut line_wires: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    let mut st = conn
+        .prepare("SELECT lwp_lin_id, lwp_wir_id FROM tew_linewirepair ORDER BY lwp_lin_id, lwp_wir_orderno, lwp_wir_id")
+        .map_err(sql)?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(sql)?;
+    for (line, wire) in readable(rows, "line-wire link", &mut warnings) {
+        line_wires.entry(line).or_default().push(wire);
     }
 
     // Connection points by symbol, named after the component terminal they stand for.
@@ -341,7 +473,7 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
             ))
         })
         .map_err(sql)?;
-    for (sym, pin) in rows.flatten() {
+    for (sym, pin) in readable(rows, "connection point", &mut warnings) {
         let list = pins.entry(sym).or_default();
         // A joined terminal can repeat a point; keep the first.
         if !list.iter().any(|q| q.circuit == pin.circuit && q.no == pin.no) {
@@ -374,12 +506,13 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         })
         .map_err(sql)?;
     let mut unplaced = 0;
-    for (id, page, component, block, x, y, angle, sx, sy, ex, ey) in rows.flatten() {
+    let mut bad_points = 0;
+    for (id, page, component, block, x, y, angle, sx, sy, ex, ey) in readable(rows, "symbol", &mut warnings) {
         let (Some(x), Some(y)) = (x, y) else {
             unplaced += 1;
             continue;
         };
-        if !(x.is_finite() && y.is_finite() && angle.is_finite()) {
+        if !(x.is_finite() && y.is_finite() && angle.is_finite() && sx.is_finite() && sy.is_finite()) {
             unplaced += 1;
             continue;
         }
@@ -387,26 +520,29 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         let scale = (if sx == 0.0 { 1.0 } else { sx }, if sy == 0.0 { 1.0 } else { sy });
         let mut out_pins: Vec<SwePin> = Vec::new();
         for raw in pins.remove(&id).unwrap_or_default() {
+            // Finite inputs can still overflow in the transform (a huge scale).
+            let placed = place(at, angle, scale, raw.offset);
+            if !(placed.x.is_finite() && placed.y.is_finite()) {
+                bad_points += 1;
+                continue;
+            }
             // Unnamed terminals: numbered by element (terminal strips, connectors drawn pin by
             // pin, so each symbol of the device has its own names), else by circuit, else 1, 2...
-            let name = raw.terminal.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| {
-                if let Some(el) = raw.element {
-                    format!("{}.{}", el + 1, raw.no + 1)
-                } else if raw.circuit > 0 {
-                    format!("{}.{}", raw.circuit, raw.no + 1)
-                } else {
-                    (raw.no + 1).to_string()
-                }
-            });
-            out_pins.push(SwePin {
-                name,
-                at: place(at, angle, scale, raw.offset),
-            });
+            let n = raw.no.saturating_add(1);
+            let name = raw
+                .terminal
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| match raw.element {
+                    Some(el) => format!("{}.{n}", el.saturating_add(1)),
+                    None if raw.circuit > 0 => format!("{}.{n}", raw.circuit),
+                    None => n.to_string(),
+                });
+            out_pins.push(SwePin { name, at: placed });
         }
         // `sym_posend*` is a box size (width, minus height) in the symbol's frame; 0, 0 is none.
         let corner = match (ex, ey) {
             (Some(ex), Some(ey)) if ex.is_finite() && ey.is_finite() && (ex != 0.0 || ey != 0.0) => {
-                Some(place(at, angle, scale, Point::new(ex, ey)))
+                Some(place(at, angle, scale, Point::new(ex, ey))).filter(|c| c.x.is_finite() && c.y.is_finite())
             }
             _ => None,
         };
@@ -421,42 +557,59 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         });
     }
     if unplaced > 0 {
-        p.warnings
-            .push(format!("{unplaced} symbol(s) without a position were left out"));
+        warnings.push(format!("{unplaced} symbol(s) without a usable position were left out"));
+    }
+    if bad_points > 0 {
+        warnings.push(format!(
+            "{bad_points} connection point(s) whose position cannot be computed were left out"
+        ));
     }
 
     let mut st = conn
         .prepare(
-            "SELECT l.lin_fil_id, l.lin_ptstartx, l.lin_ptstarty, l.lin_ptendx, l.lin_ptendy, q.equ_text \
-             FROM tew_line l LEFT JOIN tew_equipotential q ON q.equ_id = l.lin_equ_id ORDER BY l.lin_fil_id, l.lin_id",
+            "SELECT l.lin_id, l.lin_fil_id, l.lin_ptstartx, l.lin_ptstarty, l.lin_ptendx, l.lin_ptendy, q.equ_text, \
+             q.equ_id FROM tew_line l LEFT JOIN tew_equipotential q ON q.equ_id = l.lin_equ_id \
+             ORDER BY l.lin_fil_id, l.lin_id",
         )
         .map_err(sql)?;
     let rows = st
         .query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
-                r.get::<_, Option<f64>>(1)?,
+                r.get::<_, i64>(1)?,
                 r.get::<_, Option<f64>>(2)?,
                 r.get::<_, Option<f64>>(3)?,
                 r.get::<_, Option<f64>>(4)?,
-                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
             ))
         })
         .map_err(sql)?;
-    for (page, ax, ay, bx, by, potential) in rows.flatten() {
+    let mut unusable = 0;
+    for (id, page, ax, ay, bx, by, potential, net) in readable(rows, "line", &mut warnings) {
         let (Some(ax), Some(ay), Some(bx), Some(by)) = (ax, ay, bx, by) else {
+            unusable += 1;
             continue;
         };
         if ![ax, ay, bx, by].iter().all(|v| v.is_finite()) {
+            unusable += 1;
             continue;
         }
         p.lines.push(SweLine {
+            id,
             page,
             a: Point::new(ax, ay),
             b: Point::new(bx, by),
             potential: potential.filter(|s| !s.trim().is_empty()),
+            net,
+            wires: line_wires.remove(&id).unwrap_or_default(),
         });
     }
+    if unusable > 0 {
+        warnings.push(format!("{unusable} line(s) without usable end points were left out"));
+    }
+    p.warnings = warnings;
     Ok(p)
 }
 
@@ -487,7 +640,7 @@ pub fn device_tag(path: &str) -> Option<DeviceTag> {
         if matches!(c, '=' | '+' | '-') {
             flush(current, &mut buf);
             current = Some(c);
-        } else if c.is_alphanumeric() || c == '_' {
+        } else if c.is_alphanumeric() || c == '_' || c == '.' {
             buf.push(c);
         } else {
             buf.push('_');
@@ -504,7 +657,7 @@ pub fn device_tag(path: &str) -> Option<DeviceTag> {
     DeviceTag::parse(&s).ok()
 }
 
-/// The sheet size a title block name gives (`..._A2_...`, `...BASEA3...`), if any.
+/// The sheet size a title block name gives (`..._A2_...`, `...SHEETA3...`), if any.
 pub fn frame_size(frame: &str) -> Option<PageSize> {
     let up = frame.to_ascii_uppercase();
     let has = |s: &str| {
@@ -537,6 +690,26 @@ fn page_size(extent: Point) -> (PageSize, bool) {
 
 fn near(a: Point, b: Point) -> bool {
     (a.x - b.x).abs() <= SNAP && (a.y - b.y).abs() <= SNAP
+}
+
+fn dist(a: Point, b: Point) -> f64 {
+    ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
+}
+
+/// Where `q` lies along the segment `a`-`b` (0 at `a`, 1 at `b`), when it lies on it strictly
+/// between the ends.
+fn on_segment(a: Point, b: Point, q: Point) -> Option<f64> {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= SNAP * SNAP {
+        return None;
+    }
+    let t = ((q.x - a.x) * dx + (q.y - a.y) * dy) / len2;
+    let foot = Point::new(a.x + t * dx, a.y + t * dy);
+    if dist(q, foot) > JOIN || dist(q, a) <= JOIN || dist(q, b) <= JOIN || t <= 0.0 || t >= 1.0 {
+        return None;
+    }
+    Some(t)
 }
 
 fn round(v: f64) -> f64 {
@@ -610,10 +783,13 @@ fn box_symbol(block: &str, origin: Point, corner: Option<Point>, pins: &[(String
             (false, _, true) => PinDir::Left,
             (false, _, false) => PinDir::Right,
         };
+        // A repeated name gets `#k`, with k counted up until the name is free (a later pin may
+        // already be called `A#3`).
         let mut n = name.clone();
-        if !used.insert(n.clone()) {
-            n = format!("{name}#{}", i + 1);
-            used.insert(n.clone());
+        let mut k = i + 1;
+        while !used.insert(n.clone()) {
+            n = format!("{name}#{k}");
+            k += 1;
         }
         out.push(Pin {
             name: n,
@@ -634,10 +810,63 @@ fn box_symbol(block: &str, origin: Point, corner: Option<Point>, pins: &[(String
     (graphics, out)
 }
 
-/// Build WiringCraft pages from a read project: one page per schematic or line-diagram page,
-/// each symbol as a box with its connection points, each line as a wire joined to the pins at
-/// its ends, and one device per component with its part data.
-pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
+/// Tags made unique: the second `-K1` becomes `-K1_2`.
+fn unique(tag: DeviceTag, taken: &mut BTreeSet<DeviceTag>) -> DeviceTag {
+    if taken.insert(tag.clone()) {
+        return tag;
+    }
+    for n in 2usize.. {
+        let mut t = tag.clone();
+        if let Some(last) = t.product.last_mut() {
+            *last = format!("{last}_{n}");
+        }
+        if taken.insert(t.clone()) {
+            return t;
+        }
+    }
+    tag
+}
+
+/// The page numbers: the source's own page labels, with the book number in front when the
+/// project has several books (`2.05`), made unique; or, with `first_page_number`, plain numbers
+/// from there on.
+fn page_numbers(pages: &[&SwePage], books: usize, first_page_number: Option<usize>) -> Vec<String> {
+    let mut used = BTreeSet::new();
+    pages
+        .iter()
+        .enumerate()
+        .map(|(i, pg)| {
+            let base = match first_page_number {
+                Some(first) => first.saturating_add(i).to_string(),
+                None => {
+                    let label = if pg.label.trim().is_empty() {
+                        (i + 1).to_string()
+                    } else {
+                        pg.label.trim().to_owned()
+                    };
+                    if books > 1 && !pg.book.is_empty() {
+                        format!("{}.{label}", pg.book)
+                    } else {
+                        label
+                    }
+                }
+            };
+            let mut n = base.clone();
+            let mut k = 2;
+            while !used.insert(n.clone()) {
+                n = format!("{base}-{k}");
+                k += 1;
+            }
+            n
+        })
+        .collect()
+}
+
+/// Build WiringCraft pages from a read project: one page per schematic page, numbered and titled
+/// like the source, each symbol as a box with its connection points, each line as wires joined to
+/// the pins and lines at its ends, with their cable cores; one device per component and per
+/// cable. Returns the pages and devices, the warnings, and the counts report.
+pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<String>, Vec<Count>) {
     let mut warnings = Vec::new();
     let mut built = Built {
         symbols: Vec::new(),
@@ -647,20 +876,12 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
     };
     let drawn: Vec<&SwePage> = p.pages.iter().filter(|pg| DRAWN_KINDS.contains(&pg.kind)).collect();
     let others = p.pages.len() - drawn.len();
-    if others > 0 {
-        warnings.push(format!(
-            "{others} page(s) that are not schematics (cover, reports, cabinet layouts) were not imported"
-        ));
-    }
+    let covers = p.pages.iter().filter(|pg| pg.kind == KIND_COVER).count();
 
     // Tags: one per component, made unique if two components give the same tag. Each pair of
-    // origin-destination arrows becomes a pair of interruption points with its own tag.
-    let mut tags: BTreeMap<i64, DeviceTag> = BTreeMap::new();
-    let mut taken: BTreeSet<DeviceTag> = BTreeSet::new();
-    let mut untagged = 0;
-    let mut arrows = 0;
-    // A function aspect every device shares (a project with one function, `=F1`) says nothing on
-    // the drawing; it is left out of the tags.
+    // origin-destination arrows becomes a pair of interruption points with its own tag. A
+    // function aspect every device shares (a project with one function, `=F1`) says nothing on
+    // the drawing: it is left out of the tags and kept as a device property.
     let functions: BTreeSet<Vec<String>> = p
         .components
         .values()
@@ -674,10 +895,14 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
     };
     if let Some(f) = &shared_function {
         warnings.push(format!(
-            "every device has the function ={}; it is left out of the tags",
+            "every device has the function ={}; it is left out of the tags and kept as the device property Function",
             f.join(".")
         ));
     }
+    let mut tags: BTreeMap<i64, DeviceTag> = BTreeMap::new();
+    let mut taken: BTreeSet<DeviceTag> = BTreeSet::new();
+    let mut untagged = 0;
+    let mut arrows = 0;
     for c in p.components.values() {
         let tag = if c.kind == COMPONENT_ARROW {
             arrows += 1;
@@ -690,39 +915,23 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
                 t
             })
         };
-        let Some(mut tag) = tag else {
-            untagged += 1;
-            continue;
-        };
-        if taken.contains(&tag) {
-            let base = tag.clone();
-            for n in 2.. {
-                let mut t = base.clone();
-                if let Some(last) = t.product.last_mut() {
-                    *last = format!("{last}_{n}");
-                }
-                if !taken.contains(&t) {
-                    tag = t;
-                    break;
-                }
+        match tag {
+            Some(t) => {
+                tags.insert(c.id, unique(t, &mut taken));
             }
+            None => untagged += 1,
         }
-        taken.insert(tag.clone());
-        tags.insert(c.id, tag);
     }
-    if untagged > 0 {
-        warnings.push(format!(
-            "{untagged} component(s) without a usable tag are drawn without one"
-        ));
+    let mut cable_tags: BTreeMap<i64, DeviceTag> = BTreeMap::new();
+    let mut cables_untagged = 0;
+    for c in p.cables.values() {
+        match device_tag(&c.tag) {
+            Some(t) => {
+                cable_tags.insert(c.id, unique(t, &mut taken));
+            }
+            None => cables_untagged += 1,
+        }
     }
-
-    // Symbols by layout, so identical boxes share one library symbol.
-    let mut symbol_ids: BTreeMap<String, String> = BTreeMap::new();
-    let mut per_block: BTreeMap<String, usize> = BTreeMap::new();
-    let mut skipped_blocks = 0;
-    let mut used_components: BTreeSet<i64> = BTreeSet::new();
-    let mut wires_total = 0;
-    let mut wires_free = 0;
 
     // Symbols and lines by page, in one pass each.
     let mut syms_of: BTreeMap<i64, Vec<&SweSymbol>> = BTreeMap::new();
@@ -734,9 +943,26 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
         lines_of.entry(l.page).or_default().push(l);
     }
 
+    let numbers = page_numbers(&drawn, p.books, first_page_number);
+    let mut symbol_ids: BTreeMap<String, String> = BTreeMap::new();
+    let mut per_block: BTreeMap<String, usize> = BTreeMap::new();
+    let mut no_points = 0;
+    let mut unknown_component = 0;
+    let mut used_components: BTreeSet<i64> = BTreeSet::new();
+    let mut symbols_in = 0;
+    let mut symbols_out = 0;
+    let mut lines_in = 0;
+    let mut lines_out = 0usize;
+    let mut zero_length = 0;
+    let mut segments_out = 0usize;
+    let mut wires_drawn: BTreeSet<i64> = BTreeSet::new();
+    let mut cables_used: BTreeSet<i64> = BTreeSet::new();
+
     for (i, pg) in drawn.iter().enumerate() {
         let syms: Vec<&SweSymbol> = syms_of.remove(&pg.id).unwrap_or_default();
         let lines: Vec<&SweLine> = lines_of.remove(&pg.id).unwrap_or_default();
+        symbols_in += syms.len();
+        lines_in += lines.len();
         let mut extent = Point::new(0.0, 0.0);
         let mut grow = |q: Point| {
             extent.x = extent.x.max(q.x);
@@ -745,6 +971,9 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
         for s in &syms {
             grow(s.at);
             s.pins.iter().for_each(|q| grow(q.at));
+            if let Some(c) = s.corner {
+                grow(c);
+            }
         }
         for l in &lines {
             grow(l.a);
@@ -759,51 +988,51 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
         if !fits {
             warnings.push(format!(
                 "page {} reaches beyond A2; content outside the sheet is kept as is",
-                first_page_number + i
+                numbers[i]
             ));
         }
         let height = size.mm().1;
         let flip = |q: Point| Point::new(round(q.x), round(height - q.y));
 
         let title = match (pg.folder.is_empty(), pg.title.is_empty()) {
-            (false, false) => format!("{} {}: {}", pg.folder, pg.label, pg.title),
-            (false, true) => format!("{} {}", pg.folder, pg.label),
-            (true, false) => format!("{}: {}", pg.label, pg.title),
-            (true, true) => pg.label.clone(),
+            (false, false) => format!("{}: {}", pg.folder, pg.title),
+            (false, true) => pg.folder.clone(),
+            (true, false) => pg.title.clone(),
+            (true, true) => String::new(),
         };
-        let mut page = Page::new(
-            format!("swe-page-{}", pg.id),
-            (first_page_number + i).to_string(),
-            title,
-        );
+        let mut page = Page::new(format!("swe-page-{}", pg.id), numbers[i].clone(), title);
         page.size = size;
 
         // Pin positions on this page (y down) for joining wire ends.
         let mut pin_at: Vec<(Point, String, String)> = Vec::new();
         for s in &syms {
             if s.pins.is_empty() && s.corner.is_none() {
-                skipped_blocks += 1;
+                no_points += 1;
                 continue;
             }
+            symbols_out += 1;
             let origin = flip(s.at);
             let pins: Vec<(String, Point)> = s.pins.iter().map(|q| (q.name.clone(), flip(q.at))).collect();
             let (graphics, out_pins) = box_symbol(&s.block, origin, s.corner.map(flip), &pins);
-            let arrow = s
-                .component
-                .and_then(|c| p.components.get(&c))
-                .is_some_and(|c| c.kind == COMPONENT_ARROW);
-            let role = if arrow {
-                wc_core::symbol::SymbolRole::Interruption
+            let component = s.component.and_then(|c| p.components.get(&c));
+            if s.component.is_some() && component.is_none() {
+                unknown_component += 1;
+            }
+            let role = if component.is_some_and(|c| c.kind == COMPONENT_ARROW) {
+                SymbolRole::Interruption
             } else {
-                wc_core::symbol::SymbolRole::Standalone
+                SymbolRole::Standalone
             };
             let key = format!("{}|{:?}|{:?}|{:?}", s.block, role, graphics, out_pins);
             let sym_id = match symbol_ids.get(&key) {
                 Some(id) => id.clone(),
                 None => {
-                    let n = per_block.entry(s.block.clone()).or_insert(0);
+                    // Numbered per id stem, so blocks whose names clean up alike (`Relay A`,
+                    // `Relay-A`) never share an id.
+                    let stem = slug(&s.block);
+                    let n = per_block.entry(stem.clone()).or_insert(0);
                     *n += 1;
-                    let id = format!("swe.{}.{}", slug(&s.block), n);
+                    let id = format!("swe.{stem}.{n}");
                     built.symbols.push(Symbol {
                         id: id.clone(),
                         name: if s.block.is_empty() {
@@ -845,6 +1074,41 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
             });
         }
 
+        // Wire ends snap to a pin within JOIN, else to a wire end already seen within JOIN, so
+        // ends the source drew a little apart meet. Then lines are split where another line's
+        // end lands on them (a T-joint), so the joint is a shared wire end.
+        // Ends only join ends of the same net (or of a line without one): two nets drawn close
+        // together stay apart.
+        let same_net = |x: Option<i64>, y: Option<i64>| x.is_none() || y.is_none() || x == y;
+        let mut seen: Vec<(Point, Option<i64>)> = Vec::new();
+        let mut snap = |q: Point, net: Option<i64>| -> Point {
+            let pin = pin_at
+                .iter()
+                .map(|(at, _, _)| *at)
+                .filter(|at| dist(*at, q) <= JOIN)
+                .min_by(|x, y| dist(*x, q).total_cmp(&dist(*y, q)));
+            if let Some(at) = pin {
+                return at;
+            }
+            if let Some((s, _)) = seen.iter().find(|(s, n)| dist(*s, q) <= JOIN && same_net(*n, net)) {
+                return *s;
+            }
+            seen.push((q, net));
+            q
+        };
+        let mut flipped: Vec<(Point, Point, &SweLine)> = Vec::new();
+        for l in &lines {
+            let (a, b) = (snap(flip(l.a), l.net), snap(flip(l.b), l.net));
+            if near(a, b) {
+                zero_length += 1;
+                continue;
+            }
+            flipped.push((a, b, *l));
+        }
+        let ends: Vec<(Point, Option<i64>)> = flipped
+            .iter()
+            .flat_map(|(a, b, l)| [(*a, l.net), (*b, l.net)])
+            .collect();
         let end = |q: Point| -> Endpoint {
             match pin_at.iter().find(|(at, _, _)| near(*at, q)) {
                 Some((_, item, pin)) => Endpoint::Pin {
@@ -854,40 +1118,81 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
                 None => Endpoint::Point { at: q },
             }
         };
-        for (n, l) in lines.iter().enumerate() {
-            let (a, b) = (flip(l.a), flip(l.b));
-            if near(a, b) {
-                continue;
-            }
-            let (from, to) = (end(a), end(b));
-            if matches!(from, Endpoint::Point { .. }) && matches!(to, Endpoint::Point { .. }) {
-                wires_free += 1;
-            }
-            wires_total += 1;
-            page.wires.push(Wire {
-                id: format!("w{}", n + 1),
-                from,
-                to,
-                via: Vec::new(),
-                number: l.potential.clone(),
-                potential: None,
-                cable: None,
+        let mut n = 0;
+        for (a, b, l) in &flipped {
+            lines_out += 1;
+            // Cut at the landing end itself, so the two wires share that exact point.
+            let mut cuts: Vec<(f64, Point)> = ends
+                .iter()
+                .filter(|(_, net)| same_net(*net, l.net))
+                .filter_map(|(q, _)| on_segment(*a, *b, *q).map(|t| (t, *q)))
+                .collect();
+            cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
+            cuts.dedup_by(|x, y| near(x.1, y.1));
+            let mut points = vec![*a];
+            points.extend(cuts.iter().map(|(_, q)| *q));
+            points.push(*b);
+
+            // The cable core the line carries: its first wire in a cable.
+            let wires: Vec<&SweWire> = l.wires.iter().filter_map(|w| p.wires.get(w)).collect();
+            wires_drawn.extend(wires.iter().map(|w| w.id));
+            let cored = wires
+                .iter()
+                .find(|w| w.cable.is_some_and(|c| cable_tags.contains_key(&c)));
+            let cable = cored.and_then(|w| {
+                let cab = w.cable?;
+                cables_used.insert(cab);
+                let colour = p
+                    .cables
+                    .get(&cab)
+                    .and_then(|c| c.cores.get(&w.core))
+                    .cloned()
+                    .unwrap_or_default();
+                let core = match (w.core >= 0, colour.is_empty()) {
+                    (true, true) => w.core.to_string(),
+                    (true, false) => format!("{} {colour}", w.core),
+                    (false, _) => colour,
+                };
+                Some(CableCore {
+                    cable: cable_tags.get(&cab)?.clone(),
+                    core,
+                })
             });
+            // The equipotential's number is the net (potential) name: wires with the same one are
+            // connected across gaps and pages. The wire's own tag is its number.
+            let number = wires
+                .iter()
+                .map(|w| w.tag.trim())
+                .find(|t| !t.is_empty())
+                .map(str::to_owned);
+            let potential = l.potential.clone();
+            for pair in points.windows(2) {
+                let (from, to) = (pair[0], pair[1]);
+                if near(from, to) {
+                    continue;
+                }
+                n += 1;
+                segments_out += 1;
+                page.wires.push(Wire {
+                    id: format!("w{n}"),
+                    from: end(from),
+                    to: end(to),
+                    via: Vec::new(),
+                    number: number.clone(),
+                    potential: potential.clone(),
+                    cable: cable.clone(),
+                });
+            }
         }
         built.pages.push(page);
     }
-    if skipped_blocks > 0 {
-        warnings.push(format!(
-            "{skipped_blocks} drawn item(s) without connection points (frames, labels, link arrows) were left out"
-        ));
-    }
-    if wires_total > 0 && wires_free > 0 {
-        warnings.push(format!(
-            "{wires_free} of {wires_total} wire segment(s) touch no symbol pin at either end (they join other segments)"
-        ));
-    }
 
+    // Devices: every tagged component that is not an arrow, and every cable.
+    let mut devices_out = 0usize;
     for c in p.components.values() {
+        if c.kind == COMPONENT_ARROW {
+            continue;
+        }
         let Some(tag) = tags.get(&c.id) else {
             continue;
         };
@@ -898,12 +1203,10 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
         if !c.manufacturer.is_empty() {
             properties.insert("Manufacturer".to_owned(), c.manufacturer.clone());
         }
-        // Arrows join through their placed tags; they are not devices.
-        if c.kind == COMPONENT_ARROW
-            || (!used_components.contains(&c.id) && properties.is_empty() && c.description.is_empty())
-        {
-            continue;
+        if let Some(f) = &shared_function {
+            properties.insert("Function".to_owned(), format!("={}", f.join(".")));
         }
+        devices_out += 1;
         built.devices.insert(
             tag.clone(),
             Device {
@@ -913,7 +1216,116 @@ pub fn build(p: &SweProject, first_page_number: usize) -> (Built, Vec<String>) {
             },
         );
     }
-    (built, warnings)
+    let mut cables_out = 0usize;
+    for c in p.cables.values() {
+        let Some(tag) = cable_tags.get(&c.id) else {
+            continue;
+        };
+        let mut properties = BTreeMap::new();
+        if !c.part_number.is_empty() {
+            properties.insert("PartNumber".to_owned(), c.part_number.clone());
+        }
+        if !c.manufacturer.is_empty() {
+            properties.insert("Manufacturer".to_owned(), c.manufacturer.clone());
+        }
+        properties.insert("Cores".to_owned(), c.cores.len().to_string());
+        cables_out += 1;
+        built.devices.insert(
+            tag.clone(),
+            Device {
+                part: None,
+                description: "Cable".to_owned(),
+                properties,
+            },
+        );
+    }
+
+    if unknown_component > 0 {
+        warnings.push(format!(
+            "{unknown_component} symbol(s) refer to a component the database does not have; they are drawn without a tag"
+        ));
+    }
+    let non_arrows = p.components.values().filter(|c| c.kind != COMPONENT_ARROW).count();
+    let arrow_count = p.components.len() - non_arrows;
+    let symbols_total = p.symbols.len();
+    let off_page = symbols_total.saturating_sub(symbols_in);
+    let lines_off_page = p.lines.len().saturating_sub(lines_in);
+    let wires_missing = p.wires.len().saturating_sub(wires_drawn.len());
+    let note = |parts: Vec<(usize, &str)>| -> String {
+        parts
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, why)| format!("{n} {why}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let report = vec![
+        Count {
+            what: "pages",
+            source: p.pages.len(),
+            imported: built.pages.len(),
+            note: note(vec![
+                (covers, "cover page(s)"),
+                (
+                    others.saturating_sub(covers),
+                    "report, layout or other non-schematic page(s)",
+                ),
+            ]),
+        },
+        Count {
+            what: "components",
+            source: non_arrows,
+            imported: devices_out,
+            note: note(vec![(untagged, "without a usable tag")]),
+        },
+        Count {
+            what: "page link arrows",
+            source: arrow_count,
+            imported: arrow_count,
+            note: "as interruption points -OD1, -OD2, ...".to_owned(),
+        },
+        Count {
+            what: "symbols",
+            source: symbols_total,
+            imported: symbols_out,
+            note: note(vec![
+                (off_page, "on pages that are not imported"),
+                (no_points, "without connection points (frames, labels, texts)"),
+            ]),
+        },
+        Count {
+            what: "wire lines",
+            source: p.lines.len(),
+            imported: lines_out,
+            note: note(vec![
+                (lines_off_page, "on pages that are not imported"),
+                (zero_length, "of zero length"),
+                (
+                    segments_out.saturating_sub(lines_out),
+                    "extra segments from splitting at T-joints",
+                ),
+            ]),
+        },
+        Count {
+            what: "wires",
+            source: p.wires.len(),
+            imported: wires_drawn.len(),
+            note: note(vec![(wires_missing, "not on an imported page's line")]),
+        },
+        Count {
+            what: "cables",
+            source: p.cables.len(),
+            imported: cables_out,
+            note: note(vec![
+                (cables_untagged, "without a usable tag"),
+                (
+                    cables_out.saturating_sub(cables_used.len()),
+                    "not on any imported wire (device only)",
+                ),
+            ]),
+        },
+    ];
+    (built, warnings, report)
 }
 
 #[cfg(test)]

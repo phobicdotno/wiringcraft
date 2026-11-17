@@ -372,8 +372,9 @@ enum ImportCmd {
         /// Which project of the archive, counted from 1 (archives can hold several).
         #[arg(long, default_value_t = 1)]
         pick: usize,
-        #[arg(long, default_value_t = 1)]
-        first_page: usize,
+        /// Number the pages from here instead of keeping the source's page numbers.
+        #[arg(long)]
+        first_page: Option<usize>,
     },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
     Aml {
@@ -1288,7 +1289,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             };
             let conn = wc_import::swe::open(&db).map_err(e)?;
             let sw = wc_import::swe::read(&conn).map_err(e)?;
-            let (built, warnings) = wc_import::swe::build(&sw, first_page);
+            let (built, warnings, report) = wc_import::swe::build(&sw, first_page);
             for w in sw.warnings.iter().chain(&warnings) {
                 eprintln!("warning: {w}");
             }
@@ -1298,12 +1299,18 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             );
-            let (n_pages, n_dev, n_sym) = (built.pages.len(), built.devices.len(), built.symbols.len());
-            let n_wires: usize = built.pages.iter().map(|pg| pg.wires.len()).sum();
+            let n_sym = built.symbols.len();
             add_built(dir, &mut p, built, &source)?;
             save(dir, &p)?;
             println!(
-                "imported {n_pages} page(s): {n_dev} devices, {n_wires} wires, {n_sym} symbol shapes ({} ms)",
+                "{:<18} {:>8} {:>9}  why the rest is not imported",
+                "", "source", "imported"
+            );
+            for r in &report {
+                println!("{:<18} {:>8} {:>9}  {}", r.what, r.source, r.imported, r.note);
+            }
+            println!(
+                "{n_sym} symbol shape(s) for the boxes; done in {} ms",
                 started.elapsed().as_millis()
             );
         }
@@ -1794,6 +1801,21 @@ fn eplan_tables(path: &Path) -> Result<wc_import::eplan::Tables, String> {
 /// the lockfile under `source`.
 fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Result<(), String> {
     let e = |x: wc_core::Error| x.to_string();
+    // Refuse before anything is written: a repeated import must not overwrite the symbol files of
+    // an earlier one and then fail half way.
+    if let Some(page) = built.pages.iter().find(|pg| p.page(&pg.id).is_some()) {
+        return Err(format!(
+            "page {} exists; remove it or import into a fresh project",
+            page.id
+        ));
+    }
+    let numbers: std::collections::BTreeSet<&str> = p.pages.iter().map(|pg| pg.number.as_str()).collect();
+    if let Some(page) = built.pages.iter().find(|pg| numbers.contains(pg.number.as_str())) {
+        return Err(format!(
+            "page number {} is taken; import with --first-page to number the pages from a free number",
+            page.number
+        ));
+    }
     for s in &built.symbols {
         store::write_vendored_symbol(dir, s).map_err(e)?;
         p.lock.symbols.insert(
