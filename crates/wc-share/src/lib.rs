@@ -19,8 +19,10 @@
 //!   reverted from the history.
 //!
 //! The host and guests are plain state machines with no I/O; [`transport`] connects them
-//! in-process and [`net`] over TCP. Tests run whole sessions both ways.
+//! in-process and [`net`] over TCP; [`discovery`] finds sessions on the local network.
+//! Tests run whole sessions both ways.
 
+pub mod discovery;
 mod guest;
 mod host;
 mod journal;

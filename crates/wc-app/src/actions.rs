@@ -45,6 +45,7 @@ pub enum Action {
     ExportPdf,
     ExportDrawings,
     ExportAml,
+    ExportWagoMarking,
     NumberWires,
     Reports,
     Check,
@@ -111,6 +112,7 @@ impl Action {
         Action::ExportPdf,
         Action::ExportDrawings,
         Action::ExportAml,
+        Action::ExportWagoMarking,
         Action::NumberWires,
         Action::Reports,
         Action::Check,
@@ -299,6 +301,12 @@ impl Action {
                 Icon::Reports,
                 "",
             ),
+            Action::ExportWagoMarking => i(
+                "WAGO marking",
+                "Export terminal, wire, device and cable markers for WAGO smartScript (CSV)",
+                Icon::Reports,
+                "",
+            ),
             Action::NumberWires => i(
                 "Number wires",
                 "Give every connection without a number one, from its page and column (3.4)",
@@ -395,6 +403,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::ExportPdf,
                     Action::ExportDrawings,
                     Action::ExportAml,
+                    Action::ExportWagoMarking,
                 ],
             ),
             (

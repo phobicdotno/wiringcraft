@@ -217,6 +217,7 @@ impl App {
         match Open::load(dir) {
             Ok(o) => {
                 self.ed = Editor::default();
+                self.panels.reset();
                 self.ed.message = format!("Opened {}", dir.display());
                 self.open = Some(o);
                 prefs.remember(dir.to_path_buf());
@@ -522,6 +523,7 @@ impl App {
             Action::InsertMacro => self.dialog = Some(Dialog::Macros(open.macros())),
             Action::ExportDrawings => self.dialog = Some(Dialog::Message(export_drawings(open))),
             Action::ExportAml => self.dialog = Some(Dialog::Message(export_aml(open))),
+            Action::ExportWagoMarking => self.dialog = Some(Dialog::Message(export_wago_marking(open))),
             Action::NumberWires => {
                 let done = open.number_wires(wc_core::numbering::Rule::PageColumn);
                 self.dialog = Some(Dialog::Message(format!(
@@ -1748,6 +1750,27 @@ fn export_aml(open: &Open) -> String {
             }
             m
         }
+        Err(e) => format!("Export failed: {e}"),
+    }
+}
+
+/// Every marker (terminals, wires, devices, cables) as a smartScript CSV in `export`.
+fn export_wago_marking(open: &Open) -> String {
+    let dir = open.dir.join("export");
+    let path = dir.join("wago-marking.csv");
+    let inputs = wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    };
+    let t = wc_report::marking_list(&inputs, &[]);
+    let csv = wc_report::to_smartscript_csv(&t);
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, csv)) {
+        Ok(()) => format!(
+            "Exported {} markers to\n{}\n\nIn WAGO smartScript, import it as Excel/CSV data and map the Marker column.",
+            t.rows.len(),
+            path.display()
+        ),
         Err(e) => format!("Export failed: {e}"),
     }
 }

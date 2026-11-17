@@ -18,7 +18,7 @@ use wc_core::geom::{Align, Point, Rotation, Shape};
 use wc_core::symbol::{Pin, PinDir, SymbolRole};
 use wc_core::{Endpoint, Page, PlacedSymbol, Symbol, Wire};
 
-use super::{EplanFunction, EplanNode, EplanProject, device_tag};
+use super::{EplanConnection, EplanFunction, EplanNode, EplanProject, device_tag, split_end};
 
 /// Function categories (Eplan's function definition numbers) this module draws specially.
 pub const KIND_TERMINAL: u16 = 100;
@@ -337,6 +337,89 @@ struct End {
     endpoint: Endpoint,
 }
 
+/// Give drawn wires the cross-section and colour of the Eplan connection they draw: the shortest
+/// chain of wires on this page between the connection's two pins (through junctions). A terminal
+/// end (`X2:3`) is any pin of terminal 3 of strip X2. A wire keeps the first spec it gets.
+/// Returns how many wires got one.
+pub(super) fn spec_from_connections(
+    page: &mut Page,
+    owners: &[(String, String, String)],
+    connections: &[EplanConnection],
+) -> usize {
+    let key = |e: &Endpoint| match e {
+        Endpoint::Pin { item, pin } => format!("p\u{1}{item}\u{1}{pin}"),
+        Endpoint::Point { at } => format!(
+            "q\u{1}{}\u{1}{}",
+            (at.x * 100.0).round() as i64,
+            (at.y * 100.0).round() as i64
+        ),
+    };
+    let mut adj: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+    for (i, w) in page.wires.iter().enumerate() {
+        let (a, b) = (key(&w.from), key(&w.to));
+        adj.entry(a.clone()).or_default().push((i, b.clone()));
+        adj.entry(b).or_default().push((i, a));
+    }
+    let pins_of = |dev: &str, pin: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        for (item, _, terminal) in owners.iter().filter(|(_, t, _)| t == dev) {
+            if terminal.is_empty() {
+                let k = format!("p\u{1}{item}\u{1}{pin}");
+                if adj.contains_key(&k) {
+                    out.push(k);
+                }
+            } else if terminal == pin || pin.split(':').next() == Some(terminal.as_str()) {
+                let prefix = format!("p\u{1}{item}\u{1}");
+                out.extend(adj.keys().filter(|k| k.starts_with(&prefix)).cloned());
+            }
+        }
+        out
+    };
+    let mut given = 0;
+    for c in connections {
+        let spec = c.spec();
+        if spec.is_empty() {
+            continue;
+        }
+        let ((da, Some(pa)), (db, Some(pb))) = (split_end(&c.from), split_end(&c.to)) else {
+            continue;
+        };
+        let (sources, targets) = (pins_of(da, pa), pins_of(db, pb));
+        if sources.is_empty() || targets.is_empty() {
+            continue;
+        }
+        // Breadth-first from every source pin; the first target reached ends the search.
+        let mut prev: BTreeMap<String, (usize, String)> = BTreeMap::new();
+        let mut seen: BTreeSet<String> = sources.iter().cloned().collect();
+        let mut queue: std::collections::VecDeque<String> = sources.into_iter().collect();
+        let mut found = None;
+        while let Some(n) = queue.pop_front() {
+            if targets.contains(&n) {
+                found = Some(n);
+                break;
+            }
+            for (w, next) in adj.get(&n).into_iter().flatten() {
+                if seen.insert(next.clone()) {
+                    prev.insert(next.clone(), (*w, n.clone()));
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+        let mut at = found;
+        while let Some(n) = at {
+            let Some((w, back)) = prev.get(&n) else { break };
+            if let Some(wire) = page.wires.get_mut(*w)
+                && wire.spec.is_empty()
+            {
+                wire.spec = spec.clone();
+                given += 1;
+            }
+            at = Some(back.clone());
+        }
+    }
+    given
+}
+
 /// Wires between connection points that face each other on one line with nothing between.
 fn autoconnect(ends: &[End]) -> Vec<(usize, usize)> {
     let mut out = BTreeSet::new();
@@ -451,6 +534,8 @@ pub fn pages(p: &EplanProject, first_page_number: usize) -> Drawing {
         page.size = wc_core::PageSize::A3;
         page.graphics = graphics;
         let mut ends: Vec<End> = Vec::new();
+        // Placed symbol id, Eplan device name and terminal number, to find connection ends.
+        let mut owners: Vec<(String, String, String)> = Vec::new();
         for (f, at) in functions {
             let at = to_page(at, scale);
             let Some(sym) = symbol_for(f) else {
@@ -474,6 +559,7 @@ pub fn pages(p: &EplanProject, first_page_number: usize) -> Drawing {
             };
             let (rotation, mirror) = rotation_of(f.variant);
             let item = page.next_id("s");
+            owners.push((item.clone(), f.tag.clone(), f.terminal.clone()));
             for pn in &sym.pins {
                 let mut dirs = [false; 4];
                 dirs[dir_index(vector(pn.dir).transform(rotation, mirror))] = true;
@@ -525,8 +611,10 @@ pub fn pages(p: &EplanProject, first_page_number: usize) -> Drawing {
                 potential: None,
                 cable: None,
                 route: Default::default(),
+                spec: Default::default(),
             });
         }
+        spec_from_connections(&mut page, &owners, &p.connections);
         if page.symbols.is_empty() && page.graphics.is_empty() {
             continue;
         }

@@ -134,7 +134,7 @@ For the other areas, the chapter to read in each help is:
 | Potentials (named signals across pages) | yes | yes (equipotentials) | yes | done |
 | Interruption points between pages | yes | yes (origin/destination arrows) | yes | done |
 | Wire numbering by rule | yes | yes | yes | done |
-| Wire properties: cross-section, colour, wire type | yes | yes (wire styles) | no | todo (#107) |
+| Wire properties: cross-section, colour, wire type | yes | yes (wire styles) | yes: wire properties, wire list columns, from EPLAN and SolidWorks imports | done (#107) |
 | Net list and connection list | yes | yes | yes | done |
 | Shorts and open pins check | yes | yes | yes | done |
 
