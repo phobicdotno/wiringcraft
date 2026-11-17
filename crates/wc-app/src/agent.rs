@@ -268,13 +268,16 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_wire",
-            "Change a wire: its ends, bends, number, potential, or the cable it is a core of. Empty strings clear number, potential or cable.",
+            "Change a wire: its ends, bends, number, potential, the cable it is a core of, or its cross-section, colour and type. Empty strings clear number, potential, cable, section, colour or type.",
             json!({
                 "id": {"type": "string"}, "page": page_arg(),
                 "from": end_arg("New start"), "to": end_arg("New end"), "via": point_list(),
                 "number": {"type": "string"}, "potential": {"type": "string"},
                 "cable": {"type": "string", "description": "Cable device tag, e.g. -W1"},
-                "core": {"type": "string", "description": "Core name in the cable, e.g. 1 or BN"}
+                "core": {"type": "string", "description": "Core name in the cable, e.g. 1 or BN"},
+                "section": {"type": "string", "description": "Cross-section with unit, e.g. 1.5 mm² or 18 AWG"},
+                "colour": {"type": "string", "description": "Colour code, e.g. BU or GNYE"},
+                "type": {"type": "string", "description": "Wire type, e.g. H07V-K"}
             }),
             &["id"],
         ),
@@ -1615,6 +1618,15 @@ impl App {
             }
             if let Some(n) = s(v, "potential") {
                 w.potential = Some(n.trim().to_owned()).filter(|n| !n.is_empty());
+            }
+            if let Some(x) = s(v, "section") {
+                w.spec.section = wc_core::WireSpec::value(x);
+            }
+            if let Some(x) = s(v, "colour") {
+                w.spec.colour = wc_core::WireSpec::value(x);
+            }
+            if let Some(x) = s(v, "type") {
+                w.spec.kind = wc_core::WireSpec::value(x);
             }
         }
         if let Some(c) = s(v, "cable") {

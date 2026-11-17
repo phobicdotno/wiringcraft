@@ -712,6 +712,7 @@ fn run(cli: Cli) -> Res<()> {
                 potential,
                 cable,
                 route: Default::default(),
+                spec: Default::default(),
             });
             save(dir, &p)?;
             println!("{id}");

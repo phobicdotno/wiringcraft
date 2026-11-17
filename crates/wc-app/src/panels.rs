@@ -7,7 +7,7 @@ use wc_core::geom::{Rotation, Shape};
 
 use crate::actions::Action;
 use crate::canvas::Editor;
-use crate::state::{Open, Selection, Tool};
+use crate::state::{Open, Selection, SpecPart, Tool};
 use crate::theme::Theme;
 
 #[derive(Default)]
@@ -33,6 +33,65 @@ pub struct PanelState {
     tag_error: Option<String>,
     /// A reply being written to the comment shown.
     reply: String,
+    /// Edit buffers for the selected wires' section, colour and type, the values they were loaded
+    /// with (empty when the wires differ), whether they differ, and the wires they belong to.
+    spec: [String; 3],
+    spec_loaded: [String; 3],
+    spec_mixed: [bool; 3],
+    spec_for: Vec<String>,
+}
+
+/// Keep the spec buffers in step with the given wires of a page: refilled when the selection
+/// changes, and a field the user is not editing follows changes made elsewhere (undo, the agent).
+fn load_spec(open: &Open, page: usize, ids: &[String], ps: &mut PanelState) {
+    let fresh = ps.spec_for != ids;
+    if fresh {
+        ps.spec_for = ids.to_vec();
+    }
+    let Some(p) = open.project.pages.get(page) else {
+        return;
+    };
+    let wires: Vec<&wc_core::Wire> = p.wires.iter().filter(|w| ids.contains(&w.id)).collect();
+    for (k, part) in SpecPart::ALL.into_iter().enumerate() {
+        let values: std::collections::BTreeSet<Option<&String>> =
+            wires.iter().map(|w| part.of(&w.spec).as_ref()).collect();
+        let mixed = values.len() > 1;
+        let common = if mixed {
+            String::new()
+        } else {
+            values.into_iter().next().flatten().cloned().unwrap_or_default()
+        };
+        let untouched = ps.spec[k] == ps.spec_loaded[k];
+        if fresh || (untouched && (common != ps.spec_loaded[k] || mixed != ps.spec_mixed[k])) {
+            ps.spec[k] = common.clone();
+            ps.spec_loaded[k] = common;
+            ps.spec_mixed[k] = mixed;
+        }
+    }
+}
+
+/// Rows for cross-section, colour and type of the given wires, inside a two-column grid. A value
+/// typed in is set on all of them; an empty one clears it. A field left as loaded changes nothing,
+/// so tabbing through a field the wires differ in keeps their own values.
+fn spec_rows(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[String], ps: &mut PanelState) {
+    load_spec(open, page, ids, ps);
+    for (k, part) in SpecPart::ALL.into_iter().enumerate() {
+        ui.label(part.label());
+        let hint = if ps.spec_mixed[k] {
+            "several values"
+        } else {
+            part.hint()
+        };
+        let r = ui.add(egui::TextEdit::singleline(&mut ps.spec[k]).hint_text(hint));
+        if committed(&r) && ps.spec[k].trim() != ps.spec_loaded[k].trim() {
+            let value = wc_core::WireSpec::value(&ps.spec[k]);
+            open.set_wire_spec(page, ids, part, value.clone());
+            ps.spec[k] = value.clone().unwrap_or_default();
+            ps.spec_loaded[k] = ps.spec[k].clone();
+            ps.spec_mixed[k] = false;
+        }
+        ui.end_row();
+    }
 }
 
 /// A panel section title: small capitals in the muted colour, with an optional count on the
@@ -360,7 +419,25 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
     let page_idx = ed.page;
     if ed.selection.len() > 1 {
         let n = ed.selection.len();
-        ui.label(format!("{n} items selected"));
+        let wires: Vec<String> = ed
+            .selection
+            .iter()
+            .filter_map(|s| match s {
+                Selection::Wire(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if wires.len() == n {
+            // Only wires: their section, colour and type can be set together.
+            ui.label(format!("{n} wires selected"));
+            egui::Grid::new("wires-props")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| spec_rows(ui, open, page_idx, &wires, ps));
+            ui.label(RichText::new("A value typed here is set on all of them.").color(t.faint));
+        } else {
+            ui.label(format!("{n} items selected"));
+        }
         ui.label(RichText::new("Move, rotate, mirror, copy or delete them together.").color(t.faint));
         return;
     }
@@ -636,6 +713,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                         ui.label(RichText::new(e).color(t.error).small());
                         ui.end_row();
                     }
+                    spec_rows(ui, open, page_idx, std::slice::from_ref(&id), ps);
                     ui.label("Bends");
                     ui.label(wire.via.len().to_string());
                     ui.end_row();

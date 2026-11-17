@@ -507,12 +507,17 @@ fn builds_overview_pages_per_eplan_page() {
     let wires: usize = b.pages.iter().map(|pg| pg.wires.len()).sum();
     assert_eq!(wires, 4);
     assert!(warnings.iter().any(|w| w.contains("1 connection")));
-    let labelled = b
+    let specced: Vec<&wc_core::Wire> = b
         .pages
         .iter()
         .flat_map(|pg| &pg.wires)
-        .any(|w| w.number.as_deref() == Some("BK 1.5"));
-    assert!(labelled);
+        .filter(|w| w.spec.colour.as_deref() == Some("BK"))
+        .collect();
+    assert_eq!(specced.len(), 2, "both stubs of the connection");
+    for w in specced {
+        assert_eq!(w.spec.section.as_deref(), Some("1.5"));
+        assert_eq!(w.number, None, "colour and section are not a wire number");
+    }
 }
 
 #[test]

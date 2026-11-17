@@ -791,14 +791,17 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
         }
         pins.entry(ia).or_default().insert(pa.to_owned());
         pins.entry(ib).or_default().insert(pb.to_owned());
-        let label: Vec<&str> = [c.colour.as_str(), c.cross_section.as_str()]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Colour and cross-section go to the wire's own fields, not into its number. The section
+        // is kept as written: EPLAN stores the value without saying mm² or AWG.
         links.push(AmlLink {
-            name: label.join(" "),
+            name: String::new(),
             a: (ia, pa.to_owned()),
             b: (ib, pb.to_owned()),
+            spec: wc_core::WireSpec {
+                section: wc_core::WireSpec::value(&c.cross_section),
+                colour: wc_core::WireSpec::value(&c.colour),
+                kind: None,
+            },
         });
     }
     if skipped > 0 {

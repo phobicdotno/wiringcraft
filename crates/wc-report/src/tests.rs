@@ -55,6 +55,7 @@ fn wire(id: &str, from: Endpoint, to: Endpoint, number: Option<&str>, potential:
         potential: potential.map(Into::into),
         cable: None,
         route: Default::default(),
+        spec: Default::default(),
     }
 }
 
@@ -164,10 +165,41 @@ fn wire_list_names_both_ends_and_inherits_potentials() {
         symbols: &s,
         parts: &parts,
     });
-    assert_eq!(t.rows[0], ["2", "1", "24V", "", "junction 50.0,20.0", "=A+C1-K1:A1"]);
-    assert_eq!(t.rows[1][4..], ["=A+C1-K1:14", "-X1.1:1"]);
+    assert_eq!(
+        t.rows[0],
+        ["2", "1", "24V", "", "junction 50.0,20.0", "=A+C1-K1:A1", "", "", ""]
+    );
+    assert_eq!(t.rows[1][4..6], ["=A+C1-K1:14", "-X1.1:1"]);
     // w4 carries 0V itself.
     assert_eq!(t.rows[3][2], "0V");
+}
+
+#[test]
+fn wire_list_shows_section_colour_and_type() {
+    let (mut p, s, parts) = fixture();
+    let w = p
+        .pages
+        .iter_mut()
+        .flat_map(|pg| pg.wires.iter_mut())
+        .find(|w| w.id == "w2")
+        .unwrap();
+    w.spec.section = Some("1.5 mm²".into());
+    w.spec.colour = Some("BU".into());
+    w.spec.kind = Some("H07V-K".into());
+    let t = wire_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(&t.columns[6..], ["Section", "Colour", "Type"]);
+    let row = t.rows.iter().find(|r| r[1] == "2").unwrap();
+    assert_eq!(&row[6..], ["1.5 mm²", "BU", "H07V-K"], "{row:?}");
+    assert!(
+        t.rows
+            .iter()
+            .filter(|r| r[1] != "2")
+            .all(|r| r[6..].iter().all(String::is_empty))
+    );
 }
 
 #[test]

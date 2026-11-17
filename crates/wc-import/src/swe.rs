@@ -27,7 +27,7 @@ use rusqlite::{Connection, OptionalExtension};
 use wc_core::connectivity::{PinRef, nets_linked};
 use wc_core::geom::{Point, Shape};
 use wc_core::symbol::{Pin, PinDir, SymbolRole};
-use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Symbol, Wire};
+use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Symbol, Wire, WireSpec};
 
 use crate::aml::Built;
 use crate::{Error, Result};
@@ -124,6 +124,8 @@ pub struct SweWire {
     /// The component terminal at each end, (`cel_id`, `cte_no`), when the source names it.
     pub from: Option<(i64, i64)>,
     pub to: Option<(i64, i64)>,
+    /// Cross-section (`wir_sectionorgauge` with `wir_sectiontype`) and colour (`wir_color`).
+    pub spec: WireSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -625,7 +627,8 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     let mut st = conn
         .prepare(
             "SELECT wir_id, wir_cab_id, COALESCE(wir_caw_no, -1), COALESCE(wir_tag, ''), \
-             wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto FROM tew_wire",
+             wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto, wir_sectiontype, \
+             COALESCE(CAST(wir_sectionorgauge AS TEXT), ''), COALESCE(CAST(wir_color AS TEXT), '') FROM tew_wire",
         )
         .map_err(sql)?;
     // An end is named by its element and terminal number; an element of 0 or less is none.
@@ -639,6 +642,11 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
                 tag: r.get(3)?,
                 from: end(r.get(4)?, r.get(5)?),
                 to: end(r.get(6)?, r.get(7)?),
+                spec: WireSpec {
+                    section: wire_section(r.get(8)?, &r.get::<_, String>(9)?),
+                    colour: WireSpec::value(&r.get::<_, String>(10)?),
+                    kind: None,
+                },
             })
         })
         .map_err(sql)?;
@@ -861,6 +869,21 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     }
     p.warnings = warnings;
     Ok(p)
+}
+
+/// A wire's cross-section with its unit: `wir_sectiontype` 0 is mm², 1 is AWG (as the test
+/// projects show: 0.75, 1.5, 2.5 against 18, 20, 22). A value of 0 or nothing is no section; an
+/// unknown type keeps the value as written.
+fn wire_section(kind: Option<i64>, value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.parse::<f64>().is_ok_and(|x| x == 0.0) {
+        return None;
+    }
+    Some(match kind {
+        Some(0) => format!("{v} mm²"),
+        Some(1) => format!("{v} AWG"),
+        _ => v.to_owned(),
+    })
 }
 
 /// A terminal number as one product level: letters, digits and `_` kept, everything else
@@ -1642,6 +1665,12 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 .map(|w| w.tag.trim())
                 .find(|t| !t.is_empty())
                 .map(str::to_owned);
+            // Section and colour of the first wire that has them, like the number.
+            let spec = wires
+                .iter()
+                .map(|w| w.spec.clone())
+                .find(|s| !s.is_empty())
+                .unwrap_or_default();
             // Without a number the equipotential is still one net: name it after its id, so its
             // wires stay connected and two such nets stay apart.
             let potential = l
@@ -1664,6 +1693,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     potential: potential.clone(),
                     cable: cable.clone(),
                     route: Default::default(),
+                    spec: spec.clone(),
                 });
             }
         }
