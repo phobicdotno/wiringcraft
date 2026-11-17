@@ -84,6 +84,9 @@ enum Cmd {
         #[arg(long)]
         core: Option<String>,
     },
+    /// The project's locations (cabinets, rooms, panels): the `+` part of device tags.
+    #[command(subcommand)]
+    Location(LocationCmd),
     /// Set a device's part and description.
     Device {
         tag: String,
@@ -227,6 +230,22 @@ enum PanelCmd {
     Remove {
         id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum LocationCmd {
+    /// List the locations with their descriptions.
+    List,
+    /// Add a location or change its description, e.g. `location set +L1.L3 "Cabinet 3"`.
+    Set {
+        /// The location, with or without its `+`.
+        path: String,
+        /// What it is; empty clears it.
+        #[arg(default_value = "")]
+        description: String,
+    },
+    /// Remove a location from the list (devices keep their tags).
+    Remove { path: String },
 }
 
 #[derive(Subcommand)]
@@ -715,6 +734,31 @@ fn run(cli: Cli) -> Res<()> {
             });
             save(dir, &p)?;
             println!("{id}");
+        }
+        Cmd::Location(lc) => {
+            let mut p = load(dir)?;
+            match lc {
+                LocationCmd::List => {
+                    for l in &p.meta.locations {
+                        if l.description.is_empty() {
+                            println!("+{}", l.path);
+                        } else {
+                            println!("+{}\t{}", l.path, l.description);
+                        }
+                    }
+                }
+                LocationCmd::Set { path, description } => {
+                    if p.meta.set_location(&path, &description)? {
+                        save(dir, &p)?;
+                    }
+                }
+                LocationCmd::Remove { path } => {
+                    if !p.meta.remove_location(&path) {
+                        return Err(format!("no location {path}"));
+                    }
+                    save(dir, &p)?;
+                }
+            }
         }
         Cmd::Device { tag, part, description } => {
             let mut p = load(dir)?;
@@ -1936,4 +1980,50 @@ fn file_stem(number: &str, id: &str) -> String {
         .collect();
     let stem = stem.trim_start_matches('.').to_owned();
     if stem.is_empty() { "page".into() } else { stem }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn cli(dir: &Path, args: &[&str]) -> Res<()> {
+        let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
+        all.extend_from_slice(args);
+        run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn locations_are_set_listed_and_removed_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["location", "set", "+L1.L3", "Cabinet 3"]).unwrap();
+        cli(&dir, &["location", "set", "L1"]).unwrap();
+        let locs = |d: &Path| {
+            load(d)
+                .unwrap()
+                .meta
+                .locations
+                .into_iter()
+                .map(|l| (l.path, l.description))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            locs(&dir),
+            [
+                ("L1".to_owned(), String::new()),
+                ("L1.L3".to_owned(), "Cabinet 3".to_owned())
+            ]
+        );
+        cli(&dir, &["location", "list"]).unwrap();
+        cli(&dir, &["location", "remove", "+L1"]).unwrap();
+        assert_eq!(locs(&dir).len(), 1);
+        assert!(
+            cli(&dir, &["location", "remove", "L1"])
+                .unwrap_err()
+                .contains("no location")
+        );
+        assert!(cli(&dir, &["location", "set", "+L1-K1", "x"]).is_err());
+    }
 }

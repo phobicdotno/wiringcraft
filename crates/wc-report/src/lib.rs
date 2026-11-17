@@ -93,10 +93,11 @@ pub enum Kind {
     Cables,
     Plc,
     Contents,
+    Locations,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 8] = [
+    pub const ALL: [Kind; 9] = [
         Kind::Contents,
         Kind::Parts,
         Kind::Devices,
@@ -105,6 +106,7 @@ impl Kind {
         Kind::Terminals,
         Kind::Cables,
         Kind::Plc,
+        Kind::Locations,
     ];
 
     pub fn name(self) -> &'static str {
@@ -117,6 +119,7 @@ impl Kind {
             Kind::Cables => "cables",
             Kind::Plc => "plc",
             Kind::Contents => "contents",
+            Kind::Locations => "locations",
         }
     }
 
@@ -144,7 +147,37 @@ pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
         Kind::Cables => cable_list(i),
         Kind::Plc => plc_io_list(i),
         Kind::Contents => contents(i),
+        Kind::Locations => location_list(i),
     }
+}
+
+/// Locations: every location of the project with its description and how many devices are in
+/// it (by the `+` part of their tags), then locations device tags use that the project does not
+/// list.
+pub fn location_list(i: &Inputs<'_>) -> Table {
+    let mut t = Table::new("Locations", &["Location", "Description", "Devices", "Note"]);
+    let mut count: BTreeMap<String, usize> = BTreeMap::new();
+    for tag in all_tags(i).iter().filter(|t| !t.location.is_empty()) {
+        *count.entry(tag.location.join(".")).or_default() += 1;
+    }
+    for l in &i.project.meta.locations {
+        let n = count.remove(&l.path).unwrap_or(0);
+        t.rows.push(vec![
+            format!("+{}", l.path),
+            l.description.clone(),
+            n.to_string(),
+            String::new(),
+        ]);
+    }
+    for (path, n) in count {
+        t.rows.push(vec![
+            format!("+{path}"),
+            String::new(),
+            n.to_string(),
+            "not in the project's locations".into(),
+        ]);
+    }
+    t
 }
 
 pub use wc_core::project::natural_key;

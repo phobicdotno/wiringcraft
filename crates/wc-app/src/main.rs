@@ -53,6 +53,8 @@ enum Dialog {
     ProjectProps {
         name: String,
         fields: Vec<(String, String)>,
+        /// The project's locations as (path, description), edited in place.
+        locations: Vec<(String, String)>,
     },
     PageProps {
         number: String,
@@ -491,6 +493,13 @@ impl App {
                 self.dialog = Some(Dialog::ProjectProps {
                     name: open.project.meta.name.clone(),
                     fields,
+                    locations: open
+                        .project
+                        .meta
+                        .locations
+                        .iter()
+                        .map(|l| (l.path.clone(), l.description.clone()))
+                        .collect(),
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
@@ -894,7 +903,7 @@ impl App {
                         }
                     });
                 }
-                Dialog::ProjectProps { name, fields } => {
+                Dialog::ProjectProps { name, fields, locations } => {
                     egui::Grid::new("projprops")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
@@ -913,16 +922,50 @@ impl App {
                         RichText::new("These fields fill the title block on every page.")
                             .color(theme::Theme::of(ui.ctx()).faint),
                     );
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Locations").strong());
+                    let mut drop = None;
+                    egui::Grid::new("projlocations")
+                        .num_columns(3)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            for (k, (path, description)) in locations.iter_mut().enumerate() {
+                                ui.add(egui::TextEdit::singleline(path).hint_text("+L1").desired_width(100.0));
+                                ui.add(
+                                    egui::TextEdit::singleline(description)
+                                        .hint_text("What it is")
+                                        .desired_width(250.0),
+                                );
+                                if ui.button("Remove").clicked() {
+                                    drop = Some(k);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    if let Some(k) = drop {
+                        locations.remove(k);
+                    }
+                    if ui.button("Add location").clicked() {
+                        locations.push((String::new(), String::new()));
+                    }
+                    let bad = locations
+                        .iter()
+                        .filter(|(p, _)| !p.trim().is_empty())
+                        .find_map(|(p, _)| wc_core::project::location_path(p).err());
+                    if let Some(why) = &bad {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
+                    }
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(!name.trim().is_empty(), egui::Button::new("OK"))
+                            .add_enabled(!name.trim().is_empty() && bad.is_none(), egui::Button::new("OK"))
                             .clicked()
                         {
                             let n = name.clone();
                             let f = fields.clone();
+                            let l = locations.clone();
                             then = Some(Box::new(move |app: &mut App| {
                                 if let Some(o) = app.open.as_mut()
-                                    && let Err(e) = o.set_project_props(&n, &f)
+                                    && let Err(e) = o.set_project_props(&n, &f, Some(&l))
                                 {
                                     app.ed.message = e;
                                 }
@@ -1581,6 +1624,7 @@ fn report_title(k: wc_report::Kind) -> &'static str {
         wc_report::Kind::Cables => "Cables",
         wc_report::Kind::Plc => "PLC I/O",
         wc_report::Kind::Contents => "Contents",
+        wc_report::Kind::Locations => "Locations",
     }
 }
 

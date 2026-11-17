@@ -1190,7 +1190,7 @@ impl App {
                     }
                 }
                 let fields: Vec<(String, String)> = fields.into_iter().collect();
-                open.set_project_props(&name, &fields)?;
+                open.set_project_props(&name, &fields, None)?;
                 Ok("Project properties set.".into())
             }
             "comments" => self.tool_comments(v),

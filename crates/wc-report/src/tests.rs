@@ -422,3 +422,28 @@ fn plc_io_list_and_contents() {
     assert!(lines[5].starts_with("    u1 AT %I* : BOOL;"));
     assert_eq!(lines[6], "END_VAR");
 }
+
+#[test]
+fn the_location_list_counts_devices_and_names_unlisted_locations() {
+    let mut p = Project::new("t");
+    for t in ["+L1-K1", "+L1-K2", "+L2.A-K3", "-K4"] {
+        p.devices.insert(DeviceTag::parse(t).unwrap(), Default::default());
+    }
+    p.meta.set_location("L1", "Main cabinet").unwrap();
+    p.meta.set_location("L9", "").unwrap();
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let t = build(Kind::Locations, &i);
+    assert_eq!(
+        t.rows,
+        [
+            ["+L1", "Main cabinet", "2", ""],
+            ["+L9", "", "0", ""],
+            ["+L2.A", "", "1", "not in the project's locations"],
+        ]
+    );
+}

@@ -75,7 +75,7 @@ For the other areas, the chapter to read in each help is:
 | Portrait pages and A1/A0 or custom sizes | yes | yes | no | later |
 | Page types (schematic, single-line overview, graphic, report, panel layout) | yes | yes | partly: schematic, overview flag, panel layouts, report pages in the PDF | done for the basics; more types later |
 | Structure identifiers per page (function `=` and location `+`) | yes | yes (book / file / location) | yes: IEC 81346 tags, page defaults | done |
-| Locations list with descriptions | yes | yes | partly: stored and imported, no editor | todo (#94) |
+| Locations list with descriptions | yes | yes | yes: project properties, `wiringcraft location`, Locations report, SolidWorks and AutomationML import | done |
 | Frame with column and row references (e.g. 3.C) | yes | yes | yes | done (#54) |
 | Title block shared by all pages | yes | yes | yes | done |
 | Cover page and page template editing | yes | yes | no editor | todo (#53) |

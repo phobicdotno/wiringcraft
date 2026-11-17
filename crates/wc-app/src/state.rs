@@ -612,7 +612,14 @@ impl Open {
     }
 
     /// Rename the project and set its title-block fields (empty values are dropped).
-    pub fn set_project_props(&mut self, name: &str, fields: &[(String, String)]) -> Result<(), String> {
+    /// Set the project name, title-block fields and, when given, the whole list of locations as
+    /// (path, description); rows with an empty path are left out. One undo step.
+    pub fn set_project_props(
+        &mut self,
+        name: &str,
+        fields: &[(String, String)],
+        locations: Option<&[(String, String)]>,
+    ) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() {
             return Err("The project name cannot be empty.".into());
@@ -622,12 +629,20 @@ impl Open {
             .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
             .filter(|(k, v)| !k.is_empty() && !v.is_empty())
             .collect();
-        if self.project.meta.name == name && self.project.meta.title_block == block {
+        let mut meta = self.project.meta.clone();
+        meta.name = name.to_owned();
+        meta.title_block = block;
+        if let Some(locations) = locations {
+            meta.locations.clear();
+            for (path, description) in locations.iter().filter(|(p, _)| !p.trim().is_empty()) {
+                meta.set_location(path, description)?;
+            }
+        }
+        if meta == self.project.meta {
             return Ok(());
         }
         self.checkpoint();
-        self.project.meta.name = name.to_owned();
-        self.project.meta.title_block = block;
+        self.project.meta = meta;
         Ok(())
     }
 
@@ -1045,15 +1060,45 @@ pub(crate) mod tests {
     #[test]
     fn project_props_drop_empty_title_block_fields() {
         let (_tmp, mut o) = project();
-        assert!(o.set_project_props(" ", &[]).is_err());
+        assert!(o.set_project_props(" ", &[], None).is_err());
         o.set_project_props(
             "Pump station",
             &[("customer".into(), "Acme".into()), ("revision".into(), " ".into())],
+            None,
         )
         .unwrap();
         assert_eq!(o.project.meta.name, "Pump station");
         assert_eq!(o.project.meta.title_block.len(), 1);
         assert!(o.undo());
         assert_eq!(o.project.meta.name, "Test");
+    }
+
+    #[test]
+    fn project_props_set_the_locations_in_one_undo_step() {
+        let (_tmp, mut o) = project();
+        let name = o.project.meta.name.clone();
+        let mark = o.undo_mark();
+        let rows = |r: &[(&str, &str)]| {
+            r.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect::<Vec<_>>()
+        };
+        o.set_project_props(
+            &name,
+            &[],
+            Some(&rows(&[("+L2", "Room"), ("", "ignored"), ("L1", "Cabinet")])),
+        )
+        .unwrap();
+        assert_eq!(o.undo_mark(), mark + 1);
+        let paths: Vec<&str> = o.project.meta.locations.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["L1", "L2"]);
+        assert!(o.set_project_props(&name, &[], Some(&rows(&[("+L1-K1", "")]))).is_err());
+        assert_eq!(o.project.meta.locations.len(), 2, "a bad row changes nothing");
+        o.set_project_props(&name, &[], None).unwrap();
+        assert_eq!(o.project.meta.locations.len(), 2, "None keeps them");
+        o.set_project_props(&name, &[], Some(&[])).unwrap();
+        assert!(o.project.meta.locations.is_empty());
+        assert!(o.undo());
+        assert_eq!(o.project.meta.locations.len(), 2);
     }
 }

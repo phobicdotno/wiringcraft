@@ -38,6 +38,19 @@ pub struct ProjectMeta {
     pub locations: Vec<Location>,
 }
 
+/// A location path as the project stores it (`L1.L3`), from what was typed (`+L1.L3` or
+/// `L1.L3`). Refused when it is not just the `+` part of a tag.
+pub fn location_path(s: &str) -> Result<String, String> {
+    let s = s.trim();
+    let s = s.strip_prefix('+').unwrap_or(s);
+    // A tag needs a product, so try it with one; a product or function in `s` is refused.
+    let tag = DeviceTag::parse(&format!("+{s}-X")).map_err(|e| format!("{s:?} is not a location: {e}"))?;
+    if !tag.function.is_empty() || tag.product != ["X"] {
+        return Err(format!("{s:?} is not a location: give only the + part of a tag"));
+    }
+    Ok(tag.location.join("."))
+}
+
 /// A location of the project, such as a cabinet or a room.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
@@ -61,6 +74,34 @@ impl ProjectMeta {
             }
         }
         filled
+    }
+
+    /// Add a location or change its description (an empty one clears it). The path may be
+    /// typed with or without its `+`. Returns whether anything changed.
+    pub fn set_location(&mut self, path: &str, description: &str) -> Result<bool, String> {
+        let path = location_path(path)?;
+        let description = description.trim().to_owned();
+        match self.locations.iter_mut().find(|l| l.path == path) {
+            Some(l) if l.description == description => Ok(false),
+            Some(l) => {
+                l.description = description;
+                Ok(true)
+            }
+            None => {
+                self.locations.push(Location { path, description });
+                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                Ok(true)
+            }
+        }
+    }
+
+    /// Remove a location from the list (its devices keep their tags). Returns whether it was
+    /// there.
+    pub fn remove_location(&mut self, path: &str) -> bool {
+        let path = location_path(path).unwrap_or_else(|_| path.trim().to_owned());
+        let before = self.locations.len();
+        self.locations.retain(|l| l.path != path);
+        self.locations.len() != before
     }
 
     /// Add a location, or fill in the description of one the project already has. A description
@@ -537,5 +578,21 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn locations_are_set_and_removed_by_path_with_or_without_the_plus() {
+        let mut m = ProjectMeta::new("t");
+        assert_eq!(m.set_location("+L1.L3", " Cabinet 3 "), Ok(true));
+        assert_eq!(m.set_location("L1.L3", "Cabinet 3"), Ok(false), "same description");
+        assert_eq!(m.set_location("L1", ""), Ok(true));
+        let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["L1", "L1.L3"]);
+        assert_eq!(m.locations[1].description, "Cabinet 3");
+        assert!(m.set_location("+L1-K1", "x").is_err(), "a device tag is no location");
+        assert!(m.set_location("", "x").is_err());
+        assert!(m.remove_location("+L1"));
+        assert!(!m.remove_location("L1"));
+        assert_eq!(m.locations.len(), 1);
     }
 }
