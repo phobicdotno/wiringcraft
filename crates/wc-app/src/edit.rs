@@ -147,7 +147,20 @@ fn seg_dist(p: Point, a: Point, b: Point) -> f64 {
     p.distance(Point::new(a.x + t * dx, a.y + t * dy))
 }
 
-/// Is `at` on the drawing (within `tol` mm of its lines, or inside a text)?
+/// Whether `at` lies inside a closed outline (even-odd rule).
+fn inside_outline(at: Point, pts: &[Point]) -> bool {
+    let n = pts.len();
+    let mut odd = false;
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + n - 1) % n]);
+        if (a.y > at.y) != (b.y > at.y) && at.x < (b.x - a.x) * (at.y - a.y) / (b.y - a.y) + a.x {
+            odd = !odd;
+        }
+    }
+    odd
+}
+
+/// Is `at` on the drawing (within `tol` mm of its lines, inside a filled shape or a text)?
 pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
     let near_path = |pts: &[Point]| pts.windows(2).any(|ab| seg_dist(at, ab[0], ab[1]) <= tol);
     match g {
@@ -159,7 +172,7 @@ pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
             {
                 pts.push(*f);
             }
-            near_path(&pts)
+            near_path(&pts) || (*filled && inside_outline(at, points))
         }
         Shape::Rect { min, max } => near_path(&[*min, Point::new(max.x, min.y), *max, Point::new(min.x, max.y), *min]),
         Shape::Circle { center, radius, filled } => {

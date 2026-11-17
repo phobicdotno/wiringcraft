@@ -208,20 +208,30 @@ fn shapes(
         if skip_layer(&layer) {
             continue;
         }
+        // An extrusion pointing down (left by mirroring in AutoCAD) mirrors the entity's own
+        // coordinate system in x. LINE, ELLIPSE and SPLINE are in world coordinates already.
+        let flip = e.f_or(230, 1.0) < 0.0;
+        let q = |x: f64, y: f64| if flip { p(-x, y) } else { p(x, y) };
         let shape = match e.kind.as_str() {
             "LINE" => Some(Shape::Line {
                 a: p(e.f(10), e.f(20)),
                 b: p(e.f(11), e.f(21)),
             }),
             "CIRCLE" => Some(Shape::Circle {
-                center: p(e.f(10), e.f(20)),
+                center: q(e.f(10), e.f(20)),
                 radius: e.f(40) * r_scale,
                 filled: false,
             }),
             "ARC" => {
-                let (s, en) = (e.f(50) + xf.rot, e.f(51) + xf.rot);
+                // Mirrored in x, the arc from s to e runs from 180 - e to 180 - s.
+                let (s, en) = if flip {
+                    (180.0 - e.f(51), 180.0 - e.f(50))
+                } else {
+                    (e.f(50), e.f(51))
+                };
+                let (s, en) = (s + xf.rot, en + xf.rot);
                 Some(Shape::Arc {
-                    center: p(e.f(10), e.f(20)),
+                    center: q(e.f(10), e.f(20)),
                     radius: e.f(40) * r_scale,
                     start: -en,
                     end: -s,
@@ -230,7 +240,7 @@ fn shapes(
             "LWPOLYLINE" => {
                 let xs = e.all(10);
                 let ys = e.all(20);
-                let pts: Vec<Point> = xs.iter().zip(&ys).map(|(x, y)| p(*x, *y)).collect();
+                let pts: Vec<Point> = xs.iter().zip(&ys).map(|(x, y)| q(*x, *y)).collect();
                 (pts.len() >= 2).then(|| Shape::Polyline {
                     points: pts,
                     closed: (e.f(70) as i64) & 1 == 1,
@@ -238,10 +248,13 @@ fn shapes(
                 })
             }
             "ELLIPSE" => {
+                // The minor axis is the extrusion turned onto the major one, so a downward
+                // extrusion runs the parameter the other way round.
+                let ratio = e.f_or(40, 1.0);
                 let (pts, closed) = ellipse_points(
                     (e.f(10), e.f(20)),
                     (e.f(11), e.f(21)),
-                    e.f_or(40, 1.0),
+                    if flip { -ratio } else { ratio },
                     e.f_or(41, 0.0),
                     e.f_or(42, std::f64::consts::TAU),
                 );
@@ -253,8 +266,11 @@ fn shapes(
             }
             "HATCH" => {
                 let solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
-                for lp in hatch_loops(e) {
-                    if let Some(s) = polyline(lp.into_iter().map(|(x, y)| p(x, y)).collect(), true, solid) {
+                let loops = hatch_loops(e);
+                // Islands inside a solid fill stay open: each is cut into the loop around it.
+                let outlines = if solid { with_holes(loops) } else { loops };
+                for lp in outlines {
+                    if let Some(s) = polyline(lp.into_iter().map(|(x, y)| q(x, y)).collect(), true, solid) {
                         out.push((layer.clone(), s));
                     }
                 }
@@ -298,8 +314,9 @@ fn shapes(
                 }
                 None
             }
-            // Attribute templates of a block: their values come with the INSERT.
-            "ATTDEF" => None,
+            // Attribute templates of a block (their values come with the INSERT) and paper-space
+            // viewports, which draw nothing themselves.
+            "ATTDEF" | "VIEWPORT" => None,
             other => {
                 *skipped.entry(other.to_owned()).or_default() += 1;
                 None
@@ -561,13 +578,16 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                         ) else {
                             break;
                         };
-                        let ccw = cur.take(73).unwrap_or(1.0) != 0.0;
-                        let (t0, t1) = if ccw { (a0, a1) } else { (a1, a0) };
-                        let (mut p, _) = ellipse_points(c, m, ratio, t0.to_radians(), t1.to_radians());
-                        if !ccw {
+                        // A clockwise edge stores its angles mirrored, as an arc edge does: it runs
+                        // clockwise from -a0 to -a1, the same points as counter-clockwise from -a1
+                        // to -a0, reversed.
+                        if cur.take(73).unwrap_or(1.0) != 0.0 {
+                            ellipse_points(c, m, ratio, a0.to_radians(), a1.to_radians()).0
+                        } else {
+                            let (mut p, _) = ellipse_points(c, m, ratio, (-a1).to_radians(), (-a0).to_radians());
                             p.reverse();
+                            p
                         }
-                        p
                     }
                     4 => {
                         let degree = cur.count(94);
@@ -585,7 +605,10 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                                 weights.push(w);
                             }
                         }
-                        let nf = cur.count(97);
+                        // Fit points (R2010 and later): a count followed by the points or the
+                        // tangents. Older files go straight on; their 97 is the loop's own.
+                        let fit_follows = matches!(cur.codes.get(cur.i + 1), Some((11 | 12, _)));
+                        let nf = if fit_follows { cur.count(97) } else { 0 };
                         let fit: Vec<(f64, f64)> = (0..nf).filter_map(|_| cur.point(11, 21)).collect();
                         let _ = (cur.point(12, 22), cur.point(13, 23));
                         bspline_points(&ctrl, &knots, &weights, degree)
@@ -594,21 +617,23 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                     }
                     _ => break,
                 };
-                // Edges meet end to start: do not repeat the shared point.
-                let skip = usize::from(
-                    pts.last()
-                        .zip(seg.first())
-                        .is_some_and(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1) < 1e-9),
-                );
+                // Edges may be stored either way round: take the end nearer the loop so far
+                // first, and do not repeat the shared point.
+                let mut seg = seg;
+                let d =
+                    |a: (f64, f64), b: Option<&(f64, f64)>| b.map_or(f64::INFINITY, |b| (a.0 - b.0).hypot(a.1 - b.1));
+                if let Some(&end) = pts.last()
+                    && d(end, seg.last()) + 1e-9 < d(end, seg.first())
+                {
+                    seg.reverse();
+                }
+                let skip = usize::from(pts.last().is_some_and(|end| d(*end, seg.first()) < 1e-9));
                 pts.extend(seg.into_iter().skip(skip));
             }
         }
         // Source boundary objects: a count and that many handles.
-        let refs = cur.count(97);
-        for _ in 0..refs {
-            if cur.take(330).is_none() {
-                break;
-            }
+        while cur.take(97).is_some() {
+            while cur.take(330).is_some() {}
         }
         if pts.len() >= 2
             && pts
@@ -623,6 +648,77 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
         }
     }
     out
+}
+
+/// Twice the signed area of a loop (positive when counter-clockwise).
+fn area2(lp: &[(f64, f64)]) -> f64 {
+    let n = lp.len();
+    (0..n)
+        .map(|i| {
+            let (a, b) = (lp[i], lp[(i + 1) % n]);
+            a.0 * b.1 - b.0 * a.1
+        })
+        .sum()
+}
+
+/// Whether `pt` lies inside the loop (even-odd rule).
+fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
+    let mut odd = false;
+    let n = lp.len();
+    for i in 0..n {
+        let (a, b) = (lp[i], lp[(i + n - 1) % n]);
+        if (a.1 > pt.1) != (b.1 > pt.1) && pt.0 < (b.0 - a.0) * (pt.1 - a.1) / (b.1 - a.1) + a.0 {
+            odd = !odd;
+        }
+    }
+    odd
+}
+
+/// The loops of a solid fill as outlines that fill right with the non-zero and even-odd rules
+/// alike: every loop inside an odd number of others is a hole, cut into the loop just around it
+/// along the shortest bridge, so one outline goes round the solid part and back round the hole.
+fn with_holes(loops: Vec<Vec<(f64, f64)>>) -> Vec<Vec<(f64, f64)>> {
+    let mut loops: Vec<Vec<(f64, f64)>> = loops.into_iter().filter(|l| l.len() >= 3).collect();
+    loops.sort_by(|a, b| area2(b).abs().total_cmp(&area2(a).abs()));
+    // For each loop, the loops around it (they are all bigger, so earlier).
+    let around: Vec<Vec<usize>> = (0..loops.len())
+        .map(|i| (0..i).filter(|&k| inside(loops[i][0], &loops[k])).collect())
+        .collect();
+    let mut outer: Vec<Option<Vec<(f64, f64)>>> = vec![None; loops.len()];
+    for i in 0..loops.len() {
+        let mut lp = loops[i].clone();
+        if around[i].len().is_multiple_of(2) {
+            // A solid part: counter-clockwise.
+            if area2(&lp) < 0.0 {
+                lp.reverse();
+            }
+            outer[i] = Some(lp);
+            continue;
+        }
+        // A hole: clockwise, cut into the innermost solid part around it.
+        if area2(&lp) > 0.0 {
+            lp.reverse();
+        }
+        let Some(&host) = around[i].iter().rev().find(|&&k| outer[k].is_some()) else {
+            continue;
+        };
+        let Some(o) = outer[host].as_mut() else { continue };
+        let mut best = (0, 0, f64::INFINITY);
+        for (a, p) in o.iter().enumerate() {
+            for (b, h) in lp.iter().enumerate() {
+                let d = (p.0 - h.0).hypot(p.1 - h.1);
+                if d < best.2 {
+                    best = (a, b, d);
+                }
+            }
+        }
+        let (a, b, _) = best;
+        let mut cut: Vec<(f64, f64)> = o[..=a].to_vec();
+        cut.extend(lp[b..].iter().chain(&lp[..=b]));
+        cut.extend(&o[a..]);
+        *o = cut;
+    }
+    outer.into_iter().flatten().collect()
 }
 
 /// One warning per entity kind that was not read.
@@ -1061,6 +1157,95 @@ mod tests {
         let ents = "0\n3DFACE\n8\n0\n0\n3DFACE\n8\n0\n0\nSOLID\n8\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
         let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
         assert_eq!(p.warnings, ["2 3DFACE entities not read", "1 SOLID entity not read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_hole_in_a_solid_hatch_stays_open() -> Result<()> {
+        // Outer square 0..10 and an island square 4..6, both as polyline loops.
+        let ents = "0\nHATCH\n2\nSOLID\n70\n1\n91\n2\n\
+            92\n3\n72\n0\n73\n1\n93\n4\n10\n0\n20\n0\n10\n10\n20\n0\n10\n10\n20\n10\n10\n0\n20\n10\n97\n0\n\
+            92\n18\n72\n0\n73\n1\n93\n4\n10\n4\n20\n4\n10\n6\n20\n4\n10\n6\n20\n6\n10\n4\n20\n6\n97\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        assert_eq!(g.len(), 1, "one outline with the hole cut in");
+        let (pts, _, filled) = poly(&g[0]);
+        assert!(filled);
+        let lp: Vec<(f64, f64)> = pts.iter().map(|q| (q.x, -q.y)).collect();
+        assert!(
+            (area2(&lp).abs() / 2.0 - 96.0).abs() < 1e-9,
+            "100 minus the 4 of the hole"
+        );
+        assert!(!inside((5.0, 5.0), &lp), "the island is not filled");
+        assert!(inside((1.0, 1.0), &lp));
+        Ok(())
+    }
+
+    #[test]
+    fn hatch_edges_stored_backwards_and_clockwise_still_make_the_outline() -> Result<()> {
+        // Square 0..10 with its second edge stored end to start, and a clockwise ellipse edge
+        // (a circle of radius 5 round (5, 10)) from 0 down to -180, stored as 0 and 180.
+        let ents = "0\nHATCH\n2\nSOLID\n70\n1\n91\n1\n92\n1\n93\n4\n\
+            72\n1\n10\n0\n20\n0\n11\n10\n21\n0\n\
+            72\n1\n10\n10\n20\n10\n11\n10\n21\n0\n\
+            72\n3\n10\n5\n20\n10\n11\n5\n21\n0\n40\n1\n50\n0\n51\n180\n73\n0\n\
+            72\n1\n10\n0\n20\n10\n11\n0\n21\n0\n97\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        let (pts, _, _) = poly(&g[0]);
+        let lp: Vec<(f64, f64)> = pts.iter().map(|q| (q.x, -q.y)).collect();
+        // The clockwise half circle from (10,10) to (0,10) dips down to (5,5).
+        assert!(
+            lp.iter().any(|p| (p.0 - 5.0).abs() < 1e-9 && (p.1 - 5.0).abs() < 1e-9),
+            "{lp:?}"
+        );
+        assert!(
+            lp.iter().all(|p| p.1 <= 10.0 + 1e-9),
+            "nothing above the square: {lp:?}"
+        );
+        // No zig-zag: the outline never crosses itself back along the bottom.
+        assert!((area2(&lp).abs() / 2.0 - (100.0 - std::f64::consts::PI * 12.5)).abs() < 0.5);
+        Ok(())
+    }
+
+    #[test]
+    fn an_old_spline_edge_without_fit_points_keeps_the_next_loop() -> Result<()> {
+        // Loop 1: a straight degree-1 spline edge and a line back; no fit-point count. Loop 2:
+        // a triangle. Both must come in.
+        let ents = "0\nHATCH\n2\nSOLID\n70\n1\n91\n2\n\
+            92\n1\n93\n3\n\
+            72\n4\n94\n1\n73\n0\n74\n0\n95\n4\n96\n2\n40\n0\n40\n0\n40\n1\n40\n1\n10\n0\n20\n0\n10\n10\n20\n0\n\
+            72\n1\n10\n10\n20\n0\n11\n5\n21\n5\n\
+            72\n1\n10\n5\n20\n5\n11\n0\n21\n0\n97\n0\n\
+            92\n2\n72\n0\n73\n1\n93\n3\n10\n20\n20\n0\n10\n30\n20\n0\n10\n25\n20\n5\n97\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        assert_eq!(g.len(), 2, "{g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_mirrored_arc_and_ellipse_land_on_the_other_side() -> Result<()> {
+        // Extrusion (0, 0, -1): x of the entity's own coordinates runs the other way.
+        let ents = "0\nARC\n10\n10\n20\n0\n40\n5\n50\n0\n51\n90\n230\n-1\n\
+                    0\nELLIPSE\n10\n0\n20\n0\n11\n5\n21\n0\n40\n0.5\n41\n0\n42\n1.5707963267948966\n230\n-1\n\
+                    0\nVIEWPORT\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert!(skipped.is_empty(), "a viewport is no loss: {skipped:?}");
+        // The arc's centre is mirrored to (-10, 0); 0..90 becomes 90..180.
+        assert_eq!(
+            g[0],
+            Shape::Arc {
+                center: Point::new(-10.0, 0.0),
+                radius: 5.0,
+                start: -180.0,
+                end: -90.0
+            }
+        );
+        // The quarter ellipse runs from (5, 0) to (0, -2.5) instead of (0, 2.5).
+        let (e, _, _) = poly(&g[1]);
+        assert!(near(e[0], Point::new(5.0, 0.0)));
+        assert!(
+            near(*e.last().unwrap_or(&Point::new(0.0, 0.0)), Point::new(0.0, 2.5)),
+            "{e:?}"
+        );
         Ok(())
     }
 }
