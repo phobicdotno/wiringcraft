@@ -13,6 +13,14 @@
 //! symbol graphics are DWG files and are not read: each placed symbol becomes a box with its
 //! connection points where the database puts them.
 //!
+//! Tag paths come in two forms. Most databases write them with aspect signs (`=F1+L1+L11-CR1`,
+//! location `+L1+L11`). Some write the levels separated by spaces with no signs at all
+//! (`F1 L1 L11 CR1`, location `L1 L11`); there a component's tag is built from its function
+//! (`com_fun_id` -> `tew_function.fun_tagpath`), its location (`com_loc_id` ->
+//! `tew_location.loc_tagpath`) and its product path (`com_parenttagpath`, else `com_tag`). So
+//! `com_fun_id`, `com_loc_id` and `com_parenttagpath` are required columns; `tew_function` and
+//! `tew_location` are optional tables.
+//!
 //! Database coordinates are millimetres with y up. A connection point is an offset in its
 //! symbol's own frame: rotated by the symbol's angle, then scaled by the symbol's scale along the
 //! page axes (a negative scale mirrors), then moved to the symbol's position. The order matters
@@ -305,9 +313,79 @@ pub struct SweLocation {
 /// location always carries exactly this path (`+Room 1` is `Room_1` on both sides). Empty when
 /// that cleanup gives no valid location.
 fn location_path(tag_path: &str) -> String {
-    device_tag(&format!("{}-X", tag_path.trim()))
+    device_tag(&format!("{}-X", signed(tag_path, '+')))
         .map(|t| t.location.join("."))
         .unwrap_or_default()
+}
+
+/// Whether a stored tag path is in the signed form: it starts with `=`, `+` or `-`. A sign
+/// further in (`Deck-2`, `K-1`) is part of a level name in the space form.
+fn has_signs(path: &str) -> bool {
+    path.trim_start().starts_with(['=', '+', '-'])
+}
+
+/// A path in the space form (`L1 L11`) with `sign` before every level (`+L1+L11`); a sign inside
+/// a level becomes `_` (`Deck-2` is `Deck_2`), so it cannot start another aspect. A path that
+/// already has signs, or is empty, is returned as it is.
+fn signed(path: &str, sign: char) -> String {
+    let path = path.trim();
+    if path.is_empty() || has_signs(path) {
+        return path.to_owned();
+    }
+    path.split_whitespace()
+        .map(|l| {
+            let level: String = l
+                .chars()
+                .map(|c| if matches!(c, '=' | '+' | '-') { '_' } else { c })
+                .collect();
+            format!("{sign}{level}")
+        })
+        .collect()
+}
+
+/// The full tag path of a component stored in the space form: function, location and product,
+/// each in its signed form (`=F1` `+L1+L11` `-CR1`).
+fn composed_path(function: Option<&str>, location: Option<&str>, product: &str) -> String {
+    let mut out = String::new();
+    for (path, sign) in [(function, '='), (location, '+'), (Some(product), '-')] {
+        if let Some(p) = path {
+            out.push_str(&signed(p, sign));
+        }
+    }
+    out
+}
+
+/// Whether the database has a table called `name`.
+fn has_table(conn: &Connection, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .map_err(sql)
+}
+
+/// Tag paths by id from `tew_function` or `tew_location`, when the table is there. An empty path
+/// names no aspect, so its row is left out.
+fn tag_paths(conn: &Connection, table: &str, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, String>> {
+    let (id, path, what) = match table {
+        "tew_function" => ("fun_id", "fun_tagpath", "function"),
+        _ => ("loc_id", "loc_tagpath", "location"),
+    };
+    if !has_table(conn, table)? {
+        return Ok(BTreeMap::new());
+    }
+    let mut st = conn
+        .prepare(&format!("SELECT {id}, COALESCE(CAST({path} AS TEXT), '') FROM {table}"))
+        .map_err(sql)?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(sql)?;
+    Ok(readable(rows, &format!("{what} tag path"), warnings)
+        .into_iter()
+        .filter(|(_, p)| !p.trim().is_empty())
+        .collect())
 }
 
 /// One row of the import report: how many of a kind the source has and how many came in.
@@ -553,25 +631,70 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     let mut st = conn
         .prepare(
             "SELECT com_id, COALESCE(NULLIF(com_tagpath, ''), com_tag, ''), COALESCE(com_type, -1), com_com_id, \
-             COALESCE(com_tagorderno, 0), COALESCE(CAST(com_tag AS TEXT), '') FROM tew_component",
+             COALESCE(com_tagorderno, 0), COALESCE(CAST(com_tag AS TEXT), ''), com_fun_id, com_loc_id, \
+             COALESCE(CAST(com_parenttagpath AS TEXT), '') FROM tew_component",
         )
         .map_err(sql)?;
     let rows = st
         .query_map([], |r| {
-            Ok(SweComponent {
-                id: r.get(0)?,
-                tag: r.get(1)?,
-                kind: r.get(2)?,
-                parent: r.get::<_, Option<i64>>(3)?.filter(|c| *c > 0),
-                order: r.get(4)?,
-                name: r.get(5)?,
-                ..Default::default()
-            })
+            Ok((
+                SweComponent {
+                    id: r.get(0)?,
+                    tag: r.get(1)?,
+                    kind: r.get(2)?,
+                    parent: r.get::<_, Option<i64>>(3)?.filter(|c| *c > 0),
+                    order: r.get(4)?,
+                    name: r.get(5)?,
+                    ..Default::default()
+                },
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, String>(8)?,
+            ))
         })
         .map_err(sql)?;
-    for mut c in readable(rows, "component", &mut warnings) {
+    let functions = tag_paths(conn, "tew_function", &mut warnings)?;
+    let location_paths = tag_paths(conn, "tew_location", &mut warnings)?;
+    let mut space_form = 0usize;
+    for (mut c, fun, loc, product) in readable(rows, "component", &mut warnings) {
         c.description = text.get(&c.id).cloned().unwrap_or_default();
+        // A path without signs: rebuild it from its parts, so function and location survive. A
+        // tag with neither stays as written, spaces and all (`K3`, `X 1/2` is one product name).
+        let function = fun.and_then(|f| functions.get(&f)).map(String::as_str);
+        let location = loc.and_then(|l| location_paths.get(&l)).map(String::as_str);
+        let has_space = |t: &str| t.trim().contains(char::is_whitespace);
+        // Any part written in the space form counts: the stored path, or a function, location or
+        // product path the tag is rebuilt from.
+        let spaced = has_space(&c.tag)
+            || function.is_some_and(has_space)
+            || location.is_some_and(has_space)
+            || has_space(&product);
+        if !has_signs(&c.tag) && (function.is_some() || location.is_some()) {
+            // The product path, else the component's own tag as one level (a name, not a path:
+            // `X 1/2` is `X_1/2`, `+24V` is `_24V`), else the stored path.
+            let name: String = c
+                .name
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("_")
+                .chars()
+                .map(|ch| if matches!(ch, '=' | '+' | '-') { '_' } else { ch })
+                .collect();
+            let product = [product.trim(), name.as_str()]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .map_or_else(|| c.tag.clone(), str::to_owned);
+            if spaced {
+                space_form += 1;
+            }
+            c.tag = composed_path(function, location, &product);
+        }
         p.components.insert(c.id, c);
+    }
+    if space_form > 0 {
+        warnings.push(format!(
+            "{space_form} component tag path(s) are stored with spaces instead of =, + and -; their tags were built from function, location and product"
+        ));
     }
     let mut st = conn
         .prepare(
