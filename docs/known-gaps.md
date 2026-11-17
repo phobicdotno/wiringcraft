@@ -60,9 +60,11 @@ These branches can be deleted once their pull requests are merged.
 
 ## Shared sessions
 
-`README.md` says of `wc-share`: "app and network to follow". The core is merged (#79); the rest is
-#74 (network transport), #75 (discovery), #76 (app UI), #77 (project-level edits from page
-tools) and #78 (per-change undo). #43 tracks them.
+The core (#79), the network transport (#74), discovery (#75) and the app's Share session and
+Join session (#76) are in. In a session the app sends every change to the open page as one page
+edit and project-level changes (devices, comments, panels, pages, project properties) as project
+edits; Undo is off. Still open: page tools that change pages other people hold, such as wire
+numbering (#77), and undo per change (#78). #43 tracks them.
 
 ## Planning and integrations
 

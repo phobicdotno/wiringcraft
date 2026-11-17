@@ -66,6 +66,8 @@ pub struct Editor {
     /// Wire pins that line up when a symbol is placed or moved (the app sets it from the
     /// preferences). Holding Alt skips it once.
     pub auto_wire: bool,
+    /// In a shared session: pages other people have open (read-only here), page id to name.
+    pub held_by: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Editor {
@@ -88,6 +90,7 @@ impl Default for Editor {
             panel_pick: None,
             panel_drag: None,
             auto_wire: false,
+            held_by: Default::default(),
         }
     }
 }

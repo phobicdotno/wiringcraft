@@ -230,7 +230,7 @@ For the other areas, the chapter to read in each help is:
 | Revision tracking and compare | yes | yes | yes: git history, subway map, change lists | done |
 | Revision marks (clouds, revision table on pages) | yes | yes | no | later |
 | Review comments on pages | yes (comments in PDF) | partly | yes | done |
-| Several people on one project at once | yes (multi-user) | yes (server database) | session core done | todo (#43: #74, #75, #76, #77, #78) |
+| Several people on one project at once | yes (multi-user) | yes (server database) | share and join in the app, page locks | todo (#43: #77, #78) |
 | User rights per project | yes | yes | no | not planned: git hosting already controls who can change a project |
 
 ## 15. Automation and help

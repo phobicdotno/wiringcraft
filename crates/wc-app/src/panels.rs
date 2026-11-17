@@ -298,13 +298,21 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             for (i, p) in open.project.pages.iter().enumerate() {
+                let title = match ed.held_by.get(&p.id) {
+                    Some(name) => RichText::new(format!("{}  · {name}", p.title)).italics(),
+                    None => RichText::new(&p.title),
+                };
                 let r = row(
                     ui,
                     ed.page == i && ed.panel.is_none(),
                     Lead::Number(&p.number),
-                    RichText::new(&p.title),
+                    title,
                     false,
                 );
+                let r = match ed.held_by.get(&p.id) {
+                    Some(name) => r.on_hover_text(format!("Open by {name}: read-only for you")),
+                    None => r,
+                };
                 let pick = |ed: &mut Editor| {
                     if ed.panel.take().is_some() {
                         ed.view.fit = true;
