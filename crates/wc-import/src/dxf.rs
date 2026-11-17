@@ -445,6 +445,10 @@ const BRIDGE_BUDGET: usize = 4_000_000;
 /// is left unfilled.
 const NESTING_BUDGET: usize = 20_000_000;
 
+/// The most work (point pairs, wall edges collected and crossing tests) spent on all the bridges
+/// of one hatch together; past it the hatch is left unfilled.
+const HATCH_BRIDGE_WORK: usize = 20_000_000;
+
 /// The `skipped` key of a solid hatch drawn as its boundaries because its holes could not be cut.
 const HATCH_UNFILLED: &str = "solid HATCH (holes too complex)";
 
@@ -779,6 +783,9 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
         depth.push(found.and_then(|k| depth.get(k)).map_or(0, |d| d + 1));
         parent.push(found);
     }
+    let all_edges: usize = loops.iter().map(Vec::len).sum();
+    // Work spent on bridges so far, over every hole of this hatch.
+    let mut bridge_work = 0usize;
     let mut outer: Vec<Option<Vec<(f64, f64)>>> = vec![None; loops.len()];
     for (i, lp) in loops.iter().enumerate() {
         // Outer style keeps the outermost level and its holes; Ignore only the outermost.
@@ -813,7 +820,15 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
         // The shortest bridge from the hole to the outline that crosses no edge of the outline,
         // of this hole or of any other loop.
         // A bounded search: the pairs, then the crossing tests, each within a budget.
-        if o.len().saturating_mul(lp.len()) > BRIDGE_BUDGET {
+        let pair_count = o.len().saturating_mul(lp.len());
+        if pair_count > BRIDGE_BUDGET {
+            return None;
+        }
+        bridge_work = bridge_work
+            .saturating_add(pair_count)
+            .saturating_add(all_edges)
+            .saturating_add(o.len());
+        if bridge_work > HATCH_BRIDGE_WORK {
             return None;
         }
         let mut pairs: Vec<(f64, usize, usize)> = Vec::with_capacity(o.len() * lp.len());
@@ -833,10 +848,18 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
         let tries = (BRIDGE_BUDGET * 4 / walls.len().max(1)).max(1);
         let clear = |p: (f64, f64), h: (f64, f64)| !walls.iter().any(|&(c, d)| crosses(p, h, c, d));
         // No clear bridge within the budget: leave the hatch unfilled rather than fill the hole.
-        let (_, a, b) = *pairs
-            .iter()
-            .take(tries)
-            .find(|(_, a, b)| o.get(*a).zip(lp.get(*b)).is_some_and(|(p, h)| clear(*p, *h)))?;
+        let mut found = None;
+        for &(_, a, b) in pairs.iter().take(tries) {
+            bridge_work = bridge_work.saturating_add(walls.len());
+            if bridge_work > HATCH_BRIDGE_WORK {
+                return None;
+            }
+            if o.get(a).zip(lp.get(b)).is_some_and(|(p, h)| clear(*p, *h)) {
+                found = Some((a, b));
+                break;
+            }
+        }
+        let (a, b) = found?;
         let mut cut: Vec<(f64, f64)> = o.get(..=a)?.to_vec();
         cut.extend(lp.get(b..)?.iter().chain(lp.get(..=b)?));
         cut.extend(o.get(a..)?);
@@ -1591,7 +1614,16 @@ mod tests {
             })
             .collect();
         assert!(with_holes(&apart, 0).is_none());
-        assert!(started.elapsed().as_secs() < 5);
+        // Deep nesting with normal style: every other loop is a hole to bridge, and all the
+        // bridges together stop at the hatch's budget.
+        let deep: Vec<Vec<(f64, f64)>> = (0..20_000)
+            .map(|i| {
+                let (a, b) = (i as f64, 50_000.0 - i as f64);
+                vec![(a, a), (b, a), (b, b), (a, b)]
+            })
+            .collect();
+        assert!(with_holes(&deep, 0).is_none());
+        assert!(started.elapsed().as_secs() < 10);
     }
 
     #[test]
