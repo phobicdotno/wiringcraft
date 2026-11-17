@@ -563,10 +563,11 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             .max()
             .unwrap_or(0);
         for term in list {
-            let number = term.number.clone().unwrap_or_else(|| {
-                next += 1;
-                next.to_string()
-            });
+            let number = term
+                .number
+                .clone()
+                .or_else(|| wc_core::project::next_number(&mut next))
+                .unwrap_or_default();
             let side = |n: usize| -> (String, Option<String>) {
                 let Some(pin) = term.pins.get(n) else {
                     return (String::new(), None);

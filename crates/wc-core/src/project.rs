@@ -51,6 +51,12 @@ pub struct Jumper {
     pub terminals: Vec<String>,
 }
 
+/// The next automatic terminal number after `last`, which it advances; `None` past the largest.
+pub fn next_number(last: &mut u64) -> Option<String> {
+    *last = last.checked_add(1)?;
+    Some(last.to_string())
+}
+
 /// Which terminal of which strip each placed terminal is, keyed by (page id, symbol id).
 pub type TerminalNumbers = BTreeMap<(String, String), (DeviceTag, String)>;
 
@@ -105,10 +111,14 @@ pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolR
             .max()
             .unwrap_or(0);
         for t in list {
-            let number = t.number.unwrap_or_else(|| {
-                next += 1;
-                next.to_string()
-            });
+            // A strip already at the largest number leaves the rest unnumbered.
+            let number = match t.number {
+                Some(n) => n,
+                None => match next_number(&mut next) {
+                    Some(n) => n,
+                    None => continue,
+                },
+            };
             out.insert(t.key, (strip.clone(), number));
         }
     }

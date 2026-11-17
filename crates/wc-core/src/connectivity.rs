@@ -297,6 +297,30 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_terminal_number_does_not_overflow() {
+        use crate::project::PlacedSymbol;
+        use crate::tag::DeviceTag;
+        let term = |id: &str, tag: &str| PlacedSymbol {
+            id: id.into(),
+            symbol: "wc.terminal".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: DeviceTag::parse(tag).ok(),
+        };
+        let mut p = Project::new("t");
+        let mut a = Page::new("a", "1", "");
+        a.symbols = vec![term("big", "-X1.18446744073709551615"), term("bare", "-X1")];
+        p.pages = vec![a];
+        let numbers = crate::project::terminal_numbers(&p, |_| Some(SymbolRole::Terminal));
+        assert_eq!(numbers[&("a".to_owned(), "big".to_owned())].1, "18446744073709551615");
+        assert!(
+            !numbers.contains_key(&("a".to_owned(), "bare".to_owned())),
+            "no number left for it"
+        );
+    }
+
+    #[test]
     fn joins_through_points_and_potentials() {
         let mut p = Project::new("t");
         let mut a = Page::new("a", "1", "");
