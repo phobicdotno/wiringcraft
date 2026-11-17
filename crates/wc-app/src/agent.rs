@@ -1304,6 +1304,9 @@ impl App {
                 let open = need_open(self.open.as_mut())?;
                 let redo = v.get("redo").and_then(Value::as_bool).unwrap_or(false);
                 let done = if redo { open.redo() } else { open.undo() };
+                if let Some(e) = open.take_undo_error() {
+                    return Err(format!("Not done: {e}"));
+                }
                 self.ed.selection.clear();
                 Ok(if done { "Done." } else { "Nothing to undo or redo." }.into())
             }

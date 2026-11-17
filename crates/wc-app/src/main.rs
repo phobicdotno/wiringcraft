@@ -448,14 +448,12 @@ impl App {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
                 Err(e) => self.dialog = Some(Dialog::Message(format!("Saving failed:\n{e}"))),
             },
-            Action::Undo => {
-                if open.undo() {
+            Action::Undo | Action::Redo => {
+                let done = if a == Action::Undo { open.undo() } else { open.redo() };
+                if done {
                     self.ed.selection.clear();
-                }
-            }
-            Action::Redo => {
-                if open.redo() {
-                    self.ed.selection.clear();
+                } else if let Some(e) = open.take_undo_error() {
+                    self.dialog = Some(Dialog::Message(format!("Undo or redo was not done:\n{e}")));
                 }
             }
             Action::Delete if self.ed.panel.is_some() => {
@@ -2328,18 +2326,8 @@ impl App {
             );
             return;
         }
-        open.checkpoint();
-        // Only the symbol: a part with the same id stays as it is.
-        let result = wc_library::take(
-            &open.dir,
-            &mut open.project,
-            &lib,
-            wc_core::lock::ItemKind::Symbol,
-            &saved.id,
-        );
-        match result {
-            Ok(_) => {
-                open.reload_symbols();
+        match open.take_saved_symbol(&lib, &saved.id) {
+            Ok(()) => {
                 open.refresh_library();
                 self.ed.message = format!("Symbol {} saved and updated on the pages that use it.", saved.id);
             }
