@@ -444,6 +444,12 @@ impl App {
             // Undoing in a shared session takes back only this person's own change: the whole
             // project is not swapped, so other people's work stays.
             Action::Undo | Action::Redo if self.share.active() => {
+                // The host's undo writes the project folder, and a guest's sync would send a
+                // command's half-written work: neither while a command owns the files.
+                if self.assistant.command_running() {
+                    self.ed.message = "Undo and Redo wait until the assistant's command has finished.".into();
+                    return;
+                }
                 // Changes not synced yet (an assistant's, made with no frame in between) go into
                 // the session's history first, so Undo takes back the latest one.
                 self.sync_session_now(false);

@@ -619,12 +619,104 @@ fn a_page_changed_on_both_sides_takes_the_sessions_version() {
     local.pages[0].title = "Local".into();
     local.pages[1].title = "Mine".into();
     let lost = yield_to_session(&mut local, &mut base, &auth);
-    assert_eq!(lost, ["1"]);
+    assert_eq!(lost, ["page 1"]);
     assert_eq!(
         (local.pages[0].title.as_str(), base.pages[0].title.as_str()),
         ("Restored", "Restored")
     );
     assert_eq!(local.pages[1].title, "Mine", "kept");
+}
+
+#[test]
+fn every_part_changed_on_both_sides_takes_the_sessions_version() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    base.pages.push(Page::new("p2", "2", "Two"));
+    base.pages.push(Page::new("p3", "3", "Three"));
+    base.meta.title_block.insert("customer".into(), "New".into());
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    // The session (an undo) put back the customer, changed page 1 and -K1.
+    auth.meta.title_block.insert("customer".into(), "Old".into());
+    auth.pages[0].title = "Restored".into();
+    auth.devices.remove(&k1);
+    // Meanwhile this window changed another title-block field, removed page 1, changed -K1,
+    // added -K2 and removed page 3: only what the session left alone is kept.
+    local.meta.title_block.insert("drawn_by".into(), "Me".into());
+    local.pages.retain(|p| p.id != "p1" && p.id != "p3");
+    local.devices.get_mut(&k1).ok_or("no -K1")?.part = Some("changed".into());
+    local.devices.insert(k2.clone(), wc_core::Device::default());
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["the project properties", "page 1", "device -K1"]);
+    assert_eq!(local.meta, auth.meta, "the undone value is not sent back");
+    assert_eq!(
+        local.pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        ["p1", "p2"],
+        "the restored page is back; page 3's removal still goes out"
+    );
+    assert_eq!(local.pages[0].title, "Restored");
+    assert!(!local.devices.contains_key(&k1) && local.devices.contains_key(&k2));
+    assert_eq!(base.pages[0].title, "Restored");
+    assert!(!base.devices.contains_key(&k1));
+    Ok(())
+}
+
+#[test]
+fn a_page_removed_while_its_undo_is_on_its_way_stays_in_the_session() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "First".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    guest_open.project.pages.retain(|p| p.id != "p0003");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for open in [&host_open, &guest_open] {
+        assert_eq!(open.project.page("p0003").map(|p| p.title.as_str()), Some("Valves"));
+    }
+    assert!(
+        g.take_notes()
+            .iter()
+            .any(|n| n.contains("page 3") && n.contains("was not kept"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_title_block_field_changed_while_an_undo_is_on_its_way_does_not_cancel_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let before = guest_open.project.meta.title_block.get("customer").cloned();
+    guest_open
+        .project
+        .meta
+        .title_block
+        .insert("customer".into(), "New".into());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    guest_open
+        .project
+        .meta
+        .title_block
+        .insert("drawn_by".into(), "Guest".into());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for open in [&host_open, &guest_open] {
+        assert_eq!(
+            open.project.meta.title_block.get("customer"),
+            before.as_ref(),
+            "the undo is kept"
+        );
+    }
+    assert!(
+        g.take_notes()
+            .iter()
+            .any(|n| n.contains("project properties") && n.contains("was not kept"))
+    );
+    Ok(())
 }
 
 #[test]

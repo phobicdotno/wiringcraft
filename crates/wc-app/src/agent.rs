@@ -1309,12 +1309,20 @@ impl App {
                     } else {
                         self.share.can_undo()
                     };
-                    if !can {
+                    // The host's list is complete here. A guest's may not yet hold the change
+                    // just sent: the host, which gets the undo after that change, decides, and
+                    // says so in the session's notes when there is nothing to take back.
+                    if !can && self.share.is_host() {
                         return Ok("Nothing to undo or redo.".into());
                     }
                     if redo { self.share.redo() } else { self.share.undo() }?;
                     self.ed.selection.clear();
-                    return Ok("Sent to the session; it shows with the next sync.".into());
+                    return Ok(if can {
+                        "Sent to the session; it shows with the next sync."
+                    } else {
+                        "Sent to the session. Your latest change may not be in the session's list yet; if there is nothing of yours to take back, the session says so with the next sync."
+                    }
+                    .into());
                 }
                 let open = need_open(self.open.as_mut())?;
                 let done = if redo { open.redo() } else { open.undo() };
@@ -2523,6 +2531,39 @@ mod tests {
         a.share.frame(a.open.as_mut(), None, false);
         let devices = &a.open.as_ref().unwrap().project.devices;
         assert!(!devices.contains_key(&k8) && devices.contains_key(&k7));
+        a.share.stop();
+    }
+
+    #[test]
+    fn undo_in_a_session_waits_while_an_assistant_command_owns_the_files() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let k7 = wc_core::DeviceTag::parse("-K7").unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.project.devices.insert(k7.clone(), wc_core::Device::default());
+        a.share.frame(a.open.as_mut(), None, false);
+        let open = a.open.as_ref().unwrap();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let on_disk = std::fs::read_dir(&open.dir).unwrap().count();
+        let dir = open.dir.clone();
+        for action in [Action::Undo, Action::Redo] {
+            a.run(action);
+            assert!(a.ed.message.contains("wait"), "{}", a.ed.message);
+        }
+        assert!(!a.share.take_notes().iter().any(|n| n.contains("Undo")));
+        assert!(
+            a.open.as_ref().unwrap().project.devices.contains_key(&k7),
+            "nothing taken back"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), on_disk);
+        a.assistant.command_base = None;
+        a.run(Action::Undo);
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(
+            !a.open.as_ref().unwrap().project.devices.contains_key(&k7),
+            "taken back once free"
+        );
         a.share.stop();
     }
 

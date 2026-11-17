@@ -169,23 +169,128 @@ pub fn outgoing(
     out
 }
 
-/// Pages changed both in this window and in the session since the last sync (`base`): the
-/// session's version wins on them, in `local` and in `base`, so the page sent next is not built
-/// on content an undo has just put back. Returns the numbers of the pages whose local change
-/// was dropped.
+/// Parts changed both in this window and in the session since the last sync (`base`): the
+/// session's version wins on them, in `local` and in `base`, so what is sent next is not built
+/// on content an undo has just put back. A part is a page (also one removed on either side),
+/// the project properties, one device, the comments of one page, or one panel; a change to a
+/// part the session did not touch is kept and sent as usual. Returns the parts whose local
+/// change was dropped, named for the person.
 pub fn yield_to_session(local: &mut Project, base: &mut Project, auth: &Project) -> Vec<String> {
     let mut dropped = Vec::new();
-    for p in &mut local.pages {
-        let (Some(b), Some(a)) = (base.page_mut(&p.id), auth.page(&p.id)) else {
+
+    if local.meta != base.meta && auth.meta != base.meta {
+        dropped.push("the project properties".to_owned());
+        local.meta = auth.meta.clone();
+        base.meta = auth.meta.clone();
+    }
+
+    // Pages, by id, including one this window removed or the session removed.
+    let ids: Vec<String> = base.pages.iter().map(|p| p.id.clone()).collect();
+    for id in ids {
+        let Some(pos) = base.pages.iter().position(|p| p.id == id) else {
             continue;
         };
-        if !same_content(p, b) && !same_content(a, b) {
-            dropped.push(p.number.clone());
-            *p = a.clone();
-            *b = a.clone();
+        let b = &base.pages[pos];
+        let a = auth.page(&id);
+        let l = local.page(&id);
+        let differs = |x: Option<&Page>| x.is_none_or(|x| !same_content(x, b));
+        if !differs(a) || !differs(l) {
+            continue;
+        }
+        dropped.push(format!("page {}", b.number));
+        match a {
+            Some(a) => {
+                match local.page_mut(&id) {
+                    Some(p) => *p = a.clone(),
+                    None => {
+                        let at = pos.min(local.pages.len());
+                        local.pages.insert(at, a.clone());
+                    }
+                }
+                base.pages[pos] = a.clone();
+            }
+            None => {
+                local.pages.retain(|p| p.id != id);
+                base.pages.remove(pos);
+            }
+        }
+    }
+
+    // Devices, by tag.
+    let tags: std::collections::BTreeSet<_> = base.devices.keys().chain(auth.devices.keys()).cloned().collect();
+    for tag in tags {
+        let b = base.devices.get(&tag);
+        let a = auth.devices.get(&tag);
+        if a == b || local.devices.get(&tag) == b {
+            continue;
+        }
+        dropped.push(format!("device {tag}"));
+        match a.cloned() {
+            Some(d) => {
+                local.devices.insert(tag.clone(), d.clone());
+                base.devices.insert(tag, d);
+            }
+            None => {
+                local.devices.remove(&tag);
+                base.devices.remove(&tag);
+            }
+        }
+    }
+
+    // Comments, by page.
+    let pages: std::collections::BTreeSet<String> = base
+        .comments
+        .iter()
+        .chain(&auth.comments)
+        .map(|c| c.page.clone())
+        .collect();
+    for page in pages {
+        let of = |p: &Project| {
+            p.comments
+                .iter()
+                .filter(|c| c.page == page)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = (of(auth), of(base));
+        if a == b || of(local) == b {
+            continue;
+        }
+        dropped.push(format!("the comments on page {}", number_of(auth, &page)));
+        for p in [&mut *local, &mut *base] {
+            p.comments.retain(|c| c.page != page);
+            p.comments.extend(a.iter().cloned());
+        }
+    }
+
+    // Panels, by id.
+    let ids: std::collections::BTreeSet<String> =
+        base.panels.iter().chain(&auth.panels).map(|p| p.id.clone()).collect();
+    for id in ids {
+        let find = |p: &Project| p.panels.iter().find(|x| x.id == id).cloned();
+        let (a, b) = (find(auth), find(base));
+        if a == b || find(local) == b {
+            continue;
+        }
+        let name = a.as_ref().or(b.as_ref()).map_or_else(|| id.clone(), |p| p.name.clone());
+        dropped.push(format!("panel {name}"));
+        for p in [&mut *local, &mut *base] {
+            match (&a, p.panels.iter().position(|x| x.id == id)) {
+                (Some(a), Some(i)) => p.panels[i] = a.clone(),
+                (Some(a), None) => p.panels.push(a.clone()),
+                (None, Some(i)) => {
+                    p.panels.remove(i);
+                }
+                (None, None) => {}
+            }
         }
     }
     dropped
+}
+
+/// A page's number for a message, or its id when the page is gone.
+fn number_of(p: &Project, page: &str) -> String {
+    p.page(page).map_or_else(|| page.to_owned(), |p| p.number.clone())
 }
 
 /// Make `local` the session's project `auth`, changing only what differs. The symbol lock stays
@@ -559,6 +664,11 @@ impl Share {
             .is_some_and(|t| t.is_some())
     }
 
+    /// Whether this window hosts the session.
+    pub fn is_host(&self) -> bool {
+        matches!(self.role, Some(Role::Host(_)))
+    }
+
     /// Whether Redo in the session has an undo of this person's to take back.
     pub fn can_redo(&self) -> bool {
         self.role
@@ -762,7 +872,7 @@ impl Share {
             let lost = yield_to_session(&mut open.project, base, auth);
             if !lost.is_empty() {
                 self.notes.push(format!(
-                    "Your change on page {} was not kept: the undo changed that page at the same time.",
+                    "Your change to {} was not kept: the session changed it while your undo was on its way.",
                     lost.join(", ")
                 ));
             }
