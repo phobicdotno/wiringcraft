@@ -35,7 +35,7 @@ use std::io::Read;
 
 use rusqlite::{Connection, OptionalExtension};
 use wc_core::connectivity::{PinRef, nets_linked};
-use wc_core::geom::{Point, Shape};
+use wc_core::geom::{Point, Rotation, Shape};
 use wc_core::symbol::{Pin, PinDir, SymbolRole};
 use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Symbol, Wire, WireSpec};
 
@@ -1418,33 +1418,65 @@ pub fn parse_symbol_map(text: &str) -> std::result::Result<BTreeMap<String, Stri
     Ok(out)
 }
 
-/// The library symbol to draw for a source block, with its pins in the order of the block's
-/// points, when one fits: the same kind (a terminal for a terminal, an interruption for an
-/// arrow), as many pins, each pin named like a point and within [`JOIN`] of it. `pins` are the
-/// points relative to the symbol's origin.
+/// How a library symbol is turned to fit a block: tried in this order, so a symbol that fits
+/// unturned is placed unturned.
+const ORIENTATIONS: [(Rotation, bool); 8] = [
+    (Rotation::R0, false),
+    (Rotation::R90, false),
+    (Rotation::R180, false),
+    (Rotation::R270, false),
+    (Rotation::R0, true),
+    (Rotation::R90, true),
+    (Rotation::R180, true),
+    (Rotation::R270, true),
+];
+
+/// A library symbol that fits a block: the symbol, its pins in the order of the block's points,
+/// and how it is turned and mirrored on the page.
+struct LibraryFit<'a> {
+    symbol: &'a Symbol,
+    pins: Vec<Pin>,
+    rotation: Rotation,
+    mirror: bool,
+}
+
+/// The library symbol to draw for a source block, when one fits: the same kind (a terminal for a
+/// terminal, an interruption for an arrow), as many pins, each pin named like a point and within
+/// [`JOIN`] of it once the symbol is turned by a quarter step and maybe mirrored (blocks drawn
+/// turned, as in horizontal circuits). `pins` are the points relative to the symbol's origin.
 fn library_fit<'a>(
     choice: &'a SymbolChoice,
     block: &str,
     role: SymbolRole,
     pins: &[(String, Point)],
-) -> Option<(&'a Symbol, Vec<Pin>)> {
-    let fits = |sym: &Symbol| -> Option<Vec<Pin>> {
-        let kind_ok = match role {
-            SymbolRole::Terminal | SymbolRole::Interruption => sym.role == role,
-            _ => !matches!(sym.role, SymbolRole::Terminal | SymbolRole::Interruption),
-        };
-        if !kind_ok || sym.pins.len() != pins.len() {
-            return None;
-        }
+) -> Option<LibraryFit<'a>> {
+    let fits_as = |sym: &Symbol, rotation: Rotation, mirror: bool| -> Option<Vec<Pin>> {
         let mut out: Vec<Pin> = Vec::with_capacity(pins.len());
         for (name, at) in pins {
             let pin = sym.pins.iter().find(|q| &q.name == name)?;
-            if out.iter().any(|q| q.name == pin.name) || dist(pin.at, *at) > JOIN {
+            if out.iter().any(|q| q.name == pin.name) || dist(pin.at.transform(rotation, mirror), *at) > JOIN {
                 return None;
             }
             out.push(pin.clone());
         }
         Some(out)
+    };
+    let fits = |symbol: &'a Symbol| -> Option<LibraryFit<'a>> {
+        let kind_ok = match role {
+            SymbolRole::Terminal | SymbolRole::Interruption => symbol.role == role,
+            _ => !matches!(symbol.role, SymbolRole::Terminal | SymbolRole::Interruption),
+        };
+        if !kind_ok || symbol.pins.len() != pins.len() {
+            return None;
+        }
+        ORIENTATIONS.iter().find_map(|&(rotation, mirror)| {
+            fits_as(symbol, rotation, mirror).map(|pins| LibraryFit {
+                symbol,
+                pins,
+                rotation,
+                mirror,
+            })
+        })
     };
     let mapped = choice.by_block.get(block).or_else(|| {
         choice
@@ -1455,8 +1487,7 @@ fn library_fit<'a>(
     });
     if let Some(id) = mapped {
         // A block the user mapped is never matched to anything else.
-        let sym = choice.library.get(id)?;
-        return fits(sym).map(|p| (sym, p));
+        return fits(choice.library.get(id)?);
     }
     let mut names: Vec<&str> = pins.iter().map(|(n, _)| n.as_str()).collect();
     names.sort_unstable();
@@ -1466,8 +1497,7 @@ fn library_fit<'a>(
         if want != names {
             return None;
         }
-        let sym = choice.library.get(*id)?;
-        fits(sym).map(|p| (sym, p))
+        fits(choice.library.get(*id)?)
     })
 }
 
@@ -1861,11 +1891,14 @@ pub fn build_with(
             let matched = library_fit(choice, &s.block, role, &local);
             let from_library = matched.is_some();
             let (graphics, out_pins) = match &matched {
-                Some((_, lib_pins)) => (Vec::new(), lib_pins.clone()),
+                Some(fit) => (Vec::new(), fit.pins.clone()),
                 None => box_symbol(&s.block, origin, s.corner.map(flip), &pins),
             };
             let key = format!("{}|{:?}|{:?}|{:?}", s.block, role, graphics, out_pins);
-            let sym_id = if let Some((sym, _)) = matched {
+            let (rotation, mirror) = matched
+                .as_ref()
+                .map_or((Rotation::R0, false), |f| (f.rotation, f.mirror));
+            let sym_id = if let Some(LibraryFit { symbol: sym, .. }) = matched {
                 library_symbols += 1;
                 if !built.symbols.iter().any(|have| have.id == sym.id) {
                     built.symbols.push(sym.clone());
@@ -1951,8 +1984,8 @@ pub fn build_with(
                 id: item,
                 symbol: sym_id,
                 at: origin,
-                rotation: Default::default(),
-                mirror: false,
+                rotation,
+                mirror,
                 tag,
             });
         }

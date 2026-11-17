@@ -1960,3 +1960,109 @@ fn the_first_cover_page_becomes_the_projects_cover_page() {
     assert!(pages.note.contains("1 further cover page"), "{}", pages.note);
     assert!(pages.note.contains("1 report"), "{}", pages.note);
 }
+
+/// The sample fuse's block as a library symbol drawn the way the block is defined (left to
+/// right, before the page turns it by 90 degrees), with the import's names for its points.
+fn lib_fuse_as_defined() -> Symbol {
+    let sw = read(&sample()).unwrap();
+    let (built, _, _) = build_with(&sw, None, &SymbolChoice::default());
+    let f1 = page(&built, "01").symbols.iter().find(|s| s.id == "s2").unwrap();
+    let boxed = built.symbols.iter().find(|s| s.id == f1.symbol).unwrap();
+    let mut fuse = lib_coil("my.fuse", 5.0);
+    fuse.name = "Fuse".into();
+    fuse.letter_code = "F".into();
+    // The block's points on the page, turned back a quarter (270 degrees clockwise).
+    fuse.pins = boxed
+        .pins
+        .iter()
+        .map(|p| Pin {
+            at: p.at.transform(Rotation::R270, false),
+            ..p.clone()
+        })
+        .collect();
+    assert!(
+        fuse.pins.iter().all(|p| p.at.y.abs() < 1e-6),
+        "drawn left to right: {:?}",
+        fuse.pins
+    );
+    fuse
+}
+
+#[test]
+fn a_turned_block_fits_the_library_symbol_turned_the_same_way() {
+    let sw = read(&sample()).unwrap();
+    let fuse = lib_fuse_as_defined();
+    let (built, _, report) = build_with(&sw, None, &choice(std::slice::from_ref(&fuse), &[("Fuse", "my.fuse")]));
+    let pg = page(&built, "01");
+    let f1 = pg.symbols.iter().find(|s| s.id == "s2").unwrap();
+    assert_eq!(f1.symbol, "my.fuse", "the library fuse fits the block turned");
+    assert_eq!((f1.rotation, f1.mirror), (Rotation::R90, false));
+    assert_eq!(count(&report, "library symbols").imported, 1);
+    // The wire from F1's upper point still ends on the pin the source drew it to.
+    let top = fuse
+        .pins
+        .iter()
+        .min_by(|a, b| {
+            let (a, b) = (
+                a.at.transform(Rotation::R90, false),
+                b.at.transform(Rotation::R90, false),
+            );
+            a.y.total_cmp(&b.y)
+        })
+        .unwrap()
+        .name
+        .clone();
+    let ends_on_top = pg.wires.iter().any(|w| {
+        [&w.from, &w.to]
+            .iter()
+            .any(|e| matches!(e, Endpoint::Pin { item, pin } if item == "s2" && *pin == top))
+    });
+    assert!(ends_on_top, "{:?}", pg.wires);
+}
+
+#[test]
+fn a_block_that_fits_unturned_stays_unturned() {
+    let sw = read(&sample()).unwrap();
+    let (built, _, _) = build_with(&sw, None, &choice(&[lib_coil("wc.coil", 5.0)], &[]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert_eq!(k1.symbol, "wc.coil");
+    assert_eq!((k1.rotation, k1.mirror), (Rotation::R0, false));
+}
+
+#[test]
+fn a_turned_coil_fits_a_quarter_turned_library_coil() {
+    let c = sample();
+    // K1 drawn lying down: A1 5 mm to the left of the origin, A2 5 mm to the right.
+    c.execute_batch(
+        "UPDATE tew_symbolpt SET spt_dx = -5, spt_dy = 0 WHERE spt_sym_id = 1 AND spt_no = 0;
+         UPDATE tew_symbolpt SET spt_dx = 5, spt_dy = 0 WHERE spt_sym_id = 1 AND spt_no = 1;",
+    )
+    .unwrap();
+    let (built, _, _) = build_with(&read(&c).unwrap(), None, &choice(&[lib_coil("wc.coil", 5.0)], &[]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert_eq!(k1.symbol, "wc.coil");
+    // A1 at (0, -5) turned 270 degrees clockwise lands at (-5, 0).
+    assert_eq!((k1.rotation, k1.mirror), (Rotation::R270, false));
+}
+
+#[test]
+fn a_mirrored_block_fits_the_library_symbol_mirrored() {
+    let c = sample();
+    // A third point X on the coil, 3 mm right of A1: only the mirrored library coil, whose X is
+    // 3 mm left of A1, fits.
+    c.execute_batch(
+        "INSERT INTO tew_symbolpt VALUES (1, 0, 2, 3, 5);
+         INSERT INTO tew_componentterminal VALUES (50, 2, 'X');",
+    )
+    .unwrap();
+    let mut coil = lib_coil("my.coil", 5.0);
+    coil.pins.push(Pin {
+        name: "X".into(),
+        at: Point::new(-3.0, -5.0),
+        dir: PinDir::Up,
+    });
+    let (built, _, _) = build_with(&read(&c).unwrap(), None, &choice(&[coil], &[("Coil", "my.coil")]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert_eq!(k1.symbol, "my.coil");
+    assert_eq!((k1.rotation, k1.mirror), (Rotation::R0, true));
+}
