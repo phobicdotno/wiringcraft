@@ -34,6 +34,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 LicenseFile={#SourceDir}\LICENSE-MIT
 UninstallDisplayIcon={app}\wiringcraft-app.exe
 WizardStyle=modern
+; The setup program's own icon (the installed programs carry theirs, see icon_build.rs).
+SetupIconFile={#SourceDir}\wiringcraft.ico
 
 [Files]
 Source: "{#SourceDir}\wiringcraft-app.exe"; DestDir: "{app}"; Flags: ignoreversion

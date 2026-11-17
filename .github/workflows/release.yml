@@ -76,6 +76,7 @@ jobs:
           cp target/release/wiringcraft.exe target/release/wiringcraft-app.exe stage/
           cp README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md stage/
           cp -r library stage/
+          cp assets/icon/wiringcraft.ico stage/
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -123,6 +124,11 @@ jobs:
           install -Dm755 target/release/wiringcraft "$root/usr/bin/wiringcraft"
           install -Dm755 target/release/wiringcraft-app "$root/usr/bin/wiringcraft-app"
           install -Dm644 packaging/linux/wiringcraft.desktop "$root/usr/share/applications/wiringcraft.desktop"
+          # The app icon in the hicolor theme, every size the desktop asks for.
+          for n in 16 24 32 48 64 128 256 512; do
+            install -Dm644 "assets/icon/wiringcraft-$n.png" "$root/usr/share/icons/hicolor/${n}x${n}/apps/wiringcraft.png"
+          done
+          install -Dm644 assets/icon/wiringcraft.svg "$root/usr/share/icons/hicolor/scalable/apps/wiringcraft.svg"
           for f in README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md; do
             install -Dm644 "$f" "$root/usr/share/doc/wiringcraft/$f"
           done
@@ -152,6 +158,9 @@ jobs:
           wiringcraft --version
           test -x /usr/bin/wiringcraft-app
           test -f /usr/share/applications/wiringcraft.desktop
+          grep -qx 'Icon=wiringcraft' /usr/share/applications/wiringcraft.desktop
+          test -f /usr/share/icons/hicolor/256x256/apps/wiringcraft.png
+          test -f /usr/share/icons/hicolor/scalable/apps/wiringcraft.svg
           test -d /usr/share/wiringcraft/library/symbols
           sudo apt-get remove -y wiringcraft
           # Not `command -v`: the shell remembers where it found a program it already ran.
@@ -178,6 +187,7 @@ jobs:
           done
           sed "s/@VERSION@/$v/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
           cp README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md "$app/Contents/Resources/"
+          cp assets/icon/wiringcraft.icns "$app/Contents/Resources/"
           cp -R library "$app/Contents/Resources/"
           # Ad-hoc signature only (no certificate yet): the app starts after the user allows it.
           codesign --force --deep --sign - "$app"
@@ -204,6 +214,8 @@ jobs:
           bin="$dest/WiringCraft.app/Contents/MacOS"
           "$bin/wiringcraft" --version
           test -d "$dest/WiringCraft.app/Contents/Resources/library/symbols"
+          test -f "$dest/WiringCraft.app/Contents/Resources/wiringcraft.icns"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$dest/WiringCraft.app/Contents/Info.plist" | grep -qx wiringcraft
           lipo -archs "$bin/wiringcraft-app" | grep -q arm64
           lipo -archs "$bin/wiringcraft-app" | grep -q x86_64
           codesign --verify --deep "$dest/WiringCraft.app"
