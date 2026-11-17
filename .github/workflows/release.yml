@@ -75,6 +75,7 @@ jobs:
           mkdir -p stage
           cp target/release/wiringcraft.exe target/release/wiringcraft-app.exe stage/
           cp README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md stage/
+          cp -r library stage/
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -94,6 +95,11 @@ jobs:
           Start-Process $setup.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
           $dir = "$env:LOCALAPPDATA\Programs\WiringCraft"
           if (-not (Test-Path "$dir\wiringcraft-app.exe")) { throw "the app was not installed" }
+          if (-not (Test-Path "$dir\library\symbols")) { throw "the starter library was not installed" }
+          # The C runtime is linked in (.cargo/config.toml), so a clean Windows needs no VC++ redistributable.
+          foreach ($exe in 'wiringcraft.exe', 'wiringcraft-app.exe') {
+            if ([IO.File]::ReadAllText("$dir\$exe", [Text.Encoding]::ASCII) -match 'VCRUNTIME140') { throw "$exe needs VCRUNTIME140.dll" }
+          }
           & "$dir\wiringcraft.exe" --version
           if ($LASTEXITCODE -ne 0) { throw "wiringcraft --version failed" }
           $path = (Get-ItemProperty HKCU:\Environment).Path
@@ -120,6 +126,9 @@ jobs:
           for f in README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md; do
             install -Dm644 "$f" "$root/usr/share/doc/wiringcraft/$f"
           done
+          mkdir -p "$root/usr/share/wiringcraft"
+          cp -r library "$root/usr/share/wiringcraft/"
+          chmod -R u=rwX,go=rX "$root/usr/share/wiringcraft"
           mkdir -p "$root/DEBIAN"
           cat > "$root/DEBIAN/control" <<EOF
           Package: wiringcraft
@@ -128,7 +137,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Maintainer: WiringCraft <https://github.com/phobicdotno/wiringcraft>
-          Depends: libc6, libgcc-s1
+          Depends: libc6, libgcc-s1, git
           Recommends: libgl1, libxkbcommon-x11-0, libwayland-client0
           Homepage: https://github.com/phobicdotno/wiringcraft
           Description: Electrical schematics and wiring diagrams
@@ -143,8 +152,10 @@ jobs:
           wiringcraft --version
           test -x /usr/bin/wiringcraft-app
           test -f /usr/share/applications/wiringcraft.desktop
+          test -d /usr/share/wiringcraft/library/symbols
           sudo apt-get remove -y wiringcraft
-          if command -v wiringcraft || test -e /usr/bin/wiringcraft-app; then
+          # Not `command -v`: the shell remembers where it found a program it already ran.
+          if test -e /usr/bin/wiringcraft || test -e /usr/bin/wiringcraft-app || test -e /usr/share/wiringcraft; then
             echo "::error::the uninstall left the programs behind"
             exit 1
           fi
@@ -167,6 +178,7 @@ jobs:
           done
           sed "s/@VERSION@/$v/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
           cp README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md "$app/Contents/Resources/"
+          cp -R library "$app/Contents/Resources/"
           # Ad-hoc signature only (no certificate yet): the app starts after the user allows it.
           codesign --force --deep --sign - "$app"
           ln -s /Applications stage/Applications
@@ -183,6 +195,7 @@ jobs:
           hdiutil detach "$mnt"
           bin="$dest/WiringCraft.app/Contents/MacOS"
           "$bin/wiringcraft" --version
+          test -d "$dest/WiringCraft.app/Contents/Resources/library/symbols"
           lipo -archs "$bin/wiringcraft-app" | grep -q arm64
           lipo -archs "$bin/wiringcraft-app" | grep -q x86_64
           codesign --verify --deep "$dest/WiringCraft.app"
@@ -200,7 +213,7 @@ jobs:
   release:
     name: Draft release
     needs: package
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write

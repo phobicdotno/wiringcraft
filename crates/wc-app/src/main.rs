@@ -1280,8 +1280,14 @@ fn size_label(s: PageSize) -> &'static str {
 /// The starter symbol library: `library/` beside the executable or in the source tree.
 fn starter_library() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
+    let dir = exe.as_ref().and_then(|e| e.parent());
+    // Next to the program (Windows install, download folder), the Linux package layout
+    // (/usr/bin -> /usr/share/wiringcraft), the macOS app bundle (Contents/MacOS ->
+    // Contents/Resources), then the source checkout this was built from.
     let candidates = [
-        exe.as_ref().and_then(|e| e.parent()).map(|d| d.join("library")),
+        dir.map(|d| d.join("library")),
+        dir.map(|d| d.join("../share/wiringcraft/library")),
+        dir.map(|d| d.join("../Resources/library")),
         Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library")),
     ];
     candidates

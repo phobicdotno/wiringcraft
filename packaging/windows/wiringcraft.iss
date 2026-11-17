@@ -42,6 +42,8 @@ Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\DISCLAIMER.md"; DestDir: "{app}"; Flags: ignoreversion
+; The starter symbols and parts; the app looks for them next to itself.
+Source: "{#SourceDir}\library\*"; DestDir: "{app}\library"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\WiringCraft"; Filename: "{app}\wiringcraft-app.exe"

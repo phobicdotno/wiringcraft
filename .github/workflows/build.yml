@@ -47,6 +47,7 @@ jobs:
           mkdir -p "$d"
           cp "target/release/wiringcraft${{ matrix.exe }}" "target/release/wiringcraft-app${{ matrix.exe }}" "$d/"
           cp README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md "$d/"
+          cp -r library "$d/"
           "$d/wiringcraft${{ matrix.exe }}" --version
           if [ -z "${{ matrix.exe }}" ]; then
             tar -czf "$d.tar.gz" "$d"
