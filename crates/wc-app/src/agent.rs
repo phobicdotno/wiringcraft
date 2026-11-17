@@ -1302,6 +1302,8 @@ impl App {
                 // In a session the host takes back only this person's own change; swapping the
                 // whole project here would take back other people's work too.
                 if self.share.active() {
+                    // Changes made earlier in this answer go into the session's history first.
+                    self.sync_session_now(false);
                     let can = if redo {
                         self.share.can_redo()
                     } else {
@@ -1310,11 +1312,7 @@ impl App {
                     if !can {
                         return Ok("Nothing to undo or redo.".into());
                     }
-                    if redo {
-                        self.share.redo();
-                    } else {
-                        self.share.undo();
-                    }
+                    if redo { self.share.redo() } else { self.share.undo() }?;
                     self.ed.selection.clear();
                     return Ok("Sent to the session; it shows with the next sync.".into());
                 }
@@ -2266,6 +2264,20 @@ mod tests {
         call(&mut a, "undo", json!({"redo": true})).unwrap();
         a.share.frame(a.open.as_mut(), None, false);
         assert!(a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        // A change the assistant made earlier in the same answer (no frame in between) is the
+        // one its undo takes back.
+        let k8 = wc_core::DeviceTag::parse("-K8").unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.devices.insert(k8.clone(), wc_core::Device::default());
+        call(&mut a, "undo", json!({})).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        let devices = &a.open.as_ref().unwrap().project.devices;
+        assert!(!devices.contains_key(&k8) && devices.contains_key(&tag));
+        // The host's refusal comes back to the caller.
+        call(&mut a, "undo", json!({"redo": true})).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(a.share.redo().is_err_and(|e| e.starts_with("Nothing was taken back")));
         a.share.stop();
     }
 

@@ -214,6 +214,17 @@ impl App {
         let busy = ctx.input(|i| i.pointer.any_down())
             || matches!(self.dialog, Some(Dialog::Cover { .. }))
             || self.assistant.command_running();
+        self.sync_session_now(busy);
+        // Others' changes arrive without any input here.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// The work of `sync_session`, also used by the assistant's undo so the changes it made
+    /// earlier in the same answer are in the session's history first.
+    fn sync_session_now(&mut self, busy: bool) {
+        if !self.share.active() {
+            return;
+        }
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
@@ -260,8 +271,6 @@ impl App {
             applog::info(&format!("shared session: {note}"));
             self.ed.message = note;
         }
-        // Others' changes arrive without any input here.
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     fn new(cc: &eframe::CreationContext<'_>, dir: Option<PathBuf>) -> Self {
@@ -435,11 +444,12 @@ impl App {
             // Undoing in a shared session takes back only this person's own change: the whole
             // project is not swapped, so other people's work stays.
             Action::Undo | Action::Redo if self.share.active() => {
-                if a == Action::Undo {
-                    self.share.undo();
+                // A refusal is in the session's notes, which the status line shows.
+                let _ = if a == Action::Undo {
+                    self.share.undo()
                 } else {
-                    self.share.redo();
-                }
+                    self.share.redo()
+                };
                 self.ed.selection.clear();
                 return;
             }

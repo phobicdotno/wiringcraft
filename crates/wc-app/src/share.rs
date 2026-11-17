@@ -387,7 +387,9 @@ impl Role {
     }
 
     /// Undo, redo, or take back one change from the list (`Some(id)` with `redo` false).
-    fn take_back(&mut self, redo: bool, change: Option<u64>, notes: &mut Vec<String>) {
+    /// Ask for a change to be taken back. The host answers at once, so its refusal comes back
+    /// here; a guest's request is answered with a later sync.
+    fn take_back(&mut self, redo: bool, change: Option<u64>, notes: &mut Vec<String>) -> Result<(), String> {
         match self {
             Role::Host(h) => {
                 let result = match (redo, change) {
@@ -395,10 +397,12 @@ impl Role {
                     (true, None) => h.host.redo(),
                     (false, None) => h.host.undo(),
                 };
-                if let Err(e) = result {
-                    notes.push(format!("Nothing was taken back: {e}"));
-                }
                 h.hub.flush(&mut h.host);
+                result.map_err(|e| {
+                    let e = format!("Nothing was taken back: {e}");
+                    notes.push(e.clone());
+                    e
+                })
             }
             Role::Guest(j) => {
                 let msg = match (redo, change) {
@@ -406,7 +410,11 @@ impl Role {
                     (true, None) => j.guest.redo(),
                     (false, None) => j.guest.undo(),
                 };
-                send(&j.link, msg, notes);
+                j.link.send(msg).map_err(|_| {
+                    let e = "The connection to the host closed.".to_owned();
+                    notes.push(e.clone());
+                    e
+                })
             }
         }
     }
@@ -532,23 +540,26 @@ impl Share {
     /// Take back this person's own last change in the session. The host puts back only the
     /// parts that change touched, so other people's work stays; the result reaches this
     /// window with the next frame's sync.
-    pub fn undo(&mut self) {
-        if let Some(role) = self.role.as_mut() {
-            role.take_back(false, None, &mut self.notes);
+    pub fn undo(&mut self) -> Result<(), String> {
+        match self.role.as_mut() {
+            Some(role) => role.take_back(false, None, &mut self.notes),
+            None => Err("Not in a shared session.".into()),
         }
     }
 
     /// Take back this person's own last undo in the session.
-    pub fn redo(&mut self) {
-        if let Some(role) = self.role.as_mut() {
-            role.take_back(true, None, &mut self.notes);
+    pub fn redo(&mut self) -> Result<(), String> {
+        match self.role.as_mut() {
+            Some(role) => role.take_back(true, None, &mut self.notes),
+            None => Err("Not in a shared session.".into()),
         }
     }
 
     /// Take back one change from the session's list, also someone else's.
-    pub fn revert(&mut self, change: u64) {
-        if let Some(role) = self.role.as_mut() {
-            role.take_back(false, Some(change), &mut self.notes);
+    pub fn revert(&mut self, change: u64) -> Result<(), String> {
+        match self.role.as_mut() {
+            Some(role) => role.take_back(false, Some(change), &mut self.notes),
+            None => Err("Not in a shared session.".into()),
         }
     }
 
@@ -991,7 +1002,8 @@ impl Share {
                 stop = ui.button(label).clicked();
             });
         if let Some(id) = revert {
-            self.revert(id);
+            // A refusal is in the notes.
+            let _ = self.revert(id);
         }
         if stop {
             self.stop();
