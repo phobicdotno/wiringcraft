@@ -192,3 +192,42 @@ fn a_resolved_merge_conflict_can_be_committed() -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn a_failed_commit_without_an_index_copy_says_so() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let io = |e| wc_core::Error::io("test", e);
+    let write = |text: &str| std::fs::write(dir.join("notes.txt"), text).map_err(io);
+    write("base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    assert!(matches!(git.merge("other")?, MergeOutcome::Conflicts(_)));
+    write("both\n")?;
+    // The unmerged index has no tree to copy, and a hook refuses the commit.
+    let hook = dir.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(dir.join(".git/hooks")).map_err(io)?;
+    std::fs::write(&hook, "#!/bin/sh\necho refused by hook >&2\nexit 1\n").map_err(io)?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).map_err(io)?;
+    let e = git
+        .commit("Merge other")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(e.contains("refused by hook"), "the commit's reason: {e}");
+    assert!(
+        e.contains("could not be put back"),
+        "says the index was not restored: {e}"
+    );
+    assert!(e.contains("no copy of the staged files was taken"), "and why: {e}");
+    Ok(())
+}

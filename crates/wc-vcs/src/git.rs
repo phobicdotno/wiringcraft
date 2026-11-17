@@ -165,18 +165,33 @@ impl Git {
         if let Err(e) = self.run(&args) {
             // Only this call's revert can be in progress here (checked above), so aborting it
             // cannot throw away earlier work.
-            // When the lookup itself fails, try the abort anyway: no other operation was running.
-            if !self.git_path("REVERT_HEAD").is_ok_and(|p| !p.exists())
-                && let Err(abort) = self.run(&["revert", "--abort"])
-            {
-                return Err(Error::Git {
-                    args: format!("revert {commit}"),
-                    message: format!(
-                        "{e}; undoing the failed revert also failed, so the folder is mid-revert: {abort}"
-                    ),
-                });
+            // When the lookup itself fails, try the abort anyway (no other operation was running)
+            // and keep the lookup's reason with the error.
+            let (mid_revert, lookup) = match self.git_path("REVERT_HEAD") {
+                Ok(p) => (p.exists(), None),
+                Err(l) => (true, Some(l)),
+            };
+            let abort = if mid_revert {
+                self.run(&["revert", "--abort"]).err()
+            } else {
+                None
+            };
+            if abort.is_none() && lookup.is_none() {
+                return Err(e);
             }
-            return Err(e);
+            let mut message = e.to_string();
+            if let Some(l) = lookup {
+                message.push_str(&format!("; could not tell whether the revert was left half done: {l}"));
+            }
+            if let Some(a) = abort {
+                message.push_str(&format!(
+                    "; undoing the failed revert also failed, so the folder is mid-revert: {a}"
+                ));
+            }
+            return Err(Error::Git {
+                args: format!("revert {commit}"),
+                message,
+            });
         }
         Ok(self.head())
     }
