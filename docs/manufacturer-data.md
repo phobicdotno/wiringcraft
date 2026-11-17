@@ -15,14 +15,14 @@ From `crates/wc-import`:
 | Format | Module | Notes |
 |---|---|---|
 | ASCII DXF | `dxf` | Symbols and whole drawings. Binary DXF and DWG are **not** read. |
-| KiCad symbol libraries (`.kicad_sym`, KiCad 6+) | `kicad` | Graphics and pins become WiringCraft symbols. |
+| KiCad symbol libraries (`.kicad_sym`, KiCad 6+) | `kicad` | Graphics and pins of the common unit and the first unit (body style 1) become a WiringCraft symbol; later units and alternate body styles are skipped with a warning. |
 | SVG | `svg` | Graphics. |
 | PDF (vector) | `pdf` | Traced drawings. |
 | CSV | `csv` | Parts lists and PLC address lists. |
 | AutomationML (IEC 62714, CAEX XML) | `aml` | Devices, properties, connection points, links. |
 | EPLAN P8 projects (`.elk` + `.edb`) | `eplan` | Projects, not the EDZ macro/part exchange files. |
 | SolidWorks Electrical archives (`.tewzip`) | `swe` | Projects. Content Portal parts also arrive as `.tewzip`; library import is #62. |
-| Plain zip | `archive` | Opens the container and imports the open formats inside. |
+| Plain zip | `archive` | Opens the container and imports PDF, DXF, AutomationML and CSV entries inside. Other entries (including `.kicad_sym`) are listed, not imported. |
 
 Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **DWG**, **STEP**
 (3D), **BMEcat** and **ECLASS** part data, QElectroTech **`.elmt`** elements.
@@ -62,9 +62,12 @@ Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **
 
 ## What this means for WiringCraft
 
-1. **Usable now, with clear terms:** KiCad libraries (open licence, read directly), and any
-   maker's 2D **ASCII DXF** drawings for symbol graphics. DXF from Siemens and similar sites has
-   no connection points, so pins must be added after import.
+1. **Readable now:** KiCad libraries (open licence with clear terms, read directly), and any
+   maker's 2D **ASCII DXF** drawings for symbol graphics. Being able to read a file is not
+   permission to use it: most makers' terms are not stated on the pages checked, and some limit
+   use (Mitsubishi's CAD data is "for design consideration" only), so check each maker's terms
+   before building a library from their files. DXF from Siemens and similar sites has no
+   connection points, so pins must be added after import.
 2. **The biggest pool is EPLAN EDZ.** Almost every industrial maker publishes EPLAN macros, most
    through the EPLAN Data Portal, which needs an EPLAN licence. Many also put EDZ files on their
    own product pages without the portal (Siemens CAx data, Schneider, SEW, Dold, Euchner, Lenze,
