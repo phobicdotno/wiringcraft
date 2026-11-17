@@ -128,8 +128,8 @@ fn read_pages_components_symbols_lines_and_cables() {
     assert_eq!(p.cables[&40].cores.len(), 3);
     assert_eq!(p.wires[&70].cable, Some(40));
     assert_eq!(p.wires[&71].cable, None);
-    // The only warning: K1's second part (see `extra_parts_of_a_component_are_reported`).
-    assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+    // K1's second part is kept now (see `extra_parts_of_a_component_are_kept`): no warnings.
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
 }
 
 #[test]
@@ -294,14 +294,19 @@ fn duplicate_tags_are_made_unique() {
 }
 
 #[test]
-fn extra_parts_of_a_component_are_reported() {
+fn extra_parts_of_a_component_are_kept() {
     let p = read(&sample()).unwrap();
     assert_eq!(p.components[&100].part_number, "RLY-24");
-    assert!(
-        p.warnings.iter().any(|w| w.starts_with("1 extra part(s) left out")),
-        "{:?}",
-        p.warnings
-    );
+    assert_eq!(p.components[&100].extra_parts.len(), 1);
+    assert!(!p.warnings.iter().any(|w| w.contains("left out")), "{:?}", p.warnings);
+    // They reach the device as numbered properties, which `link_parts` turns into accessories.
+    let (built, _, _) = build(&p, None);
+    let (number, maker) = &p.components[&100].extra_parts[0];
+    assert!(built.devices.values().any(|d| {
+        d.properties.get("PartNumber") == Some(&"RLY-24".to_owned())
+            && d.properties.get("PartNumber 2") == Some(number)
+            && (maker.is_empty() || d.properties.get("Manufacturer 2") == Some(maker))
+    }));
 }
 
 #[test]
