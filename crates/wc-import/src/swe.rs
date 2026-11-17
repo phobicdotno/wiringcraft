@@ -370,13 +370,21 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
         })
         .map_err(sql)?;
+    let mut extra_parts = 0;
     for (id, part, maker) in readable(rows, "part", &mut warnings) {
-        if let Some(c) = p.components.get_mut(&id)
-            && c.part_number.is_empty()
-        {
-            c.part_number = part;
-            c.manufacturer = maker;
+        if let Some(c) = p.components.get_mut(&id) {
+            if c.part_number.is_empty() {
+                c.part_number = part;
+                c.manufacturer = maker;
+            } else {
+                extra_parts += 1;
+            }
         }
+    }
+    if extra_parts > 0 {
+        warnings.push(format!(
+            "{extra_parts} extra part(s) left out: a component keeps only its first part"
+        ));
     }
 
     // Cables, their cores, and the wires.
@@ -823,11 +831,12 @@ fn fallback_net(id: i64, taken: &BTreeSet<String>) -> String {
         .unwrap_or(base)
 }
 
-/// Tags made unique: the second `-K1` becomes `-K1_2`.
-fn unique(tag: DeviceTag, taken: &mut BTreeSet<DeviceTag>) -> DeviceTag {
+/// Tags made unique: the second `-K1` becomes `-K1_2`. `renamed` counts the changed ones.
+fn unique(tag: DeviceTag, taken: &mut BTreeSet<DeviceTag>, renamed: &mut usize) -> DeviceTag {
     if taken.insert(tag.clone()) {
         return tag;
     }
+    *renamed += 1;
     for n in 2usize.. {
         let mut t = tag.clone();
         if let Some(last) = t.product.last_mut() {
@@ -843,7 +852,12 @@ fn unique(tag: DeviceTag, taken: &mut BTreeSet<DeviceTag>) -> DeviceTag {
 /// The page numbers: the source's own page labels, with the book number in front when the
 /// project has several books (`2.05`), made unique; or, with `first_page_number`, plain numbers
 /// from there on.
-fn page_numbers(pages: &[&SwePage], books: usize, first_page_number: Option<usize>) -> Vec<String> {
+fn page_numbers(
+    pages: &[&SwePage],
+    books: usize,
+    first_page_number: Option<usize>,
+    renumbered: &mut usize,
+) -> Vec<String> {
     let mut used = BTreeSet::new();
     pages
         .iter()
@@ -866,6 +880,9 @@ fn page_numbers(pages: &[&SwePage], books: usize, first_page_number: Option<usiz
             };
             let mut n = base.clone();
             let mut k = 2;
+            if used.contains(&n) {
+                *renumbered += 1;
+            }
             while !used.insert(n.clone()) {
                 n = format!("{base}-{k}");
                 k += 1;
@@ -915,6 +932,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut tags: BTreeMap<i64, DeviceTag> = BTreeMap::new();
     let mut taken: BTreeSet<DeviceTag> = BTreeSet::new();
     let mut untagged = 0;
+    let mut renamed = 0;
     let mut arrows = 0;
     for c in p.components.values() {
         let tag = if c.kind == COMPONENT_ARROW {
@@ -930,7 +948,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         };
         match tag {
             Some(t) => {
-                tags.insert(c.id, unique(t, &mut taken));
+                tags.insert(c.id, unique(t, &mut taken, &mut renamed));
             }
             None => untagged += 1,
         }
@@ -940,10 +958,15 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     for c in p.cables.values() {
         match device_tag(&c.tag) {
             Some(t) => {
-                cable_tags.insert(c.id, unique(t, &mut taken));
+                cable_tags.insert(c.id, unique(t, &mut taken, &mut renamed));
             }
             None => cables_untagged += 1,
         }
+    }
+    if renamed > 0 {
+        warnings.push(format!(
+            "{renamed} device or cable tag(s) were already taken and got a suffix (-K1 became -K1_2)"
+        ));
     }
 
     // Symbols and lines by page, in one pass each.
@@ -956,7 +979,13 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         lines_of.entry(l.page).or_default().push(l);
     }
 
-    let numbers = page_numbers(&drawn, p.books, first_page_number);
+    let mut renumbered = 0;
+    let numbers = page_numbers(&drawn, p.books, first_page_number, &mut renumbered);
+    if renumbered > 0 {
+        warnings.push(format!(
+            "{renumbered} page number(s) were used twice in the source and got a suffix (5 became 5-2)"
+        ));
+    }
     // Potential names the source uses, so a fallback name never takes one of them.
     let potential_names: BTreeSet<String> = p.lines.iter().filter_map(|l| l.potential.clone()).collect();
     let mut symbol_ids: BTreeMap<String, String> = BTreeMap::new();
@@ -974,6 +1003,9 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut cables_used: BTreeSet<i64> = BTreeSet::new();
     let mut multi_core_lines = 0usize;
     let mut cores_not_shown = 0usize;
+    let mut multi_number_lines = 0usize;
+    let mut numbers_not_shown = 0usize;
+    let mut wires_on_zero_length: BTreeSet<i64> = BTreeSet::new();
 
     for (i, pg) in drawn.iter().enumerate() {
         let syms: Vec<&SweSymbol> = syms_of.remove(&pg.id).unwrap_or_default();
@@ -1152,6 +1184,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             });
             if near(a, b) {
                 zero_length += 1;
+                wires_on_zero_length.extend(l.wires.iter().copied());
                 continue;
             }
             // The line stays: the first net that snaps onto a free pin takes it, and its new
@@ -1233,6 +1266,11 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             });
             // The equipotential's number is the net (potential) name: wires with the same one are
             // connected across gaps and pages. The wire's own tag is its number.
+            let numbers: BTreeSet<&str> = wires.iter().map(|w| w.tag.trim()).filter(|t| !t.is_empty()).collect();
+            if numbers.len() > 1 {
+                multi_number_lines += 1;
+                numbers_not_shown += numbers.len() - 1;
+            }
             let number = wires
                 .iter()
                 .map(|w| w.tag.trim())
@@ -1328,7 +1366,16 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let symbols_total = p.symbols.len();
     let off_page = symbols_total.saturating_sub(symbols_in);
     let lines_off_page = p.lines.len().saturating_sub(lines_in);
-    let wires_missing = p.wires.len().saturating_sub(wires_drawn.len());
+    // A wire left out only because its lines were of zero length is counted as such.
+    let wires_zero_only = wires_on_zero_length
+        .iter()
+        .filter(|w| p.wires.contains_key(w) && !wires_drawn.contains(w))
+        .count();
+    let wires_missing = p
+        .wires
+        .len()
+        .saturating_sub(wires_drawn.len())
+        .saturating_sub(wires_zero_only);
     let note = |parts: Vec<(usize, &str)>| -> String {
         parts
             .into_iter()
@@ -1390,6 +1437,15 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             imported: wires_drawn.len(),
             note: note(vec![
                 (wires_missing, "not on an imported page's line"),
+                (wires_zero_only, "only on lines of zero length"),
+                (
+                    multi_number_lines,
+                    "line(s) carry several wire numbers; their wire shows the first",
+                ),
+                (
+                    numbers_not_shown,
+                    "other wire number(s) on those lines are left off that line's wire",
+                ),
                 (
                     multi_core_lines,
                     "line(s) carry several cable cores; their wire shows the first core only",
