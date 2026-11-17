@@ -887,3 +887,44 @@ fn location_descriptions_survive_blank_english_and_a_late_repeat_and_bad_rows_sa
         "a later repeat fills the description: {got:?}"
     );
 }
+
+#[test]
+fn a_mirrored_symbol_turned_90_degrees_meets_its_line() {
+    let c = sample();
+    // Point (0, 5) turned by 90 degrees is (-5, 0); mirrored in x it is (5, 0), where the line
+    // starts. Scaling first would put it at (-5, 0), away from the line.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (110, 'K9', '-K9', -1);
+         INSERT INTO tew_symbol VALUES (40, 10, 110, 'Coil', 150, 100, 90, -1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (40, 0, 0, 0, 5);
+         INSERT INTO tew_line VALUES (30, 10, 155, 100, 180, 100, NULL);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    let pin = Endpoint::Pin {
+        item: "s40".into(),
+        pin: "1".into(),
+    };
+    assert!(
+        page(&built, "01").wires.iter().any(|w| w.from == pin || w.to == pin),
+        "the line joins the mirrored, turned pin"
+    );
+}
+
+#[test]
+fn a_mirrored_box_turned_90_degrees_has_its_corner_mirrored_too() {
+    let c = sample();
+    // Box 35 by -40 in the symbol's frame: turned (40, 35), mirrored in x (-40, 35).
+    c.execute_batch(
+        "INSERT INTO tew_symbol VALUES (41, 10, NULL, 'Box', 150, 100, 90, -1, 1, 35, -40);
+         INSERT INTO tew_symbolpt VALUES (41, 0, 0, 0, 5);",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let s = p.symbols.iter().find(|s| s.id == 41).unwrap();
+    let corner = s.corner.unwrap();
+    assert!(
+        (corner.x - 110.0).abs() < 1e-9 && (corner.y - 135.0).abs() < 1e-9,
+        "{corner:?}"
+    );
+}
