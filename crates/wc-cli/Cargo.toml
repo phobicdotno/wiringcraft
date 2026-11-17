@@ -20,9 +20,10 @@ wc-vcs.workspace = true
 wc-report.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+# A private, unique folder for archive entries on their way to the single-file importers.
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 # Tests write an EDZ archive.
 sevenz-rust2 = { workspace = true, features = ["compress"] }
 # Tests write a SolidWorks Electrical archive with library databases.

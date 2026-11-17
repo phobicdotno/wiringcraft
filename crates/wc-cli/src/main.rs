@@ -1683,8 +1683,13 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             if entries.is_empty() && csvs.is_empty() {
                 return Ok(());
             }
-            let tmp = std::env::temp_dir().join(format!("wiringcraft-archive-{}", std::process::id()));
-            std::fs::create_dir_all(&tmp).map_err(e)?;
+            // Unique and readable only by this user, so nobody can plant a file or link there;
+            // removed when it goes out of scope, also on an early return.
+            let staging = tempfile::Builder::new()
+                .prefix("wiringcraft-archive-")
+                .tempdir()
+                .map_err(e)?;
+            let tmp = staging.path();
             let mut next = first_page;
             for (i, (name, kind, data)) in entries.into_iter().enumerate() {
                 let ext = match kind {
@@ -1768,7 +1773,6 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     eprintln!("warning: {name}: {err}");
                 }
             }
-            let _ = std::fs::remove_dir_all(&tmp);
         }
         ImportCmd::PageDwg { file, page, scale } => {
             let dxf = dwg_to_dxf(&file)?;
@@ -3078,14 +3082,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        let mut p = load(&dir).unwrap();
-        p.devices.insert(DeviceTag::parse("-K1").unwrap(), Default::default());
-        save(&dir, &p).unwrap();
         use std::io::Write;
         let file = tmp.path().join("vendor.zip");
         {
             let mut z = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
             let opt = zip::write::SimpleFileOptions::default();
+            // The list comes first in the zip; -K1 exists only once the AutomationML entry is in.
             z.start_file("io/plc.csv", opt).unwrap();
             z.write_all(b"Device;Address;Comment\r\n-K1;%I0.0;Start\r\n").unwrap();
             z.start_file("parts.csv", opt).unwrap();
@@ -3093,6 +3095,13 @@ mod tests {
                 .unwrap();
             z.start_file("notes.csv", opt).unwrap();
             z.write_all(b"Name;Value\r\na;1\r\n").unwrap();
+            z.start_file("plant.aml", opt).unwrap();
+            z.write_all(
+                br#"<CAEXFile FileName="plant.aml" SchemaVersion="3.0"><InstanceHierarchy Name="Plant">
+  <InternalElement Name="K1" ID="e1"><ExternalInterface Name="A1" ID="i1"/></InternalElement>
+</InstanceHierarchy></CAEXFile>"#,
+            )
+            .unwrap();
             z.finish().unwrap();
         }
         let lib = tmp.path().join("lib");

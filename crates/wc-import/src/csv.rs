@@ -113,8 +113,10 @@ pub enum CsvKind {
 /// readers accept. A header with both a device and an address column is a PLC list, even when
 /// it also names a type or article; `None` when neither reader would take the file.
 pub fn kind(text: &str) -> Option<CsvKind> {
+    // The same header the readers take: the first record that is not blank, quoted line
+    // breaks and all.
     let first_line = text.lines().next().unwrap_or("");
-    let header = records(first_line, guess_delimiter(first_line)).into_iter().next()?;
+    let header = records(text, guess_delimiter(first_line)).into_iter().next()?;
     let plc: Vec<PlcCol> = header.iter().map(|h| classify_plc(h)).collect();
     if plc.contains(&PlcCol::Tag) && plc.contains(&PlcCol::Address) {
         return Some(CsvKind::PlcAddresses);
@@ -300,6 +302,15 @@ mod tests {
         );
         assert_eq!(kind("Manufacturer,Order number\nABB,1SBL"), Some(CsvKind::Parts));
         assert_eq!(kind("Name,Value\na,1"), None);
+        // A blank first line and a quoted line break in a header name, as the readers take them.
+        assert_eq!(kind("\nOrder number\nA1\n"), Some(CsvKind::Parts));
+        let text = "\"Device\";\"PLC\naddress\"\n-K1;%I0.0";
+        assert_eq!(kind(text), Some(CsvKind::PlcAddresses));
+        assert_eq!(
+            plc_addresses(text).map(|(rows, _)| rows.len()).ok(),
+            Some(1),
+            "the reader agrees"
+        );
         assert_eq!(kind(""), None);
     }
     use super::*;
