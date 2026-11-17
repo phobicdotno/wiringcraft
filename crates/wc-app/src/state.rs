@@ -186,6 +186,9 @@ impl Open {
             symbol_versions: BTreeMap::new(),
             undo_error: None,
         };
+        // Locked symbols no page uses are loaded too, so Undo can put back the version a
+        // library update replaces.
+        me.reload_symbols();
         me.refresh_library();
         Ok(me)
     }
@@ -487,6 +490,40 @@ impl Open {
             }
         }
         Ok(())
+    }
+
+    /// Take the newer library versions of the project's items (only `only`, when given), as
+    /// one undo step. An update that would leave wires on pins a new symbol version no longer
+    /// has is taken back, and the wires are named.
+    pub fn update_library(
+        &mut self,
+        lib: &wc_library::Library,
+        only: Option<&[String]>,
+    ) -> Result<Vec<(ItemKind, String)>, String> {
+        self.checkpoint();
+        let done = wc_library::update(&self.dir, &mut self.project, lib, only).map_err(|e| e.to_string())?;
+        self.reload_symbols();
+        let mut dangling: Vec<String> = done
+            .iter()
+            .filter(|(kind, _)| *kind == ItemKind::Symbol)
+            .filter_map(|(_, id)| Some(dangling_pins(&self.project, id, self.symbols.get(id)?)))
+            .flatten()
+            .collect();
+        if dangling.is_empty() {
+            return Ok(done);
+        }
+        dangling.sort();
+        let wires = dangling.join(", ");
+        if !self.undo() {
+            let why = self.take_undo_error().unwrap_or_default();
+            return Err(format!(
+                "wires end on pins the new versions no longer have ({wires}), and the update could not be taken back: {why}"
+            ));
+        }
+        self.redo.clear();
+        Err(format!(
+            "nothing was updated: wires end on pins the new versions no longer have ({wires}). Move those wires first."
+        ))
     }
 
     /// Why the last Undo or Redo failed, once.
@@ -1241,6 +1278,28 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Wire ends on pins of symbol `id` that `symbol` does not have: `page 3 -K1:13` each.
+pub fn dangling_pins(project: &wc_core::Project, id: &str, symbol: &wc_core::Symbol) -> Vec<String> {
+    let mut out = Vec::new();
+    for page in &project.pages {
+        for w in &page.wires {
+            for end in [&w.from, &w.to] {
+                let wc_core::Endpoint::Pin { item, pin } = end else {
+                    continue;
+                };
+                let Some(placed) = page.symbol(item) else { continue };
+                if placed.symbol == id && symbol.pin(pin).is_none() {
+                    let name = placed.tag.as_ref().map_or_else(|| item.clone(), ToString::to_string);
+                    out.push(format!("page {} {name}:{pin}", page.number));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
@@ -1307,6 +1366,78 @@ pub(crate) mod tests {
         assert_eq!(o.symbols["wc.coil"], new);
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
         assert_eq!(o.project.lock.symbols["wc.coil"].hash, new.hash());
+    }
+
+    /// A library folder named "mine", put ahead of the others, holding `sym`.
+    fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
+        let mine = root.join("mine");
+        std::fs::create_dir_all(mine.join("symbols")).unwrap();
+        std::fs::write(
+            mine.join(format!("symbols/{}.json", sym.id)),
+            serde_json::to_string(sym).unwrap(),
+        )
+        .unwrap();
+        o.project.meta.libraries.insert(
+            0,
+            LibrarySource {
+                name: "mine".into(),
+                kind: "folder".into(),
+                location: mine.display().to_string(),
+                reference: None,
+            },
+        );
+        wc_library::Library::open(&o.dir, &o.project).unwrap()
+    }
+
+    #[test]
+    fn undo_after_reopening_puts_back_a_locked_symbol_no_page_uses() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        o.save().unwrap();
+        let old = store::read_vendored_symbol(&o.dir, "wc.coil").unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        let done = o.update_library(&lib, None).unwrap();
+        assert!(done.contains(&(ItemKind::Symbol, "wc.coil".to_owned())));
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
+        assert!(o.undo());
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    #[test]
+    fn a_library_update_that_drops_a_wired_pin_is_taken_back() {
+        let (tmp, mut o) = project();
+        let s1 = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let s2 = o.place(1, "wc.coil", Point::new(60.0, 20.0)).unwrap();
+        let pin = |item: &str| Endpoint::Pin {
+            item: item.to_owned(),
+            pin: "A2".into(),
+        };
+        o.project.pages[1].wires.push(Wire {
+            id: "w1".into(),
+            from: pin(&s1),
+            to: pin(&s2),
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.pins.retain(|p| p.name != "A2");
+        let lib = library_first(&mut o, tmp.path(), &new);
+        let before = o.project.clone();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(err.contains(":A2"), "{err}");
+        assert_eq!(o.project, before, "nothing was updated");
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+        assert!(!o.can_redo(), "no step is left to redo into the broken version");
     }
 
     #[test]

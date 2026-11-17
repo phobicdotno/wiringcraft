@@ -710,12 +710,8 @@ impl App {
                 match wc_library::Library::open(&open.dir, &open.project) {
                     Ok(lib) => {
                         if a == Action::LibraryUpdate {
-                            open.checkpoint();
-                            match wc_library::update(&open.dir, &mut open.project, &lib, None) {
-                                Ok(done) => {
-                                    open.reload_symbols();
-                                    self.ed.message = format!("Updated {} library items.", done.len());
-                                }
+                            match open.update_library(&lib, None) {
+                                Ok(done) => self.ed.message = format!("Updated {} library items.", done.len()),
                                 Err(e) => self.ed.message = format!("Update failed: {e}"),
                             }
                         }
@@ -2317,7 +2313,7 @@ impl App {
         }
         // Wires on a pin the new version no longer has would point at nothing: say which, and
         // leave the project's copy as it is.
-        let dangling = dangling_pins(&open.project, &saved.id, &saved.symbol);
+        let dangling = state::dangling_pins(&open.project, &saved.id, &saved.symbol);
         if !dangling.is_empty() {
             self.ed.message = format!(
                 "Symbol {} saved, but the project keeps its old version: wires end on pins it no longer has ({}). Rename those pins back, or move the wires, then update the library.",
@@ -2336,28 +2332,6 @@ impl App {
             }
         }
     }
-}
-
-/// Wire ends on pins of symbol `id` that `symbol` does not have: `page 3 -K1:13` each.
-fn dangling_pins(project: &wc_core::Project, id: &str, symbol: &wc_core::Symbol) -> Vec<String> {
-    let mut out = Vec::new();
-    for page in &project.pages {
-        for w in &page.wires {
-            for end in [&w.from, &w.to] {
-                let wc_core::Endpoint::Pin { item, pin } = end else {
-                    continue;
-                };
-                let Some(placed) = page.symbol(item) else { continue };
-                if placed.symbol == id && symbol.pin(pin).is_none() {
-                    let name = placed.tag.as_ref().map_or_else(|| item.clone(), ToString::to_string);
-                    out.push(format!("page {} {name}:{pin}", page.number));
-                }
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
 }
 
 /// A note across the top of the canvas: someone else has this page open, so it is read-only.
@@ -2676,8 +2650,8 @@ mod library_tests {
         ed.set_tool(symbol_editor::Tool::Pin);
         ed.pin_name = "A1".into();
         ed.click(wc_core::geom::Point::new(0.0, -5.0));
-        assert_eq!(dangling_pins(&p, "my.coil", &ed.symbol), ["page 3 -K1:A2"]);
-        assert!(dangling_pins(&p, "other", &ed.symbol).is_empty());
+        assert_eq!(state::dangling_pins(&p, "my.coil", &ed.symbol), ["page 3 -K1:A2"]);
+        assert!(state::dangling_pins(&p, "other", &ed.symbol).is_empty());
     }
 
     /// Makes `<root>/<rel>/symbols` and returns `<root>/<rel>` canonicalized.

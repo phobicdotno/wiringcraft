@@ -1259,10 +1259,7 @@ impl App {
                 if need_s(v, "action")? == "update" {
                     let ids = strings(v, "ids");
                     let only = (!ids.is_empty()).then_some(ids.as_slice());
-                    open.checkpoint();
-                    let done =
-                        wc_library::update(&open.dir, &mut open.project, &lib, only).map_err(|e| e.to_string())?;
-                    open.reload_symbols();
+                    let done = open.update_library(&lib, only)?;
                     open.refresh_library();
                     let ids: Vec<String> = done.iter().map(|(_, id)| id.clone()).collect();
                     return Ok(format!("Updated {} item(s): {}", ids.len(), ids.join(", ")));
@@ -2312,6 +2309,20 @@ mod tests {
             "the editor undid"
         );
         assert_eq!(a.open.as_ref().unwrap().project, before, "the project was not touched");
+    }
+
+    #[test]
+    fn the_symbol_editor_closes_when_another_project_is_opened() {
+        let (_tmp, mut a) = app(vec![]);
+        a.run(Action::NewSymbol);
+        assert!(a.symbol_editor.is_some());
+        let (_other_tmp, other) = crate::state::tests::project();
+        let other_before = other.project.clone();
+        a.open = Some(other);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| a.symbol_editor_window(ctx));
+        assert!(a.symbol_editor.is_none(), "it belonged to the first project");
+        assert_eq!(a.open.as_ref().unwrap().project, other_before);
     }
 
     #[test]
