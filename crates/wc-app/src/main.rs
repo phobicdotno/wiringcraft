@@ -2099,11 +2099,18 @@ fn export_wago_marking(open: &Open) -> String {
     let t = wc_report::marking_list(&inputs, &[]);
     let csv = wc_report::to_smartscript_csv(&t);
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, csv)) {
-        Ok(()) => format!(
-            "Exported {} markers to\n{}\n\nIn WAGO smartScript, import it as Excel/CSV data and map the Marker column.",
-            t.rows.len(),
-            path.display()
-        ),
+        Ok(()) => {
+            let mut msg = format!(
+                "Exported {} markers to\n{}\n\nIn WAGO smartScript, import it as Excel/CSV data and map the Marker column.",
+                t.rows.len(),
+                path.display()
+            );
+            for w in wc_report::formula_warnings(&t) {
+                msg.push_str("\n\nWarning: ");
+                msg.push_str(&w);
+            }
+            msg
+        }
         Err(e) => format!("Export failed: {e}"),
     }
 }
