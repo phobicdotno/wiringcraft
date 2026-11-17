@@ -647,3 +647,95 @@ fn leaving_drops_the_connection() -> TestResult {
     assert_eq!(s.host.peers().len(), 1);
     Ok(())
 }
+
+#[test]
+fn a_refused_switch_releases_the_old_page_everywhere() -> TestResult {
+    let mut s = Session::new();
+    let (a_id, a_link, mut a) = s.join("Ola")?;
+    let (b_id, b_link, mut b) = s.join("Kari")?;
+    a_link.send(a.open(Some("p0002")))?;
+    b_link.send(b.open(Some("p0003")))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(a.can_edit("p0002"));
+
+    // Ola asks for Kari's page: refused, and Ola's old page is free on every side.
+    a_link.send(a.open(Some("p0003")))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(
+        a.refusals,
+        vec![Refusal::PageLocked {
+            page: "p0003".into(),
+            by: b_id
+        }]
+    );
+    assert_eq!(s.host.locks().get("p0002"), None);
+    assert_eq!(a.locks, s.host.locks().clone());
+    assert_eq!(b.locks, s.host.locks().clone());
+    assert!(s.host.peers().iter().any(|p| p.id == a_id && p.page.is_none()));
+    b_link.send(b.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(b.can_edit("p0002"), "the old page can be taken");
+    Ok(())
+}
+
+#[test]
+fn a_later_accepted_edit_wins_over_an_earlier_refused_one() -> TestResult {
+    let log = Shared::default();
+    let mut s = Session {
+        host: Host::new(
+            demo(),
+            "Hanna Host",
+            "h@x.no",
+            Box::new(Flaky {
+                fail: 1,
+                log: log.clone(),
+            }),
+        ),
+        hub: Hub::new(),
+        log,
+    };
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+
+    // Two edits sent before any answer; only the first fails to record.
+    let mut page = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place(&mut page, "s1", 10.0);
+    a_link.send(a.edit_page(page.clone()).ok_or("lock")?)?;
+    place(&mut page, "s2", 20.0);
+    a_link.send(a.edit_page(page).ok_or("lock")?)?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    let kept = s.host.project().page("p0002").ok_or("page")?;
+    assert_eq!(kept.symbols.len(), 2, "the second edit holds both symbols");
+    assert_eq!(a.project.as_ref().and_then(|p| p.page("p0002")), Some(kept));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_commit_leaves_the_folder_as_it_was() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let journal = GitJournal::open(dir)?;
+    journal.git().commit("start")?;
+    let hook = dir.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(dir.join(".git/hooks"))?;
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n")?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+
+    let mut host = Host::new(project.clone(), "Hanna Host", "hanna@example.com", Box::new(journal));
+    let added = host.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0009", "9", "Spare"),
+    });
+    assert!(matches!(added, Err(Refusal::NotRecorded { .. })), "{added:?}");
+    assert_eq!(host.project(), &project);
+    assert_eq!(store::load(dir)?, project, "the saved files are put back too");
+    Ok(())
+}

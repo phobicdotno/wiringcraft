@@ -272,20 +272,27 @@ impl Host {
     }
 
     fn do_open(&mut self, by: PeerId, page: Option<String>) -> Result<(), Refusal> {
-        if let Some(id) = &page {
-            if self.project.page(id).is_none() {
-                return Err(Refusal::UnknownPage { page: id.clone() });
-            }
-            if let Some(&holder) = self.locks.get(id)
-                && holder != by
-            {
-                return Err(Refusal::PageLocked {
-                    page: id.clone(),
-                    by: holder,
-                });
-            }
-        }
+        // The page held so far is given up first, even when the new one is refused: the guest
+        // gave it up on its side when it asked, and the lock list sent below says so to all.
+        let held = self.locks.len();
         self.locks.retain(|_, holder| *holder != by);
+        let refusal = match &page {
+            Some(id) if self.project.page(id).is_none() => Some(Refusal::UnknownPage { page: id.clone() }),
+            Some(id) => self.locks.get(id).map(|&holder| Refusal::PageLocked {
+                page: id.clone(),
+                by: holder,
+            }),
+            None => None,
+        };
+        if let Some(refusal) = refusal {
+            if let Some(p) = self.peers.get_mut(&by) {
+                p.page = None;
+            }
+            if self.locks.len() != held {
+                self.broadcast_presence();
+            }
+            return Err(refusal);
+        }
         if let Some(id) = &page {
             self.locks.insert(id.clone(), by);
         }
@@ -317,9 +324,12 @@ impl Host {
             if let Some(p) = self.project.page_mut(&page.id) {
                 *p = before;
             }
+            self.restore_files(by);
             return Err(refusal);
         }
-        self.send_others(by, HostMsg::PageChanged { page, by });
+        // Everyone gets the page, the author too: a refusal of an earlier edit sent the author
+        // the old page, and this puts the accepted one back after it, in order.
+        self.send_others(HOST, HostMsg::PageChanged { page, by });
         Ok(())
     }
 
@@ -332,6 +342,7 @@ impl Host {
         }
         if let Err(refusal) = self.record(by, edit.page().map(str::to_owned), edit.describe()) {
             self.project = before;
+            self.restore_files(by);
             return Err(refusal);
         }
         if let ProjectEdit::RemovePage { id } = &edit
@@ -368,6 +379,20 @@ impl Host {
             return Err(Refusal::NotRecorded { reason });
         }
         Ok(())
+    }
+
+    /// After a change could not be recorded: write the project as it is again, so the files
+    /// do not keep the change that was undone.
+    fn restore_files(&mut self, by: PeerId) {
+        if let Err(e) = self.journal.restore(&self.project) {
+            let change = Change {
+                by,
+                author: self.peers.get(&by).map(Participant::author).unwrap_or_default(),
+                page: None,
+                message: "Put the project folder back after a change that was not recorded".into(),
+            };
+            self.journal_errors.push((change, e.to_string()));
+        }
     }
 
     fn joined_guests(&self) -> impl Iterator<Item = PeerId> + '_ {

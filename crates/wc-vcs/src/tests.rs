@@ -119,3 +119,45 @@ fn revert_refuses_while_another_operation_is_in_progress() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_failed_revert_in_a_linked_worktree_is_undone() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path().join("main");
+    std::fs::create_dir(&dir).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    store::create(&dir, "Demo")?;
+    let git = Git::new(&dir);
+    git.init()?;
+    let write = |d: &std::path::Path, v: &str| {
+        std::fs::write(d.join("note.txt"), v).map_err(|e| wc_core::Error::io("write", e))
+    };
+    write(&dir, "one\n")?;
+    git.commit("one")?;
+    write(&dir, "two\n")?;
+    let two = git.commit("two")?.unwrap_or_default();
+    write(&dir, "three\n")?;
+    git.commit("three")?;
+    let wt = tmp.path().join("wt");
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["worktree", "add", "-q", "-b", "side"])
+        .arg(&wt)
+        .status()
+        .map_err(|e| wc_core::Error::io("git", e))?
+        .success();
+    assert!(ok, "worktree add");
+    let side = Git::new(&wt);
+    // Reverting "two" conflicts with "three": nothing may be left half done.
+    assert!(side.revert(&two).is_err());
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| wc_core::Error::io("git", e))?;
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    let text = std::fs::read_to_string(wt.join("note.txt")).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(text, "three\n");
+    Ok(())
+}

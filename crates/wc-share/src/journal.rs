@@ -22,6 +22,11 @@ pub struct Change {
 /// Where the host records changes. Called once per applied change, right after it was applied.
 pub trait Journal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()>;
+
+    /// Called when `record` failed: put back what it stored, so it holds `project` again.
+    fn restore(&mut self, _project: &Project) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Keeps changes in memory; for tests and for sessions without a project folder.
@@ -66,6 +71,13 @@ impl Journal for GitJournal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()> {
         wc_core::store::save(&self.dir, project)?;
         self.git.commit_as(&change.message, &change.author)?;
+        Ok(())
+    }
+
+    /// Save the project as it was before the change, so the folder does not keep a change
+    /// whose commit failed.
+    fn restore(&mut self, project: &Project) -> Result<()> {
+        wc_core::store::save(&self.dir, project)?;
         Ok(())
     }
 }
