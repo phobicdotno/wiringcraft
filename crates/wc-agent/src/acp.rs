@@ -312,6 +312,8 @@ pub struct Acp {
     pictures: bool,
     /// Notes for the panel, shown at the next poll.
     notices: Vec<String>,
+    /// Claude said or did something in the running turn.
+    turn_output: bool,
     /// The user pressed Stop in this turn: its remaining tool calls are refused.
     stopped: bool,
     /// The agent's name and version.
@@ -329,6 +331,8 @@ pub struct AcpPolled {
     pub changed: bool,
     /// A turn ended (answered, stopped or failed).
     pub finished: bool,
+    /// The turn failed before Claude answered or did anything, so the message can be offered again.
+    pub unanswered: bool,
 }
 
 impl Acp {
@@ -418,6 +422,7 @@ impl Acp {
             queued: None,
             pictures: false,
             notices: Vec::new(),
+            turn_output: false,
             stopped: false,
             agent: String::new(),
             models: Vec::new(),
@@ -456,6 +461,7 @@ impl Acp {
     /// Send a message; it waits while the session is still starting.
     pub fn prompt(&mut self, text: &str, images: &[Image]) {
         self.stopped = false;
+        self.turn_output = false;
         match (&self.session, self.state) {
             (Some(s), State::Ready) => {
                 let (blocks, left_out) = prompt_blocks(text, images, self.pictures);
@@ -518,7 +524,10 @@ impl Acp {
                         } else {
                             format!("Claude Code stopped:\n{tail}")
                         }));
-                        out.finished = self.busy() || out.finished;
+                        if self.busy() {
+                            out.finished = true;
+                            out.unanswered = !self.turn_output;
+                        }
                         self.state = State::Off;
                     }
                 }
@@ -557,6 +566,7 @@ impl Acp {
                 self.send(&json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("{m} is not offered")}}));
             }
             (Some("session/update"), None) => {
+                self.turn_output = true;
                 let u = &msg["params"]["update"];
                 match u["sessionUpdate"].as_str() {
                     Some("agent_message_chunk") => {
@@ -610,6 +620,7 @@ impl Acp {
                     log.push(Entry::Error("Claude Code did not open a session.".into()));
                     self.stop_process();
                     out.finished = true;
+                    out.unanswered = true;
                     return;
                 };
                 self.session = Some(id.to_owned());
@@ -665,6 +676,7 @@ impl Acp {
             Pending::Prompt if !auth => {
                 self.state = State::Ready;
                 out.finished = true;
+                out.unanswered = !self.turn_output;
                 log.push(Entry::Error(format!("Claude Code: {message}")));
             }
             _ => {
@@ -674,6 +686,7 @@ impl Acp {
                     format!("Claude Code could not start a session: {message}")
                 }));
                 out.finished = true;
+                out.unanswered = !self.turn_output;
                 self.stop_process();
             }
         }
@@ -804,6 +817,55 @@ read l
         assert_eq!(acp.agent, "fake 1");
         assert_eq!(acp.models.len(), 2);
         assert!(!acp.busy());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A prompt with a screenshot that the agent refuses comes back as unanswered, so the
+    /// panel can offer the message and its screenshot again.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_picture_prompt_is_unanswered() {
+        let dir = std::env::temp_dir().join(format!("wc-acp-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let script = dir.join("agent.sh");
+        let seen = dir.join("prompt.json");
+        let body = format!(
+            r#"#!/bin/sh
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"image":true}}}}}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"S"}}}}'
+read l; echo "$l" > '{}'; echo '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32603,"message":"overloaded"}}}}'
+read l
+"#,
+            seen.display()
+        );
+        if std::fs::write(&script, body).is_err() {
+            return;
+        }
+        let argv = vec!["sh".to_owned(), script.to_string_lossy().into_owned()];
+        let Ok(mut acp) = Acp::start(&argv, &dir, json!({}), "note", "", Arc::new(|| {})) else {
+            return;
+        };
+        let shot = Image {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        acp.prompt("", &[shot]);
+        let mut log = Vec::new();
+        let mut polled = AcpPolled::default();
+        for _ in 0..400 {
+            polled = acp.poll(&mut log);
+            if polled.finished {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(polled.finished && polled.unanswered, "{log:?}");
+        assert_eq!(log, vec![Entry::Error("Claude Code: overloaded".into())]);
+        let sent: Value = std::fs::read_to_string(&seen)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        assert_eq!(sent["params"]["prompt"][0]["type"], "image");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

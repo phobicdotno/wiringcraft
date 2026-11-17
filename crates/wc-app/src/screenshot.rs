@@ -1,6 +1,10 @@
 //! Screenshots for the assistant: pasted from the clipboard or dropped on the panel as image
 //! files, made small enough to send, and put back on the clipboard so the person can paste one
 //! into an issue form in the browser.
+//!
+//! On Linux the clipboard is reached through X11, so a Wayland desktop needs XWayland for
+//! pictures (GNOME and KDE run it by default); the button then says the clipboard is not
+//! available. Dropping a file works either way.
 
 use std::io::Cursor;
 use std::path::Path;

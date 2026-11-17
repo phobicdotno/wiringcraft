@@ -55,6 +55,7 @@ impl App {
             let extra = a.shared.len().saturating_sub(MAX_WAITING);
             a.shared.drain(..extra);
             a.sent = shots;
+            a.sent_text = text;
         } else {
             self.assistant.input = text;
         }
@@ -83,8 +84,7 @@ impl App {
             Ok(None) => self.assistant_log(Entry::Note(
                 "There is no picture on the clipboard. Take a screenshot (on Windows Win+Shift+S, on a Mac Cmd+Ctrl+Shift+4) and try again.".into(),
             )),
-            Err(e) if !quiet => self.assistant_log(Entry::Error(e)),
-            Err(_) => {}
+            Err(e) => self.assistant_log(Entry::Error(e)),
         }
     }
 
@@ -185,6 +185,9 @@ impl App {
         if let Some(c) = self.assistant.acp.as_mut() {
             let p = c.poll(&mut self.assistant.login_log);
             finished |= p.finished;
+            if p.unanswered {
+                self.assistant.give_back(None);
+            }
         }
         // API key.
         if self.assistant.session.busy() {
@@ -194,14 +197,7 @@ impl App {
             self.assistant.session = session;
             finished |= polled.finished;
             if let Some(text) = self.assistant.session.returned.take() {
-                if self.assistant.input.is_empty() {
-                    self.assistant.input = text;
-                }
-                // The screenshots of a message that could not be sent wait to go again.
-                if self.assistant.waiting.is_empty() {
-                    let sent = std::mem::take(&mut self.assistant.sent);
-                    self.assistant.waiting = sent.into_iter().map(|s| (s, None)).collect();
-                }
+                self.assistant.give_back(Some(text));
             }
         }
         if finished {

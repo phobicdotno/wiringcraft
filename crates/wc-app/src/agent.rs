@@ -83,7 +83,8 @@ pub struct Assistant {
     pub login_log: Vec<wc_agent::Entry>,
     /// Screenshots waiting to go with the next message, with their thumbnails once shown.
     pub waiting: Vec<(Shot, Option<egui::TextureHandle>)>,
-    /// Screenshots sent with the last message, offered again if it could not be sent.
+    /// The last message's words and screenshots, offered again if it could not be sent.
+    pub sent_text: String,
     pub sent: Vec<Shot>,
     /// The latest screenshots of this conversation, for a request the assistant files.
     pub shared: Vec<Shot>,
@@ -108,6 +109,7 @@ impl Assistant {
             acp: None,
             login_log: Vec::new(),
             waiting: Vec::new(),
+            sent_text: String::new(),
             sent: Vec::new(),
             shared: Vec::new(),
             clipboard: screenshot::Clipboard::default(),
@@ -116,6 +118,19 @@ impl Assistant {
 
     pub fn specs(&self) -> &[Value] {
         &self.specs
+    }
+
+    /// The last message was not answered: put its words (unless something new was typed) and
+    /// its screenshots back in the box. Screenshots added since stay, after the given-back ones.
+    pub fn give_back(&mut self, text: Option<String>) {
+        let text = text.unwrap_or_else(|| std::mem::take(&mut self.sent_text));
+        if self.input.trim().is_empty() {
+            self.input = text;
+        }
+        let newer = std::mem::take(&mut self.waiting);
+        self.waiting = std::mem::take(&mut self.sent).into_iter().map(|s| (s, None)).collect();
+        self.waiting.extend(newer);
+        self.waiting.truncate(screenshot::MAX_WAITING);
     }
 
     /// Working on a message, with either backend.
@@ -2263,6 +2278,26 @@ mod tests {
         .unwrap();
         assert!(out.contains("Screenshots box"), "{out}");
         assert_eq!(a.open_url.len(), 3);
+    }
+
+    #[test]
+    fn an_unanswered_message_gets_its_screenshots_back() {
+        let shot = |w| Shot::from_rgba(w, 1, vec![0; w * 4]).unwrap();
+        let mut s = Assistant::with_transport(Arc::new(Script(Mutex::new(Vec::new()))));
+        s.sent_text = "look at this".into();
+        s.sent = vec![shot(1), shot(2)];
+        // A picture dropped while the message was on its way stays, after the given-back ones.
+        s.waiting = vec![(shot(3), None)];
+        s.give_back(None);
+        let widths: Vec<u32> = s.waiting.iter().map(|(x, _)| x.image.width()).collect();
+        assert_eq!(widths, vec![1, 2, 3]);
+        assert_eq!(s.input, "look at this");
+        assert!(s.sent.is_empty());
+        // Words typed since are kept; the given-back words come from the API.
+        s.input = "new words".into();
+        s.give_back(Some("old".into()));
+        assert_eq!(s.input, "new words");
+        assert_eq!(s.waiting.len(), 3);
     }
 
     #[test]
