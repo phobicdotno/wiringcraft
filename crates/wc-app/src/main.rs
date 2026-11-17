@@ -1241,10 +1241,41 @@ impl App {
                         o.set_project_props_live(name, fields);
                         *seen = o.history_count();
                     }
+                    // The logo is its own undo step, taken at once (Cancel leaves it).
+                    if let Some(o) = self.open.as_mut() {
+                        ui.horizontal(|ui| {
+                            ui.label("Logo");
+                            let current = o.project.meta.logo.as_ref().map(|l| l.file.clone());
+                            ui.label(
+                                RichText::new(current.as_deref().unwrap_or("none"))
+                                    .color(theme::Theme::of(ui.ctx()).faint),
+                            );
+                            if ui
+                                .button("Logo...")
+                                .on_hover_text("Pick a PNG or JPEG picture; it is copied into the project")
+                                .clicked()
+                                && let Some(src) = rfd::FileDialog::new()
+                                    .set_title("Project logo")
+                                    .add_filter("Pictures", &["png", "jpg", "jpeg"])
+                                    .pick_file()
+                            {
+                                match o.set_logo_from(&src) {
+                                    Ok(file) => self.ed.message = format!("Logo set to {file}"),
+                                    Err(e) => self.ed.message = e,
+                                }
+                                *seen = o.history_count();
+                            }
+                            if current.is_some() && ui.button("Remove").clicked() {
+                                o.remove_logo();
+                                *seen = o.history_count();
+                            }
+                        });
+                    }
                     ui.label(
                         RichText::new(
                             "Shown on the cover and in the title block of every page as you type. \
-                             Add free text on the cover with the Text tool.",
+                             Add free text on the cover with the Text tool. Drag the logo on the \
+                             cover to move it, or its bottom-right corner to size it.",
                         )
                         .color(theme::Theme::of(ui.ctx()).faint),
                     );
@@ -2142,13 +2173,15 @@ fn export_pdf(open: &Open) -> String {
         symbols: &open.symbols,
         parts: &open.parts,
     };
+    let pictures = wc_pdf::read_pictures(&open.dir, &open.project);
     let options = wc_pdf::Options {
         reports: wc_report::Kind::ALL
             .into_iter()
             .map(|k| wc_report::build(k, &inputs))
             .filter(|t| !t.rows.is_empty())
             .collect(),
-        underlays: wc_pdf::read_underlays(&open.dir, &open.project),
+        underlays: pictures.files,
+        unreadable: pictures.unreadable,
         panels: open.project.panels.clone(),
         ..Default::default()
     };

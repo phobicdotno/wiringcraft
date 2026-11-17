@@ -149,6 +149,9 @@ pub struct Open {
     pub branch: String,
     /// Underlay pictures loaded as textures, by file; `None` when the file cannot be shown.
     pub underlays: BTreeMap<String, Option<egui::TextureHandle>>,
+    /// Why a picture in `underlays` has no texture, by file: missing, unreadable, outside the
+    /// project, or not a picture.
+    pub picture_problems: BTreeMap<String, String>,
     /// The terminal numbering before the change in progress (taken at its checkpoint), so
     /// jumpers can follow their terminals once it is done.
     terminals_before: Option<wc_core::project::TerminalNumbers>,
@@ -195,6 +198,7 @@ impl Open {
             form_step: None,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
+            picture_problems: BTreeMap::new(),
             terminals_before: None,
             held_by_others: BTreeMap::new(),
             symbol_versions: BTreeMap::new(),
@@ -217,30 +221,140 @@ impl Open {
     /// The texture for a page's underlay picture, loaded on first use. Pictures larger than the
     /// graphics card takes are scaled down to fit.
     pub fn underlay_texture(&mut self, ctx: &egui::Context, u: &wc_core::Underlay) -> Option<egui::TextureHandle> {
-        if let Some(t) = self.underlays.get(&u.file) {
+        self.picture_texture(ctx, &u.file)
+    }
+
+    /// The texture for a picture file in the project (an underlay or the logo), loaded on first
+    /// use; `None` when it is missing, outside the project or not a picture, with the reason in
+    /// [`Open::picture_problems`].
+    pub fn picture_texture(&mut self, ctx: &egui::Context, file: &str) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.underlays.get(file) {
             return t.clone();
         }
         let max_side = ctx.input(|i| i.max_texture_side).max(1) as u32;
-        let tex = u
-            .file_is_safe()
-            .then(|| std::fs::read(self.dir.join(&u.file)).ok())
-            .flatten()
-            .and_then(|bytes| image::load_from_memory(&bytes).ok())
-            .map(|img| {
-                if img.width() > max_side || img.height() > max_side {
+        let img = match wc_pdf::read_picture(&self.dir, file) {
+            Ok(Some(bytes)) => image::load_from_memory(&bytes).map_err(|e| format!("not a picture: {e}")),
+            Ok(None) => Err("the file is missing".to_owned()),
+            Err(why) => Err(why),
+        };
+        let tex = match img {
+            Ok(img) => {
+                self.picture_problems.remove(file);
+                let img = if img.width() > max_side || img.height() > max_side {
                     img.resize(max_side, max_side, image::imageops::FilterType::Triangle)
                 } else {
                     img
-                }
-            })
-            .map(|img| {
+                };
                 let rgba = img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
                 let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                ctx.load_texture(format!("underlay:{}", u.file), pixels, egui::TextureOptions::LINEAR)
-            });
-        self.underlays.insert(u.file.clone(), tex.clone());
+                Some(ctx.load_texture(format!("picture:{file}"), pixels, egui::TextureOptions::LINEAR))
+            }
+            Err(why) => {
+                self.picture_problems.insert(file.to_owned(), why);
+                None
+            }
+        };
+        self.underlays.insert(file.to_owned(), tex.clone());
         tex
+    }
+
+    /// Copy the picture at `src` into the project's `pictures` folder and make it the project
+    /// logo, as one undo step. A different file of the same name already there is kept and the
+    /// copy gets a new name, so an undo can still show the old logo. Returns the project path.
+    pub fn set_logo_from(&mut self, src: &Path) -> Result<String, String> {
+        let bytes = std::fs::read(src).map_err(|e| format!("Cannot read {}: {e}", src.display()))?;
+        let ext = match image::guess_format(&bytes) {
+            Ok(image::ImageFormat::Png) => "png",
+            Ok(image::ImageFormat::Jpeg) => "jpg",
+            _ => return Err("The logo must be a PNG or JPEG picture.".into()),
+        };
+        let stem: String = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("logo")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let stem = if stem.trim_matches('_').is_empty() {
+            "logo".to_owned()
+        } else {
+            stem
+        };
+        let folder = self.dir.join(wc_core::Logo::DIR);
+        std::fs::create_dir_all(&folder).map_err(|e| format!("Cannot create {}: {e}", folder.display()))?;
+        // The folder may be a link: the copy must still land inside the project.
+        let real = |p: &Path| {
+            p.canonicalize()
+                .map_err(|e| format!("Cannot find {}: {e}", p.display()))
+        };
+        if !real(&folder)?.starts_with(real(&self.dir)?) {
+            return Err(format!(
+                "{} leads out of the project folder; the logo is not copied there.",
+                folder.display()
+            ));
+        }
+        let mut n = 1;
+        let file = loop {
+            let name = if n == 1 {
+                format!("{stem}.{ext}")
+            } else {
+                format!("{stem}-{n}.{ext}")
+            };
+            let path = folder.join(&name);
+            match std::fs::read(&path) {
+                Ok(have) if have == bytes => break name,
+                Ok(_) => n += 1,
+                // Only a name nobody uses is written, and never over a file made meanwhile.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let made = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes));
+                    match made {
+                        Ok(()) => break name,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                        Err(e) => return Err(format!("Cannot write {}: {e}", path.display())),
+                    }
+                }
+                Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
+            }
+        };
+        let file = format!("{}/{file}", wc_core::Logo::DIR);
+        // A picture shown before under this name may have been another one.
+        self.underlays.remove(&file);
+        let cover = self.project.meta.logo.as_ref().and_then(|l| l.cover);
+        self.checkpoint();
+        self.project.meta.logo = Some(wc_core::Logo {
+            file: file.clone(),
+            cover,
+        });
+        Ok(file)
+    }
+
+    /// Take the logo off the cover and the title blocks, as one undo step. Its file stays in the
+    /// project, so an undo brings it back.
+    pub fn remove_logo(&mut self) {
+        if self.project.meta.logo.is_some() {
+            self.checkpoint();
+            self.project.meta.logo = None;
+        }
+    }
+
+    /// Put the logo's box on the cover page at `min`..`max`. The caller takes the undo
+    /// checkpoint, once for a whole drag.
+    pub fn set_logo_place(&mut self, min: Point, max: Point) {
+        if let Some(logo) = self.project.meta.logo.as_mut() {
+            logo.cover = Some((min, max));
+            self.dirty = true;
+        }
     }
 
     pub fn refresh_library(&mut self) {
@@ -2012,6 +2126,96 @@ pub(crate) mod tests {
 
     fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_logo_is_not_copied_through_a_pictures_link_out_of_the_project() {
+        let (tmp, mut o) = project();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, o.dir.join(wc_core::Logo::DIR)).unwrap();
+        let src = tmp.path().join("logo.png");
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3])))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&src, png).unwrap();
+        let err = o.set_logo_from(&src).unwrap_err();
+        assert!(err.contains("out of the project"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "nothing written outside"
+        );
+        assert!(o.project.meta.logo.is_none());
+    }
+
+    #[test]
+    fn a_logo_that_cannot_be_shown_keeps_the_reason() {
+        let (_tmp, mut o) = project();
+        let ctx = egui::Context::default();
+        assert!(o.picture_texture(&ctx, "pictures/none.png").is_none());
+        assert_eq!(
+            o.picture_problems.get("pictures/none.png").map(String::as_str),
+            Some("the file is missing")
+        );
+        std::fs::create_dir_all(o.dir.join("pictures")).unwrap();
+        std::fs::write(o.dir.join("pictures/bad.png"), "not a picture").unwrap();
+        assert!(o.picture_texture(&ctx, "pictures/bad.png").is_none());
+        assert!(o.picture_problems["pictures/bad.png"].starts_with("not a picture"));
+        assert!(o.picture_texture(&ctx, "../x.png").is_none());
+        assert!(o.picture_problems["../x.png"].contains("not inside the project"));
+    }
+
+    #[test]
+    fn a_picked_logo_is_copied_into_the_project_as_one_undo_step() {
+        let (tmp, mut o) = project();
+        let png = |rgb: [u8; 3]| {
+            let mut out = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3, 2, image::Rgb(rgb)))
+                .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                .unwrap();
+            out
+        };
+        let src = tmp.path().join("Our Logo.png");
+        std::fs::write(&src, png([255, 0, 0])).unwrap();
+        assert_eq!(o.set_logo_from(&src).unwrap(), "pictures/Our_Logo.png");
+        assert_eq!(
+            std::fs::read(o.dir.join("pictures/Our_Logo.png")).unwrap(),
+            png([255, 0, 0])
+        );
+        // The same picture again reuses the file; another one of the same name gets its own.
+        assert_eq!(o.set_logo_from(&src).unwrap(), "pictures/Our_Logo.png");
+        std::fs::write(&src, png([0, 0, 255])).unwrap();
+        assert_eq!(o.set_logo_from(&src).unwrap(), "pictures/Our_Logo-2.png");
+        assert_eq!(
+            std::fs::read(o.dir.join("pictures/Our_Logo.png")).unwrap(),
+            png([255, 0, 0])
+        );
+        // Moving it on the cover is kept when another picture is picked.
+        o.checkpoint();
+        o.set_logo_place(Point::new(10.0, 10.0), Point::new(40.0, 30.0));
+        std::fs::write(&src, png([0, 255, 0])).unwrap();
+        o.set_logo_from(&src).unwrap();
+        let logo = o.project.meta.logo.clone().unwrap();
+        assert_eq!(logo.cover, Some((Point::new(10.0, 10.0), Point::new(40.0, 30.0))));
+        assert!(o.undo());
+        assert_eq!(o.project.meta.logo.as_ref().unwrap().file, "pictures/Our_Logo-2.png");
+        o.remove_logo();
+        assert!(o.project.meta.logo.is_none());
+        assert!(o.undo(), "removing is one step too");
+        assert!(o.project.meta.logo.is_some());
+        // Saved with the project and loaded again.
+        o.save().unwrap();
+        let again = Open::load(&o.dir).unwrap();
+        assert_eq!(again.project.meta.logo, o.project.meta.logo);
+        // Not a picture: refused, nothing changes.
+        let txt = tmp.path().join("logo.txt");
+        std::fs::write(&txt, "hello").unwrap();
+        let before = o.project.meta.logo.clone();
+        assert!(o.set_logo_from(&txt).unwrap_err().contains("PNG or JPEG"));
+        assert_eq!(o.project.meta.logo, before);
     }
 
     #[test]

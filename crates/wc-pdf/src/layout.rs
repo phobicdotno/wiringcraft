@@ -418,18 +418,84 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
         Ink::Thin,
         &mut out,
     );
-    text(
-        (fx[4] + 15.0, mid + 9.5),
-        2.0,
-        Align::Center,
-        "WiringCraft",
-        Ink::Thin,
-        &mut out,
-    );
+    // The project's logo takes this box when it has one (see `title_logo_box`).
+    if project.meta.logo.is_none() {
+        text(
+            (fx[4] + 15.0, mid + 9.5),
+            2.0,
+            Align::Center,
+            "WiringCraft",
+            Ink::Thin,
+            &mut out,
+        );
+    }
     if page.cover {
         cover_marks(project, (x0, y0 + HEADER, x1, ty), date, &mut out);
     }
     out
+}
+
+/// The title block's logo box on `page` (top-left and bottom-right, in millimetres): the
+/// bottom-right field, where pages without a logo show "WiringCraft".
+pub fn title_logo_box(page: &Page) -> (Point, Point) {
+    let (w, h) = page.size.mm();
+    let (x1, y1) = (w - MARGIN, h - MARGIN);
+    let mid = y1 - TITLE_H / 2.0;
+    (Point::new(x1 - 30.0 + 1.0, mid + 1.0), Point::new(x1 - 1.0, y1 - 1.0))
+}
+
+/// Where the cover page shows the logo until the user moves it: centred above the project's
+/// name.
+pub fn cover_logo_default(page: &Page) -> (Point, Point) {
+    let (w, h) = page.size.mm();
+    let (x0, y0, x1, ty) = (MARGIN, MARGIN + HEADER, w - MARGIN, h - MARGIN - TITLE_H);
+    let cx = (x0 + x1) / 2.0;
+    let name_y = y0 + (ty - y0) * 0.2;
+    let top = y0 + 4.0;
+    let bottom = (name_y - 10.0).max(top + 5.0);
+    let half = 45.0_f64.min((x1 - x0) / 2.0 - 5.0);
+    (Point::new(cx - half, top), Point::new(cx + half, bottom))
+}
+
+/// The logo's box on the cover page: where the user put it, or its default place. `None`
+/// when `page` is not the cover or the project has no logo.
+pub fn cover_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> {
+    let logo = project.meta.logo.as_ref()?;
+    if !page.cover {
+        return None;
+    }
+    Some(match logo.cover {
+        Some((a, b)) => (
+            Point::new(a.x.min(b.x), a.y.min(b.y)),
+            Point::new(a.x.max(b.x), a.y.max(b.y)),
+        ),
+        None => cover_logo_default(page),
+    })
+}
+
+/// Every box the project's logo is drawn in on `page`: the title block's, and on the cover
+/// page also its place there. Empty when the project has no logo. The picture is fitted into
+/// each box keeping its proportions ([`fit_picture`]).
+pub fn logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
+    if project.meta.logo.is_none() {
+        return Vec::new();
+    }
+    let mut out = vec![title_logo_box(page)];
+    out.extend(cover_logo_box(project, page));
+    out
+}
+
+/// The largest rectangle with the picture's proportions (`width` by `height` pixels) centred
+/// in the box `min`..`max`.
+pub fn fit_picture((min, max): (Point, Point), (width, height): (u32, u32)) -> (Point, Point) {
+    let (bw, bh) = (max.x - min.x, max.y - min.y);
+    if width == 0 || height == 0 || bw <= 0.0 || bh <= 0.0 {
+        return (min, max);
+    }
+    let scale = (bw / f64::from(width)).min(bh / f64::from(height));
+    let (w, h) = (f64::from(width) * scale, f64::from(height) * scale);
+    let (x, y) = (min.x + (bw - w) / 2.0, min.y + (bh - h) / 2.0);
+    (Point::new(x, y), Point::new(x + w, y + h))
 }
 
 /// The cover page's content inside the drawing area `(x0, y0, x1, y1)`: the project's name
@@ -684,6 +750,7 @@ pub fn draw_page(
         prims: pen.prims,
         layers: pen.layers,
         underlay: None,
+        pictures: Vec::new(),
     }
 }
 
@@ -866,6 +933,7 @@ pub fn draw_table_page(
         prims: pen.prims,
         layers: pen.layers,
         underlay: None,
+        pictures: Vec::new(),
     }
 }
 
@@ -960,5 +1028,6 @@ pub fn draw_panel_page(
         prims: pen.prims,
         layers: pen.layers,
         underlay: None,
+        pictures: Vec::new(),
     }
 }

@@ -1029,6 +1029,7 @@ fn run(cli: Cli) -> Res<()> {
                 .into_iter()
                 .map(|k| wc_report::build(k, &inputs))
                 .collect();
+            let pictures = wc_pdf::read_pictures(dir, &p);
             let (bytes, report) = wc_pdf::export(
                 &p,
                 &symbols,
@@ -1037,7 +1038,8 @@ fn run(cli: Cli) -> Res<()> {
                     date,
                     wire_labels: true,
                     reports: tables,
-                    underlays: wc_pdf::read_underlays(dir, &p),
+                    underlays: pictures.files,
+                    unreadable: pictures.unreadable,
                     panels: p.panels.clone(),
                 },
             );

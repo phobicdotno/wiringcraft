@@ -26,8 +26,8 @@ pub use geom::{Point, Shape};
 pub use lock::{LockEntry, Lockfile};
 pub use part::Part;
 pub use project::{
-    CableCore, Device, DevicePart, Endpoint, Location, Page, PageSize, PlacedSymbol, Project, ProjectMeta, Underlay,
-    Wire, WireSpec,
+    CableCore, Device, DevicePart, Endpoint, Location, Logo, Page, PageSize, PlacedSymbol, Project, ProjectMeta,
+    Underlay, Wire, WireSpec,
 };
 pub use review::{Comment, Reply};
 pub use symbol::{Pin, Symbol};
