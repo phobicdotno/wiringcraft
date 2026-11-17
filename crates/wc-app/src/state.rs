@@ -155,6 +155,9 @@ pub struct Open {
     /// In a shared session, the pages someone else has open (page id to their name). Tools that
     /// work on every page leave these alone; the session would refuse the change otherwise.
     pub held_by_others: BTreeMap<String, String>,
+    /// Every version of a vendored symbol this window has loaded, by content hash, so Undo
+    /// and Redo can put back the version the restored lock names.
+    symbol_versions: BTreeMap<String, Symbol>,
 }
 
 impl Open {
@@ -178,6 +181,7 @@ impl Open {
             underlays: BTreeMap::new(),
             terminals_before: None,
             held_by_others: BTreeMap::new(),
+            symbol_versions: BTreeMap::new(),
         };
         me.refresh_library();
         Ok(me)
@@ -366,6 +370,7 @@ impl Open {
             Some(prev) => {
                 self.forget_terminal_change();
                 self.redo.push(std::mem::replace(&mut self.project, prev));
+                self.sync_symbols();
                 self.dirty = true;
                 self.history += 1;
                 true
@@ -380,11 +385,42 @@ impl Open {
             Some(next) => {
                 self.forget_terminal_change();
                 self.undo.push(std::mem::replace(&mut self.project, next));
+                self.sync_symbols();
                 self.dirty = true;
                 self.history += 1;
                 true
             }
             None => false,
+        }
+    }
+
+    /// Load the vendored symbols again after the library changed them, keeping the versions
+    /// they replace so Undo can bring those back.
+    pub fn reload_symbols(&mut self) {
+        for sym in self.symbols.values() {
+            self.symbol_versions.insert(sym.hash(), sym.clone());
+        }
+        let (syms, _) = store::vendored_symbols(&self.dir, &self.project);
+        self.symbols = syms;
+    }
+
+    /// After Undo or Redo: put back the vendored symbol versions the restored lock names, both
+    /// in memory and in the project folder, so the pages draw what the lock says.
+    fn sync_symbols(&mut self) {
+        for (id, entry) in &self.project.lock.symbols {
+            if self.symbols.get(id).is_some_and(|s| s.hash() == entry.hash) {
+                continue;
+            }
+            let Some(want) = self.symbol_versions.get(&entry.hash).cloned() else {
+                continue;
+            };
+            if let Err(e) = store::write_vendored_symbol(&self.dir, &want) {
+                crate::applog::warn(&format!("Could not put back symbol {id}: {e}"));
+                continue;
+            }
+            if let Some(old) = self.symbols.insert(id.clone(), want) {
+                self.symbol_versions.insert(old.hash(), old);
+            }
         }
     }
 
@@ -1147,6 +1183,31 @@ pub(crate) mod tests {
         store::save(&dir, &p).unwrap();
         let open = Open::load(&dir).unwrap();
         (tmp, open)
+    }
+
+    #[test]
+    fn undo_puts_back_the_symbol_version_a_library_update_replaced() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        assert_eq!(o.symbols["wc.coil"], new);
+
+        assert!(o.undo());
+        assert_eq!(o.symbols["wc.coil"], old, "the cache follows the lock");
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "and the file"
+        );
+        assert!(o.redo());
+        assert_eq!(o.symbols["wc.coil"], new);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
     }
 
     fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

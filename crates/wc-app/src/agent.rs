@@ -1262,8 +1262,7 @@ impl App {
                     open.checkpoint();
                     let done =
                         wc_library::update(&open.dir, &mut open.project, &lib, only).map_err(|e| e.to_string())?;
-                    let (syms, _) = wc_core::store::vendored_symbols(&open.dir, &open.project);
-                    open.symbols = syms;
+                    open.reload_symbols();
                     open.refresh_library();
                     let ids: Vec<String> = done.iter().map(|(_, id)| id.clone()).collect();
                     return Ok(format!("Updated {} item(s): {}", ids.len(), ids.join(", ")));

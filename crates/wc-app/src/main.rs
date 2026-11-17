@@ -715,8 +715,7 @@ impl App {
                             open.checkpoint();
                             match wc_library::update(&open.dir, &mut open.project, &lib, None) {
                                 Ok(done) => {
-                                    let (syms, _) = wc_core::store::vendored_symbols(&open.dir, &open.project);
-                                    open.symbols = syms;
+                                    open.reload_symbols();
                                     self.ed.message = format!("Updated {} library items.", done.len());
                                 }
                                 Err(e) => self.ed.message = format!("Update failed: {e}"),
@@ -2330,16 +2329,17 @@ impl App {
             return;
         }
         open.checkpoint();
-        let result = wc_library::update(
+        // Only the symbol: a part with the same id stays as it is.
+        let result = wc_library::take(
             &open.dir,
             &mut open.project,
             &lib,
-            Some(std::slice::from_ref(&saved.id)),
+            wc_core::lock::ItemKind::Symbol,
+            &saved.id,
         );
         match result {
             Ok(_) => {
-                let (syms, _) = wc_core::store::vendored_symbols(&open.dir, &open.project);
-                open.symbols = syms;
+                open.reload_symbols();
                 open.refresh_library();
                 self.ed.message = format!("Symbol {} saved and updated on the pages that use it.", saved.id);
             }
