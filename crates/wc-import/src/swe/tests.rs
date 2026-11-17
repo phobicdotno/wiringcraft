@@ -1876,8 +1876,10 @@ fn the_projects_latest_revision_and_checker_fill_its_title_block() {
         "
 CREATE TABLE tew_revision (rev_id INTEGER, rev_objectid INTEGER, rev_orderno INTEGER, rev_tag TEXT,
   rev_checkedby TEXT);
--- Object 1 is the book: order number 2 is its latest revision.
-INSERT INTO tew_revision VALUES (2, 1, 2, 'B', 'Bob'), (1, 1, 1, 'A', 'Ann'), (3, 10, 1, 'P1', 'Cid');
+-- Object 1 is the book: order number 2 is its latest revision. Object 77 is neither a page
+-- nor a book (say a page row that could not be read): its later row is not the project's.
+INSERT INTO tew_revision VALUES (2, 1, 2, 'B', 'Bob'), (1, 1, 1, 'A', 'Ann'), (3, 10, 1, 'P1', 'Cid'),
+  (4, 77, 9, 'X', 'Xan');
 ",
     )
     .unwrap();
@@ -1896,6 +1898,7 @@ INSERT INTO tew_revision VALUES (2, 1, 2, 'B', 'Bob'), (1, 1, 1, 'A', 'Ann'), (3
         page(&built, "01").title_block.get("revision").map(String::as_str),
         Some("P1")
     );
+    assert_eq!(p.revision.get("revision").map(String::as_str), Some("B"));
 }
 
 #[test]

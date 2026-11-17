@@ -333,13 +333,17 @@ fn column_named<'a>(columns: &'a [String], names: &[&str]) -> Option<&'a str> {
 /// Each page's title-block fields from its latest revision in `tew_revision`, by page id
 /// (`fil_id`). The table's columns are found by name, not position, since the layout is not
 /// published: the page is the `..._fil_id` column, else an object id column whose value is one
-/// of `pages` (rows for other objects, such as a book, are left out); the latest revision is the
-/// one with the highest order number (else id, else row). A missing table gives nothing; a
-/// table without a page column is reported.
+/// of `pages`; the latest revision is the one with the highest order number (else id, else
+/// row). A missing table gives nothing; a table without a page column is reported.
 ///
-/// With an object id column, the latest row for an object that is not a page (the book or the
-/// project) is the project's own revision: it comes back as the second value.
-pub fn page_revisions(conn: &Connection, pages: &BTreeSet<i64>, warnings: &mut Vec<String>) -> Result<Revisions> {
+/// With an object id column, the latest row for one of `books` is the project's own revision
+/// ([`Revisions::project`]). Rows for any other object are left out.
+pub fn page_revisions(
+    conn: &Connection,
+    pages: &BTreeSet<i64>,
+    books: &BTreeSet<i64>,
+    warnings: &mut Vec<String>,
+) -> Result<Revisions> {
     if !has_table(conn, "tew_revision")? {
         return Ok(Revisions::default());
     }
@@ -399,7 +403,9 @@ pub fn page_revisions(conn: &Connection, pages: &BTreeSet<i64>, warnings: &mut V
     let mut out = Revisions::default();
     for (id, values) in readable(rows, "page revision", warnings) {
         let for_page = pages.contains(&id);
-        if !for_page && !by_object {
+        // Only a book's row is the project's: an id that is neither a page nor a book (a page
+        // row that could not be read, or another object) is left out.
+        if !for_page && !(by_object && books.contains(&id)) {
             continue;
         }
         // Later rows are later revisions: each replaces the page's fields as a whole.
@@ -744,7 +750,8 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         .map_err(sql)?;
     let page_rows = readable(rows, "page", &mut warnings);
     let page_ids: BTreeSet<i64> = page_rows.iter().map(|r| r.0).collect();
-    let revisions = page_revisions(conn, &page_ids, &mut warnings)?;
+    let book_ids: BTreeSet<i64> = books.keys().copied().collect();
+    let revisions = page_revisions(conn, &page_ids, &book_ids, &mut warnings)?;
     p.revision = revisions.project;
     let mut revisions = revisions.pages;
     for (id, order, kind, label, folder_id, folder_name, frame, book) in page_rows {
