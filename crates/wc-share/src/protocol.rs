@@ -213,7 +213,7 @@ pub enum HostMsg {
     Closed,
 }
 
-/// Apply a project-level change. The host checks it first ([`check_edit`]); guests apply what
+/// Apply a project-level change. The host checks it first (`check_edit`); guests apply what
 /// the host sends, so every copy ends up the same.
 pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
     match edit {

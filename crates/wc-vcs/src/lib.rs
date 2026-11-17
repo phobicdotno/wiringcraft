@@ -6,7 +6,7 @@
 //!
 //! - [`history`]: the commit graph laid out as a subway map (one coloured line per branch);
 //! - [`subway_svg`] / [`subway_text`]: that map drawn as SVG or as terminal text;
-//! - [`changes`]: what changed between two versions in schematic terms (pages, symbols, wires),
+//! - [`changes()`]: what changed between two versions in schematic terms (pages, symbols, wires),
 //!   not in lines of JSON;
 //! - [`page_history`]: who changed one page, when, and what they changed.
 
