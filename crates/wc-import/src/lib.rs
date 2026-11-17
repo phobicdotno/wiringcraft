@@ -4,6 +4,7 @@
 
 pub mod aml;
 pub mod archive;
+pub mod bmecat;
 pub mod csv;
 pub mod dxf;
 pub mod eplan;
