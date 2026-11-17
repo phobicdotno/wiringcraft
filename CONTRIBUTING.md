@@ -56,7 +56,9 @@ Nothing is pushed to `main`; every change is a pull request.
    the description. The pull request then holds the claim until 4 hours after its last push or edit.
    Push at least every few hours while you work, or renew.
 3. Run before pushing: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo test --workspace`.
+   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`,
+   `cargo test --workspace`. In PowerShell the docs check is
+   `$env:RUSTDOCFLAGS = "-D warnings"; cargo doc --workspace --no-deps; Remove-Item Env:RUSTDOCFLAGS`.
 4. CI builds and tests on Linux, Windows and macOS. CodeRabbit reviews the pull request when you
    comment `@coderabbitai review` on it (CodeRabbit reviews small public repositories only on
    request); answer or resolve its comments, and ask again after larger pushes.

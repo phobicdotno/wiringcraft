@@ -50,3 +50,8 @@ jobs:
       - run: cargo test --workspace
         env:
           WIRINGCRAFT_CLI: ${{ github.workspace }}/target/debug/wiringcraft${{ runner.os == 'Windows' && '.exe' || '' }}
+      # Broken or private intra-doc links fail the build (once; the docs are the same on every OS).
+      - run: cargo doc --workspace --no-deps
+        if: runner.os == 'Linux'
+        env:
+          RUSTDOCFLAGS: -D warnings
