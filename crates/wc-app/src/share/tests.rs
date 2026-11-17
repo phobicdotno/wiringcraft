@@ -412,3 +412,64 @@ fn two_windows_share_over_the_network_and_every_change_is_a_commit() -> TestResu
     assert!(g.take_notes().iter().any(|n| n.contains("ended")));
     Ok(())
 }
+
+#[test]
+fn a_second_join_never_writes_over_an_earlier_copy() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (_h, _log, _host_open, _g, first) = session(tmp.path())?;
+    let mut h2_open = Open::load(&tmp.path().join("host"))?;
+    let (mut h2, _) = host(&h2_open);
+    let mut g2 = guest(&mut h2, "Kari", &tmp.path().join("guest"));
+    h2.frame(Some(&mut h2_open), None, false);
+    let ids = pending(&h2);
+    approve(&mut h2, ids[0], true);
+    let second = g2.frame(None, None, false).ok_or("the second guest got no project")?;
+    assert_eq!(first.dir, tmp.path().join("guest").join("Pump station"));
+    assert_eq!(second.dir, tmp.path().join("guest").join("Pump station (2)"));
+    Ok(())
+}
+
+#[test]
+fn a_change_reaching_a_page_held_by_someone_else_is_not_sent_at_all() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    let k1 = DeviceTag::parse("-K1")?;
+    host_open.project.devices.insert(k1.clone(), Device::default());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(guest_open.project.devices.contains_key(&k1));
+    let before = log.messages().len();
+
+    // The guest renames -K1 to -K2 everywhere, including on the host's page.
+    let k2 = DeviceTag::parse("-K2")?;
+    let d = guest_open.project.devices.remove(&k1).ok_or("no -K1")?;
+    guest_open.project.devices.insert(k2.clone(), d);
+    guest_open.project.page_mut("p0002").ok_or("no page")?.title = "Motor -K2".into();
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves -K2".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    assert_eq!(log.messages().len(), before, "nothing of the action was recorded");
+    assert!(host_open.project.devices.contains_key(&k1));
+    assert!(!host_open.project.devices.contains_key(&k2));
+    assert!(
+        guest_open.project.devices.contains_key(&k1),
+        "the guest's copy is put back whole"
+    );
+    assert_eq!(
+        guest_open.project.page("p0003").map(|p| p.title.as_str()),
+        Some("Valves")
+    );
+    assert!(g.take_notes().iter().any(|n| n.contains("page 2")));
+    Ok(())
+}
+
+#[test]
+fn a_change_from_someone_else_marks_the_copy_unsaved() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.save()?;
+    host_open.project.page_mut("p0002").ok_or("no page")?.title = "Motor starter".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(guest_open.dirty);
+    Ok(())
+}

@@ -64,6 +64,9 @@ enum Dialog {
         seen: u64,
     },
     PageProps {
+        /// The page the dialog edits, by id: in a shared session someone else can remove an
+        /// earlier page while it is open, which moves every later page's index.
+        id: String,
         number: String,
         title: String,
         size: PageSize,
@@ -205,6 +208,17 @@ impl App {
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
         });
         if let Some(joined) = self.share.frame(self.open.as_mut(), page, busy) {
+            // The joined copy replaces the open project: keep its unsaved work first.
+            if let Some(o) = self.open.as_mut()
+                && o.dirty
+                && let Err(e) = o.save()
+            {
+                self.share.stop();
+                self.dialog = Some(Dialog::Message(format!(
+                    "Left the session: the open project could not be saved before switching to the shared copy:\n{e}"
+                )));
+                return;
+            }
             self.ed = Editor::default();
             self.panels.reset();
             self.dialog = None;
@@ -538,6 +552,7 @@ impl App {
             Action::PageProps => {
                 if let Some(p) = open.project.pages.get(page) {
                     self.dialog = Some(Dialog::PageProps {
+                        id: p.id.clone(),
                         number: p.number.clone(),
                         title: p.title.clone(),
                         size: p.size,
@@ -1119,6 +1134,7 @@ impl App {
                     });
                 }
                 Dialog::PageProps {
+                    id,
                     number,
                     title,
                     size,
@@ -1157,7 +1173,11 @@ impl App {
                         if ui.button("OK").clicked()
                             && let Some(o) = self.open.as_mut()
                         {
-                            match o.set_page_props(self.ed.page, number, title, *size, *overview) {
+                            let at = o.project.pages.iter().position(|p| p.id == *id);
+                            match at
+                                .ok_or_else(|| "This page was removed by another participant.".to_owned())
+                                .and_then(|i| o.set_page_props(i, number, title, *size, *overview))
+                            {
                                 Ok(i) => {
                                     self.ed.page = i;
                                     self.ed.view.fit = true;

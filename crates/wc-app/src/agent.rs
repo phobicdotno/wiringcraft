@@ -1302,6 +1302,10 @@ impl App {
             }
             "versions" => self.tool_versions(v),
             "undo" => {
+                // Undo swaps the whole project, which would take back other people's work too.
+                if self.share.active() {
+                    return Err("Undo and redo are off in a shared session; use the page history.".into());
+                }
                 let open = need_open(self.open.as_mut())?;
                 let redo = v.get("redo").and_then(Value::as_bool).unwrap_or(false);
                 let done = if redo { open.redo() } else { open.undo() };
@@ -2443,6 +2447,27 @@ mod tests {
         let p = page2(&a);
         assert_eq!((p.title.as_str(), p.symbols.len(), p.wires.len()), ("Rewritten", 1, 1));
         assert!(a.open.as_ref().unwrap().symbols.contains_key("wc.lamp"));
+    }
+
+    #[test]
+    fn undo_is_refused_in_a_shared_session() {
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "place_symbol",
+            json!({"symbol": "wc.coil", "x": 50, "y": 50, "page": "2"}),
+        )
+        .unwrap();
+        let mut open = a.open.take().unwrap();
+        a.share.start_host(&mut open, "Hanna", "hanna@example.com").unwrap();
+        a.open = Some(open);
+        let before = a.open.as_ref().unwrap().project.clone();
+        for redo in [false, true] {
+            assert!(call(&mut a, "undo", json!({"redo": redo})).is_err());
+            assert_eq!(a.open.as_ref().unwrap().project, before, "nothing was undone");
+        }
+        a.share.stop();
+        assert!(call(&mut a, "undo", json!({})).is_ok());
     }
 
     #[test]

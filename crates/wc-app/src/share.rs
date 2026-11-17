@@ -622,14 +622,18 @@ impl Share {
         let base = self.base.get_or_insert_with(|| open.project.clone());
         let mine = page.as_deref().filter(|p| role.holds(p));
         let me = role.me().unwrap_or(HOST);
-        let out = outgoing(&open.project, base, mine, &role.locks(), me);
-        let sent = out.page.is_some() || !out.edits.is_empty();
+        let mut out = outgoing(&open.project, base, mine, &role.locks(), me);
         if !out.dropped.is_empty() {
+            // One action is kept whole or not at all: a device renamed on two pages must not
+            // change the device while the page someone else holds keeps the old tag.
             self.notes.push(format!(
-                "Changes to page {} were not kept: in a shared session you can change only the page you have open.",
+                "Your change was not kept: it touched page {}, and in a shared session you can change only the page you have open.",
                 out.dropped.join(", ")
             ));
+            out.page = None;
+            out.edits.clear();
         }
+        let sent = out.page.is_some() || !out.edits.is_empty();
         for edit in out.edits {
             role.edit_project(edit, &mut self.notes);
         }
@@ -642,6 +646,10 @@ impl Share {
         }
         let auth = role.project()?;
         let changed = incoming(&mut open.project, auth);
+        if changed {
+            // Others' changes are in the window, not yet in this copy's files.
+            open.dirty = true;
+        }
         if changed || sent || !out.dropped.is_empty() {
             open.forget_terminal_change();
             self.base = Some(open.project.clone());
@@ -873,24 +881,43 @@ impl Share {
 /// open it there. Symbols the project uses are taken from the libraries where they can be.
 fn write_copy(folder: &Path, project: &Project) -> Result<Open, String> {
     let leaf = crate::prefs::folder_name(&project.meta.name).unwrap_or_else(|| "shared-project".into());
-    let dir = folder.join(leaf);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let dir = fresh_dir(folder, &leaf)?;
     store::save(&dir, project).map_err(|e| e.to_string())?;
     let mut open = Open::load(&dir)?;
     let wanted: Vec<String> = open.project.lock.symbols.keys().cloned().collect();
     let mut missing = Vec::new();
     for id in wanted {
-        if open.ensure_symbol(&id).is_err() {
-            missing.push(id);
+        if let Err(e) = open.ensure_symbol(&id) {
+            missing.push(format!("{id} ({e})"));
         }
     }
     if !missing.is_empty() {
         crate::applog::warn(&format!(
-            "shared session: symbols not found in the libraries here: {}",
+            "shared session: symbols that could not be taken from the libraries here: {}",
             missing.join(", ")
         ));
     }
     Ok(open)
+}
+
+/// A new, empty folder `folder/leaf`, or `leaf (2)`, `leaf (3)`, ... when that name is taken, so
+/// joining never writes over an earlier copy.
+fn fresh_dir(folder: &Path, leaf: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    for n in 1..1000 {
+        let name = if n == 1 {
+            leaf.to_owned()
+        } else {
+            format!("{leaf} ({n})")
+        };
+        let dir = folder.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        }
+    }
+    Err(format!("{}: no free folder name for {leaf}", folder.display()))
 }
 
 /// The address others reach this computer at on the local network, found by asking the system
