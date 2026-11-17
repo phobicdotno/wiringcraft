@@ -105,6 +105,14 @@ impl Bridge {
         })
     }
 
+    /// Answer every waiting tool call with `why` instead of running it (no turn is running, or
+    /// the user stopped it).
+    pub fn refuse(&self, why: &str) {
+        while let Ok(req) = self.rx.try_recv() {
+            let _ = req.reply.send(Err(why.to_owned()));
+        }
+    }
+
     /// Run the tool calls that came in, on the caller's (window) thread. Returns a panel line
     /// for each.
     pub fn poll(&self, tools: &mut dyn Tools) -> Vec<Entry> {
@@ -341,6 +349,26 @@ mod tests {
         assert_eq!(reply["id"], 9);
         assert_eq!(reply["result"]["content"][0]["text"], "show {\"page\":\"2\"}");
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn refused_calls_are_answered_not_run() {
+        let (tx, rx) = mpsc::channel();
+        let bridge = Bridge {
+            port: 0,
+            token: String::new(),
+            rx,
+        };
+        let (rtx, rrx) = mpsc::channel();
+        let _ = tx.send(ToolRequest {
+            name: "place".into(),
+            input: json!({}),
+            reply: rtx,
+            gave_up: Arc::new(AtomicBool::new(false)),
+        });
+        bridge.refuse("stopped");
+        assert_eq!(rrx.try_recv().ok(), Some(Err("stopped".to_owned())));
+        assert!(bridge.poll(&mut Echo).is_empty());
     }
 
     #[test]

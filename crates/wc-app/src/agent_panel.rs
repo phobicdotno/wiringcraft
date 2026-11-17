@@ -102,9 +102,14 @@ impl App {
     pub(crate) fn assistant_poll(&mut self, ctx: &egui::Context) {
         let mut finished = false;
         // Claude login: tool calls from Claude Code, then what it said.
+        // Calls outside a running turn (after Stop, or late) are refused, never run.
         if let Some(bridge) = self.assistant.bridge.take() {
-            let entries = bridge.poll(&mut AppTools(self));
-            self.assistant.login_log.extend(entries);
+            if self.assistant.acp.as_ref().is_some_and(acp::Acp::takes_tools) {
+                let entries = bridge.poll(&mut AppTools(self));
+                self.assistant.login_log.extend(entries);
+            } else {
+                bridge.refuse("Stopped by the user: no turn is running in WiringCraft.");
+            }
             self.assistant.bridge = Some(bridge);
         }
         if let Some(c) = self.assistant.acp.as_mut() {

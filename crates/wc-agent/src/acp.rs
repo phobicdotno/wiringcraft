@@ -286,6 +286,8 @@ pub struct Acp {
     bridge: Value,
     note: String,
     queued: Option<String>,
+    /// The user pressed Stop in this turn: its remaining tool calls are refused.
+    stopped: bool,
     /// The agent's name and version.
     pub agent: String,
     /// Models the agent offers, `(id, name)`, and the one in use.
@@ -388,6 +390,7 @@ impl Acp {
             bridge,
             note: note.to_owned(),
             queued: None,
+            stopped: false,
             agent: String::new(),
             models: Vec::new(),
             model: String::new(),
@@ -409,6 +412,11 @@ impl Acp {
     }
 
     /// Working on a message (or starting with one waiting).
+    /// Whether a tool call from the agent belongs to a turn that is running and not stopped.
+    pub fn takes_tools(&self) -> bool {
+        self.state == State::Busy && !self.stopped
+    }
+
     pub fn busy(&self) -> bool {
         self.state == State::Busy || (self.state == State::Starting && self.queued.is_some())
     }
@@ -419,6 +427,7 @@ impl Acp {
 
     /// Send a message; it waits while the session is still starting.
     pub fn prompt(&mut self, text: &str) {
+        self.stopped = false;
         match (&self.session, self.state) {
             (Some(s), State::Ready) => {
                 let params = json!({"sessionId": s, "prompt": [{"type": "text", "text": text}]});
@@ -432,6 +441,7 @@ impl Acp {
     /// Ask the agent to stop the turn.
     pub fn cancel(&mut self) {
         self.queued = None;
+        self.stopped = true;
         if let Some(s) = &self.session {
             self.send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": s}}));
         }
