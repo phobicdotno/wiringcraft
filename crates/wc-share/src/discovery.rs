@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -35,8 +35,12 @@ pub const FORGET_AFTER: Duration = Duration::from_secs(7);
 /// Marks a datagram as a WiringCraft beacon, so other traffic on the port is ignored.
 const MAGIC: &str = "wiringcraft-session";
 
-/// The largest beacon read; longer datagrams are not beacons.
-const MAX_BEACON: usize = 2048;
+/// The largest beacon, in bytes. An announcer refuses a longer one; a browser reads no more.
+pub const MAX_BEACON: usize = 2048;
+
+/// The most datagrams one [`Browser::poll`] reads, so a flood cannot hold up the window.
+/// The rest wait for the next poll.
+const MAX_PER_POLL: usize = 256;
 
 /// What a host announces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +61,7 @@ struct Wire {
 }
 
 impl Beacon {
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         serde_json::to_vec(&Wire {
             magic: MAGIC.into(),
             beacon: self.clone(),
@@ -85,6 +89,8 @@ pub struct Session {
 pub struct Announcer {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Why the last send failed; cleared by the next one that works.
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl Announcer {
@@ -96,9 +102,21 @@ impl Announcer {
 
     /// Announce `beacon` to `to` every `every` (tests send to a browser on localhost).
     pub fn start_to(beacon: Beacon, to: SocketAddr, every: Duration) -> Result<Self> {
+        let bytes = beacon.encode();
+        if bytes.len() > MAX_BEACON {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the session announcement is {} bytes, more than the {MAX_BEACON} a browser reads; use a shorter project or host name",
+                    bytes.len()
+                ),
+            )
+            .into());
+        }
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         socket.set_broadcast(true)?;
-        let bytes = beacon.encode();
+        let last_error = Arc::new(Mutex::new(None));
+        let error = Arc::clone(&last_error);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = thread::Builder::new().name("session-announce".into()).spawn(move || {
@@ -106,8 +124,12 @@ impl Announcer {
             let mut next = Instant::now();
             while !flag.load(Ordering::Relaxed) {
                 if Instant::now() >= next {
-                    // A failed send (no network yet, cable out) is tried again next time.
-                    let _ = socket.send_to(&bytes, to);
+                    // A failed send (no network yet, cable out) is tried again next time;
+                    // its reason is kept for `last_error`.
+                    let result = socket.send_to(&bytes, to).err().map(|e| e.to_string());
+                    if let Ok(mut slot) = error.lock() {
+                        *slot = result;
+                    }
                     next = Instant::now() + every;
                 }
                 thread::sleep(tick);
@@ -116,7 +138,14 @@ impl Announcer {
         Ok(Self {
             stop,
             thread: Some(thread),
+            last_error,
         })
+    }
+
+    /// Why the last announcement could not be sent, while it keeps failing (for example no
+    /// network). `None` once a send works again.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|e| e.clone())
     }
 
     /// Stop announcing. Browsers forget the session after [`FORGET_AFTER`].
@@ -172,11 +201,11 @@ impl Browser {
         Ok(self.socket.local_addr()?)
     }
 
-    /// Read every beacon that has arrived and return the sessions heard within the timeout,
-    /// sorted by project name and host.
+    /// Read the beacons that have arrived (at most a few hundred per call) and return the
+    /// sessions heard within the timeout, sorted by project name and host.
     pub fn poll(&mut self) -> Result<Vec<Session>> {
         let mut buf = [0u8; MAX_BEACON];
-        loop {
+        for _ in 0..MAX_PER_POLL {
             match self.socket.recv_from(&mut buf) {
                 Ok((n, from)) => {
                     if let Some(b) = Beacon::decode(&buf[..n]) {
@@ -190,10 +219,10 @@ impl Browser {
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 // Windows reports an earlier send's ICMP error on the next receive; it says
                 // nothing about this socket.
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
                 Err(e) => return Err(e.into()),
             }
         }

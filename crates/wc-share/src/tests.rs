@@ -1027,7 +1027,7 @@ mod discovery {
     use std::time::{Duration, Instant};
 
     use super::TestResult;
-    use crate::discovery::{Announcer, Beacon, Browser, Session};
+    use crate::discovery::{Announcer, Beacon, Browser, MAX_BEACON, Session};
     use crate::net::{Listener, connect};
 
     const EVERY: Duration = Duration::from_millis(50);
@@ -1087,11 +1087,55 @@ mod discovery {
     fn nothing_is_heard_unless_sharing_was_turned_on_and_other_traffic_is_ignored() -> TestResult {
         let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
         let to = b.local_addr()?;
+        assert!(b.poll()?.is_empty(), "no announcer, no session");
         let other = std::net::UdpSocket::bind("127.0.0.1:0")?;
         other.send_to(b"hello", to)?;
         other.send_to(br#"{"magic":"something-else","project":"x","host":"y","port":1}"#, to)?;
-        std::thread::sleep(Duration::from_millis(200));
+        // A real beacon sent after them shows the browser has read the other two.
+        other.send_to(&beacon("Control", "Ola", 7003).encode(), to)?;
+        let list = poll_until(&mut b, |l| !l.is_empty())?;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].project, "Control");
+        Ok(())
+    }
+
+    #[test]
+    fn an_announcement_longer_than_a_browser_reads_is_refused() -> TestResult {
+        let to: SocketAddr = "127.0.0.1:9".parse()?;
+        let fixed = beacon("", "Ola", 7001).encode().len();
+        let at_limit = beacon(&"P".repeat(MAX_BEACON - fixed), "Ola", 7001);
+        assert_eq!(at_limit.encode().len(), MAX_BEACON);
+        Announcer::start_to(at_limit, to, EVERY)?.stop();
+        let over = beacon(&"P".repeat(MAX_BEACON - fixed + 1), "Ola", 7001);
+        let err = Announcer::start_to(over, to, EVERY).err().ok_or("accepted")?;
+        assert!(err.to_string().contains("2048"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_flood_of_datagrams_does_not_hold_up_a_poll() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let to = b.local_addr()?;
+        let other = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        for _ in 0..2_000 {
+            other.send_to(b"noise", to)?;
+        }
+        let start = Instant::now();
         assert!(b.poll()?.is_empty());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failing_announcement_keeps_its_reason() -> TestResult {
+        // Port 0 cannot be sent to.
+        let a = Announcer::start_to(beacon("P", "Ola", 7001), "127.0.0.1:0".parse()?, EVERY)?;
+        let start = Instant::now();
+        while a.last_error().is_none() && start.elapsed() < PATIENCE {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(a.last_error().is_some());
         Ok(())
     }
 
