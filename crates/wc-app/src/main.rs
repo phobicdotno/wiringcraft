@@ -41,10 +41,14 @@ const TITLE_FIELDS: &[(&str, &str)] = &[
 ];
 
 enum Dialog {
-    OpenPath(String),
+    /// The folder field, and why the last Browse could not be used.
+    OpenPath(prefs::FolderField, Option<String>),
     NewProject {
-        dir: String,
+        /// The folder the project folder goes in.
+        location: prefs::FolderField,
         name: String,
+        /// Why the last Browse could not be used.
+        error: Option<String>,
     },
     ProjectProps {
         name: String,
@@ -198,6 +202,13 @@ impl App {
     }
 
     fn open_dir(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
+        let dir = &match prefs::absolute(dir) {
+            Ok(d) => d,
+            Err(e) => {
+                self.dialog = Some(Dialog::Message(format!("Could not open the project: {e}")));
+                return;
+            }
+        };
         match Open::load(dir) {
             Ok(o) => {
                 self.ed = Editor::default();
@@ -241,18 +252,23 @@ impl App {
                     .as_ref()
                     .map(|o| o.dir.display().to_string())
                     .unwrap_or_default();
-                self.dialog = Some(Dialog::OpenPath(start));
+                self.dialog = Some(Dialog::OpenPath(prefs::FolderField::typed(start), None));
             }
             Action::NewProject => {
-                let parent = self
+                let location = self
                     .open
                     .as_ref()
                     .and_then(|o| o.dir.parent())
-                    .map(|d| d.join("new-project").display().to_string())
-                    .unwrap_or_default();
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(prefs::projects_dir);
+                // A default location that cannot be shown as text is not guessed at: the field
+                // starts empty (Create stays off) and says why.
+                let mut field = prefs::FolderField::default();
+                let error = field.pick(location).err();
                 self.dialog = Some(Dialog::NewProject {
-                    dir: parent,
+                    location: field,
                     name: String::new(),
+                    error,
                 });
             }
             Action::ToggleChrome => {
@@ -621,7 +637,7 @@ impl App {
         let mut keep = true;
         let mut then: Option<Then> = None;
         let title = match &dialog {
-            Dialog::OpenPath(_) => "Open project",
+            Dialog::OpenPath(..) => "Open project",
             Dialog::NewProject { .. } => "New project",
             Dialog::ProjectProps { .. } => "Project properties",
             Dialog::PageProps { .. } => "Page properties",
@@ -788,17 +804,30 @@ impl App {
                         keep = false;
                     }
                 }
-                Dialog::OpenPath(path) => {
+                Dialog::OpenPath(path, error) => {
                     ui.label("Project folder (the one holding project.toml):");
-                    let r = ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                    let r = ui
+                        .horizontal(|ui| {
+                            let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(340.0));
+                            if ui.button("Browse…").clicked()
+                                && let Some(d) = pick_folder("Open project", &path.text)
+                            {
+                                *error = path.pick(d).err();
+                            }
+                            r
+                        })
+                        .inner;
                     for recent in &self.prefs.recent {
                         if ui.link(recent.display().to_string()).clicked() {
-                            *path = recent.display().to_string();
+                            *error = path.pick(recent.clone()).err();
                         }
+                    }
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Open").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
-                            let p = PathBuf::from(path.trim());
+                            let p = path.path();
                             then = Some(Box::new(move |app: &mut App| {
                                 let mut prefs = std::mem::take(&mut app.prefs);
                                 app.open_dir(&p, &mut prefs);
@@ -811,32 +840,48 @@ impl App {
                         }
                     });
                 }
-                Dialog::NewProject { dir, name } => {
+                Dialog::NewProject { location, name, error } => {
                     egui::Grid::new("newproj")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
-                            ui.label("Folder");
-                            ui.add(egui::TextEdit::singleline(dir).desired_width(380.0));
-                            ui.end_row();
                             ui.label("Name");
                             ui.add(
                                 egui::TextEdit::singleline(name)
-                                    .hint_text("the folder name")
+                                    .hint_text("also the folder name")
                                     .desired_width(380.0),
                             );
                             ui.end_row();
+                            ui.label("Location");
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut location.text).desired_width(300.0));
+                                if ui.button("Browse…").clicked()
+                                    && let Some(d) = pick_folder("Where to create the project", &location.text)
+                                {
+                                    *error = location.pick(d).err();
+                                }
+                            });
+                            ui.end_row();
                         });
+                    // The folder follows the name and the location, whichever is typed last.
+                    let target = prefs::new_project_dir(&location.path(), name);
+                    let t = theme::Theme::of(ui.ctx());
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(t.error));
+                    }
+                    match &target {
+                        Ok(d) => ui.label(RichText::new(format!("Creates {}", d.display())).color(t.muted)),
+                        Err(e) => ui.label(RichText::new(e.as_str()).color(t.error)),
+                    };
                     ui.label(
-                        RichText::new("A new folder with one cover page, recorded as a git repository.")
-                            .color(theme::Theme::of(ui.ctx()).faint),
+                        RichText::new("A new folder with one cover page, recorded as a git repository.").color(t.faint),
                     );
                     ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!dir.trim().is_empty(), egui::Button::new("Create"))
-                            .clicked()
+                        if let Ok(d) = target
+                            && ui
+                                .add_enabled(!location.is_empty(), egui::Button::new("Create"))
+                                .clicked()
                         {
-                            let d = PathBuf::from(dir.trim());
                             let n = name.trim().to_owned();
                             then = Some(Box::new(move |app: &mut App| app.new_project(&d, &n)));
                             keep = false;
@@ -1294,7 +1339,10 @@ impl App {
             name.to_owned()
         };
         if let Err(e) = wc_core::store::create(dir, &name) {
-            self.dialog = Some(Dialog::Message(format!("Could not create the project:\n{e}")));
+            self.dialog = Some(Dialog::Message(format!(
+                "Could not create the project in\n{}:\n{e}",
+                dir.display()
+            )));
             return;
         }
         // A starter library next to the app, when there is one, so the symbol picker is not empty.
@@ -1366,6 +1414,31 @@ fn size_label(s: PageSize) -> &'static str {
         PageSize::A3 => "A3 landscape",
         PageSize::A2 => "A2 landscape",
     }
+}
+
+/// The system's folder picker, starting in `start` (or its nearest existing parent). `None` when
+/// the user cancels. Blocks the window while open, like any modal dialog.
+fn pick_folder(title: &str, start: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title(title);
+    if let Some(d) = picker_start(start) {
+        dialog = dialog.set_directory(d);
+    }
+    dialog.pick_folder()
+}
+
+/// Where the folder picker opens for what is typed in a dialog: the projects folder for a blank
+/// field, otherwise the same rule as the dialogs (a bare name is inside the projects folder),
+/// then the nearest folder of that path that exists.
+fn picker_start(typed: &str) -> Option<PathBuf> {
+    let start = if typed.trim().is_empty() {
+        prefs::projects_dir()
+    } else {
+        prefs::project_path(typed)
+    };
+    start
+        .ancestors()
+        .find(|d| !d.as_os_str().is_empty() && d.is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// The window and taskbar icon (assets/icon, made by tools/gen_icon.py), built into the
@@ -2045,5 +2118,32 @@ mod icon_tests {
     fn the_main_window_carries_the_icon() {
         let icon = super::main_viewport().icon;
         assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod picker_tests {
+    use super::*;
+
+    #[test]
+    fn the_picker_opens_where_the_dialog_would_put_the_project() {
+        let nearest = |p: PathBuf| {
+            p.ancestors()
+                .find(|d| !d.as_os_str().is_empty() && d.is_dir())
+                .map(Path::to_path_buf)
+        };
+        // A bare name is looked up under the projects folder, never the folder the app started
+        // in, whether or not that name exists there.
+        let name = "some-project-name";
+        assert_eq!(picker_start(name), nearest(prefs::projects_dir().join(name)));
+        assert_eq!(picker_start("  "), nearest(prefs::projects_dir()));
+        // A full path opens at its nearest existing folder (inside a fresh, empty folder).
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("not-there").join("deeper");
+        assert_eq!(
+            picker_start(&deep.display().to_string()),
+            Some(tmp.path().to_path_buf())
+        );
     }
 }
