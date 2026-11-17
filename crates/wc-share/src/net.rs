@@ -274,8 +274,8 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(total, lines);
+        assert!(sender.join().is_ok(), "the sender thread panicked");
         assert!(done.load(Ordering::SeqCst));
-        let _ = sender.join();
         Ok(())
     }
 
