@@ -168,6 +168,18 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Find text in free texts, device tags, wire numbers, potentials and device descriptions
+    /// on every page; one hit per line: page, kind, value. With --replace, replace it in every
+    /// hit (a device tag renames the device everywhere it appears).
+    Find {
+        query: String,
+        /// Replace the found text with this, in every hit.
+        #[arg(long)]
+        replace: Option<String>,
+        /// Upper and lower case must match.
+        #[arg(long)]
+        match_case: bool,
+    },
     /// Show what is inside a project archive from another tool (.tewzip, .zw1, .elk, .zip).
     Inspect { file: PathBuf },
     /// Version control: commit, branches, merge, history.
@@ -606,6 +618,21 @@ fn save(dir: &Path, p: &Project) -> Res<()> {
     store::save(dir, &p).map(|_| ()).map_err(e)
 }
 
+/// The `find` output: one hit per line, the page number (`-` for a device not drawn), the
+/// kind and the value, separated by tabs.
+fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
+    hits.iter()
+        .map(|h| {
+            let page = h
+                .target
+                .page()
+                .and_then(|id| p.page(id))
+                .map_or_else(|| "-".to_owned(), |pg| pg.number.clone());
+            format!("{page}\t{}\t{}\n", h.kind.label(), h.value)
+        })
+        .collect()
+}
+
 /// The `location list` output: one location per line, `+path`, then a tab and the description
 /// when it has one.
 fn write_locations(out: &mut impl std::io::Write, locations: &[wc_core::project::Location]) -> std::io::Result<()> {
@@ -1040,6 +1067,25 @@ fn run(cli: Cli) -> Res<()> {
                 "numbered {} connection(s); {} wire(s) changed",
                 done.connections, done.wires
             );
+        }
+        Cmd::Find {
+            query,
+            replace,
+            match_case,
+        } => {
+            let mut p = load(dir)?;
+            let opts = wc_core::find::FindOptions { match_case };
+            let hits = wc_core::find::find(&p, &query, opts);
+            print!("{}", find_lines(&p, &hits));
+            if let Some(with) = replace {
+                let n = wc_core::find::replace(&mut p, &hits, &query, &with, opts)?;
+                if n > 0 {
+                    save(dir, &p)?;
+                }
+                println!("replaced {n} value(s)");
+            } else if hits.is_empty() {
+                println!("nothing found");
+            }
         }
         Cmd::Check { all } => {
             let p = load(dir)?;
@@ -2632,6 +2678,34 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn find_lists_hits_and_replace_renames_the_device() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let tag = wc_core::DeviceTag::parse("-K1").unwrap();
+        p.pages[0].symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "wc.coil".into(),
+            at: wc_core::Point::new(10.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag.clone()),
+        });
+        p.devices.insert(tag, wc_core::Device::default());
+        save(&dir, &p).unwrap();
+        let hits = wc_core::find::find(&p, "k1", Default::default());
+        let number = p.pages[0].number.clone();
+        assert_eq!(find_lines(&p, &hits), format!("{number}\tDevice tag\t-K1\n"));
+        cli(&dir, &["find", "K1", "--match-case", "--replace", "K2"]).unwrap();
+        let p = load(&dir).unwrap();
+        let k2 = wc_core::DeviceTag::parse("-K2").unwrap();
+        assert_eq!(p.pages[0].symbols[0].tag.as_ref(), Some(&k2));
+        assert!(p.devices.contains_key(&k2));
+        assert!(cli(&dir, &["find", "K2", "--replace", "?"]).is_err(), "not a tag");
     }
 
     #[test]

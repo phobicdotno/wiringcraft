@@ -750,35 +750,7 @@ impl Open {
             return Err(format!("{to} is already used."));
         }
         self.checkpoint();
-        let mut n = 0;
-        if let Some(d) = self.project.devices.remove(from) {
-            self.project.devices.insert(to.clone(), d);
-        }
-        for p in &mut self.project.pages {
-            for s in &mut p.symbols {
-                if s.tag.as_ref() == Some(from) {
-                    s.tag = Some(to.clone());
-                    n += 1;
-                }
-            }
-            for w in &mut p.wires {
-                if let Some(c) = &mut w.cable
-                    && &c.cable == from
-                {
-                    c.cable = to.clone();
-                }
-            }
-        }
-        for panel in &mut self.project.panels {
-            for item in &mut panel.items {
-                if let wc_core::panel::PanelItem::Device { tag, .. } = item
-                    && tag == from
-                {
-                    *tag = to.clone();
-                }
-            }
-        }
-        Ok(n)
+        Ok(self.project.rename_device(from, to))
     }
 
     /// Make every symbol a page uses available in the project.
@@ -2257,6 +2229,7 @@ mod tests {
             logged: Default::default(),
             share: Default::default(),
             symbol_editor: None,
+            find: None,
         };
         (tmp, app)
     }
@@ -2372,6 +2345,56 @@ mod tests {
         let _ = ctx.run(Default::default(), |ctx| a.symbol_editor_window(ctx));
         assert!(a.symbol_editor.is_none(), "it belonged to the first project");
         assert_eq!(a.open.as_ref().unwrap().project, other_before);
+    }
+
+    #[test]
+    fn find_and_replace_renames_a_device_everywhere_as_one_undo_step() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let first = open.place(0, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let tag = open.project.pages[0].symbol(&first).unwrap().tag.clone().unwrap();
+        let copy = open.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
+        open.project.pages[1]
+            .symbols
+            .iter_mut()
+            .find(|s| s.id == copy)
+            .unwrap()
+            .tag = Some(tag.clone());
+        let before = open.project.clone();
+        a.run(Action::Find);
+        let find = a.find.as_mut().unwrap();
+        find.query = tag.to_string();
+        find.with = "-K77".into();
+        find.match_case = true;
+        let version = a.open.as_ref().unwrap().history_count();
+        find.refresh(&a.open.as_ref().unwrap().project, version);
+        assert_eq!(find.hits.len(), 2, "{:?}", find.hits);
+        // Only the hit on the second page is ticked: the device is still renamed on both.
+        find.chosen = vec![false, true];
+        a.replace_found();
+        assert!(
+            a.find.as_ref().unwrap().message.starts_with("Replaced"),
+            "{}",
+            a.find.as_ref().unwrap().message
+        );
+        let open = a.open.as_mut().unwrap();
+        let new = wc_core::DeviceTag::parse("-K77").unwrap();
+        assert_eq!(open.project.pages[0].symbol(&first).unwrap().tag.as_ref(), Some(&new));
+        assert_eq!(open.project.pages[1].symbol(&copy).unwrap().tag.as_ref(), Some(&new));
+        assert!(open.undo());
+        assert_eq!(open.project, before, "one undo takes the whole replace back");
+    }
+
+    #[test]
+    fn find_shows_a_hit_on_its_page() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let page = open.project.pages[1].id.clone();
+        a.ed.page = 0;
+        a.show_found(&page, Some(Selection::Symbol(id.clone())));
+        assert_eq!(a.ed.page, 1);
+        assert_eq!(a.ed.selection, vec![Selection::Symbol(id)]);
     }
 
     #[test]
