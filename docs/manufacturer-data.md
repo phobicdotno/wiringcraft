@@ -16,6 +16,7 @@ From `crates/wc-import`:
 |---|---|---|
 | ASCII DXF | `dxf` | Symbols and whole drawings, from the entities LINE, CIRCLE, ARC, LWPOLYLINE, POLYLINE, TEXT, MTEXT, POINT and INSERT. Other entities (for example ELLIPSE, SPLINE, HATCH) are skipped, so some graphics can be lost. Binary DXF and DWG are **not** read. |
 | KiCad symbol libraries (`.kicad_sym`, KiCad 6+) | `kicad` | Graphics and visible pins of the common unit and the first unit (body style 1) become a WiringCraft symbol. Later units are skipped with a warning; alternate body styles and hidden pins are left out without one. |
+| QElectroTech elements (`.elmt`) | `qet` | `wiringcraft import symbol-qet <files> --lib <folder>`: lines, rectangles, circles, ellipses, arcs, polygons and static texts become graphics (ellipses and elliptic arcs as polylines); terminals become pins with their direction; the label's place becomes the tag place; `link_type` sets the role (master, slave, terminal, report). 10 px of QElectroTech is 5 mm by default (`--scale`). Unknown items are counted in a warning. |
 | SVG | `svg` | Graphics. |
 | PDF (vector) | `pdf` | Traced drawings. |
 | CSV | `csv` | Parts lists and PLC address lists. |
@@ -25,7 +26,7 @@ From `crates/wc-import`:
 | Plain zip | `archive` | Opens the container and imports PDF, DXF, AutomationML and CSV entries inside. Other entries (including `.kicad_sym`) are listed, not imported. |
 
 Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **DWG**, **STEP**
-(3D), **BMEcat** and **ECLASS** part data, QElectroTech **`.elmt`** elements.
+(3D), **BMEcat** and **ECLASS** part data.
 
 ## Portals that serve many manufacturers
 
@@ -35,7 +36,7 @@ Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **
 | [SOLIDWORKS Electrical Content Portal](https://help.solidworks.com/2025/English/SWElec/r_swelec_UsingECP.htm) | Manufacturer parts, cable references, symbols. TE Connectivity via TraceParts ([blog](https://blogs.solidworks.com/products/solidworks/traceparts-collaboration-integrating-the-te-connectivity-catalog-into-the-electrical-content-portal-ecp)) | `.tewzip` | 3DEXPERIENCE ID plus an active SOLIDWORKS Electrical Schematic subscription ([Javelin](https://www.javelin-tech.com/blog/2025/02/using-the-solidworks-electrical-content-portal/)) | Dassault terms | Container yes; parts library is #62 |
 | CADENAS PARTcommunity / TraceParts | 2D/3D CAD for thousands of makers, some ECAD macros | 80+ native and neutral formats incl. DXF, DWG, STEP | Free account | Per portal and per maker | DXF yes (ASCII) |
 | [KiCad libraries](https://www.kicad.org/libraries/license/index.html) | Generic and manufacturer-specific symbols (mostly electronics) | `.kicad_sym` | Free, no login (GitLab) | CC-BY-SA 4.0 with the KiCad libraries exception: free to use in any design, closed or commercial; redistributing the libraries as a collection keeps CC-BY-SA | **Yes** |
-| [QElectroTech element collection](https://qelectrotech.org/) and [contrib repo](https://github.com/qelectrotech/qelectrotech-element-contrib) | IEC schematic elements, manufacturer variants (Hager, ABB, Hensel, Shelly, WAGO planned) | `.elmt` (XML) | Free, no login | Contrib repo under GPL-2.0; check the main collection's licence per element | No |
+| [QElectroTech element collection](https://qelectrotech.org/) and [contrib repo](https://github.com/qelectrotech/qelectrotech-element-contrib) | IEC schematic elements, manufacturer variants (Hager, ABB, Hensel, Shelly, WAGO planned) | `.elmt` (XML) | Free, no login | Contrib repo under GPL-2.0; check the main collection's licence per element | **Yes** (symbols) |
 
 ## Manufacturers
 
@@ -78,11 +79,10 @@ Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **
    order numbers, descriptions and technical data. A BMEcat import would fill the parts library
    for makers who publish it.
 4. **QElectroTech `.elmt`** is an open XML format with a free collection that includes some
-   manufacturer variants (Hager, ABB, Shelly). An importer would add many IEC symbols with
-   connection points.
+   manufacturer variants (Hager, ABB, Shelly). The `qet` importer reads them as symbols with
+   connection points; check each element's licence before shipping it in a library.
 5. **DWG** is common (Eaton, Mitsubishi, Rockwell) but closed; DXF is usually offered next to it.
 6. **SolidWorks Electrical Content Portal** data needs a SolidWorks subscription; its `.tewzip`
    parts are covered by the library import in #62.
 
-Follow-up candidates for the todo list: EDZ import, BMEcat parts import, QElectroTech `.elmt`
-symbol import.
+Follow-up candidates for the todo list: EDZ import, BMEcat parts import.
