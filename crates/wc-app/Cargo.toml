@@ -19,7 +19,10 @@ wc-pdf.workspace = true
 wc-report.workspace = true
 wc-agent.workspace = true
 serde_json.workspace = true
-eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.31", default-features = false, features = ["glow", "wgpu", "default_fonts", "x11", "wayland"] }
+# eframe turns off wgpu's default backends; Direct3D 12 (with the WARP software adapter on a
+# machine without a GPU) and Metal are needed where OpenGL 2+ is missing (see main.rs).
+wgpu = { version = "24", default-features = false, features = ["dx12", "metal"] }
 serde.workspace = true
 toml.workspace = true
 image.workspace = true

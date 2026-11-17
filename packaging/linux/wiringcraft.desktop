@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=WiringCraft
+Comment=Electrical schematics and wiring diagrams
+Exec=wiringcraft-app
+Terminal=false
+Categories=Development;Science;Engineering;Electronics;

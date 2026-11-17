@@ -18,7 +18,8 @@ mod screenshot;
 mod state;
 mod theme;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, Pos2, RichText, Stroke, Vec2};
 
@@ -1399,9 +1400,19 @@ fn main_viewport() -> egui::ViewportBuilder {
 /// The starter symbol library: `library/` beside the executable or in the source tree.
 fn starter_library() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    find_library(exe.as_deref().and_then(Path::parent), &source)
+}
+
+/// The first `library/` with a `symbols` folder: next to the program (Windows install, download
+/// folder), the Linux package layout (/usr/bin -> /usr/share/wiringcraft), the macOS app bundle
+/// (Contents/MacOS -> Contents/Resources), then the source checkout this was built from.
+fn find_library(exe_dir: Option<&Path>, source: &Path) -> Option<PathBuf> {
     let candidates = [
-        exe.as_ref().and_then(|e| e.parent()).map(|d| d.join("library")),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library")),
+        exe_dir.map(|d| d.join("library")),
+        exe_dir.map(|d| d.join("../share/wiringcraft/library")),
+        exe_dir.map(|d| d.join("../Resources/library")),
+        Some(source.to_path_buf()),
     ];
     candidates
         .into_iter()
@@ -1881,11 +1892,144 @@ fn main() -> eframe::Result {
     }
     applog::init();
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
+    let wanted = std::env::var(RENDERER_VAR).ok();
     let options = eframe::NativeOptions {
         viewport: main_viewport(),
+        renderer: renderer_for(wanted.as_deref()),
         ..Default::default()
     };
-    eframe::run_native("WiringCraft", options, Box::new(|cc| Ok(Box::new(App::new(cc, dir)))))
+    // No usable OpenGL (a remote desktop session, a virtual machine, a missing graphics driver
+    // often offer only OpenGL 1.1): start again on wgpu (Direct3D, Metal or Vulkan, with a
+    // software fallback). A window system cannot be started twice in one process, so this is a
+    // new process. Some OpenGL failures panic inside eframe instead of returning an error, so a
+    // panic before the app has started falls back the same way. Set WIRINGCRAFT_RENDERER=wgpu
+    // to skip the first try.
+    let fallback = falls_back(wanted.as_deref());
+    if fallback {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            if !STARTED.load(Ordering::SeqCst) {
+                // Leave at once: waiting here would keep this process's half-made window on
+                // screen while the new one runs.
+                restart_with_wgpu(&format!("{info}"), false);
+            }
+        }));
+    }
+    let result = eframe::run_native(
+        "WiringCraft",
+        options,
+        Box::new(|cc| {
+            STARTED.store(true, Ordering::SeqCst);
+            Ok(Box::new(App::new(cc, dir)))
+        }),
+    );
+    if let Err(e) = &result
+        && fallback
+        && !STARTED.load(Ordering::SeqCst)
+    {
+        restart_with_wgpu(&e.to_string(), true);
+    }
+    result
+}
+
+/// Environment variable that picks the graphics backend: `glow` (OpenGL, the default) or `wgpu`.
+const RENDERER_VAR: &str = "WIRINGCRAFT_RENDERER";
+
+/// Set once the window and its renderer are up; a failure after that is not a renderer problem.
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// The backend to start with: `wgpu` when asked for, OpenGL otherwise.
+fn renderer_for(wanted: Option<&str>) -> eframe::Renderer {
+    match wanted {
+        Some("wgpu") => eframe::Renderer::Wgpu,
+        _ => eframe::Renderer::Glow,
+    }
+}
+
+/// Whether a failure before the app starts should try again on wgpu: only for the default
+/// choice, so a backend picked by hand, and the second try itself, never loop.
+fn falls_back(wanted: Option<&str>) -> bool {
+    wanted.is_none()
+}
+
+/// Run this program again on wgpu with the same arguments, then leave: with the new process's
+/// exit code when `wait`, at once otherwise.
+fn restart_with_wgpu(why: &str, wait: bool) {
+    eprintln!("wiringcraft-app: OpenGL could not start ({why}); starting again with wgpu");
+    let child = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .env(RENDERER_VAR, "wgpu")
+            .spawn()
+    });
+    match child {
+        Ok(mut c) if wait => std::process::exit(c.wait().ok().and_then(|s| s.code()).unwrap_or(1)),
+        Ok(_) => std::process::exit(0),
+        Err(err) => eprintln!("wiringcraft-app: could not start again with wgpu: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod renderer_tests {
+    use super::*;
+
+    #[test]
+    fn opengl_is_the_default_and_wgpu_can_be_picked() {
+        assert_eq!(renderer_for(None), eframe::Renderer::Glow);
+        assert_eq!(renderer_for(Some("glow")), eframe::Renderer::Glow);
+        assert_eq!(renderer_for(Some("wgpu")), eframe::Renderer::Wgpu);
+        assert_eq!(renderer_for(Some("other")), eframe::Renderer::Glow);
+    }
+
+    #[test]
+    fn only_the_default_choice_falls_back_so_the_second_try_never_loops() {
+        assert!(falls_back(None));
+        assert!(!falls_back(Some("wgpu")), "the second try runs with wgpu set");
+        assert!(!falls_back(Some("glow")), "OpenGL picked by hand is not overruled");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod library_tests {
+    use super::*;
+
+    /// Makes `<root>/<rel>/symbols` and returns `<root>/<rel>` canonicalized.
+    fn lib(root: &Path, rel: &str) -> PathBuf {
+        std::fs::create_dir_all(root.join(rel).join("symbols")).unwrap();
+        root.join(rel).canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_library_is_found_in_each_install_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let none = t.path().join("no-source");
+        // Linux package: /usr/bin/wiringcraft-app with /usr/share/wiringcraft/library.
+        let linux = t.path().join("usr");
+        let want = lib(&linux, "share/wiringcraft/library");
+        std::fs::create_dir_all(linux.join("bin")).unwrap();
+        assert_eq!(find_library(Some(&linux.join("bin")), &none), Some(want));
+        // macOS bundle: Contents/MacOS with Contents/Resources/library.
+        let mac = t.path().join("WiringCraft.app/Contents");
+        let want = lib(&mac, "Resources/library");
+        std::fs::create_dir_all(mac.join("MacOS")).unwrap();
+        assert_eq!(find_library(Some(&mac.join("MacOS")), &none), Some(want));
+        // Nothing installed and no source checkout: no library.
+        let empty = t.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(find_library(Some(&empty), &none), None);
+    }
+
+    #[test]
+    fn a_library_next_to_the_program_wins() {
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("app");
+        let beside = lib(&app, "library");
+        let source = lib(t.path(), "source/library");
+        assert_eq!(find_library(Some(&app), &source), Some(beside));
+        assert_eq!(find_library(None, &source), Some(source));
+    }
 }
 
 #[cfg(test)]

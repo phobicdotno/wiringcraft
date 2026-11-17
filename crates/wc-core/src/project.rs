@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::geom::{Point, Rotation, Shape};
+use crate::route::Route;
 use crate::tag::DeviceTag;
 
 /// A library source as listed in `project.toml`. Earlier entries win when ids collide.
@@ -31,6 +32,38 @@ pub struct ProjectMeta {
     pub title_block: BTreeMap<String, String>,
     #[serde(default, rename = "library")]
     pub libraries: Vec<LibrarySource>,
+    /// The project's locations (cabinets, rooms, panels), with what they are. A device is in a
+    /// location through the `+` part of its tag, so `+L1.L3-K1` is in the location `L1.L3`.
+    #[serde(default, rename = "location", skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<Location>,
+}
+
+/// A location of the project, such as a cabinet or a room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Location {
+    /// The location part of device tags, levels joined by `.`: `L1.L3` for `+L1.L3`.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+impl ProjectMeta {
+    /// Add a location, or fill in the description of one the project already has. A description
+    /// already there is kept. Returns whether anything changed.
+    pub fn merge_location(&mut self, loc: Location) -> bool {
+        match self.locations.iter_mut().find(|l| l.path == loc.path) {
+            Some(have) if have.description.is_empty() && !loc.description.is_empty() => {
+                have.description = loc.description;
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.locations.push(loc);
+                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                true
+            }
+        }
+    }
 }
 
 impl ProjectMeta {
@@ -42,6 +75,7 @@ impl ProjectMeta {
             format_version: Self::FORMAT_VERSION,
             title_block: BTreeMap::new(),
             libraries: Vec::new(),
+            locations: Vec::new(),
         }
     }
 }
@@ -154,6 +188,9 @@ pub struct Wire {
     /// The cable this wire runs in, when it is a cable core.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cable: Option<CableCore>,
+    /// The route style its bend points were made with; older files have none (square).
+    #[serde(default, skip_serializing_if = "Route::is_square")]
+    pub route: Route,
 }
 
 /// A wire's place in a cable: the cable device (for example `-W1`) and the core's name
@@ -388,6 +425,38 @@ mod tests {
         assert_eq!(row_letter(1), 'A');
         assert_eq!(row_letter(8), 'H');
         assert_eq!(row_letter(0), 'A');
+    }
+
+    #[test]
+    fn locations_are_saved_only_when_there_are_some_and_merge_by_path() -> Result<(), toml::de::Error> {
+        let old: ProjectMeta = toml::from_str("name = \"Old\"\nformat_version = 1\n")?;
+        assert!(
+            old.locations.is_empty(),
+            "an older project.toml loads with no locations"
+        );
+        let mut m = ProjectMeta::new("x");
+        assert!(!toml::to_string(&m).is_ok_and(|s| s.contains("location")));
+        let loc = |p: &str, d: &str| Location {
+            path: p.into(),
+            description: d.into(),
+        };
+        assert!(m.merge_location(loc("L2", "")));
+        assert!(m.merge_location(loc("L1.L3", "Engine room")));
+        assert!(
+            m.merge_location(loc("L2", "Bridge")),
+            "an empty description is filled in"
+        );
+        assert!(
+            !m.merge_location(loc("L2", "Other")),
+            "a description already there stays"
+        );
+        let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["L1.L3", "L2"]);
+        let text = toml::to_string(&m).unwrap_or_default();
+        assert!(text.contains("[[location]]"), "{text}");
+        let back: ProjectMeta = toml::from_str(&text)?;
+        assert_eq!(back.locations, m.locations);
+        Ok(())
     }
 
     #[test]

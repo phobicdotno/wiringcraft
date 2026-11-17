@@ -366,6 +366,7 @@ mod tests {
             number: None,
             potential: Some("24V".into()),
             cable: None,
+            route: Default::default(),
         });
         p.pages.push(page);
         p.devices.insert(

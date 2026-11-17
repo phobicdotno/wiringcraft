@@ -54,6 +54,7 @@ fn wire(id: &str, from: Endpoint, to: Endpoint, number: Option<&str>, potential:
         number: number.map(Into::into),
         potential: potential.map(Into::into),
         cable: None,
+        route: Default::default(),
     }
 }
 

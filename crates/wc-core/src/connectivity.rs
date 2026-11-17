@@ -158,6 +158,7 @@ mod tests {
             number: None,
             potential: potential.map(Into::into),
             cable: None,
+            route: Default::default(),
         }
     }
     fn pin(item: &str, pin: &str) -> Endpoint {
