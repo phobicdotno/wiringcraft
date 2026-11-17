@@ -334,6 +334,9 @@ impl App {
         }
         let Some(open) = self.open.as_mut() else { return };
         match a {
+            Action::Save if self.assistant.command_running() => {
+                self.ed.message = "Saving waits until the assistant's command has finished.".into();
+            }
             Action::Save => match open.save() {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
                 Err(e) => self.dialog = Some(Dialog::Message(format!("Saving failed:\n{e}"))),
@@ -1380,6 +1383,10 @@ impl App {
     }
 
     fn commit(&mut self, msg: &str) {
+        if self.assistant.command_running() {
+            self.ed.message = "Recording a version waits until the assistant's command has finished.".into();
+            return;
+        }
         let Some(open) = self.open.as_mut() else { return };
         if let Err(e) = open.save() {
             self.dialog = Some(Dialog::Message(format!("Saving failed:\n{e}")));

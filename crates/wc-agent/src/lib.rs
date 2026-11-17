@@ -996,8 +996,12 @@ mod tests {
             ]
         }))]);
         let mut s = Session::new(t);
-        let go = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let mut tools = Slow { go, order: Vec::new() };
+        // The worker waits until the turn is stopped, so `quick` cannot run before that.
+        let go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = Slow {
+            go: Arc::clone(&go),
+            order: Vec::new(),
+        };
         let set = settings();
         assert!(s.send("go", &[], "", &set, "sys", &[]).is_ok());
         while tools.order.is_empty() {
@@ -1005,6 +1009,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         s.stop();
+        go.store(true, std::sync::atomic::Ordering::SeqCst);
         let p = s.poll(&mut tools, &set, "sys", true);
         assert!(p.finished);
         // The started call is finished; the one after it is not run.

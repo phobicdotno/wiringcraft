@@ -144,7 +144,15 @@ impl Assistant {
 
     /// Working on a message, with either backend.
     pub fn busy(&self) -> bool {
-        self.session.busy() || self.acp.as_ref().is_some_and(wc_agent::acp::Acp::busy)
+        self.session.busy()
+            || self.acp.as_ref().is_some_and(wc_agent::acp::Acp::busy)
+            || self.bridge.as_ref().is_some_and(wc_agent::bridge::Bridge::working)
+    }
+
+    /// A `run_command` is running on its worker thread. The window does not save meanwhile,
+    /// so whatever changes on disk is the command's.
+    pub fn command_running(&self) -> bool {
+        self.command_base.is_some()
     }
 }
 
@@ -2048,9 +2056,10 @@ impl App {
         }))
     }
 
-    /// The command is done: read what it changed. Edits the user made while it ran are kept
-    /// when the command left the project alone; when both changed it, the command's result
-    /// wins and the user's edits are one undo step back, and the answer says so.
+    /// The command is done: read what it changed. The window does not save while a command
+    /// runs, so a change on disk is the command's. Edits the user made in the window meanwhile
+    /// always win: if both changed the project, the command's changes are not loaded and the
+    /// answer says so, so the assistant can ask before running it again.
     fn command_finish(&mut self, r: Result<String, String>) -> Result<String, String> {
         let base = self.assistant.command_base.take();
         let Some(open) = self.open.as_mut() else {
@@ -2064,29 +2073,33 @@ impl App {
             return r;
         }
         let fresh = Open::load(&open.dir)?;
+        // Symbols the command added or changed come in; symbols the window vendored meanwhile
+        // (not saved yet, so not on disk) stay.
+        open.symbols.extend(fresh.symbols);
+        open.branch = fresh.branch;
+        let by_command = fresh.project != base;
+        let by_window = open.project != base;
         let mut note = None;
-        if fresh.project != base && fresh.project != open.project {
-            if open.project != base {
-                note = Some(
-                    "The project was also edited in the window while the command ran; the command's result \
-                     replaced those edits (Undo brings them back).",
-                );
-            }
+        if by_command && by_window {
+            note = Some(
+                "The project was edited in the window while the command ran, so the command's changes were \
+                 not loaded: the window's edits are kept, and saving writes them over the command's result.",
+            );
+        } else if by_command {
             open.checkpoint();
             open.project = fresh.project;
             open.dirty = false;
         }
-        open.symbols = fresh.symbols;
-        open.branch = fresh.branch;
         open.refresh_library();
         self.prune_selection();
-        if let Some(n) = note {
-            self.ed.message = n.into();
-        }
-        match (r, note) {
-            (Ok(t), Some(n)) => Ok(format!("{t}\n\n{n}")),
-            (Err(t), Some(n)) => Err(format!("{t}\n\n{n}")),
-            (r, None) => r,
+        match note {
+            Some(n) => {
+                self.ed.message = n.into();
+                Err(match r {
+                    Ok(t) | Err(t) => format!("{t}\n\n{n} Ask the user before running it again."),
+                })
+            }
+            None => r,
         }
     }
 }
@@ -2562,20 +2575,41 @@ mod tests {
         let (_tmp, mut a) = app(vec![]);
         let r = command_around(&mut a, |a| command_writes_customer(a, "Disk"));
         assert_eq!(customer(&a).as_deref(), Some("Disk"));
-        assert!(!format!("{r:?}").contains("Undo brings them back"));
+        assert!(!format!("{r:?}").contains("not loaded"));
     }
 
     #[test]
-    fn when_both_changed_the_project_the_command_wins_and_undo_brings_the_edit_back() {
+    fn when_both_changed_the_project_the_window_s_edits_win() {
         let (_tmp, mut a) = app(vec![]);
         let r = command_around(&mut a, |a| {
             call(a, "set_project", json!({"title_block": {"customer": "Window"}})).unwrap();
             command_writes_customer(a, "Disk");
         });
-        assert_eq!(customer(&a).as_deref(), Some("Disk"));
-        assert!(format!("{r:?}").contains("Undo brings them back"));
-        assert!(a.open.as_mut().unwrap().undo());
         assert_eq!(customer(&a).as_deref(), Some("Window"));
+        assert!(
+            a.open.as_ref().unwrap().dirty,
+            "the window's edits are still to be saved"
+        );
+        let e = r.unwrap_err();
+        assert!(e.contains("not loaded"), "{e}");
+    }
+
+    #[test]
+    fn the_window_does_not_save_while_a_command_runs() {
+        let (_tmp, mut a) = app(vec![]);
+        let r = command_around(&mut a, |a| {
+            assert!(a.assistant.command_running());
+            call(a, "set_project", json!({"title_block": {"customer": "First"}})).unwrap();
+            let _ = call(a, "run_action", json!({"action": "Save"}));
+            let dir = a.open.as_ref().unwrap().dir.clone();
+            let disk = Open::load(&dir).unwrap();
+            assert_eq!(disk.project.meta.title_block.get("customer"), None, "nothing saved");
+            call(a, "set_project", json!({"title_block": {"customer": "Second"}})).unwrap();
+        });
+        // A read-only command: the latest window edit stays, with no conflict reported.
+        assert_eq!(customer(&a).as_deref(), Some("Second"));
+        assert!(!format!("{r:?}").contains("not loaded"), "{r:?}");
+        assert!(!a.assistant.command_running());
     }
 
     #[test]
