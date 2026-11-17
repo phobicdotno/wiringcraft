@@ -16,7 +16,7 @@ mod prefs;
 mod state;
 mod theme;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, Pos2, RichText, Stroke, Vec2};
 
@@ -1280,15 +1280,19 @@ fn size_label(s: PageSize) -> &'static str {
 /// The starter symbol library: `library/` beside the executable or in the source tree.
 fn starter_library() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
-    let dir = exe.as_ref().and_then(|e| e.parent());
-    // Next to the program (Windows install, download folder), the Linux package layout
-    // (/usr/bin -> /usr/share/wiringcraft), the macOS app bundle (Contents/MacOS ->
-    // Contents/Resources), then the source checkout this was built from.
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    find_library(exe.as_deref().and_then(Path::parent), &source)
+}
+
+/// The first `library/` with a `symbols` folder: next to the program (Windows install, download
+/// folder), the Linux package layout (/usr/bin -> /usr/share/wiringcraft), the macOS app bundle
+/// (Contents/MacOS -> Contents/Resources), then the source checkout this was built from.
+fn find_library(exe_dir: Option<&Path>, source: &Path) -> Option<PathBuf> {
     let candidates = [
-        dir.map(|d| d.join("library")),
-        dir.map(|d| d.join("../share/wiringcraft/library")),
-        dir.map(|d| d.join("../Resources/library")),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library")),
+        exe_dir.map(|d| d.join("library")),
+        exe_dir.map(|d| d.join("../share/wiringcraft/library")),
+        exe_dir.map(|d| d.join("../Resources/library")),
+        Some(source.to_path_buf()),
     ];
     candidates
         .into_iter()
@@ -1714,4 +1718,46 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("WiringCraft", options, Box::new(|cc| Ok(Box::new(App::new(cc, dir)))))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod library_tests {
+    use super::*;
+
+    /// Makes `<root>/<rel>/symbols` and returns `<root>/<rel>` canonicalized.
+    fn lib(root: &Path, rel: &str) -> PathBuf {
+        std::fs::create_dir_all(root.join(rel).join("symbols")).unwrap();
+        root.join(rel).canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_library_is_found_in_each_install_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let none = t.path().join("no-source");
+        // Linux package: /usr/bin/wiringcraft-app with /usr/share/wiringcraft/library.
+        let linux = t.path().join("usr");
+        let want = lib(&linux, "share/wiringcraft/library");
+        std::fs::create_dir_all(linux.join("bin")).unwrap();
+        assert_eq!(find_library(Some(&linux.join("bin")), &none), Some(want));
+        // macOS bundle: Contents/MacOS with Contents/Resources/library.
+        let mac = t.path().join("WiringCraft.app/Contents");
+        let want = lib(&mac, "Resources/library");
+        std::fs::create_dir_all(mac.join("MacOS")).unwrap();
+        assert_eq!(find_library(Some(&mac.join("MacOS")), &none), Some(want));
+        // Nothing installed and no source checkout: no library.
+        let empty = t.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(find_library(Some(&empty), &none), None);
+    }
+
+    #[test]
+    fn a_library_next_to_the_program_wins() {
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("app");
+        let beside = lib(&app, "library");
+        let source = lib(t.path(), "source/library");
+        assert_eq!(find_library(Some(&app), &source), Some(beside));
+        assert_eq!(find_library(None, &source), Some(source));
+    }
 }
