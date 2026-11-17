@@ -8,6 +8,7 @@ use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
 use wc_core::project::PageSize;
 use wc_core::route::{self, Axis, Route};
+use wc_core::template::PageTemplate;
 use wc_core::{DevicePart, DeviceTag, Endpoint, Page, Part, PlacedSymbol, Project, Symbol, Wire, store};
 
 /// How a part is listed in the picker: manufacturer, order number and description.
@@ -1404,6 +1405,44 @@ impl Open {
         self.project.meta.title_block = block;
     }
 
+    /// Set the page template while its form is open, so every page shows each change at once.
+    /// Like [`Open::set_project_props_live`], the form's changes stay one undo step while
+    /// nothing else changes the history.
+    pub fn set_template_live(&mut self, template: &PageTemplate) {
+        if self.project.meta.template == *template {
+            return;
+        }
+        if self.form_step == Some(self.history) {
+            self.dirty = true;
+        } else {
+            self.checkpoint();
+            self.form_step = Some(self.history);
+        }
+        self.project.meta.template = template.clone();
+    }
+
+    /// Take back what [`Open::set_template_live`] changed since `since` (the form was
+    /// cancelled), back to `before`. When the form's own undo step is the last one and holds
+    /// nothing else, it is undone; otherwise the template alone is put back as a new step.
+    pub fn revert_template(&mut self, since: usize, before: &PageTemplate) {
+        let only_the_form = self.undo_mark() == since + 1
+            && self.undo.last().is_some_and(|prev| {
+                let mut p = prev.clone();
+                p.meta.template.clone_from(&self.project.meta.template);
+                p == self.project && prev.meta.template == *before
+            });
+        if only_the_form {
+            if self.undo() {
+                self.redo.clear();
+            }
+            return;
+        }
+        if self.project.meta.template != *before {
+            self.checkpoint();
+            self.project.meta.template = before.clone();
+        }
+    }
+
     /// Whether the last undo step differs from the project only in its name and title-block
     /// fields (it is a properties form's step, with nothing else in it).
     fn last_step_changed_only_props(&self) -> bool {
@@ -2263,6 +2302,37 @@ pub(crate) mod tests {
         assert!(!o.can_redo());
         o.revert_live(since, &before);
         assert!(!o.can_undo(), "nothing changed, nothing undone");
+    }
+
+    #[test]
+    fn the_template_form_is_one_undo_step_and_cancel_puts_it_back() {
+        let (_tmp, mut o) = project();
+        o.start_live_form();
+        let before = o.project.meta.template.clone();
+        let mut draft = before.clone();
+        for columns in [11, 12] {
+            draft.columns = columns;
+            o.set_template_live(&draft);
+            assert_eq!(o.project.meta.template.columns, columns, "shown at once");
+        }
+        draft.boxes[0].label = "Client".into();
+        o.set_template_live(&draft);
+        // Saved with the project and read back.
+        o.save().unwrap();
+        let text = std::fs::read_to_string(o.dir.join("project.toml")).unwrap();
+        assert!(text.contains("[template]") && text.contains("Client"), "{text}");
+        assert_eq!(store::load(&o.dir).unwrap().meta.template, draft);
+        assert!(o.undo(), "one step");
+        assert_eq!(o.project.meta.template, before);
+        assert!(!o.can_undo());
+
+        // Cancel takes the form's changes back and leaves nothing to redo.
+        let since2 = o.start_live_form();
+        draft.columns = 8;
+        o.set_template_live(&draft);
+        o.revert_template(since2, &before);
+        assert_eq!(o.project.meta.template, before);
+        assert!(!o.can_redo() && !o.can_undo());
     }
 
     /// The cover form's flow in `main.rs`: it refreshes its buffer when the history count moved

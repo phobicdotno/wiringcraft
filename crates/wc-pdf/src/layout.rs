@@ -12,9 +12,10 @@ use crate::writer::{Drawn, Layer, Link, Pen, text_width_mm};
 pub use wc_core::project::FRAME_COLUMNS;
 const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
 const HEADER: f64 = 6.0;
-const TITLE_H: f64 = 24.0;
+const TITLE_H: f64 = wc_core::template::TITLE_HEIGHT;
 
-/// The column (1-based) a point falls into.
+/// The column (1-based) a point falls into with the built-in column count; a project's own
+/// count is [`Project::column_of`].
 pub fn column_of(size: PageSize, x: f64) -> usize {
     size.column_of(x)
 }
@@ -153,7 +154,7 @@ impl CrossRefs {
                 let a = Appearance {
                     page_id: page.id.clone(),
                     page_number: page.number.clone(),
-                    column: column_of(page.size, s.at.x),
+                    column: project.column_of(page, s.at.x),
                     row: page.size.row_of(s.at.y),
                     pins: sym.pins.iter().map(|p| p.name.clone()).collect(),
                     item: s.id.clone(),
@@ -254,8 +255,31 @@ fn fit_height(t: &str, height: f64, room: f64) -> f64 {
     }
 }
 
-/// Padding between a title-block text and its box's sides, in millimetres.
-const PAD: f64 = 1.5;
+use wc_core::template::{self, PAD};
+
+/// Collinear segments `(at, from, to)` with overlapping or touching pieces joined, sorted by
+/// `at` then `from`.
+fn merge_segments(mut segs: Vec<(f64, f64, f64)>) -> Vec<(f64, f64, f64)> {
+    const EPS: f64 = 1e-6;
+    for s in &mut segs {
+        if s.1 > s.2 {
+            (s.1, s.2) = (s.2, s.1);
+        }
+    }
+    segs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let mut out: Vec<(f64, f64, f64)> = Vec::new();
+    for s in segs {
+        if let Some(last) = out.last_mut()
+            && (last.0 - s.0).abs() < EPS
+            && s.1 <= last.2 + EPS
+        {
+            last.2 = last.2.max(s.2);
+        } else {
+            out.push(s);
+        }
+    }
+    out
+}
 
 pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, date: &str) -> Vec<FrameMark> {
     let (w, h) = page.size.mm();
@@ -293,8 +317,10 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
     });
     // Column strip along the top.
     line((x0, y0 + HEADER), (x1, y0 + HEADER), Ink::Thin, &mut out);
-    let col_w = (x1 - x0) / FRAME_COLUMNS as f64;
-    for c in 0..FRAME_COLUMNS {
+    let template = &project.meta.template;
+    let columns = template.column_count();
+    let col_w = (x1 - x0) / columns as f64;
+    for c in 0..columns {
         let cx = x0 + col_w * c as f64;
         if c > 0 {
             line((cx, y0), (cx, y0 + HEADER), Ink::Thin, &mut out);
@@ -336,109 +362,75 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
             &mut out,
         );
     }
-    // Title block: a full-width band at the bottom, divided into fields.
+    // Title block: a full-width band at the bottom, divided into the template's boxes.
     let ty = y1 - TITLE_H;
-    let mid = ty + TITLE_H / 2.0;
     line((x0, ty), (x1, ty), Ink::Thick, &mut out);
-    let fx = [x0, x0 + 80.0, x1 - 150.0, x1 - 60.0, x1 - 30.0];
-    for x in fx.iter().skip(1) {
-        line((*x, ty), (*x, y1), Ink::Thin, &mut out);
-    }
-    line((fx[0], mid), (fx[1], mid), Ink::Thin, &mut out);
-    line((fx[0] + 40.0, mid), (fx[0] + 40.0, y1), Ink::Thin, &mut out);
-    line((fx[2], mid), (x1, mid), Ink::Thin, &mut out);
-    // The page's own fields (its revision, date, ...) win over the project's.
-    let get = |k: &str| page.title_field(&project.meta, k);
-    // Each value is shrunk to the width of its box (less padding), so a long one never runs into
-    // the next box or over the frame.
-    let field = |x: f64, w: f64, y: f64, label: &str, value: &str, height: f64, out: &mut Vec<FrameMark>| {
-        text((x + PAD, y + 3.0), 1.8, Align::Left, label, Ink::Label, out);
-        let h = fit_height(value, height, w - 2.0 * PAD);
-        text((x + PAD, y + 9.5), h, Align::Left, value, Ink::Thin, out);
-    };
-    // A centred value in a box from `x` that is `w` wide.
-    let centred = |x: f64, w: f64, y: f64, value: &str, height: f64, out: &mut Vec<FrameMark>| {
-        let h = fit_height(value, height, w - 2.0 * PAD);
-        text((x + w / 2.0, y), h, Align::Center, value, Ink::Thin, out);
-    };
-    field(fx[0], fx[1] - fx[0], ty, "Customer", get("customer"), 3.0, &mut out);
-    field(fx[0], 40.0, mid, "Drawn by", get("drawn_by"), 2.5, &mut out);
-    field(
-        fx[0] + 40.0,
-        fx[1] - fx[0] - 40.0,
-        mid,
-        "Checked by",
-        get("checked_by"),
-        2.5,
-        &mut out,
-    );
-    text(
-        (fx[1] + PAD, ty + 3.0),
-        1.8,
-        Align::Left,
-        "Project",
-        Ink::Label,
-        &mut out,
-    );
-    // The project box's texts start 3 mm in.
-    let project_room = fx[2] - fx[1] - 3.0 - PAD;
-    let name = &project.meta.name;
-    let name_h = fit_height(name, 4.0, project_room);
-    text((fx[1] + 3.0, ty + 11.0), name_h, Align::Left, name, Ink::Thin, &mut out);
-    let title_h = fit_height(&page.title, 3.0, project_room);
-    text(
-        (fx[1] + 3.0, ty + 19.5),
-        title_h,
-        Align::Left,
-        &page.title,
-        Ink::Thin,
-        &mut out,
-    );
-    let numbers: Vec<&str> = [get("project_number"), get("plant")]
-        .into_iter()
-        .filter(|s| !s.is_empty())
+    let boxes: Vec<_> = template
+        .boxes
+        .iter()
+        .filter_map(|b| b.resolve(x0, x1).map(|r| (b, r)))
         .collect();
-    let numbers = numbers.join("  \u{b7}  ");
-    let numbers_h = fit_height(&numbers, 2.2, fx[2] - fx[1] - 2.0 - PAD);
-    text(
-        (fx[2] - 2.0, ty + 22.0),
-        numbers_h,
-        Align::Right,
-        &numbers,
-        Ink::Thin,
-        &mut out,
-    );
-    field(fx[2], fx[3] - fx[2], ty, "Revision", get("revision"), 2.5, &mut out);
-    let d = if get("date").trim().is_empty() {
-        date
-    } else {
-        get("date")
-    };
-    field(fx[2], fx[3] - fx[2], mid, "Date", d, 2.5, &mut out);
-    text((fx[3] + PAD, ty + 3.0), 1.8, Align::Left, "Page", Ink::Label, &mut out);
-    centred(fx[3], fx[4] - fx[3], ty + 10.5, &page.number, 4.0, &mut out);
-    text(
-        (fx[3] + PAD, mid + 3.0),
-        1.8,
-        Align::Left,
-        "Location",
-        Ink::Label,
-        &mut out,
-    );
-    centred(fx[3], fx[4] - fx[3], mid + 9.5, get("location"), 2.5, &mut out);
-    text((fx[4] + PAD, ty + 3.0), 1.8, Align::Left, "Sheet", Ink::Label, &mut out);
+    // Box sides, less those on the band's outline, with overlapping pieces drawn once.
+    let mut across: Vec<(f64, f64, f64)> = Vec::new();
+    let mut down: Vec<(f64, f64, f64)> = Vec::new();
+    for (_, (l, t, r, b)) in &boxes {
+        for y in [*t, *b] {
+            if y > 1e-6 && y < TITLE_H - 1e-6 {
+                across.push((ty + y, *l, *r));
+            }
+        }
+        for x in [*l, *r] {
+            if x > x0 + 1e-6 && x < x1 - 1e-6 {
+                down.push((x, ty + t, ty + b));
+            }
+        }
+    }
+    for (x, a, b) in merge_segments(down) {
+        line((x, a), (x, b), Ink::Thin, &mut out);
+    }
+    for (y, a, b) in merge_segments(across) {
+        line((a, y), (b, y), Ink::Thin, &mut out);
+    }
+    // The page's own fields (its revision, date, ...) win over the project's.
     let sheet = format!("{} / {}", index + 1, total);
-    centred(fx[4], x1 - fx[4], ty + 10.0, &sheet, 3.0, &mut out);
-    // The project's logo takes this box when it has one (see `title_logo_box`).
-    if project.meta.logo.is_none() {
-        text(
-            (fx[4] + 15.0, mid + 9.5),
-            2.0,
-            Align::Center,
-            "WiringCraft",
-            Ink::Thin,
-            &mut out,
-        );
+    let value = |key: &str| -> String {
+        match key {
+            template::PROJECT_NAME => project.meta.name.clone(),
+            template::PAGE_TITLE => page.title.clone(),
+            template::PAGE_NUMBER => page.number.clone(),
+            template::SHEET => sheet.clone(),
+            "date" if page.title_field(&project.meta, "date").trim().is_empty() => date.to_owned(),
+            k => page.title_field(&project.meta, k).to_owned(),
+        }
+    };
+    for (b, (l, t, r, _)) in &boxes {
+        let top = ty + t;
+        text((l + PAD, top + 3.0), 1.8, Align::Left, &b.label, Ink::Label, &mut out);
+        // Each value is shrunk to the width of its box (less padding), so a long one never runs
+        // into the next box or over the frame.
+        for bt in &b.texts {
+            let shown: Vec<String> = bt.values.iter().map(|k| value(k)).filter(|v| !v.is_empty()).collect();
+            let shown = shown.join("  \u{b7}  ");
+            let (x, room) = match bt.align {
+                Align::Left => (l + bt.inset, r - l - bt.inset - PAD),
+                Align::Right => (r - bt.inset, r - l - bt.inset - PAD),
+                Align::Center => ((l + r) / 2.0, r - l - 2.0 * PAD),
+            };
+            let h = fit_height(&shown, bt.size, room);
+            text((x, top + bt.y), h, bt.align, &shown, Ink::Thin, &mut out);
+        }
+        // The project's logo takes a logo box when it has one (see `title_logo_box`).
+        if b.logo && project.meta.logo.is_none() {
+            let h = fit_height("WiringCraft", 2.0, r - l - 2.0 * PAD);
+            text(
+                ((l + r) / 2.0, top + 9.5),
+                h,
+                Align::Center,
+                "WiringCraft",
+                Ink::Thin,
+                &mut out,
+            );
+        }
     }
     if page.cover {
         cover_marks(project, (x0, y0 + HEADER, x1, ty), date, &mut out);
@@ -447,12 +439,21 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
 }
 
 /// The title block's logo box on `page` (top-left and bottom-right, in millimetres): the
-/// bottom-right field, where pages without a logo show "WiringCraft".
-pub fn title_logo_box(page: &Page) -> (Point, Point) {
+/// page template's first logo box, less 1 mm all round, where pages without a logo show
+/// "WiringCraft". `None` when the template has no logo box.
+pub fn title_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> {
     let (w, h) = page.size.mm();
-    let (x1, y1) = (w - MARGIN, h - MARGIN);
-    let mid = y1 - TITLE_H / 2.0;
-    (Point::new(x1 - 30.0 + 1.0, mid + 1.0), Point::new(x1 - 1.0, y1 - 1.0))
+    let (x0, x1, y1) = (MARGIN, w - MARGIN, h - MARGIN);
+    let ty = y1 - TITLE_H;
+    let (l, t, r, b) = project
+        .meta
+        .template
+        .boxes
+        .iter()
+        .filter(|b| b.logo)
+        .find_map(|b| b.resolve(x0, x1))?;
+    let (a, b) = (Point::new(l + 1.0, ty + t + 1.0), Point::new(r - 1.0, ty + b - 1.0));
+    (a.x < b.x && a.y < b.y).then_some((a, b))
 }
 
 /// Where the cover page shows the logo until the user moves it: centred above the project's
@@ -491,7 +492,7 @@ pub fn logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
     if project.meta.logo.is_none() {
         return Vec::new();
     }
-    let mut out = vec![title_logo_box(page)];
+    let mut out: Vec<_> = title_logo_box(project, page).into_iter().collect();
     out.extend(cover_logo_box(project, page));
     out
 }
@@ -1031,5 +1032,328 @@ pub fn draw_panel_page(
         layers: pen.layers,
         underlay: None,
         pictures: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+    use wc_core::template::{BoxText, PageTemplate, Side, TitleBox};
+
+    // The title block exactly as it was drawn before the layout came from the page template.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn legacy_frame_marks(
+        project: &Project,
+        page: &Page,
+        index: usize,
+        total: usize,
+        date: &str,
+    ) -> Vec<FrameMark> {
+        let (w, h) = page.size.mm();
+        let (x0, y0, x1, y1) = (MARGIN, MARGIN, w - MARGIN, h - MARGIN);
+        let mut out = Vec::new();
+        let line = |a: (f64, f64), b: (f64, f64), ink: Ink, out: &mut Vec<FrameMark>| {
+            out.push(FrameMark {
+                shape: Shape::Line {
+                    a: Point::new(a.0, a.1),
+                    b: Point::new(b.0, b.1),
+                },
+                ink,
+            });
+        };
+        let text = |at: (f64, f64), height: f64, align: Align, t: &str, ink: Ink, out: &mut Vec<FrameMark>| {
+            if !t.is_empty() {
+                out.push(FrameMark {
+                    shape: Shape::Text {
+                        at: Point::new(at.0, at.1),
+                        text: t.to_owned(),
+                        height,
+                        align,
+                        angle: 0.0,
+                    },
+                    ink,
+                });
+            }
+        };
+        out.push(FrameMark {
+            shape: Shape::Rect {
+                min: Point::new(x0, y0),
+                max: Point::new(x1, y1),
+            },
+            ink: Ink::Thick,
+        });
+        // Column strip along the top.
+        line((x0, y0 + HEADER), (x1, y0 + HEADER), Ink::Thin, &mut out);
+        let col_w = (x1 - x0) / wc_core::project::FRAME_COLUMNS as f64;
+        for c in 0..wc_core::project::FRAME_COLUMNS {
+            let cx = x0 + col_w * c as f64;
+            if c > 0 {
+                line((cx, y0), (cx, y0 + HEADER), Ink::Thin, &mut out);
+            }
+            text(
+                (cx + col_w / 2.0, y0 + HEADER - 1.8),
+                2.5,
+                Align::Center,
+                &(c + 1).to_string(),
+                Ink::Thin,
+                &mut out,
+            );
+        }
+        // Row letters down both sides, in the margin outside the frame, so nothing inside moves.
+        let rows = page.size.frame_rows();
+        let row_h = (y1 - y0) / rows as f64;
+        for r in 0..rows {
+            let ry = y0 + row_h * r as f64;
+            if r > 0 {
+                line((x0 - 3.0, ry), (x0, ry), Ink::Thin, &mut out);
+                line((x1, ry), (x1 + 3.0, ry), Ink::Thin, &mut out);
+            }
+            let letter = wc_core::project::row_letter(r + 1).to_string();
+            let cy = ry + row_h / 2.0 + 0.9;
+            text(
+                (x0 - MARGIN / 2.0, cy),
+                2.5,
+                Align::Center,
+                &letter,
+                Ink::Thin,
+                &mut out,
+            );
+            text(
+                (x1 + MARGIN / 2.0, cy),
+                2.5,
+                Align::Center,
+                &letter,
+                Ink::Thin,
+                &mut out,
+            );
+        }
+        // Title block: a full-width band at the bottom, divided into fields.
+        let ty = y1 - TITLE_H;
+        let mid = ty + TITLE_H / 2.0;
+        line((x0, ty), (x1, ty), Ink::Thick, &mut out);
+        let fx = [x0, x0 + 80.0, x1 - 150.0, x1 - 60.0, x1 - 30.0];
+        for x in fx.iter().skip(1) {
+            line((*x, ty), (*x, y1), Ink::Thin, &mut out);
+        }
+        line((fx[0], mid), (fx[1], mid), Ink::Thin, &mut out);
+        line((fx[0] + 40.0, mid), (fx[0] + 40.0, y1), Ink::Thin, &mut out);
+        line((fx[2], mid), (x1, mid), Ink::Thin, &mut out);
+        // The page's own fields (its revision, date, ...) win over the project's.
+        let get = |k: &str| page.title_field(&project.meta, k);
+        // Each value is shrunk to the width of its box (less padding), so a long one never runs into
+        // the next box or over the frame.
+        let field = |x: f64, w: f64, y: f64, label: &str, value: &str, height: f64, out: &mut Vec<FrameMark>| {
+            text((x + PAD, y + 3.0), 1.8, Align::Left, label, Ink::Label, out);
+            let h = fit_height(value, height, w - 2.0 * PAD);
+            text((x + PAD, y + 9.5), h, Align::Left, value, Ink::Thin, out);
+        };
+        // A centred value in a box from `x` that is `w` wide.
+        let centred = |x: f64, w: f64, y: f64, value: &str, height: f64, out: &mut Vec<FrameMark>| {
+            let h = fit_height(value, height, w - 2.0 * PAD);
+            text((x + w / 2.0, y), h, Align::Center, value, Ink::Thin, out);
+        };
+        field(fx[0], fx[1] - fx[0], ty, "Customer", get("customer"), 3.0, &mut out);
+        field(fx[0], 40.0, mid, "Drawn by", get("drawn_by"), 2.5, &mut out);
+        field(
+            fx[0] + 40.0,
+            fx[1] - fx[0] - 40.0,
+            mid,
+            "Checked by",
+            get("checked_by"),
+            2.5,
+            &mut out,
+        );
+        text(
+            (fx[1] + PAD, ty + 3.0),
+            1.8,
+            Align::Left,
+            "Project",
+            Ink::Label,
+            &mut out,
+        );
+        // The project box's texts start 3 mm in.
+        let project_room = fx[2] - fx[1] - 3.0 - PAD;
+        let name = &project.meta.name;
+        let name_h = fit_height(name, 4.0, project_room);
+        text((fx[1] + 3.0, ty + 11.0), name_h, Align::Left, name, Ink::Thin, &mut out);
+        let title_h = fit_height(&page.title, 3.0, project_room);
+        text(
+            (fx[1] + 3.0, ty + 19.5),
+            title_h,
+            Align::Left,
+            &page.title,
+            Ink::Thin,
+            &mut out,
+        );
+        let numbers: Vec<&str> = [get("project_number"), get("plant")]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        let numbers = numbers.join("  \u{b7}  ");
+        let numbers_h = fit_height(&numbers, 2.2, fx[2] - fx[1] - 2.0 - PAD);
+        text(
+            (fx[2] - 2.0, ty + 22.0),
+            numbers_h,
+            Align::Right,
+            &numbers,
+            Ink::Thin,
+            &mut out,
+        );
+        field(fx[2], fx[3] - fx[2], ty, "Revision", get("revision"), 2.5, &mut out);
+        let d = if get("date").trim().is_empty() {
+            date
+        } else {
+            get("date")
+        };
+        field(fx[2], fx[3] - fx[2], mid, "Date", d, 2.5, &mut out);
+        text((fx[3] + PAD, ty + 3.0), 1.8, Align::Left, "Page", Ink::Label, &mut out);
+        centred(fx[3], fx[4] - fx[3], ty + 10.5, &page.number, 4.0, &mut out);
+        text(
+            (fx[3] + PAD, mid + 3.0),
+            1.8,
+            Align::Left,
+            "Location",
+            Ink::Label,
+            &mut out,
+        );
+        centred(fx[3], fx[4] - fx[3], mid + 9.5, get("location"), 2.5, &mut out);
+        text((fx[4] + PAD, ty + 3.0), 1.8, Align::Left, "Sheet", Ink::Label, &mut out);
+        let sheet = format!("{} / {}", index + 1, total);
+        centred(fx[4], x1 - fx[4], ty + 10.0, &sheet, 3.0, &mut out);
+        // The project's logo takes this box when it has one (see `title_logo_box`).
+        if project.meta.logo.is_none() {
+            text(
+                (fx[4] + 15.0, mid + 9.5),
+                2.0,
+                Align::Center,
+                "WiringCraft",
+                Ink::Thin,
+                &mut out,
+            );
+        }
+        if page.cover {
+            cover_marks(project, (x0, y0 + HEADER, x1, ty), date, &mut out);
+        }
+        out
+    }
+
+    fn key(m: &FrameMark) -> String {
+        format!("{:?} {:?}", m.ink, m.shape)
+    }
+
+    /// Lines as sorted, rounded segments; texts in drawing order.
+    fn split(marks: &[FrameMark]) -> (Vec<String>, Vec<String>) {
+        let r = |v: f64| format!("{:.4}", v);
+        let mut lines = Vec::new();
+        let mut texts = Vec::new();
+        for m in marks {
+            match &m.shape {
+                Shape::Line { a, b } => {
+                    let (p, q) = if (a.x, a.y) <= (b.x, b.y) { (a, b) } else { (b, a) };
+                    lines.push(format!("{:?} {} {} {} {}", m.ink, r(p.x), r(p.y), r(q.x), r(q.y)));
+                }
+                Shape::Text { .. } => texts.push(key(m)),
+                _ => lines.push(key(m)),
+            }
+        }
+        lines.sort();
+        (lines, texts)
+    }
+
+    fn demo(size: PageSize, logo: bool) -> (Project, Page) {
+        let mut p = Project::new("Pump station with a rather long project name that has to shrink");
+        for (k, v) in [
+            ("customer", "ACME"),
+            ("drawn_by", "PH"),
+            ("checked_by", "OK"),
+            ("project_number", "P-1"),
+            ("plant", "North"),
+            ("revision", "B"),
+            ("location", "+CAB1"),
+        ] {
+            p.meta.title_block.insert(k.into(), v.into());
+        }
+        if logo {
+            p.meta.logo = Some(wc_core::Logo {
+                file: "pictures/logo.png".into(),
+                cover: None,
+            });
+        }
+        let mut page = Page::new("p1", "12", "Motor feeders");
+        page.size = size;
+        (p, page)
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_default_template_draws_the_title_block_as_before() {
+        for size in [PageSize::A4, PageSize::A3, PageSize::A2] {
+            for logo in [false, true] {
+                let (p, page) = demo(size, logo);
+                for date in ["", "2026-11-17"] {
+                    let now = split(&frame_marks(&p, &page, 2, 7, date));
+                    let before = split(&legacy_frame_marks(&p, &page, 2, 7, date));
+                    assert_eq!(now, before, "{size:?} logo {logo} date {date:?}");
+                }
+                let mut cover = page.clone();
+                cover.cover = true;
+                assert_eq!(
+                    split(&frame_marks(&p, &cover, 0, 7, "")),
+                    split(&legacy_frame_marks(&p, &cover, 0, 7, ""))
+                );
+                let logo_box = title_logo_box(&p, &page).unwrap();
+                let (w, h) = page.size.mm();
+                let (x1, y1) = (w - MARGIN, h - MARGIN);
+                let mid = y1 - TITLE_H / 2.0;
+                assert_eq!(
+                    logo_box,
+                    (Point::new(x1 - 30.0 + 1.0, mid + 1.0), Point::new(x1 - 1.0, y1 - 1.0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_box_shows_on_every_page_and_columns_follow_the_template() {
+        let (mut p, page) = demo(PageSize::A3, false);
+        p.meta.title_block.insert("order".into(), "ORD-77".into());
+        let mut t = PageTemplate {
+            columns: 12,
+            ..Default::default()
+        };
+        // Make room for an order box left of the revision.
+        t.boxes[3].right = 180.0;
+        let mut order = TitleBox::new("Order", (180.0, Side::Right), (150.0, Side::Right), 0.0, 24.0);
+        order.texts.push(BoxText::new(&["order"], 2.5, 9.5, Align::Left));
+        t.boxes.push(order);
+        // No logo box: the title block then has no logo.
+        t.boxes.retain(|b| !b.logo);
+        p.meta.template = t;
+        let mut second = page.clone();
+        second.id = "p2".into();
+        for pg in [&page, &second] {
+            let marks = frame_marks(&p, pg, 0, 2, "");
+            let texts: Vec<&str> = marks
+                .iter()
+                .filter_map(|m| match &m.shape {
+                    Shape::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(texts.contains(&"Order") && texts.contains(&"ORD-77"), "{texts:?}");
+            assert!(texts.contains(&"12") && !texts.contains(&"13"), "12 columns");
+            assert!(!texts.contains(&"WiringCraft"), "no logo box");
+        }
+        assert_eq!(title_logo_box(&p, &page), None);
+        // Cross-references use the same 12 columns.
+        let (w, _) = page.size.mm();
+        assert_eq!(p.column_of(&page, w - MARGIN - 1.0), 12);
+        assert_eq!(p.column_of(&page, MARGIN + (w - 2.0 * MARGIN) / 12.0 + 0.1), 2);
+    }
+
+    #[test]
+    fn overlapping_box_sides_are_drawn_once() {
+        let merged = merge_segments(vec![(5.0, 0.0, 2.0), (5.0, 3.0, 2.0), (5.0, 4.0, 6.0), (1.0, 0.0, 1.0)]);
+        assert_eq!(merged, vec![(1.0, 0.0, 1.0), (5.0, 0.0, 3.0), (5.0, 4.0, 6.0)]);
     }
 }

@@ -20,6 +20,7 @@ pub mod route;
 pub mod store;
 pub mod symbol;
 pub mod tag;
+pub mod template;
 
 pub use error::{Error, Result};
 pub use geom::{Point, Shape};

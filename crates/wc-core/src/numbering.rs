@@ -114,7 +114,7 @@ pub fn number_wires(
                 let base = format!(
                     "{}.{}",
                     page.map(|p| p.number.trim()).unwrap_or(""),
-                    page.map(|p| p.size.column_of(*x)).unwrap_or(1)
+                    page.map(|p| project.column_of(p, *x)).unwrap_or(1)
                 );
                 let mut k = 1;
                 let mut candidate = base.clone();
