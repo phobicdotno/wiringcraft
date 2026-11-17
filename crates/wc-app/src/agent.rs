@@ -1422,7 +1422,8 @@ impl App {
             "open_comments": open.project.comments.iter().filter(|c| !c.resolved).count(),
             "shown": shown,
             "selection": self.ed.selection.iter().map(selection_id).collect::<Vec<_>>(),
-            "can_undo": open.can_undo(),
+            // In a session, Undo takes back only this person's changes made in it.
+            "can_undo": if self.share.active() { self.share.can_undo() } else { open.can_undo() },
         })))
     }
 
@@ -2246,6 +2247,8 @@ mod tests {
         open.project.devices.insert(tag.clone(), wc_core::Device::default());
         a.share.frame(a.open.as_mut(), None, false);
         assert!(a.share.can_undo());
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["can_undo"], json!(true), "get_state asks the session");
         a.run(Action::Undo);
         a.share.frame(a.open.as_mut(), None, false);
         assert!(!a.open.as_ref().unwrap().project.devices.contains_key(&tag));
@@ -2504,6 +2507,12 @@ mod tests {
         a.share.start_host(&mut open, "Hanna", "hanna@example.com").unwrap();
         a.open = Some(open);
         let before = a.open.as_ref().unwrap().project.clone();
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(
+            state["can_undo"],
+            json!(false),
+            "work from before the session is not undone"
+        );
         for redo in [false, true] {
             assert_eq!(
                 call(&mut a, "undo", json!({"redo": redo})),
