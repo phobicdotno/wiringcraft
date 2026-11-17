@@ -45,7 +45,7 @@ impl Kind {
             Kind::AutomationMl => "AutomationML (importable)",
             Kind::KicadSymbols => "KiCad symbol library (importable into a library)",
             Kind::Xml => "XML (vendor data)",
-            Kind::Csv => "CSV list (importable)",
+            Kind::Csv => "CSV list (importable: parts list into a library, or PLC addresses)",
             Kind::Spreadsheet => "spreadsheet",
             Kind::SqliteDb => "SQLite database (vendor project data)",
             Kind::AccessDb => "Access database (vendor project data)",
