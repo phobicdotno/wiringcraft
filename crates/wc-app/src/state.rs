@@ -532,11 +532,7 @@ impl Open {
             &mut project,
             rule,
             false,
-            |id| {
-                symbols
-                    .get(id)
-                    .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
-            },
+            |id| symbols.get(id).map(|s| s.role),
             |page, end| match end {
                 wc_core::Endpoint::Point { at } => Some(*at),
                 wc_core::Endpoint::Pin { item, pin } => {

@@ -48,16 +48,16 @@ pub struct Numbered {
 /// wires keeps it (and its other wires take it) unless `overwrite` is set; new numbers never
 /// repeat one already in use. Wires that touch no pin are left alone.
 ///
-/// `is_interruption(symbol id)` joins interruption points as for the net list, and
+/// `role(symbol id)` joins interruption points and jumpers as for the net list, and
 /// `position(page, end)` gives a wire end's place on the page (pin ends need the symbol).
 pub fn number_wires(
     project: &mut Project,
     rule: Rule,
     overwrite: bool,
-    is_interruption: impl Fn(&str) -> bool,
+    role: impl Fn(&str) -> Option<crate::symbol::SymbolRole>,
     position: impl Fn(&Page, &Endpoint) -> Option<Point>,
 ) -> Numbered {
-    let (nets, wire_net) = wire_nets(project, is_interruption);
+    let (nets, wire_net) = wire_nets(project, role);
     // Where each net starts: the first page it is drawn on, then its leftmost, topmost point.
     let mut start: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
     let mut existing: BTreeMap<usize, String> = BTreeMap::new();
@@ -204,22 +204,22 @@ mod tests {
     #[test]
     fn sequential_in_drawing_order_and_one_number_per_connection() {
         let mut p = project();
-        let n = number_wires(&mut p, Rule::Sequential, false, |_| false, pos);
+        let n = number_wires(&mut p, Rule::Sequential, false, |_| None, pos);
         // Left to right: c (x 50), e (x 200), a/b (x 300); d touches no pin.
         assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
         assert_eq!((n.connections, n.wires), (3, 4));
         // Running it again changes nothing.
-        assert_eq!(number_wires(&mut p, Rule::Sequential, false, |_| false, pos).wires, 0);
+        assert_eq!(number_wires(&mut p, Rule::Sequential, false, |_| None, pos).wires, 0);
     }
 
     #[test]
     fn page_column_and_potential_rules() {
         let mut p = project();
-        number_wires(&mut p, Rule::PageColumn, false, |_| false, pos);
+        number_wires(&mut p, Rule::PageColumn, false, |_| None, pos);
         // A3: columns are 40 mm wide from x = 10.
         assert_eq!(numbers(&p), [Some("3.8"), Some("3.8"), Some("3.2"), None, Some("3.5")]);
         let mut p = project();
-        number_wires(&mut p, Rule::Potential, false, |_| false, pos);
+        number_wires(&mut p, Rule::Potential, false, |_| None, pos);
         assert_eq!(numbers(&p), [Some("2"), Some("2"), Some("1"), None, Some("24V")]);
     }
 
@@ -227,10 +227,10 @@ mod tests {
     fn existing_numbers_are_kept_unless_overwritten() {
         let mut p = project();
         p.pages[0].wires[1].number = Some("1".into());
-        number_wires(&mut p, Rule::Sequential, false, |_| false, pos);
+        number_wires(&mut p, Rule::Sequential, false, |_| None, pos);
         // a/b keep 1 (now on both wires); the others skip it.
         assert_eq!(numbers(&p), [Some("1"), Some("1"), Some("2"), None, Some("3")]);
-        number_wires(&mut p, Rule::Sequential, true, |_| false, pos);
+        number_wires(&mut p, Rule::Sequential, true, |_| None, pos);
         assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
     }
 
@@ -238,7 +238,7 @@ mod tests {
     fn same_column_gets_a_suffix_and_hostile_positions_are_harmless() {
         let mut p = project();
         p.pages[0].wires[2] = wire("c", pin("s3", "29"), pin("s4", "28"), None, None);
-        number_wires(&mut p, Rule::PageColumn, false, |_| false, pos);
+        number_wires(&mut p, Rule::PageColumn, false, |_| None, pos);
         assert_eq!(numbers(&p)[2], Some("3.7"));
         assert_eq!(numbers(&p)[0], Some("3.8"));
         let mut p = project();
@@ -246,7 +246,7 @@ mod tests {
             &mut p,
             Rule::PageColumn,
             false,
-            |_| false,
+            |_| None,
             |_, _| Some(Point::new(f64::NAN, f64::INFINITY)),
         );
         // Every wire that touches a pin still gets a number.

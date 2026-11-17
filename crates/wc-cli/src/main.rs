@@ -869,11 +869,7 @@ fn run(cli: Cli) -> Res<()> {
                 &mut p,
                 rule,
                 overwrite,
-                |id| {
-                    symbols
-                        .get(id)
-                        .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
-                },
+                |id| symbols.get(id).map(|s| s.role),
                 |page, end| match end {
                     wc_core::Endpoint::Point { at } => Some(*at),
                     wc_core::Endpoint::Pin { item, pin } => {
@@ -989,11 +985,7 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Nets => {
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
-            let linked = wc_core::connectivity::nets_linked(&p, |id| {
-                symbols
-                    .get(id)
-                    .is_some_and(|s| s.role == wc_core::symbol::SymbolRole::Interruption)
-            });
+            let linked = wc_core::connectivity::nets_linked(&p, |id| symbols.get(id).map(|s| s.role));
             for (i, n) in linked.iter().enumerate() {
                 let pins: Vec<String> = n
                     .pins

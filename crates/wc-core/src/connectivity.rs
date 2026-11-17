@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use crate::project::{Endpoint, Page, Project};
+use crate::symbol::SymbolRole;
 
 /// A pin on a placed symbol: (page id, placed symbol id, pin name).
 pub type PinRef = (String, String, String);
@@ -62,13 +63,15 @@ fn wired_pins<'a>(page: &'a Page, item: &'a str) -> impl Iterator<Item = (&'a st
 
 /// Group every connected pin into nets. Pins with no wire are left out.
 pub fn nets(project: &Project) -> Vec<Net> {
-    nets_linked(project, |_| false)
+    nets_linked(project, |_| None)
 }
 
-/// Like [`nets`], and also joins interruption points: every placed symbol for which
-/// `is_interruption(symbol id)` holds is connected to the others with the same device tag.
-pub fn nets_linked(project: &Project, is_interruption: impl Fn(&str) -> bool) -> Vec<Net> {
-    wire_nets(project, is_interruption).0
+/// Like [`nets`], and also joins interruption points. `role(symbol id)` is the role of a placed
+/// symbol's library symbol (`None` when it is not known): every interruption point is connected
+/// to the others with the same device tag, and only terminals (or symbols of unknown role) take
+/// part in jumpers.
+pub fn nets_linked(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> Vec<Net> {
+    wire_nets(project, role).0
 }
 
 /// A wire: (page id, wire id).
@@ -76,7 +79,7 @@ pub type WireRef = (String, String);
 
 /// Like [`nets_linked`], and also says which net each wire belongs to (an index into the nets).
 /// A wire that touches no pin, directly or through other wires, belongs to no net.
-pub fn wire_nets(project: &Project, is_interruption: impl Fn(&str) -> bool) -> (Vec<Net>, BTreeMap<WireRef, usize>) {
+pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> (Vec<Net>, BTreeMap<WireRef, usize>) {
     let mut ids: BTreeMap<Node, usize> = BTreeMap::new();
     let mut dsu = Dsu { parent: Vec::new() };
     let mut wire_nodes: Vec<(WireRef, usize)> = Vec::new();
@@ -108,7 +111,7 @@ pub fn wire_nets(project: &Project, is_interruption: impl Fn(&str) -> bool) -> (
         }
         for s in &page.symbols {
             let Some(tag) = &s.tag else { continue };
-            if !is_interruption(&s.symbol) {
+            if role(&s.symbol) != Some(SymbolRole::Interruption) {
                 continue;
             }
             // Only interruption points that are wired take part; their pins join under the tag.
@@ -126,7 +129,10 @@ pub fn wire_nets(project: &Project, is_interruption: impl Fn(&str) -> bool) -> (
     for (k, j) in project.meta.jumpers.iter().enumerate() {
         for page in &project.pages {
             for s in &page.symbols {
-                if !s.tag.as_ref().is_some_and(|t| j.terminal_of(t).is_some()) {
+                // A device drawn with a terminal's tag is no terminal; it stays off the jumper.
+                if !s.tag.as_ref().is_some_and(|t| j.terminal_of(t).is_some())
+                    || role(&s.symbol).is_some_and(|r| r != SymbolRole::Terminal)
+                {
                     continue;
                 }
                 let wired: Vec<(String, usize)> = wired_pins(page, &s.id)
@@ -228,6 +234,25 @@ mod tests {
                 .iter()
                 .any(|n| n.pins.iter().any(|q| q.2 == "V") && n.pins.len() == 2)
         );
+        // A coil drawn with the tag -X1.4 is no terminal: with roles known it stays off the jumper.
+        let mut coil = term("c1", "-X1.4");
+        coil.symbol = "wc.coil".into();
+        p.pages[1].symbols.push(coil);
+        p.pages[1].wires.push(wire("w5", pin("c1", "1"), pin("m3", "W"), None));
+        let role = |id: &str| {
+            Some(if id == "wc.terminal" {
+                SymbolRole::Terminal
+            } else {
+                SymbolRole::Standalone
+            })
+        };
+        let w_net = |nets: &[Net]| {
+            nets.iter()
+                .find(|n| n.pins.iter().any(|q| q.2 == "W"))
+                .map(|n| n.pins.len())
+        };
+        assert_eq!(w_net(&nets_linked(&p, role)), Some(2), "the coil's wire is its own net");
+        assert_eq!(w_net(&nets(&p)), Some(6), "without roles the tag alone decides");
     }
 
     #[test]
@@ -276,7 +301,7 @@ mod tests {
         b.wires.push(wire("w1", pin("s9", "1"), pin("s2", "1"), None));
         p.pages = vec![a, b];
         assert_eq!(nets(&p).len(), 2);
-        let linked = nets_linked(&p, |s| s == "arrow");
+        let linked = nets_linked(&p, |s| (s == "arrow").then_some(SymbolRole::Interruption));
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].pins.len(), 4);
     }

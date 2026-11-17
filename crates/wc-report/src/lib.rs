@@ -269,9 +269,7 @@ fn pin_label(p: &Project, page_id: &str, item: &str, pin: &str) -> String {
 
 /// The net each pin belongs to, with its potential name (or a generated one).
 fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
-    let nets = connectivity::nets_linked(i.project, |id| {
-        i.symbols.get(id).is_some_and(|s| s.role == SymbolRole::Interruption)
-    });
+    let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
     let mut by_pin = BTreeMap::new();
     for (n, net) in nets.iter().enumerate() {
         let name = net.names.first().cloned().unwrap_or_else(|| format!("N{}", n + 1));

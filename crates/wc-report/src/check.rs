@@ -238,9 +238,7 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
     }
 
     // Shorts: one net carrying two potential names (for example L1 and L2).
-    let nets = wc_core::connectivity::nets_linked(p, |id| {
-        i.symbols.get(id).is_some_and(|s| s.role == SymbolRole::Interruption)
-    });
+    let nets = wc_core::connectivity::nets_linked(p, |id| i.symbols.get(id).map(|s| s.role));
     for n in nets {
         let names: BTreeSet<&str> = n.names.iter().map(String::as_str).collect();
         if names.len() > 1 {
