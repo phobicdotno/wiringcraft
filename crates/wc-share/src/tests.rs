@@ -1020,3 +1020,163 @@ mod network {
         Ok(())
     }
 }
+
+/// Finding sessions on the network, with beacons sent to a browser on this computer.
+mod discovery {
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+
+    use super::TestResult;
+    use crate::discovery::{Announcer, Beacon, Browser, MAX_BEACON, Session};
+    use crate::net::{Listener, connect};
+
+    const EVERY: Duration = Duration::from_millis(50);
+    const FORGET: Duration = Duration::from_millis(400);
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    fn beacon(project: &str, host: &str, port: u16) -> Beacon {
+        Beacon {
+            project: project.into(),
+            host: host.into(),
+            port,
+        }
+    }
+
+    /// Poll until `done` holds for the list, or fail after a while.
+    fn poll_until(b: &mut Browser, done: impl Fn(&[Session]) -> bool) -> std::result::Result<Vec<Session>, String> {
+        let start = Instant::now();
+        loop {
+            let list = b.poll().map_err(|e| e.to_string())?;
+            if done(&list) {
+                return Ok(list);
+            }
+            if start.elapsed() > PATIENCE {
+                return Err(format!("gave up waiting; last list {list:?}"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn two_announced_sessions_are_listed_and_a_stopped_one_is_forgotten() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let to = b.local_addr()?;
+        let pumps = Announcer::start_to(beacon("Pump station", "Ola", 7001), to, EVERY)?;
+        let mill = Announcer::start_to(beacon("Mill", "Kari", 7002), to, EVERY)?;
+        let list = poll_until(&mut b, |l| l.len() == 2)?;
+        assert_eq!(
+            list.iter()
+                .map(|s| (s.project.as_str(), s.host.as_str(), s.addr.port()))
+                .collect::<Vec<_>>(),
+            [("Mill", "Kari", 7002), ("Pump station", "Ola", 7001)]
+        );
+        assert!(
+            list.iter().all(|s| s.addr.ip().is_loopback()),
+            "joined at the sender's address"
+        );
+
+        mill.stop();
+        let list = poll_until(&mut b, |l| l.len() == 1)?;
+        assert_eq!(list[0].project, "Pump station", "the running one stays");
+        drop(pumps);
+        poll_until(&mut b, <[Session]>::is_empty)?;
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_is_heard_unless_sharing_was_turned_on_and_other_traffic_is_ignored() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let to = b.local_addr()?;
+        assert!(b.poll()?.is_empty(), "no announcer, no session");
+        let other = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        other.send_to(b"hello", to)?;
+        other.send_to(br#"{"magic":"something-else","project":"x","host":"y","port":1}"#, to)?;
+        // A real beacon sent after them shows the browser has read the other two.
+        other.send_to(&beacon("Control", "Ola", 7003).encode(), to)?;
+        let list = poll_until(&mut b, |l| !l.is_empty())?;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].project, "Control");
+        Ok(())
+    }
+
+    #[test]
+    fn an_announcement_longer_than_a_browser_reads_is_refused() -> TestResult {
+        let to: SocketAddr = "127.0.0.1:9".parse()?;
+        let fixed = beacon("", "Ola", 7001).encode().len();
+        let at_limit = beacon(&"P".repeat(MAX_BEACON - fixed), "Ola", 7001);
+        assert_eq!(at_limit.encode().len(), MAX_BEACON);
+        Announcer::start_to(at_limit, to, EVERY)?.stop();
+        let over = beacon(&"P".repeat(MAX_BEACON - fixed + 1), "Ola", 7001);
+        let err = Announcer::start_to(over, to, EVERY).err().ok_or("accepted")?;
+        assert!(err.to_string().contains("2048"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_flood_of_datagrams_does_not_hold_up_a_poll() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let to = b.local_addr()?;
+        let other = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        for _ in 0..2_000 {
+            other.send_to(b"noise", to)?;
+        }
+        let start = Instant::now();
+        assert!(b.poll()?.is_empty());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        Ok(())
+    }
+
+    #[test]
+    fn one_poll_reads_at_most_its_budget_from_a_queue_that_never_empties() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let from: SocketAddr = "127.0.0.1:5000".parse()?;
+        let mut calls = 0usize;
+        let read = b.receive(|buf| {
+            calls += 1;
+            buf[..5].copy_from_slice(b"noise");
+            Ok((5, from))
+        })?;
+        assert_eq!(read, crate::discovery::MAX_PER_POLL);
+        assert_eq!(calls, crate::discovery::MAX_PER_POLL);
+
+        // A beacon behind the budget is picked up by the next poll, not lost.
+        let wire = beacon("Control", "Ola", 7003).encode();
+        let mut left = 3;
+        b.receive(|buf| {
+            if left == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            left -= 1;
+            buf[..wire.len()].copy_from_slice(&wire);
+            Ok((wire.len(), from))
+        })?;
+        let list = b.poll()?;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].addr, SocketAddr::new(from.ip(), 7003));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failing_announcement_keeps_its_reason() -> TestResult {
+        // Port 0 cannot be sent to.
+        let a = Announcer::start_to(beacon("P", "Ola", 7001), "127.0.0.1:0".parse()?, EVERY)?;
+        let start = Instant::now();
+        while a.last_error().is_none() && start.elapsed() < PATIENCE {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(a.last_error().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn joining_by_a_typed_address_works_without_discovery() -> TestResult {
+        let l = Listener::bind("127.0.0.1:0")?;
+        let port = l.local_addr()?.port();
+        // What a person types when the network passes no broadcasts.
+        let typed = format!(" 127.0.0.1:{port} ");
+        let addr: SocketAddr = typed.trim().parse()?;
+        assert!(connect(addr).is_ok());
+        Ok(())
+    }
+}
