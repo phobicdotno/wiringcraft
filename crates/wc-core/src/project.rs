@@ -744,12 +744,50 @@ impl Page {
 /// A device: one real-world product, possibly drawn with several symbols on several pages.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Device {
+    /// The main part.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
+    /// More parts that belong to the device: an auxiliary contact block, a marker, an end plate.
+    /// Old files without it read as none, and a device without any is saved as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accessories: Vec<DevicePart>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub properties: BTreeMap<String, String>,
+}
+
+/// One more part of a device, with how many of it the device needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevicePart {
+    pub part: String,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub qty: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn is_one(n: &u32) -> bool {
+    *n == 1
+}
+
+impl Device {
+    /// Every part of the device with its quantity: the main part (once), then the accessories.
+    pub fn all_parts(&self) -> Vec<(&str, u32)> {
+        self.part
+            .as_deref()
+            .map(|p| (p, 1))
+            .into_iter()
+            .chain(self.accessories.iter().map(|a| (a.part.as_str(), a.qty)))
+            .collect()
+    }
+
+    /// Whether the device uses part `id`, as its main part or as an accessory.
+    pub fn uses_part(&self, id: &str) -> bool {
+        self.part.as_deref() == Some(id) || self.accessories.iter().any(|a| a.part == id)
+    }
 }
 
 /// A whole project in memory.
@@ -810,7 +848,10 @@ impl Project {
 
     /// Every part id used by any device.
     pub fn used_parts(&self) -> std::collections::BTreeSet<String> {
-        self.devices.values().filter_map(|d| d.part.clone()).collect()
+        self.devices
+            .values()
+            .flat_map(|d| d.all_parts().into_iter().map(|(p, _)| p.to_owned()))
+            .collect()
     }
 
     /// Pages that place a given symbol.
@@ -866,6 +907,35 @@ pub fn natural_key(s: &str) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_with_one_part_reads_and_writes_as_before() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let old = r#"{"part":"acme.relay","description":"Relay"}"#;
+        let d: Device = serde_json::from_str(old)?;
+        assert!(d.accessories.is_empty());
+        assert_eq!(serde_json::to_string(&d)?, old);
+        assert_eq!(d.all_parts(), [("acme.relay", 1)]);
+
+        let mut d = d;
+        d.accessories = vec![
+            DevicePart {
+                part: "acme.block".into(),
+                qty: 1,
+            },
+            DevicePart {
+                part: "acme.marker".into(),
+                qty: 4,
+            },
+        ];
+        let json = serde_json::to_string(&d)?;
+        assert!(json.contains(r#""accessories":[{"part":"acme.block"},{"part":"acme.marker","qty":4}]"#));
+        assert_eq!(serde_json::from_str::<Device>(&json)?, d);
+        assert!(d.uses_part("acme.marker") && !d.uses_part("acme.other"));
+        let mut p = Project::new("x");
+        p.devices.insert(DeviceTag::parse("-K1")?, d);
+        assert_eq!(p.used_parts().len(), 3);
+        Ok(())
+    }
 
     #[test]
     fn rows_cover_the_frame_height_for_each_sheet_size() {

@@ -401,6 +401,7 @@ pub fn device_entry(d: &AmlDevice, parts: &mut Vec<wc_core::Part>) -> Option<(De
     });
     let device = Device {
         part,
+        accessories: Vec::new(),
         description: d
             .properties
             .get("Function text")
@@ -725,6 +726,7 @@ mod tests {
             tag("=A-K1")?,
             Device {
                 part: Some(part.id.clone()),
+                accessories: Vec::new(),
                 description: "Pump relay".into(),
                 properties: BTreeMap::new(),
             },

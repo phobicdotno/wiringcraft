@@ -8,7 +8,7 @@ use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
 use wc_core::project::PageSize;
 use wc_core::route::{self, Axis, Route};
-use wc_core::{DeviceTag, Endpoint, Page, Part, PlacedSymbol, Project, Symbol, Wire, store};
+use wc_core::{DevicePart, DeviceTag, Endpoint, Page, Part, PlacedSymbol, Project, Symbol, Wire, store};
 
 /// How a part is listed in the picker: manufacturer, order number and description.
 pub fn part_label(p: &Part) -> String {
@@ -230,8 +230,12 @@ impl Open {
             .project
             .devices
             .values()
-            .filter_map(|d| d.part.as_ref())
-            .filter_map(|id| store::read_vendored_part(&self.dir, id).ok().map(|p| (id.clone(), p)))
+            .flat_map(|d| d.all_parts())
+            .filter_map(|(id, _)| {
+                store::read_vendored_part(&self.dir, id)
+                    .ok()
+                    .map(|p| (id.to_owned(), p))
+            })
             .collect();
         let mut parts: BTreeMap<String, String> = self.parts.iter().map(|(k, p)| (k.clone(), part_label(p))).collect();
         if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
@@ -252,22 +256,46 @@ impl Open {
         if current == part {
             return Ok(());
         }
-        if let Some(id) = part
-            && !self.parts.contains_key(id)
-        {
-            let p = match store::read_vendored_part(&self.dir, id) {
-                Ok(p) => p,
-                Err(_) => {
-                    let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
-                    wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id)
-                        .map_err(|e| e.to_string())?;
-                    store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?
-                }
-            };
-            self.parts.insert(id.to_owned(), p);
+        if let Some(id) = part {
+            self.ensure_part(id)?;
         }
         self.checkpoint();
         self.project.devices.entry(tag.clone()).or_default().part = part.map(str::to_owned);
+        Ok(())
+    }
+
+    /// Make sure a part is in the project (taken from the library when needed) and loaded.
+    fn ensure_part(&mut self, id: &str) -> Result<(), String> {
+        if self.parts.contains_key(id) {
+            return Ok(());
+        }
+        let p = match store::read_vendored_part(&self.dir, id) {
+            Ok(p) => p,
+            Err(_) => {
+                let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
+                wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
+                store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?
+            }
+        };
+        self.parts.insert(id.to_owned(), p);
+        Ok(())
+    }
+
+    /// Replace a device's accessories (its parts after the main part). New parts are taken from
+    /// the library into the project; a quantity of 0 is taken as 1. One undo step.
+    pub fn set_device_accessories(&mut self, tag: &DeviceTag, accessories: Vec<DevicePart>) -> Result<(), String> {
+        let accessories: Vec<DevicePart> = accessories
+            .into_iter()
+            .map(|a| DevicePart { qty: a.qty.max(1), ..a })
+            .collect();
+        if self.project.devices.get(tag).map_or(&[][..], |d| &d.accessories) == accessories.as_slice() {
+            return Ok(());
+        }
+        for a in &accessories {
+            self.ensure_part(&a.part)?;
+        }
+        self.checkpoint();
+        self.project.devices.entry(tag.clone()).or_default().accessories = accessories;
         Ok(())
     }
 
@@ -1689,6 +1717,49 @@ pub(crate) mod tests {
         assert_eq!(o.project.devices[&tag].part, None);
         assert!(o.undo());
         assert_eq!(o.project.devices[&tag].part.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn devices_get_accessories_with_quantities() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let a = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        let tag = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        let id = o.part_library.first().map(|(id, _)| id.clone()).unwrap();
+        o.set_device_accessories(
+            &tag,
+            vec![DevicePart {
+                part: id.clone(),
+                qty: 0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            o.project.devices[&tag].accessories,
+            [DevicePart {
+                part: id.clone(),
+                qty: 1
+            }]
+        );
+        assert!(o.parts.contains_key(&id), "taken into the project");
+        assert!(o.project.used_parts().contains(&id));
+        assert!(
+            o.set_device_accessories(
+                &tag,
+                vec![DevicePart {
+                    part: "no.such.part".into(),
+                    qty: 1
+                }]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            o.project.devices[&tag].accessories.len(),
+            1,
+            "a failed change keeps what was there"
+        );
+        assert!(o.undo());
+        assert!(o.project.devices.get(&tag).is_none_or(|d| d.accessories.is_empty()));
     }
 
     #[test]

@@ -242,6 +242,7 @@ fn devices_and_cables_get_the_library_part_they_name() {
     parts.extend(read_cable_types(&db(APP_DATA), &mut report, &mut warnings).unwrap());
     let device = |pn: &str, maker: &str| Device {
         part: None,
+        accessories: Vec::new(),
         description: String::new(),
         properties: BTreeMap::from([
             ("PartNumber".to_owned(), pn.to_owned()),
@@ -284,6 +285,33 @@ fn devices_and_cables_get_the_library_part_they_name() {
         built.devices[&DeviceTag::parse("-K1").unwrap()].properties["PartNumber"],
         "RLY-24"
     );
+    let added: Vec<&str> = built.parts.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(added, ["maker-a.rly-24", "maker-c.cbl-3g1"]);
+
+    // Further parts become accessories: the same part twice counts 2, an unknown one is skipped
+    // (its text properties stay), and a gap ends the list.
+    let mut d = device("RLY-24", "Maker A");
+    for (n, pn, maker) in [
+        (2, "CBL-3G1", "Maker C"),
+        (3, "NOPE", "Maker A"),
+        (4, "cbl-3g1", "maker c"),
+    ] {
+        d.properties.insert(format!("PartNumber {n}"), pn.into());
+        d.properties.insert(format!("Manufacturer {n}"), maker.into());
+    }
+    d.properties.insert("PartNumber 6".into(), "RLY-24".into());
+    let mut built = Built::default();
+    built.devices.insert(DeviceTag::parse("-K9").unwrap(), d);
+    assert_eq!(link_parts(&mut built, &parts), 1);
+    let k9 = &built.devices[&DeviceTag::parse("-K9").unwrap()];
+    assert_eq!(
+        k9.accessories,
+        [wc_core::DevicePart {
+            part: "maker-c.cbl-3g1".into(),
+            qty: 2
+        }]
+    );
+    assert_eq!(k9.all_parts(), [("maker-a.rly-24", 1), ("maker-c.cbl-3g1", 2)]);
     let added: Vec<&str> = built.parts.iter().map(|p| p.id.as_str()).collect();
     assert_eq!(added, ["maker-a.rly-24", "maker-c.cbl-3g1"]);
 }
