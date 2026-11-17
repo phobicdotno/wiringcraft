@@ -91,30 +91,59 @@ impl Git {
 
     /// Record every change in the folder. Returns the new commit, or `None` when nothing changed.
     pub fn commit(&self, message: &str) -> Result<Option<String>> {
+        self.commit_inner(message, None)
+    }
+
+    /// Like [`Git::commit`], but recorded as written by `author` (`Name <email>`), for example
+    /// another participant of a shared session. The committer stays the local user.
+    pub fn commit_as(&self, message: &str, author: &str) -> Result<Option<String>> {
+        self.commit_inner(message, Some(author))
+    }
+
+    fn commit_inner(&self, message: &str, author: Option<&str>) -> Result<Option<String>> {
         self.run(&["add", "-A"])?;
         let staged = self.run(&["status", "--porcelain"])?;
         let merging = self.dir.join(".git").join("MERGE_HEAD").exists();
         if staged.trim().is_empty() && !merging && self.head().is_some() {
             return Ok(None);
         }
-        let mut args = vec!["commit", "-q", "--allow-empty", "-m", message];
+        let author_arg = author.map(|a| format!("--author={a}"));
+        let mut args: Vec<&str> = Vec::new();
         // Commit as the configured user; fall back to a neutral identity so a fresh machine works.
-        let has_identity = self.run(&["config", "user.email"]).is_ok();
-        if !has_identity {
-            args = vec![
-                "-c",
-                "user.name=WiringCraft",
-                "-c",
-                "user.email=wiringcraft@localhost",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                message,
-            ];
+        if self.run(&["config", "user.email"]).is_err() {
+            args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"]);
+        }
+        args.extend(["commit", "-q", "--allow-empty", "-m", message]);
+        if let Some(a) = &author_arg {
+            args.push(a);
         }
         self.run(&args)?;
         Ok(self.head())
+    }
+
+    /// Undo one earlier commit with a new commit that reverses it (the history keeps both).
+    /// Returns the new commit. Fails, leaving nothing half done, when later commits changed the
+    /// same lines.
+    pub fn revert(&self, commit: &str) -> Result<Option<String>> {
+        let mut args: Vec<&str> = Vec::new();
+        if self.run(&["config", "user.email"]).is_err() {
+            args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"]);
+        }
+        args.extend(["revert", "--no-edit", commit]);
+        if let Err(e) = self.run(&args) {
+            let _ = self.run(&["revert", "--abort"]);
+            return Err(e);
+        }
+        Ok(self.head())
+    }
+
+    /// The author (`Name <email>`) and subject of a commit.
+    pub fn author_and_subject(&self, rev: &str) -> Result<(String, String)> {
+        let out = self.run(&["log", "-1", "--format=%an <%ae>%n%s", rev])?;
+        let mut lines = out.lines();
+        let author = lines.next().unwrap_or_default().to_owned();
+        let subject = lines.next().unwrap_or_default().to_owned();
+        Ok((author, subject))
     }
 
     pub fn current_branch(&self) -> Option<String> {

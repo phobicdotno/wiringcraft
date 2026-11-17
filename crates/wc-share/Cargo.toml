@@ -1,0 +1,19 @@
+[package]
+name = "wc-share"
+description = "WiringCraft shared work sessions: several people editing one open project, with join approval, page locks and one commit per change"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wc-core.workspace = true
+wc-vcs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
