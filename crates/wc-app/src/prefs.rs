@@ -23,6 +23,10 @@ pub struct Prefs {
     /// Snap step in mm.
     pub snap: f64,
     pub recent: Vec<PathBuf>,
+    /// The assistant panel is shown.
+    pub show_assistant: bool,
+    /// The assistant's model, effort and (when not in the environment) API key.
+    pub assistant: wc_agent::Settings,
 }
 
 impl Default for Prefs {
@@ -33,6 +37,8 @@ impl Default for Prefs {
             show_grid: true,
             snap: 2.5,
             recent: Vec::new(),
+            show_assistant: false,
+            assistant: wc_agent::Settings::default(),
         }
     }
 }

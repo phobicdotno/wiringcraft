@@ -54,6 +54,7 @@ pub enum Action {
     PageHistory,
     ToggleChrome,
     ToggleTheme,
+    Assistant,
 }
 
 pub struct Info {
@@ -64,6 +65,65 @@ pub struct Info {
 }
 
 impl Action {
+    /// Every action, for the assistant's `run_action` tool.
+    pub const ALL: &'static [Action] = &[
+        Action::NewProject,
+        Action::Open,
+        Action::ProjectProps,
+        Action::Save,
+        Action::Undo,
+        Action::Redo,
+        Action::Select,
+        Action::PlaceSymbol,
+        Action::DrawWire,
+        Action::InsertMacro,
+        Action::SaveMacro,
+        Action::TextTool,
+        Action::LineTool,
+        Action::RectTool,
+        Action::Delete,
+        Action::Rotate,
+        Action::Mirror,
+        Action::Copy,
+        Action::Cut,
+        Action::Paste,
+        Action::SelectAll,
+        Action::AddPage,
+        Action::DuplicatePage,
+        Action::PageProps,
+        Action::PageUp,
+        Action::PageDown,
+        Action::DeletePage,
+        Action::NewPanel,
+        Action::ArrangePanel,
+        Action::DeletePanel,
+        Action::ZoomIn,
+        Action::ZoomOut,
+        Action::ZoomFit,
+        Action::ToggleGrid,
+        Action::LibraryStatus,
+        Action::LibraryUpdate,
+        Action::ExportPdf,
+        Action::ExportDrawings,
+        Action::ExportAml,
+        Action::NumberWires,
+        Action::Reports,
+        Action::Check,
+        Action::Commit,
+        Action::NewBranch,
+        Action::History,
+        Action::CommentTool,
+        Action::PageHistory,
+        Action::ToggleChrome,
+        Action::ToggleTheme,
+        Action::Assistant,
+    ];
+
+    /// The action's name as the assistant uses it, e.g. `AddPage`.
+    pub fn name(self) -> String {
+        format!("{self:?}")
+    }
+
     pub fn info(self) -> Info {
         let i = |label, tip, icon, shortcut| Info {
             label,
@@ -246,6 +306,12 @@ impl Action {
                 Icon::Theme,
                 "",
             ),
+            Action::Assistant => i(
+                "Assistant",
+                "Show the AI assistant: tell it what to draw or change and it works in the open project",
+                Icon::Assistant,
+                "Ctrl+J",
+            ),
         }
     }
 }
@@ -275,6 +341,7 @@ pub const TOOLBAR: &[&[Action]] = &[
     &[Action::Commit, Action::NewBranch, Action::History],
     &[Action::CommentTool, Action::PageHistory],
     &[Action::Check, Action::Reports, Action::ExportPdf],
+    &[Action::Assistant],
 ];
 
 /// A named group of ribbon buttons.
@@ -309,6 +376,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::Delete,
                 ],
             ),
+            ("Assistant", &[Action::Assistant]),
             (
                 "Draw",
                 &[
@@ -353,5 +421,11 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
             ("Review", &[Action::CommentTool, Action::PageHistory]),
         ],
     ),
-    ("View", &[("Appearance", &[Action::ToggleChrome, Action::ToggleTheme])]),
+    (
+        "View",
+        &[
+            ("Appearance", &[Action::ToggleChrome, Action::ToggleTheme]),
+            ("Assistant", &[Action::Assistant]),
+        ],
+    ),
 ];

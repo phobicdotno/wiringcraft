@@ -27,6 +27,7 @@ See the feature list for the full plan.
 | `wc-report` | parts list, device list, wire list, net list, terminal plan, cable list, PLC I/O list, table of contents |
 | `wc-pdf` | vector PDF export (schematic pages plus report pages) |
 | `wc-vcs` | git versioning, subway-map history, schematic change lists |
+| `wc-agent` | the live AI assistant: Claude conversation, tool loop, HTTPS client |
 | `wc-cli` | the `wiringcraft` command |
 | `wc-app` | the desktop editor (`wiringcraft-app`) |
 
@@ -54,6 +55,22 @@ pin, click bends, click a pin to finish or double-click a free point), rotate (R
 Wheel zooms around the pointer, right or middle drag pans, F fits the page, G toggles the grid.
 New devices get the next free tag, with the function and location used on that page.
 Versions → Commit / Branch / History records versions and shows the subway map.
+
+### Assistant
+
+View → Assistant (Ctrl+J, or the speech-bubble button at the end of the toolbar) opens a panel
+where you tell Claude what to draw or change in plain words. It works in the open project while
+you watch: places symbols, draws wires, edits pages, devices, parts, panel layouts and comments,
+runs checks, reports and exports, records versions, and can run any toolbar command and any
+`wiringcraft` command-line command (imports, PLC variable lists, STEP export, merges ...).
+Everything it changes in one turn is a single undo step (Ctrl+Z).
+
+It needs an Anthropic API key: set `ANTHROPIC_API_KEY`, or paste one under Settings in the panel
+(kept in your WiringCraft preferences, never in a project). Settings also pick the model
+(Claude Opus 5.5 by default) and the effort. The conversation code is in `crates/wc-agent`; the
+tools are in `crates/wc-app/src/agent.rs`.
+
+![assistant](docs/screenshots/assistant.png)
 
 ## Build
 
