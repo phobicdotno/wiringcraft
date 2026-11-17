@@ -33,14 +33,34 @@ pub struct PanelState {
     tag_error: Option<String>,
     /// A reply being written to the comment shown.
     reply: String,
-    /// Edit buffers for the selected wires' section, colour and type, the values they were loaded
-    /// with (empty when the wires differ), whether they differ, and the wires they belong to.
-    spec: [String; 3],
-    spec_loaded: [String; 3],
-    spec_mixed: [bool; 3],
-    /// Whether the user typed in the field since it was loaded or committed.
-    spec_dirty: [bool; 3],
+    /// Edit state for the selected wires' section, colour and type, in `SpecPart::ALL` order, and
+    /// the wires it belongs to.
+    spec: [SpecField; 3],
     spec_for: (usize, Vec<String>),
+}
+
+impl PanelState {
+    /// A fresh state for a newly opened project: nothing typed in it carries over. The device
+    /// search stays.
+    pub fn reset(&mut self) {
+        *self = Self {
+            search: std::mem::take(&mut self.search),
+            ..Self::default()
+        };
+    }
+}
+
+/// The edit state of one wire spec field.
+#[derive(Default)]
+struct SpecField {
+    /// What the field shows.
+    buffer: String,
+    /// The value it was loaded with (empty when the wires differ).
+    loaded: String,
+    /// Whether the wires differ in it.
+    mixed: bool,
+    /// Whether the user typed in it since it was loaded or committed.
+    dirty: bool,
 }
 
 /// Keep the spec buffers in step with the given wires of a page: refilled when the selection
@@ -49,13 +69,15 @@ fn load_spec(open: &Open, page: usize, ids: &[String], ps: &mut PanelState) {
     let fresh = ps.spec_for.0 != page || ps.spec_for.1 != ids;
     if fresh {
         ps.spec_for = (page, ids.to_vec());
-        ps.spec_dirty = [false; 3];
+        for f in &mut ps.spec {
+            f.dirty = false;
+        }
     }
     let Some(p) = open.project.pages.get(page) else {
         return;
     };
     let wires: Vec<&wc_core::Wire> = p.wires.iter().filter(|w| ids.contains(&w.id)).collect();
-    for (k, part) in SpecPart::ALL.into_iter().enumerate() {
+    for (part, f) in SpecPart::ALL.into_iter().zip(&mut ps.spec) {
         let values: std::collections::BTreeSet<Option<&String>> =
             wires.iter().map(|w| part.of(&w.spec).as_ref()).collect();
         let mixed = values.len() > 1;
@@ -64,10 +86,10 @@ fn load_spec(open: &Open, page: usize, ids: &[String], ps: &mut PanelState) {
         } else {
             values.into_iter().next().flatten().cloned().unwrap_or_default()
         };
-        if fresh || (!ps.spec_dirty[k] && (common != ps.spec_loaded[k] || mixed != ps.spec_mixed[k])) {
-            ps.spec[k] = common.clone();
-            ps.spec_loaded[k] = common;
-            ps.spec_mixed[k] = mixed;
+        if fresh || (!f.dirty && (common != f.loaded || mixed != f.mixed)) {
+            f.buffer = common.clone();
+            f.loaded = common;
+            f.mixed = mixed;
         }
     }
 }
@@ -77,24 +99,20 @@ fn load_spec(open: &Open, page: usize, ids: &[String], ps: &mut PanelState) {
 /// in changes nothing, so tabbing through a field the wires differ in keeps their own values.
 fn spec_rows(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[String], ps: &mut PanelState) {
     load_spec(open, page, ids, ps);
-    for (k, part) in SpecPart::ALL.into_iter().enumerate() {
+    for (part, f) in SpecPart::ALL.into_iter().zip(&mut ps.spec) {
         ui.label(part.label());
-        let hint = if ps.spec_mixed[k] {
-            "several values"
-        } else {
-            part.hint()
-        };
-        let r = ui.add(egui::TextEdit::singleline(&mut ps.spec[k]).hint_text(hint));
+        let hint = if f.mixed { "several values" } else { part.hint() };
+        let r = ui.add(egui::TextEdit::singleline(&mut f.buffer).hint_text(hint));
         if r.changed() {
-            ps.spec_dirty[k] = true;
+            f.dirty = true;
         }
-        if committed(&r) && ps.spec_dirty[k] {
-            ps.spec_dirty[k] = false;
-            let value = wc_core::WireSpec::value(&ps.spec[k]);
+        if committed(&r) && f.dirty {
+            f.dirty = false;
+            let value = wc_core::WireSpec::value(&f.buffer);
             open.set_wire_spec(page, ids, part, value.clone());
-            ps.spec[k] = value.clone().unwrap_or_default();
-            ps.spec_loaded[k] = ps.spec[k].clone();
-            ps.spec_mixed[k] = false;
+            f.buffer = value.unwrap_or_default();
+            f.loaded = f.buffer.clone();
+            f.mixed = false;
         }
         ui.end_row();
     }

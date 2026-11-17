@@ -72,12 +72,23 @@ fn page<'a>(built: &'a Built, n: &str) -> &'a Page {
 }
 
 #[test]
-fn place_scales_then_rotates() {
+fn place_rotates_then_scales() {
+    let near = |p: Point, x: f64, y: f64| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9;
     let p = place(Point::new(10.0, 20.0), 90.0, (1.0, 1.0), Point::new(4.0, 0.0));
-    assert!((p.x - 10.0).abs() < 1e-9 && (p.y - 24.0).abs() < 1e-9);
+    assert!(near(p, 10.0, 24.0), "{p:?}");
     // Mirrored in x, no rotation.
     let p = place(Point::new(10.0, 20.0), 0.0, (-1.0, 1.0), Point::new(4.0, 1.0));
-    assert!((p.x - 6.0).abs() < 1e-9 && (p.y - 21.0).abs() < 1e-9);
+    assert!(near(p, 6.0, 21.0), "{p:?}");
+    // Mirrored in x and turned by 90 degrees: (4, 1) turns to (-1, 4), the mirror makes (1, 4).
+    // Scaling first would give (9, 16).
+    let p = place(Point::new(10.0, 20.0), 90.0, (-1.0, 1.0), Point::new(4.0, 1.0));
+    assert!(near(p, 11.0, 24.0), "{p:?}");
+    // The same at 270 degrees: (4, 1) turns to (1, -4), the mirror makes (-1, -4).
+    let p = place(Point::new(10.0, 20.0), 270.0, (-1.0, 1.0), Point::new(4.0, 1.0));
+    assert!(near(p, 9.0, 16.0), "{p:?}");
+    // A uniform scale of 2 with a turn.
+    let p = place(Point::new(0.0, 0.0), 90.0, (2.0, 2.0), Point::new(1.0, 0.0));
+    assert!(near(p, 0.0, 2.0), "{p:?}");
 }
 
 #[test]
@@ -881,9 +892,10 @@ fn location_descriptions_survive_blank_english_and_a_late_repeat_and_bad_rows_sa
 }
 
 /// The sample plus terminal strip X1 with terminals 1 and 2 (source order 2, 1; tag paths written
-/// with a space), drawn at (150, 200) and (170, 200); a line joins X1.1's lower point to K1:A2.
-/// Wire records: X1.1 lower to K1:A2 (drawn so), X1.2 upper to K1:A1 (not drawn so), and one to
-/// a terminal that is not drawn.
+/// with a space), drawn at (150, 200) and (170, 200); line 10 joins X1.1's lower point to K1:A2
+/// and carries wire record N1; line 11 runs up from X1.2's upper point and carries N2.
+/// Wire records: N1 X1.1 lower to K1:A2 (drawn so), N2 X1.2 upper to K1:A1 (not drawn so), one to
+/// a terminal that is not drawn, and one with no ends.
 fn sample_with_strip() -> Connection {
     let c = sample();
     c.execute_batch(
@@ -894,7 +906,8 @@ INSERT INTO tew_symbol VALUES (20, 10, 201, 'Terminal', 150, 200, 0, 1, 1, NULL,
 INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5), (21, 0, 0, 0, 5), (21, 0, 1, 0, -5);
 INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0), (61, 21, 0, 202, 0);
 INSERT INTO tew_componentterminal VALUES (60, 0, NULL), (60, 1, NULL), (61, 0, NULL), (61, 1, NULL);
-INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL);
+INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL), (11, 10, 170, 205, 170, 215, NULL);
+INSERT INTO tew_linewirepair VALUES (10, 80, 1), (11, 81, 1);
 INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto) VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1), (81, NULL, -1, 'N2', 61, 0, 50, 0),
   (82, NULL, -1, '', 60, 0, 99, 0), (83, NULL, -1, '', 0, 0, 0, 0);
 ",
@@ -1297,4 +1310,138 @@ fn wires_carry_their_section_and_colour() {
         assert_eq!(w.spec.section.as_deref(), Some("0.75 mm²"));
         assert_eq!(w.spec.colour.as_deref(), Some("BN"));
     }
+}
+
+#[test]
+fn a_mirrored_symbol_turned_90_degrees_meets_its_line() {
+    let c = sample();
+    // Point (0, 5) turned by 90 degrees is (-5, 0); mirrored in x it is (5, 0), where the line
+    // starts. Scaling first would put it at (-5, 0), away from the line.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (110, 'K9', '-K9', -1);
+         INSERT INTO tew_symbol VALUES (40, 10, 110, 'Coil', 150, 100, 90, -1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (40, 0, 0, 0, 5);
+         INSERT INTO tew_line VALUES (30, 10, 155, 100, 180, 100, NULL);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    let pin = Endpoint::Pin {
+        item: "s40".into(),
+        pin: "1".into(),
+    };
+    assert!(
+        page(&built, "01").wires.iter().any(|w| w.from == pin || w.to == pin),
+        "the line joins the mirrored, turned pin"
+    );
+}
+
+#[test]
+fn a_mirrored_box_turned_90_degrees_has_its_corner_mirrored_too() {
+    let c = sample();
+    // Box 35 by -40 in the symbol's frame: turned (40, 35), mirrored in x (-40, 35).
+    c.execute_batch(
+        "INSERT INTO tew_symbol VALUES (41, 10, NULL, 'Box', 150, 100, 90, -1, 1, 35, -40);
+         INSERT INTO tew_symbolpt VALUES (41, 0, 0, 0, 5);",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let s = p.symbols.iter().find(|s| s.id == 41).unwrap();
+    let corner = s.corner.unwrap();
+    assert!(
+        (corner.x - 110.0).abs() < 1e-9 && (corner.y - 135.0).abs() < 1e-9,
+        "{corner:?}"
+    );
+}
+
+#[test]
+fn wire_records_without_a_drawn_line_are_counted_with_their_reason() {
+    let c = sample_with_strip();
+    // A jumper X1.1 upper to X1.2 lower, and a record X1.2 lower to K1:A2, neither on a line.
+    c.execute_batch(
+        "INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 60, 0, 61, 1), (91, NULL, -1, '', 61, 1, 50, 1);",
+    )
+    .unwrap();
+    let (_, warnings, report) = build(&read(&c).unwrap(), None);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(
+        ends.note.contains("1 are jumpers between terminals of one strip"),
+        "{}",
+        ends.note
+    );
+    assert!(
+        ends.note
+            .contains("1 are in the source's wire list but on no drawn line"),
+        "{}",
+        ends.note
+    );
+    assert!(
+        ends.note.contains("1 join terminals that are not connected"),
+        "only N2: {}",
+        ends.note
+    );
+    let apart = warnings
+        .iter()
+        .find(|w| w.contains("not connected on the imported drawing"))
+        .unwrap();
+    assert!(apart.starts_with("1 wire(s)"), "{apart}");
+}
+
+#[test]
+fn a_wire_on_a_zero_length_line_still_counts_as_drawn() {
+    let c = sample_with_strip();
+    // A record X1.2 lower to K1:A2 whose only line has no length: the source draws it, so it is
+    // a mismatch to report, not a record without a line.
+    c.execute_batch(
+        "INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (92, NULL, -1, 'N9', 61, 1, 50, 1);
+         INSERT INTO tew_line VALUES (12, 10, 170, 195, 170, 195, NULL);
+         INSERT INTO tew_linewirepair VALUES (12, 92, 1);",
+    )
+    .unwrap();
+    let (_, warnings, report) = build(&read(&c).unwrap(), None);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(!ends.note.contains("on no drawn line"), "{}", ends.note);
+    assert!(
+        ends.note.contains("2 join terminals that are not connected"),
+        "{}",
+        ends.note
+    );
+    let apart = warnings
+        .iter()
+        .find(|w| w.contains("not connected on the imported drawing"))
+        .unwrap();
+    assert!(apart.contains("wire N9"), "{apart}");
+}
+
+#[test]
+fn a_wire_on_a_line_without_usable_end_points_still_counts_as_drawn() {
+    let c = sample_with_strip();
+    // Its only line has no end point, so the line is left out; the source still draws the wire.
+    c.execute_batch(
+        "INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (93, NULL, -1, 'N8', 61, 1, 50, 1);
+         INSERT INTO tew_line VALUES (13, 10, NULL, 195, 170, 195, NULL);
+         INSERT INTO tew_linewirepair VALUES (13, 93, 1);",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert!(p.wires_on_lines.contains(&93) && !p.lines.iter().any(|l| l.id == 13));
+    let (_, warnings, report) = build(&p, None);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(!ends.note.contains("on no drawn line"), "{}", ends.note);
+    let apart = warnings
+        .iter()
+        .find(|w| w.contains("not connected on the imported drawing"))
+        .unwrap();
+    assert!(apart.contains("wire N8"), "{apart}");
 }

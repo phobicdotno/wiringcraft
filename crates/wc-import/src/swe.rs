@@ -14,8 +14,10 @@
 //! connection points where the database puts them.
 //!
 //! Database coordinates are millimetres with y up. A connection point is an offset in its
-//! symbol's own frame: scaled by the symbol's scale (a negative scale mirrors), then rotated by
-//! the symbol's angle, then moved to the symbol's position.
+//! symbol's own frame: rotated by the symbol's angle, then scaled by the symbol's scale along the
+//! page axes (a negative scale mirrors), then moved to the symbol's position. The order matters
+//! for a mirrored symbol turned by 90 or 270 degrees: SolidWorks Electrical mirrors after it
+//! rotates.
 //!
 //! Input is treated as hostile: missing tables or columns are errors; rows that cannot be read,
 //! and everything left out, are counted in the warnings and the report; nothing panics.
@@ -167,6 +169,9 @@ pub struct SweProject {
     pub cables: BTreeMap<i64, SweCable>,
     pub components: BTreeMap<i64, SweComponent>,
     pub locations: Vec<SweLocation>,
+    /// Every wire some source line carries (`tew_linewirepair`), also on lines left out for
+    /// unusable end points: the source draws these wires.
+    pub wires_on_lines: BTreeSet<i64>,
     /// The project's own fields (name, customer, ...), from the archive's project list. Not in
     /// the project database itself, so a bare database import has none.
     pub info: Option<SweProjectInfo>,
@@ -481,12 +486,15 @@ fn texts(conn: &Connection, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, 
     Ok(out)
 }
 
-/// A connection point's page position: offset scaled, rotated by `angle` degrees, moved to `at`.
+/// A connection point's page position: offset rotated by `angle` degrees, then scaled along the
+/// page axes (a negative scale mirrors), then moved to `at`. Mirroring after rotating is what
+/// SolidWorks Electrical does: on test projects every wire line of a mirrored symbol turned by 90
+/// or 270 degrees ends on the point placed this way, and misses it when the scale comes first.
 pub fn place(at: Point, angle: f64, scale: (f64, f64), offset: Point) -> Point {
-    let (x, y) = (offset.x * scale.0, offset.y * scale.1);
     let r = angle.to_radians();
     let (s, c) = r.sin_cos();
-    Point::new(at.x + x * c - y * s, at.y + x * s + y * c)
+    let (x, y) = (offset.x * c - offset.y * s, offset.x * s + offset.y * c);
+    Point::new(at.x + x * scale.0, at.y + y * scale.1)
 }
 
 /// Read the drawable model of one project database.
@@ -662,6 +670,7 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         .map_err(sql)?;
     for (line, wire) in readable(rows, "line-wire link", &mut warnings) {
         line_wires.entry(line).or_default().push(wire);
+        p.wires_on_lines.insert(wire);
     }
 
     // Connection points by symbol, named after the component terminal they stand for.
@@ -1374,6 +1383,8 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut wires_on_zero_length: BTreeSet<i64> = BTreeSet::new();
     // Component terminal (`cel_id`, `cte_no`) -> the pin drawn for it, and a label for messages.
     let mut drawn_at: BTreeMap<(i64, i64), (PinRef, String)> = BTreeMap::new();
+    // Element (`cel_id`) -> its component, to tell a jumper between terminals of one strip.
+    let mut element_component: BTreeMap<i64, i64> = BTreeMap::new();
 
     for (i, pg) in drawn.iter().enumerate() {
         let syms: Vec<&SweSymbol> = syms_of.remove(&pg.id).unwrap_or_default();
@@ -1478,6 +1489,9 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 // so the pin is taken by position, not by name.
                 for (q, o) in s.pins.iter().zip(&out_pins) {
                     let Some(t) = q.terminal else { continue };
+                    if let Some(c) = s.component {
+                        element_component.insert(t.0, c);
+                    }
                     drawn_at.entry(t).or_insert_with(|| {
                         (
                             (page.id.clone(), item.clone(), o.name.clone()),
@@ -1724,6 +1738,19 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut ends_agree = 0usize;
     let mut ends_not_drawn = 0usize;
     let mut ends_apart: Vec<String> = Vec::new();
+    // Wire records no drawn line carries: the source has the connection but not the drawing.
+    let mut jumpers_undrawn = 0usize;
+    // Judged on the source, not on what was imported: a wire whose line collapsed to zero length
+    // or sits on a page left out is still drawn there, and stays a mismatch.
+    let carried = &p.wires_on_lines;
+    let mut records_undrawn = 0usize;
+    let strip_of_element = |el: i64| {
+        element_component
+            .get(&el)
+            .and_then(|c| p.components.get(c))
+            .and_then(&strip_of)
+            .map(|s| s.id)
+    };
     for w in p.wires.values() {
         let (Some(a), Some(b)) = (w.from, w.to) else {
             if w.from.is_some() || w.to.is_some() {
@@ -1738,6 +1765,14 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         };
         match (net_of.get(pa), net_of.get(pb)) {
             (Some(x), Some(y)) if x == y => ends_agree += 1,
+            _ if !carried.contains(&w.id) => {
+                // Not on any drawn line: a jumper made in the terminal strip editor, or a
+                // connection the source keeps only in its wire list.
+                match (strip_of_element(a.0), strip_of_element(b.0)) {
+                    (Some(x), Some(y)) if x == y => jumpers_undrawn += 1,
+                    _ => records_undrawn += 1,
+                }
+            }
             _ => {
                 let name = if w.tag.trim().is_empty() {
                     format!("wire {}", w.id)
@@ -1964,6 +1999,11 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     "join terminals that are not connected on the drawing (see the warnings)",
                 ),
                 (ends_not_drawn, "with a terminal that is not drawn on a schematic page"),
+                (
+                    jumpers_undrawn,
+                    "are jumpers between terminals of one strip that no drawn line carries (WiringCraft has no jumpers yet, #108)",
+                ),
+                (records_undrawn, "are in the source's wire list but on no drawn line"),
                 (one_end_named, "more name only one terminal (not checked)"),
             ]),
         },
