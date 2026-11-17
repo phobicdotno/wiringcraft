@@ -33,7 +33,7 @@ pub mod transport;
 pub use guest::{Guest, GuestStatus};
 pub use host::{HOST, Host};
 pub use journal::{Change, GitJournal, Journal, MemoryJournal};
-pub use protocol::{GuestMsg, HostMsg, Peer, PeerId, ProjectEdit, Refusal, Snapshot, apply_edit};
+pub use protocol::{GuestMsg, HostMsg, Peer, PeerId, ProjectEdit, Refusal, Snapshot, apply_edit, same_but_number};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -39,12 +39,7 @@ pub struct Outgoing {
 
 /// A page without its display number, which only `Renumber` changes.
 fn same_content(a: &Page, b: &Page) -> bool {
-    if a.number == b.number {
-        return a == b;
-    }
-    let mut b = b.clone();
-    b.number = a.number.clone();
-    *a == b
+    wc_share::same_but_number(a, b)
 }
 
 /// What changed in `local` since `base` (the project after the last sync), as session messages.

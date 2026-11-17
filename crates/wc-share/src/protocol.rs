@@ -249,8 +249,10 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
     }
 }
 
-/// Two versions of a page, ignoring the display number (only `Renumber` changes that).
-fn same_but_number(a: &Page, b: &Page) -> bool {
+/// Two versions of a page, ignoring the display number (only `Renumber` changes that). The
+/// app uses the same rule to see what changed, so change detection and the host's stale check
+/// agree.
+pub fn same_but_number(a: &Page, b: &Page) -> bool {
     if a.number == b.number {
         return a == b;
     }
