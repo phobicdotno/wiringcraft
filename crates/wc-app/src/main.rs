@@ -1756,19 +1756,30 @@ fn pick_folder(title: &str, start: &str) -> Picked {
     if let Some(d) = picker_start(start) {
         dialog = dialog.set_directory(d);
     }
+    applog::take_picker_errors();
     let shown = std::time::Instant::now();
     let r = dialog.pick_folder();
-    picker_outcome(r, shown.elapsed())
+    picker_outcome(r, shown.elapsed(), &applog::take_picker_errors())
 }
 
-/// The picker reports a failure the same way as Cancel, so an answer quicker than anyone can
-/// click means it never showed.
-fn picker_outcome(r: Option<PathBuf>, open_for: std::time::Duration) -> Picked {
+/// The picker reports a failure the same way as Cancel. On Linux rfd logs it when the desktop
+/// portal fails and then zenity does too (`errors`, see [`applog::take_picker_errors`]); a
+/// portal failure alone is not one, since zenity then showed. Otherwise an answer quicker than
+/// anyone can click means it never showed.
+fn picker_outcome(r: Option<PathBuf>, open_for: std::time::Duration, errors: &[String]) -> Picked {
     const NO_PORTAL: &str = "The folder picker could not open. On Linux it needs a desktop portal \
                              (xdg-desktop-portal) or zenity in a desktop session. Type the folder instead.";
     match r {
         Some(d) => Picked::Folder(d),
-        None if open_for < std::time::Duration::from_millis(150) => {
+        None if errors.iter().any(|e| e.contains("with zenity")) => {
+            applog::warn(&format!(
+                "folder picker: could not open after {open_for:?}: {}",
+                errors.join("; ")
+            ));
+            Picked::Failed(NO_PORTAL.to_owned())
+        }
+        // Only when rfd logged nothing: a portal failure alone means zenity showed instead.
+        None if errors.is_empty() && open_for < std::time::Duration::from_millis(150) => {
             applog::warn(&format!(
                 "folder picker: no answer after {open_for:?}; taken as not opened"
             ));
@@ -2819,16 +2830,48 @@ mod picker_tests {
     fn a_picker_that_never_showed_says_so_instead_of_doing_nothing() {
         use std::time::Duration;
         let d = PathBuf::from("/x");
-        assert_eq!(picker_outcome(Some(d.clone()), Duration::ZERO), Picked::Folder(d));
-        assert_eq!(picker_outcome(None, Duration::from_secs(2)), Picked::Cancelled);
+        assert_eq!(picker_outcome(Some(d.clone()), Duration::ZERO, &[]), Picked::Folder(d));
+        assert_eq!(picker_outcome(None, Duration::from_secs(2), &[]), Picked::Cancelled);
         assert!(matches!(
-            picker_outcome(None, Duration::from_millis(5)),
+            picker_outcome(None, Duration::from_millis(5), &[]),
             Picked::Failed(e) if e.contains("desktop portal")
         ));
         // Typed text the dialogs refuse opens the picker in the projects folder.
         if cfg!(windows) {
             assert_eq!(picker_start("C:foo"), picker_start(""));
         }
+    }
+
+    #[test]
+    fn a_picker_that_fails_slowly_is_reported_and_a_cancel_after_a_portal_failure_is_not() {
+        use std::time::Duration;
+        // What rfd logs when the portal times out and zenity is not there.
+        applog::listen_to_picker();
+        applog::take_picker_errors();
+        log::error!(target: "rfd::backend::xdg_desktop_portal", "Failed to pick folder: Portal request timed out");
+        log::error!(
+            target: "rfd::backend::xdg_desktop_portal",
+            "Failed to pick folder with zenity: No such file or directory (os error 2)"
+        );
+        log::error!(target: "eframe", "not from the picker");
+        let errors = applog::take_picker_errors();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(applog::take_picker_errors().is_empty(), "taken once");
+        assert!(matches!(
+            picker_outcome(None, Duration::from_secs(25), &errors),
+            Picked::Failed(e) if e.contains("desktop portal")
+        ));
+        // The portal failed but zenity showed and the user cancelled it.
+        let portal_only = &errors[..1];
+        assert_eq!(
+            picker_outcome(None, Duration::from_secs(3), portal_only),
+            Picked::Cancelled
+        );
+        let d = PathBuf::from("/x");
+        assert_eq!(
+            picker_outcome(Some(d.clone()), Duration::from_secs(3), &errors),
+            Picked::Folder(d)
+        );
     }
 
     #[test]

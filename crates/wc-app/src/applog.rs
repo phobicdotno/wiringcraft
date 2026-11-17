@@ -341,8 +341,53 @@ pub fn dir() -> Option<PathBuf> {
     crate::prefs::config_dir().map(|d| d.join("logs"))
 }
 
+/// Errors the file picker library (rfd) reported through the `log` crate since they were last
+/// taken. rfd has no error result of its own: a picker that could not open answers like Cancel.
+static PICKER_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Takes the `log` records of the file picker library: warnings and errors go into this log,
+/// and errors are kept for [`take_picker_errors`]. Other crates' records are not wanted.
+struct PickerLog;
+
+impl log::Log for PickerLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn && m.target().starts_with("rfd")
+    }
+
+    fn log(&self, r: &log::Record) {
+        if !self.enabled(r.metadata()) {
+            return;
+        }
+        let message = r.args().to_string();
+        warn(&format!("{}: {message}", r.target()));
+        if r.level() == log::Level::Error
+            && let Ok(mut e) = PICKER_ERRORS.lock()
+        {
+            e.push(message);
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Listen for the file picker library's `log` records. Safe to call more than once.
+pub fn listen_to_picker() {
+    if log::set_logger(&PickerLog).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+}
+
+/// The picker errors logged since the last call (see [`PICKER_ERRORS`]).
+pub fn take_picker_errors() -> Vec<String> {
+    PICKER_ERRORS
+        .lock()
+        .map(|mut e| std::mem::take(&mut *e))
+        .unwrap_or_default()
+}
+
 /// Start logging into the data folder and log panics. Safe to call more than once.
 pub fn init() {
+    listen_to_picker();
     let Some(dir) = dir() else { return };
     if LOG.set(Mutex::new(Logger::new(dir, MAX_FILE, KEEP))).is_err() {
         return;
