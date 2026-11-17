@@ -1736,11 +1736,11 @@ pub fn build_with(
     // Element (`cel_id`) -> its component, to tell a jumper between terminals of one strip.
     let mut element_component: BTreeMap<i64, i64> = BTreeMap::new();
 
-    for (i, pg) in drawn.iter().enumerate() {
+    for (pg, number) in drawn.iter().zip(&numbers) {
         if pg.kind == KIND_COVER {
             // Its source drawing (frame, logo, field texts) is not brought across: WiringCraft
             // draws the cover from the project's fields, which the import filled.
-            let mut page = Page::new(format!("swe-page-{}", pg.id), numbers[i].clone(), pg.title.clone());
+            let mut page = Page::new(format!("swe-page-{}", pg.id), number.clone(), pg.title.clone());
             page.cover = true;
             page.size = frame_size(&pg.frame).unwrap_or_default();
             page.title_block = pg.title_block.clone();
@@ -1776,7 +1776,7 @@ pub fn build_with(
         if !fits {
             warnings.push(format!(
                 "page {} reaches beyond A2; content outside the sheet is kept as is",
-                numbers[i]
+                number
             ));
         }
         let height = size.mm().1;
@@ -1788,7 +1788,7 @@ pub fn build_with(
             (true, false) => pg.title.clone(),
             (true, true) => String::new(),
         };
-        let mut page = Page::new(format!("swe-page-{}", pg.id), numbers[i].clone(), title);
+        let mut page = Page::new(format!("swe-page-{}", pg.id), number.clone(), title);
         page.size = size;
         // A line diagram repeats devices the schematics draw in detail.
         page.overview = pg.kind == KIND_LINE_DIAGRAM;
