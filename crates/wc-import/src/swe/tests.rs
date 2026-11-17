@@ -71,12 +71,23 @@ fn page<'a>(built: &'a Built, n: &str) -> &'a Page {
 }
 
 #[test]
-fn place_scales_then_rotates() {
+fn place_rotates_then_scales() {
+    let near = |p: Point, x: f64, y: f64| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9;
     let p = place(Point::new(10.0, 20.0), 90.0, (1.0, 1.0), Point::new(4.0, 0.0));
-    assert!((p.x - 10.0).abs() < 1e-9 && (p.y - 24.0).abs() < 1e-9);
+    assert!(near(p, 10.0, 24.0), "{p:?}");
     // Mirrored in x, no rotation.
     let p = place(Point::new(10.0, 20.0), 0.0, (-1.0, 1.0), Point::new(4.0, 1.0));
-    assert!((p.x - 6.0).abs() < 1e-9 && (p.y - 21.0).abs() < 1e-9);
+    assert!(near(p, 6.0, 21.0), "{p:?}");
+    // Mirrored in x and turned by 90 degrees: (4, 1) turns to (-1, 4), the mirror makes (1, 4).
+    // Scaling first would give (9, 16).
+    let p = place(Point::new(10.0, 20.0), 90.0, (-1.0, 1.0), Point::new(4.0, 1.0));
+    assert!(near(p, 11.0, 24.0), "{p:?}");
+    // The same at 270 degrees: (4, 1) turns to (1, -4), the mirror makes (-1, -4).
+    let p = place(Point::new(10.0, 20.0), 270.0, (-1.0, 1.0), Point::new(4.0, 1.0));
+    assert!(near(p, 9.0, 16.0), "{p:?}");
+    // A uniform scale of 2 with a turn.
+    let p = place(Point::new(0.0, 0.0), 90.0, (2.0, 2.0), Point::new(1.0, 0.0));
+    assert!(near(p, 0.0, 2.0), "{p:?}");
 }
 
 #[test]
@@ -1357,10 +1368,8 @@ fn space_form_edge_cases_keep_their_levels() {
 #[test]
 fn a_bare_tag_with_spaces_and_no_function_or_location_stays_one_name() {
     let c = space_form();
-    c.execute_batch(
-        "INSERT INTO tew_component VALUES (520, 'X 1/2', 'X 1/2', -1, NULL, 0, NULL, NULL, '');",
-    )
-    .unwrap();
+    c.execute_batch("INSERT INTO tew_component VALUES (520, 'X 1/2', 'X 1/2', -1, NULL, 0, NULL, NULL, '');")
+        .unwrap();
     let p = read(&c).unwrap();
     assert_eq!(p.components[&520].tag, "X 1/2", "as written");
     let (built, _, _) = build(&p, None);
@@ -1368,5 +1377,46 @@ fn a_bare_tag_with_spaces_and_no_function_or_location_stays_one_name() {
         built.devices.contains_key(&DeviceTag::parse("-X_1_2").unwrap()),
         "one product level: {:?}",
         built.devices.keys()
+    );
+}
+
+#[test]
+fn a_mirrored_symbol_turned_90_degrees_meets_its_line() {
+    let c = sample();
+    // Point (0, 5) turned by 90 degrees is (-5, 0); mirrored in x it is (5, 0), where the line
+    // starts. Scaling first would put it at (-5, 0), away from the line.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (110, 'K9', '-K9', -1);
+         INSERT INTO tew_symbol VALUES (40, 10, 110, 'Coil', 150, 100, 90, -1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (40, 0, 0, 0, 5);
+         INSERT INTO tew_line VALUES (30, 10, 155, 100, 180, 100, NULL);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    let pin = Endpoint::Pin {
+        item: "s40".into(),
+        pin: "1".into(),
+    };
+    assert!(
+        page(&built, "01").wires.iter().any(|w| w.from == pin || w.to == pin),
+        "the line joins the mirrored, turned pin"
+    );
+}
+
+#[test]
+fn a_mirrored_box_turned_90_degrees_has_its_corner_mirrored_too() {
+    let c = sample();
+    // Box 35 by -40 in the symbol's frame: turned (40, 35), mirrored in x (-40, 35).
+    c.execute_batch(
+        "INSERT INTO tew_symbol VALUES (41, 10, NULL, 'Box', 150, 100, 90, -1, 1, 35, -40);
+         INSERT INTO tew_symbolpt VALUES (41, 0, 0, 0, 5);",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let s = p.symbols.iter().find(|s| s.id == 41).unwrap();
+    let corner = s.corner.unwrap();
+    assert!(
+        (corner.x - 110.0).abs() < 1e-9 && (corner.y - 135.0).abs() < 1e-9,
+        "{corner:?}"
     );
 }
