@@ -363,6 +363,18 @@ enum ImportCmd {
         #[arg(long, default_value_t = 400)]
         first_page: usize,
     },
+    /// A SolidWorks Electrical project archive (.tewzip) or project database
+    /// (tew_project_data.sqlite): its schematic and line-diagram pages, symbols as boxes with
+    /// their connection points at the original positions, wires joined to them, and devices with
+    /// part data. Symbol graphics (DWG) are not read.
+    Swe {
+        path: PathBuf,
+        /// Which project of the archive, counted from 1 (archives can hold several).
+        #[arg(long, default_value_t = 1)]
+        pick: usize,
+        #[arg(long, default_value_t = 1)]
+        first_page: usize,
+    },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
     Aml {
         file: PathBuf,
@@ -1249,6 +1261,50 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                  connections",
                 ep.pages.len(),
                 ep.connections.len()
+            );
+        }
+        ImportCmd::Swe { path, pick, first_page } => {
+            let project = pick;
+            let started = std::time::Instant::now();
+            let mut p = load(dir)?;
+            // A database file directly, or an archive read from disk: only the picked project's
+            // database is unpacked, so a large archive costs little memory.
+            let mut head = [0u8; 16];
+            let mut file = std::fs::File::open(&path).map_err(e)?;
+            let is_db = std::io::Read::read_exact(&mut file, &mut head).is_ok() && &head == b"SQLite format 3\0";
+            let db = if is_db {
+                std::fs::read(&path).map_err(e)?
+            } else {
+                let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
+                let got =
+                    wc_import::swe::database_from_archive(file, project).map_err(|x| format!("{x} (use --pick)"))?;
+                if got.count > 1 {
+                    eprintln!(
+                        "the archive holds {} projects; importing number {project} ({})",
+                        got.count, got.folder
+                    );
+                }
+                got.bytes
+            };
+            let conn = wc_import::swe::open(&db).map_err(e)?;
+            let sw = wc_import::swe::read(&conn).map_err(e)?;
+            let (built, warnings) = wc_import::swe::build(&sw, first_page);
+            for w in sw.warnings.iter().chain(&warnings) {
+                eprintln!("warning: {w}");
+            }
+            let source = format!(
+                "import:{}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+            let (n_pages, n_dev, n_sym) = (built.pages.len(), built.devices.len(), built.symbols.len());
+            let n_wires: usize = built.pages.iter().map(|pg| pg.wires.len()).sum();
+            add_built(dir, &mut p, built, &source)?;
+            save(dir, &p)?;
+            println!(
+                "imported {n_pages} page(s): {n_dev} devices, {n_wires} wires, {n_sym} symbol shapes ({} ms)",
+                started.elapsed().as_millis()
             );
         }
         ImportCmd::Aml { file, first_page } => {
