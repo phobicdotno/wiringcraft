@@ -103,6 +103,15 @@ enum Drag {
     Move { from: Point, checkpoint: bool },
     /// Drawing a selection box from this corner.
     Box { from: Point },
+    /// Moving the logo on the cover page, or with `size` sizing it from its bottom-right
+    /// corner: the grab point, the logo's box when the drag started, and whether the undo
+    /// checkpoint for this drag was taken.
+    Logo {
+        from: Point,
+        start: (Point, Point),
+        size: bool,
+        checkpoint: bool,
+    },
 }
 
 impl Editor {
@@ -590,6 +599,15 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     }
 
     paint_frame(&painter, &xf, open, &page, t.ink, t.faint);
+    paint_logo(
+        &painter,
+        &xf,
+        open,
+        &page,
+        ui.ctx(),
+        &t,
+        matches!(ed.tool, Tool::Select),
+    );
 
     for (i, g) in page.graphics.iter().enumerate() {
         let selected = ed.is_selected(&Selection::Graphic(i));
@@ -895,8 +913,23 @@ fn select_tool(
     if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
-        ed.drag = match open.hit(page, at, tol) {
-            Some(h) => {
+        let logo = wc_pdf::cover_logo_box(&open.project, page);
+        let hit = open.hit(page, at, tol);
+        ed.drag = match (logo, hit) {
+            // The sizing corner wins over whatever lies under it; elsewhere the page's items do.
+            (Some((a, b)), _) if logo_corner(b, at, tol) => Some(Drag::Logo {
+                from: at,
+                start: (a, b),
+                size: true,
+                checkpoint: false,
+            }),
+            (Some((a, b)), None) if a.x <= at.x && at.x <= b.x && a.y <= at.y && at.y <= b.y => Some(Drag::Logo {
+                from: at,
+                start: (a, b),
+                size: false,
+                checkpoint: false,
+            }),
+            (_, Some(h)) => {
                 if !ed.is_selected(&h) {
                     if shift {
                         ed.selection.push(h);
@@ -909,10 +942,35 @@ fn select_tool(
                     checkpoint: false,
                 })
             }
-            None => Some(Drag::Box { from: at }),
+            (_, None) => Some(Drag::Box { from: at }),
         };
     }
     match ed.drag {
+        Some(Drag::Logo {
+            from,
+            start,
+            size,
+            checkpoint,
+        }) if resp.dragged_by(egui::PointerButton::Primary) => {
+            // The raw pointer, like `from`: `ed.cursor` is snapped to the grid, and mixing the
+            // two would jump the logo on the first move.
+            if let Some(cur) = resp.interact_pointer_pos().map(|p| xf.mm(p)) {
+                let (a, b) = logo_dragged(start, size, Point::new(cur.x - from.x, cur.y - from.y));
+                let now = wc_pdf::cover_logo_box(&open.project, page);
+                if now != Some((a, b)) {
+                    if !checkpoint {
+                        open.checkpoint();
+                    }
+                    open.set_logo_place(a, b);
+                    ed.drag = Some(Drag::Logo {
+                        from,
+                        start,
+                        size,
+                        checkpoint: true,
+                    });
+                }
+            }
+        }
         Some(Drag::Move { from, checkpoint }) if resp.dragged_by(egui::PointerButton::Primary) => {
             if let Some(cur) = ed.cursor {
                 // Move by whole snap steps so pins stay on the grid.
@@ -955,6 +1013,75 @@ fn select_tool(
     if resp.drag_stopped() {
         let alt = resp.ctx.input(|i| i.modifiers.alt);
         drag_released(open, ed, alt);
+    }
+}
+
+/// Whether `at` is on the sizing corner of a logo box whose bottom-right corner is `max`.
+fn logo_corner(max: Point, at: Point, tol: f64) -> bool {
+    let r = tol.max(2.0);
+    (at.x - max.x).abs() <= r && (at.y - max.y).abs() <= r
+}
+
+/// The logo's box after a drag by `d` (whole millimetres) from `start`: moved, or with `size`
+/// its bottom-right corner moved, keeping it at least 5 mm each way.
+fn logo_dragged((a, b): (Point, Point), size: bool, d: Point) -> (Point, Point) {
+    let d = Point::new(d.x.round(), d.y.round());
+    if size {
+        (a, Point::new((b.x + d.x).max(a.x + 5.0), (b.y + d.y).max(a.y + 5.0)))
+    } else {
+        (Point::new(a.x + d.x, a.y + d.y), Point::new(b.x + d.x, b.y + d.y))
+    }
+}
+
+/// The project logo in the title block and, on the cover page, in its place there. With the
+/// select tool the cover's logo shows its box and sizing corner.
+fn paint_logo(
+    p: &egui::Painter,
+    xf: &Xf,
+    open: &mut Open,
+    page: &Page,
+    ctx: &egui::Context,
+    t: &theme::Theme,
+    select: bool,
+) {
+    let Some(file) = open.project.meta.logo.as_ref().map(|l| l.file.clone()) else {
+        return;
+    };
+    let tex = open.picture_texture(ctx, &file);
+    for b in wc_pdf::logo_boxes(&open.project, page) {
+        match &tex {
+            Some(tex) => {
+                let [w, h] = tex.size();
+                let (a, z) = wc_pdf::fit_picture(b, (w as u32, h as u32));
+                let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                p.image(tex.id(), Rect::from_two_pos(xf.s(a), xf.s(z)), uv, Color32::WHITE);
+            }
+            None => {
+                let area = Rect::from_two_pos(xf.s(b.0), xf.s(b.1));
+                p.rect_stroke(area, 0.0, Stroke::new(1.0_f32, t.faint), egui::StrokeKind::Inside);
+                let label = match open.picture_problems.get(&file).map(String::as_str) {
+                    None | Some("the file is missing") => "Logo missing".to_owned(),
+                    Some(why) => format!("Logo cannot be shown: {why}"),
+                };
+                p.text(
+                    area.center(),
+                    Align2::CENTER_CENTER,
+                    label,
+                    FontId::proportional(xf.len(2.0).clamp(8.0, 13.0)),
+                    t.faint,
+                );
+            }
+        }
+    }
+    if select && let Some((a, b)) = wc_pdf::cover_logo_box(&open.project, page) {
+        let area = Rect::from_two_pos(xf.s(a), xf.s(b));
+        p.rect_stroke(
+            area,
+            0.0,
+            Stroke::new(1.0_f32, t.faint.gamma_multiply(0.6)),
+            egui::StrokeKind::Middle,
+        );
+        p.rect_filled(Rect::from_center_size(area.max, Vec2::splat(7.0)), 1.0, t.faint);
     }
 }
 
@@ -1291,6 +1418,26 @@ fn jumper_points(
 mod tests {
     use super::*;
     use crate::state::tests::project;
+
+    #[test]
+    fn the_cover_logo_moves_and_sizes_by_whole_millimetres_and_stays_usable() {
+        let start = (Point::new(10.0, 10.0), Point::new(40.0, 30.0));
+        assert_eq!(
+            logo_dragged(start, false, Point::new(5.4, -2.6)),
+            (Point::new(15.0, 7.0), Point::new(45.0, 27.0))
+        );
+        assert_eq!(
+            logo_dragged(start, true, Point::new(10.0, 5.0)),
+            (Point::new(10.0, 10.0), Point::new(50.0, 35.0))
+        );
+        assert_eq!(
+            logo_dragged(start, true, Point::new(-100.0, -100.0)),
+            (Point::new(10.0, 10.0), Point::new(15.0, 15.0)),
+            "never smaller than 5 mm"
+        );
+        assert!(logo_corner(Point::new(40.0, 30.0), Point::new(41.5, 29.0), 0.5));
+        assert!(!logo_corner(Point::new(40.0, 30.0), Point::new(35.0, 25.0), 0.5));
+    }
 
     #[test]
     fn a_notched_outline_leaves_the_notch_empty() {

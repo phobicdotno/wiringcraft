@@ -24,6 +24,17 @@ pub struct Drawn {
     pub layers: BTreeSet<Layer>,
     /// A picture drawn under everything else, on the `Scans` layer.
     pub underlay: Option<PageImage>,
+    /// Pictures drawn over the page (the project logo). One image used on several pages is
+    /// stored in the file once.
+    pub pictures: Vec<Placed>,
+}
+
+/// A shared picture placed in a rectangle of a page, in millimetres (y down).
+#[derive(Debug, Clone)]
+pub struct Placed {
+    pub image: std::sync::Arc<PageImage>,
+    pub min: (f64, f64),
+    pub max: (f64, f64),
 }
 
 /// A picture ready to embed: JPEG data as stored, or Flate-compressed samples.
@@ -38,6 +49,9 @@ pub struct PageImage {
     /// Extra dictionary entries, such as an inverted `/Decode` for Adobe CMYK JPEGs.
     pub extra: &'static str,
     pub data: Vec<u8>,
+    /// Transparency: one Flate-compressed 8-bit alpha sample per pixel, written as the image's
+    /// soft mask. `None` for an opaque picture.
+    pub alpha: Option<Vec<u8>>,
     /// Where it goes on the page, in millimetres (y down).
     pub min: (f64, f64),
     pub max: (f64, f64),
@@ -197,7 +211,30 @@ impl Doc {
                 image_obj.insert(i, 6 + 3 * n + used.len() + image_obj.len());
             }
         }
+        // Placed pictures follow, one object per distinct image however many pages show it.
+        let mut shared: Vec<(*const PageImage, usize)> = Vec::new();
         let mut objs: Vec<(usize, Vec<u8>)> = Vec::new();
+        for p in &self.pages {
+            for placed in &p.drawn.pictures {
+                let key = std::sync::Arc::as_ptr(&placed.image);
+                if !shared.iter().any(|(k, _)| *k == key) {
+                    let obj = 6 + 3 * n + used.len() + image_obj.len() + shared.len();
+                    shared.push((key, obj));
+                }
+            }
+        }
+        // Soft masks of transparent pictures come last, numbered as they are needed.
+        let mut next_free = 6 + 3 * n + used.len() + image_obj.len() + shared.len();
+        for p in &self.pages {
+            for placed in &p.drawn.pictures {
+                let key = std::sync::Arc::as_ptr(&placed.image);
+                if let Some((_, obj)) = shared.iter().find(|(k, _)| *k == key)
+                    && !objs.iter().any(|(o, _)| o == obj)
+                {
+                    objs.extend(image_objects(&placed.image, *obj, &mut next_free));
+                }
+            }
+        }
         let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", page_obj(i))).collect();
         let oc = if used.is_empty() {
             String::new()
@@ -280,22 +317,30 @@ impl Doc {
                     x1 - x0,
                     y1 - y0
                 );
-                xobjects = format!(" /XObject << /Im0 {obj} 0 R >>");
-                let mut body = format!(
-                    "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{} /BitsPerComponent 8 /Filter /{}{} /Length {} >>\nstream\n",
-                    img.width,
-                    img.height,
-                    img.colour_space,
-                    img.filter,
-                    img.extra,
-                    img.data.len()
-                )
-                .into_bytes();
-                body.extend_from_slice(&img.data);
-                body.extend_from_slice(b"\nendstream");
-                objs.push((*obj, body));
+                xobjects = format!("/Im0 {obj} 0 R");
+                objs.extend(image_objects(img, *obj, &mut next_free));
             }
             ops.push_str(&p.drawn.ops);
+            for (k, placed) in p.drawn.pictures.iter().enumerate() {
+                let key = std::sync::Arc::as_ptr(&placed.image);
+                let Some((_, obj)) = shared.iter().find(|(s, _)| *s == key) else {
+                    continue;
+                };
+                let (x0, x1) = (placed.min.0 * PT_PER_MM, placed.max.0 * PT_PER_MM);
+                let (y0, y1) = (h - placed.max.1 * PT_PER_MM, h - placed.min.1 * PT_PER_MM);
+                let _ = writeln!(
+                    ops,
+                    "q {:.3} 0 0 {:.3} {x0:.3} {y0:.3} cm /Pic{k} Do Q",
+                    x1 - x0,
+                    y1 - y0
+                );
+                let _ = write!(xobjects, " /Pic{k} {obj} 0 R");
+            }
+            let xobjects = if xobjects.is_empty() {
+                String::new()
+            } else {
+                format!(" /XObject << {} >>", xobjects.trim_start())
+            };
             objs.push((
                 page_obj(i),
                 format!(
@@ -349,6 +394,45 @@ impl Doc {
         out.extend_from_slice(xref.as_bytes());
         out
     }
+}
+
+/// The image XObject holding `img`'s samples as object `obj`, and its soft mask (numbered from
+/// `next_free`, which moves past it) when the picture is transparent.
+fn image_objects(img: &PageImage, obj: usize, next_free: &mut usize) -> Vec<(usize, Vec<u8>)> {
+    let stream = |dict: String, data: &[u8]| {
+        let mut body = format!("{dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\nendstream");
+        body
+    };
+    let mut out = Vec::new();
+    let mut smask = String::new();
+    if let Some(alpha) = &img.alpha {
+        let m = *next_free;
+        *next_free += 1;
+        smask = format!(" /SMask {m} 0 R");
+        out.push((
+            m,
+            stream(
+                format!(
+                    "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                    img.width, img.height
+                ),
+                alpha,
+            ),
+        ));
+    }
+    out.push((
+        obj,
+        stream(
+            format!(
+                "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{} /BitsPerComponent 8 /Filter /{}{}{smask}",
+                img.width, img.height, img.colour_space, img.filter, img.extra
+            ),
+            &img.data,
+        ),
+    ));
+    out
 }
 
 /// Builds a content stream in page millimetres (y down), converting to PDF points (y up).

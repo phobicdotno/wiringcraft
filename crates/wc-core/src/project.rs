@@ -40,6 +40,43 @@ pub struct ProjectMeta {
     /// Jumpers (bridges) between terminals of one strip; jumpered terminals are one potential.
     #[serde(default, rename = "jumper", skip_serializing_if = "Vec::is_empty")]
     pub jumpers: Vec<Jumper>,
+    /// The project's logo, shown on the cover page and in every title block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<Logo>,
+}
+
+/// The project's logo: a JPEG or PNG file in the project folder. The title block shows it in
+/// its own box on every page; the cover page shows it larger, where the user put it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Logo {
+    /// Path relative to the project folder, with `/` separators, e.g. `pictures/logo.png`.
+    pub file: String,
+    /// The rectangle the logo is fitted into on the cover page (top-left and bottom-right
+    /// corners, in millimetres). `None` puts it in its default place above the project name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<(Point, Point)>,
+}
+
+impl Logo {
+    /// Folder in a project that holds pictures such as the logo.
+    pub const DIR: &'static str = "pictures";
+
+    /// Whether `file` is a plain relative path inside the project (see [`relative_file_is_safe`]).
+    pub fn file_is_safe(&self) -> bool {
+        relative_file_is_safe(&self.file)
+    }
+}
+
+/// Whether `file` is a plain relative path inside the project (no `..`, no absolute path,
+/// no backslashes or drive letters). This checks the text only: a link inside the project can
+/// still lead out of it, so readers also check where the path really goes
+/// (`wc_pdf::read_picture`).
+pub fn relative_file_is_safe(f: &str) -> bool {
+    !f.is_empty()
+        && !f.starts_with('/')
+        && !f.contains('\\')
+        && !f.contains(':')
+        && f.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// Terminals of one strip bridged together by a jumper: they form one potential.
@@ -347,6 +384,7 @@ impl ProjectMeta {
             libraries: Vec::new(),
             locations: Vec::new(),
             jumpers: Vec::new(),
+            logo: None,
         }
     }
 
@@ -700,15 +738,9 @@ impl Underlay {
     /// Folder in a project that holds underlay pictures.
     pub const DIR: &'static str = "underlays";
 
-    /// Whether `file` is a plain relative path inside the project (no `..`, no absolute path,
-    /// no backslashes), so reading it can never leave the project folder.
+    /// Whether `file` is a plain relative path inside the project (see [`relative_file_is_safe`]).
     pub fn file_is_safe(&self) -> bool {
-        let f = &self.file;
-        !f.is_empty()
-            && !f.starts_with('/')
-            && !f.contains('\\')
-            && !f.contains(':')
-            && f.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+        relative_file_is_safe(&self.file)
     }
 }
 
@@ -1109,6 +1141,44 @@ mod tests {
         assert!(!m.remove_from_jumper(&x2, "1"));
         let plain = toml::to_string(&ProjectMeta::new("t"))?;
         assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
+    fn the_logo_is_saved_with_its_cover_place_and_older_projects_load_without_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let old: ProjectMeta = toml::from_str("name = \"t\"\nformat_version = 1\n")?;
+        assert_eq!(old.logo, None);
+        assert!(
+            !toml::to_string(&old)?.contains("logo"),
+            "nothing written without a logo"
+        );
+        let mut m = ProjectMeta::new("t");
+        m.logo = Some(Logo {
+            file: "pictures/logo.png".into(),
+            cover: Some((Point::new(10.0, 20.0), Point::new(50.0, 40.0))),
+        });
+        let back: ProjectMeta = toml::from_str(&toml::to_string(&m)?)?;
+        assert_eq!(back.logo, m.logo);
+        m.logo = Some(Logo {
+            file: "pictures/logo.png".into(),
+            cover: None,
+        });
+        let text = toml::to_string(&m)?;
+        assert!(!text.contains("cover"), "{text}");
+        assert_eq!(toml::from_str::<ProjectMeta>(&text)?.logo, m.logo);
+        for bad in [
+            "",
+            "/etc/logo.png",
+            "../logo.png",
+            "a/../b.png",
+            "C:/logo.png",
+            "a\\b.png",
+            "a//b.png",
+        ] {
+            assert!(!relative_file_is_safe(bad), "{bad}");
+        }
+        assert!(relative_file_is_safe("pictures/logo.png"));
         Ok(())
     }
 

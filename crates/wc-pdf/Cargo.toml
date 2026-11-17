@@ -11,5 +11,8 @@ wc-report.workspace = true
 miniz_oxide.workspace = true
 image.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
