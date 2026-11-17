@@ -220,6 +220,10 @@ struct MarkingArgs {
     /// Only the terminals of this strip (as the terminal plan names it, e.g. -X1).
     #[arg(long, allow_hyphen_values = true)]
     strip: Option<String>,
+    /// Written between the numbers of a multi-level terminal's levels on its one marker
+    /// (default " / "). A terminal's level is its `Level` property.
+    #[arg(long, allow_hyphen_values = true)]
+    level_separator: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -2243,6 +2247,10 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
         lines,
         language,
         strip,
+        level_separator: args
+            .level_separator
+            .clone()
+            .unwrap_or_else(|| wc_report::LEVEL_SEPARATOR.to_owned()),
     };
     let t = wc_report::marking_list_with(&inputs, &options);
     std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
@@ -3673,6 +3681,7 @@ mod tests {
             lines: vec!["marker".into(), "tag".into(), "description".into()],
             lang: "de".into(),
             strip: None,
+            level_separator: None,
         };
         let done = export_wago_marking(&dir, &out, &args).unwrap();
         assert_eq!(done.markers, 1);

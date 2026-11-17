@@ -174,7 +174,13 @@ pub struct MarkingOptions {
     pub language: Language,
     /// Only this terminal strip's terminals (as the terminal plan names it, e.g. `-X1`).
     pub strip: Option<String>,
+    /// Written between the numbers of a multi-level terminal's levels on its one marker
+    /// (see [`crate::LEVEL_PROPERTY`]).
+    pub level_separator: String,
 }
+
+/// The default [`MarkingOptions::level_separator`].
+pub const LEVEL_SEPARATOR: &str = " / ";
 
 impl Default for MarkingOptions {
     fn default() -> Self {
@@ -183,6 +189,7 @@ impl Default for MarkingOptions {
             lines: vec![LineField::Marker],
             language: Language::En,
             strip: None,
+            level_separator: LEVEL_SEPARATOR.to_owned(),
         }
     }
 }
@@ -202,21 +209,24 @@ pub fn marking_list(i: &Inputs<'_>, kinds: &[MarkerKind]) -> Table {
 /// The terminal strips that have numbered terminals, in natural order: what
 /// [`MarkingOptions::strip`] can name.
 pub fn terminal_strips(i: &Inputs<'_>) -> Vec<String> {
-    let mut strips: Vec<String> = terminal_rows(i).into_iter().map(|(s, _)| s).collect();
+    let mut strips: Vec<String> = terminal_rows(i).into_iter().map(|(s, _, _)| s).collect();
     // `-X1` and `-X01` sort alike, so their rows can interleave: order them exactly first.
     strips.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
     strips.dedup();
     strips
 }
 
-/// (strip, number) of every numbered terminal, sorted and without repeats.
-fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String)> {
+/// (strip, number, level) of every numbered terminal, sorted and without repeats. The level is
+/// the terminal plan's: set on the levels of a multi-level terminal.
+fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
     // The terminal plan already numbers terminals and sorts strips and numbers.
-    let mut rows: Vec<(String, String)> = terminal_plan(i)
+    let mut rows: Vec<(String, String, Option<u32>)> = terminal_plan(i)
         .rows
         .into_iter()
         .filter_map(|r| match (r.first(), r.get(1)) {
-            (Some(strip), Some(number)) if strip != "(untagged)" => Some((strip.clone(), number.clone())),
+            (Some(strip), Some(number)) if strip != "(untagged)" => {
+                Some((strip.clone(), number.clone(), r.get(7).and_then(|l| l.parse().ok())))
+            }
             _ => None,
         })
         .collect();
@@ -226,10 +236,34 @@ fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String)> {
             .then(natural_key(&a.1).cmp(&natural_key(&b.1)))
             // `1` and `01` have equal keys: order them exactly too, so `dedup` sees
             // repeats side by side.
-            .then_with(|| a.cmp(b))
+            .then_with(|| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
     });
-    rows.dedup();
+    rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     rows
+}
+
+/// The terminal markers of `rows` (from [`terminal_rows`]) as (strip, marker text): one per
+/// terminal block, so the levels of a multi-level terminal share one marker with their numbers
+/// joined by `separator` (`1 / 2`). A level of 2 or more joins the terminal before it in the
+/// same strip when that one is a lower level.
+pub(crate) fn terminal_markers(rows: Vec<(String, String, Option<u32>)>, separator: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut last: Option<(String, u32)> = None;
+    for (strip, number, level) in rows {
+        let joins = match (&last, level) {
+            (Some((s, below)), Some(l)) => *s == strip && l >= 2 && l > *below,
+            _ => false,
+        };
+        match out.last_mut() {
+            Some((_, marker)) if joins => {
+                marker.push_str(separator);
+                marker.push_str(&number);
+            }
+            _ => out.push((strip.clone(), number)),
+        }
+        last = level.map(|l| (strip, l));
+    }
+    out
 }
 
 /// The marker list as `o` asks for it: columns type, group, one per line, count.
@@ -288,7 +322,7 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
     };
 
     if wanted(MarkerKind::Terminals) {
-        for (strip, number) in terminal_rows(i) {
+        for (strip, number) in terminal_markers(terminal_rows(i), &o.level_separator) {
             if o.strip.as_ref().is_some_and(|s| s.trim() != strip) {
                 continue;
             }

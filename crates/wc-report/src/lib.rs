@@ -22,7 +22,7 @@ mod tests;
 pub use aml::{AmlCounts, automationml};
 pub use check::{Finding, Severity, check, check_table};
 pub use marking::{
-    Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,
+    LEVEL_SEPARATOR, Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,
     marking_list_with, parse_kinds, parse_lines, terminal_strips, to_smartscript_csv,
 };
 pub use plc::{PlcVariables, plc_variables};
@@ -477,7 +477,32 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
     t
 }
 
+/// The device property that makes a terminal one level of a multi-level (double- or triple-deck)
+/// terminal: `1` is the bottom level, `2` the next one up. A terminal with level 2 or more sits on
+/// the same terminal block as the terminal before it in the strip, so `-X1.1` (level 1) and
+/// `-X1.2` (level 2) are one two-level terminal.
+pub const LEVEL_PROPERTY: &str = "Level";
+
+/// A terminal's level from its [`LEVEL_PROPERTY`]; `None` when it has none or it is not a whole
+/// number from 1 up.
+fn terminal_level(project: &wc_core::Project, strip: &str, number: &str) -> Option<u32> {
+    let tag = DeviceTag::parse(&format!("{strip}.{number}")).ok()?;
+    project
+        .devices
+        .get(&tag)?
+        .properties
+        .get(LEVEL_PROPERTY)?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|l| *l >= 1)
+}
+
 /// Terminal plan: for every terminal strip, each terminal with what connects to its two sides.
+///
+/// The last column is the terminal's level on a multi-level terminal (see [`LEVEL_PROPERTY`]):
+/// empty for a single-level terminal, and `1` for the bottom level of a block even when only the
+/// levels above it say so.
 ///
 /// A terminal is a symbol with the terminal role. Its strip and number come from the tag:
 /// `-X1.3` is terminal 3 of strip `-X1`. Terminals tagged with just the strip (`-X1`) are
@@ -493,6 +518,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             "Potential",
             "Page",
             "Jumpered with",
+            "Level",
         ],
     );
     // The potential column sees jumpers; the Upper and Lower columns show what is wired to that
@@ -605,12 +631,28 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
             .max()
             .unwrap_or(0);
-        for term in list {
-            let number = term
-                .number
-                .clone()
-                .or_else(|| wc_core::project::next_number(&mut next))
-                .unwrap_or_default();
+        let numbered: Vec<(Term, String)> = list
+            .into_iter()
+            .map(|term| {
+                let number = term
+                    .number
+                    .clone()
+                    .or_else(|| wc_core::project::next_number(&mut next))
+                    .unwrap_or_default();
+                (term, number)
+            })
+            .collect();
+        let mut levels: Vec<Option<u32>> = numbered
+            .iter()
+            .map(|(_, n)| terminal_level(i.project, &strip, n))
+            .collect();
+        // The bottom level of a block needs no property of its own: the level above says so.
+        for k in 0..levels.len() {
+            if levels[k].is_none() && levels.get(k + 1).copied().flatten().is_some_and(|l| l >= 2) {
+                levels[k] = Some(1);
+            }
+        }
+        for ((term, number), level) in numbered.into_iter().zip(levels) {
             let side = |n: usize| -> (String, Option<String>) {
                 let Some(pin) = term.pins.get(n) else {
                     return (String::new(), None);
@@ -628,6 +670,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 pa.or(pb).unwrap_or_default(),
                 term.page.clone(),
                 term.jumpered.clone(),
+                level.map(|l| l.to_string()).unwrap_or_default(),
             ]);
         }
     }

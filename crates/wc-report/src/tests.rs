@@ -288,7 +288,7 @@ fn terminal_plan_shows_jumpers() {
         symbols: &s,
         parts: &parts,
     });
-    assert_eq!(t.columns.last().map(String::as_str), Some("Jumpered with"));
+    assert_eq!(t.columns[6], "Jumpered with");
     let row = |strip: &str, n: &str| t.rows.iter().find(|r| r[0] == strip && r[1] == n).unwrap().clone();
     assert_eq!(row("-X1", "1")[6], "2");
     assert_eq!(row("-X1", "2")[6], "1");
@@ -889,4 +889,72 @@ fn only_a_terminal_on_an_overview_page_counts_as_drawn_for_a_jumper() {
     // A real terminal there does.
     p.pages.last_mut().unwrap().symbols[0].symbol = "term".into();
     assert!(!warned(&p), "an overview terminal counts");
+}
+
+#[test]
+fn a_two_level_terminal_shows_its_levels_and_shares_one_marker() {
+    let (mut p, s, parts) = fixture();
+    // -X1.1 and -X1.2 are the two levels of one terminal; -X1.3 and -X1.4 another one whose
+    // bottom level says so itself; -X1.5 stands alone.
+    for (id, tag, x) in [("t3", "-X1.3", 130.0), ("t4", "-X1.4", 135.0), ("t5", "-X1.5", 140.0)] {
+        p.pages[0].symbols.push(place(id, "term", x, Some(tag)));
+    }
+    for (tag, level) in [("-X1.2", "2"), ("-X1.3", "1"), ("-X1.4", " 2 "), ("-X1.5", "x")] {
+        let tag = DeviceTag::parse(tag).unwrap();
+        p.devices
+            .entry(tag)
+            .or_default()
+            .properties
+            .insert(LEVEL_PROPERTY.into(), level.into());
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let plan = terminal_plan(&i);
+    assert_eq!(plan.columns.last().map(String::as_str), Some("Level"));
+    let levels: Vec<(&str, &str)> = plan
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| (r[1].as_str(), r[7].as_str()))
+        .collect();
+    assert_eq!(
+        levels,
+        [("1", "1"), ("2", "2"), ("3", "1"), ("4", "2"), ("5", "")],
+        "the bottom level is 1 without a property; a bad level is none"
+    );
+    let marked = |sep: &str| -> Vec<String> {
+        let o = MarkingOptions {
+            strip: Some("-X1".into()),
+            level_separator: sep.into(),
+            ..MarkingOptions::default()
+        };
+        marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect()
+    };
+    assert_eq!(marked(LEVEL_SEPARATOR), ["1 / 2", "3 / 4", "5"]);
+    assert_eq!(marked("+"), ["1+2", "3+4", "5"]);
+    // Other strips are untouched.
+    assert_eq!(plan.rows.iter().find(|r| r[0] == "-X2").unwrap()[7], "");
+}
+
+#[test]
+fn levels_join_only_upwards_within_one_strip() {
+    let rows = |v: &[(&str, &str, Option<u32>)]| -> Vec<(String, String, Option<u32>)> {
+        v.iter().map(|(a, b, l)| ((*a).into(), (*b).into(), *l)).collect()
+    };
+    let got = marking::terminal_markers(
+        rows(&[
+            ("-X1", "1", Some(1)),
+            ("-X1", "2", Some(2)),
+            ("-X1", "3", Some(3)),
+            ("-X1", "4", Some(2)),
+            ("-X2", "1", Some(2)),
+            ("-X2", "2", None),
+        ]),
+        "/",
+    );
+    let got: Vec<String> = got.into_iter().map(|(s, m)| format!("{s} {m}")).collect();
+    assert_eq!(got, ["-X1 1/2/3", "-X1 4", "-X2 1", "-X2 2"]);
 }
