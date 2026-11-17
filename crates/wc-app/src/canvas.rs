@@ -5,6 +5,7 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape as EShape, Stroke, Vec2};
 use wc_core::geom::{Align, Point};
+use wc_core::route::Route;
 use wc_core::{Endpoint, Page, Shape};
 
 use crate::state::{Open, Selection, Tool};
@@ -772,6 +773,16 @@ fn select_tool(
             (None, false) => ed.selection.clear(),
         }
     }
+    // Right-click on a wire: select it (keeping a selection it is part of) and offer the route
+    // styles for every selected wire.
+    if resp.secondary_clicked()
+        && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
+    {
+        right_clicked(ed, open.hit(page, at, tol));
+    }
+    if !selected_wires(ed).is_empty() {
+        resp.context_menu(|ui| route_menu(ui, open, ed));
+    }
     if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
@@ -871,6 +882,84 @@ fn wired_note(n: usize) -> String {
         0 => String::new(),
         1 => " Connected 1 wire to pins that line up (hold Alt to skip).".into(),
         n => format!(" Connected {n} wires to pins that line up (hold Alt to skip)."),
+    }
+}
+
+/// A right-click on `hit`: a wire that is not selected becomes the only selection; a selected
+/// one keeps the selection it is part of, so the menu acts on all of it. Anything else leaves
+/// the selection alone.
+fn right_clicked(ed: &mut Editor, hit: Option<Selection>) {
+    if let Some(h @ Selection::Wire(_)) = hit
+        && !ed.is_selected(&h)
+    {
+        ed.select_only(h);
+    }
+}
+
+/// The ids of the selected wires.
+fn selected_wires(ed: &Editor) -> Vec<String> {
+    ed.selection
+        .iter()
+        .filter_map(|s| match s {
+            Selection::Wire(id) => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The route style shared by all of `wires`, or `None` when they differ.
+fn shared_route(page: &Page, wires: &[String]) -> Option<Route> {
+    let mut styles = page.wires.iter().filter(|w| wires.contains(&w.id)).map(|w| w.route);
+    let first = styles.next()?;
+    styles.all(|r| r == first).then_some(first)
+}
+
+/// The wire right-click menu: the route styles, the current one marked.
+fn route_menu(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor) {
+    let wires = selected_wires(ed);
+    let Some(page) = open.project.pages.get(ed.page) else {
+        return;
+    };
+    let current = shared_route(page, &wires);
+    ui.label(if wires.len() == 1 {
+        "Route".to_owned()
+    } else {
+        format!("Route of {} wires", wires.len())
+    });
+    for style in Route::ALL {
+        if ui.radio(current == Some(style), style.label()).clicked() {
+            ed.message = route_note(open.set_route(ed.page, &wires, style), style);
+            ui.close_menu();
+        }
+    }
+    ui.separator();
+    if ui.add(egui::Button::new("Delete").shortcut_text("Del")).clicked() {
+        delete_selected_wires(open, ed);
+        ui.close_menu();
+    }
+}
+
+/// The wire menu's Delete: remove the selected wires, as one undo step. Other selected items
+/// (symbols, drawings) stay, and symbols keep their pins.
+fn delete_selected_wires(open: &mut Open, ed: &mut Editor) {
+    let wires: Vec<Selection> = selected_wires(ed).into_iter().map(Selection::Wire).collect();
+    if wires.is_empty() {
+        return;
+    }
+    open.delete_many(ed.page, &wires);
+    ed.selection.retain(|s| !wires.contains(s));
+    ed.message = match wires.len() {
+        1 => "Deleted 1 wire.".to_owned(),
+        n => format!("Deleted {n} wires."),
+    };
+}
+
+fn route_note(changed: usize, style: Route) -> String {
+    let what = style.label().to_lowercase();
+    match changed {
+        0 => "No wire routes changed.".to_owned(),
+        1 => format!("Route changed to {what} on 1 wire."),
+        n => format!("Route changed to {what} on {n} wires."),
     }
 }
 
@@ -1088,6 +1177,59 @@ mod tests {
             from: Point::new(0.0, 0.0),
             checkpoint: true,
         });
+    }
+
+    #[test]
+    fn right_click_keeps_a_selection_it_is_part_of() {
+        let wire = |id: &str| Selection::Wire(id.into());
+        let mut ed = Editor {
+            selection: vec![wire("w1"), wire("w2")],
+            ..Editor::default()
+        };
+        right_clicked(&mut ed, Some(wire("w1")));
+        assert_eq!(ed.selection, [wire("w1"), wire("w2")]);
+        right_clicked(&mut ed, Some(Selection::Symbol("s1".into())));
+        right_clicked(&mut ed, None);
+        assert_eq!(ed.selection, [wire("w1"), wire("w2")], "only wires change it");
+        right_clicked(&mut ed, Some(wire("w3")));
+        assert_eq!(ed.selection, [wire("w3")]);
+        assert_eq!(selected_wires(&ed), ["w3"]);
+    }
+
+    #[test]
+    fn the_wire_menu_deletes_the_clicked_wire_or_the_selection() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let free = |x: f64| Endpoint::Point {
+            at: Point::new(x, 100.0),
+        };
+        for x in [10.0, 30.0, 50.0] {
+            o.add_wire(page, free(x), free(x + 10.0), Vec::new());
+        }
+        let ids: Vec<String> = o.project.pages[page].wires.iter().map(|w| w.id.clone()).collect();
+        let symbols = o.project.pages[page].symbols.clone();
+        let wire = |i: usize| Selection::Wire(ids[i].clone());
+
+        // One wire, right-clicked while not selected.
+        ed.selection = vec![Selection::Symbol(coil.clone())];
+        right_clicked(&mut ed, Some(wire(0)));
+        delete_selected_wires(&mut o, &mut ed);
+        let left: Vec<&str> = o.project.pages[page].wires.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(left, [ids[1].as_str(), ids[2].as_str()]);
+        assert!(ed.selection.is_empty());
+        assert_eq!(ed.message, "Deleted 1 wire.");
+
+        // The rest, right-clicking one of a selection that also holds a symbol.
+        ed.selection = vec![wire(1), wire(2), Selection::Symbol(coil.clone())];
+        right_clicked(&mut ed, Some(wire(2)));
+        let before = o.project.pages[page].clone();
+        delete_selected_wires(&mut o, &mut ed);
+        assert!(o.project.pages[page].wires.is_empty());
+        assert_eq!(o.project.pages[page].symbols, symbols, "symbols and their pins stay");
+        assert_eq!(ed.selection, [Selection::Symbol(coil)]);
+        assert_eq!(ed.message, "Deleted 2 wires.");
+        assert!(o.undo());
+        assert_eq!(o.project.pages[page], before, "one undo brings both back");
     }
 
     #[test]

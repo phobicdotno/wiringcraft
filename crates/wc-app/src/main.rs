@@ -18,7 +18,8 @@ mod screenshot;
 mod state;
 mod theme;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, Pos2, RichText, Stroke, Vec2};
 
@@ -40,10 +41,14 @@ const TITLE_FIELDS: &[(&str, &str)] = &[
 ];
 
 enum Dialog {
-    OpenPath(String),
+    /// The folder field, and why the last Browse could not be used.
+    OpenPath(prefs::FolderField, Option<String>),
     NewProject {
-        dir: String,
+        /// The folder the project folder goes in.
+        location: prefs::FolderField,
         name: String,
+        /// Why the last Browse could not be used.
+        error: Option<String>,
     },
     ProjectProps {
         name: String,
@@ -197,6 +202,13 @@ impl App {
     }
 
     fn open_dir(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
+        let dir = &match prefs::absolute(dir) {
+            Ok(d) => d,
+            Err(e) => {
+                self.dialog = Some(Dialog::Message(format!("Could not open the project: {e}")));
+                return;
+            }
+        };
         match Open::load(dir) {
             Ok(o) => {
                 self.ed = Editor::default();
@@ -240,18 +252,23 @@ impl App {
                     .as_ref()
                     .map(|o| o.dir.display().to_string())
                     .unwrap_or_default();
-                self.dialog = Some(Dialog::OpenPath(start));
+                self.dialog = Some(Dialog::OpenPath(prefs::FolderField::typed(start), None));
             }
             Action::NewProject => {
-                let parent = self
+                let location = self
                     .open
                     .as_ref()
                     .and_then(|o| o.dir.parent())
-                    .map(|d| d.join("new-project").display().to_string())
-                    .unwrap_or_default();
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(prefs::projects_dir);
+                // A default location that cannot be shown as text is not guessed at: the field
+                // starts empty (Create stays off) and says why.
+                let mut field = prefs::FolderField::default();
+                let error = field.pick(location).err();
                 self.dialog = Some(Dialog::NewProject {
-                    dir: parent,
+                    location: field,
                     name: String::new(),
+                    error,
                 });
             }
             Action::ToggleChrome => {
@@ -620,7 +637,7 @@ impl App {
         let mut keep = true;
         let mut then: Option<Then> = None;
         let title = match &dialog {
-            Dialog::OpenPath(_) => "Open project",
+            Dialog::OpenPath(..) => "Open project",
             Dialog::NewProject { .. } => "New project",
             Dialog::ProjectProps { .. } => "Project properties",
             Dialog::PageProps { .. } => "Page properties",
@@ -787,17 +804,30 @@ impl App {
                         keep = false;
                     }
                 }
-                Dialog::OpenPath(path) => {
+                Dialog::OpenPath(path, error) => {
                     ui.label("Project folder (the one holding project.toml):");
-                    let r = ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                    let r = ui
+                        .horizontal(|ui| {
+                            let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(340.0));
+                            if ui.button("Browse…").clicked()
+                                && let Some(d) = pick_folder("Open project", &path.text)
+                            {
+                                *error = path.pick(d).err();
+                            }
+                            r
+                        })
+                        .inner;
                     for recent in &self.prefs.recent {
                         if ui.link(recent.display().to_string()).clicked() {
-                            *path = recent.display().to_string();
+                            *error = path.pick(recent.clone()).err();
                         }
+                    }
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Open").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
-                            let p = PathBuf::from(path.trim());
+                            let p = path.path();
                             then = Some(Box::new(move |app: &mut App| {
                                 let mut prefs = std::mem::take(&mut app.prefs);
                                 app.open_dir(&p, &mut prefs);
@@ -810,32 +840,48 @@ impl App {
                         }
                     });
                 }
-                Dialog::NewProject { dir, name } => {
+                Dialog::NewProject { location, name, error } => {
                     egui::Grid::new("newproj")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
-                            ui.label("Folder");
-                            ui.add(egui::TextEdit::singleline(dir).desired_width(380.0));
-                            ui.end_row();
                             ui.label("Name");
                             ui.add(
                                 egui::TextEdit::singleline(name)
-                                    .hint_text("the folder name")
+                                    .hint_text("also the folder name")
                                     .desired_width(380.0),
                             );
                             ui.end_row();
+                            ui.label("Location");
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut location.text).desired_width(300.0));
+                                if ui.button("Browse…").clicked()
+                                    && let Some(d) = pick_folder("Where to create the project", &location.text)
+                                {
+                                    *error = location.pick(d).err();
+                                }
+                            });
+                            ui.end_row();
                         });
+                    // The folder follows the name and the location, whichever is typed last.
+                    let target = prefs::new_project_dir(&location.path(), name);
+                    let t = theme::Theme::of(ui.ctx());
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(t.error));
+                    }
+                    match &target {
+                        Ok(d) => ui.label(RichText::new(format!("Creates {}", d.display())).color(t.muted)),
+                        Err(e) => ui.label(RichText::new(e.as_str()).color(t.error)),
+                    };
                     ui.label(
-                        RichText::new("A new folder with one cover page, recorded as a git repository.")
-                            .color(theme::Theme::of(ui.ctx()).faint),
+                        RichText::new("A new folder with one cover page, recorded as a git repository.").color(t.faint),
                     );
                     ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!dir.trim().is_empty(), egui::Button::new("Create"))
-                            .clicked()
+                        if let Ok(d) = target
+                            && ui
+                                .add_enabled(!location.is_empty(), egui::Button::new("Create"))
+                                .clicked()
                         {
-                            let d = PathBuf::from(dir.trim());
                             let n = name.trim().to_owned();
                             then = Some(Box::new(move |app: &mut App| app.new_project(&d, &n)));
                             keep = false;
@@ -1293,7 +1339,10 @@ impl App {
             name.to_owned()
         };
         if let Err(e) = wc_core::store::create(dir, &name) {
-            self.dialog = Some(Dialog::Message(format!("Could not create the project:\n{e}")));
+            self.dialog = Some(Dialog::Message(format!(
+                "Could not create the project in\n{}:\n{e}",
+                dir.display()
+            )));
             return;
         }
         // A starter library next to the app, when there is one, so the symbol picker is not empty.
@@ -1367,6 +1416,31 @@ fn size_label(s: PageSize) -> &'static str {
     }
 }
 
+/// The system's folder picker, starting in `start` (or its nearest existing parent). `None` when
+/// the user cancels. Blocks the window while open, like any modal dialog.
+fn pick_folder(title: &str, start: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title(title);
+    if let Some(d) = picker_start(start) {
+        dialog = dialog.set_directory(d);
+    }
+    dialog.pick_folder()
+}
+
+/// Where the folder picker opens for what is typed in a dialog: the projects folder for a blank
+/// field, otherwise the same rule as the dialogs (a bare name is inside the projects folder),
+/// then the nearest folder of that path that exists.
+fn picker_start(typed: &str) -> Option<PathBuf> {
+    let start = if typed.trim().is_empty() {
+        prefs::projects_dir()
+    } else {
+        prefs::project_path(typed)
+    };
+    start
+        .ancestors()
+        .find(|d| !d.as_os_str().is_empty() && d.is_dir())
+        .map(Path::to_path_buf)
+}
+
 /// The window and taskbar icon (assets/icon, made by tools/gen_icon.py), built into the
 /// program. An unreadable picture gives an empty icon, so the system default shows.
 fn window_icon() -> egui::IconData {
@@ -1399,9 +1473,19 @@ fn main_viewport() -> egui::ViewportBuilder {
 /// The starter symbol library: `library/` beside the executable or in the source tree.
 fn starter_library() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    find_library(exe.as_deref().and_then(Path::parent), &source)
+}
+
+/// The first `library/` with a `symbols` folder: next to the program (Windows install, download
+/// folder), the Linux package layout (/usr/bin -> /usr/share/wiringcraft), the macOS app bundle
+/// (Contents/MacOS -> Contents/Resources), then the source checkout this was built from.
+fn find_library(exe_dir: Option<&Path>, source: &Path) -> Option<PathBuf> {
     let candidates = [
-        exe.as_ref().and_then(|e| e.parent()).map(|d| d.join("library")),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library")),
+        exe_dir.map(|d| d.join("library")),
+        exe_dir.map(|d| d.join("../share/wiringcraft/library")),
+        exe_dir.map(|d| d.join("../Resources/library")),
+        Some(source.to_path_buf()),
     ];
     candidates
         .into_iter()
@@ -1881,11 +1965,144 @@ fn main() -> eframe::Result {
     }
     applog::init();
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
+    let wanted = std::env::var(RENDERER_VAR).ok();
     let options = eframe::NativeOptions {
         viewport: main_viewport(),
+        renderer: renderer_for(wanted.as_deref()),
         ..Default::default()
     };
-    eframe::run_native("WiringCraft", options, Box::new(|cc| Ok(Box::new(App::new(cc, dir)))))
+    // No usable OpenGL (a remote desktop session, a virtual machine, a missing graphics driver
+    // often offer only OpenGL 1.1): start again on wgpu (Direct3D, Metal or Vulkan, with a
+    // software fallback). A window system cannot be started twice in one process, so this is a
+    // new process. Some OpenGL failures panic inside eframe instead of returning an error, so a
+    // panic before the app has started falls back the same way. Set WIRINGCRAFT_RENDERER=wgpu
+    // to skip the first try.
+    let fallback = falls_back(wanted.as_deref());
+    if fallback {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            if !STARTED.load(Ordering::SeqCst) {
+                // Leave at once: waiting here would keep this process's half-made window on
+                // screen while the new one runs.
+                restart_with_wgpu(&format!("{info}"), false);
+            }
+        }));
+    }
+    let result = eframe::run_native(
+        "WiringCraft",
+        options,
+        Box::new(|cc| {
+            STARTED.store(true, Ordering::SeqCst);
+            Ok(Box::new(App::new(cc, dir)))
+        }),
+    );
+    if let Err(e) = &result
+        && fallback
+        && !STARTED.load(Ordering::SeqCst)
+    {
+        restart_with_wgpu(&e.to_string(), true);
+    }
+    result
+}
+
+/// Environment variable that picks the graphics backend: `glow` (OpenGL, the default) or `wgpu`.
+const RENDERER_VAR: &str = "WIRINGCRAFT_RENDERER";
+
+/// Set once the window and its renderer are up; a failure after that is not a renderer problem.
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// The backend to start with: `wgpu` when asked for, OpenGL otherwise.
+fn renderer_for(wanted: Option<&str>) -> eframe::Renderer {
+    match wanted {
+        Some("wgpu") => eframe::Renderer::Wgpu,
+        _ => eframe::Renderer::Glow,
+    }
+}
+
+/// Whether a failure before the app starts should try again on wgpu: only for the default
+/// choice, so a backend picked by hand, and the second try itself, never loop.
+fn falls_back(wanted: Option<&str>) -> bool {
+    wanted.is_none()
+}
+
+/// Run this program again on wgpu with the same arguments, then leave: with the new process's
+/// exit code when `wait`, at once otherwise.
+fn restart_with_wgpu(why: &str, wait: bool) {
+    eprintln!("wiringcraft-app: OpenGL could not start ({why}); starting again with wgpu");
+    let child = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .env(RENDERER_VAR, "wgpu")
+            .spawn()
+    });
+    match child {
+        Ok(mut c) if wait => std::process::exit(c.wait().ok().and_then(|s| s.code()).unwrap_or(1)),
+        Ok(_) => std::process::exit(0),
+        Err(err) => eprintln!("wiringcraft-app: could not start again with wgpu: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod renderer_tests {
+    use super::*;
+
+    #[test]
+    fn opengl_is_the_default_and_wgpu_can_be_picked() {
+        assert_eq!(renderer_for(None), eframe::Renderer::Glow);
+        assert_eq!(renderer_for(Some("glow")), eframe::Renderer::Glow);
+        assert_eq!(renderer_for(Some("wgpu")), eframe::Renderer::Wgpu);
+        assert_eq!(renderer_for(Some("other")), eframe::Renderer::Glow);
+    }
+
+    #[test]
+    fn only_the_default_choice_falls_back_so_the_second_try_never_loops() {
+        assert!(falls_back(None));
+        assert!(!falls_back(Some("wgpu")), "the second try runs with wgpu set");
+        assert!(!falls_back(Some("glow")), "OpenGL picked by hand is not overruled");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod library_tests {
+    use super::*;
+
+    /// Makes `<root>/<rel>/symbols` and returns `<root>/<rel>` canonicalized.
+    fn lib(root: &Path, rel: &str) -> PathBuf {
+        std::fs::create_dir_all(root.join(rel).join("symbols")).unwrap();
+        root.join(rel).canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_library_is_found_in_each_install_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let none = t.path().join("no-source");
+        // Linux package: /usr/bin/wiringcraft-app with /usr/share/wiringcraft/library.
+        let linux = t.path().join("usr");
+        let want = lib(&linux, "share/wiringcraft/library");
+        std::fs::create_dir_all(linux.join("bin")).unwrap();
+        assert_eq!(find_library(Some(&linux.join("bin")), &none), Some(want));
+        // macOS bundle: Contents/MacOS with Contents/Resources/library.
+        let mac = t.path().join("WiringCraft.app/Contents");
+        let want = lib(&mac, "Resources/library");
+        std::fs::create_dir_all(mac.join("MacOS")).unwrap();
+        assert_eq!(find_library(Some(&mac.join("MacOS")), &none), Some(want));
+        // Nothing installed and no source checkout: no library.
+        let empty = t.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(find_library(Some(&empty), &none), None);
+    }
+
+    #[test]
+    fn a_library_next_to_the_program_wins() {
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("app");
+        let beside = lib(&app, "library");
+        let source = lib(t.path(), "source/library");
+        assert_eq!(find_library(Some(&app), &source), Some(beside));
+        assert_eq!(find_library(None, &source), Some(source));
+    }
 }
 
 #[cfg(test)]
@@ -1901,5 +2118,32 @@ mod icon_tests {
     fn the_main_window_carries_the_icon() {
         let icon = super::main_viewport().icon;
         assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod picker_tests {
+    use super::*;
+
+    #[test]
+    fn the_picker_opens_where_the_dialog_would_put_the_project() {
+        let nearest = |p: PathBuf| {
+            p.ancestors()
+                .find(|d| !d.as_os_str().is_empty() && d.is_dir())
+                .map(Path::to_path_buf)
+        };
+        // A bare name is looked up under the projects folder, never the folder the app started
+        // in, whether or not that name exists there.
+        let name = "some-project-name";
+        assert_eq!(picker_start(name), nearest(prefs::projects_dir().join(name)));
+        assert_eq!(picker_start("  "), nearest(prefs::projects_dir()));
+        // A full path opens at its nearest existing folder (inside a fresh, empty folder).
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("not-there").join("deeper");
+        assert_eq!(
+            picker_start(&deep.display().to_string()),
+            Some(tmp.path().to_path_buf())
+        );
     }
 }

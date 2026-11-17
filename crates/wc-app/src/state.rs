@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
 use wc_core::project::PageSize;
+use wc_core::route::{self, Axis, Route};
 use wc_core::{DeviceTag, Endpoint, Page, Part, PlacedSymbol, Project, Symbol, Wire, store};
 
 /// How a part is listed in the picker: manufacturer, order number and description.
@@ -356,6 +357,7 @@ impl Open {
                 number: None,
                 potential: None,
                 cable: None,
+                route: Default::default(),
             });
         }
     }
@@ -381,6 +383,7 @@ impl Open {
                 number: None,
                 potential: None,
                 cable: None,
+                route: Default::default(),
             });
         }
         if !pairs.is_empty() {
@@ -680,6 +683,48 @@ impl Open {
             Endpoint::Pin { item, pin } => self.pin_pos(page, item, pin),
         }
     }
+
+    /// Which way a wire leaves this end: along the pin's direction, or `None` for a free point.
+    pub fn end_axis(&self, page: &Page, e: &Endpoint) -> Option<Axis> {
+        let Endpoint::Pin { item, pin } = e else {
+            return None;
+        };
+        let placed = page.symbol(item)?;
+        let pin = self.symbols.get(&placed.symbol)?.pin(pin)?;
+        Some(Axis::of(pin.dir, placed.rotation))
+    }
+
+    /// Redraw these wires between the same two ends in `style`, as one undo step. Returns how
+    /// many wires were changed; wires with an end on a missing symbol are left alone.
+    pub fn set_route(&mut self, page: usize, wires: &[String], style: Route) -> usize {
+        let Some(pg) = self.project.pages.get(page) else {
+            return 0;
+        };
+        let changes: Vec<(String, Vec<Point>)> = pg
+            .wires
+            .iter()
+            .filter(|w| wires.contains(&w.id))
+            .filter_map(|w| {
+                let a = self.end_pos(pg, &w.from)?;
+                let b = self.end_pos(pg, &w.to)?;
+                let via = route::via(a, self.end_axis(pg, &w.from), b, self.end_axis(pg, &w.to), style);
+                (via != w.via || w.route != style).then(|| (w.id.clone(), via))
+            })
+            .collect();
+        if changes.is_empty() {
+            return 0;
+        }
+        self.checkpoint();
+        if let Some(pg) = self.project.pages.get_mut(page) {
+            for (id, via) in &changes {
+                if let Some(w) = pg.wires.iter_mut().find(|w| &w.id == id) {
+                    w.via = via.clone();
+                    w.route = style;
+                }
+            }
+        }
+        changes.len()
+    }
 }
 
 /// The name review comments are signed with: `WIRINGCRAFT_USER`, then git's `user.name`, then
@@ -730,6 +775,65 @@ pub(crate) mod tests {
         store::save(&dir, &p).unwrap();
         let open = Open::load(&dir).unwrap();
         (tmp, open)
+    }
+
+    #[test]
+    fn changing_the_route_redraws_selected_wires_in_one_undo_step() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let k1 = o.place(page, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let k2 = o.place(page, "wc.coil", Point::new(60.0, 80.0)).unwrap();
+        let pin = |item: &str, pin: &str| Endpoint::Pin {
+            item: item.into(),
+            pin: pin.into(),
+        };
+        o.add_wire(page, pin(&k1, "A2"), pin(&k2, "A1"), Vec::new());
+        o.add_wire(
+            page,
+            pin(&k2, "A2"),
+            Endpoint::Point {
+                at: Point::new(100.0, 140.0),
+            },
+            Vec::new(),
+        );
+        let ids: Vec<String> = o.project.pages[page].wires.iter().map(|w| w.id.clone()).collect();
+        let before = o.project.pages.clone();
+        assert_eq!(o.set_route(page, &ids, Route::Sloped), 2);
+        for w in &o.project.pages[page].wires {
+            assert_eq!(w.route, Route::Sloped);
+            let a = o.end_pos(&o.project.pages[page], &w.from).unwrap();
+            let b = o.end_pos(&o.project.pages[page], &w.to).unwrap();
+            let expected = route::via(
+                a,
+                o.end_axis(&o.project.pages[page], &w.from),
+                b,
+                o.end_axis(&o.project.pages[page], &w.to),
+                Route::Sloped,
+            );
+            assert_eq!(w.via, expected);
+            assert!(!w.via.is_empty(), "the ends are not lined up, so the wire bends");
+        }
+        assert_eq!(o.set_route(page, &ids, Route::Sloped), 0, "nothing left to change");
+        assert!(o.undo());
+        assert_eq!(o.project.pages, before, "one undo puts both wires back");
+    }
+
+    #[test]
+    fn a_rotated_coil_leaves_its_pins_sideways() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let k1 = o.place(page, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let end = Endpoint::Pin {
+            item: k1.clone(),
+            pin: "A1".into(),
+        };
+        assert_eq!(o.end_axis(&o.project.pages[page], &end), Some(Axis::Vertical));
+        o.project.pages[page].symbols[0].rotation = Rotation::R90;
+        assert_eq!(o.end_axis(&o.project.pages[page], &end), Some(Axis::Horizontal));
+        let free = Endpoint::Point {
+            at: Point::new(0.0, 0.0),
+        };
+        assert_eq!(o.end_axis(&o.project.pages[page], &free), None);
     }
 
     #[test]

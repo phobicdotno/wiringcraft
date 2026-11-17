@@ -1,0 +1,256 @@
+# Install packages for Windows, Linux and macOS (#47).
+#
+# - Windows: a setup .exe (Inno Setup), installed per user, with a Start menu entry and the
+#   `wiringcraft` command on the user's PATH.
+# - Linux: a .deb with both programs in /usr/bin and a desktop entry. Built on the oldest
+#   supported Ubuntu runner, so it also runs on newer distributions.
+# - macOS: a .dmg with WiringCraft.app, universal (Apple silicon and Intel). The command line
+#   program is inside the app: WiringCraft.app/Contents/MacOS/wiringcraft.
+#
+# Each package is installed, run (`wiringcraft --version`) and uninstalled again in CI before it
+# is uploaded. The packages are not signed yet: Windows SmartScreen and macOS Gatekeeper warn on
+# first start (see the release notes).
+#
+# A version tag (`v0.2.0`, matching the version in Cargo.toml) builds the packages and attaches
+# them to a draft GitHub release, to be checked and published by hand. A manual run (Actions >
+# Release > Run workflow) builds and tests the packages only; they are under "Artifacts".
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # A change to the packaging builds and tests the packages too (no release).
+  pull_request:
+    paths: ['packaging/**', '.github/workflows/release.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Package (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: windows-x64 }
+          - { os: ubuntu-22.04, name: linux-x64 }
+          - { os: macos-latest, name: macos-universal }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch
+        with:
+          toolchain: stable
+          targets: ${{ matrix.name == 'macos-universal' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: package
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          test -n "$v"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$v" ]]; then
+            echo "::error::tag ${GITHUB_REF#refs/tags/} does not match version $v in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+
+      # Windows: setup .exe
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release -p wc-cli -p wc-app
+          mkdir -p stage
+          cp target/release/wiringcraft.exe target/release/wiringcraft-app.exe stage/
+          cp README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md stage/
+          cp -r library stage/
+          cp assets/icon/wiringcraft.ico stage/
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup install failed" }
+          }
+          & $iscc /Q "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$PWD\stage" "/DOutputDir=$PWD\dist" packaging\windows\wiringcraft.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed with $LASTEXITCODE" }
+      - name: Install, run, uninstall (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist\*-setup.exe | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          $dir = "$env:LOCALAPPDATA\Programs\WiringCraft"
+          if (-not (Test-Path "$dir\wiringcraft-app.exe")) { throw "the app was not installed" }
+          if (-not (Test-Path "$dir\library\symbols")) { throw "the starter library was not installed" }
+          # The C runtime is linked in (.cargo/config.toml), so a clean Windows needs no VC++ redistributable.
+          foreach ($exe in 'wiringcraft.exe', 'wiringcraft-app.exe') {
+            if ([IO.File]::ReadAllText("$dir\$exe", [Text.Encoding]::ASCII) -match 'VCRUNTIME140') { throw "$exe needs VCRUNTIME140.dll" }
+          }
+          & "$dir\wiringcraft.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "wiringcraft --version failed" }
+          $path = (Get-ItemProperty HKCU:\Environment).Path
+          if (-not ($path -split ';' -contains $dir)) { throw "the install folder is not on the user PATH" }
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          # The uninstaller hands off to a copy of itself; give it a moment to finish.
+          for ($i = 0; $i -lt 30 -and (Test-Path "$dir\wiringcraft.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$dir\wiringcraft.exe") { throw "the uninstall left the programs behind" }
+          $path = (Get-ItemProperty HKCU:\Environment).Path
+          if ($path -split ';' -contains $dir) { throw "the uninstall left the PATH entry behind" }
+          "install, run and uninstall: ok"
+
+      # Linux: .deb
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo build --release -p wc-cli -p wc-app
+          v=${{ steps.version.outputs.version }}
+          root="wiringcraft_${v}_amd64"
+          install -Dm755 target/release/wiringcraft "$root/usr/bin/wiringcraft"
+          install -Dm755 target/release/wiringcraft-app "$root/usr/bin/wiringcraft-app"
+          install -Dm644 packaging/linux/wiringcraft.desktop "$root/usr/share/applications/wiringcraft.desktop"
+          # The app icon in the hicolor theme, every size the desktop asks for.
+          for n in 16 24 32 48 64 128 256 512; do
+            install -Dm644 "assets/icon/wiringcraft-$n.png" "$root/usr/share/icons/hicolor/${n}x${n}/apps/wiringcraft.png"
+          done
+          install -Dm644 assets/icon/wiringcraft.svg "$root/usr/share/icons/hicolor/scalable/apps/wiringcraft.svg"
+          for f in README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md; do
+            install -Dm644 "$f" "$root/usr/share/doc/wiringcraft/$f"
+          done
+          mkdir -p "$root/usr/share/wiringcraft"
+          cp -r library "$root/usr/share/wiringcraft/"
+          chmod -R u=rwX,go=rX "$root/usr/share/wiringcraft"
+          mkdir -p "$root/DEBIAN"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: wiringcraft
+          Version: $v
+          Section: electronics
+          Priority: optional
+          Architecture: amd64
+          Maintainer: WiringCraft <https://github.com/phobicdotno/wiringcraft>
+          Depends: libc6 (>= 2.35), libgcc-s1, git
+          Recommends: libgl1, libxkbcommon-x11-0, libwayland-client0
+          Homepage: https://github.com/phobicdotno/wiringcraft
+          Description: Electrical schematics and wiring diagrams
+           WiringCraft desktop app (wiringcraft-app) and command line (wiringcraft).
+          EOF
+          dpkg-deb --root-owner-group --build "$root" "dist/wiringcraft-$v-linux-amd64.deb"
+      - name: Install, run, uninstall (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get install -y "./$(ls dist/*.deb)"
+          wiringcraft --version
+          test -x /usr/bin/wiringcraft-app
+          test -f /usr/share/applications/wiringcraft.desktop
+          grep -qx 'Icon=wiringcraft' /usr/share/applications/wiringcraft.desktop
+          test -f /usr/share/icons/hicolor/256x256/apps/wiringcraft.png
+          test -f /usr/share/icons/hicolor/scalable/apps/wiringcraft.svg
+          test -d /usr/share/wiringcraft/library/symbols
+          sudo apt-get remove -y wiringcraft
+          # Not `command -v`: the shell remembers where it found a program it already ran.
+          if test -e /usr/bin/wiringcraft || test -e /usr/bin/wiringcraft-app || test -e /usr/share/wiringcraft; then
+            echo "::error::the uninstall left the programs behind"
+            exit 1
+          fi
+          echo "install, run and uninstall: ok"
+
+      # macOS: universal .dmg
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          v=${{ steps.version.outputs.version }}
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$t" -p wc-cli -p wc-app
+          done
+          app="stage/WiringCraft.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          for b in wiringcraft wiringcraft-app; do
+            lipo -create -output "$app/Contents/MacOS/$b" \
+              "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
+          done
+          sed "s/@VERSION@/$v/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          cp README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md "$app/Contents/Resources/"
+          cp assets/icon/wiringcraft.icns "$app/Contents/Resources/"
+          cp -R library "$app/Contents/Resources/"
+          # Ad-hoc signature only (no certificate yet): the app starts after the user allows it.
+          codesign --force --deep --sign - "$app"
+          ln -s /Applications stage/Applications
+          # hdiutil on the hosted runners fails now and then with "Resource temporarily
+          # unavailable"; the mount below is retried the same way.
+          for i in 1 2 3 4 5; do
+            hdiutil create -volname WiringCraft -srcfolder stage -format UDZO -ov "dist/wiringcraft-$v-macos-universal.dmg" && break
+            test "$i" -lt 5 && sleep 10 || exit 1
+          done
+      - name: Install, run, uninstall (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mnt="$RUNNER_TEMP/wc-dmg"
+          dest="$RUNNER_TEMP/Applications"
+          mkdir -p "$dest"
+          for i in 1 2 3 4 5; do
+            hdiutil attach -nobrowse -readonly -mountpoint "$mnt" dist/*.dmg && break
+            test "$i" -lt 5 && sleep 10 || exit 1
+          done
+          cp -R "$mnt/WiringCraft.app" "$dest/"
+          hdiutil detach "$mnt"
+          bin="$dest/WiringCraft.app/Contents/MacOS"
+          "$bin/wiringcraft" --version
+          test -d "$dest/WiringCraft.app/Contents/Resources/library/symbols"
+          test -f "$dest/WiringCraft.app/Contents/Resources/wiringcraft.icns"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$dest/WiringCraft.app/Contents/Info.plist" | grep -qx wiringcraft
+          lipo -archs "$bin/wiringcraft-app" | grep -q arm64
+          lipo -archs "$bin/wiringcraft-app" | grep -q x86_64
+          codesign --verify --deep "$dest/WiringCraft.app"
+          rm -rf "$dest/WiringCraft.app"
+          test ! -e "$dest/WiringCraft.app"
+          echo "install, run and uninstall: ok"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Draft release
+    needs: package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Attach the packages to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'package-*' --dir dist
+          cat > notes.md <<'EOF'
+          Install packages for Windows (setup .exe), Linux (.deb) and macOS (.dmg, Apple silicon and Intel).
+
+          The packages are not signed yet:
+          - Windows: SmartScreen may say "Windows protected your PC". Choose More info > Run anyway.
+          - macOS: the first start is blocked. Open System Settings > Privacy & Security and choose Open Anyway.
+          EOF
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "WiringCraft $TAG" --notes-file notes.md dist/*/*

@@ -144,7 +144,27 @@ pub struct SweProject {
     pub wires: BTreeMap<i64, SweWire>,
     pub cables: BTreeMap<i64, SweCable>,
     pub components: BTreeMap<i64, SweComponent>,
+    pub locations: Vec<SweLocation>,
     pub warnings: Vec<String>,
+}
+
+/// A location (`tew_location`): a cabinet, room or panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SweLocation {
+    pub id: i64,
+    /// Full tag path as written in the database, e.g. `+L1+L3`.
+    pub tag_path: String,
+    pub description: String,
+}
+
+/// A location tag path as WiringCraft writes the location part of a tag: `+L1+L3` is `L1.L3`.
+/// Built with [`device_tag`], the same cleanup a device's tag path gets, so a device in this
+/// location always carries exactly this path (`+Room 1` is `Room_1` on both sides). Empty when
+/// that cleanup gives no valid location.
+fn location_path(tag_path: &str) -> String {
+    device_tag(&format!("{}-X", tag_path.trim()))
+        .map(|t| t.location.join("."))
+        .unwrap_or_default()
 }
 
 /// One row of the import report: how many of a kind the source has and how many came in.
@@ -164,17 +184,23 @@ fn sql(e: rusqlite::Error) -> Error {
 /// The rows that could be read; the others are counted under `what`.
 fn readable<T>(rows: impl Iterator<Item = rusqlite::Result<T>>, what: &str, warnings: &mut Vec<String>) -> Vec<T> {
     let mut bad = 0usize;
+    let mut first: Option<String> = None;
     let out: Vec<T> = rows
         .filter_map(|r| match r {
             Ok(v) => Some(v),
-            Err(_) => {
+            Err(e) => {
                 bad += 1;
+                first.get_or_insert_with(|| e.to_string());
                 None
             }
         })
         .collect();
     if bad > 0 {
-        warnings.push(format!("{bad} {what} row(s) could not be read and were left out"));
+        // The first reason names the column and the problem, so the source can be fixed.
+        let why = first.unwrap_or_default();
+        warnings.push(format!(
+            "{bad} {what} row(s) could not be read and were left out (first: {why})"
+        ));
     }
     out
 }
@@ -260,7 +286,7 @@ fn texts(conn: &Connection, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, 
     let mut out: BTreeMap<i64, String> = BTreeMap::new();
     let mut st = conn
         .prepare(
-            "SELECT tra_objectid, tra_0 FROM tew_translatedtext WHERE tra_objectno = -1 AND tra_0 <> '' \
+            "SELECT tra_objectid, tra_0 FROM tew_translatedtext WHERE tra_objectno = -1 AND TRIM(tra_0) <> '' \
              ORDER BY tra_lan_strid = 'en'",
         )
         .map_err(sql)?;
@@ -617,6 +643,30 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     if unusable > 0 {
         warnings.push(format!("{unusable} line(s) without usable end points were left out"));
     }
+    // Locations, when the database has them (older or trimmed databases may not).
+    let has_locations = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'tew_location'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(sql)?
+        > 0;
+    if has_locations {
+        let mut st = conn
+            .prepare("SELECT loc_id, COALESCE(loc_tagpath, '') FROM tew_location ORDER BY loc_tagpath")
+            .map_err(sql)?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(sql)?;
+        for (id, tag_path) in readable(rows, "location", &mut warnings) {
+            p.locations.push(SweLocation {
+                id,
+                tag_path,
+                description: text.get(&id).cloned().unwrap_or_default(),
+            });
+        }
+    }
     p.warnings = warnings;
     Ok(p)
 }
@@ -903,7 +953,25 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         parts: Vec::new(),
         pages: Vec::new(),
         devices: BTreeMap::new(),
+        locations: Vec::new(),
     };
+    // Locations, with their descriptions. One without a usable tag path cannot be named.
+    let mut locations_untagged = 0;
+    for l in &p.locations {
+        let path = location_path(&l.tag_path);
+        if path.is_empty() {
+            locations_untagged += 1;
+            continue;
+        }
+        let description = l.description.trim().to_owned();
+        match built.locations.iter_mut().find(|have| have.path == path) {
+            // A repeat fills in a description the first one lacked, like merge_location.
+            Some(have) if have.description.is_empty() => have.description = description,
+            Some(_) => {}
+            None => built.locations.push(wc_core::Location { path, description }),
+        }
+    }
+    let locations_merged = p.locations.len() - locations_untagged - built.locations.len();
     let drawn: Vec<&SwePage> = p.pages.iter().filter(|pg| DRAWN_KINDS.contains(&pg.kind)).collect();
     let others = p.pages.len() - drawn.len();
     let covers = p.pages.iter().filter(|pg| pg.kind == KIND_COVER).count();
@@ -1299,6 +1367,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     number: number.clone(),
                     potential: potential.clone(),
                     cable: cable.clone(),
+                    route: Default::default(),
                 });
             }
         }
@@ -1468,6 +1537,15 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     cables_out.saturating_sub(cables_used.len()),
                     "not on any imported wire (device only)",
                 ),
+            ]),
+        },
+        Count {
+            what: "locations",
+            source: p.locations.len(),
+            imported: built.locations.len(),
+            note: note(vec![
+                (locations_untagged, "without a usable tag path"),
+                (locations_merged, "with the same tag path as another (merged)"),
             ]),
         },
     ];
