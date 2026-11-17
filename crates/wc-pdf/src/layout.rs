@@ -378,7 +378,11 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
         &mut out,
     );
     field(fx[2], ty, "Revision", get("revision"), 2.5, &mut out);
-    let d = if get("date").is_empty() { date } else { get("date") };
+    let d = if get("date").trim().is_empty() {
+        date
+    } else {
+        get("date")
+    };
     field(fx[2], mid, "Date", d, 2.5, &mut out);
     text((fx[3] + 1.5, ty + 3.0), 1.8, Align::Left, "Page", Ink::Label, &mut out);
     text(
@@ -422,7 +426,92 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
         Ink::Thin,
         &mut out,
     );
+    if page.cover {
+        cover_marks(project, (x0, y0 + HEADER, x1, ty), date, &mut out);
+    }
     out
+}
+
+/// The cover page's content inside the drawing area `(x0, y0, x1, y1)`: the project's name
+/// large, its description under it, and a table of the project fields. Every value comes from
+/// the project, so it always matches the title blocks. Standard fields are listed even when
+/// empty, so the cover reads as a form; other fields are listed when they have a value.
+fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: &str, out: &mut Vec<FrameMark>) {
+    let tb = &project.meta.title_block;
+    let cx = (x0 + x1) / 2.0;
+    let h = y1 - y0;
+    let push_text = |at: (f64, f64), height: f64, align: Align, t: &str, ink: Ink, out: &mut Vec<FrameMark>| {
+        if !t.trim().is_empty() {
+            out.push(FrameMark {
+                shape: Shape::Text {
+                    at: Point::new(at.0, at.1),
+                    text: t.to_owned(),
+                    height,
+                    align,
+                    angle: 0.0,
+                },
+                ink,
+            });
+        }
+    };
+    // Long texts are drawn smaller so they stay inside their room (text is never wrapped).
+    let fit_in = |t: &str, height: f64, room: f64| {
+        let w = text_width_mm(t, height);
+        if w > room && room > 0.0 {
+            height * room / w
+        } else {
+            height
+        }
+    };
+    let fit = |t: &str, height: f64| fit_in(t, height, x1 - x0 - 10.0);
+    let name_y = y0 + h * 0.2;
+    let name = &project.meta.name;
+    push_text((cx, name_y), fit(name, 9.0), Align::Center, name, Ink::Thin, out);
+    let desc = tb.get("description").map(String::as_str).unwrap_or("");
+    push_text((cx, name_y + 9.0), fit(desc, 4.0), Align::Center, desc, Ink::Thin, out);
+
+    let mut rows: Vec<(&str, &str)> = wc_core::project::TITLE_FIELDS
+        .iter()
+        .filter(|(k, _)| *k != "description")
+        .map(|(k, label)| {
+            let v = tb.get(*k).map(String::as_str).unwrap_or("");
+            let v = if *k == "date" && v.trim().is_empty() { date } else { v };
+            (*label, v)
+        })
+        .collect();
+    for (k, v) in tb {
+        if !wc_core::project::TITLE_FIELDS.iter().any(|(f, _)| f == k) && !v.trim().is_empty() {
+            rows.push((k.as_str(), v.as_str()));
+        }
+    }
+    // The table fits under the description; rows shrink a little on small sheets.
+    let top = name_y + 18.0;
+    let row_h = ((y1 - 8.0 - top) / rows.len().max(1) as f64).min(8.0);
+    let (tx0, tx1) = (
+        cx - 90.0_f64.min((x1 - x0) / 2.0 - 5.0),
+        cx + 90.0_f64.min((x1 - x0) / 2.0 - 5.0),
+    );
+    let split = tx0 + (tx1 - tx0) * 0.35;
+    let rule = |y: f64, ink: Ink, out: &mut Vec<FrameMark>| {
+        out.push(FrameMark {
+            shape: Shape::Line {
+                a: Point::new(tx0, y),
+                b: Point::new(tx1, y),
+            },
+            ink,
+        });
+    };
+    rule(top, Ink::Thick, out);
+    let size = (row_h * 0.4).min(3.5);
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let ry = top + row_h * i as f64;
+        let base = ry + row_h / 2.0 + size * 0.35;
+        let label_h = fit_in(label, size * 0.8, split - tx0 - 3.0);
+        push_text((tx0 + 1.5, base), label_h, Align::Left, label, Ink::Label, out);
+        let value_h = fit_in(value, size, tx1 - split - 3.0);
+        push_text((split + 1.5, base), value_h, Align::Left, value, Ink::Thin, out);
+        rule(ry + row_h, Ink::Thin, out);
+    }
 }
 
 fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {

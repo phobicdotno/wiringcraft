@@ -363,6 +363,8 @@ fn ellipse_points(c: (f64, f64), major: (f64, f64), ratio: f64, t0: f64, t1: f64
     let Some(sweep) = turn(t1 - t0, std::f64::consts::TAU) else {
         return (Vec::new(), false);
     };
+    // A huge start angle would swallow the small steps added to it.
+    let t0 = t0.rem_euclid(std::f64::consts::TAU);
     let full = sweep >= std::f64::consts::TAU - 1e-9;
     let n = ((TURN_STEPS * sweep / std::f64::consts::TAU).ceil() as usize).max(4);
     let at = |t: f64| {
@@ -380,6 +382,7 @@ fn arc_points(c: (f64, f64), r: f64, a0: f64, a1: f64, ccw: bool) -> Vec<(f64, f
     let Some(sweep) = turn(if ccw { a1 - a0 } else { a0 - a1 }, 360.0) else {
         return Vec::new();
     };
+    let a0 = a0.rem_euclid(360.0);
     let n = ((TURN_STEPS * sweep / 360.0).ceil() as usize).max(2);
     let dir = if ccw { 1.0 } else { -1.0 };
     (0..=n)
@@ -422,11 +425,25 @@ fn de_boor(ctrl: &[(f64, f64, f64)], knots: &[f64], p: usize, u: f64) -> Option<
     (w.abs() > 1e-12).then(|| (x / w, y / w))
 }
 
+/// The highest spline degree evaluated as a curve; above it a spline is drawn through its fit or
+/// control points.
+const MAX_SPLINE_DEGREE: usize = 15;
+
+/// The most point pairs tried as a bridge from one hole to the outline around it; a larger hole
+/// is filled over rather than searched for longer.
+const BRIDGE_BUDGET: usize = 4_000_000;
+
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
 fn bspline_points(ctrl: &[(f64, f64)], knots: &[f64], weights: &[f64], degree: usize) -> Option<Vec<(f64, f64)>> {
     let n = ctrl.len();
-    if degree == 0 || n <= degree || knots.len() != n + degree + 1 || knots.windows(2).any(|w| w[1] < w[0]) {
+    // Drawings use degree 3 or so; a huge degree would cost samples x degree^2 steps.
+    if degree == 0
+        || degree > MAX_SPLINE_DEGREE
+        || n <= degree
+        || knots.len() != n + degree + 1
+        || knots.windows(2).any(|w| w[1] < w[0])
+    {
         return None;
     }
     let w = |i: usize| {
@@ -753,6 +770,10 @@ fn with_holes(loops: Vec<Vec<(f64, f64)>>, style: i64) -> Vec<Vec<(f64, f64)>> {
         let Some(o) = outer[host].as_mut() else { continue };
         // The shortest bridge from the hole to the outline that crosses no edge of the outline,
         // of this hole or of any other loop.
+        // A bounded search: the pairs, then the crossing tests, each within a budget.
+        if o.len().saturating_mul(lp.len()) > BRIDGE_BUDGET {
+            continue;
+        }
         let mut pairs: Vec<(f64, usize, usize)> = Vec::with_capacity(o.len() * lp.len());
         for (a, p) in o.iter().enumerate() {
             for (b, h) in lp.iter().enumerate() {
@@ -770,8 +791,9 @@ fn with_holes(loops: Vec<Vec<(f64, f64)>>, style: i64) -> Vec<Vec<(f64, f64)>> {
                 walls.extend(edges_of(other));
             }
         }
+        let tries = (BRIDGE_BUDGET * 4 / walls.len().max(1)).max(1);
         let clear = |p: (f64, f64), h: (f64, f64)| !walls.iter().any(|&(c, d)| crosses(p, h, c, d));
-        let Some(&(_, a, b)) = pairs.iter().find(|(_, a, b)| clear(o[*a], lp[*b])) else {
+        let Some(&(_, a, b)) = pairs.iter().take(tries).find(|(_, a, b)| clear(o[*a], lp[*b])) else {
             continue;
         };
         let mut cut: Vec<(f64, f64)> = o[..=a].to_vec();
@@ -1450,5 +1472,47 @@ mod tests {
         assert!((area(&with_holes(loops(), 1)) - 64.0).abs() < 1e-9);
         // Ignore: the whole outer loop.
         assert!((area(&with_holes(loops(), 2)) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_huge_start_angle_still_gives_a_curve() {
+        let (pts, closed) = ellipse_points((0.0, 0.0), (5.0, 0.0), 0.5, 1e300, 1e300);
+        assert!(closed);
+        let xs: Vec<f64> = pts.iter().map(|p| p.0).collect();
+        let spread = xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(spread > 9.0, "a real ellipse, not one point: {spread}");
+        let arc = arc_points((0.0, 0.0), 1.0, 1e20, 1e20 + 90.0, true);
+        let first = arc[0];
+        assert!(arc.iter().any(|p| (p.0 - first.0).hypot(p.1 - first.1) > 1.0));
+    }
+
+    #[test]
+    fn a_spline_of_huge_degree_is_not_evaluated() {
+        let n = 1001;
+        let ctrl: Vec<(f64, f64)> = (0..n).map(|i| (i as f64, 0.0)).collect();
+        let mut knots = vec![0.0; n];
+        knots.extend(vec![1.0; n]);
+        let started = std::time::Instant::now();
+        assert!(bspline_points(&ctrl, &knots, &[], n - 1).is_none());
+        assert!(started.elapsed().as_secs() < 1);
+        // A normal degree still works.
+        let k3 = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        assert!(bspline_points(&ctrl[..4], &k3, &[], 3).is_some());
+    }
+
+    #[test]
+    fn a_hole_too_big_to_search_is_filled_over_not_hung_on() {
+        let ring = |r: f64, n: usize| -> Vec<(f64, f64)> {
+            (0..n)
+                .map(|i| {
+                    let t = std::f64::consts::TAU * i as f64 / n as f64;
+                    (r * t.cos(), r * t.sin())
+                })
+                .collect()
+        };
+        let started = std::time::Instant::now();
+        let out = with_holes(vec![ring(10.0, 3000), ring(5.0, 3000)], 0);
+        assert_eq!(out.len(), 1, "the outer part is kept");
+        assert!(started.elapsed().as_secs() < 5);
     }
 }

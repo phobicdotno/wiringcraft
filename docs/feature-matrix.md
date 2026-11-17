@@ -153,7 +153,7 @@ For the other areas, the chapter to read in each help is:
 | Terminals and terminal strips | yes | yes | yes | done |
 | Terminal plan report | yes | yes | yes | done |
 | Terminal strip editor (reorder, add spares) | yes | yes | no | later |
-| Jumpers (bridges) between terminals | yes | yes | no | todo (#108) |
+| Jumpers (bridges) between terminals | yes | yes | yes: project file, one net, terminal plan column, CLI and app; SolidWorks import to follow | done (#108) |
 | Terminal and wire marking export (label printers) | yes | yes | no | todo (#57, WAGO) |
 | SolidWorks terminal strips on import | - | - | open | open PR (#104, issue #70) |
 

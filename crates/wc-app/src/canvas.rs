@@ -645,6 +645,28 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         }
     }
 
+    // Jumpers: a bar through the jumpered terminals drawn on this page, in strip order.
+    let numbers = if open.project.meta.jumpers.is_empty() {
+        Default::default()
+    } else {
+        wc_core::project::terminal_numbers(&open.project, |id| open.symbols.get(id).map(|s| s.role))
+    };
+    for j in &open.project.meta.jumpers {
+        let at = jumper_points(&page, &open.symbols, &numbers, j);
+        if at.len() < 2 {
+            continue;
+        }
+        let stroke = Stroke::new(xf.len(0.6).max(1.5), t.wire);
+        for pair in at.windows(2) {
+            if let [a, b] = pair {
+                painter.line_segment([xf.s(*a), xf.s(*b)], stroke);
+            }
+        }
+        for p in &at {
+            painter.circle_filled(xf.s(*p), xf.len(0.9).max(2.0), t.wire);
+        }
+    }
+
     for s in &page.symbols {
         let selected = ed.is_selected(&Selection::Symbol(s.id.clone()));
         let c = if selected { t.selection } else { t.ink };
@@ -1231,6 +1253,36 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
     ed.message = "Wire added.".into();
 }
 
+/// Where the jumper's bar passes on `page`: the terminal symbols of its terminals, in strip order.
+/// Other symbols with a terminal's tag (a device drawn with it) are no bar end.
+fn jumper_points(
+    page: &Page,
+    symbols: &std::collections::BTreeMap<String, wc_core::symbol::Symbol>,
+    numbers: &wc_core::project::TerminalNumbers,
+    j: &wc_core::project::Jumper,
+) -> Vec<Point> {
+    let mut at: Vec<(&str, Point)> = page
+        .symbols
+        .iter()
+        .filter(|s| {
+            symbols
+                .get(&s.symbol)
+                .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal)
+                && j.has(numbers, page, s, true)
+        })
+        .filter_map(|s| {
+            let n = match numbers.get(&(page.id.clone(), s.id.clone())) {
+                Some((_, n)) => n.as_str(),
+                None => j.terminal_of(s.tag.as_ref()?)?,
+            };
+            Some((n, s.at))
+        })
+        .collect();
+    let key = wc_core::project::natural_key;
+    at.sort_by(|a, b| key(a.0).cmp(&key(b.0)).then_with(|| a.0.cmp(b.0)));
+    at.into_iter().map(|(_, p)| p).collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1323,6 +1375,35 @@ mod tests {
     }
 
     use wc_core::project::Endpoint;
+
+    #[test]
+    fn a_jumper_bar_runs_through_terminal_symbols_only() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+        let mut put = |symbol: &str, at: Point, tag: &str| {
+            let id = o.place(page, symbol, at).unwrap();
+            let t = Some(wc_core::DeviceTag::parse(tag).unwrap());
+            o.project.pages[page]
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == id)
+                .unwrap()
+                .tag = t;
+        };
+        put("wc.terminal", Point::new(40.0, 20.0), "-X1.2");
+        put("wc.terminal", Point::new(20.0, 20.0), "-X1.1");
+        put("wc.coil", Point::new(90.0, 60.0), "-X1.1");
+        o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        let j = &o.project.meta.jumpers[0];
+        let numbers = wc_core::project::terminal_numbers(&o.project, |id| o.symbols.get(id).map(|s| s.role));
+        let at = jumper_points(&o.project.pages[page], &o.symbols, &numbers, j);
+        assert_eq!(
+            at,
+            [Point::new(20.0, 20.0), Point::new(40.0, 20.0)],
+            "in strip order, no coil"
+        );
+    }
 
     /// A contact at (50, 20) and a coil placed off to the side, ready to be dragged under it.
     fn moving_coil() -> (tempfile::TempDir, Open, Editor, String) {

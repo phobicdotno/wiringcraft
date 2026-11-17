@@ -37,8 +37,6 @@ These branches can be deleted once their pull requests are merged.
 
 | Gap | Where it shows | Todo |
 |---|---|---|
-| QElectroTech `.elmt` elements are not read | `docs/manufacturer-data.md` | #91 |
-| BMEcat (and ECLASS features) part data is not read | `docs/manufacturer-data.md` | #92 |
 | EDZ exchange files (EPLAN macros and parts) are not read | `docs/manufacturer-data.md` | #93 (parts first; macros follow) |
 | KiCad: only the first unit of a multi-unit symbol; `.kicad_sym` inside a zip is listed, not imported | `crates/wc-import/src/kicad.rs`, `crates/wc-import/src/archive.rs` | #96 |
 | SolidWorks Electrical: symbol and page graphics from DWG | `crates/wc-import/src/swe.rs` | #59 |
