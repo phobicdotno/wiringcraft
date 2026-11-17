@@ -421,7 +421,16 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             "Jumpered with",
         ],
     );
-    let (nets, net_of) = net_names(i);
+    // The potential column sees jumpers; the Upper and Lower columns show what is wired to that
+    // side of this terminal itself, so they come from the nets without jumpers.
+    let (_, net_of) = net_names(i);
+    let mut unjumpered = i.project.clone();
+    unjumpered.meta.jumpers.clear();
+    let (nets, _) = net_names(&Inputs {
+        project: &unjumpered,
+        symbols: i.symbols,
+        parts: i.parts,
+    });
     // Pins connected to a pin, excluding the pin itself.
     let others = |pin: &PinRef| -> Vec<String> {
         nets.iter()

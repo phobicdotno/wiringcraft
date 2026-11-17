@@ -198,6 +198,10 @@ fn terminal_plan_shows_jumpers() {
     let (mut p, s, parts) = fixture();
     let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
     p.meta.add_jumper(&x1, &["1".to_owned(), "2".to_owned()]).unwrap();
+    // Wire the upper side of -X1.2 too: through the jumper it is the same potential as the
+    // upper side of -X1.1, but -X1.1's Upper column must still list only its own wiring.
+    let pg = p.pages.iter_mut().find(|pg| pg.symbol("s3").is_some()).unwrap();
+    pg.wires.push(wire("w8", pin("s3", "1"), pin("s1", "A2"), None, None));
     let t = terminal_plan(&Inputs {
         project: &p,
         symbols: &s,
@@ -208,6 +212,13 @@ fn terminal_plan_shows_jumpers() {
     assert_eq!(row("-X1", "1")[6], "2");
     assert_eq!(row("-X1", "2")[6], "1");
     assert_eq!(row("-X2", "1")[6], "", "not jumpered");
+    // Upper and Lower still show what is wired to that side of the terminal itself.
+    assert_eq!(row("-X1", "1")[2], "=A+C1-K1:14");
+    assert_eq!(row("-X1", "1")[3], "-P1:X1");
+    assert!(row("-X1", "2")[2].contains("K1:A2"), "{:?}", row("-X1", "2"));
+    assert!(!row("-X1", "2")[2].contains("K1:14"), "not -X1.1's wiring");
+    // The potential is shared through the jumper.
+    assert_eq!(row("-X1", "1")[4], row("-X1", "2")[4]);
 }
 
 #[test]

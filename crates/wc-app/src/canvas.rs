@@ -566,6 +566,11 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         let mut at: Vec<(Vec<(String, u64)>, Point)> = page
             .symbols
             .iter()
+            .filter(|s| {
+                open.symbols
+                    .get(&s.symbol)
+                    .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal)
+            })
             .filter_map(|s| {
                 let n = j.terminal_of(s.tag.as_ref()?)?;
                 Some((wc_core::project::natural_key(n), s.at))

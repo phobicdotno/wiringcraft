@@ -118,28 +118,29 @@ pub fn wire_nets(project: &Project, is_interruption: impl Fn(&str) -> bool) -> (
             }
         }
     }
-    // Jumpers: the wired pins of every jumpered terminal, on any page, are one net.
+    // Jumpers: the jumper joins the same side of its terminals, on any page: every wired pin `1`
+    // of them is one net, every pin `2` another. A terminal's two sides stay apart, as they are
+    // without a jumper, so wire numbers and the terminal plan keep telling them apart.
     for (k, j) in project.meta.jumpers.iter().enumerate() {
-        let link = Node::Link(format!("\u{0}jumper\u{0}{k}"));
         for page in &project.pages {
             for s in &page.symbols {
                 if !s.tag.as_ref().is_some_and(|t| j.terminal_of(t).is_some()) {
                     continue;
                 }
-                let wired: Vec<usize> = page
+                let wired: Vec<(String, usize)> = page
                     .wires
                     .iter()
                     .flat_map(|w| [&w.from, &w.to])
                     .filter_map(|e| match e {
                         Endpoint::Pin { item, pin } if item == &s.id => {
-                            Some(Node::Pin((page.id.clone(), item.clone(), pin.clone())))
+                            Some((pin.clone(), Node::Pin((page.id.clone(), item.clone(), pin.clone()))))
                         }
                         _ => None,
                     })
-                    .map(|n| id_of(n, &mut dsu))
+                    .map(|(pin, n)| (pin, id_of(n, &mut dsu)))
                     .collect();
-                for n in wired {
-                    let l = id_of(link.clone(), &mut dsu);
+                for (pin, n) in wired {
+                    let l = id_of(Node::Link(format!("\u{0}jumper\u{0}{k}\u{0}{pin}")), &mut dsu);
                     dsu.union(n, l);
                 }
             }
@@ -225,6 +226,15 @@ mod tests {
         assert_eq!(joined.len(), 2, "3 and 4 jumpered, 9 not");
         let big = joined.iter().find(|n| n.pins.len() == 4);
         assert!(big.is_some_and(|n| n.pins.iter().any(|q| q.2 == "U") && n.pins.iter().any(|q| q.2 == "A1")));
+        // The other side of a jumpered terminal is not joined to this one.
+        p.pages[1].wires.push(wire("w4", pin("t4", "2"), pin("m2", "V"), None));
+        let sides = nets(&p);
+        assert_eq!(sides.len(), 3, "pin 2 of -X1.4 is its own net");
+        assert!(
+            sides
+                .iter()
+                .any(|n| n.pins.iter().any(|q| q.2 == "V") && n.pins.len() == 2)
+        );
     }
 
     #[test]
