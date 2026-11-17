@@ -1298,12 +1298,27 @@ impl App {
             }
             "versions" => self.tool_versions(v),
             "undo" => {
-                // Undo swaps the whole project, which would take back other people's work too.
+                let redo = v.get("redo").and_then(Value::as_bool).unwrap_or(false);
+                // In a session the host takes back only this person's own change; swapping the
+                // whole project here would take back other people's work too.
                 if self.share.active() {
-                    return Err("Undo and redo are off in a shared session; use the page history.".into());
+                    let can = if redo {
+                        self.share.can_redo()
+                    } else {
+                        self.share.can_undo()
+                    };
+                    if !can {
+                        return Ok("Nothing to undo or redo.".into());
+                    }
+                    if redo {
+                        self.share.redo();
+                    } else {
+                        self.share.undo();
+                    }
+                    self.ed.selection.clear();
+                    return Ok("Sent to the session; it shows with the next sync.".into());
                 }
                 let open = need_open(self.open.as_mut())?;
-                let redo = v.get("redo").and_then(Value::as_bool).unwrap_or(false);
                 let done = if redo { open.redo() } else { open.undo() };
                 self.ed.selection.clear();
                 Ok(if done { "Done." } else { "Nothing to undo or redo." }.into())
@@ -2238,6 +2253,16 @@ mod tests {
         a.run(Action::Redo);
         a.share.frame(a.open.as_mut(), None, false);
         assert!(a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        // The assistant's undo tool goes the same way.
+        assert_eq!(
+            call(&mut a, "undo", json!({})),
+            Ok("Sent to the session; it shows with the next sync.".into())
+        );
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(!a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        call(&mut a, "undo", json!({"redo": true})).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(a.open.as_ref().unwrap().project.devices.contains_key(&tag));
         a.share.stop();
     }
 
@@ -2467,7 +2492,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_is_refused_in_a_shared_session() {
+    fn undo_in_a_shared_session_does_not_take_back_work_from_before_it() {
         let (_tmp, mut a) = app(vec![]);
         call(
             &mut a,
@@ -2480,7 +2505,10 @@ mod tests {
         a.open = Some(open);
         let before = a.open.as_ref().unwrap().project.clone();
         for redo in [false, true] {
-            assert!(call(&mut a, "undo", json!({"redo": redo})).is_err());
+            assert_eq!(
+                call(&mut a, "undo", json!({"redo": redo})),
+                Ok("Nothing to undo or redo.".into())
+            );
             assert_eq!(a.open.as_ref().unwrap().project, before, "nothing was undone");
         }
         a.share.stop();

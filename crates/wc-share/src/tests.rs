@@ -1490,6 +1490,31 @@ fn undoing_a_removed_page_brings_it_back_with_its_comments_unless_someone_holds_
     assert!(s.host.project().page("p0009").is_some());
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     assert_eq!(a.project.as_ref(), Some(s.host.project()));
+
+    // Taking back a new page is refused once someone has commented on it, so their comment is
+    // not left on a page that is gone.
+    s.host.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0010", "10.1", "Spare"),
+    })?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    let note = Comment {
+        id: "c2".into(),
+        page: "p0010".into(),
+        at: None,
+        author: "Kari".into(),
+        time: 0,
+        text: "why".into(),
+        resolved: false,
+        replies: Vec::new(),
+    };
+    b_link.send(b.edit_project(ProjectEdit::SetComments {
+        page: "p0010".into(),
+        comments: vec![note],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(s.host.undo().is_err());
+    assert!(s.host.project().page("p0010").is_some());
+    assert!(s.host.project().comments.iter().any(|c| c.id == "c2"));
     Ok(())
 }
 

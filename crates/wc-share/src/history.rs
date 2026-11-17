@@ -82,15 +82,25 @@ impl Parts {
                 a.panels.insert(id.to_owned(), y.cloned());
             }
         }
+        // A page added or removed keeps its comments in the record even when they did not
+        // change, so that taking it back is refused once someone has commented on it since,
+        // instead of leaving that comment on a page that is gone.
+        let added_or_removed: Vec<String> = b
+            .pages
+            .iter()
+            .filter(|(id, x)| x.is_none() || a.pages.get(*id).is_some_and(Option::is_none))
+            .map(|(id, _)| id.clone())
+            .collect();
         let pages: BTreeSet<&str> = before
             .comments
             .iter()
             .chain(&after.comments)
             .map(|c| c.page.as_str())
+            .chain(added_or_removed.iter().map(String::as_str))
             .collect();
         for page in pages {
             let (x, y) = (comments_on(before, page), comments_on(after, page));
-            if x != y {
+            if x != y || added_or_removed.iter().any(|p| p == page) {
                 b.comments.insert(page.to_owned(), x);
                 a.comments.insert(page.to_owned(), y);
             }
