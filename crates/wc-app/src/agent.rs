@@ -2097,6 +2097,8 @@ impl App {
         let fresh = Open::load(&open.dir)?;
         // Symbols the command added or changed come in; symbols the window vendored meanwhile
         // (not saved yet, so not on disk) stay.
+        // Pending window changes follow their terminals under the roles they were made with.
+        open.follow_terminals();
         open.symbols.extend(fresh.symbols);
         open.branch = fresh.branch;
         let by_command = fresh.project != base;
@@ -2108,6 +2110,9 @@ impl App {
                  not loaded: the window's edits are kept, and saving writes them over the command's result.",
             );
         } else if by_command {
+            // The roles may have changed with the command: nothing is left to follow for the
+            // undo snapshot, which keeps the drawing and its jumpers as they were.
+            open.forget_terminal_change();
             open.checkpoint();
             open.project = fresh.project;
             open.forget_terminal_change();

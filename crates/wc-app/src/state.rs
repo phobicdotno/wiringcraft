@@ -1797,6 +1797,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_terminal_whose_page_becomes_an_overview_does_not_take_another_terminals_number() {
+        let (_tmp, mut o) = project();
+        let first = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.project.pages.push(Page::new("p0003", "3", "More"));
+        let second = o.project.pages.len() - 1;
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |page: usize, at: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        // a on the first page, b and c on the second: a 1, b 2, c 3. Jumper a and c.
+        let (_a, _b, _c) = (put(first, 10.0), put(second, 10.0), put(second, 20.0));
+        o.add_jumper(&x1, &["1".into(), "3".into()]).unwrap();
+        // The first page becomes an overview: b 1, c 2. a is no terminal of the plan any more,
+        // and must not pass its old number 1 on to b.
+        o.checkpoint();
+        o.project.pages[first].overview = true;
+        o.follow_terminals();
+        assert!(
+            o.project.meta.jumpers.iter().all(|j| j.terminals != ["1", "2"]),
+            "{:?}",
+            o.project.meta.jumpers
+        );
+        assert!(o.project.meta.jumpers.is_empty(), "only c is left of the jumper");
+    }
+
+    #[test]
     fn redo_brings_back_a_followed_move_and_an_overview_page_keeps_its_jumpers() {
         let (_tmp, mut o) = project();
         let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();

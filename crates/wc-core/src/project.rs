@@ -70,13 +70,16 @@ pub fn follow_terminals_in(
         return false;
     }
     let mut after = terminal_numbers(project, role);
+    let taken: std::collections::BTreeSet<(DeviceTag, String)> = after.values().cloned().collect();
     for (key, was) in before {
         // Only a page turned into an overview keeps its terminals' numbers; a symbol that is no
         // longer a terminal leaves its jumper like a deleted one.
         let on_overview = project
             .page(&key.0)
             .is_some_and(|pg| pg.overview && pg.symbols.iter().any(|s| s.id == key.1));
-        if on_overview && !after.contains_key(key) {
+        // Its old number now belongs to another terminal (strip-only terminals renumbered
+        // without the overview page): it is no longer that terminal, and leaves its jumper.
+        if on_overview && !after.contains_key(key) && !taken.contains(was) {
             after.insert(key.clone(), was.clone());
         }
     }
