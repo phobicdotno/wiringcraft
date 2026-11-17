@@ -158,6 +158,12 @@ pub struct Open {
     /// Every version of a vendored symbol this window has loaded, by content hash, so Undo
     /// and Redo can put back the version the restored lock names.
     symbol_versions: BTreeMap<String, Symbol>,
+    /// Symbols whose vendored file may hold another version than the one loaded, after a
+    /// failed Undo or Redo could not put a file back. The next Undo or Redo writes them again.
+    stale_symbol_files: std::collections::BTreeSet<String>,
+    /// Tests: whether each coming symbol file write fails, in order.
+    #[cfg(test)]
+    fail_symbol_writes: std::collections::VecDeque<bool>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
 }
@@ -184,6 +190,9 @@ impl Open {
             terminals_before: None,
             held_by_others: BTreeMap::new(),
             symbol_versions: BTreeMap::new(),
+            stale_symbol_files: Default::default(),
+            #[cfg(test)]
+            fail_symbol_writes: Default::default(),
             undo_error: None,
         };
         // Locked symbols no page uses are loaded too, so Undo can put back the version a
@@ -468,7 +477,11 @@ impl Open {
     fn sync_symbols(&mut self) -> Result<(), String> {
         let mut wanted: Vec<(String, Symbol)> = Vec::new();
         for (id, entry) in &self.project.lock.symbols {
-            if self.symbols.get(id).is_some_and(|s| s.hash() == entry.hash) {
+            if let Some(loaded) = self.symbols.get(id).filter(|s| s.hash() == entry.hash) {
+                // Loaded already; its file is written again only when it could not be put back.
+                if self.stale_symbol_files.contains(id) {
+                    wanted.push((id.clone(), loaded.clone()));
+                }
                 continue;
             }
             // The version the lock names: kept from earlier, or still in the project folder.
@@ -491,27 +504,31 @@ impl Open {
             }
         }
         for (n, (id, want)) in wanted.iter().enumerate() {
-            if let Err(e) = store::write_vendored_symbol(&self.dir, want) {
-                // Put back the files already written; say which could not be.
-                let unrestored: Vec<String> = wanted
-                    .iter()
-                    .take(n)
-                    .filter_map(|(done, _)| {
-                        let old = self.symbols.get(done)?;
-                        store::write_vendored_symbol(&self.dir, old)
-                            .err()
-                            .map(|e| format!("{done} ({e})"))
-                    })
-                    .collect();
+            if let Err(e) = self.write_symbol_file(want) {
+                // Put back the files already written; say which could not be, and remember
+                // them so the next Undo or Redo writes them again.
+                let mut unrestored = Vec::new();
+                for (done, _) in wanted.iter().take(n) {
+                    let Some(old) = self.symbols.get(done).cloned() else {
+                        continue;
+                    };
+                    if let Err(e) = self.write_symbol_file(&old) {
+                        unrestored.push(format!("{done} ({e})"));
+                        self.stale_symbol_files.insert(done.clone());
+                    }
+                }
                 let mut msg = format!("symbol {id} could not be put back: {e}");
                 if !unrestored.is_empty() {
                     msg.push_str(&format!(
-                        "; these symbol files now hold the other version and could not be restored: {}",
+                        "; these symbol files now hold the other version and could not be restored: {}. The next Undo or Redo writes them again.",
                         unrestored.join(", ")
                     ));
                 }
                 return Err(msg);
             }
+        }
+        for (id, _) in &wanted {
+            self.stale_symbol_files.remove(id);
         }
         for (id, want) in wanted {
             if let Some(old) = self.symbols.insert(id, want) {
@@ -533,6 +550,16 @@ impl Open {
             }
         }
         Ok(())
+    }
+
+    fn write_symbol_file(&mut self, sym: &Symbol) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_symbol_writes.pop_front() == Some(true) {
+            return Err("test write failure".into());
+        }
+        store::write_vendored_symbol(&self.dir, sym)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Keep the loaded symbol versions, so a step that replaces them can be undone.
@@ -1675,6 +1702,43 @@ pub(crate) mod tests {
         assert!(!reason.trim().is_empty(), "the parse error follows: {err}");
         let parse = store::read_vendored_symbol(&o.dir, "wc.coil").unwrap_err().to_string();
         assert!(err.ends_with(&parse), "{err} / {parse}");
+    }
+
+    #[test]
+    fn a_rollback_that_fails_is_written_again_by_the_next_undo() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        o.place(1, "wc.lamp", Point::new(60.0, 20.0)).unwrap();
+        let (coil, lamp) = (o.symbols["wc.coil"].clone(), o.symbols["wc.lamp"].clone());
+        o.checkpoint();
+        let mut coil2 = coil.clone();
+        coil2.name = "Coil, changed".into();
+        let mut lamp2 = lamp.clone();
+        lamp2.name = "Lamp, changed".into();
+        for s in [&coil2, &lamp2] {
+            store::write_vendored_symbol(&o.dir, s).unwrap();
+            o.project.lock.symbols.get_mut(&s.id).unwrap().hash = s.hash();
+        }
+        o.reload_symbols();
+        // Undo: the coil file is written, the lamp write fails, and putting the coil back fails.
+        o.fail_symbol_writes = [false, true, true].into();
+        assert!(!o.undo());
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(err.contains("could not be restored: wc.coil"), "{err}");
+        assert_eq!(o.symbols["wc.coil"], coil2, "memory follows the lock");
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            coil,
+            "the file does not"
+        );
+        // A step whose lock names what memory already holds still writes the coil file again.
+        o.checkpoint();
+        assert!(o.undo());
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), coil2);
+        // And the step that failed now goes through.
+        assert!(o.undo());
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), coil);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.lamp").unwrap(), lamp);
     }
 
     #[test]
