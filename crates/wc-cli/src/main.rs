@@ -2000,6 +2000,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wago_marking_kind_option_splits_on_commas_and_repeats() {
+        let cli = Cli::try_parse_from([
+            "wiringcraft",
+            "-C",
+            "proj",
+            "export",
+            "wago-marking",
+            "out.csv",
+            "--kind",
+            "terminals,wires",
+            "--kind",
+            "cables",
+        ])
+        .unwrap();
+        assert_eq!(cli.project, PathBuf::from("proj"));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Export(ExportCmd::WagoMarking { ref out, ref kinds })
+                if out == &PathBuf::from("out.csv") && kinds == &["terminals", "wires", "cables"]
+        ));
+
+        let cli = Cli::try_parse_from(["wiringcraft", "export", "wago-marking", "out.csv"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Export(ExportCmd::WagoMarking { ref kinds, .. }) if kinds.is_empty()
+        ));
+        assert!(Cli::try_parse_from(["wiringcraft", "export", "wago-marking"]).is_err());
+    }
+
+    #[test]
     fn wago_marking_export_writes_the_list_and_refuses_unknown_kinds() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
