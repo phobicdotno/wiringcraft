@@ -2047,6 +2047,7 @@ mod tests {
     #[test]
     fn a_taken_message_was_logged_first() {
         let (_tmp, mut a) = app(vec![]);
+        crate::applog::take_captured();
         a.dialog = Some(Dialog::Message("Export failed".into()));
         // `take_message` logs before taking, and forgets the text once taken: the cache that
         // stops a message from being logged twice must not hold it, or the same message taken
@@ -2056,6 +2057,12 @@ mod tests {
         a.dialog = Some(Dialog::Message("Export failed".into()));
         assert_eq!(a.take_message().as_deref(), Some("Export failed"));
         assert!(a.logged.1.is_empty());
+        let warned = (crate::applog::Level::Warn, "Export failed".to_owned());
+        assert_eq!(
+            crate::applog::take_captured(),
+            [warned.clone(), warned],
+            "both reached the log"
+        );
         // And the frame's own logging sees a third one as new.
         a.dialog = Some(Dialog::Message("Export failed".into()));
         assert_eq!(a.new_messages().len(), 1);

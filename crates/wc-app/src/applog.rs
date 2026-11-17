@@ -365,7 +365,21 @@ pub fn init() {
     log(Level::Info, &format!("start {}", crate::feedback::version()));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What this test thread logged, so tests can see it without a log folder.
+    static CAPTURED: std::cell::RefCell<Vec<(Level, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The lines this test thread logged since the last call.
+#[cfg(test)]
+pub(crate) fn take_captured() -> Vec<(Level, String)> {
+    CAPTURED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 pub fn log(level: Level, message: &str) {
+    #[cfg(test)]
+    CAPTURED.with(|c| c.borrow_mut().push((level, message.to_owned())));
     if let Some(m) = LOG.get()
         && let Ok(mut l) = m.lock()
     {
@@ -450,6 +464,23 @@ mod tests {
         l.write(Level::Info, "hello");
         let e = l.error().unwrap();
         assert!(e.contains("not-a-folder"), "{e}");
+    }
+
+    #[test]
+    fn a_rotation_that_cannot_drop_the_oldest_file_keeps_the_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The oldest kept file is a folder with something in it, so deleting it fails with an
+        // error other than "not found".
+        let oldest = tmp.path().join(format!("{NAME}.1"));
+        fs::create_dir(&oldest).unwrap();
+        fs::write(oldest.join("x"), "x").unwrap();
+        let mut l = Logger::new(tmp.path(), 60, 1);
+        l.write(Level::Info, "first line that fills the file");
+        assert!(l.error().is_none());
+        l.write(Level::Info, "second line forces a rotation");
+        let e = l.error().unwrap();
+        assert!(e.contains(&tmp.path().display().to_string()), "{e}");
+        assert!(oldest.join("x").exists(), "nothing was lost");
     }
 
     #[test]
