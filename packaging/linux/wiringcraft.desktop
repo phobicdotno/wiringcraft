@@ -3,5 +3,6 @@ Type=Application
 Name=WiringCraft
 Comment=Electrical schematics and wiring diagrams
 Exec=wiringcraft-app
+Icon=wiringcraft
 Terminal=false
 Categories=Development;Science;Engineering;Electronics;
