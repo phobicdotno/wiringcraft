@@ -7,7 +7,7 @@ use wc_core::geom::{Rotation, Shape};
 
 use crate::actions::Action;
 use crate::canvas::Editor;
-use crate::state::{Open, Selection, Tool};
+use crate::state::{Open, Selection, SpecPart, Tool};
 use crate::theme::Theme;
 
 #[derive(Default)]
@@ -33,6 +33,99 @@ pub struct PanelState {
     tag_error: Option<String>,
     /// A reply being written to the comment shown.
     reply: String,
+    /// Edit state for the selected wires' section, colour and type, in `SpecPart::ALL` order, and
+    /// the wires it belongs to.
+    spec: [SpecField; 3],
+    spec_for: (usize, Vec<String>),
+}
+
+impl PanelState {
+    /// A fresh state for a newly opened project: nothing typed in it carries over. The device
+    /// search stays.
+    pub fn reset(&mut self) {
+        *self = Self {
+            search: std::mem::take(&mut self.search),
+            ..Self::default()
+        };
+    }
+}
+
+/// The edit state of one wire spec field.
+#[derive(Default)]
+struct SpecField {
+    /// What the field shows.
+    buffer: String,
+    /// The value it was loaded with (empty when the wires differ).
+    loaded: String,
+    /// Whether the wires differ in it.
+    mixed: bool,
+    /// Whether the user typed in it since it was loaded or committed.
+    dirty: bool,
+}
+
+/// Keep the spec buffers in step with the given wires of a page: refilled when the selection
+/// changes, and a field the user is not editing follows changes made elsewhere (undo, the agent).
+fn load_spec(open: &Open, page: usize, ids: &[String], ps: &mut PanelState) {
+    let fresh = ps.spec_for.0 != page || ps.spec_for.1 != ids;
+    if fresh {
+        ps.spec_for = (page, ids.to_vec());
+        for f in &mut ps.spec {
+            f.dirty = false;
+        }
+    }
+    let Some(p) = open.project.pages.get(page) else {
+        return;
+    };
+    let wires: Vec<&wc_core::Wire> = p.wires.iter().filter(|w| ids.contains(&w.id)).collect();
+    for (part, f) in SpecPart::ALL.into_iter().zip(&mut ps.spec) {
+        let values: std::collections::BTreeSet<Option<&String>> =
+            wires.iter().map(|w| part.of(&w.spec).as_ref()).collect();
+        let mixed = values.len() > 1;
+        let common = if mixed {
+            String::new()
+        } else {
+            values.into_iter().next().flatten().cloned().unwrap_or_default()
+        };
+        if fresh || (!f.dirty && (common != f.loaded || mixed != f.mixed)) {
+            f.buffer = common.clone();
+            f.loaded = common;
+            f.mixed = mixed;
+        }
+    }
+}
+
+/// Forget the wire spec drafts when this frame shows no wire rows (a panel, a symbol, a comment,
+/// the page): coming back to the same wires then reloads their values instead of an old draft.
+fn forget_spec_unless_wires(ed: &Editor, ps: &mut PanelState) {
+    let wires =
+        ed.panel.is_none() && !ed.selection.is_empty() && ed.selection.iter().all(|s| matches!(s, Selection::Wire(_)));
+    if !wires {
+        ps.spec_for = Default::default();
+    }
+}
+
+/// Rows for cross-section, colour and type of the given wires, inside a two-column grid. A value
+/// typed in is set on all of them; emptying a field clears it on all of them. A field nobody typed
+/// in changes nothing, so tabbing through a field the wires differ in keeps their own values.
+fn spec_rows(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[String], ps: &mut PanelState) {
+    load_spec(open, page, ids, ps);
+    for (part, f) in SpecPart::ALL.into_iter().zip(&mut ps.spec) {
+        ui.label(part.label());
+        let hint = if f.mixed { "several values" } else { part.hint() };
+        let r = ui.add(egui::TextEdit::singleline(&mut f.buffer).hint_text(hint));
+        if r.changed() {
+            f.dirty = true;
+        }
+        if committed(&r) && f.dirty {
+            f.dirty = false;
+            let value = wc_core::WireSpec::value(&f.buffer);
+            open.set_wire_spec(page, ids, part, value.clone());
+            f.buffer = value.unwrap_or_default();
+            f.loaded = f.buffer.clone();
+            f.mixed = false;
+        }
+        ui.end_row();
+    }
 }
 
 /// A panel section title: small capitals in the muted colour, with an optional count on the
@@ -346,6 +439,7 @@ fn committed(r: &egui::Response) -> bool {
 pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState) {
     let t = Theme::of(ui.ctx());
     section(ui, "Properties", None);
+    forget_spec_unless_wires(ed, ps);
     if let Some(pi) = ed.panel {
         panel_properties(ui, open, ed, pi);
         return;
@@ -360,7 +454,25 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
     let page_idx = ed.page;
     if ed.selection.len() > 1 {
         let n = ed.selection.len();
-        ui.label(format!("{n} items selected"));
+        let wires: Vec<String> = ed
+            .selection
+            .iter()
+            .filter_map(|s| match s {
+                Selection::Wire(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if wires.len() == n {
+            // Only wires: their section, colour and type can be set together.
+            ui.label(format!("{n} wires selected"));
+            egui::Grid::new("wires-props")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| spec_rows(ui, open, page_idx, &wires, ps));
+            ui.label(RichText::new("A value typed here is set on all of them.").color(t.faint));
+        } else {
+            ui.label(format!("{n} items selected"));
+        }
         ui.label(RichText::new("Move, rotate, mirror, copy or delete them together.").color(t.faint));
         return;
     }
@@ -636,6 +748,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                         ui.label(RichText::new(e).color(t.error).small());
                         ui.end_row();
                     }
+                    spec_rows(ui, open, page_idx, std::slice::from_ref(&id), ps);
                     ui.label("Bends");
                     ui.label(wire.via.len().to_string());
                     ui.end_row();
@@ -989,5 +1102,24 @@ fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
             ui.label(RichText::new(m).monospace());
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_drafts_are_forgotten_when_no_wire_rows_show() {
+        let mut ps = PanelState::default();
+        let mut wire = Editor::default();
+        wire.selection = vec![Selection::Wire("w1".into())];
+        ps.spec_for = (0, vec!["w1".into()]);
+        forget_spec_unless_wires(&wire, &mut ps);
+        assert_eq!(ps.spec_for, (0, vec!["w1".into()]), "the wire rows show: kept");
+        let mut symbol = Editor::default();
+        symbol.selection = vec![Selection::Symbol("s1".into())];
+        forget_spec_unless_wires(&symbol, &mut ps);
+        assert_eq!(ps.spec_for, (0, Vec::new()), "a symbol shows: forgotten");
     }
 }

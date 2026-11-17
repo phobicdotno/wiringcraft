@@ -23,7 +23,8 @@ CREATE TABLE tew_equipotential (equ_id INTEGER, equ_text TEXT);
 CREATE TABLE tew_cable (cab_id INTEGER, cab_tag TEXT, cab_reference TEXT, cab_manufacturer TEXT);
 CREATE TABLE tew_cablewire (caw_cab_id INTEGER, caw_no INTEGER, caw_color TEXT);
 CREATE TABLE tew_wire (wir_id INTEGER, wir_cab_id INTEGER, wir_caw_no INTEGER, wir_tag TEXT,
-  wir_cel_idfrom INTEGER, wir_cte_nofrom INTEGER, wir_cel_idto INTEGER, wir_cte_noto INTEGER);
+  wir_cel_idfrom INTEGER, wir_cte_nofrom INTEGER, wir_cel_idto INTEGER, wir_cte_noto INTEGER,
+  wir_sectiontype INTEGER, wir_sectionorgauge TEXT, wir_color TEXT);
 CREATE TABLE tew_linewirepair (lwp_lin_id INTEGER, lwp_wir_id INTEGER, lwp_wir_orderno INTEGER);
 ";
 
@@ -907,7 +908,7 @@ INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0), (61, 21, 0, 202, 0)
 INSERT INTO tew_componentterminal VALUES (60, 0, NULL), (60, 1, NULL), (61, 0, NULL), (61, 1, NULL);
 INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL), (11, 10, 170, 205, 170, 215, NULL);
 INSERT INTO tew_linewirepair VALUES (10, 80, 1), (11, 81, 1);
-INSERT INTO tew_wire VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1), (81, NULL, -1, 'N2', 61, 0, 50, 0),
+INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto) VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1), (81, NULL, -1, 'N2', 61, 0, 50, 0),
   (82, NULL, -1, '', 60, 0, 99, 0), (83, NULL, -1, '', 0, 0, 0, 0);
 ",
     )
@@ -996,7 +997,7 @@ fn imported_terminals_show_in_the_terminal_plan_per_strip() {
     // A terminal whose number has a dot, and a wire record with only one end.
     c.execute_batch(
         "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (203, '3.1', '-X1-3.1', 4, 200, 3), (204, '1+2', '-X1-1+2', 4, 200, 4);
-         INSERT INTO tew_wire VALUES (84, NULL, -1, '', 60, 0, NULL, NULL);",
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto) VALUES (84, NULL, -1, '', 60, 0, NULL, NULL);",
     )
     .unwrap();
     let (built, _, report) = build(&read(&c).unwrap(), None);
@@ -1041,7 +1042,7 @@ fn a_wire_end_on_a_repeated_pin_name_is_found_on_the_right_pin() {
          INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0);
          INSERT INTO tew_componentterminal VALUES (60, 0, '1'), (60, 1, '1');
          INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL);
-         INSERT INTO tew_wire VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1);",
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto) VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1);",
     )
     .unwrap();
     let (_, warnings, report) = build(&read(&c).unwrap(), None);
@@ -1383,6 +1384,35 @@ fn a_bare_tag_with_spaces_and_no_function_or_location_stays_one_name() {
 }
 
 #[test]
+fn wires_carry_their_section_and_colour() {
+    assert_eq!(wire_section(Some(0), "1.5").as_deref(), Some("1.5 mm²"));
+    assert_eq!(wire_section(Some(1), " 20 ").as_deref(), Some("20 AWG"));
+    assert_eq!(wire_section(Some(0), "0"), None, "0 is no section");
+    assert_eq!(wire_section(Some(-1), ""), None);
+    assert_eq!(
+        wire_section(None, "2,5").as_deref(),
+        Some("2,5"),
+        "unknown type: as written"
+    );
+
+    let c = sample();
+    c.execute_batch(
+        "UPDATE tew_wire SET wir_sectiontype = 0, wir_sectionorgauge = '0.75', wir_color = 'BN' WHERE wir_id = 70;",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.wires[&70].spec.section.as_deref(), Some("0.75 mm²"));
+    assert_eq!(p.wires[&71].spec, WireSpec::default());
+    let (built, _, _) = build(&p, None);
+    let drawn: Vec<&Wire> = page(&built, "01").wires.iter().filter(|w| w.cable.is_some()).collect();
+    assert!(!drawn.is_empty());
+    for w in drawn {
+        assert_eq!(w.spec.section.as_deref(), Some("0.75 mm²"));
+        assert_eq!(w.spec.colour.as_deref(), Some("BN"));
+    }
+}
+
+#[test]
 fn a_mirrored_symbol_turned_90_degrees_meets_its_line() {
     let c = sample();
     // Point (0, 5) turned by 90 degrees is (-5, 0); mirrored in x it is (5, 0), where the line
@@ -1576,4 +1606,29 @@ fn a_spaced_location_path_counts_as_the_space_form() {
         "{:?}",
         p.warnings
     );
+}
+
+#[test]
+fn a_cable_core_keeps_its_own_wire_s_spec() {
+    let c = sample();
+    // Line 1 carries the cable wire 70 (no spec) and wire 71 (with one).
+    c.execute_batch(
+        "UPDATE tew_wire SET wir_sectiontype = 0, wir_sectionorgauge = '1.5', wir_color = 'RD' WHERE wir_id = 71;
+         INSERT INTO tew_linewirepair VALUES (1, 71, 2);",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let (built, _, report) = build(&p, None);
+    let cabled: Vec<&Wire> = built
+        .pages
+        .iter()
+        .flat_map(|pg| pg.wires.iter())
+        .filter(|w| w.cable.is_some())
+        .collect();
+    assert!(!cabled.is_empty());
+    for w in cabled {
+        assert_eq!(w.spec, WireSpec::default(), "71's section is not put on 70's core");
+    }
+    let wires = report.iter().find(|c| c.what == "wires").unwrap();
+    assert!(wires.note.contains("no section or colour"), "{}", wires.note);
 }

@@ -32,6 +32,8 @@ pub struct AmlLink {
     pub name: String,
     pub a: (usize, String),
     pub b: (usize, String),
+    /// Cross-section, colour and type, when the source has them (EPLAN connections do).
+    pub spec: wc_core::WireSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -214,7 +216,12 @@ pub fn parse(text: &str) -> Result<AmlImport> {
     };
     for (name, a, b) in raw_links {
         match (resolve(&a), resolve(&b)) {
-            (Some(a), Some(b)) => out.links.push(AmlLink { name, a, b }),
+            (Some(a), Some(b)) => out.links.push(AmlLink {
+                name,
+                a,
+                b,
+                spec: Default::default(),
+            }),
             _ => out.warnings.push(format!(
                 "link {name:?} refers to an unknown connection point ({a} / {b})"
             )),
@@ -487,6 +494,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                     potential: None,
                     cable: None,
                     route: Default::default(),
+                    spec: l.spec.clone(),
                 });
             }
         } else {
@@ -507,6 +515,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                         potential: potential.clone(),
                         cable: None,
                         route: Default::default(),
+                        spec: l.spec.clone(),
                     });
                 }
             }
@@ -630,6 +639,7 @@ mod tests {
             potential: Some("L+".into()),
             cable: None,
             route: Default::default(),
+            spec: Default::default(),
         });
         project.pages.push(page);
         let part = wc_core::Part {
