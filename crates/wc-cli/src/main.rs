@@ -472,6 +472,12 @@ enum ImportCmd {
         /// Number the pages from here instead of keeping the source's page numbers.
         #[arg(long)]
         first_page: Option<usize>,
+        /// Which library symbol to draw for which source block: a text file with one
+        /// `block name = symbol.id` per line. Without it, blocks whose pins match a built-in
+        /// symbol (coil A1/A2, contacts 13/14 and 11/12, lamp X1/X2, terminal 1/2) use it when
+        /// the pins sit where the block's points are; the rest are drawn as boxes.
+        #[arg(long)]
+        symbol_map: Option<PathBuf>,
     },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
     Aml {
@@ -1484,7 +1490,12 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 ep.connections.len()
             );
         }
-        ImportCmd::Swe { path, pick, first_page } => {
+        ImportCmd::Swe {
+            path,
+            pick,
+            first_page,
+            symbol_map,
+        } => {
             let project = pick;
             let started = std::time::Instant::now();
             let mut p = load(dir)?;
@@ -1526,7 +1537,11 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let conn = wc_import::swe::open(&db).map_err(e)?;
             let mut sw = wc_import::swe::read(&conn).map_err(e)?;
             sw.info = info;
-            let (built, warnings, report) = wc_import::swe::build(&sw, first_page);
+            let choice = swe_symbol_choice(dir, &p, symbol_map.as_deref())?;
+            for w in &choice.2 {
+                eprintln!("warning: {w}");
+            }
+            let (built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);
             for w in sw.warnings.iter().chain(&warnings) {
                 eprintln!("warning: {w}");
             }
@@ -1536,8 +1551,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             );
-            let n_sym = built.symbols.len();
-            add_built(dir, &mut p, built, &source)?;
+            let n_sym = add_swe_built(dir, &mut p, built, &source, &choice.1)?;
             save(dir, &p)?;
             println!(
                 "{:<18} {:>8} {:>9}  why the rest is not imported",
@@ -2121,6 +2135,138 @@ fn eplan_tables(path: &Path) -> Result<wc_import::eplan::Tables, String> {
 
 /// Add imported symbols, parts, pages and devices to a project, pinning symbols and parts in
 /// the lockfile under `source`.
+/// The library symbols a SolidWorks import may draw, with the library each comes from: the
+/// project's own copy where it has one (so a repeated import matches it), otherwise the
+/// project's libraries. With `map`, the user's block map from that file. Also returns the
+/// warnings to show: copies or library symbols that cannot be read, mapped symbols no library has.
+fn swe_symbol_choice(
+    dir: &Path,
+    p: &Project,
+    map: Option<&Path>,
+) -> Res<(
+    wc_import::swe::SymbolChoice,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+)> {
+    let mut choice = wc_import::swe::SymbolChoice::default();
+    if let Some(path) = map {
+        let text = std::fs::read_to_string(path).map_err(|x| format!("{}: {x}", path.display()))?;
+        choice.by_block = wc_import::swe::parse_symbol_map(&text).map_err(|x| format!("{}: {x}", path.display()))?;
+    }
+    let mut wanted: std::collections::BTreeSet<String> = choice.by_block.values().cloned().collect();
+    wanted.extend(wc_import::swe::BUILTIN_BY_PINS.iter().map(|(_, id)| (*id).to_owned()));
+    let lib = readable_libraries(dir, p);
+    let mut sources = std::collections::BTreeMap::new();
+    let mut warnings = Vec::new();
+    for id in wanted {
+        // The project's own copy first, used on a page or not.
+        if p.lock.symbols.contains_key(&id) {
+            match project_copy(dir, &id) {
+                Ok(Some(s)) => {
+                    let source = p.lock.symbols.get(&id).map(|l| l.source.clone()).unwrap_or_default();
+                    sources.insert(id.clone(), source);
+                    choice.library.insert(id, s);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(why) => warnings.push(format!("{why}; trying the libraries")),
+            }
+        }
+        match lib.as_ref().map(|l| l.symbol(&id)) {
+            Some(Ok((s, source))) => {
+                sources.insert(id.clone(), source);
+                choice.library.insert(id, s);
+            }
+            // Only a symbol that is really missing is "no library has"; one that cannot be read
+            // was reported with its reason.
+            Some(Err(wc_library::Error::NotFound { .. })) | None => {
+                if choice.by_block.values().any(|v| *v == id) {
+                    warnings.push(format!(
+                        "symbol map names {id}, which no library has; those blocks stay boxes"
+                    ));
+                }
+            }
+            Some(Err(why)) => warnings.push(format!(
+                "library symbol {id} cannot be read, blocks it would match stay boxes: {why}"
+            )),
+        }
+    }
+    Ok((choice, sources, warnings))
+}
+
+/// The project's libraries that can be opened, in their order. A source that cannot be opened (a
+/// git source not synced yet) only means fewer matches, and says so; the others stay usable.
+fn readable_libraries(dir: &Path, p: &Project) -> Option<wc_library::Library> {
+    let mut readable = p.clone();
+    readable.meta.libraries.retain(|source| {
+        let mut one = p.clone();
+        one.meta.libraries = vec![source.clone()];
+        wc_library::Library::open(dir, &one)
+            .inspect_err(|x| eprintln!("warning: library {} not read, blocks may stay boxes: {x}", source.name))
+            .is_ok()
+    });
+    wc_library::Library::open(dir, &readable)
+        .inspect_err(|x| eprintln!("warning: libraries not read, blocks may stay boxes: {x}"))
+        .ok()
+}
+
+/// The project's own copy of symbol `id`: `None` when it has none, the reason when the copy is
+/// there but cannot be read.
+fn project_copy(dir: &Path, id: &str) -> Res<Option<wc_core::Symbol>> {
+    let path = dir
+        .join(store::VENDOR_DIR)
+        .join(ItemKind::Symbol.dir())
+        .join(format!("{id}.json"));
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(format!("project copy of symbol {id} is not a file: {}", path.display())),
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(x) => {
+            return Err(format!(
+                "project copy of symbol {id} cannot be read: {}: {x}",
+                path.display()
+            ));
+        }
+    }
+    store::read_vendored_symbol(dir, id)
+        .map(Some)
+        .map_err(|why| format!("project copy of symbol {id} cannot be read: {why}"))
+}
+
+/// Adds a SolidWorks Electrical import to `p`, keeping the library symbols it used (named in
+/// `sources`, new to the project or pinned before) pinned to their libraries. Returns how many
+/// symbol shapes the import made itself.
+fn add_swe_built(
+    dir: &Path,
+    p: &mut Project,
+    built: wc_import::aml::Built,
+    source: &str,
+    sources: &std::collections::BTreeMap<String, String>,
+) -> Res<usize> {
+    let n_sym = built.symbols.iter().filter(|s| !sources.contains_key(&s.id)).count();
+    let from_library: Vec<String> = built
+        .symbols
+        .iter()
+        .filter(|s| sources.contains_key(&s.id))
+        .map(|s| s.id.clone())
+        .collect();
+    add_built(dir, p, built, source)?;
+    keep_library_sources(p, &from_library, sources);
+    Ok(n_sym)
+}
+
+/// Library symbols an import used stay pinned to the library they came from (`add_built` pins
+/// everything it adds to the import), whether they were pinned before or not.
+fn keep_library_sources(p: &mut Project, ids: &[String], sources: &std::collections::BTreeMap<String, String>) {
+    for id in ids {
+        if let (Some(lib), Some(entry)) = (sources.get(id), p.lock.symbols.get_mut(id))
+            && !lib.is_empty()
+        {
+            entry.source.clone_from(lib);
+        }
+    }
+}
+
 fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Result<(), String> {
     let e = |x: wc_core::Error| x.to_string();
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of
@@ -2263,6 +2409,208 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_project_copy_that_cannot_be_read_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert_eq!(project_copy(dir, "wc.coil"), Ok(None), "no copy: no error");
+        let folder = dir.join(store::VENDOR_DIR).join(ItemKind::Symbol.dir());
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("wc.coil.json"), "{ not json").unwrap();
+        let reason = store::read_vendored_symbol(dir, "wc.coil").unwrap_err().to_string();
+        let why = project_copy(dir, "wc.coil").unwrap_err();
+        assert_eq!(why, format!("project copy of symbol wc.coil cannot be read: {reason}"));
+        // A folder where the copy should be is not taken for a missing copy.
+        std::fs::remove_file(folder.join("wc.coil.json")).unwrap();
+        std::fs::create_dir(folder.join("wc.coil.json")).unwrap();
+        let why = project_copy(dir, "wc.coil").unwrap_err();
+        assert!(
+            why.starts_with("project copy of symbol wc.coil is not a file: "),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn an_import_uses_the_pinned_project_copy_even_when_no_page_uses_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        p.meta.libraries.push(LibrarySource {
+            name: "starter".into(),
+            kind: "folder".into(),
+            location: starter.to_string_lossy().into_owned(),
+            reference: None,
+        });
+        let (mut coil, source) = wc_library::Library::open(&dir, &p).unwrap().symbol("wc.coil").unwrap();
+        // The pinned copy differs from what the library has now (a changed library).
+        coil.name = "Pinned coil".into();
+        store::write_vendored_symbol(&dir, &coil).unwrap();
+        p.lock.symbols.insert(
+            "wc.coil".into(),
+            wc_core::LockEntry {
+                source: source.clone(),
+                hash: "h".into(),
+            },
+        );
+        assert!(
+            p.pages
+                .iter()
+                .all(|pg| pg.symbols.iter().all(|s| s.symbol != "wc.coil")),
+            "no page uses the pinned symbol"
+        );
+        let (choice, sources, _) = swe_symbol_choice(&dir, &p, None).unwrap();
+        assert_eq!(choice.library["wc.coil"].name, "Pinned coil", "the project copy wins");
+        assert_eq!(sources["wc.coil"], source, "it stays pinned to its library");
+        // A library that is gone does not lose the pinned copy either.
+        p.meta.libraries.clear();
+        let (choice, _, _) = swe_symbol_choice(&dir, &p, None).unwrap();
+        assert_eq!(choice.library["wc.coil"].name, "Pinned coil");
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_opened_leaves_the_others_usable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let folder = |name: &str, location: String| LibrarySource {
+            name: name.into(),
+            kind: "folder".into(),
+            location,
+            reference: None,
+        };
+        p.meta.libraries = vec![
+            LibrarySource {
+                name: "broken".into(),
+                kind: "ftp".into(),
+                location: "x".into(),
+                reference: None,
+            },
+            folder(
+                "starter",
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../library")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ];
+        assert!(
+            wc_library::Library::open(&dir, &p).is_err(),
+            "the source list as a whole fails"
+        );
+        let (choice, sources, _) = swe_symbol_choice(&dir, &p, None).unwrap();
+        assert!(
+            choice.library.contains_key("wc.coil"),
+            "the readable library is still used"
+        );
+        assert_eq!(sources["wc.coil"], "starter");
+    }
+
+    #[test]
+    fn an_unreadable_mapped_symbol_says_why_and_not_that_it_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let lib = tmp.path().join("lib");
+        std::fs::create_dir_all(lib.join("symbols")).unwrap();
+        std::fs::write(lib.join("symbols").join("my.coil.json"), "{ not json").unwrap();
+        p.meta.libraries = vec![LibrarySource {
+            name: "mine".into(),
+            kind: "folder".into(),
+            location: lib.to_string_lossy().into_owned(),
+            reference: None,
+        }];
+        let map = tmp.path().join("map.txt");
+        std::fs::write(&map, "Relay = my.coil\nLamp = my.lamp\n").unwrap();
+        let (choice, _, warnings) = swe_symbol_choice(&dir, &p, Some(&map)).unwrap();
+        assert!(!choice.library.contains_key("my.coil"));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("library symbol my.coil cannot be read")),
+            "the reason is given: {warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("names my.coil, which no library has")),
+            "an unreadable symbol is not called missing: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("names my.lamp, which no library has")),
+            "a really missing one still is: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_import_keeps_a_used_library_symbol_pinned_to_its_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.pages.clear();
+        let coil: wc_core::Symbol =
+            serde_json::from_str(r#"{"id":"wc.coil","name":"Coil","graphics":[],"pins":[]}"#).unwrap();
+        let sources: std::collections::BTreeMap<String, String> = [("wc.coil".into(), "starter".into())].into();
+        let import = |id: &str, number: &str| {
+            let mut page = Page::new(id, number, "");
+            page.symbols.push(PlacedSymbol {
+                id: "s1".into(),
+                symbol: "wc.coil".into(),
+                at: Point::new(10.0, 10.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: DeviceTag::parse("-K1").ok(),
+            });
+            wc_import::aml::Built {
+                symbols: vec![coil.clone()],
+                pages: vec![page],
+                ..Default::default()
+            }
+        };
+        add_swe_built(&dir, &mut p, import("i1", "1"), "import:first.db", &sources).unwrap();
+        save(&dir, &p).unwrap();
+        let mut p = load(&dir).unwrap();
+        assert_eq!(p.lock.symbols["wc.coil"].source, "starter");
+        assert!(
+            p.pages
+                .iter()
+                .any(|pg| pg.symbols.iter().any(|s| s.symbol == "wc.coil"))
+        );
+        // The second import uses the symbol that is pinned and used already.
+        add_swe_built(&dir, &mut p, import("i2", "2"), "import:second.db", &sources).unwrap();
+        save(&dir, &p).unwrap();
+        assert_eq!(load(&dir).unwrap().lock.symbols["wc.coil"].source, "starter");
+    }
+
+    #[test]
+    fn an_import_keeps_library_symbols_pinned_to_their_library() {
+        let mut p = Project::new("t");
+        let entry = |source: &str| wc_core::LockEntry {
+            source: source.into(),
+            hash: "h".into(),
+        };
+        // wc.coil was pinned to the starter library before; add_built just re-pinned it, and a
+        // new wc.lamp, to the import, and an import box to the import as well.
+        for id in ["wc.coil", "wc.lamp", "swe.fuse.1"] {
+            p.lock.symbols.insert(id.into(), entry("import:x.db"));
+        }
+        let sources: std::collections::BTreeMap<String, String> = [
+            ("wc.coil".into(), "starter".into()),
+            ("wc.lamp".into(), "starter".into()),
+        ]
+        .into();
+        keep_library_sources(&mut p, &["wc.coil".into(), "wc.lamp".into()], &sources);
+        let src = |id: &str| p.lock.symbols[id].source.clone();
+        assert_eq!((src("wc.coil"), src("wc.lamp")), ("starter".into(), "starter".into()));
+        assert_eq!(src("swe.fuse.1"), "import:x.db");
     }
 
     #[test]

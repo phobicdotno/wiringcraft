@@ -1227,6 +1227,101 @@ fn box_symbol(block: &str, origin: Point, corner: Option<Point>, pins: &[(String
     (graphics, out)
 }
 
+/// Library symbols the import may draw instead of a box, and which source blocks should use
+/// which of them.
+#[derive(Debug, Clone, Default)]
+pub struct SymbolChoice {
+    /// Library symbols by id: the ones a source block may become.
+    pub library: BTreeMap<String, Symbol>,
+    /// Source block name to library symbol id, as the user mapped them. Tried before the
+    /// built-in matches.
+    pub by_block: BTreeMap<String, String>,
+}
+
+/// Built-in matches: a block whose connection points carry exactly these names may be drawn as
+/// this library symbol, when the symbol's pins sit where the block's points do.
+pub const BUILTIN_BY_PINS: &[(&[&str], &str)] = &[
+    (&["A1", "A2"], "wc.coil"),
+    (&["13", "14"], "wc.contact.no"),
+    (&["11", "12"], "wc.contact.nc"),
+    (&["X1", "X2"], "wc.lamp"),
+    (&["1", "2"], "wc.terminal"),
+];
+
+/// A user's block map: one `block name = symbol.id` per line; blank lines and lines starting
+/// with `#` are skipped. A line without `=`, or with an empty side, is refused with its number.
+pub fn parse_symbol_map(text: &str) -> std::result::Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((block, id)) = line.split_once('=') else {
+            return Err(format!("line {}: expected `block name = symbol.id`", i + 1));
+        };
+        let (block, id) = (block.trim(), id.trim());
+        if block.is_empty() || id.is_empty() {
+            return Err(format!("line {}: block name and symbol id are both needed", i + 1));
+        }
+        out.insert(block.to_owned(), id.to_owned());
+    }
+    Ok(out)
+}
+
+/// The library symbol to draw for a source block, with its pins in the order of the block's
+/// points, when one fits: the same kind (a terminal for a terminal, an interruption for an
+/// arrow), as many pins, each pin named like a point and within [`JOIN`] of it. `pins` are the
+/// points relative to the symbol's origin.
+fn library_fit<'a>(
+    choice: &'a SymbolChoice,
+    block: &str,
+    role: SymbolRole,
+    pins: &[(String, Point)],
+) -> Option<(&'a Symbol, Vec<Pin>)> {
+    let fits = |sym: &Symbol| -> Option<Vec<Pin>> {
+        let kind_ok = match role {
+            SymbolRole::Terminal | SymbolRole::Interruption => sym.role == role,
+            _ => !matches!(sym.role, SymbolRole::Terminal | SymbolRole::Interruption),
+        };
+        if !kind_ok || sym.pins.len() != pins.len() {
+            return None;
+        }
+        let mut out: Vec<Pin> = Vec::with_capacity(pins.len());
+        for (name, at) in pins {
+            let pin = sym.pins.iter().find(|q| &q.name == name)?;
+            if out.iter().any(|q| q.name == pin.name) || dist(pin.at, *at) > JOIN {
+                return None;
+            }
+            out.push(pin.clone());
+        }
+        Some(out)
+    };
+    let mapped = choice.by_block.get(block).or_else(|| {
+        choice
+            .by_block
+            .iter()
+            .find(|(b, _)| b.eq_ignore_ascii_case(block))
+            .map(|(_, id)| id)
+    });
+    if let Some(id) = mapped {
+        // A block the user mapped is never matched to anything else.
+        let sym = choice.library.get(id)?;
+        return fits(sym).map(|p| (sym, p));
+    }
+    let mut names: Vec<&str> = pins.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort_unstable();
+    BUILTIN_BY_PINS.iter().find_map(|(want, id)| {
+        let mut want = want.to_vec();
+        want.sort_unstable();
+        if want != names {
+            return None;
+        }
+        let sym = choice.library.get(*id)?;
+        fits(sym).map(|p| (sym, p))
+    })
+}
+
 /// The name of an equipotential without a number: `net<id>`, or `net<id>_2`, ... when the source
 /// already uses that as a potential name.
 fn fallback_net(id: i64, taken: &BTreeSet<String>) -> String {
@@ -1306,6 +1401,16 @@ fn page_numbers(
 /// the pins and lines at its ends, with their cable cores; one device per component and per
 /// cable. Returns the pages and devices, the warnings, and the counts report.
 pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<String>, Vec<Count>) {
+    build_with(p, first_page_number, &SymbolChoice::default())
+}
+
+/// [`build`], drawing a source block as a library symbol from `choice` where one fits (see
+/// [`SymbolChoice`]); the others stay boxes. The library symbols used are in `Built::symbols`.
+pub fn build_with(
+    p: &SweProject,
+    first_page_number: Option<usize>,
+    choice: &SymbolChoice,
+) -> (Built, Vec<String>, Vec<Count>) {
     let mut warnings = Vec::new();
     let mut built = Built {
         symbols: Vec::new(),
@@ -1493,6 +1598,8 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut used_components: BTreeSet<i64> = BTreeSet::new();
     let mut symbols_in = 0;
     let mut symbols_out = 0;
+    // Of those, drawn as a library symbol and as a box.
+    let (mut library_symbols, mut boxed_symbols) = (0usize, 0usize);
     let mut lines_in = 0;
     let mut lines_out = 0usize;
     let mut zero_length = 0;
@@ -1567,7 +1674,6 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             symbols_out += 1;
             let origin = flip(s.at);
             let pins: Vec<(String, Point)> = s.pins.iter().map(|q| (q.name.clone(), flip(q.at))).collect();
-            let (graphics, out_pins) = box_symbol(&s.block, origin, s.corner.map(flip), &pins);
             let component = s.component.and_then(|c| p.components.get(&c));
             if s.component.is_some() && component.is_none() {
                 unknown_component += 1;
@@ -1577,33 +1683,60 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 Some(COMPONENT_TERMINAL) => SymbolRole::Terminal,
                 _ => SymbolRole::Standalone,
             };
+            let local: Vec<(String, Point)> = pins
+                .iter()
+                .map(|(n, at)| (n.clone(), Point::new(at.x - origin.x, at.y - origin.y)))
+                .collect();
+            let matched = library_fit(choice, &s.block, role, &local);
+            let from_library = matched.is_some();
+            let (graphics, out_pins) = match &matched {
+                Some((_, lib_pins)) => (Vec::new(), lib_pins.clone()),
+                None => box_symbol(&s.block, origin, s.corner.map(flip), &pins),
+            };
             let key = format!("{}|{:?}|{:?}|{:?}", s.block, role, graphics, out_pins);
-            let sym_id = match symbol_ids.get(&key) {
-                Some(id) => id.clone(),
-                None => {
-                    // Numbered per id stem, so blocks whose names clean up alike (`Relay A`,
-                    // `Relay-A`) never share an id.
-                    let stem = slug(&s.block);
-                    let n = per_block.entry(stem.clone()).or_insert(0);
-                    *n += 1;
-                    let id = format!("swe.{stem}.{n}");
-                    built.symbols.push(Symbol {
-                        id: id.clone(),
-                        name: if s.block.is_empty() {
-                            "SolidWorks Electrical symbol".to_owned()
-                        } else {
-                            s.block.clone()
-                        },
-                        category: "SolidWorks Electrical import".to_owned(),
-                        letter_code: String::new(),
-                        role,
-                        graphics,
-                        pins: out_pins.clone(),
-                        tag_at: Point::new(0.0, -MARGIN - 1.0),
-                        description: String::new(),
-                    });
-                    symbol_ids.insert(key, id.clone());
-                    id
+            let sym_id = if let Some((sym, _)) = matched {
+                library_symbols += 1;
+                if !built.symbols.iter().any(|have| have.id == sym.id) {
+                    built.symbols.push(sym.clone());
+                }
+                sym.id.clone()
+            } else {
+                boxed_symbols += 1;
+                match symbol_ids.get(&key) {
+                    Some(id) => id.clone(),
+                    None => {
+                        // Numbered per id stem, so blocks whose names clean up alike (`Relay A`,
+                        // `Relay-A`) never share an id.
+                        let stem = slug(&s.block);
+                        let n = per_block.entry(stem.clone()).or_insert(0);
+                        // Never an id a library symbol of this import has or may get.
+                        let id = loop {
+                            *n += 1;
+                            let candidate = format!("swe.{stem}.{n}");
+                            if !choice.library.contains_key(&candidate)
+                                && !built.symbols.iter().any(|have| have.id == candidate)
+                            {
+                                break candidate;
+                            }
+                        };
+                        built.symbols.push(Symbol {
+                            id: id.clone(),
+                            name: if s.block.is_empty() {
+                                "SolidWorks Electrical symbol".to_owned()
+                            } else {
+                                s.block.clone()
+                            },
+                            category: "SolidWorks Electrical import".to_owned(),
+                            letter_code: String::new(),
+                            role,
+                            graphics,
+                            pins: out_pins.clone(),
+                            tag_at: Point::new(0.0, -MARGIN - 1.0),
+                            description: String::new(),
+                        });
+                        symbol_ids.insert(key, id.clone());
+                        id
+                    }
                 }
             };
             let item = format!("s{}", s.id);
@@ -1629,12 +1762,15 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     });
                 }
             }
-            for pin in &out_pins {
-                pin_at.push((
-                    Point::new(origin.x + pin.at.x, origin.y + pin.at.y),
-                    item.clone(),
-                    pin.name.clone(),
-                ));
+            // Wire ends find a library symbol's pins where the source drew the points (up to
+            // JOIN away from the symbol's own pins), so which net reaches which pin stays the
+            // source's.
+            for (k, pin) in out_pins.iter().enumerate() {
+                let at = match pins.get(k) {
+                    Some((_, source)) if from_library => *source,
+                    _ => Point::new(origin.x + pin.at.x, origin.y + pin.at.y),
+                };
+                pin_at.push((at, item.clone(), pin.name.clone()));
             }
             let tag = s.component.and_then(|c| tags.get(&c).cloned());
             if let Some(c) = s.component.filter(|c| tags.contains_key(c)) {
@@ -2037,6 +2173,12 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 (off_page, "on pages that are not imported"),
                 (no_points, "without connection points (frames, labels, texts)"),
             ]),
+        },
+        Count {
+            what: "library symbols",
+            source: symbols_out,
+            imported: library_symbols,
+            note: note(vec![(boxed_symbols, "drawn as boxes: no library symbol fits")]),
         },
         Count {
             what: "wire lines",
