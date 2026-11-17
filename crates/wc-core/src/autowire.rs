@@ -110,9 +110,14 @@ pub fn suggest<'a>(
     let boxes: Vec<(&str, Point, Point)> = page
         .symbols
         .iter()
-        .filter_map(|s| {
-            let (lo, hi) = symbol(&s.symbol)?.placed_bounds(s.at, s.rotation, s.mirror);
-            Some((s.id.as_str(), lo, hi))
+        .map(|s| {
+            // A symbol whose definition is missing still stands in the way, as the small box the
+            // editor draws for it.
+            let (lo, hi) = match symbol(&s.symbol) {
+                Some(sym) => sym.placed_bounds(s.at, s.rotation, s.mirror),
+                None => Symbol::unknown_bounds(s.at),
+            };
+            (s.id.as_str(), lo, hi)
         })
         .collect();
 
@@ -266,7 +271,7 @@ mod tests {
             Endpoint::Pin { item, pin } => format!("{item}:{pin}"),
             Endpoint::Point { .. } => "point".into(),
         };
-        suggest(page, |_| Some(&sym), &items)
+        suggest(page, |id| (id == "part").then_some(&sym), &items)
             .iter()
             .map(|(a, b)| (name(a), name(b)))
             .collect()
@@ -326,6 +331,22 @@ mod tests {
             cable: None,
         });
         assert!(run(&page, &["b"]).is_empty(), "a wire ends on the line");
+    }
+
+    #[test]
+    fn a_symbol_without_a_definition_still_blocks_it() {
+        let mut page = Page::new("p1", "1", "");
+        put(&mut page, "a", 50.0, 0.0, Rotation::R0);
+        put(&mut page, "b", 50.0, 60.0, Rotation::R0);
+        assert_eq!(run(&page, &["b"]).len(), 1, "a clear line is wired");
+        put(&mut page, "lost", 50.0, 30.0, Rotation::R0);
+        if let Some(s) = page.symbols.last_mut() {
+            s.symbol = "missing".into();
+        }
+        assert!(
+            run(&page, &["b"]).is_empty(),
+            "no wire through a symbol that is not in the library"
+        );
     }
 
     #[test]

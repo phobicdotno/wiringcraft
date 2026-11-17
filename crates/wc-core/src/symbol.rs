@@ -72,6 +72,11 @@ impl Symbol {
         self.pins.iter().find(|p| p.name == name)
     }
 
+    /// The box drawn for a placed symbol whose definition is missing: 4 mm round its origin.
+    pub fn unknown_bounds(at: Point) -> (Point, Point) {
+        (at + Point::new(-4.0, -4.0), at + Point::new(4.0, 4.0))
+    }
+
     /// The box around the symbol's drawing when placed at `at`, origin included.
     pub fn placed_bounds(&self, at: Point, rotation: Rotation, mirror: bool) -> (Point, Point) {
         let mut pts = vec![at];

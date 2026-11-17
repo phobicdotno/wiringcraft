@@ -280,7 +280,7 @@ impl Open {
     pub fn symbol_bounds(&self, page: &Page, id: &str) -> Option<(Point, Point)> {
         let placed = page.symbol(id)?;
         let Some(sym) = self.symbols.get(&placed.symbol) else {
-            return Some((placed.at + Point::new(-4.0, -4.0), placed.at + Point::new(4.0, 4.0)));
+            return Some(wc_core::Symbol::unknown_bounds(placed.at));
         };
         Some(sym.placed_bounds(placed.at, placed.rotation, placed.mirror))
     }
