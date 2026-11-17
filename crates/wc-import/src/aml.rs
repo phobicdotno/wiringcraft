@@ -41,6 +41,30 @@ pub struct AmlImport {
     pub devices: Vec<AmlDevice>,
     pub links: Vec<AmlLink>,
     pub warnings: Vec<String>,
+    /// Structure elements that are locations (`+L1`), with their description.
+    pub locations: Vec<wc_core::Location>,
+}
+
+/// The location levels of a structure element named `own` inside elements named `outer`: every
+/// `+` name on the way adds its levels, unless it already repeats the levels above it.
+fn location_levels(outer: &[String], own: &str) -> Vec<String> {
+    let mut acc: Vec<String> = Vec::new();
+    for name in outer.iter().map(String::as_str).chain([own]) {
+        let name = name.trim();
+        if !name.starts_with('+') {
+            continue;
+        }
+        let Ok(path) = wc_core::project::location_path(name) else {
+            continue;
+        };
+        let levels: Vec<String> = path.split('.').map(str::to_owned).collect();
+        if levels.starts_with(&acc) {
+            acc = levels;
+        } else {
+            acc.extend(levels);
+        }
+    }
+    acc
 }
 
 fn attr(e: &BytesStart, name: &str) -> Option<String> {
@@ -79,7 +103,21 @@ pub fn parse(text: &str) -> Result<AmlImport> {
     let mut raw_links: Vec<(String, String, String)> = Vec::new();
     let mut iface_index: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut elem_ids: BTreeMap<String, usize> = BTreeMap::new();
-    let mut pending: Vec<(Vec<String>, Elem)> = Vec::new();
+    // Each finished element with the names of its parents and their designations (the tag
+    // attribute when they have one, else the name).
+    let mut pending: Vec<(Vec<String>, Vec<String>, Elem)> = Vec::new();
+    // An element's designation for locations: a reference designation that is a location, else
+    // its name when that is one, else whatever it is designated by.
+    let designation = |e: &Elem| {
+        let attr = TAG_ATTRIBUTES.iter().find_map(|k| e.attributes.get(*k));
+        let is_loc = |s: &str| s.trim_start().starts_with('+');
+        match attr {
+            Some(a) if is_loc(a) => a.clone(),
+            _ if is_loc(&e.name) => e.name.clone(),
+            Some(a) => a.clone(),
+            None => e.name.clone(),
+        }
+    };
     let mut seen_caex = false;
     let mut events = 0usize;
     loop {
@@ -104,7 +142,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                         };
                         if empty {
                             let path = stack.iter().map(|s| s.name.clone()).collect();
-                            pending.push((path, el));
+                            let outer = stack.iter().map(designation).collect();
+                            pending.push((path, outer, el));
                         } else {
                             stack.push(el);
                         }
@@ -147,7 +186,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                     "InternalElement" => {
                         if let Some(el) = stack.pop() {
                             let path = stack.iter().map(|s| s.name.clone()).collect();
-                            pending.push((path, el));
+                            let outer = stack.iter().map(designation).collect();
+                            pending.push((path, outer, el));
                         }
                     }
                     "ExternalInterface" | "Attribute" => {
@@ -164,9 +204,37 @@ pub fn parse(text: &str) -> Result<AmlImport> {
     if !seen_caex {
         return Err(Error::Format("not an AutomationML (CAEX) file".into()));
     }
-    for (path, el) in pending {
+    for (path, outer, el) in pending {
         if el.interfaces.is_empty() {
-            continue; // structure (function, location), not a device
+            // Structure (function, location), not a device. A location goes to the project.
+            let own = designation(&el);
+            // Only an element that is itself a location (`+L1`, not `+L1-K1`) names one.
+            let valid = wc_core::project::location_path(&own);
+            if own.trim_start().starts_with('+')
+                && let Err(why) = &valid
+            {
+                out.warnings
+                    .push(format!("{}: {why}; not taken as a location", el.name));
+            }
+            if own.trim_start().starts_with('+') && valid.is_ok() {
+                let levels = location_levels(&outer, &own);
+                if !levels.is_empty() {
+                    let description = ["Description", "description", "Beschreibung"]
+                        .iter()
+                        .find_map(|k| el.attributes.get(*k))
+                        .cloned()
+                        .unwrap_or_default();
+                    let path = levels.join(".");
+                    match out.locations.iter_mut().find(|l| l.path == path) {
+                        // Children come before their parents: a description found later fills
+                        // an entry that has none.
+                        Some(l) if l.description.is_empty() => l.description = description,
+                        Some(_) => {}
+                        None => out.locations.push(wc_core::Location { path, description }),
+                    }
+                }
+            }
+            continue;
         }
         let idx = out.devices.len();
         elem_ids.insert(el.id.clone(), idx);
@@ -294,7 +362,10 @@ pub fn build(imp: &AmlImport, first_page_number: usize) -> Built {
         title: "AutomationML connections".into(),
         devices: (0..imp.devices.len()).collect(),
     };
-    layout(imp, &[all], "aml", first_page_number)
+    let mut built = layout(imp, &[all], "aml", first_page_number);
+    built.locations = imp.locations.clone();
+    built.locations.sort_by(|a, b| a.path.cmp(&b.path));
+    built
 }
 
 /// A group of devices that starts on a new overview page, such as the devices of one page of
@@ -689,6 +760,62 @@ mod tests {
             (imp.devices[l.b.0].name.as_str(), l.b.1.as_str()),
         ];
         assert_eq!(ends, [("=A-K1", "14"), ("=A-P1", "X1")]);
+        Ok(())
+    }
+
+    #[test]
+    fn location_structure_elements_become_project_locations() -> Result<()> {
+        let text = r#"<CAEXFile><InstanceHierarchy Name="H">
+    <InternalElement Name="+L1" ID="l1">
+      <Attribute Name="Description"><Value>Main cabinet</Value></Attribute>
+      <InternalElement Name="+L3" ID="l3">
+        <InternalElement Name="K1" ID="{e1}">
+          <ExternalInterface Name="A1" ID="i1"/>
+        </InternalElement>
+      </InternalElement>
+      <InternalElement Name="+L1.L4" ID="l4"/>
+    </InternalElement>
+    <InternalElement Name="+L9" ID="l9">
+      <Attribute Name="Description"><Value>Engine room</Value></Attribute>
+      <InternalElement Name="+L9-K2" ID="k2"/>
+      <InternalElement Name="+L9" ID="l9b"/>
+    </InternalElement>
+    <InternalElement Name="+L7" ID="l7">
+      <Attribute Name="ReferenceDesignation"><Value>F1</Value></Attribute>
+    </InternalElement>
+    <InternalElement Name="Cabinet" ID="c2">
+      <Attribute Name="RefDes"><Value>+L2</Value></Attribute>
+      <InternalElement Name="+L5" ID="l5"/>
+    </InternalElement>
+    <InternalElement Name="=PUMP" ID="f1"/>
+  </InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(text)?;
+        let built = build(&imp, 1);
+        let got: Vec<(&str, &str)> = built
+            .locations
+            .iter()
+            .map(|l| (l.path.as_str(), l.description.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("L1", "Main cabinet"),
+                ("L1.L3", ""),
+                ("L1.L4", ""),
+                ("L2", ""),
+                ("L2.L5", ""),
+                ("L7", ""),
+                ("L9", "Engine room")
+            ]
+        );
+        assert_eq!(imp.devices.len(), 1, "locations are not devices");
+        assert!(
+            imp.warnings
+                .iter()
+                .any(|w| w.contains("+L9-K2") && w.contains("not a location")),
+            "{:?}",
+            imp.warnings
+        );
         Ok(())
     }
 }

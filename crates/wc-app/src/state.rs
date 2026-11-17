@@ -709,19 +709,32 @@ impl Open {
         n.to_string()
     }
 
-    /// Rename the project and set its title-block fields (empty values are dropped).
-    pub fn set_project_props(&mut self, name: &str, fields: &[(String, String)]) -> Result<(), String> {
+    /// Set the project name, title-block fields and, when given, the whole list of locations as
+    /// (path, description): empty rows are left out, a bad, doubled or pathless row is refused.
+    /// Empty title-block values are dropped. One undo step.
+    pub fn set_project_props(
+        &mut self,
+        name: &str,
+        fields: &[(String, String)],
+        locations: Option<&[(String, String)]>,
+    ) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() {
             return Err("The project name cannot be empty.".into());
         }
-        let block = title_block_of(fields);
-        if self.project.meta.name == name && self.project.meta.title_block == block {
+        // The copy below replaces the meta: jumpers follow the change before it first.
+        self.follow_terminals();
+        let mut meta = self.project.meta.clone();
+        meta.name = name.to_owned();
+        meta.title_block = title_block_of(fields);
+        if let Some(locations) = locations {
+            meta.locations = wc_core::project::location_rows(locations)?;
+        }
+        if meta == self.project.meta {
             return Ok(());
         }
         self.checkpoint();
-        self.project.meta.name = name.to_owned();
-        self.project.meta.title_block = block;
+        self.project.meta = meta;
         Ok(())
     }
 
@@ -1146,15 +1159,16 @@ pub(crate) mod tests {
     #[test]
     fn cancel_restores_opening_props_after_undo_and_other_property_edits() {
         let (_tmp, mut o) = project();
-        o.set_project_props("Opening", &fields(&[("customer", "Opening")]))
+        o.set_project_props("Opening", &fields(&[("customer", "Opening")]), None)
             .unwrap();
         let since = o.start_live_form();
         let before = o.props_snapshot();
         o.set_project_props_live("Form", &fields(&[("customer", "Form")]));
         assert!(o.undo());
         assert!(o.undo());
-        o.set_project_props("First", &fields(&[("customer", "First")])).unwrap();
-        o.set_project_props("Second", &fields(&[("customer", "Second")]))
+        o.set_project_props("First", &fields(&[("customer", "First")]), None)
+            .unwrap();
+        o.set_project_props("Second", &fields(&[("customer", "Second")]), None)
             .unwrap();
         // The last step looks like a form step but is not the form's: Cancel still restores
         // what the form opened with.
@@ -1196,7 +1210,8 @@ pub(crate) mod tests {
         o.form_step = None;
         o.start_live_form();
         o.set_project_props_live("Test", &fields(&[("customer", "A")]));
-        o.set_project_props("Test", &fields(&[("customer", "X")])).unwrap();
+        o.set_project_props("Test", &fields(&[("customer", "X")]), None)
+            .unwrap();
         o.set_project_props_live("Test", &fields(&[("customer", "B")]));
         assert!(o.undo());
         assert_eq!(o.project.meta.title_block["customer"], "X");
@@ -1624,10 +1639,11 @@ pub(crate) mod tests {
     #[test]
     fn project_props_drop_empty_title_block_fields() {
         let (_tmp, mut o) = project();
-        assert!(o.set_project_props(" ", &[]).is_err());
+        assert!(o.set_project_props(" ", &[], None).is_err());
         o.set_project_props(
             "Pump station",
             &[("customer".into(), "Acme".into()), ("revision".into(), " ".into())],
+            None,
         )
         .unwrap();
         assert_eq!(o.project.meta.name, "Pump station");
@@ -1809,5 +1825,40 @@ pub(crate) mod tests {
         o.project.pages[page].overview = true;
         o.follow_terminals();
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "3"]);
+    }
+
+    #[test]
+    fn project_props_set_the_locations_in_one_undo_step() {
+        let (_tmp, mut o) = project();
+        let name = o.project.meta.name.clone();
+        let mark = o.undo_mark();
+        let rows = |r: &[(&str, &str)]| {
+            r.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect::<Vec<_>>()
+        };
+        o.set_project_props(&name, &[], Some(&rows(&[("+L2", "Room"), ("", ""), ("L1", "Cabinet")])))
+            .unwrap();
+        assert_eq!(o.undo_mark(), mark + 1);
+        let paths: Vec<&str> = o.project.meta.locations.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["L1", "L2"]);
+        assert!(o.set_project_props(&name, &[], Some(&rows(&[("+L1-K1", "")]))).is_err());
+        assert!(
+            o.set_project_props(&name, &[], Some(&rows(&[("L1", "a"), ("+L1", "b")])))
+                .is_err(),
+            "twice"
+        );
+        assert!(
+            o.set_project_props(&name, &[], Some(&rows(&[("", "Cabinet")])))
+                .is_err(),
+            "no path"
+        );
+        assert_eq!(o.project.meta.locations.len(), 2, "a bad row changes nothing");
+        o.set_project_props(&name, &[], None).unwrap();
+        assert_eq!(o.project.meta.locations.len(), 2, "None keeps them");
+        o.set_project_props(&name, &[], Some(&[])).unwrap();
+        assert!(o.project.meta.locations.is_empty());
+        assert!(o.undo());
+        assert_eq!(o.project.meta.locations.len(), 2);
     }
 }

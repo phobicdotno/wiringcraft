@@ -185,12 +185,16 @@ fn tuple(p: Point) -> (f64, f64) {
     (p.x, p.y)
 }
 
-fn draw_shape(pen: &mut Pen, s: &Shape) {
+pub(crate) fn draw_shape(pen: &mut Pen, s: &Shape) {
     match s {
         Shape::Line { a, b } => pen.line(tuple(*a), tuple(*b)),
-        Shape::Polyline { points, closed } => {
+        Shape::Polyline { points, closed, filled } => {
             let pts: Vec<(f64, f64)> = points.iter().map(|p| tuple(*p)).collect();
-            pen.polyline(&pts, *closed);
+            if *filled {
+                pen.polygon_filled(&pts);
+            } else {
+                pen.polyline(&pts, *closed);
+            }
         }
         Shape::Rect { min, max } => pen.rect(tuple(*min), tuple(*max)),
         Shape::Circle { center, radius, filled } => pen.circle(tuple(*center), *radius, *filled),

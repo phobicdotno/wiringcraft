@@ -402,6 +402,19 @@ impl Pen {
         self.ops.push_str(if closed { "s\n" } else { "S\n" });
     }
 
+    /// A closed outline filled with the pen colour.
+    pub fn polygon_filled(&mut self, pts: &[(f64, f64)]) {
+        let Some(first) = pts.first() else { return };
+        self.path(pts.to_vec(), true, true);
+        let (x, y) = self.p(first.0, first.1);
+        let _ = writeln!(self.ops, "{x:.2} {y:.2} m");
+        for q in &pts[1..] {
+            let (x, y) = self.p(q.0, q.1);
+            let _ = writeln!(self.ops, "{x:.2} {y:.2} l");
+        }
+        self.ops.push_str("h f\n");
+    }
+
     pub fn line(&mut self, a: (f64, f64), b: (f64, f64)) {
         self.polyline(&[a, b], false);
     }

@@ -958,6 +958,7 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
         devices,
         links,
         warnings: Vec::new(),
+        locations: Vec::new(),
     };
     let mut built = aml::layout(&imp, &sections, "eplan", first_page_number + drawing.pages.len());
     for d in imp.devices.iter().filter(|d| drawing.drawn.contains(&d.name)) {
