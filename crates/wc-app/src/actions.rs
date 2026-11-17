@@ -27,6 +27,7 @@ pub enum Action {
     Paste,
     SelectAll,
     AddPage,
+    CoverPage,
     DuplicatePage,
     PageProps,
     PageUp,
@@ -93,6 +94,7 @@ impl Action {
         Action::Paste,
         Action::SelectAll,
         Action::AddPage,
+        Action::CoverPage,
         Action::DuplicatePage,
         Action::PageProps,
         Action::PageUp,
@@ -232,6 +234,12 @@ impl Action {
             ),
             Action::SelectAll => i("Select all", "Select everything on this page", Icon::Select, "Ctrl+A"),
             Action::AddPage => i("New page", "Add a schematic page", Icon::PageAdd, "Ctrl+N"),
+            Action::CoverPage => i(
+                "Cover page",
+                "Open the cover page and edit the project's name and fields; they show on the cover and every title block",
+                Icon::Cover,
+                "",
+            ),
             Action::DuplicatePage => i(
                 "Duplicate page",
                 "Copy this page; its devices get the next free tags",
@@ -364,6 +372,7 @@ pub const TOOLBAR: &[&[Action]] = &[
     &[Action::TextTool, Action::LineTool, Action::RectTool],
     &[
         Action::AddPage,
+        Action::CoverPage,
         Action::DuplicatePage,
         Action::PageProps,
         Action::DeletePage,
@@ -429,6 +438,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                 "Pages",
                 &[
                     Action::AddPage,
+                    Action::CoverPage,
                     Action::DuplicatePage,
                     Action::PageProps,
                     Action::PageUp,

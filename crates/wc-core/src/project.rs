@@ -38,6 +38,28 @@ pub struct ProjectMeta {
     pub locations: Vec<Location>,
 }
 
+/// The project fields the editor offers by key and label, in the order the project properties
+/// form, the cover page and the title block list them. Other keys are kept and shown after.
+pub const TITLE_FIELDS: &[(&str, &str)] = &[
+    ("customer", "Customer"),
+    ("description", "Description"),
+    ("project_number", "Project number"),
+    ("plant", "Plant"),
+    ("location", "Location"),
+    ("drawn_by", "Drawn by"),
+    ("checked_by", "Checked by"),
+    ("revision", "Revision"),
+    ("date", "Date"),
+];
+
+/// The label for a title-block field key: its [`TITLE_FIELDS`] label, or the key itself.
+pub fn title_field_label(key: &str) -> &str {
+    TITLE_FIELDS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map_or(key, |(_, label)| label)
+}
+
 /// A location of the project, such as a cabinet or a room.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
@@ -241,6 +263,10 @@ pub struct Page {
     /// so its symbols do not count as the device's drawings in `check`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overview: bool,
+    /// The project's cover page: its drawing area shows the project's name and fields (from
+    /// [`ProjectMeta`]), so editing them once updates the cover and every title block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cover: bool,
 }
 
 /// A raster picture under a page: a JPEG or PNG file in the project folder, stretched over a
@@ -283,6 +309,7 @@ impl Page {
             graphics: Vec::new(),
             underlay: None,
             overview: false,
+            cover: false,
         }
     }
 
@@ -350,6 +377,11 @@ impl Project {
     }
 
     /// Sort pages by their display number, comparing numeric parts as numbers.
+    /// The index of the cover page, if the project has one (the first page marked as cover).
+    pub fn cover_page(&self) -> Option<usize> {
+        self.pages.iter().position(|p| p.cover)
+    }
+
     pub fn sort_pages(&mut self) {
         self.pages.sort_by(|a, b| {
             natural_key(&a.number)

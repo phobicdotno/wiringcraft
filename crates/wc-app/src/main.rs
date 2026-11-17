@@ -30,15 +30,7 @@ use state::{Open, Selection, Tool};
 use wc_core::project::PageSize;
 
 /// Title-block fields offered in the project properties, in this order.
-const TITLE_FIELDS: &[(&str, &str)] = &[
-    ("customer", "Customer"),
-    ("project_number", "Project number"),
-    ("plant", "Plant"),
-    ("drawn_by", "Drawn by"),
-    ("checked_by", "Checked by"),
-    ("revision", "Revision"),
-    ("date", "Date"),
-];
+use wc_core::project::TITLE_FIELDS;
 
 enum Dialog {
     /// The folder field, and why the last Browse could not be used.
@@ -53,6 +45,13 @@ enum Dialog {
     ProjectProps {
         name: String,
         fields: Vec<(String, String)>,
+    },
+    /// The cover page form: changes show on the page as they are typed; `since` is the undo
+    /// mark from when it opened, so OK keeps them as one undo step and Cancel takes them back.
+    Cover {
+        name: String,
+        fields: Vec<(String, String)>,
+        since: usize,
     },
     PageProps {
         number: String,
@@ -478,19 +477,24 @@ impl App {
             }
             Action::DeletePage => self.dialog = Some(Dialog::DeletePage(page)),
             Action::ProjectProps => {
-                let block = &open.project.meta.title_block;
-                let mut fields: Vec<(String, String)> = TITLE_FIELDS
-                    .iter()
-                    .map(|(k, _)| ((*k).to_owned(), block.get(*k).cloned().unwrap_or_default()))
-                    .collect();
-                for (k, v) in block {
-                    if !TITLE_FIELDS.iter().any(|(f, _)| f == k) {
-                        fields.push((k.clone(), v.clone()));
-                    }
-                }
                 self.dialog = Some(Dialog::ProjectProps {
                     name: open.project.meta.name.clone(),
-                    fields,
+                    fields: form_fields(&open.project.meta.title_block),
+                });
+            }
+            Action::CoverPage => {
+                let i = open.cover_page();
+                if self.ed.page != i || self.ed.panel.is_some() {
+                    self.ed.panel = None;
+                    self.ed.page = i;
+                    self.ed.selection.clear();
+                    self.ed.wire = None;
+                }
+                self.ed.view.fit = true;
+                self.dialog = Some(Dialog::Cover {
+                    name: open.project.meta.name.clone(),
+                    fields: form_fields(&open.project.meta.title_block),
+                    since: open.undo_mark(),
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
@@ -643,6 +647,7 @@ impl App {
             Dialog::OpenPath(..) => "Open project",
             Dialog::NewProject { .. } => "New project",
             Dialog::ProjectProps { .. } => "Project properties",
+            Dialog::Cover { .. } => "Cover page",
             Dialog::PageProps { .. } => "Page properties",
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
@@ -665,7 +670,19 @@ impl App {
             .collapsible(false)
             .resizable(true)
             .min_width(if wide { (screen.width() * 0.75).min(1100.0) } else { 0.0 })
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            // The cover form sits at the side, so the page it changes stays in view.
+            .anchor(
+                if matches!(dialog, Dialog::Cover { .. }) {
+                    egui::Align2::RIGHT_TOP
+                } else {
+                    egui::Align2::CENTER_CENTER
+                },
+                if matches!(dialog, Dialog::Cover { .. }) {
+                    Vec2::new(-16.0, 96.0)
+                } else {
+                    Vec2::ZERO
+                },
+            )
             .show(ctx, |ui| match &mut dialog {
                 Dialog::SaveMacro {
                     clip,
@@ -903,8 +920,7 @@ impl App {
                             ui.add(egui::TextEdit::singleline(name).desired_width(300.0));
                             ui.end_row();
                             for (k, v) in fields.iter_mut() {
-                                let label = TITLE_FIELDS.iter().find(|(f, _)| f == k).map_or(k.as_str(), |(_, l)| l);
-                                ui.label(label);
+                                ui.label(wc_core::project::title_field_label(k));
                                 ui.add(egui::TextEdit::singleline(v).desired_width(300.0));
                                 ui.end_row();
                             }
@@ -930,6 +946,43 @@ impl App {
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::Cover { name, fields, since } => {
+                    let mut changed = false;
+                    egui::Grid::new("cover")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Project name");
+                            changed |= ui.add(egui::TextEdit::singleline(name).desired_width(300.0)).changed();
+                            ui.end_row();
+                            for (k, v) in fields.iter_mut() {
+                                ui.label(wc_core::project::title_field_label(k));
+                                changed |= ui.add(egui::TextEdit::singleline(v).desired_width(300.0)).changed();
+                                ui.end_row();
+                            }
+                        });
+                    if changed && let Some(o) = self.open.as_mut() {
+                        o.set_project_props_live(*since, name, fields);
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Shown on the cover and in the title block of every page as you type. \
+                             Add free text on the cover with the Text tool.",
+                        )
+                        .color(theme::Theme::of(ui.ctx()).faint),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            if let Some(o) = self.open.as_mut() {
+                                o.revert_live(*since);
+                            }
                             keep = false;
                         }
                     });
@@ -1611,6 +1664,21 @@ fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
                     }
                 });
         });
+}
+
+/// A project's title-block fields as form rows: the standard fields first (empty when not
+/// set), then any others the project has.
+fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = TITLE_FIELDS
+        .iter()
+        .map(|(k, _)| ((*k).to_owned(), block.get(*k).cloned().unwrap_or_default()))
+        .collect();
+    for (k, v) in block {
+        if !TITLE_FIELDS.iter().any(|(f, _)| f == k) {
+            fields.push((k.clone(), v.clone()));
+        }
+    }
+    fields
 }
 
 fn export_pdf(open: &Open) -> String {

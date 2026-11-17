@@ -453,3 +453,62 @@ fn the_frame_shows_row_letters_on_both_sides() {
     assert_eq!(count("H"), 2, "A2 has eight rows");
     assert_eq!(count("I"), 0);
 }
+
+#[test]
+fn the_cover_and_every_title_block_show_the_same_project_fields() {
+    let mut project = wc_core::Project::new("Pump station");
+    let tb = &mut project.meta.title_block;
+    tb.insert("customer".into(), "ACME Water".into());
+    tb.insert("description".into(), "Two duty pumps".into());
+    tb.insert("revision".into(), "B".into());
+    tb.insert("contract".into(), "K-77".into());
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    let schematic = Page::new("p2", "2", "Motors");
+    let texts = |page: &Page, project: &wc_core::Project| -> Vec<String> {
+        layout::frame_marks(project, page, 0, 2, "2026-11-17")
+            .into_iter()
+            .filter_map(|m| match m.shape {
+                Shape::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    };
+    let count = |v: &[String], t: &str| v.iter().filter(|x| *x == t).count();
+    let on_cover = texts(&cover, &project);
+    // Once in the cover's table, once in its title block.
+    assert_eq!(count(&on_cover, "ACME Water"), 2, "{on_cover:?}");
+    assert_eq!(
+        count(&on_cover, "Pump station"),
+        2,
+        "large on the cover and in the title block"
+    );
+    assert_eq!(count(&on_cover, "Two duty pumps"), 1);
+    assert_eq!(count(&on_cover, "K-77"), 1, "other fields are listed too");
+    assert_eq!(
+        count(&on_cover, "Project number"),
+        1,
+        "standard fields show even when empty"
+    );
+    assert_eq!(
+        count(&on_cover, "2026-11-17"),
+        2,
+        "the export date when the project has none"
+    );
+    let on_page = texts(&schematic, &project);
+    assert_eq!(
+        count(&on_page, "ACME Water"),
+        1,
+        "a normal page has only its title block"
+    );
+    assert_eq!(count(&on_page, "Two duty pumps"), 0);
+
+    // Edit the field once: the cover and every title block follow.
+    project
+        .meta
+        .title_block
+        .insert("customer".into(), "Nordic Water".into());
+    assert_eq!(count(&texts(&cover, &project), "Nordic Water"), 2);
+    assert_eq!(count(&texts(&schematic, &project), "Nordic Water"), 1);
+    assert_eq!(count(&texts(&cover, &project), "ACME Water"), 0);
+}

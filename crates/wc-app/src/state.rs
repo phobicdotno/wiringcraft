@@ -558,6 +558,8 @@ impl Open {
         copy.id = self.free_page_id();
         copy.number = self.next_page_number();
         copy.title = format!("{} (copy)", copy.title);
+        // A project has one cover page; its copy is an ordinary page.
+        copy.cover = false;
         let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
         for s in &mut copy.symbols {
             let Some(old) = s.tag.clone() else { continue };
@@ -617,11 +619,7 @@ impl Open {
         if name.is_empty() {
             return Err("The project name cannot be empty.".into());
         }
-        let block: BTreeMap<String, String> = fields
-            .iter()
-            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-            .filter(|(k, v)| !k.is_empty() && !v.is_empty())
-            .collect();
+        let block = title_block_of(fields);
         if self.project.meta.name == name && self.project.meta.title_block == block {
             return Ok(());
         }
@@ -629,6 +627,68 @@ impl Open {
         self.project.meta.name = name.to_owned();
         self.project.meta.title_block = block;
         Ok(())
+    }
+
+    /// The cover page's index. A project without one gets one: an empty first page titled
+    /// "Cover" (as new projects started) is marked as the cover, otherwise a new cover page
+    /// goes in front of the others. Creating or marking it is one undo step.
+    pub fn cover_page(&mut self) -> usize {
+        if let Some(i) = self.project.cover_page() {
+            return i;
+        }
+        self.checkpoint();
+        if let Some(first) = self.project.pages.first_mut()
+            && first.title.trim().eq_ignore_ascii_case("cover")
+            && first.symbols.is_empty()
+            && first.wires.is_empty()
+        {
+            first.cover = true;
+            return 0;
+        }
+        let id = self.free_page_id();
+        let used = |n: &str| self.project.pages.iter().any(|p| p.number == n);
+        let number = ["0", "0.1", "0.01"]
+            .into_iter()
+            .find(|n| !used(n))
+            .map_or_else(|| self.next_page_number(), str::to_owned);
+        let mut page = Page::new(id.clone(), number, "Cover");
+        page.cover = true;
+        if let Some(first) = self.project.pages.first() {
+            page.size = first.size;
+        }
+        self.project.pages.push(page);
+        self.project.sort_pages();
+        self.index_of(&id)
+    }
+
+    /// Set the project name and fields while a form is open, so the page shows each change at
+    /// once. Every change made since `since` (an [`Open::undo_mark`] taken when the form opened)
+    /// stays one undo step. An empty name is not applied (it is being typed).
+    pub fn set_project_props_live(&mut self, since: usize, name: &str, fields: &[(String, String)]) {
+        let name = name.trim();
+        let block = title_block_of(fields);
+        let name_changes = !name.is_empty() && self.project.meta.name != name;
+        if !name_changes && self.project.meta.title_block == block {
+            return;
+        }
+        if self.undo_mark() == since {
+            self.checkpoint();
+        } else {
+            self.redo.clear();
+            self.dirty = true;
+        }
+        if name_changes {
+            self.project.meta.name = name.to_owned();
+        }
+        self.project.meta.title_block = block;
+    }
+
+    /// Take back what [`Open::set_project_props_live`] changed since `since` (the form was
+    /// cancelled).
+    pub fn revert_live(&mut self, since: usize) {
+        if self.undo_mark() > since && self.undo() {
+            self.redo.clear();
+        }
     }
 
     /// Put a wire into a cable as a core, or take it out (`None`). The cable device is created
@@ -729,6 +789,15 @@ impl Open {
 
 /// The name review comments are signed with: `WIRINGCRAFT_USER`, then git's `user.name`, then
 /// the login name.
+/// Title-block fields from a form: trimmed, with empty keys and values dropped.
+fn title_block_of(fields: &[(String, String)]) -> BTreeMap<String, String> {
+    fields
+        .iter()
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .collect()
+}
+
 pub fn author_name() -> String {
     std::env::var("WIRINGCRAFT_USER")
         .ok()
@@ -775,6 +844,68 @@ pub(crate) mod tests {
         store::save(&dir, &p).unwrap();
         let open = Open::load(&dir).unwrap();
         (tmp, open)
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    #[test]
+    fn the_cover_form_shows_changes_as_typed_and_keeps_them_as_one_undo_step() {
+        let (_tmp, mut o) = project();
+        assert_eq!(o.cover_page(), 0, "a new project's first page is its cover");
+        assert!(!o.can_undo(), "nothing to create");
+        let since = o.undo_mark();
+        for typed in ["A", "AC", "ACME"] {
+            o.set_project_props_live(since, "Test", &fields(&[("customer", typed)]));
+            assert_eq!(o.project.meta.title_block["customer"], typed, "shown at once");
+        }
+        o.set_project_props_live(since, "", &fields(&[("customer", "ACME")]));
+        assert_eq!(o.project.meta.name, "Test", "an empty name is still being typed");
+        o.set_project_props_live(since, "Pumps", &fields(&[("customer", "ACME"), ("revision", "")]));
+        assert_eq!(o.project.meta.name, "Pumps");
+        assert_eq!(o.project.meta.title_block.len(), 1, "empty fields are dropped");
+        assert!(o.undo());
+        assert_eq!(o.project.meta.name, "Test");
+        assert!(
+            o.project.meta.title_block.is_empty(),
+            "one undo takes the whole form back"
+        );
+        assert!(!o.can_undo());
+
+        // Cancel takes the typed changes back and leaves nothing to redo.
+        let since = o.undo_mark();
+        o.set_project_props_live(since, "Test", &fields(&[("customer", "Other")]));
+        o.revert_live(since);
+        assert!(o.project.meta.title_block.is_empty());
+        assert!(!o.can_redo());
+        o.revert_live(since);
+        assert!(!o.can_undo(), "nothing changed, nothing undone");
+    }
+
+    #[test]
+    fn a_project_without_a_cover_gets_one_in_front() {
+        let (_tmp, mut o) = project();
+        o.project.pages[0].cover = false;
+        o.project.pages[0].title = "Overview".into();
+        let i = o.cover_page();
+        let cover = &o.project.pages[i];
+        assert!(cover.cover);
+        assert_eq!((i, cover.number.as_str(), cover.title.as_str()), (0, "0", "Cover"));
+        assert_eq!(o.project.pages.len(), 3);
+        assert_eq!(o.cover_page(), 0, "found again, not made twice");
+        assert!(o.undo());
+        assert_eq!(o.project.pages.len(), 2, "making it is one undo step");
+
+        // An empty first page titled "Cover" (how projects started) becomes the cover.
+        o.project.pages[0].title = "Cover".into();
+        assert_eq!(o.cover_page(), 0);
+        assert_eq!(o.project.pages.len(), 2);
+        assert!(o.project.pages[0].cover);
+
+        // Its copy is a normal page: a project keeps one cover.
+        let copy = o.duplicate_page(0).unwrap();
+        assert!(!o.project.pages[copy].cover);
     }
 
     #[test]
