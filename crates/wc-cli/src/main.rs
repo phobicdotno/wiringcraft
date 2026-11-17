@@ -2187,8 +2187,16 @@ fn project_copy(dir: &Path, id: &str) -> Res<Option<wc_core::Symbol>> {
         .join(store::VENDOR_DIR)
         .join(ItemKind::Symbol.dir())
         .join(format!("{id}.json"));
-    if !path.is_file() {
-        return Ok(None);
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(format!("project copy of symbol {id} is not a file: {}", path.display())),
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(x) => {
+            return Err(format!(
+                "project copy of symbol {id} cannot be read: {}: {x}",
+                path.display()
+            ));
+        }
     }
     store::read_vendored_symbol(dir, id)
         .map(Some)
@@ -2359,9 +2367,15 @@ mod tests {
         let folder = dir.join(store::VENDOR_DIR).join(ItemKind::Symbol.dir());
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("wc.coil.json"), "{ not json").unwrap();
+        let reason = store::read_vendored_symbol(dir, "wc.coil").unwrap_err().to_string();
+        let why = project_copy(dir, "wc.coil").unwrap_err();
+        assert_eq!(why, format!("project copy of symbol wc.coil cannot be read: {reason}"));
+        // A folder where the copy should be is not taken for a missing copy.
+        std::fs::remove_file(folder.join("wc.coil.json")).unwrap();
+        std::fs::create_dir(folder.join("wc.coil.json")).unwrap();
         let why = project_copy(dir, "wc.coil").unwrap_err();
         assert!(
-            why.starts_with("project copy of symbol wc.coil cannot be read: "),
+            why.starts_with("project copy of symbol wc.coil is not a file: "),
             "{why}"
         );
     }
