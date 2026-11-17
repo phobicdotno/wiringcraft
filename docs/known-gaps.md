@@ -37,7 +37,6 @@ These branches can be deleted once their pull requests are merged.
 
 | Gap | Where it shows | Todo |
 |---|---|---|
-| QElectroTech `.elmt` elements are not read | `docs/manufacturer-data.md` | #91 |
 | BMEcat (and ECLASS features) part data is not read | `docs/manufacturer-data.md` | #92 |
 | EDZ exchange files (EPLAN macros and parts) are not read | `docs/manufacturer-data.md` | #93 (parts first; macros follow) |
 | DXF: ELLIPSE, SPLINE and HATCH are skipped | `crates/wc-import/src/dxf.rs`, `docs/manufacturer-data.md` | #95 |

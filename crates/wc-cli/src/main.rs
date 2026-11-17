@@ -361,6 +361,25 @@ enum ImportCmd {
         #[arg(long, default_value = "")]
         category: String,
     },
+    /// QElectroTech elements (`.elmt`), one symbol per file. Ids are `<prefix>.<file name>`;
+    /// the first terminal becomes the origin.
+    SymbolQet {
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        #[arg(long)]
+        lib: PathBuf,
+        /// Id prefix.
+        #[arg(long, default_value = "qet")]
+        prefix: String,
+        /// Millimetres per QElectroTech pixel; 0.5 puts its 10 px grid on a 5 mm grid.
+        #[arg(long, default_value_t = wc_import::qet::DEFAULT_SCALE)]
+        scale: f64,
+        #[arg(long, default_value = "")]
+        category: String,
+        /// Letter code for new devices, e.g. `K`.
+        #[arg(long, default_value = "")]
+        letter_code: String,
+    },
     /// Parts from a CSV or semicolon-separated export (Excel "Save as CSV").
     PartsCsv {
         file: PathBuf,
@@ -1207,6 +1226,22 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 );
             }
         }
+        ImportCmd::SymbolQet {
+            files,
+            lib,
+            prefix,
+            scale,
+            category,
+            letter_code,
+        } => {
+            let (written, failed) = import_qet(&files, &lib, &prefix, scale, &category, &letter_code)?;
+            if failed > 0 {
+                return Err(format!(
+                    "{failed} of {} element(s) could not be imported",
+                    written + failed
+                ));
+            }
+        }
         ImportCmd::PlcCsv { file } => {
             let mut p = load(dir)?;
             let bytes = std::fs::read(&file).map_err(e)?;
@@ -1815,6 +1850,61 @@ fn export_wago_marking(dir: &Path, out: &Path, kinds: &[String]) -> Res<Exported
     })
 }
 
+/// Import QElectroTech elements into a symbol library folder, one symbol per file. A file that
+/// cannot be read is reported and skipped. Returns how many were written and how many failed.
+fn import_qet(
+    files: &[PathBuf],
+    lib: &Path,
+    prefix: &str,
+    scale: f64,
+    category: &str,
+    letter_code: &str,
+) -> Res<(usize, usize)> {
+    let (mut written, mut failed) = (0, 0);
+    for file in files {
+        let stem: String = file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let id = format!("{}.{stem}", prefix.trim_end_matches('.'));
+        let read = std::fs::read_to_string(file)
+            .map_err(e)
+            .and_then(|text| wc_import::qet::element(&text, &id, scale).map_err(e));
+        let (mut imp, warnings) = match read {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("error: {}: {err}", file.display());
+                failed += 1;
+                continue;
+            }
+        };
+        for w in warnings {
+            eprintln!("warning: {}: {w}", file.display());
+        }
+        imp.symbol.category = category.to_owned();
+        imp.symbol.letter_code = letter_code.to_owned();
+        let path = wc_library::write_symbol(lib, &imp.symbol).map_err(e)?;
+        println!(
+            "{} -> {} ({} pins, {} shapes)",
+            imp.qet_name,
+            path.display(),
+            imp.symbol.pins.len(),
+            imp.symbol.graphics.len()
+        );
+        written += 1;
+    }
+    Ok((written, failed))
+}
+
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
     p.devices
         .values()
@@ -2015,6 +2105,39 @@ fn file_stem(number: &str, id: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qet_elements_land_in_the_library_and_bad_files_are_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = tmp.path().join("Lamp Red.elmt");
+        std::fs::write(
+            &good,
+            r#"<definition type="element"><names><name lang="en">Lamp</name></names><description>
+<circle x="-5" y="-5" diameter="10"/><terminal x="-10" y="0" orientation="w"/><terminal x="10" y="0" orientation="e"/>
+</description></definition>"#,
+        )
+        .unwrap();
+        let bad = tmp.path().join("bad.elmt");
+        std::fs::write(&bad, "<svg/>").unwrap();
+        let lib = tmp.path().join("lib");
+        let (written, failed) = import_qet(&[good, bad], &lib, "qet.", 0.5, "Lamps", "P").unwrap();
+        assert_eq!((written, failed), (1, 1));
+        let json = std::fs::read_to_string(lib.join("symbols").join("qet.lamp_red.json")).unwrap();
+        let s: wc_core::Symbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (s.name.as_str(), s.category.as_str(), s.letter_code.as_str()),
+            ("Lamp", "Lamps", "P")
+        );
+        assert_eq!(s.pins.len(), 2);
+
+        let cli =
+            Cli::try_parse_from(["wiringcraft", "import", "symbol-qet", "a.elmt", "b.elmt", "--lib", "l"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Import(ImportCmd::SymbolQet { ref files, scale, .. }) if files.len() == 2 && scale == 0.5
+        ));
+        assert!(Cli::try_parse_from(["wiringcraft", "import", "symbol-qet", "--lib", "l"]).is_err());
+    }
 
     #[test]
     fn wago_marking_kind_option_splits_on_commas_and_repeats() {
