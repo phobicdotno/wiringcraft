@@ -11,7 +11,7 @@ CREATE TABLE tew_file (fil_id INTEGER, fil_orderno INTEGER, fil_filetype INTEGER
 CREATE TABLE tew_folder (fol_id INTEGER, fol_name TEXT);
 CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0 TEXT);
 CREATE TABLE tew_component (com_id INTEGER, com_tag TEXT, com_tagpath TEXT, com_type INTEGER,
-  com_com_id INTEGER, com_tagorderno INTEGER);
+  com_com_id INTEGER, com_tagorderno INTEGER, com_fun_id INTEGER, com_loc_id INTEGER, com_parenttagpath TEXT);
 CREATE TABLE tew_buildofmaterial (bom_id INTEGER, bom_objectid INTEGER, bom_orderno INTEGER, bom_reference TEXT, bom_manufacturer TEXT);
 CREATE TABLE tew_symbol (sym_id INTEGER, sym_fil_id INTEGER, sym_com_id INTEGER, sym_blockname TEXT, sym_posx REAL, sym_posy REAL,
   sym_angle REAL, sym_scalex REAL, sym_scaley REAL, sym_posendx REAL, sym_posendy REAL);
@@ -887,7 +887,7 @@ fn sample_with_strip() -> Connection {
     let c = sample();
     c.execute_batch(
         "
-INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1 1', 4, 200, 2), (202, '2', '-X1 2', 4, 200, 1);
+INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1 1', 4, 200, 2), (202, '2', '-X1 2', 4, 200, 1);
 INSERT INTO tew_symbol VALUES (20, 10, 201, 'Terminal', 150, 200, 0, 1, 1, NULL, NULL),
   (21, 10, 202, 'Terminal', 170, 200, 0, 1, 1, NULL, NULL);
 INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5), (21, 0, 0, 0, 5), (21, 0, 1, 0, -5);
@@ -968,7 +968,7 @@ fn terminal_strips_come_in_with_their_terminals_and_wire_ends_are_checked() {
 #[test]
 fn a_terminal_without_a_strip_keeps_its_own_tag() {
     let c = sample();
-    c.execute_batch("INSERT INTO tew_component VALUES (300, '5', '-X9-5', 4, NULL, 0);")
+    c.execute_batch("INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (300, '5', '-X9-5', 4, NULL, 0);")
         .unwrap();
     let (built, _, report) = build(&read(&c).unwrap(), None);
     assert!(built.devices.contains_key(&DeviceTag::parse("-X9.5").unwrap()));
@@ -982,7 +982,7 @@ fn imported_terminals_show_in_the_terminal_plan_per_strip() {
     let c = sample_with_strip();
     // A terminal whose number has a dot, and a wire record with only one end.
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (203, '3.1', '-X1-3.1', 4, 200, 3), (204, '1+2', '-X1-1+2', 4, 200, 4);
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (203, '3.1', '-X1-3.1', 4, 200, 3), (204, '1+2', '-X1-1+2', 4, 200, 4);
          INSERT INTO tew_wire VALUES (84, NULL, -1, '', 60, 0, NULL, NULL);",
     )
     .unwrap();
@@ -1022,7 +1022,7 @@ fn a_wire_end_on_a_repeated_pin_name_is_found_on_the_right_pin() {
     // A strip terminal whose two points are both called `1`: the lower one becomes `1#2`.
     // The line reaches only the lower one, and the wire record names that one.
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1-1', 4, 200, 1);
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1-1', 4, 200, 1);
          INSERT INTO tew_symbol VALUES (20, 10, 201, 'Terminal', 150, 200, 0, 1, 1, NULL, NULL);
          INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5);
          INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0);
@@ -1043,7 +1043,7 @@ fn a_wire_end_on_a_repeated_pin_name_is_found_on_the_right_pin() {
 fn terminal_numbers_that_sort_alike_count_the_strip_as_out_of_order() {
     let c = sample();
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '01', '-X1-01', 4, 200, 1),
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '01', '-X1-01', 4, 200, 1),
            (202, '1', '-X1-1', 4, 200, 2), (210, 'X2', '-X2', 3, NULL, 0), (211, '1', '-X2-1', 4, 210, 1),
            (212, '2', '-X2-2', 4, 210, 2), (213, '10', '-X2-10', 4, 210, 3);",
     )
@@ -1267,4 +1267,63 @@ fn a_blank_english_translation_does_not_hide_another_language() {
     let info = project_info(&c, "1").unwrap().unwrap();
     assert_eq!(info.description, "Beschreibung");
     assert!(info.warnings.is_empty(), "{:?}", info.warnings);
+}
+
+/// A database in the space form: function F1, locations L1 and L1 L11, and components whose
+/// tag paths have no signs, as some SolidWorks Electrical projects store them.
+fn space_form() -> Connection {
+    let c = sample();
+    c.execute_batch(
+        "CREATE TABLE tew_function (fun_id INTEGER, fun_tagpath TEXT);
+         CREATE TABLE tew_location (loc_id INTEGER, loc_tagpath TEXT);
+         INSERT INTO tew_function VALUES (2, 'F1');
+         INSERT INTO tew_location VALUES (3, 'L1'), (2450, 'L1 L11');
+         INSERT INTO tew_component VALUES (500, 'CR1', 'F1 L1 L11 CR1', -1, NULL, 0, 2, 2450, 'CR1'),
+           (501, 'TB1', 'F1 L1 L11 TB1', 3, NULL, 0, 2, 2450, 'TB1'),
+           (502, '4', 'F1 L1 L11 TB1 4', 4, 501, 4, 2, 2450, 'TB1 4'),
+           (503, 'M2', 'F1 L1 M2', -1, NULL, 0, 2, 3, 'M2');",
+    )
+    .unwrap();
+    c
+}
+
+#[test]
+fn tag_paths_stored_with_spaces_keep_function_and_location() {
+    let p = read(&space_form()).unwrap();
+    assert_eq!(p.components[&500].tag, "=F1+L1+L11-CR1");
+    assert_eq!(p.components[&503].tag, "=F1+L1-M2");
+    assert_eq!(p.components[&100].tag, "=F1+L1+L2-K1", "a signed path stays as it is");
+    assert_eq!(
+        p.components[&101].tag, "F1",
+        "a bare tag without function or location stays"
+    );
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.starts_with("4 component tag path(s) are stored with spaces")),
+        "{:?}",
+        p.warnings
+    );
+    let (built, _, _) = build(&p, None);
+    // Not every device has =F1 (the sample's F1 has none), so the function stays in the tags.
+    for t in ["=F1+L1.L11-CR1", "=F1+L1-M2", "=F1+L1.L11-TB1", "=F1+L1.L11-TB1.4"] {
+        assert!(
+            built.devices.contains_key(&DeviceTag::parse(t).unwrap()),
+            "{t}: {:?}",
+            built.devices.keys()
+        );
+    }
+    let paths: Vec<&str> = built.locations.iter().map(|l| l.path.as_str()).collect();
+    assert_eq!(paths, ["L1", "L1.L11"], "location paths in the space form");
+}
+
+#[test]
+fn signed_paths_and_space_paths_compose_alike() {
+    assert_eq!(signed("L1 L11", '+'), "+L1+L11");
+    assert_eq!(signed("+L1+L11", '+'), "+L1+L11");
+    assert_eq!(signed("  ", '+'), "");
+    assert_eq!(composed_path(Some("F1"), Some("L1 L11"), "TB1 4"), "=F1+L1+L11-TB1-4");
+    assert_eq!(composed_path(None, None, "K1"), "-K1");
+    assert_eq!(location_path("L1 L11"), "L1.L11");
+    assert_eq!(location_path("+L1+L11"), "L1.L11");
 }
