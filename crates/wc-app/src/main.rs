@@ -933,10 +933,12 @@ impl App {
                     let r = ui
                         .horizontal(|ui| {
                             let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(340.0));
-                            if ui.button("Browse…").clicked()
-                                && let Some(d) = pick_folder("Open project", &path.text)
-                            {
-                                *error = path.pick(d).err();
+                            if ui.button("Browse…").clicked() {
+                                match pick_folder("Open project", &path.text) {
+                                    Picked::Folder(d) => *error = path.pick(d).err(),
+                                    Picked::Failed(e) => *error = Some(e),
+                                    Picked::Cancelled => {}
+                                }
                             }
                             r
                         })
@@ -951,13 +953,17 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Open").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
-                            let p = path.path();
-                            then = Some(Box::new(move |app: &mut App| {
-                                let mut prefs = std::mem::take(&mut app.prefs);
-                                app.open_dir(&p, &mut prefs);
-                                app.prefs = prefs;
-                            }));
-                            keep = false;
+                            match path.path() {
+                                Ok(p) => {
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        let mut prefs = std::mem::take(&mut app.prefs);
+                                        app.open_dir(&p, &mut prefs);
+                                        app.prefs = prefs;
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
                         }
                         if ui.button("Cancel").clicked() {
                             keep = false;
@@ -979,16 +985,18 @@ impl App {
                             ui.label("Location");
                             ui.horizontal(|ui| {
                                 ui.add(egui::TextEdit::singleline(&mut location.text).desired_width(300.0));
-                                if ui.button("Browse…").clicked()
-                                    && let Some(d) = pick_folder("Where to create the project", &location.text)
-                                {
-                                    *error = location.pick(d).err();
+                                if ui.button("Browse…").clicked() {
+                                    match pick_folder("Where to create the project", &location.text) {
+                                        Picked::Folder(d) => *error = location.pick(d).err(),
+                                        Picked::Failed(e) => *error = Some(e),
+                                        Picked::Cancelled => {}
+                                    }
                                 }
                             });
                             ui.end_row();
                         });
                     // The folder follows the name and the location, whichever is typed last.
-                    let target = prefs::new_project_dir(&location.path(), name);
+                    let target = location.path().and_then(|l| prefs::new_project_dir(&l, name));
                     let t = theme::Theme::of(ui.ctx());
                     if let Some(e) = error {
                         ui.label(RichText::new(e.as_str()).color(t.error));
@@ -1646,24 +1654,58 @@ fn size_label(s: PageSize) -> &'static str {
     }
 }
 
-/// The system's folder picker, starting in `start` (or its nearest existing parent). `None` when
-/// the user cancels. Blocks the window while open, like any modal dialog.
-fn pick_folder(title: &str, start: &str) -> Option<PathBuf> {
+/// What the folder picker gave.
+#[derive(Debug, Clone, PartialEq)]
+enum Picked {
+    Folder(PathBuf),
+    Cancelled,
+    /// The picker could not open; the reason is for the dialog.
+    Failed(String),
+}
+
+/// The system's folder picker, starting in `start` (or its nearest existing parent). Blocks the
+/// window while open, like any modal dialog.
+fn pick_folder(title: &str, start: &str) -> Picked {
+    // On Linux the picker is the desktop portal, reached over the session bus.
+    let bus = !cfg!(target_os = "linux") || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
+    if !bus {
+        return picker_outcome(None, std::time::Duration::ZERO, false);
+    }
     let mut dialog = rfd::FileDialog::new().set_title(title);
     if let Some(d) = picker_start(start) {
         dialog = dialog.set_directory(d);
     }
-    dialog.pick_folder()
+    let shown = std::time::Instant::now();
+    let r = dialog.pick_folder();
+    picker_outcome(r, shown.elapsed(), true)
+}
+
+/// The picker reports a failure the same way as Cancel, so an answer quicker than anyone can
+/// click means it never showed.
+fn picker_outcome(r: Option<PathBuf>, open_for: std::time::Duration, bus: bool) -> Picked {
+    const NO_PORTAL: &str = "The folder picker could not open. On Linux it needs a desktop portal \
+                             (xdg-desktop-portal) in a desktop session. Type the folder instead.";
+    match r {
+        Some(d) => Picked::Folder(d),
+        None if !bus || open_for < std::time::Duration::from_millis(150) => {
+            applog::warn(&format!(
+                "folder picker: no answer after {open_for:?}; taken as not opened"
+            ));
+            Picked::Failed(NO_PORTAL.to_owned())
+        }
+        None => Picked::Cancelled,
+    }
 }
 
 /// Where the folder picker opens for what is typed in a dialog: the projects folder for a blank
 /// field, otherwise the same rule as the dialogs (a bare name is inside the projects folder),
 /// then the nearest folder of that path that exists.
 fn picker_start(typed: &str) -> Option<PathBuf> {
+    // Text that cannot be used yet (a drive-relative path) opens the projects folder.
     let start = if typed.trim().is_empty() {
         prefs::projects_dir()
     } else {
-        prefs::project_path(typed)
+        prefs::project_path(typed).unwrap_or_else(|_| prefs::projects_dir())
     };
     start
         .ancestors()
@@ -2481,6 +2523,26 @@ mod icon_tests {
 #[allow(clippy::unwrap_used)]
 mod picker_tests {
     use super::*;
+
+    #[test]
+    fn a_picker_that_never_showed_says_so_instead_of_doing_nothing() {
+        use std::time::Duration;
+        let d = PathBuf::from("/x");
+        assert_eq!(picker_outcome(Some(d.clone()), Duration::ZERO, true), Picked::Folder(d));
+        assert_eq!(picker_outcome(None, Duration::from_secs(2), true), Picked::Cancelled);
+        assert!(matches!(
+            picker_outcome(None, Duration::from_millis(5), true),
+            Picked::Failed(e) if e.contains("desktop portal")
+        ));
+        assert!(matches!(
+            picker_outcome(None, Duration::from_secs(2), false),
+            Picked::Failed(_)
+        ));
+        // Typed text the dialogs refuse opens the picker in the projects folder.
+        if cfg!(windows) {
+            assert_eq!(picker_start("C:foo"), picker_start(""));
+        }
+    }
 
     #[test]
     fn the_picker_opens_where_the_dialog_would_put_the_project() {

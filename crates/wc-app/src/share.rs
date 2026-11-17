@@ -797,8 +797,9 @@ impl Share {
             });
         if join {
             let (addr, name, email) = (form.addr.clone(), form.name.clone(), form.email.clone());
-            let folder = crate::prefs::project_path(&form.folder);
-            match self.join(&addr, &name, &email, folder) {
+            let joined =
+                crate::prefs::project_path(&form.folder).and_then(|folder| self.join(&addr, &name, &email, folder));
+            match joined {
                 Ok(()) => {
                     if let Some(f) = self.form.as_mut() {
                         f.browser = None;
