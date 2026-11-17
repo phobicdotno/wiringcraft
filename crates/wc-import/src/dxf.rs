@@ -1392,7 +1392,7 @@ mod tests {
             &[sq(0.0, 0.0, 10.0, 10.0), sq(3.0, 3.0, 9.0, 9.0), sq(9.3, 9.3, 9.6, 9.6)],
             0,
         )
-        .expect("small enough");
+        .unwrap_or_default();
         assert_eq!(out.len(), 1);
         let want = 100.0 - 36.0 - 0.09;
         assert!((filled_area(&out[0]) - want).abs() < 1e-9, "{}", filled_area(&out[0]));
@@ -1422,7 +1422,7 @@ mod tests {
             (4.9, 10.0),
             (0.0, 10.0),
         ];
-        let out = with_holes(&[slotted.clone(), sq(4.6, 5.9, 4.8, 6.1)], 0).expect("small enough");
+        let out = with_holes(&[slotted.clone(), sq(4.6, 5.9, 4.8, 6.1)], 0).unwrap_or_default();
         let want = filled_area(&slotted) - 0.04;
         assert!((filled_area(&out[0]) - want).abs() < 1e-9);
         let lp = &out[0];
@@ -1516,7 +1516,7 @@ mod tests {
         let loops = || vec![sq(0.0, 10.0), sq(2.0, 8.0), sq(4.0, 6.0)];
         let area = |style| {
             with_holes(&loops(), style)
-                .expect("small enough")
+                .unwrap_or_default()
                 .iter()
                 .map(|l| area2(l).abs() / 2.0)
                 .sum::<f64>()
@@ -1599,7 +1599,7 @@ mod tests {
         let c = f64::from(1u32 << 30);
         let sq = |a: f64, b: f64| vec![(c + a, c + a), (c + b, c + a), (c + b, c + b), (c + a, c + b)];
         assert!((area2(&sq(0.0, 4.0)) - 32.0).abs() < 1e-6);
-        let out = with_holes(&[sq(0.0, 4.0), sq(1.0, 2.0)], 0).expect("small enough");
+        let out = with_holes(&[sq(0.0, 4.0), sq(1.0, 2.0)], 0).unwrap_or_default();
         assert_eq!(out.len(), 1);
         assert!((area2(&out[0]) / 2.0 - 15.0).abs() < 1e-6, "{}", area2(&out[0]) / 2.0);
     }
@@ -1610,12 +1610,13 @@ mod tests {
         let h = std::f64::consts::FRAC_1_SQRT_2;
         let ctrl = [(1.0, 0.0, 1.0), (h, h, h), (0.0, 1.0, 1.0)];
         let knots = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-        let mid = de_boor(&ctrl, &knots, 2, 0.5).expect("a point");
+        let mid = de_boor(&ctrl, &knots, 2, 0.5).unwrap_or((f64::NAN, f64::NAN));
         assert!((mid.0 - h).abs() < 1e-9 && (mid.1 - h).abs() < 1e-9, "{mid:?}");
         // And bspline_points applies the weights it is given: every sample on the unit circle.
-        let pts = bspline_points(&[(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], &knots, &[1.0, h, 1.0], 2).expect("a curve");
+        let pts = bspline_points(&[(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], &knots, &[1.0, h, 1.0], 2).unwrap_or_default();
+        assert!(!pts.is_empty());
         assert!(pts.iter().all(|p| (p.0.hypot(p.1) - 1.0).abs() < 1e-9));
-        let plain = bspline_points(&[(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], &knots, &[], 2).expect("a curve");
+        let plain = bspline_points(&[(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], &knots, &[], 2).unwrap_or_default();
         assert!(
             plain.iter().any(|p| (p.0.hypot(p.1) - 1.0).abs() > 0.01),
             "unweighted is no circle"
