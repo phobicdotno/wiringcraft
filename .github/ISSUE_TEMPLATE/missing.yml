@@ -10,6 +10,11 @@ body:
     validations:
       required: true
   - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Paste a screenshot of WiringCraft here (Ctrl+V, or Cmd+V on a Mac), or drag picture files in. Leave out anything private.
+  - type: textarea
     id: done
     attributes:
       label: Done when

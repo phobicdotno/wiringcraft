@@ -3172,6 +3172,8 @@ dependencies = [
 name = "wc-app"
 version = "0.1.0"
 dependencies = [
+ "arboard",
+ "base64",
  "eframe",
  "image",
  "serde",
