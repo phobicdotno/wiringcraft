@@ -20,13 +20,14 @@ From `crates/wc-import`:
 | SVG | `svg` | Graphics. |
 | PDF (vector) | `pdf` | Traced drawings. |
 | CSV | `csv` | Parts lists and PLC address lists. |
+| BMEcat catalogues (XML, 1.2 and 2005) | `bmecat` | `wiringcraft import parts-bmecat <file> --lib <folder>`: one part per product/article with order number, maker (or the catalogue's supplier), description in the catalogue's language, and as properties the maker's part number, GTIN, ECLASS (or other) class and every feature with its unit. Products marked for deletion are skipped; prices, pictures and other media are not read. |
 | AutomationML (IEC 62714, CAEX XML) | `aml` | Devices, properties, connection points, links. |
 | EPLAN P8 projects (`.elk` + `.edb`) | `eplan` | Projects, not the EDZ macro/part exchange files. |
 | SolidWorks Electrical archives (`.tewzip`) | `swe` | Projects. Content Portal parts also arrive as `.tewzip`; library import is #62. |
 | Plain zip | `archive` | Opens the container and imports PDF, DXF, AutomationML and CSV entries inside. Other entries (including `.kicad_sym`) are listed, not imported. |
 
 Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **DWG**, **STEP**
-(3D), **BMEcat** and **ECLASS** part data.
+(3D), ECLASS data outside a BMEcat catalogue.
 
 ## Portals that serve many manufacturers
 
@@ -43,7 +44,7 @@ Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **
 | Manufacturer | Product area | Where | Formats | Login | Terms | WiringCraft today |
 |---|---|---|---|---|---|---|
 | **WAGO** | Terminal blocks, I/O, interface | [Product pages, Downloads / CAE data](https://www.wago.com/global/digitization/digital-engineering/eplan); EPLAN Data Portal; [other CAE tools](https://www.wago.com/global/digitization/digital-engineering/engineering-data) | EPLAN Data Standard macros (11,000+ products, logic macros, 3D); WSCAD, StriePlan, AutoCAD Electrical, SEE Electrical, HagerCAD; 2D/3D via CADENAS | Product pages: not stated; Data Portal: EPLAN ID | Not stated | 2D DXF via CADENAS yes; EPLAN no. No SolidWorks Electrical catalogue confirmed. |
-| **Phoenix Contact** | Terminals, connectors, power, I/O | [Product data for engineering](https://phoenixcontact.com/en-gb/product-data-for-your-engineering-process) | EPLAN P8 file generator and EPLAN Data Portal; AutoCAD Electrical, SEE Electrical, WSCAD, Zuken, Aucotec, AmpereSoft, SDProget, NX Electrical; BMEcat XML; ECLASS | Not stated | Not stated | No direct path; BMEcat is a candidate |
+| **Phoenix Contact** | Terminals, connectors, power, I/O | [Product data for engineering](https://phoenixcontact.com/en-gb/product-data-for-your-engineering-process) | EPLAN P8 file generator and EPLAN Data Portal; AutoCAD Electrical, SEE Electrical, WSCAD, Zuken, Aucotec, AmpereSoft, SDProget, NX Electrical; BMEcat XML; ECLASS | Not stated | Not stated | BMEcat parts: yes |
 | **Siemens** | PLCs, drives, switchgear | Industry Support product page, **CAx data** tab, CAx Download Manager ([how-to](https://industrialmonitordirect.com/blogs/knowledgebase/download-siemens-eplan-edz-macros-via-cax-data-manager)) | EPLAN P8 macros (EDZ); 2D/3D CAD (DXF, STEP) without connection points | Not stated; the download tool needs Java | Siemens terms | DXF yes (graphics only) |
 | **Schneider Electric** | Switchgear, drives, PLCs | se.com document downloads (e.g. [EPLAN EDZ](https://www.se.com/hk/en/download/document/EPLAN_EDZ_Spacial_SM/)); EPLAN Data Portal | EDZ, EPLAN macro templates; DXF/DWG per product | Not stated | Schneider terms | DXF yes |
 | **Eaton** | Switchgear, motor control | [ECAD / MCAD / EPLAN tools](https://www.eaton.com/us/en-us/support/tools/ecad-mcad-eplan-.html): eCAD Data Portal and mCAD Data Portal on PARTcommunity; EPLAN Data Portal (30,000+ products) | eCAD macros in native formats plus neutral DXF/DWG; 2D/3D in 80+ formats | Personal eCAD/PARTcommunity account | Portal terms | DXF yes |
@@ -76,8 +77,8 @@ Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **
    people who download from those pages; it should be built from the public format and own test
    files, as the EPLAN project importer was.
 3. **Part data without drawings:** Phoenix Contact's BMEcat XML and ECLASS classification carry
-   order numbers, descriptions and technical data. A BMEcat import would fill the parts library
-   for makers who publish it.
+   order numbers, descriptions and technical data. The `bmecat` importer fills the parts library
+   from them for makers who publish it.
 4. **QElectroTech `.elmt`** is an open XML format with a free collection that includes some
    manufacturer variants (Hager, ABB, Shelly). The `qet` importer reads them as symbols with
    connection points; check each element's licence before shipping it in a library.
@@ -85,4 +86,5 @@ Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **
 6. **SolidWorks Electrical Content Portal** data needs a SolidWorks subscription; its `.tewzip`
    parts are covered by the library import in #62.
 
-Follow-up candidates for the todo list: EDZ import, BMEcat parts import.
+Follow-up candidates for the todo list: EDZ import.
+

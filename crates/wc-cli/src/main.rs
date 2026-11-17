@@ -361,6 +361,13 @@ enum ImportCmd {
         #[arg(long, default_value = "")]
         category: String,
     },
+    /// Parts from a BMEcat catalogue (XML, version 1.2 or 2005): order number, maker,
+    /// description, the maker's part number, GTIN, and ECLASS class and features as properties.
+    PartsBmecat {
+        file: PathBuf,
+        #[arg(long)]
+        lib: PathBuf,
+    },
     /// QElectroTech elements (`.elmt`), one symbol per file. Ids are `<prefix>.<file name>`;
     /// the first terminal becomes the origin.
     SymbolQet {
@@ -1263,6 +1270,13 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 applied.unknown.len()
             );
         }
+        ImportCmd::PartsBmecat { file, lib } => {
+            let (n, warnings) = import_bmecat(&file, &lib)?;
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+            println!("imported {n} part(s) into {}", lib.display());
+        }
         ImportCmd::PartsCsv { file, lib } => {
             let bytes = std::fs::read(&file).map_err(e)?;
             let (parts, warnings) = wc_import::csv::parts(&wc_import::csv::decode(&bytes)).map_err(e)?;
@@ -1850,6 +1864,17 @@ fn export_wago_marking(dir: &Path, out: &Path, kinds: &[String]) -> Res<Exported
     })
 }
 
+/// Import a BMEcat catalogue's parts into a library folder. Files that are not UTF-8 are read
+/// as Latin-1, which BMEcat 1.2 catalogues often declare. Returns the count and warnings.
+fn import_bmecat(file: &Path, lib: &Path) -> Res<(usize, Vec<String>)> {
+    let bytes = std::fs::read(file).map_err(e)?;
+    let (parts, warnings) = wc_import::bmecat::parts(&wc_import::csv::decode(&bytes)).map_err(e)?;
+    for p in &parts {
+        wc_library::write_part(lib, p).map_err(e)?;
+    }
+    Ok((parts.len(), warnings))
+}
+
 /// Import QElectroTech elements into a symbol library folder, one symbol per file. A file that
 /// cannot be read is reported and skipped. Returns how many were written and how many failed.
 fn import_qet(
@@ -2118,6 +2143,25 @@ fn file_stem(number: &str, id: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bmecat_parts_land_in_the_library_also_from_latin1_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("cat.xml");
+        let mut bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><BMECAT version=\"1.2\"><T_NEW_CATALOG><ARTICLE><SUPPLIER_AID>K1</SUPPLIER_AID><ARTICLE_DETAILS><DESCRIPTION_SHORT>Sch".to_vec();
+        bytes.push(0xFC); // ü in Latin-1
+        bytes.extend_from_slice(b"tz</DESCRIPTION_SHORT><MANUFACTURER_NAME>Acme</MANUFACTURER_NAME></ARTICLE_DETAILS></ARTICLE></T_NEW_CATALOG></BMECAT>");
+        std::fs::write(&file, bytes).unwrap();
+        let lib = tmp.path().join("lib");
+        let (n, warnings) = import_bmecat(&file, &lib).unwrap();
+        assert_eq!(n, 1, "{warnings:?}");
+        let json = std::fs::read_to_string(lib.join("parts").join("acme.k1.json")).unwrap();
+        let p: wc_core::Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(p.description, "Schütz");
+
+        std::fs::write(&file, "<catalog/>").unwrap();
+        assert!(import_bmecat(&file, &lib).is_err());
+    }
 
     #[test]
     fn qet_elements_land_in_the_library_and_bad_files_are_counted() {

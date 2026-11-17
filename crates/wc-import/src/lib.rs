@@ -4,6 +4,7 @@
 
 pub mod aml;
 pub mod archive;
+pub mod bmecat;
 pub mod csv;
 pub mod dxf;
 pub mod eplan;
@@ -23,6 +24,28 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Give a read part its id and add it to `out`, keyed by id. `what` names the source row or
+/// product in warnings ("row 3", "product 2"). Returns false when the part was skipped.
+pub(crate) fn add_part(
+    out: &mut std::collections::BTreeMap<String, wc_core::Part>,
+    mut part: wc_core::Part,
+    what: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    part.id = wc_core::Part::make_id(&part.manufacturer, &part.order_number);
+    if let Err(e) = wc_core::store::check_id(&part.id) {
+        warnings.push(format!(
+            "{what}: cannot make an id from {:?} ({e}), skipped",
+            part.order_number
+        ));
+        return false;
+    }
+    if out.insert(part.id.clone(), part).is_some() {
+        warnings.push(format!("{what}: duplicate order number, the later one wins"));
+    }
+    true
+}
 
 use wc_core::geom::{Point, Shape, bounds_of};
 use wc_core::symbol::{Pin, PinDir};
