@@ -168,6 +168,9 @@ pub struct Open {
     /// update's write of it fails after other items were already written.
     #[cfg(test)]
     block_after_snapshot: Option<PathBuf>,
+    /// Tests: a file whose backup read fails, though the file is a plain readable one.
+    #[cfg(test)]
+    unreadable: Option<PathBuf>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
 }
@@ -199,6 +202,8 @@ impl Open {
             fail_symbol_writes: Default::default(),
             #[cfg(test)]
             block_after_snapshot: None,
+            #[cfg(test)]
+            unreadable: None,
             undo_error: None,
         };
         // Locked symbols no page uses are loaded too, so Undo can put back the version a
@@ -610,7 +615,13 @@ impl Open {
             .iter()
             .filter(|(kind, _)| *kind == ItemKind::Part)
             .filter_map(|(kind, id)| store::vendor_path(&self.dir, *kind, id).ok())
-            .map(|path| Ok((path.clone(), snapshot_file(&path)?)))
+            .map(|path| {
+                #[cfg(test)]
+                if self.unreadable.as_ref() == Some(&path) {
+                    return Err(format!("{} cannot be read: test read failure", path.display()));
+                }
+                Ok((path.clone(), snapshot_file(&path)?))
+            })
             .collect::<Result<_, String>>()
             .map_err(|e| format!("nothing was updated: {e}"))?;
         #[cfg(test)]
@@ -1698,26 +1709,25 @@ pub(crate) mod tests {
         let mut new = old.clone();
         new.name = "Coil, changed".into();
         let lib = library_first(&mut o, tmp.path(), &new);
-        // The part file is there but cannot be read (a folder stands in for it, which also
-        // holds when the tests run as root).
+        // The part file is a plain, removable file whose read fails.
         let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
-        std::fs::remove_file(&part_file).unwrap();
-        std::fs::create_dir(&part_file).unwrap();
+        let bytes = std::fs::read(&part_file).unwrap();
+        o.unreadable = Some(part_file.clone());
         let lock = o.project.lock.clone();
-        let could_undo = o.can_undo();
+        let mark = o.undo_mark();
         let err = o.update_library(&lib, None).unwrap_err();
         assert!(
             err.starts_with("nothing was updated") && err.contains("cannot be read"),
             "{err}"
         );
-        assert!(part_file.is_dir(), "the unreadable file is not removed");
+        assert_eq!(std::fs::read(&part_file).unwrap(), bytes, "the file is kept as it was");
         assert_eq!(o.project.lock, lock);
         assert_eq!(
             store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
             old,
             "no symbol written"
         );
-        assert_eq!(o.can_undo(), could_undo, "no undo step");
+        assert_eq!(o.undo_mark(), mark, "no undo step");
     }
 
     #[test]
