@@ -699,6 +699,16 @@ impl Open {
         self.history
     }
 
+    /// The project's name and fields when the history moved since `seen` (a change the form
+    /// did not make), updating `seen`; `None` when nothing else changed.
+    pub fn props_if_changed(&self, seen: &mut u64) -> Option<PropsSnapshot> {
+        if *seen == self.history {
+            return None;
+        }
+        *seen = self.history;
+        Some(self.props_snapshot())
+    }
+
     /// Set the project name and fields while a form is open, so the page shows each change at
     /// once. The form's changes since [`Open::start_live_form`] stay one undo step while nothing
     /// else changes the history. An empty name is not applied (it is being typed).
@@ -976,22 +986,41 @@ pub(crate) mod tests {
         o.start_live_form();
         let mut buffer = fields(&[("customer", "A")]);
         o.set_project_props_live("Test", &buffer);
-        let seen = o.history_count();
-        // Undo from the toolbar while the form is open.
+        let mut seen = o.history_count();
+        assert!(
+            o.props_if_changed(&mut seen).is_none(),
+            "the form's own edit is not news"
+        );
+        // Undo from the toolbar while the form is open: the form reloads what it shows.
         assert!(o.undo());
-        assert_ne!(o.history_count(), seen, "the form notices the undo");
-        buffer = o
-            .project
-            .meta
-            .title_block
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let now = o.props_if_changed(&mut seen).unwrap();
+        buffer = now.title_block.into_iter().collect();
         // Editing another field now does not bring customer A back.
         buffer.push(("revision".into(), "B".into()));
         o.set_project_props_live("Test", &buffer);
         assert!(!o.project.meta.title_block.contains_key("customer"));
         assert_eq!(o.project.meta.title_block["revision"], "B");
+    }
+
+    #[test]
+    fn cancel_restores_opening_props_after_undo_and_other_property_edits() {
+        let (_tmp, mut o) = project();
+        o.set_project_props("Opening", &fields(&[("customer", "Opening")]))
+            .unwrap();
+        let since = o.start_live_form();
+        let before = o.props_snapshot();
+        o.set_project_props_live("Form", &fields(&[("customer", "Form")]));
+        assert!(o.undo());
+        assert!(o.undo());
+        o.set_project_props("First", &fields(&[("customer", "First")])).unwrap();
+        o.set_project_props("Second", &fields(&[("customer", "Second")]))
+            .unwrap();
+        // The last step looks like a form step but is not the form's: Cancel still restores
+        // what the form opened with.
+        assert_eq!(o.undo_mark(), since + 1);
+        assert!(o.last_step_changed_only_props());
+        o.revert_live(since, &before);
+        assert_eq!(o.props_snapshot(), before);
     }
 
     #[test]

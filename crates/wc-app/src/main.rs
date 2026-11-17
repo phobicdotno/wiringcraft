@@ -587,34 +587,13 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
-        let mut out = Vec::new();
         // An open dialog takes the keyboard: a shortcut would change the project under it (the
         // cover form's Cancel takes back only what the form changed).
-        if self.dialog.is_some() {
+        let dialog_open = self.dialog.is_some();
+        let mut out = ctrl_shortcuts(ctx, dialog_open);
+        if dialog_open {
             return out;
         }
-        let ctrl = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
-        ctx.input_mut(|i| {
-            for (k, a) in [
-                (Key::S, Action::Save),
-                (Key::Z, Action::Undo),
-                (Key::Y, Action::Redo),
-                (Key::O, Action::Open),
-                (Key::N, Action::AddPage),
-                (Key::P, Action::ExportPdf),
-                (Key::K, Action::Commit),
-                (Key::R, Action::Reports),
-                (Key::E, Action::Check),
-                (Key::A, Action::SelectAll),
-                (Key::J, Action::Assistant),
-            ] {
-                if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
-                    out.push(Action::NewProject);
-                } else if i.consume_shortcut(&ctrl(k)) {
-                    out.push(a);
-                }
-            }
-        });
         if ctx.wants_keyboard_input() {
             return out;
         }
@@ -977,12 +956,9 @@ impl App {
                     before,
                     seen,
                 } => {
-                    if let Some(o) = self.open.as_ref()
-                        && o.history_count() != *seen
-                    {
-                        name.clone_from(&o.project.meta.name);
-                        *fields = form_fields(&o.project.meta.title_block);
-                        *seen = o.history_count();
+                    if let Some(now) = self.open.as_ref().and_then(|o| o.props_if_changed(seen)) {
+                        *name = now.name;
+                        *fields = form_fields(&now.title_block);
                     }
                     let mut changed = false;
                     egui::Grid::new("cover")
@@ -1702,6 +1678,37 @@ fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
 
 /// A project's title-block fields as form rows: the standard fields first (empty when not
 /// set), then any others the project has.
+/// The Ctrl shortcuts pressed this frame, none while a dialog is open.
+fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
+    let mut out = Vec::new();
+    if dialog_open {
+        return out;
+    }
+    let ctrl = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
+    ctx.input_mut(|i| {
+        for (k, a) in [
+            (Key::S, Action::Save),
+            (Key::Z, Action::Undo),
+            (Key::Y, Action::Redo),
+            (Key::O, Action::Open),
+            (Key::N, Action::AddPage),
+            (Key::P, Action::ExportPdf),
+            (Key::K, Action::Commit),
+            (Key::R, Action::Reports),
+            (Key::E, Action::Check),
+            (Key::A, Action::SelectAll),
+            (Key::J, Action::Assistant),
+        ] {
+            if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
+                out.push(Action::NewProject);
+            } else if i.consume_shortcut(&ctrl(k)) {
+                out.push(a);
+            }
+        }
+    });
+    out
+}
+
 fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
     let mut fields: Vec<(String, String)> = TITLE_FIELDS
         .iter()
@@ -2155,6 +2162,29 @@ fn restart_with_wgpu(why: &str, wait: bool) {
 #[cfg(test)]
 mod renderer_tests {
     use super::*;
+
+    #[test]
+    fn ctrl_shortcuts_wait_while_a_dialog_is_open() {
+        let ctx = egui::Context::default();
+        let press = |dialog_open: bool| {
+            let raw = egui::RawInput {
+                modifiers: Modifiers::COMMAND,
+                events: vec![egui::Event::Key {
+                    key: Key::N,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            };
+            let mut got = Vec::new();
+            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, dialog_open));
+            got
+        };
+        assert!(press(true).is_empty(), "Ctrl+N does nothing under a dialog");
+        assert!(matches!(press(false).as_slice(), [Action::AddPage]));
+    }
 
     #[test]
     fn opengl_is_the_default_and_wgpu_can_be_picked() {
