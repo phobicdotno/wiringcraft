@@ -720,9 +720,16 @@ impl App {
                 Dialog::Report { log, include } => {
                     ui.label(
                         "This is WiringCraft's log of what happened recently. Home folders, keys, tokens and \
-                         email addresses are already hidden, and no drawing content is in it. Nothing is sent \
-                         unless you choose to.",
+                         email addresses are already hidden. Messages WiringCraft showed are in it, and they can \
+                         name devices or pages of your project, so look it over first. Nothing is sent unless \
+                         you choose to.",
                     );
+                    if let Some(e) = applog::error() {
+                        ui.colored_label(
+                            theme::Theme::of(ui.ctx()).error,
+                            format!("The log could not be written: {e}"),
+                        );
+                    }
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                         let shown = if log.is_empty() {
                             "(The log is empty.)"
@@ -734,10 +741,9 @@ impl App {
                     ui.checkbox(include, "Include this log in my report");
                     ui.horizontal(|ui| {
                         if ui.button("Open the report form").clicked() {
-                            let mut request = feedback::Request::default();
-                            if *include && !log.is_empty() {
-                                request.detail = report_detail(log);
-                                self.copied_text = Some(log.clone());
+                            let (request, copy) = report_request(log, *include);
+                            if let Some(copy) = copy {
+                                self.copied_text = Some(copy);
                                 self.ed.message = "The log is on the clipboard: paste it into the report if the \
                                                    form shows only its end."
                                     .into();
@@ -1754,6 +1760,17 @@ const REPORT_LOG_BYTES: usize = 60_000;
 /// How much of the log's end goes into the report form itself (the link has a size limit).
 const REPORT_FORM_BYTES: usize = 1_500;
 
+/// The report form's fields and the text for the clipboard: the log goes in only when the person
+/// chose to include it and there is one.
+fn report_request(log: &str, include: bool) -> (feedback::Request, Option<String>) {
+    let mut request = feedback::Request::default();
+    if include && !log.is_empty() {
+        request.detail = report_detail(log);
+        return (request, Some(log.to_owned()));
+    }
+    (request, None)
+}
+
 /// The "how to make it happen again" field of a report: the end of the log.
 fn report_detail(log: &str) -> String {
     let mut start = log.len().saturating_sub(REPORT_FORM_BYTES);
@@ -1772,16 +1789,28 @@ fn report_detail(log: &str) -> String {
 impl App {
     /// Write new status messages and message boxes to the log, once each.
     fn log_messages(&mut self) {
+        for (level, text) in self.new_messages() {
+            applog::log(level, &text);
+        }
+    }
+
+    /// Status messages and message boxes not logged yet. A message box is logged once while it
+    /// is open; after it closes, the same text is logged again the next time it shows.
+    fn new_messages(&mut self) -> Vec<(applog::Level, String)> {
+        let mut new = Vec::new();
         if !self.ed.message.is_empty() && self.ed.message != self.logged.0 {
             self.logged.0 = self.ed.message.clone();
-            applog::info(&self.logged.0);
+            new.push((applog::Level::Info, self.logged.0.clone()));
         }
-        if let Some(Dialog::Message(m)) = &self.dialog
-            && *m != self.logged.1
-        {
-            self.logged.1 = m.clone();
-            applog::warn(m);
+        match &self.dialog {
+            Some(Dialog::Message(m)) if *m != self.logged.1 => {
+                self.logged.1 = m.clone();
+                new.push((applog::Level::Warn, m.clone()));
+            }
+            Some(Dialog::Message(_)) => {}
+            _ => self.logged.1.clear(),
         }
+        new
     }
 }
 

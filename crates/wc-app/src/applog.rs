@@ -4,7 +4,8 @@
 //!
 //! Lines are masked before they are written: the home folder becomes `~`, and API keys, tokens
 //! and email addresses are replaced, so a log can be shared without leaking them. Project content
-//! is not logged, only what was done (commands, opened and saved folders, messages and errors).
+//! is not saved in the log, but messages WiringCraft shows can name devices or pages, and those
+//! messages are logged, so the report dialog asks the person to look the log over first.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -45,6 +46,8 @@ pub struct Logger {
     home: Option<String>,
     file: Option<File>,
     size: u64,
+    /// Why the log could not be written last time, if it could not.
+    error: Option<String>,
 }
 
 impl Logger {
@@ -60,6 +63,7 @@ impl Logger {
             home,
             file: None,
             size: 0,
+            error: None,
         }
     }
 
@@ -78,11 +82,40 @@ impl Logger {
             level.as_str(),
             mask(message, self.home.as_deref())
         );
-        // A log that cannot be written must never stop the program.
-        let _ = self.append(&line);
+        // A log that cannot be written must never stop the program. Keep the reason, and say
+        // it on stderr once per new reason (not through the log, which is what failed).
+        match self.append(&line) {
+            Ok(()) => self.error = None,
+            Err(e) => {
+                let reason = format!("{}: {e}", self.dir.display());
+                if self.error.as_deref() != Some(reason.as_str()) {
+                    eprintln!("WiringCraft could not write its log in {reason}");
+                }
+                self.error = Some(reason);
+            }
+        }
+    }
+
+    /// Why the last line could not be written, if it could not.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     fn append(&mut self, line: &str) -> std::io::Result<()> {
+        // One line never makes a file bigger than the limit: cut it at a character boundary.
+        let cut;
+        let line = if line.len() as u64 > self.max_file {
+            let mut end = usize::try_from(self.max_file.saturating_sub(1))
+                .unwrap_or(0)
+                .min(line.len());
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            cut = format!("{}\n", &line[..end]);
+            cut.as_str()
+        } else {
+            line
+        };
         if self.file.is_none() {
             fs::create_dir_all(&self.dir)?;
             let f = OpenOptions::new().create(true).append(true).open(self.path())?;
@@ -201,6 +234,11 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=')
 }
 
+/// Where a secret value that continues in `rest` ends: at the next white space.
+fn value_end(rest: &str) -> usize {
+    rest.find(char::is_whitespace).unwrap_or(rest.len())
+}
+
 /// Hide what must not leave the machine: the home folder (as `~`), API keys and tokens, values
 /// after key words such as `token=` or `Bearer`, and email addresses.
 pub fn mask(text: &str, home: Option<&str>) -> String {
@@ -238,18 +276,22 @@ pub fn mask(text: &str, home: Option<&str>) -> String {
             hide_next = false;
         } else if let Some(k) = key {
             match word.find(['=', ':']) {
-                // `token=abc...` in one word: keep the key, hide the value.
+                // `token=abc...` in one word: keep the key, hide the value up to the next space
+                // (a value can hold characters that end an ordinary word, such as `!`).
                 Some(i) if word.len() > i + 1 && i >= k.len() => {
                     out.push_str(&word[..=i]);
                     out.push_str("***");
+                    rest = &rest[value_end(rest)..];
                 }
                 _ => {
                     out.push_str(word);
                     hide_next = true;
                 }
             }
-        } else if hide_next && word.len() >= 6 {
+        } else if hide_next {
+            // The value after a key word, whatever its length, up to the next space.
             out.push_str("***");
+            rest = &rest[value_end(rest)..];
             hide_next = false;
         } else if word.find('@').is_some_and(|at| at > 0 && word[at + 1..].contains('.')) {
             out.push_str("<email>");
@@ -309,6 +351,12 @@ pub fn warn(message: &str) {
     log(Level::Warn, message);
 }
 
+/// Why the log could not be written, if it could not.
+pub fn error() -> Option<String> {
+    LOG.get()
+        .and_then(|m| m.lock().ok().and_then(|l| l.error().map(str::to_owned)))
+}
+
 /// The newest part of the log, for a problem report.
 pub fn tail(max_bytes: usize) -> String {
     LOG.get()
@@ -347,6 +395,34 @@ mod tests {
     }
 
     #[test]
+    fn one_long_line_never_passes_the_size_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut l = Logger::new(tmp.path(), 100, 2);
+        l.write(Level::Info, &"æøå".repeat(100));
+        l.write(Level::Info, "short");
+        l.write(Level::Info, &"x".repeat(500));
+        for p in [l.path(), l.rotated(1), l.rotated(2)] {
+            let len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            assert!(len <= 100, "{} is {len} bytes", p.display());
+            if let Ok(text) = fs::read_to_string(&p) {
+                assert!(text.ends_with('\n'));
+            }
+        }
+        assert!(l.error().is_none());
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_written_keeps_the_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not-a-folder");
+        fs::write(&file, "x").unwrap();
+        let mut l = Logger::new(&file, 1000, 2);
+        l.write(Level::Info, "hello");
+        let e = l.error().unwrap();
+        assert!(e.contains("not-a-folder"), "{e}");
+    }
+
+    #[test]
     fn reopening_appends_to_the_same_file() {
         let tmp = tempfile::tempdir().unwrap();
         Logger::new(tmp.path(), 10_000, 2).write(Level::Info, "first run");
@@ -366,6 +442,9 @@ mod tests {
         assert_eq!(m("api_key=abcdef123456 next"), "api_key=*** next");
         assert_eq!(m("Authorization: Bearer abcdefghijkl"), "Authorization: Bearer ***");
         assert_eq!(m("password: hunter2hunter2"), "password: ***");
+        assert_eq!(m("password: abc"), "password: ***", "short values too");
+        assert_eq!(m("password: abcdef!ghijkl end"), "password: *** end", "the whole value");
+        assert_eq!(m("token=abc!def end"), "token=*** end");
         assert_eq!(m("from ola.nordmann@example.com today"), "from <email> today");
         assert_eq!(m("two\nlines"), "two lines");
         assert_eq!(m("Saved 3 pages"), "Saved 3 pages", "ordinary text stays");

@@ -891,6 +891,8 @@ impl App {
 
     /// Take the message a command left in a dialog, so the model gets it as a result.
     fn take_message(&mut self) -> Option<String> {
+        // Log it first: once taken, the frame's own logging never sees it.
+        self.log_messages();
         match self.dialog.take() {
             Some(Dialog::Message(m)) => Some(m),
             other => {
@@ -2003,6 +2005,47 @@ mod tests {
 
     fn page2(app: &App) -> &Page {
         app.open.as_ref().unwrap().project.page("p0002").unwrap()
+    }
+
+    #[test]
+    fn a_message_box_is_logged_again_after_it_closed() {
+        let (_tmp, mut a) = app(vec![]);
+        let fail = || Some(Dialog::Message("Saving failed:\ndisk full".into()));
+        let boxes = |a: &mut App| {
+            a.new_messages()
+                .into_iter()
+                .filter(|(l, _)| *l == crate::applog::Level::Warn)
+                .count()
+        };
+        a.dialog = fail();
+        assert_eq!(boxes(&mut a), 1);
+        assert_eq!(boxes(&mut a), 0, "once while it is open");
+        a.dialog = None;
+        assert_eq!(boxes(&mut a), 0);
+        // A save that worked, then the same failure again.
+        a.ed.message = "Saved".into();
+        a.new_messages();
+        a.dialog = fail();
+        assert_eq!(boxes(&mut a), 1, "the second failure is logged too");
+    }
+
+    #[test]
+    fn the_report_gets_the_log_only_when_chosen() {
+        let (request, copy) = crate::report_request("line one\nline two\n", false);
+        assert!(request.detail.is_empty() && copy.is_none());
+        let (request, copy) = crate::report_request("", true);
+        assert!(request.detail.is_empty() && copy.is_none(), "no empty log");
+        let (request, copy) = crate::report_request("line one\nline two\n", true);
+        assert!(request.detail.contains("line two"));
+        assert_eq!(copy.as_deref(), Some("line one\nline two\n"));
+    }
+
+    #[test]
+    fn a_taken_message_was_logged_first() {
+        let (_tmp, mut a) = app(vec![]);
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        assert_eq!(a.take_message().as_deref(), Some("Export failed"));
+        assert_eq!(a.logged.1, "Export failed");
     }
 
     #[test]
