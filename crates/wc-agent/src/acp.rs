@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use serde_json::{Value, json};
 
-use crate::Entry;
+use crate::{Entry, Image};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 /// The adapter's install command, shown when none is found.
@@ -185,6 +185,28 @@ pub fn initialize_params() -> Value {
     })
 }
 
+/// A prompt's content: the pictures (when the agent takes them), then the words. Returns the
+/// blocks and how many pictures were left out; the words then say so, so the model knows.
+pub fn prompt_blocks(text: &str, images: &[Image], pictures: bool) -> (Vec<Value>, usize) {
+    let mut blocks = Vec::new();
+    let mut text = text.to_owned();
+    let mut left_out = 0;
+    if pictures {
+        blocks.extend(
+            images
+                .iter()
+                .map(|i| json!({"type": "image", "mimeType": i.media_type, "data": i.data})),
+        );
+    } else if !images.is_empty() {
+        left_out = images.len();
+        text.push_str(&format!(
+            "\n\n(The user attached {left_out} screenshot(s), but they could not be passed on. Ask them to describe what it shows.)"
+        ));
+    }
+    blocks.push(json!({"type": "text", "text": text}));
+    (blocks, left_out)
+}
+
 /// `session/new`: the working folder, WiringCraft's MCP bridge, the system note and the
 /// adapter's own options (its shell and file tools off).
 pub fn session_new_params(cwd: &Path, bridge: &Value, init: &Value, note: &str) -> Value {
@@ -285,7 +307,11 @@ pub struct Acp {
     cwd: PathBuf,
     bridge: Value,
     note: String,
-    queued: Option<String>,
+    queued: Option<(String, Vec<Image>)>,
+    /// The agent takes pictures in a prompt (`promptCapabilities.image`).
+    pictures: bool,
+    /// Notes for the panel, shown at the next poll.
+    notices: Vec<String>,
     /// The user pressed Stop in this turn: its remaining tool calls are refused.
     stopped: bool,
     /// The agent's name and version.
@@ -390,6 +416,8 @@ impl Acp {
             bridge,
             note: note.to_owned(),
             queued: None,
+            pictures: false,
+            notices: Vec::new(),
             stopped: false,
             agent: String::new(),
             models: Vec::new(),
@@ -426,15 +454,21 @@ impl Acp {
     }
 
     /// Send a message; it waits while the session is still starting.
-    pub fn prompt(&mut self, text: &str) {
+    pub fn prompt(&mut self, text: &str, images: &[Image]) {
         self.stopped = false;
         match (&self.session, self.state) {
             (Some(s), State::Ready) => {
-                let params = json!({"sessionId": s, "prompt": [{"type": "text", "text": text}]});
+                let (blocks, left_out) = prompt_blocks(text, images, self.pictures);
+                if left_out > 0 {
+                    self.notices.push(format!(
+                        "This Claude Code version does not take pictures, so {left_out} screenshot(s) were not sent."
+                    ));
+                }
+                let params = json!({"sessionId": s, "prompt": blocks});
                 self.request(Pending::Prompt, "session/prompt", params);
                 self.state = State::Busy;
             }
-            _ => self.queued = Some(text.to_owned()),
+            _ => self.queued = Some((text.to_owned(), images.to_vec())),
         }
     }
 
@@ -466,6 +500,10 @@ impl Acp {
     /// Read what the agent said; streamed text goes into `log`.
     pub fn poll(&mut self, log: &mut Vec<Entry>) -> AcpPolled {
         let mut out = AcpPolled::default();
+        for n in self.notices.drain(..) {
+            log.push(Entry::Note(n));
+            out.changed = true;
+        }
         while let Ok(msg) = self.from_agent.try_recv() {
             out.changed = true;
             match msg {
@@ -551,6 +589,10 @@ impl Acp {
     fn answered(&mut self, kind: Pending, result: &Value, log: &mut Vec<Entry>, out: &mut AcpPolled) {
         match kind {
             Pending::Initialize => {
+                self.pictures = result
+                    .pointer("/agentCapabilities/promptCapabilities/image")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let info = &result["agentInfo"];
                 self.agent = [
                     info["title"].as_str().or(info["name"].as_str()),
@@ -591,8 +633,8 @@ impl Acp {
                 if !wanted.is_empty() && wanted != self.model && self.models.iter().any(|(id, _)| *id == wanted) {
                     self.set_model(&wanted);
                 }
-                if let Some(text) = self.queued.take() {
-                    self.prompt(&text);
+                if let Some((text, images)) = self.queued.take() {
+                    self.prompt(&text, &images);
                 }
             }
             Pending::Prompt => {
@@ -706,6 +748,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pictures_go_only_to_an_agent_that_takes_them() {
+        let shot = Image {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let (b, left) = prompt_blocks("look", std::slice::from_ref(&shot), true);
+        assert_eq!(left, 0);
+        assert_eq!(b[0], json!({"type": "image", "mimeType": "image/png", "data": "AAAA"}));
+        assert_eq!(b[1], json!({"type": "text", "text": "look"}));
+        let (b, left) = prompt_blocks("look", &[shot], false);
+        assert_eq!((left, b.len()), (1, 1));
+        assert!(
+            b[0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("could not be passed on"))
+        );
+    }
+
     /// A stand-in adapter: a shell script that answers initialize, session/new and one prompt.
     #[cfg(unix)]
     #[test]
@@ -727,7 +788,7 @@ read l
         let argv = vec!["sh".to_owned(), script.to_string_lossy().into_owned()];
         let acp = Acp::start(&argv, &dir, json!({}), "note", "", Arc::new(|| {}));
         let Ok(mut acp) = acp else { return };
-        acp.prompt("hi");
+        acp.prompt("hi", &[]);
         assert!(acp.busy());
         let mut log = Vec::new();
         let mut finished = false;

@@ -12,12 +12,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use eframe::egui;
 use serde_json::{Value, json};
 use wc_core::geom::{Point, Rotation, Shape};
 use wc_core::project::PageSize;
 use wc_core::{DeviceTag, Endpoint, Page};
 
 use crate::actions::Action;
+use crate::screenshot::{self, Shot};
 use crate::state::{Open, Selection};
 use crate::{App, Dialog};
 
@@ -79,6 +81,13 @@ pub struct Assistant {
     pub acp: Option<wc_agent::acp::Acp>,
     /// Claude login: the conversation as shown.
     pub login_log: Vec<wc_agent::Entry>,
+    /// Screenshots waiting to go with the next message, with their thumbnails once shown.
+    pub waiting: Vec<(Shot, Option<egui::TextureHandle>)>,
+    /// Screenshots sent with the last message, offered again if it could not be sent.
+    pub sent: Vec<Shot>,
+    /// The latest screenshots of this conversation, for a request the assistant files.
+    pub shared: Vec<Shot>,
+    pub clipboard: screenshot::Clipboard,
 }
 
 impl Default for Assistant {
@@ -98,6 +107,10 @@ impl Assistant {
             bridge: None,
             acp: None,
             login_log: Vec::new(),
+            waiting: Vec::new(),
+            sent: Vec::new(),
+            shared: Vec::new(),
+            clipboard: screenshot::Clipboard::default(),
         }
     }
 
@@ -1870,6 +1883,23 @@ impl App {
                     return Err("`title` and `what` must not be empty.".into());
                 }
                 let confirmed = v["confirmed"].as_bool().unwrap_or(false);
+                // gh cannot attach pictures, so with a screenshot the form opens and the latest
+                // screenshot goes on the clipboard, ready to paste into it.
+                if let Some(shot) = self.assistant.shared.last().cloned() {
+                    self.open_url.push(feedback::form_url(kind, &r));
+                    let pasted = self.assistant.clipboard.copy(&shot);
+                    self.ed.message = match &pasted {
+                        Ok(()) => {
+                            "Opened the request on GitHub; press Ctrl+V in its Screenshots box to add the screenshot."
+                                .into()
+                        }
+                        Err(_) => "Opened the request on GitHub; drag the screenshot into its Screenshots box.".into(),
+                    };
+                    return Ok(match pasted {
+                        Ok(()) => "Opened the filled-in form in the user's browser and put the latest screenshot on their clipboard. Tell them to click the form's Screenshots box, press Ctrl+V (Cmd+V on a Mac), then Submit.".into(),
+                        Err(e) => format!("Opened the filled-in form in the user's browser. The screenshot could not go on the clipboard ({e}); tell them to drag their screenshot file into the form's Screenshots box, then Submit."),
+                    });
+                }
                 if confirmed && feedback::gh_ready() {
                     let url = feedback::file(kind, &r)?;
                     self.ed.message = format!("Filed {url}");
@@ -2220,6 +2250,19 @@ mod tests {
             .is_err()
         );
         assert!(call(&mut a, "todo", json!({"action": "other"})).is_err());
+        // With a screenshot in the conversation the form opens even with the go-ahead, since
+        // pictures can only be added there.
+        a.assistant
+            .shared
+            .push(Shot::from_rgba(1, 1, vec![0, 0, 0, 255]).unwrap());
+        let out = call(
+            &mut a,
+            "todo",
+            json!({"action": "file", "kind": "problem", "title": "Wrong arrow", "what": "See screenshot", "confirmed": true}),
+        )
+        .unwrap();
+        assert!(out.contains("Screenshots box"), "{out}");
+        assert_eq!(a.open_url.len(), 3);
     }
 
     #[test]

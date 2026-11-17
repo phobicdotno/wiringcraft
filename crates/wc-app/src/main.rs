@@ -13,6 +13,7 @@ mod icons;
 mod panel_view;
 mod panels;
 mod prefs;
+mod screenshot;
 mod state;
 mod theme;
 
