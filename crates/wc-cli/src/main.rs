@@ -1306,7 +1306,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 if bytes.len() as u64 > limit {
                     return Err(format!("{} is larger than {} MB", path.display(), limit >> 20));
                 }
-                bytes
+                (bytes, None)
             } else {
                 let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
                 let got =
@@ -1317,10 +1317,16 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                         got.count, got.folder
                     );
                 }
-                got.bytes
+                let info_warnings = got.info.iter().flat_map(|i| &i.warnings);
+                for w in got.info_warning.iter().chain(info_warnings) {
+                    eprintln!("warning: {w}");
+                }
+                (got.bytes, got.info)
             };
+            let (db, info) = db;
             let conn = wc_import::swe::open(&db).map_err(e)?;
-            let sw = wc_import::swe::read(&conn).map_err(e)?;
+            let mut sw = wc_import::swe::read(&conn).map_err(e)?;
+            sw.info = info;
             let (built, warnings, report) = wc_import::swe::build(&sw, first_page);
             for w in sw.warnings.iter().chain(&warnings) {
                 eprintln!("warning: {w}");
@@ -1883,6 +1889,8 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
     for loc in built.locations {
         p.meta.merge_location(loc);
     }
+    // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
+    p.meta.fill_title_block(built.title_block);
     Ok(())
 }
 
