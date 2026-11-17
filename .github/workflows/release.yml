@@ -182,7 +182,12 @@ jobs:
           # Ad-hoc signature only (no certificate yet): the app starts after the user allows it.
           codesign --force --deep --sign - "$app"
           ln -s /Applications stage/Applications
-          hdiutil create -volname WiringCraft -srcfolder stage -format UDZO -ov "dist/wiringcraft-$v-macos-universal.dmg"
+          # hdiutil on the hosted runners fails now and then with "Resource temporarily
+          # unavailable"; the mount below is retried the same way.
+          for i in 1 2 3 4 5; do
+            hdiutil create -volname WiringCraft -srcfolder stage -format UDZO -ov "dist/wiringcraft-$v-macos-universal.dmg" && break
+            test "$i" -lt 5 && sleep 10 || exit 1
+          done
       - name: Install, run, uninstall (macOS)
         if: runner.os == 'macOS'
         shell: bash
@@ -190,7 +195,10 @@ jobs:
           mnt="$RUNNER_TEMP/wc-dmg"
           dest="$RUNNER_TEMP/Applications"
           mkdir -p "$dest"
-          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" dist/*.dmg
+          for i in 1 2 3 4 5; do
+            hdiutil attach -nobrowse -readonly -mountpoint "$mnt" dist/*.dmg && break
+            test "$i" -lt 5 && sleep 10 || exit 1
+          done
           cp -R "$mnt/WiringCraft.app" "$dest/"
           hdiutil detach "$mnt"
           bin="$dest/WiringCraft.app/Contents/MacOS"
