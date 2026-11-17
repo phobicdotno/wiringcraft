@@ -335,6 +335,10 @@ enum PageCmd {
         /// An overview (line diagram): its devices do not count as drawings in `check`.
         #[arg(long)]
         overview: bool,
+        /// The project's cover page: shows the project's name and fields. A project has one
+        /// cover page, so any other page loses the mark.
+        #[arg(long)]
+        cover: bool,
     },
     List,
     Remove {
@@ -342,6 +346,13 @@ enum PageCmd {
     },
     /// Mark a page as an overview (line diagram), or with `--off` as a normal page again.
     Overview {
+        id: String,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Make a page the project's cover page (any other page loses the mark), or with `--off` a
+    /// normal page again.
+    Cover {
         id: String,
         #[arg(long)]
         off: bool,
@@ -617,6 +628,13 @@ fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+/// Says which pages stopped being the cover page when another one took the mark.
+fn cover_moved(ids: Vec<String>) {
+    for id in ids {
+        eprintln!("page {id:?} is no longer the cover page");
+    }
+}
+
 fn load(dir: &Path) -> Res<Project> {
     store::load(dir).map_err(e)
 }
@@ -809,6 +827,7 @@ fn run(cli: Cli) -> Res<()> {
                     title,
                     size,
                     overview,
+                    cover,
                 } => {
                     store::check_id(&id).map_err(e)?;
                     if p.page(&id).is_some() {
@@ -823,6 +842,10 @@ fn run(cli: Cli) -> Res<()> {
                         other => return Err(format!("unknown size {other}")),
                     };
                     p.pages.push(page);
+                    if cover {
+                        let i = p.pages.len() - 1;
+                        cover_moved(p.set_cover(i, true).unwrap_or_default());
+                    }
                     p.sort_pages();
                 }
                 PageCmd::List => {
@@ -834,7 +857,12 @@ fn run(cli: Cli) -> Res<()> {
                             pg.title,
                             pg.symbols.len(),
                             pg.wires.len(),
-                            if pg.overview { ", overview" } else { "" }
+                            match (pg.cover, pg.overview) {
+                                (true, true) => ", cover, overview",
+                                (true, false) => ", cover",
+                                (false, true) => ", overview",
+                                (false, false) => "",
+                            }
                         );
                     }
                     return Ok(());
@@ -853,6 +881,14 @@ fn run(cli: Cli) -> Res<()> {
                         .find(|pg| pg.id == id)
                         .ok_or_else(|| format!("no page {id:?}"))?;
                     page.overview = !off;
+                }
+                PageCmd::Cover { id, off } => {
+                    let i = p
+                        .pages
+                        .iter()
+                        .position(|pg| pg.id == id)
+                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    cover_moved(p.set_cover(i, !off).unwrap_or_default());
                 }
             }
             save(dir, &p)?;
@@ -2783,6 +2819,38 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_page_is_added_as_or_made_the_one_cover_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(
+            &dir,
+            &["page", "add", "front", "--number", "0", "--title", "Cover", "--cover"],
+        )
+        .unwrap();
+        cli(&dir, &["page", "add", "info", "--number", "0.1", "--title", "Notes"]).unwrap();
+        let covers = |dir: &Path| -> Vec<String> {
+            load(dir)
+                .unwrap()
+                .pages
+                .iter()
+                .filter(|p| p.cover)
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        assert_eq!(covers(&dir), ["front"]);
+        // Making another page the cover moves the mark: one cover per project.
+        cli(&dir, &["page", "cover", "info"]).unwrap();
+        assert_eq!(covers(&dir), ["info"]);
+        // Adding a new cover moves it too.
+        cli(&dir, &["page", "add", "c2", "--number", "00", "--cover"]).unwrap();
+        assert_eq!(covers(&dir), ["c2"]);
+        cli(&dir, &["page", "cover", "c2", "--off"]).unwrap();
+        assert!(covers(&dir).is_empty());
+        assert!(cli(&dir, &["page", "cover", "nope"]).unwrap_err().contains("no page"));
     }
 
     #[test]

@@ -199,7 +199,7 @@ pub fn specs() -> Vec<Value> {
     vec![
         tool(
             "get_state",
-            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, counts), panel layouts, devices count, open comments, the page or panel shown, the selection and whether undo is possible.",
+            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection and whether undo is possible.",
             json!({}),
             &[],
         ),
@@ -337,8 +337,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_page",
-            "Change a page's number, title or sheet size, or mark it as an overview (a line diagram: its devices do not count as drawings in the project check).",
-            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}, "overview": {"type": "boolean"}}),
+            "Change a page's number, title or sheet size, mark it as an overview (a line diagram: its devices do not count as drawings in the project check), or make it the project's cover page (it shows the project's name and fields; any other cover page loses the mark).",
+            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}, "overview": {"type": "boolean"}, "cover": {"type": "boolean"}}),
             &[],
         ),
         tool(
@@ -368,7 +368,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "edit_page_json",
             "Replace a whole page with new content in the page file format (as get_page returns it, without the extra pin and point fields). For bulk edits the other tools cannot do. The page id stays.",
-            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), symbols, wires, graphics, underlay."}}),
+            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), cover (true for the cover page; leaving it out keeps the page's current value), symbols, wires, graphics, underlay."}}),
             &["content"],
         ),
         tool(
@@ -725,6 +725,7 @@ impl Open {
         let (w, h) = p.size.mm();
         json!({
             "id": p.id, "number": p.number, "title": p.title, "size": p.size,
+            "overview": p.overview, "cover": p.cover,
             "size_mm": [w, h],
             "symbols": symbols, "wires": wires, "graphics": graphics,
             "underlay": p.underlay, "comments": comments,
@@ -1093,6 +1094,9 @@ impl App {
                     size.unwrap_or(cur.size),
                     v.get("overview").and_then(Value::as_bool).unwrap_or(cur.overview),
                 )?;
+                if let Some(cover) = v.get("cover").and_then(Value::as_bool) {
+                    open.set_page_cover(i, cover)?;
+                }
                 if self.ed.page == page {
                     self.ed.page = i;
                 }
@@ -1145,6 +1149,11 @@ impl App {
                     .ok_or("No such page.")?;
                 let mut content = v.get("content").cloned().ok_or("`content` is missing.")?;
                 content["id"] = json!(id);
+                // A page content without `cover` keeps the page's own value.
+                let was_cover = open.project.pages.get(page).is_some_and(|p| p.cover);
+                if content.get("cover").is_none_or(Value::is_null) {
+                    content["cover"] = json!(was_cover);
+                }
                 let new: Page = serde_json::from_value(content).map_err(|e| format!("Not a page: {e}"))?;
                 open.ensure_page_symbols(&new)?;
                 open.checkpoint();
@@ -1153,8 +1162,13 @@ impl App {
                         open.project.devices.entry(t.clone()).or_default();
                     }
                 }
+                let cover = new.cover;
                 if let Some(p) = open.project.pages.get_mut(page) {
                     *p = new;
+                }
+                // One cover page per project: a new cover takes the mark from any other page.
+                if cover {
+                    open.project.set_cover(page, true);
                 }
                 open.project.sort_pages();
                 let i = open.find_page(&id).unwrap_or(0);
@@ -1371,6 +1385,7 @@ impl App {
             .map(|p| {
                 json!({
                     "id": p.id, "number": p.number, "title": p.title, "size": p.size,
+                    "overview": p.overview, "cover": p.cover,
                     "symbols": p.symbols.len(), "wires": p.wires.len(), "graphics": p.graphics.len()
                 })
             })
@@ -2843,6 +2858,61 @@ mod tests {
                 .iter()
                 .all(|s| s.tag.as_ref().unwrap().to_string() == "=PUMP-K7")
         );
+    }
+
+    #[test]
+    fn the_assistant_reads_and_sets_the_cover_page_and_page_content_keeps_it() {
+        let (_tmp, mut a) = app(vec![]);
+        let covers = |a: &App| -> Vec<String> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .pages
+                .iter()
+                .filter(|p| p.cover)
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        call(&mut a, "update_page", json!({"page": "p0002", "cover": true})).unwrap();
+        assert_eq!(covers(&a), ["p0002"]);
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        let listed = state["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "p0002")
+            .unwrap();
+        assert_eq!(listed["cover"], json!(true));
+        // Page content without `cover` keeps the page the cover page.
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        assert_eq!(content["cover"], json!(true));
+        content.as_object_mut().unwrap().remove("cover");
+        content["title"] = json!("Front");
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert_eq!(covers(&a), ["p0002"]);
+        assert_eq!(page2(&a).title, "Front");
+        // A new cover takes the mark from the old one, as one undo step.
+        let out = call(&mut a, "add_page", json!({"title": "Second"})).unwrap();
+        let new_id = out.rsplit("id ").next().unwrap().trim_end_matches('.').to_owned();
+        call(&mut a, "update_page", json!({"page": new_id, "cover": true})).unwrap();
+        assert_eq!(covers(&a), std::slice::from_ref(&new_id));
+        a.open.as_mut().unwrap().undo();
+        assert_eq!(covers(&a), ["p0002"]);
+        // Page content with `cover: true` on a normal page takes the mark from the cover page,
+        // and one undo gives it back.
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": new_id})).unwrap()).unwrap();
+        assert_eq!(content["cover"], json!(false));
+        content["cover"] = json!(true);
+        call(&mut a, "edit_page_json", json!({"page": new_id, "content": content})).unwrap();
+        assert_eq!(covers(&a), std::slice::from_ref(&new_id));
+        a.open.as_mut().unwrap().undo();
+        assert_eq!(covers(&a), ["p0002"]);
+        // `cover: false` makes it a normal page.
+        call(&mut a, "update_page", json!({"page": "p0002", "cover": false})).unwrap();
+        assert!(covers(&a).is_empty());
     }
 
     #[test]

@@ -878,6 +878,23 @@ impl Project {
         self.pages.iter().position(|p| p.cover)
     }
 
+    /// Mark the page at `index` as the project's cover page (`on`), or as a normal page again.
+    /// A project has one cover page: marking a page takes the mark off every other page. Returns
+    /// the ids of the other pages that lost it; `None` when there is no page at `index`.
+    pub fn set_cover(&mut self, index: usize, on: bool) -> Option<Vec<String>> {
+        self.pages.get(index)?;
+        let mut moved = Vec::new();
+        for (i, p) in self.pages.iter_mut().enumerate() {
+            if i == index {
+                p.cover = on;
+            } else if on && p.cover {
+                p.cover = false;
+                moved.push(p.id.clone());
+            }
+        }
+        Some(moved)
+    }
+
     pub fn sort_pages(&mut self) {
         self.pages.sort_by(|a, b| {
             natural_key(&a.number)
@@ -1026,6 +1043,24 @@ mod tests {
         p.devices.insert(DeviceTag::parse("-K1")?, d);
         assert_eq!(p.used_parts().len(), 3);
         Ok(())
+    }
+
+    #[test]
+    fn one_page_is_the_cover() {
+        let mut p = Project::new("x");
+        for (id, n) in [("a", "1"), ("b", "2"), ("c", "3")] {
+            p.pages.push(Page::new(id, n, ""));
+        }
+        assert_eq!(p.set_cover(0, true), Some(vec![]));
+        assert_eq!(p.cover_page(), Some(0));
+        // Marking another page moves the mark.
+        assert_eq!(p.set_cover(2, true), Some(vec!["a".to_owned()]));
+        assert_eq!(p.pages.iter().filter(|pg| pg.cover).count(), 1);
+        assert_eq!(p.cover_page(), Some(2));
+        // Off leaves the other pages alone.
+        assert_eq!(p.set_cover(2, false), Some(vec![]));
+        assert_eq!(p.cover_page(), None);
+        assert_eq!(p.set_cover(9, true), None);
     }
 
     #[test]
