@@ -628,9 +628,30 @@ fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
                 .page()
                 .and_then(|id| p.page(id))
                 .map_or_else(|| "-".to_owned(), |pg| pg.number.clone());
-            format!("{page}\t{}\t{}\n", h.kind.label(), h.value)
+            format!(
+                "{}\t{}\t{}\n",
+                escape_field(&page),
+                h.kind.label(),
+                escape_field(&h.value)
+            )
         })
         .collect()
+}
+
+/// A value as one tab-separated field: backslash, tab and line breaks written as `\\`, `\t`,
+/// `\n` and `\r`, so a multi-line text stays one hit per line.
+fn escape_field(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The `location list` output: one location per line, `+path`, then a tab and the description
@@ -3057,6 +3078,12 @@ mod tests {
             "no part file written"
         );
         assert_eq!(std::fs::read(dir.join("project.toml")).unwrap(), project_file);
+    }
+
+    #[test]
+    fn a_found_value_stays_on_one_line() {
+        assert_eq!(escape_field("Motor\nStart\tA\\B\r"), "Motor\\nStart\\tA\\\\B\\r");
+        assert_eq!(escape_field("-K1"), "-K1");
     }
 
     #[test]

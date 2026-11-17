@@ -2366,8 +2366,7 @@ mod tests {
         find.query = tag.to_string();
         find.with = "-K77".into();
         find.match_case = true;
-        let version = a.open.as_ref().unwrap().history_count();
-        find.refresh(&a.open.as_ref().unwrap().project, version);
+        find.refresh(&a.open.as_ref().unwrap().project);
         assert_eq!(find.hits.len(), 2, "{:?}", find.hits);
         // Only the hit on the second page is ticked: the device is still renamed on both.
         find.chosen = vec![false, true];
@@ -2392,9 +2391,18 @@ mod tests {
         let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
         let page = open.project.pages[1].id.clone();
         a.ed.page = 0;
+        let start = wc_core::Endpoint::Point {
+            at: Point::new(0.0, 0.0),
+        };
+        a.ed.wire = Some((start.clone(), Vec::new()));
         a.show_found(&page, Some(Selection::Symbol(id.clone())));
         assert_eq!(a.ed.page, 1);
-        assert_eq!(a.ed.selection, vec![Selection::Symbol(id)]);
+        assert_eq!(a.ed.selection, vec![Selection::Symbol(id.clone())]);
+        assert!(a.ed.wire.is_none(), "a wire begun on another page is dropped");
+        // On the same page a wire being drawn is kept.
+        a.ed.wire = Some((start, Vec::new()));
+        a.show_found(&page, Some(Selection::Symbol(id)));
+        assert!(a.ed.wire.is_some());
     }
 
     #[test]

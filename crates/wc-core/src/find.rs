@@ -207,6 +207,20 @@ pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
         }
     }
     let shown = project.tag_index();
+    // A device that no page draws is found by its tag here; a drawn one by its symbols above.
+    for tag in project.devices.keys().filter(|t| !shown.contains_key(*t)) {
+        let value = tag.to_string();
+        if contains(&value, query, opts) {
+            hits.push(Hit {
+                kind: FindKind::Tag,
+                target: FindTarget::Device {
+                    tag: tag.clone(),
+                    shown_at: None,
+                },
+                value,
+            });
+        }
+    }
     for (tag, d) in &project.devices {
         if contains(&d.description, query, opts) {
             hits.push(Hit {
@@ -223,7 +237,8 @@ pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
 }
 
 /// Replace `query` with `with` in the chosen `hits` (from [`find`] with the same query and
-/// options). All or nothing: when a renamed tag is not a valid tag or is already used, nothing
+/// options). All or nothing: when a renamed tag is not a valid tag or is already used, or a hit
+/// no longer holds the value it was found with (the project changed since the search), nothing
 /// changes and the reason comes back. Returns how many values changed.
 ///
 /// A device tag hit renames that device everywhere it appears, once per device, even when
@@ -241,6 +256,7 @@ pub fn replace(
     let mut p = project.clone();
     let mut changed = 0usize;
     let mut renames: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
+    let stale = || "The project changed since the search; search again.".to_owned();
     for hit in hits {
         match (&hit.kind, &hit.target) {
             (FindKind::Text, FindTarget::Graphic { page, index }) => {
@@ -250,11 +266,16 @@ pub fn replace(
                     .find(|pg| &pg.id == page)
                     .and_then(|pg| pg.graphics.get_mut(*index))
                 {
+                    if *text != hit.value {
+                        return Err(stale());
+                    }
                     let new = replace_text(text, query, with, opts);
                     if new != *text {
                         *text = new;
                         changed += 1;
                     }
+                } else {
+                    return Err(stale());
                 }
             }
             (FindKind::WireNumber | FindKind::Potential, FindTarget::Wire { page, id }) => {
@@ -269,6 +290,9 @@ pub fn replace(
                     } else {
                         &mut w.potential
                     };
+                    if field.as_deref() != Some(hit.value.as_str()) {
+                        return Err(stale());
+                    }
                     if let Some(v) = field {
                         let new = replace_text(v, query, with, opts);
                         if new != *v {
@@ -281,6 +305,9 @@ pub fn replace(
             }
             (FindKind::Description, FindTarget::Device { tag, .. }) => {
                 if let Some(d) = p.devices.get_mut(tag) {
+                    if d.description != hit.value {
+                        return Err(stale());
+                    }
                     let new = replace_text(&d.description, query, with, opts);
                     if new != d.description {
                         d.description = new;
@@ -288,8 +315,17 @@ pub fn replace(
                     }
                 }
             }
-            (FindKind::Tag, FindTarget::Symbol { page, id }) => {
-                let tag = p.page(page).and_then(|pg| pg.symbol(id)).and_then(|s| s.tag.clone());
+            (FindKind::Tag, target @ (FindTarget::Symbol { .. } | FindTarget::Device { .. })) => {
+                let tag = match target {
+                    FindTarget::Symbol { page, id } => {
+                        p.page(page).and_then(|pg| pg.symbol(id)).and_then(|s| s.tag.clone())
+                    }
+                    FindTarget::Device { tag, .. } => p.devices.contains_key(tag).then(|| tag.clone()),
+                    _ => None,
+                };
+                if tag.as_ref().map(ToString::to_string).as_deref() != Some(hit.value.as_str()) {
+                    return Err(stale());
+                }
                 if let Some(from) = tag {
                     let text = replace_text(&from.to_string(), query, with, opts);
                     let to = DeviceTag::parse(&text).map_err(|e| format!("{from} would become \"{text}\": {e}"))?;
@@ -320,10 +356,26 @@ pub fn replace(
         return Err(format!("{to} is already used."));
     }
     // Renamed in two steps through placeholders, so `-K1` -> `-K2` and `-K2` -> `-K3` in one
-    // replace do not run into each other.
+    // replace do not run into each other. A placeholder is a tag nothing in the project uses
+    // and no rename gives.
+    let mut used: std::collections::BTreeSet<DeviceTag> = p
+        .devices
+        .keys()
+        .cloned()
+        .chain(p.tag_index().into_keys())
+        .chain(renames.values().cloned())
+        .collect();
+    let mut next = 0usize;
     let mut placed: Vec<(DeviceTag, DeviceTag)> = Vec::new();
-    for (i, (from, to)) in renames.iter().enumerate() {
-        let temp = DeviceTag::parse(&format!("-WCFIND{i}")).map_err(|e| e.to_string())?;
+    for (from, to) in &renames {
+        let temp = loop {
+            let t = DeviceTag::parse(&format!("-WCFIND{next}")).map_err(|e| e.to_string())?;
+            next += 1;
+            if !used.contains(&t) {
+                break t;
+            }
+        };
+        used.insert(temp.clone());
         p.rename_device(from, &temp);
         placed.push((temp, to.clone()));
     }
@@ -529,6 +581,62 @@ mod tests {
             .collect();
         // -K1 -> -F1 is taken; -K12 -> -F12 would be fine.
         assert!(replace(&mut p, &both, "K1", "F1", opts).is_err());
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn an_undrawn_device_is_found_and_renamed_by_its_tag() {
+        let mut p = sample();
+        p.devices.insert(tag("-Q5"), Device::default());
+        let opts = FindOptions::default();
+        let hits = find(&p, "Q5", opts);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, FindKind::Tag);
+        assert_eq!(hits[0].target.page(), None);
+        assert_eq!(replace(&mut p, &hits, "Q5", "Q6", opts), Ok(0));
+        assert!(p.devices.contains_key(&tag("-Q6")) && !p.devices.contains_key(&tag("-Q5")));
+        // A drawn device is found by its symbols only, not once more as a device.
+        assert!(
+            find(&p, "K12", opts)
+                .iter()
+                .all(|h| matches!(h.target, FindTarget::Symbol { .. }))
+        );
+    }
+
+    #[test]
+    fn a_placeholder_tag_in_use_is_not_overwritten() {
+        let mut p = sample();
+        p.devices.insert(
+            tag("-WCFIND0"),
+            Device {
+                description: "Keep me".into(),
+                ..Default::default()
+            },
+        );
+        let opts = FindOptions { match_case: true };
+        let hits: Vec<Hit> = find(&p, "F1", opts)
+            .into_iter()
+            .filter(|h| h.kind == FindKind::Tag)
+            .collect();
+        assert!(replace(&mut p, &hits, "F1", "F2", opts).is_ok());
+        assert_eq!(
+            p.devices.get(&tag("-WCFIND0")).map(|d| d.description.as_str()),
+            Some("Keep me")
+        );
+        assert!(p.tag_index().contains_key(&tag("-F2")));
+    }
+
+    #[test]
+    fn a_hit_that_changed_since_the_search_changes_nothing() {
+        let mut p = sample();
+        let opts = FindOptions::default();
+        let hits = find(&p, "pump", opts);
+        // Another edit puts a different text where the found one was.
+        if let Some(Shape::Text { text, .. }) = p.pages[0].graphics.get_mut(0) {
+            *text = "Fan pump".into();
+        }
+        let before = p.clone();
+        assert!(replace(&mut p, &hits, "pump", "fan", opts).is_err());
         assert_eq!(p, before);
     }
 

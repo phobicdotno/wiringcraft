@@ -17,8 +17,11 @@ pub struct FindState {
     pub hits: Vec<Hit>,
     /// Which hits Replace changes, in step with `hits`.
     pub chosen: Vec<bool>,
-    /// What `hits` were found for: the query, the case option and the project's change count.
-    searched: Option<(String, bool, u64)>,
+    /// What `hits` were found for: the query and the case option, and the project as it was
+    /// then. Compared by content, so another participant's edits or another project opened in
+    /// its place search again too, not only this window's own edits.
+    searched: Option<(String, bool)>,
+    searched_in: Option<Project>,
     pub message: String,
 }
 
@@ -38,14 +41,15 @@ pub enum FindOutcome {
 
 impl FindState {
     /// Search again when the text, the case option or the project changed since the last search.
-    pub fn refresh(&mut self, project: &Project, version: u64) {
-        let key = (self.query.clone(), self.match_case, version);
-        if self.searched.as_ref() == Some(&key) {
+    pub fn refresh(&mut self, project: &Project) {
+        let key = (self.query.clone(), self.match_case);
+        if self.searched.as_ref() == Some(&key) && self.searched_in.as_ref() == Some(project) {
             return;
         }
         self.hits = find(project, &self.query, self.options());
         self.chosen = vec![true; self.hits.len()];
         self.searched = Some(key);
+        self.searched_in = Some(project.clone());
     }
 
     pub fn options(&self) -> FindOptions {
@@ -64,8 +68,8 @@ impl FindState {
             .collect()
     }
 
-    /// Draw the window. `version` is the project's change count, so the hits follow edits.
-    pub fn show(&mut self, ctx: &egui::Context, project: &Project, version: u64) -> FindOutcome {
+    /// Draw the window. The hits follow every change to `project`.
+    pub fn show(&mut self, ctx: &egui::Context, project: &Project) -> FindOutcome {
         let mut out = FindOutcome::None;
         let mut open = true;
         egui::Window::new("Find and replace")
@@ -86,7 +90,7 @@ impl FindState {
                     ui.end_row();
                 });
                 ui.checkbox(&mut self.match_case, "Match case");
-                self.refresh(project, version);
+                self.refresh(project);
                 ui.separator();
                 if self.query.is_empty() {
                     ui.label("Searches free texts, device tags, wire numbers, potentials and device descriptions on every page.");
@@ -204,18 +208,34 @@ mod tests {
             query: "pump".into(),
             ..Default::default()
         };
-        f.refresh(&p, 1);
+        f.refresh(&p);
         assert_eq!(f.hits.len(), 1);
         f.chosen[0] = false;
-        f.refresh(&p, 1);
+        f.refresh(&p);
         assert!(!f.chosen[0], "the same search keeps the ticks");
         p.pages[0].graphics.clear();
-        f.refresh(&p, 2);
+        f.refresh(&p);
         assert!(f.hits.is_empty(), "a changed project is searched again");
         f.match_case = true;
         f.query = "K1".into();
-        f.refresh(&p, 2);
+        f.refresh(&p);
         assert_eq!(f.chosen_hits().len(), 1);
+    }
+
+    #[test]
+    fn another_project_is_searched_again() {
+        let p = project();
+        let mut f = FindState {
+            query: "pump".into(),
+            ..Default::default()
+        };
+        f.refresh(&p);
+        assert_eq!(f.hits.len(), 1);
+        // Another project in its place (opened, joined or changed by others): no stale hits.
+        let mut q = project();
+        q.pages[0].graphics.clear();
+        f.refresh(&q);
+        assert!(f.hits.is_empty());
     }
 
     #[test]

@@ -2307,7 +2307,7 @@ impl App {
             self.find = None;
             return;
         };
-        match find.show(ctx, &open.project, open.history_count()) {
+        match find.show(ctx, &open.project) {
             find_window::FindOutcome::None => {}
             find_window::FindOutcome::Close => self.find = None,
             find_window::FindOutcome::Go { page, select } => self.show_found(&page, select),
@@ -2323,6 +2323,10 @@ impl App {
             return;
         };
         self.ed.panel = None;
+        if self.ed.page != i {
+            // A wire started on the other page cannot end on this one.
+            self.ed.wire = None;
+        }
         self.ed.page = i;
         self.ed.tool = Tool::Select;
         self.ed.view.fit = true;
