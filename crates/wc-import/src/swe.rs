@@ -361,7 +361,8 @@ fn has_table(conn: &Connection, name: &str) -> Result<bool> {
     .map_err(sql)
 }
 
-/// Tag paths by id from `tew_function` or `tew_location`, when the table is there.
+/// Tag paths by id from `tew_function` or `tew_location`, when the table is there. An empty path
+/// names no aspect, so its row is left out.
 fn tag_paths(conn: &Connection, table: &str, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, String>> {
     let (id, path, what) = match table {
         "tew_function" => ("fun_id", "fun_tagpath", "function"),
@@ -378,6 +379,7 @@ fn tag_paths(conn: &Connection, table: &str, warnings: &mut Vec<String>) -> Resu
         .map_err(sql)?;
     Ok(readable(rows, &format!("{what} tag path"), warnings)
         .into_iter()
+        .filter(|(_, p)| !p.trim().is_empty())
         .collect())
 }
 
@@ -657,8 +659,10 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         let location = loc.and_then(|l| location_paths.get(&l)).map(String::as_str);
         let spaced = c.tag.trim().contains(char::is_whitespace);
         if !has_signs(&c.tag) && (function.is_some() || location.is_some()) {
-            // The product path, else the component's own tag, else the stored path.
-            let product = [product.trim(), c.name.trim()]
+            // The product path, else the component's own tag as one level (a name, not a path:
+            // `X 1/2` is `X_1/2`), else the stored path.
+            let name = c.name.split_whitespace().collect::<Vec<_>>().join("_");
+            let product = [product.trim(), name.as_str()]
                 .into_iter()
                 .find(|s| !s.is_empty())
                 .map_or_else(|| c.tag.clone(), str::to_owned);

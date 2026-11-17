@@ -1420,3 +1420,36 @@ fn a_mirrored_box_turned_90_degrees_has_its_corner_mirrored_too() {
         "{corner:?}"
     );
 }
+
+#[test]
+fn an_empty_function_path_does_not_rebuild_the_stored_tag() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_function (fun_id, fun_tagpath) VALUES (930, '');
+         INSERT INTO tew_component VALUES (530, 'K2', 'K1', -1, NULL, 0, 930, NULL, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(
+        p.components[&530].tag, "K1",
+        "no function resolved, the stored path stays"
+    );
+}
+
+#[test]
+fn a_component_name_used_as_product_stays_one_level() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_function (fun_id, fun_tagpath) VALUES (931, 'F1');
+         INSERT INTO tew_component VALUES (531, 'X 1/2', 'F1 X 1/2', -1, NULL, 0, 931, NULL, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.components[&531].tag, "=F1-X_1/2");
+    let (built, _, _) = build(&p, None);
+    assert!(
+        built.devices.contains_key(&DeviceTag::parse("=F1-X_1_2").unwrap()),
+        "one product level: {:?}",
+        built.devices.keys()
+    );
+}
