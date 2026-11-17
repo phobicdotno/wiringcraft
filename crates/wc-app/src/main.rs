@@ -1286,6 +1286,35 @@ fn size_label(s: PageSize) -> &'static str {
     }
 }
 
+/// The window and taskbar icon (assets/icon, made by tools/gen_icon.py), built into the
+/// program. An unreadable picture gives an empty icon, so the system default shows.
+fn window_icon() -> egui::IconData {
+    const PNG: &[u8] = include_bytes!("../../../assets/icon/wiringcraft-256.png");
+    image::load_from_memory_with_format(PNG, image::ImageFormat::Png)
+        .map(|img| {
+            let img = img.into_rgba8();
+            let (width, height) = img.dimensions();
+            egui::IconData {
+                rgba: img.into_raw(),
+                width,
+                height,
+            }
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("wiringcraft-app: the built-in icon could not be read ({e}); using the system default");
+            egui::IconData::default()
+        })
+}
+
+/// The main window: size, title and icon.
+fn main_viewport() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_inner_size([1400.0, 860.0])
+        .with_min_inner_size([900.0, 560.0])
+        .with_title("WiringCraft")
+        .with_icon(window_icon())
+}
+
 /// The starter symbol library: `library/` beside the executable or in the source tree.
 fn starter_library() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
@@ -1710,11 +1739,24 @@ fn main() -> eframe::Result {
     }
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 860.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("WiringCraft"),
+        viewport: main_viewport(),
         ..Default::default()
     };
     eframe::run_native("WiringCraft", options, Box::new(|cc| Ok(Box::new(App::new(cc, dir)))))
+}
+
+#[cfg(test)]
+mod icon_tests {
+    #[test]
+    fn the_window_icon_is_built_in() {
+        let icon = super::window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
+
+    #[test]
+    fn the_main_window_carries_the_icon() {
+        let icon = super::main_viewport().icon;
+        assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
+    }
 }
