@@ -1863,6 +1863,39 @@ INSERT INTO tew_revision VALUES (1, 1, 'R1'), (2, 10, 'P3');
     let sch = p.pages.iter().find(|pg| pg.id == 10).unwrap();
     assert_eq!(sch.title_block.get("revision").map(String::as_str), Some("P3"));
     assert_eq!(sch.title_block.len(), 1);
+    // The book's row is the project's revision, in the project's title block.
+    assert_eq!(p.revision.get("revision").map(String::as_str), Some("R1"));
+    let (built, _, _) = build(&p, None);
+    assert_eq!(built.title_block.get("revision").map(String::as_str), Some("R1"));
+}
+
+#[test]
+fn the_projects_latest_revision_and_checker_fill_its_title_block() {
+    let c = sample();
+    c.execute_batch(
+        "
+CREATE TABLE tew_revision (rev_id INTEGER, rev_objectid INTEGER, rev_orderno INTEGER, rev_tag TEXT,
+  rev_checkedby TEXT);
+-- Object 1 is the book: order number 2 is its latest revision.
+INSERT INTO tew_revision VALUES (2, 1, 2, 'B', 'Bob'), (1, 1, 1, 'A', 'Ann'), (3, 10, 1, 'P1', 'Cid');
+",
+    )
+    .unwrap();
+    let mut p = read(&c).unwrap();
+    // The project's own fields win; the revision fills only what they leave.
+    p.info = Some(SweProjectInfo {
+        created_by: "Eve".into(),
+        ..Default::default()
+    });
+    let (built, _, _) = build(&p, None);
+    let field = |k: &str| built.title_block.get(k).map(String::as_str);
+    assert_eq!(field("revision"), Some("B"));
+    assert_eq!(field("checked_by"), Some("Bob"));
+    assert_eq!(field("drawn_by"), Some("Eve"));
+    assert_eq!(
+        page(&built, "01").title_block.get("revision").map(String::as_str),
+        Some("P1")
+    );
 }
 
 #[test]

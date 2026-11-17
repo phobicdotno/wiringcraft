@@ -191,6 +191,9 @@ pub struct SweProject {
     /// The project's own fields (name, customer, ...), from the archive's project list. Not in
     /// the project database itself, so a bare database import has none.
     pub info: Option<SweProjectInfo>,
+    /// The project's own latest revision fields (`tew_revision` rows for the book or project,
+    /// not a page). They fill the project's title block where [`Self::info`] leaves a field.
+    pub revision: BTreeMap<String, String>,
     /// The archive's catalog parts ([`library::from_archive`]), set by the caller. Devices and
     /// cables that name one of them are linked to it, and their layout footprints take its size.
     pub catalog: Vec<wc_core::Part>,
@@ -333,18 +336,17 @@ fn column_named<'a>(columns: &'a [String], names: &[&str]) -> Option<&'a str> {
 /// of `pages` (rows for other objects, such as a book, are left out); the latest revision is the
 /// one with the highest order number (else id, else row). A missing table gives nothing; a
 /// table without a page column is reported.
-pub fn page_revisions(
-    conn: &Connection,
-    pages: &BTreeSet<i64>,
-    warnings: &mut Vec<String>,
-) -> Result<BTreeMap<i64, BTreeMap<String, String>>> {
+///
+/// With an object id column, the latest row for an object that is not a page (the book or the
+/// project) is the project's own revision: it comes back as the second value.
+pub fn page_revisions(conn: &Connection, pages: &BTreeSet<i64>, warnings: &mut Vec<String>) -> Result<Revisions> {
     if !has_table(conn, "tew_revision")? {
-        return Ok(BTreeMap::new());
+        return Ok(Revisions::default());
     }
     let cols = columns(conn, "tew_revision")?;
     let Some(page) = column_named(&cols, &["fil_id", "objectid", "object_id", "obj_id", "objid"]) else {
         warnings.push("page revisions were not read: tew_revision has no page or object column".into());
-        return Ok(BTreeMap::new());
+        return Ok(Revisions::default());
     };
     // Title-block key, the column names it may have, and whether it is a date.
     let wanted: [(&str, &[&str], bool); 7] = [
@@ -366,7 +368,7 @@ pub fn page_revisions(
         .collect();
     if found.is_empty() {
         warnings.push("page revisions were not read: tew_revision has no revision, name or date column".into());
-        return Ok(BTreeMap::new());
+        return Ok(Revisions::default());
     }
     let order = column_named(&cols, &["orderno", "no", "id"]).unwrap_or("rowid");
     let quote = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
@@ -392,9 +394,12 @@ pub fn page_revisions(
             Ok((r.get::<_, i64>(0)?, values?))
         })
         .map_err(sql)?;
-    let mut out: BTreeMap<i64, BTreeMap<String, String>> = BTreeMap::new();
+    // A `fil_id` column names files only; an object id column also names the book or project.
+    let by_object = !page.ends_with("fil_id");
+    let mut out = Revisions::default();
     for (id, values) in readable(rows, "page revision", warnings) {
-        if !pages.contains(&id) {
+        let for_page = pages.contains(&id);
+        if !for_page && !by_object {
             continue;
         }
         // Later rows are later revisions: each replaces the page's fields as a whole.
@@ -407,9 +412,20 @@ pub fn page_revisions(
             })
             .filter(|(_, v)| !v.is_empty())
             .collect();
-        out.insert(id, block);
+        if for_page {
+            out.pages.insert(id, block);
+        } else {
+            out.project = block;
+        }
     }
     Ok(out)
+}
+
+/// What [`page_revisions`] read: each page's latest revision fields, and the project's.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Revisions {
+    pub pages: BTreeMap<i64, BTreeMap<String, String>>,
+    pub project: BTreeMap<String, String>,
 }
 
 /// A location (`tew_location`): a cabinet, room or panel.
@@ -728,7 +744,9 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         .map_err(sql)?;
     let page_rows = readable(rows, "page", &mut warnings);
     let page_ids: BTreeSet<i64> = page_rows.iter().map(|r| r.0).collect();
-    let mut revisions = page_revisions(conn, &page_ids, &mut warnings)?;
+    let revisions = page_revisions(conn, &page_ids, &mut warnings)?;
+    p.revision = revisions.project;
+    let mut revisions = revisions.pages;
     for (id, order, kind, label, folder_id, folder_name, frame, book) in page_rows {
         let folder = folder_id.and_then(|f| text.get(&f).cloned()).unwrap_or(folder_name);
         p.pages.push(SwePage {
@@ -1532,6 +1550,9 @@ pub fn build_with(
         title_block: p.info.as_ref().map(SweProjectInfo::title_block).unwrap_or_default(),
         panels: Vec::new(),
     };
+    for (k, v) in &p.revision {
+        built.title_block.entry(k.clone()).or_insert_with(|| v.clone());
+    }
     // Locations, with their descriptions. One without a usable tag path cannot be named.
     let mut locations_untagged = 0;
     for l in &p.locations {
