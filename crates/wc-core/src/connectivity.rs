@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::project::{Endpoint, Project};
+use crate::project::{Endpoint, Page, Project};
 
 /// A pin on a placed symbol: (page id, placed symbol id, pin name).
 pub type PinRef = (String, String, String);
@@ -45,6 +45,19 @@ enum Node {
     Potential(String),
     /// Interruption points sharing a device tag.
     Link(String),
+}
+
+/// Every wire end on a pin of placed symbol `item` of `page`: the pin's name and its node.
+fn wired_pins<'a>(page: &'a Page, item: &'a str) -> impl Iterator<Item = (&'a str, Node)> + 'a {
+    page.wires
+        .iter()
+        .flat_map(|w| [&w.from, &w.to])
+        .filter_map(move |e| match e {
+            Endpoint::Pin { item: i, pin } if i == item => {
+                Some((pin.as_str(), Node::Pin((page.id.clone(), i.clone(), pin.clone()))))
+            }
+            _ => None,
+        })
 }
 
 /// Group every connected pin into nets. Pins with no wire are left out.
@@ -100,18 +113,7 @@ pub fn wire_nets(project: &Project, is_interruption: impl Fn(&str) -> bool) -> (
             }
             // Only interruption points that are wired take part; their pins join under the tag.
             let link = Node::Link(tag.to_string());
-            let wired: Vec<usize> = page
-                .wires
-                .iter()
-                .flat_map(|w| [&w.from, &w.to])
-                .filter_map(|e| match e {
-                    Endpoint::Pin { item, pin } if item == &s.id => {
-                        Some(Node::Pin((page.id.clone(), item.clone(), pin.clone())))
-                    }
-                    _ => None,
-                })
-                .map(|n| id_of(n, &mut dsu))
-                .collect();
+            let wired: Vec<usize> = wired_pins(page, &s.id).map(|(_, n)| id_of(n, &mut dsu)).collect();
             for n in wired {
                 let l = id_of(link.clone(), &mut dsu);
                 dsu.union(n, l);
@@ -127,17 +129,8 @@ pub fn wire_nets(project: &Project, is_interruption: impl Fn(&str) -> bool) -> (
                 if !s.tag.as_ref().is_some_and(|t| j.terminal_of(t).is_some()) {
                     continue;
                 }
-                let wired: Vec<(String, usize)> = page
-                    .wires
-                    .iter()
-                    .flat_map(|w| [&w.from, &w.to])
-                    .filter_map(|e| match e {
-                        Endpoint::Pin { item, pin } if item == &s.id => {
-                            Some((pin.clone(), Node::Pin((page.id.clone(), item.clone(), pin.clone()))))
-                        }
-                        _ => None,
-                    })
-                    .map(|(pin, n)| (pin, id_of(n, &mut dsu)))
+                let wired: Vec<(String, usize)> = wired_pins(page, &s.id)
+                    .map(|(pin, n)| (pin.to_owned(), id_of(n, &mut dsu)))
                     .collect();
                 for (pin, n) in wired {
                     let l = id_of(Node::Link(format!("\u{0}jumper\u{0}{k}\u{0}{pin}")), &mut dsu);

@@ -1982,3 +1982,38 @@ fn file_stem(number: &str, id: &str) -> String {
     let stem = stem.trim_start_matches('.').to_owned();
     if stem.is_empty() { "page".into() } else { stem }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn cli(dir: &Path, args: &[&str]) -> Res<()> {
+        let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
+        all.extend_from_slice(args);
+        run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn jumpers_are_added_listed_and_removed_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let saved = load(&dir).unwrap().meta.jumpers;
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            (&saved[0].strip, saved[0].terminals.as_slice()),
+            (&x1, ["3", "4"].map(String::from).as_slice())
+        );
+        cli(&dir, &["jumper", "list"]).unwrap();
+        cli(&dir, &["jumper", "add", "--", "-X1", "4", "5"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["3", "4", "5"]);
+        cli(&dir, &["jumper", "remove", "--", "-X1", "4"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["3", "5"]);
+        let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
+        assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
+        assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+}

@@ -80,16 +80,21 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
         }
     } else {
         let numbers: Vec<String> = terms.into_iter().map(|(_, n, _)| n).collect();
-        // Only offered when it changes something: not for two placements of one terminal, nor
-        // for terminals already jumpered together.
-        let mut after = open.project.meta.clone();
-        if after.add_jumper(&strip, &numbers).is_ok()
-            && after != open.project.meta
-            && ui
-                .button(format!("Jumper these {} terminals of {strip}", numbers.len()))
-                .clicked()
-        {
-            let _ = open.add_jumper(&strip, &numbers);
+        // Only offered when it changes something; when it cannot be done, say why.
+        match open.jumper_offer(&strip, &numbers) {
+            Ok(true) => {
+                if ui
+                    .button(format!("Jumper these {} terminals of {strip}", numbers.len()))
+                    .clicked()
+                    && let Err(why) = open.add_jumper(&strip, &numbers)
+                {
+                    ui.label(why);
+                }
+            }
+            Ok(false) => {}
+            Err(why) => {
+                ui.weak(format!("No jumper: {why}"));
+            }
         }
     }
 }

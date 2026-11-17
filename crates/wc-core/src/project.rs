@@ -120,10 +120,18 @@ impl ProjectMeta {
     }
 
     /// Jumper `terminals` of `strip` together. Jumpers of the strip that share a terminal with
-    /// them become one. Refused when fewer than two different terminals result.
+    /// them become one. Refused when fewer than two different terminals result, or when a
+    /// terminal cannot be the last level of a tag of the strip (`1.2` would be two levels).
     pub fn add_jumper(&mut self, strip: &DeviceTag, terminals: &[String]) -> Result<(), String> {
         let mut set: Vec<String> = Vec::new();
         for t in terminals.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            let mut tag = strip.clone();
+            tag.product.push(t.to_owned());
+            if DeviceTag::parse(&tag.to_string()).ok().as_ref() != Some(&tag) {
+                return Err(format!(
+                    "{t:?} cannot be a terminal of {strip}: a terminal is one tag level"
+                ));
+            }
             if !set.iter().any(|s| s == t) {
                 set.push(t.to_owned());
             }
@@ -144,17 +152,17 @@ impl ProjectMeta {
                 kept.push(j);
             }
         }
-        set.sort_by_key(|t| natural_key(t));
+        // Equal natural keys (`1`, `01`) fall back to the text, so the order never depends on
+        // the order given.
+        set.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
         kept.push(Jumper {
             strip: strip.clone(),
             terminals: set,
         });
         kept.sort_by(|a, b| {
             a.strip.to_string().cmp(&b.strip.to_string()).then_with(|| {
-                a.terminals
-                    .first()
-                    .map(|t| natural_key(t))
-                    .cmp(&b.terminals.first().map(|t| natural_key(t)))
+                let first = |j: &Jumper| j.terminals.first().map(|t| (natural_key(t), t.clone()));
+                first(a).cmp(&first(b))
             })
         });
         self.jumpers = kept;
@@ -651,6 +659,24 @@ mod tests {
                 at: Point::new(1.0, 2.0)
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn jumper_terminals_are_one_tag_level_and_keep_a_fixed_order() -> Result<(), String> {
+        let x1 = DeviceTag::parse("-X1").map_err(|e| e.to_string())?;
+        let mut m = ProjectMeta::new("t");
+        let refused = m.add_jumper(&x1, &["1.2".into(), "3.4".into()]);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("one tag level")),
+            "{refused:?}"
+        );
+        assert!(m.jumpers.is_empty(), "nothing saved");
+        m.add_jumper(&x1, &["1".into(), "01".into()])?;
+        let once = m.clone();
+        m.add_jumper(&x1, &["01".into(), "1".into()])?;
+        assert_eq!(m, once, "the same terminals in another order change nothing");
+        assert_eq!(m.jumpers[0].terminals, ["01", "1"]);
         Ok(())
     }
 }

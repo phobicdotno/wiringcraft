@@ -668,6 +668,14 @@ impl Open {
         Ok(())
     }
 
+    /// Whether jumpering `terminals` of `strip` is worth offering: `Ok(true)` when it changes the
+    /// jumpers, `Ok(false)` when they are already jumpered together, the reason when refused.
+    pub fn jumper_offer(&self, strip: &DeviceTag, terminals: &[String]) -> Result<bool, String> {
+        let mut after = self.project.meta.clone();
+        after.add_jumper(strip, terminals)?;
+        Ok(after != self.project.meta)
+    }
+
     /// Take a terminal of a strip out of its jumper, as one undo step. Returns whether it was in one.
     pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
         let mut meta = self.project.meta.clone();
@@ -1054,6 +1062,21 @@ pub(crate) mod tests {
         assert!(!o.remove_from_jumper(&x1, "1"));
         assert!(o.undo());
         assert_eq!(o.project.meta.jumpers.len(), 1);
+    }
+
+    #[test]
+    fn the_jumper_button_is_offered_only_when_it_changes_something() {
+        let (_tmp, mut o) = project();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let v = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            o.jumper_offer(&x1, &v(&["1", "1"])).is_err(),
+            "two placements of one terminal"
+        );
+        assert_eq!(o.jumper_offer(&x1, &v(&["1", "2"])), Ok(true));
+        o.add_jumper(&x1, &v(&["1", "2"])).unwrap();
+        assert_eq!(o.jumper_offer(&x1, &v(&["1", "2"])), Ok(false), "already jumpered");
+        assert_eq!(o.jumper_offer(&x1, &v(&["2", "3"])), Ok(true));
     }
 
     #[test]
