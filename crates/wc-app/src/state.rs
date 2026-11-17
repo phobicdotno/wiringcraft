@@ -149,6 +149,9 @@ pub struct Open {
     pub branch: String,
     /// Underlay pictures loaded as textures, by file; `None` when the file cannot be shown.
     pub underlays: BTreeMap<String, Option<egui::TextureHandle>>,
+    /// Why a picture in `underlays` has no texture, by file: missing, unreadable, outside the
+    /// project, or not a picture.
+    pub picture_problems: BTreeMap<String, String>,
     /// The terminal numbering before the change in progress (taken at its checkpoint), so
     /// jumpers can follow their terminals once it is done.
     terminals_before: Option<wc_core::project::TerminalNumbers>,
@@ -195,6 +198,7 @@ impl Open {
             form_step: None,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
+            picture_problems: BTreeMap::new(),
             terminals_before: None,
             held_by_others: BTreeMap::new(),
             symbol_versions: BTreeMap::new(),
@@ -221,29 +225,36 @@ impl Open {
     }
 
     /// The texture for a picture file in the project (an underlay or the logo), loaded on first
-    /// use; `None` when it is missing, outside the project or not a picture.
+    /// use; `None` when it is missing, outside the project or not a picture, with the reason in
+    /// [`Open::picture_problems`].
     pub fn picture_texture(&mut self, ctx: &egui::Context, file: &str) -> Option<egui::TextureHandle> {
         if let Some(t) = self.underlays.get(file) {
             return t.clone();
         }
         let max_side = ctx.input(|i| i.max_texture_side).max(1) as u32;
-        let tex = wc_pdf::read_picture(&self.dir, file)
-            .ok()
-            .flatten()
-            .and_then(|bytes| image::load_from_memory(&bytes).ok())
-            .map(|img| {
-                if img.width() > max_side || img.height() > max_side {
+        let img = match wc_pdf::read_picture(&self.dir, file) {
+            Ok(Some(bytes)) => image::load_from_memory(&bytes).map_err(|e| format!("not a picture: {e}")),
+            Ok(None) => Err("the file is missing".to_owned()),
+            Err(why) => Err(why),
+        };
+        let tex = match img {
+            Ok(img) => {
+                self.picture_problems.remove(file);
+                let img = if img.width() > max_side || img.height() > max_side {
                     img.resize(max_side, max_side, image::imageops::FilterType::Triangle)
                 } else {
                     img
-                }
-            })
-            .map(|img| {
+                };
                 let rgba = img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
                 let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                ctx.load_texture(format!("picture:{file}"), pixels, egui::TextureOptions::LINEAR)
-            });
+                Some(ctx.load_texture(format!("picture:{file}"), pixels, egui::TextureOptions::LINEAR))
+            }
+            Err(why) => {
+                self.picture_problems.insert(file.to_owned(), why);
+                None
+            }
+        };
         self.underlays.insert(file.to_owned(), tex.clone());
         tex
     }
@@ -278,6 +289,17 @@ impl Open {
         };
         let folder = self.dir.join(wc_core::Logo::DIR);
         std::fs::create_dir_all(&folder).map_err(|e| format!("Cannot create {}: {e}", folder.display()))?;
+        // The folder may be a link: the copy must still land inside the project.
+        let real = |p: &Path| {
+            p.canonicalize()
+                .map_err(|e| format!("Cannot find {}: {e}", p.display()))
+        };
+        if !real(&folder)?.starts_with(real(&self.dir)?) {
+            return Err(format!(
+                "{} leads out of the project folder; the logo is not copied there.",
+                folder.display()
+            ));
+        }
         let mut n = 1;
         let file = loop {
             let name = if n == 1 {
@@ -2104,6 +2126,46 @@ pub(crate) mod tests {
 
     fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_logo_is_not_copied_through_a_pictures_link_out_of_the_project() {
+        let (tmp, mut o) = project();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, o.dir.join(wc_core::Logo::DIR)).unwrap();
+        let src = tmp.path().join("logo.png");
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3])))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&src, png).unwrap();
+        let err = o.set_logo_from(&src).unwrap_err();
+        assert!(err.contains("out of the project"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "nothing written outside"
+        );
+        assert!(o.project.meta.logo.is_none());
+    }
+
+    #[test]
+    fn a_logo_that_cannot_be_shown_keeps_the_reason() {
+        let (_tmp, mut o) = project();
+        let ctx = egui::Context::default();
+        assert!(o.picture_texture(&ctx, "pictures/none.png").is_none());
+        assert_eq!(
+            o.picture_problems.get("pictures/none.png").map(String::as_str),
+            Some("the file is missing")
+        );
+        std::fs::create_dir_all(o.dir.join("pictures")).unwrap();
+        std::fs::write(o.dir.join("pictures/bad.png"), "not a picture").unwrap();
+        assert!(o.picture_texture(&ctx, "pictures/bad.png").is_none());
+        assert!(o.picture_problems["pictures/bad.png"].starts_with("not a picture"));
+        assert!(o.picture_texture(&ctx, "../x.png").is_none());
+        assert!(o.picture_problems["../x.png"].contains("not inside the project"));
     }
 
     #[test]

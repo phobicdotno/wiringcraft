@@ -1059,10 +1059,14 @@ fn paint_logo(
             None => {
                 let area = Rect::from_two_pos(xf.s(b.0), xf.s(b.1));
                 p.rect_stroke(area, 0.0, Stroke::new(1.0_f32, t.faint), egui::StrokeKind::Inside);
+                let label = match open.picture_problems.get(&file).map(String::as_str) {
+                    None | Some("the file is missing") => "Logo missing".to_owned(),
+                    Some(why) => format!("Logo cannot be shown: {why}"),
+                };
                 p.text(
                     area.center(),
                     Align2::CENTER_CENTER,
-                    "Logo missing",
+                    label,
                     FontId::proportional(xf.len(2.0).clamp(8.0, 13.0)),
                     t.faint,
                 );
