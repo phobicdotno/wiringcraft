@@ -800,6 +800,10 @@ impl wc_agent::Tools for AppTools<'_> {
     }
 
     fn run(&mut self, name: &str, input: &Value) -> Result<String, String> {
+        // The previous tool's change is followed first, so this one sees the jumpers right.
+        if let Some(o) = self.0.open.as_mut() {
+            o.follow_terminals();
+        }
         let r = self.0.agent_tool(name, input);
         // Items the assistant removed must not stay selected.
         self.0.prune_selection();
@@ -807,6 +811,10 @@ impl wc_agent::Tools for AppTools<'_> {
     }
 
     fn start(&mut self, name: &str, input: &Value) -> Started {
+        // As in `run`: the previous tool's change is followed before this one starts.
+        if let Some(o) = self.0.open.as_mut() {
+            o.follow_terminals();
+        }
         let r = self.0.agent_start(name, input);
         if matches!(r, Started::Done(_)) {
             self.0.prune_selection();
@@ -2089,6 +2097,8 @@ impl App {
         let fresh = Open::load(&open.dir)?;
         // Symbols the command added or changed come in; symbols the window vendored meanwhile
         // (not saved yet, so not on disk) stay.
+        // Pending window changes follow their terminals under the roles they were made with.
+        open.follow_terminals();
         open.symbols.extend(fresh.symbols);
         open.branch = fresh.branch;
         let by_command = fresh.project != base;
@@ -2100,8 +2110,12 @@ impl App {
                  not loaded: the window's edits are kept, and saving writes them over the command's result.",
             );
         } else if by_command {
+            // The roles may have changed with the command: nothing is left to follow for the
+            // undo snapshot, which keeps the drawing and its jumpers as they were.
+            open.forget_terminal_change();
             open.checkpoint();
             open.project = fresh.project;
+            open.forget_terminal_change();
             open.dirty = false;
         }
         open.refresh_library();

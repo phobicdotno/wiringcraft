@@ -57,6 +57,45 @@ pub fn next_number(last: &mut u64) -> Option<String> {
     Some(last.to_string())
 }
 
+/// Keep the jumpers of `project` on their terminals after a change: `before` is the
+/// [`terminal_numbers`] from before it. A terminal that is still placed but no longer numbered
+/// (its page became an overview) counts as unchanged, not deleted. Returns whether a jumper
+/// changed.
+pub fn follow_terminals_in(
+    project: &mut Project,
+    before: &TerminalNumbers,
+    role: impl Fn(&str) -> Option<SymbolRole>,
+) -> bool {
+    if project.meta.jumpers.is_empty() {
+        return false;
+    }
+    let mut after = terminal_numbers(project, role);
+    let taken: std::collections::BTreeSet<(DeviceTag, String)> = after.values().cloned().collect();
+    for (key, was) in before {
+        // Only a page turned into an overview keeps its terminals' numbers; a symbol that is no
+        // longer a terminal leaves its jumper like a deleted one.
+        let on_overview = project
+            .page(&key.0)
+            .is_some_and(|pg| pg.overview && pg.symbols.iter().any(|s| s.id == key.1));
+        // Its old number now belongs to another terminal (strip-only terminals renumbered
+        // without the overview page): it is no longer that terminal, and leaves its jumper.
+        if on_overview && !after.contains_key(key) && !taken.contains(was) {
+            after.insert(key.clone(), was.clone());
+        }
+    }
+    project.meta.follow_terminals(before, &after)
+}
+
+/// Whether a placed symbol with `tag` and symbol `role` counts as a terminal: a terminal symbol,
+/// or a symbol of unknown role tagged with a terminal level (`-X1.4`).
+pub fn is_terminal(tag: &DeviceTag, role: Option<SymbolRole>) -> bool {
+    let terminal = match role {
+        Some(r) => r == SymbolRole::Terminal,
+        None => tag.product.len() > 1,
+    };
+    terminal && !tag.product.is_empty()
+}
+
 /// Which terminal of which strip each placed terminal is, keyed by (page id, symbol id).
 pub type TerminalNumbers = BTreeMap<(String, String), (DeviceTag, String)>;
 
@@ -76,11 +115,7 @@ pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolR
     for (pi, page) in project.pages.iter().enumerate().filter(|(_, p)| !p.overview) {
         for s in &page.symbols {
             let Some(tag) = &s.tag else { continue };
-            let terminal = match role(&s.symbol) {
-                Some(r) => r == SymbolRole::Terminal,
-                None => tag.product.len() > 1,
-            };
-            if !terminal || tag.product.is_empty() {
+            if !is_terminal(tag, role(&s.symbol)) {
                 continue;
             }
             let mut strip = tag.clone();
@@ -376,6 +411,84 @@ impl ProjectMeta {
         }
         self.jumpers.retain(|j| j.terminals.len() >= 2);
         changed
+    }
+
+    /// Keep every jumper on the same placed terminals after the drawing changed: `before` and
+    /// `after` are [`terminal_numbers`] of the project before and after the change. A terminal
+    /// that got another number (renamed, or a strip-only terminal moved past another) keeps its
+    /// place in the jumper under the new number; when all of a jumper's terminals went to one
+    /// other strip (the strip was renamed) the jumper goes with them; a terminal that went to
+    /// another strip on its own, or was deleted, leaves the jumper. Terminals that were not drawn
+    /// stay as they are. Returns whether anything changed.
+    pub fn follow_terminals(&mut self, before: &TerminalNumbers, after: &TerminalNumbers) -> bool {
+        /// What became of a jumpered terminal.
+        enum Went {
+            NotDrawn,
+            Deleted,
+            To(DeviceTag, String),
+        }
+        let old = std::mem::take(&mut self.jumpers);
+        for j in &old {
+            let went: Vec<(String, Went)> = j
+                .terminals
+                .iter()
+                .map(|t| {
+                    let keys: Vec<&(String, String)> = before
+                        .iter()
+                        .filter(|(_, (s, n))| *s == j.strip && n == t)
+                        .map(|(k, _)| k)
+                        .collect();
+                    if keys.is_empty() {
+                        return (t.clone(), Went::NotDrawn);
+                    }
+                    // A placement that kept its number means the terminal is still there.
+                    let same = (j.strip.clone(), t.clone());
+                    let to = if keys.iter().any(|k| after.get(*k) == Some(&same)) {
+                        Some(same)
+                    } else {
+                        keys.iter().find_map(|k| after.get(*k).cloned())
+                    };
+                    (t.clone(), to.map_or(Went::Deleted, |(s, n)| Went::To(s, n)))
+                })
+                .collect();
+            let mut strips: std::collections::BTreeSet<&DeviceTag> = went
+                .iter()
+                .filter_map(|(_, w)| match w {
+                    Went::To(s, _) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            // Terminals that are not drawn stay on their strip, so the jumper only moves when
+            // every member went to the same other strip.
+            if went.iter().any(|(_, w)| matches!(w, Went::NotDrawn)) {
+                strips.insert(&j.strip);
+            }
+            let strip = match strips.iter().next() {
+                Some(only) if strips.len() == 1 => (*only).clone(),
+                _ => j.strip.clone(),
+            };
+            let terminals: Vec<String> = went
+                .into_iter()
+                .filter_map(|(t, w)| match w {
+                    Went::NotDrawn => Some(t),
+                    Went::To(s, n) => (s == strip).then_some(n),
+                    Went::Deleted => None,
+                })
+                .collect();
+            // One terminal left is no jumper.
+            let mut distinct = terminals.clone();
+            distinct.sort();
+            distinct.dedup();
+            if distinct.len() < 2 {
+                continue;
+            }
+            // Jumpers that now share a terminal become one. A number that cannot be a terminal
+            // of the strip is refused there; the jumper is then kept as it was, not dropped.
+            if self.add_jumper(&strip, &terminals).is_err() {
+                self.jumpers.push(j.clone());
+            }
+        }
+        self.jumpers != old
     }
 
     /// The jumper a terminal (`-X1.4`) is in, if any.
@@ -973,6 +1086,100 @@ mod tests {
         m.add_jumper(&x1, &["01".into(), "1".into()])?;
         assert_eq!(m, once, "the same terminals in another order change nothing");
         assert_eq!(m.jumpers[0].terminals, ["01", "1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn jumpers_follow_renamed_moved_and_deleted_terminals() -> Result<(), String> {
+        let t = |s: &str| DeviceTag::parse(s).map_err(|e| e.to_string());
+        let key = |id: &str| ("a".to_owned(), id.to_owned());
+        let nums = |v: &[(&str, &str, &str)]| -> Result<TerminalNumbers, String> {
+            v.iter()
+                .map(|(id, s, n)| Ok((key(id), (t(s)?, (*n).to_owned()))))
+                .collect()
+        };
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        let x1 = t("-X1")?;
+        let before = nums(&[("a", "-X1", "3"), ("b", "-X1", "4"), ("c", "-X1", "5")])?;
+        let jumpered = || -> Result<ProjectMeta, String> {
+            let mut m = ProjectMeta::new("t");
+            m.add_jumper(&x1, &s(&["3", "4"]))?;
+            Ok(m)
+        };
+        // Renamed within the strip: 3 becomes 7.
+        let mut m = jumpered()?;
+        assert!(m.follow_terminals(
+            &before,
+            &nums(&[("a", "-X1", "7"), ("b", "-X1", "4"), ("c", "-X1", "5")])?
+        ));
+        assert_eq!(m.jumpers[0].terminals, s(&["4", "7"]));
+        // Strip-only terminals moved: a and c swap their numbers; the jumper stays on a and b.
+        let mut m = jumpered()?;
+        m.follow_terminals(
+            &before,
+            &nums(&[("a", "-X1", "5"), ("b", "-X1", "4"), ("c", "-X1", "3")])?,
+        );
+        assert_eq!(m.jumpers[0].terminals, s(&["4", "5"]));
+        // Deleted: one terminal left is no jumper.
+        let mut m = jumpered()?;
+        m.follow_terminals(&before, &nums(&[("a", "-X1", "3"), ("c", "-X1", "5")])?);
+        assert!(m.jumpers.is_empty());
+        // The whole strip renamed: the jumper goes with it.
+        let mut m = jumpered()?;
+        m.follow_terminals(&before, &nums(&[("a", "-X2", "3"), ("b", "-X2", "4")])?);
+        assert_eq!(
+            (&m.jumpers[0].strip, m.jumpers[0].terminals.clone()),
+            (&t("-X2")?, s(&["3", "4"]))
+        );
+        // One terminal moved to another strip: it leaves the jumper.
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&["3", "4", "5"]))?;
+        m.follow_terminals(
+            &before,
+            &nums(&[("a", "-X9", "1"), ("b", "-X1", "4"), ("c", "-X1", "5")])?,
+        );
+        assert_eq!(
+            (&m.jumpers[0].strip, m.jumpers[0].terminals.clone()),
+            (&x1, s(&["4", "5"]))
+        );
+        // Only one member drawn, and it moved to another strip: the undrawn ones stay on X1.
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&["3", "8", "9"]))?;
+        m.follow_terminals(&nums(&[("a", "-X1", "3")])?, &nums(&[("a", "-X9", "1")])?);
+        assert_eq!(m.jumpers.len(), 1);
+        assert_eq!(
+            (&m.jumpers[0].strip, m.jumpers[0].terminals.clone()),
+            (&x1, s(&["8", "9"]))
+        );
+        // Nothing changed: nothing to do; a terminal that is not drawn stays.
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&["4", "8"]))?;
+        assert!(!m.follow_terminals(&before, &before));
+        Ok(())
+    }
+
+    #[test]
+    fn a_terminal_drawn_twice_stays_while_one_drawing_keeps_its_number() -> Result<(), String> {
+        let t = |s: &str| DeviceTag::parse(s).map_err(|e| e.to_string());
+        let key = |id: &str| ("a".to_owned(), id.to_owned());
+        let x1 = t("-X1")?;
+        let before: TerminalNumbers = [
+            (key("a1"), (x1.clone(), "3".to_owned())),
+            (key("a2"), (x1.clone(), "3".to_owned())),
+            (key("b"), (x1.clone(), "4".to_owned())),
+        ]
+        .into();
+        // The second drawing of 3 is renamed to 7; the first is still 3.
+        let after: TerminalNumbers = [
+            (key("a1"), (x1.clone(), "3".to_owned())),
+            (key("a2"), (x1.clone(), "7".to_owned())),
+            (key("b"), (x1.clone(), "4".to_owned())),
+        ]
+        .into();
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &["3".into(), "4".into()])?;
+        assert!(!m.follow_terminals(&before, &after));
+        assert_eq!(m.jumpers[0].terminals, ["3", "4"]);
         Ok(())
     }
 }

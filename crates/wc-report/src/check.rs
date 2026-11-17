@@ -237,6 +237,33 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
         }
     }
 
+    // Jumpers naming a terminal that is drawn nowhere join nothing there.
+    if !p.meta.jumpers.is_empty() {
+        let numbers = wc_core::project::terminal_numbers(p, role);
+        for j in &p.meta.jumpers {
+            for t in &j.terminals {
+                let on_overview = || {
+                    p.pages.iter().filter(|pg| pg.overview).any(|pg| {
+                        pg.symbols.iter().any(|s| {
+                            s.tag.as_ref().is_some_and(|tag| {
+                                wc_core::project::is_terminal(tag, role(&s.symbol))
+                                    && j.terminal_of(tag) == Some(t.as_str())
+                            })
+                        })
+                    })
+                };
+                if !numbers.values().any(|(s, n)| *s == j.strip && n == t) && !on_overview() {
+                    out.push(Finding {
+                        severity: Severity::Warning,
+                        page_id: None,
+                        item: None,
+                        message: format!("jumper of {}: terminal {t} is drawn nowhere", j.strip),
+                    });
+                }
+            }
+        }
+    }
+
     // Shorts: one net carrying two potential names (for example L1 and L2).
     let nets = wc_core::connectivity::nets_linked(p, |id| i.symbols.get(id).map(|s| s.role));
     for n in nets {

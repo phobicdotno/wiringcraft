@@ -616,3 +616,47 @@ fn marking_list_drops_repeated_terminals_even_between_equal_sorting_numbers() {
     assert_eq!(ones, 1, "{x1:?}");
     assert_eq!(x1.iter().filter(|n| **n == "01").count(), 1, "{x1:?}");
 }
+
+#[test]
+fn check_names_a_jumper_terminal_drawn_nowhere() {
+    let (mut p, s, parts) = fixture();
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    p.meta.add_jumper(&x1, &["1".into(), "2".into(), "9".into()]).unwrap();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<String> = check(&i).into_iter().map(|f| f.message).collect();
+    assert!(
+        found.iter().any(|m| m == "jumper of -X1: terminal 9 is drawn nowhere"),
+        "{found:?}"
+    );
+    assert!(!found.iter().any(|m| m.contains("terminal 1 is drawn nowhere")));
+}
+
+#[test]
+fn only_a_terminal_on_an_overview_page_counts_as_drawn_for_a_jumper() {
+    let (mut p, s, parts) = fixture();
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    p.meta.add_jumper(&x1, &["1".into(), "9".into()]).unwrap();
+    let mut overview = Page::new("p9", "9", "Overview");
+    overview.overview = true;
+    // A coil tagged like terminal 9 is no terminal 9.
+    overview.symbols.push(place("s30", "coil", 100.0, Some("-X1.9")));
+    p.pages.push(overview);
+    let warned = |p: &wc_core::Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .any(|f| f.message == "jumper of -X1: terminal 9 is drawn nowhere")
+    };
+    assert!(warned(&p), "a coil does not draw the terminal");
+    // A real terminal there does.
+    p.pages.last_mut().unwrap().symbols[0].symbol = "term".into();
+    assert!(!warned(&p), "an overview terminal counts");
+}

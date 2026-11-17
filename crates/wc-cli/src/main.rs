@@ -567,8 +567,20 @@ fn load(dir: &Path) -> Res<Project> {
     store::load(dir).map_err(e)
 }
 
+/// Save the project. Jumpers first follow their terminals: what the command renamed, moved or
+/// deleted is found by comparing with the project as it is on disk.
 fn save(dir: &Path, p: &Project) -> Res<()> {
-    store::save(dir, p).map(|_| ()).map_err(e)
+    let mut p = p.clone();
+    // A new project has nothing on disk to compare with; any other load failure is reported.
+    let on_disk = dir.join(store::PROJECT_FILE).exists();
+    if !p.meta.jumpers.is_empty() && on_disk {
+        let old = store::load(dir).map_err(|err| format!("jumpers not updated: {}", e(err)))?;
+        let (old_symbols, _) = store::vendored_symbols(dir, &old);
+        let before = wc_core::project::terminal_numbers(&old, |id| old_symbols.get(id).map(|s| s.role));
+        let (symbols, _) = store::vendored_symbols(dir, &p);
+        wc_core::project::follow_terminals_in(&mut p, &before, |id| symbols.get(id).map(|s| s.role));
+    }
+    store::save(dir, &p).map(|_| ()).map_err(e)
 }
 
 /// The `location list` output: one location per line, `+path`, then a tab and the description
@@ -2440,6 +2452,33 @@ mod tests {
         let src = |id: &str| p.lock.symbols[id].source.clone();
         assert_eq!((src("wc.coil"), src("wc.lamp")), ("starter".into(), "starter".into()));
         assert_eq!(src("swe.fuse.1"), "import:x.db");
+    }
+
+    #[test]
+    fn saving_from_the_command_line_keeps_jumpers_on_renamed_terminals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let page = &mut p.pages[0];
+        for (id, tag) in [("t3", "-X1.3"), ("t4", "-X1.4")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0, 10.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: DeviceTag::parse(tag).ok(),
+            });
+        }
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["3".into(), "4".into()]).unwrap();
+        save(&dir, &p).unwrap();
+        // A command renames -X1.3 to -X1.7.
+        let mut p = load(&dir).unwrap();
+        p.pages[0].symbols[0].tag = DeviceTag::parse("-X1.7").ok();
+        save(&dir, &p).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["4", "7"]);
     }
 
     #[test]
