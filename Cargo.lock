@@ -3726,6 +3726,7 @@ name = "wc-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rusqlite",
  "serde_json",
  "sevenz-rust2",
  "tempfile",
@@ -3736,6 +3737,7 @@ dependencies = [
  "wc-report",
  "wc-vcs",
  "winresource",
+ "zip",
 ]
 
 [[package]]

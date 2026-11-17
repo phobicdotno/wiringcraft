@@ -25,6 +25,9 @@ serde_json.workspace = true
 tempfile.workspace = true
 # Tests write an EDZ archive.
 sevenz-rust2 = { workspace = true, features = ["compress"] }
+# Tests write a SolidWorks Electrical archive with library databases.
+rusqlite.workspace = true
+zip.workspace = true
 
 [lints]
 workspace = true

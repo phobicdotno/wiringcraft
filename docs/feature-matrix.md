@@ -163,7 +163,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | Cables as devices with cores | yes | yes | yes | done |
 | Cable list report | yes | yes | yes | done |
-| Cable types from the catalog | yes | yes | partly: the part names the type | todo (#62 for SWE catalog) |
+| Cable types from the catalog | yes | yes | yes: cable types as parts with their cores, from SolidWorks archives (`import swe-library`) | done (#62) |
 | Cable routing through ducts and length calculation | add-on (Pro Panel) | yes (3D) | no | later (with the SolidCraft export, phase 5) |
 
 ## 9. PLC
@@ -216,7 +216,7 @@ For the other areas, the chapter to read in each help is:
 | DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | yes: sampled curves, solid hatches filled | done |
 | DWG read and write | yes | yes | no | not planned: closed format; DXF covers it. SWE DWGs are #59 |
 | Import EPLAN projects | - | yes (some) | yes | done |
-| Import SolidWorks Electrical projects | no | - | yes | done; follow-ups #59, #60, #61, #62, #71, #108 |
+| Import SolidWorks Electrical projects | no | - | yes | done; library parts, cable types and symbol blocks with `import swe-library` (#62); follow-ups #59, #60, #61, #108 |
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |
 | AutomationML export | yes | partly | yes | done |
 | List exchange as CSV (import and export) | yes | yes | yes | done |
