@@ -216,7 +216,7 @@ For the other areas, the chapter to read in each help is:
 | DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | no | todo (#95) |
 | DWG read and write | yes | yes | no | not planned: closed format; DXF covers it. SWE DWGs are #59 |
 | Import EPLAN projects | - | yes (some) | yes | done |
-| Import SolidWorks Electrical projects | no | - | yes | done; follow-ups #59, #60, #61, #62, #70, #71, #103 |
+| Import SolidWorks Electrical projects | no | - | yes | done; follow-ups #59, #60, #61, #62, #71, #108 |
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |
 | AutomationML export | yes | partly | yes | done |
 | List exchange as CSV (import and export) | yes | yes | yes | done |
