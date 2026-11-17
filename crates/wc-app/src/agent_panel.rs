@@ -199,6 +199,9 @@ impl App {
                 let entries = bridge.poll(&mut AppTools(self));
                 self.assistant.login_log.extend(entries);
             } else {
+                // A call already running on a worker thread is still completed.
+                let entries = bridge.poll_running(&mut AppTools(self));
+                self.assistant.login_log.extend(entries);
                 bridge.refuse("Stopped by the user: no turn is running in WiringCraft.");
             }
             self.assistant.bridge = Some(bridge);
@@ -229,7 +232,13 @@ impl App {
                 open.squash_undo(mark);
             }
         }
-        if self.assistant.busy() {
+        if self.assistant.busy()
+            || self
+                .assistant
+                .bridge
+                .as_ref()
+                .is_some_and(wc_agent::bridge::Bridge::working)
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }

@@ -5,11 +5,14 @@
 //! This crate knows nothing about the editor. It owns the conversation, the HTTP calls (made on
 //! a background thread so the window never freezes) and the tool loop; the app supplies the
 //! tools through [`Tools`] and runs them on its own thread, so every change shows up on the
-//! canvas as it happens.
+//! canvas as it happens. A tool that waits on another program hands back a [`Pending`] from
+//! [`Tools::start`] instead; it runs on a worker thread and [`Tools::finish`] applies its result
+//! on the window thread, so the window keeps drawing meanwhile.
 
 pub mod acp;
 pub mod bridge;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
@@ -425,11 +428,88 @@ pub trait Tools {
     fn specs(&self) -> Vec<Value>;
     /// Run one tool. `Ok` is the result text, `Err` an error the model should see.
     fn run(&mut self, name: &str, input: &Value) -> Result<String, String>;
+    /// Start one tool. A tool that waits on another program returns [`Started::Running`]; the
+    /// caller keeps polling and hands its result to [`Tools::finish`] on the same thread. The
+    /// default runs the tool straight away.
+    fn start(&mut self, name: &str, input: &Value) -> Started {
+        Started::Done(self.run(name, input))
+    }
+    /// Complete a call that [`Tools::start`] left running, with what its worker returned.
+    fn finish(&mut self, name: &str, input: &Value, result: Result<String, String>) -> Result<String, String> {
+        let _ = (name, input);
+        result
+    }
     /// A short line for the panel describing a call, e.g. `place_symbol wc.contact.no on page 2`.
     fn describe(&self, name: &str, input: &Value) -> String {
         let _ = input;
         name.to_owned()
     }
+}
+
+/// What [`Tools::start`] did with a call.
+pub enum Started {
+    /// It ran; this is its result.
+    Done(Result<String, String>),
+    /// It runs on a worker thread.
+    Running(Pending),
+}
+
+/// A tool's work running on a worker thread.
+pub struct Pending(Receiver<Result<String, String>>);
+
+impl Pending {
+    /// Run `work` on a new thread.
+    pub fn spawn(work: impl FnOnce() -> Result<String, String> + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("wiringcraft-tool".into())
+            .spawn(move || {
+                let _ = tx.send(work());
+            });
+        if let Err(e) = spawned {
+            let (tx, rx) = mpsc::channel();
+            let _ = tx.send(Err(format!("Could not start the tool: {e}")));
+            return Self(rx);
+        }
+        Self(rx)
+    }
+
+    /// The result, once the work is done.
+    pub fn try_take(&self) -> Option<Result<String, String>> {
+        match self.0.try_recv() {
+            Ok(r) => Some(r),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("The tool stopped without an answer.".into())),
+        }
+    }
+
+    /// Wait for the result.
+    pub fn wait(self) -> Result<String, String> {
+        self.0
+            .recv()
+            .unwrap_or_else(|_| Err("The tool stopped without an answer.".into()))
+    }
+}
+
+/// Run a call to the end on this thread: start it, wait if it went to a worker, finish it.
+pub fn run_to_end(tools: &mut dyn Tools, name: &str, input: &Value) -> Result<String, String> {
+    match tools.start(name, input) {
+        Started::Done(r) => r,
+        Started::Running(p) => {
+            let r = p.wait();
+            tools.finish(name, input, r)
+        }
+    }
+}
+
+/// The tool calls of one reply, run one after another (a call can depend on the one before).
+struct Batch {
+    calls: VecDeque<ToolCall>,
+    results: Vec<(String, Result<String, String>)>,
+    stop: Stop,
+    can_go_on: bool,
+    /// The call running on a worker thread, with its panel line.
+    running: Option<(ToolCall, String, Pending)>,
 }
 
 /// A line in the assistant panel.
@@ -464,6 +544,8 @@ pub struct Session {
     pub log: Vec<Entry>,
     transport: Arc<dyn Transport>,
     pending: Option<Receiver<Result<Value, String>>>,
+    /// Tool calls of the last reply still to run or finish.
+    batch: Option<Batch>,
     rounds: usize,
     stop: bool,
     /// Text given back after a failed first request, for the input box.
@@ -479,6 +561,7 @@ impl Session {
             log: Vec::new(),
             transport,
             pending: None,
+            batch: None,
             rounds: 0,
             stop: false,
             returned: None,
@@ -488,7 +571,7 @@ impl Session {
     }
 
     pub fn busy(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.batch.is_some()
     }
 
     /// Start a fresh conversation (keeps the transport).
@@ -496,6 +579,7 @@ impl Session {
         self.conversation = Conversation::default();
         self.log.clear();
         self.pending = None;
+        self.batch = None;
         self.stop = false;
         self.returned = None;
     }
@@ -553,64 +637,114 @@ impl Session {
     }
 
     /// Look for an answer; run its tools and send the results when the model wants more.
-    /// With `block`, wait for the answer (for tests and scripts).
+    /// With `block`, wait for the answer and for tools on worker threads (for tests and scripts).
     pub fn poll(&mut self, tools: &mut dyn Tools, settings: &Settings, system: &str, block: bool) -> Polled {
-        let Some(rx) = &self.pending else {
-            return Polled::default();
-        };
-        let got = if block {
-            rx.recv().map_err(|_| TryRecvError::Disconnected)
-        } else {
-            rx.try_recv()
-        };
-        let result = match got {
-            Ok(r) => r,
-            Err(TryRecvError::Empty) => return Polled::default(),
-            Err(TryRecvError::Disconnected) => Err("The request was lost.".into()),
-        };
-        self.pending = None;
-        let mut out = Polled {
-            changed: true,
-            ..Default::default()
-        };
-        let reply = match result.and_then(|v| self.conversation.absorb(&v)) {
-            Ok(r) => r,
-            Err(e) => {
-                self.log.push(Entry::Error(e));
-                self.returned = self.conversation.take_unanswered();
-                out.finished = true;
+        let mut out = Polled::default();
+        if self.batch.is_none() {
+            let Some(rx) = &self.pending else {
                 return out;
+            };
+            let got = if block {
+                rx.recv().map_err(|_| TryRecvError::Disconnected)
+            } else {
+                rx.try_recv()
+            };
+            let result = match got {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => return out,
+                Err(TryRecvError::Disconnected) => Err("The request was lost.".into()),
+            };
+            self.pending = None;
+            out.changed = true;
+            let reply = match result.and_then(|v| self.conversation.absorb(&v)) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.log.push(Entry::Error(e));
+                    self.returned = self.conversation.take_unanswered();
+                    out.finished = true;
+                    return out;
+                }
+            };
+            self.input_tokens += reply.input_tokens;
+            self.output_tokens += reply.output_tokens;
+            for t in &reply.text {
+                self.log.push(Entry::Assistant(t.clone()));
             }
+            if !reply.model.is_empty() && reply.model != settings.model {
+                self.log.push(Entry::Note(format!("Answered by {}.", reply.model)));
+            }
+            self.batch = Some(Batch {
+                can_go_on: reply.stop == Stop::ToolUse && !self.stop,
+                calls: reply.calls.into(),
+                results: Vec::new(),
+                stop: reply.stop,
+                running: None,
+            });
+        }
+        self.run_batch(tools, settings, system, block, &mut out);
+        out
+    }
+
+    fn log_tool(&mut self, what: String, r: &Result<String, String>) {
+        self.log.push(Entry::Tool {
+            what,
+            ok: r.is_ok(),
+            detail: match r {
+                Ok(t) | Err(t) => short(t),
+            },
+        });
+    }
+
+    /// Run the reply's tool calls in order. A call on a worker thread pauses the batch until
+    /// it is done; then the results go back and the turn goes on or ends.
+    fn run_batch(&mut self, tools: &mut dyn Tools, settings: &Settings, system: &str, block: bool, out: &mut Polled) {
+        let Some(mut b) = self.batch.take() else {
+            return;
         };
-        self.input_tokens += reply.input_tokens;
-        self.output_tokens += reply.output_tokens;
-        for t in &reply.text {
-            self.log.push(Entry::Assistant(t.clone()));
-        }
-        if !reply.model.is_empty() && reply.model != settings.model {
-            self.log.push(Entry::Note(format!("Answered by {}.", reply.model)));
-        }
-        let can_go_on = reply.stop == Stop::ToolUse && !self.stop;
-        let mut results = Vec::new();
-        for call in &reply.calls {
-            if !can_go_on {
-                results.push((call.id.clone(), Err("Not run: the turn was stopped.".to_owned())));
+        loop {
+            if let Some((call, what, pending)) = b.running.take() {
+                let raw = if block {
+                    pending.wait()
+                } else {
+                    match pending.try_take() {
+                        Some(r) => r,
+                        None => {
+                            b.running = Some((call, what, pending));
+                            self.batch = Some(b);
+                            return;
+                        }
+                    }
+                };
+                let r = tools.finish(&call.name, &call.input, raw);
+                out.changed = true;
+                out.tools_ran = true;
+                self.log_tool(what, &r);
+                b.results.push((call.id, r));
+            }
+            let Some(call) = b.calls.pop_front() else {
+                break;
+            };
+            if !b.can_go_on || self.stop {
+                b.results
+                    .push((call.id, Err("Not run: the turn was stopped.".to_owned())));
                 continue;
             }
             let what = tools.describe(&call.name, &call.input);
-            let r = tools.run(&call.name, &call.input);
-            out.tools_ran = true;
-            self.log.push(Entry::Tool {
-                what,
-                ok: r.is_ok(),
-                detail: match &r {
-                    Ok(t) | Err(t) => short(t),
-                },
-            });
-            results.push((call.id.clone(), r));
+            match tools.start(&call.name, &call.input) {
+                Started::Done(r) => {
+                    out.tools_ran = true;
+                    self.log_tool(what, &r);
+                    b.results.push((call.id, r));
+                }
+                Started::Running(p) => {
+                    out.changed = true;
+                    b.running = Some((call, what, p));
+                }
+            }
         }
+        let results = b.results;
         self.conversation.tool_results(results);
-        match &reply.stop {
+        match &b.stop {
             Stop::ToolUse if self.stop => {
                 self.log.push(Entry::Note("Stopped.".into()));
                 out.finished = true;
@@ -649,7 +783,6 @@ impl Session {
                 out.finished = true;
             }
         }
-        out
     }
 }
 
@@ -758,6 +891,130 @@ mod tests {
         assert_eq!(seen[0]["fallbacks"], "default");
         assert_eq!(seen[0]["output_config"]["effort"], "high");
         assert!(matches!(s.log.last(), Some(Entry::Assistant(t)) if t == "Done."));
+    }
+
+    /// `slow` runs on a worker thread until `go` is set; everything else runs at once.
+    struct Slow {
+        go: Arc<std::sync::atomic::AtomicBool>,
+        order: Vec<String>,
+    }
+
+    impl Tools for Slow {
+        fn specs(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn run(&mut self, name: &str, _input: &Value) -> Result<String, String> {
+            self.order.push(format!("run {name}"));
+            Ok(name.to_owned())
+        }
+        fn start(&mut self, name: &str, input: &Value) -> Started {
+            if name != "slow" {
+                return Started::Done(self.run(name, input));
+            }
+            self.order.push("start slow".into());
+            let go = Arc::clone(&self.go);
+            Started::Running(Pending::spawn(move || {
+                while !go.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok("slow output".into())
+            }))
+        }
+        fn finish(&mut self, name: &str, _input: &Value, r: Result<String, String>) -> Result<String, String> {
+            self.order.push(format!("finish {name}"));
+            r.map(|t| format!("{t}, read back"))
+        }
+    }
+
+    #[test]
+    fn a_slow_tool_does_not_hold_up_the_poll() {
+        let t = script(vec![
+            Ok(json!({
+                "stop_reason": "tool_use",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "slow", "input": {}},
+                    {"type": "tool_use", "id": "t2", "name": "quick", "input": {}}
+                ]
+            })),
+            Ok(json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": "Done."}]})),
+        ]);
+        let mut s = Session::new(t.clone());
+        let go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = Slow {
+            go: Arc::clone(&go),
+            order: Vec::new(),
+        };
+        let set = settings();
+        assert!(s.send("go", &[], "", &set, "sys", &[]).is_ok());
+        // Wait for the model's answer; the slow tool then starts and the poll returns.
+        let mut started = false;
+        for _ in 0..2000 {
+            let p = s.poll(&mut tools, &set, "sys", false);
+            assert!(!p.finished);
+            if !tools.order.is_empty() {
+                started = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started);
+        // Polls come straight back while the tool works, and the next call waits its turn.
+        for _ in 0..5 {
+            let p = s.poll(&mut tools, &set, "sys", false);
+            assert!(!p.finished && !p.tools_ran);
+        }
+        assert!(s.busy());
+        assert_eq!(tools.order, vec!["start slow"]);
+        go.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut finished = false;
+        for _ in 0..2000 {
+            if s.poll(&mut tools, &set, "sys", false).finished {
+                finished = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(finished);
+        assert_eq!(tools.order, vec!["start slow", "finish slow", "run quick"]);
+        let seen = t.seen.lock().map(|v| v.clone()).unwrap_or_default();
+        let results = seen[1]["messages"][2]["content"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["tool_use_id"], "t1");
+        assert!(results[0]["content"].to_string().contains("slow output, read back"));
+    }
+
+    #[test]
+    fn stopping_while_a_slow_tool_runs_skips_the_rest() {
+        let t = script(vec![Ok(json!({
+            "stop_reason": "tool_use",
+            "content": [
+                {"type": "tool_use", "id": "t1", "name": "slow", "input": {}},
+                {"type": "tool_use", "id": "t2", "name": "quick", "input": {}}
+            ]
+        }))]);
+        let mut s = Session::new(t);
+        // The worker waits until the turn is stopped, so `quick` cannot run before that.
+        let go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = Slow {
+            go: Arc::clone(&go),
+            order: Vec::new(),
+        };
+        let set = settings();
+        assert!(s.send("go", &[], "", &set, "sys", &[]).is_ok());
+        while tools.order.is_empty() {
+            s.poll(&mut tools, &set, "sys", false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        s.stop();
+        go.store(true, std::sync::atomic::Ordering::SeqCst);
+        let p = s.poll(&mut tools, &set, "sys", true);
+        assert!(p.finished);
+        // The started call is finished; the one after it is not run.
+        assert_eq!(tools.order, vec!["start slow", "finish slow"]);
+        assert!(!s.busy());
     }
 
     #[test]

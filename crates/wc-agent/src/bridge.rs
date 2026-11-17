@@ -7,6 +7,7 @@
 //! Only this computer can connect (the port is bound to 127.0.0.1), and a connection must first
 //! send the token the app made for this run.
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::{Entry, Tools};
+use crate::{Entry, Pending, Started, Tools};
 
 /// The MCP server's name as the agent sees it; its tools become `mcp__wiringcraft-app__<tool>`.
 pub const NAME: &str = "wiringcraft-app";
@@ -45,6 +46,8 @@ pub struct Bridge {
     pub port: u16,
     pub token: String,
     rx: Receiver<ToolRequest>,
+    /// The call running on a worker thread, with its panel line. Later calls wait in `rx`.
+    running: RefCell<Option<(ToolRequest, String, Pending)>>,
 }
 
 /// A hard-to-guess token: the standard library's per-process random hash keys, twice.
@@ -92,7 +95,12 @@ impl Bridge {
                 }
             }
         })?;
-        Ok(Self { port, token, rx })
+        Ok(Self {
+            port,
+            token,
+            rx,
+            running: RefCell::new(None),
+        })
     }
 
     /// The `mcpServers` entry for the agent's session: this program started as the bridge.
@@ -114,26 +122,60 @@ impl Bridge {
     }
 
     /// Run the tool calls that came in, on the caller's (window) thread. Returns a panel line
-    /// for each.
+    /// for each finished call. A call that went to a worker thread ([`Tools::start`]) is
+    /// finished in a later poll once its work is done; calls after it wait until then, so
+    /// they run in the order they came.
     pub fn poll(&self, tools: &mut dyn Tools) -> Vec<Entry> {
-        let mut out = Vec::new();
-        while let Ok(req) = self.rx.try_recv() {
+        let mut out = self.poll_running(tools);
+        while self.running.borrow().is_none() {
+            let Ok(req) = self.rx.try_recv() else {
+                break;
+            };
             if req.gave_up.load(Ordering::SeqCst) {
                 continue;
             }
             let what = tools.describe(&req.name, &req.input);
-            let r = tools.run(&req.name, &req.input);
-            out.push(Entry::Tool {
-                what,
-                ok: r.is_ok(),
-                detail: match &r {
-                    Ok(t) | Err(t) => t.chars().take(300).collect(),
-                },
-            });
-            let _ = req.reply.send(r);
+            match tools.start(&req.name, &req.input) {
+                Started::Done(r) => answer(&mut out, req, what, r),
+                Started::Running(p) => *self.running.borrow_mut() = Some((req, what, p)),
+            }
         }
         out
     }
+
+    /// Finish the call on a worker thread if its work is done. Called by [`Bridge::poll`], and
+    /// on its own while new calls are refused, so a started call is always completed.
+    pub fn poll_running(&self, tools: &mut dyn Tools) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let done = {
+            let running = self.running.borrow();
+            running.as_ref().and_then(|(_, _, p)| p.try_take())
+        };
+        if let Some(raw) = done
+            && let Some((req, what, _)) = self.running.borrow_mut().take()
+        {
+            let r = tools.finish(&req.name, &req.input, raw);
+            answer(&mut out, req, what, r);
+        }
+        out
+    }
+
+    /// A call is running on a worker thread.
+    pub fn working(&self) -> bool {
+        self.running.borrow().is_some()
+    }
+}
+
+/// Send a call's result back and note it for the panel.
+fn answer(out: &mut Vec<Entry>, req: ToolRequest, what: String, r: Result<String, String>) {
+    out.push(Entry::Tool {
+        what,
+        ok: r.is_ok(),
+        detail: match &r {
+            Ok(t) | Err(t) => t.chars().take(300).collect(),
+        },
+    });
+    let _ = req.reply.send(r);
 }
 
 /// One connection: check the token, then answer MCP messages line by line.
@@ -375,6 +417,7 @@ mod tests {
             port: 0,
             token: String::new(),
             rx,
+            running: RefCell::new(None),
         };
         let (rtx, rrx) = mpsc::channel();
         let _ = tx.send(ToolRequest {
@@ -395,6 +438,7 @@ mod tests {
             port: 0,
             token: String::new(),
             rx,
+            running: RefCell::new(None),
         };
         let (rtx, _rrx) = mpsc::channel();
         let _ = tx.send(ToolRequest {
@@ -412,6 +456,70 @@ mod tests {
         let entries = bridge.poll(&mut Echo);
         assert_eq!(entries.len(), 1);
         assert!(matches!(&entries[0], Entry::Tool { detail, .. } if detail.starts_with("now")));
+    }
+
+    /// `slow` waits on a worker thread for `go`; other calls run at once.
+    struct SlowEcho(Arc<AtomicBool>);
+    impl Tools for SlowEcho {
+        fn specs(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn run(&mut self, name: &str, _input: &Value) -> Result<String, String> {
+            Ok(name.to_owned())
+        }
+        fn start(&mut self, name: &str, input: &Value) -> Started {
+            if name != "slow" {
+                return Started::Done(self.run(name, input));
+            }
+            let go = Arc::clone(&self.0);
+            Started::Running(Pending::spawn(move || {
+                while !go.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok("slow".into())
+            }))
+        }
+    }
+
+    #[test]
+    fn a_slow_call_runs_on_a_worker_and_later_calls_wait_their_turn() {
+        let (tx, rx) = mpsc::channel();
+        let bridge = Bridge {
+            port: 0,
+            token: String::new(),
+            rx,
+            running: RefCell::new(None),
+        };
+        let (slow_tx, slow_rx) = mpsc::channel();
+        let (quick_tx, quick_rx) = mpsc::channel();
+        for (name, reply) in [("slow", slow_tx), ("quick", quick_tx)] {
+            let _ = tx.send(ToolRequest {
+                name: name.into(),
+                input: json!({}),
+                reply,
+                gave_up: Arc::new(AtomicBool::new(false)),
+            });
+        }
+        let go = Arc::new(AtomicBool::new(false));
+        let mut tools = SlowEcho(Arc::clone(&go));
+        // The poll comes straight back while the slow call works; the quick one waits.
+        assert!(bridge.poll(&mut tools).is_empty());
+        assert!(bridge.working());
+        assert!(slow_rx.try_recv().is_err());
+        assert!(quick_rx.try_recv().is_err());
+        go.store(true, Ordering::SeqCst);
+        let mut entries = Vec::new();
+        for _ in 0..2000 {
+            entries.extend(bridge.poll(&mut tools));
+            if entries.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(entries.len(), 2);
+        assert_eq!(slow_rx.try_recv().ok(), Some(Ok("slow".to_owned())));
+        assert_eq!(quick_rx.try_recv().ok(), Some(Ok("quick".to_owned())));
+        assert!(!bridge.working());
     }
 
     #[test]
