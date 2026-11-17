@@ -240,10 +240,17 @@ impl ProjectMeta {
     pub fn set_location(&mut self, path: &str, description: &str) -> Result<bool, String> {
         let path = location_path(path)?;
         let description = description.trim().to_owned();
-        match self.locations.iter_mut().find(|l| l.path == path) {
-            Some(l) if l.description == description => Ok(false),
+        // Stored paths may be as typed (`+L1`), so compare their normal form.
+        let found = self
+            .locations
+            .iter_mut()
+            .find(|l| location_path(&l.path).is_ok_and(|p| p == path));
+        match found {
+            Some(l) if l.path == path && l.description == description => Ok(false),
             Some(l) => {
+                l.path = path;
                 l.description = description;
+                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
                 Ok(true)
             }
             None => {
@@ -940,6 +947,15 @@ mod tests {
         let why = m.remove_location("+L1-K1");
         assert!(why.as_ref().is_err_and(|e| e.contains("not a location")), "{why:?}");
         assert_eq!(m.locations.len(), 1);
+        // Setting a path stored with its sign updates that entry, in normal form.
+        m.locations.push(Location {
+            path: "+L7".into(),
+            description: "Desk".into(),
+        });
+        assert_eq!(m.set_location("L7", "Desk 2"), Ok(true));
+        let l7: Vec<&Location> = m.locations.iter().filter(|l| l.path.ends_with("L7")).collect();
+        assert_eq!(l7.len(), 1, "no second entry");
+        assert_eq!((l7[0].path.as_str(), l7[0].description.as_str()), ("L7", "Desk 2"));
     }
 
     #[test]

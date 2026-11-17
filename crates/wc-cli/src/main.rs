@@ -837,7 +837,7 @@ fn run(cli: Cli) -> Res<()> {
                         p.meta
                             .locations
                             .iter()
-                            .find(|l| Some(&l.path) == have.as_ref())
+                            .find(|l| have.is_some() && wc_core::project::location_path(&l.path).ok() == have)
                             .map(|l| l.description.clone())
                             .unwrap_or_default()
                     });
