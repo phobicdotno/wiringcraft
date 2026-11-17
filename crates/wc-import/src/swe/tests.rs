@@ -613,7 +613,7 @@ fn a_line_on_two_cable_cores_is_reported() {
     assert!(
         wires
             .note
-            .contains("1 other cable core(s) on those lines are not shown"),
+            .contains("1 other cable core(s) on those lines are left off that line's wire"),
         "{}",
         wires.note
     );

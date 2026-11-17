@@ -1396,7 +1396,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 ),
                 (
                     cores_not_shown,
-                    "other cable core(s) on those lines are not shown on any imported wire",
+                    "other cable core(s) on those lines are left off that line's wire",
                 ),
             ]),
         },
