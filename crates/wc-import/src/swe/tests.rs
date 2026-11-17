@@ -1902,6 +1902,27 @@ INSERT INTO tew_revision VALUES (2, 1, 2, 'B', 'Bob', 'Dan'), (1, 1, 1, 'A', 'An
 }
 
 #[test]
+fn with_several_books_the_first_books_revision_is_the_projects() {
+    let c = sample();
+    c.execute_batch(
+        "
+INSERT INTO tew_bundle VALUES (2, '2');
+CREATE TABLE tew_revision (rev_id INTEGER, rev_objectid INTEGER, rev_orderno INTEGER, rev_tag TEXT);
+-- Book 2's row comes last in the table's order, but book 1 is the first book.
+INSERT INTO tew_revision VALUES (1, 1, 1, 'B1'), (2, 2, 5, 'B2');
+",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.revision.get("revision").map(String::as_str), Some("B1"));
+    assert!(
+        p.warnings.iter().any(|w| w.contains("different revisions")),
+        "{:?}",
+        p.warnings
+    );
+}
+
+#[test]
 fn a_revision_table_without_a_page_column_is_reported_not_guessed() {
     let c = sample();
     c.execute_batch(

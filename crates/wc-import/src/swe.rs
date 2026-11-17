@@ -336,8 +336,9 @@ fn column_named<'a>(columns: &'a [String], names: &[&str]) -> Option<&'a str> {
 /// of `pages`; the latest revision is the one with the highest order number (else id, else
 /// row). A missing table gives nothing; a table without a page column is reported.
 ///
-/// With an object id column, the latest row for one of `books` is the project's own revision
-/// ([`Revisions::project`]). Rows for any other object are left out.
+/// With an object id column, the latest row for one of `books` is that book's revision; the
+/// first book's (lowest id) is the project's own ([`Revisions::project`]), with a warning when
+/// another book's differs. Rows for any other object are left out.
 pub fn page_revisions(
     conn: &Connection,
     pages: &BTreeSet<i64>,
@@ -401,6 +402,8 @@ pub fn page_revisions(
     // A `fil_id` column names files only; an object id column also names the book or project.
     let by_object = !page.ends_with("fil_id");
     let mut out = Revisions::default();
+    // Each book's latest revision; the first book's (lowest id) is the project's.
+    let mut by_book: BTreeMap<i64, BTreeMap<String, String>> = BTreeMap::new();
     for (id, values) in readable(rows, "page revision", warnings) {
         let for_page = pages.contains(&id);
         // Only a book's row is the project's: an id that is neither a page nor a book (a page
@@ -421,8 +424,16 @@ pub fn page_revisions(
         if for_page {
             out.pages.insert(id, block);
         } else {
-            out.project = block;
+            by_book.insert(id, block);
         }
+    }
+    let mut books_with = by_book.into_values();
+    if let Some(first) = books_with.next() {
+        if books_with.any(|other| other != first) {
+            warnings
+                .push("the books have different revisions: the project's title block takes the first book's".into());
+        }
+        out.project = first;
     }
     Ok(out)
 }
