@@ -152,9 +152,11 @@ pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
     let near_path = |pts: &[Point]| pts.windows(2).any(|ab| seg_dist(at, ab[0], ab[1]) <= tol);
     match g {
         Shape::Line { a, b } => seg_dist(at, *a, *b) <= tol,
-        Shape::Polyline { points, closed } => {
+        Shape::Polyline { points, closed, filled } => {
             let mut pts = points.clone();
-            if *closed && let Some(f) = points.first() {
+            if (*closed || *filled)
+                && let Some(f) = points.first()
+            {
                 pts.push(*f);
             }
             near_path(&pts)

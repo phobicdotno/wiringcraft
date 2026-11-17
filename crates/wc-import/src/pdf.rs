@@ -943,7 +943,11 @@ impl Interp<'_> {
                         if mm.len() == 2 {
                             self.out.graphics.push(Shape::Line { a: mm[0], b: mm[1] });
                         } else {
-                            self.out.graphics.push(Shape::Polyline { points: mm, closed });
+                            self.out.graphics.push(Shape::Polyline {
+                                points: mm,
+                                closed,
+                                filled: false,
+                            });
                         }
                     }
                 }
@@ -1305,7 +1309,7 @@ mod tests {
             assert!((a.y - (841.89 - 20.0) * MM_PER_PT).abs() < 1e-6, "y flipped");
             assert!(
                 g.iter()
-                    .any(|s| matches!(s, Shape::Polyline { closed: true, points } if points.len() == 4))
+                    .any(|s| matches!(s, Shape::Polyline { closed: true, points, .. } if points.len() == 4))
             );
             assert!(g.iter().any(|s| matches!(s, Shape::Text { text, .. } if text == "K1")));
         }

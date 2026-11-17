@@ -292,6 +292,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 Some(Shape::Polyline {
                     points: vec![m.p(x, y), m.p(x + w, y), m.p(x + w, y + h), m.p(x, y + h)],
                     closed: true,
+                    filled: false,
                 })
             }
             "circle" | "ellipse" => {
@@ -315,6 +316,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 (pts.len() >= 2).then(|| Shape::Polyline {
                     points: pts,
                     closed: tag == "polygon",
+                    filled: false,
                 })
             }
             "path" => {
@@ -323,7 +325,11 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 for (pts, closed) in parts {
                     first.get_or_insert(pts[0]);
                     if pin_name.is_none() {
-                        shapes.push(Shape::Polyline { points: pts, closed });
+                        shapes.push(Shape::Polyline {
+                            points: pts,
+                            closed,
+                            filled: false,
+                        });
                     }
                 }
                 if let (Some(n), Some(p)) = (pin_name.clone(), first) {

@@ -231,7 +231,11 @@ fn convert(
                         .unwrap_or_default();
                     match points.as_slice() {
                         [a, b] => graphics.push(Shape::Line { a: *a, b: *b }),
-                        [_, _, ..] => graphics.push(Shape::Polyline { points, closed: false }),
+                        [_, _, ..] => graphics.push(Shape::Polyline {
+                            points,
+                            closed: false,
+                            filled: false,
+                        }),
                         _ => {}
                     }
                 }

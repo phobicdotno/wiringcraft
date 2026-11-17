@@ -164,9 +164,14 @@ fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
         Shape::Line { a, b } => {
             p.line_segment([xf.s(*a), xf.s(*b)], stroke);
         }
-        Shape::Polyline { points, closed } => {
+        Shape::Polyline { points, closed, filled } => {
             let pts: Vec<Pos2> = points.iter().map(|q| xf.s(*q)).collect();
-            if *closed {
+            if *filled {
+                // egui fills convex outlines exactly; the outline drawn over it keeps a concave
+                // one readable.
+                p.add(EShape::convex_polygon(pts.clone(), stroke.color, Stroke::NONE));
+                p.add(EShape::closed_line(pts, stroke));
+            } else if *closed {
                 p.add(EShape::closed_line(pts, stroke));
             } else {
                 p.add(EShape::line(pts, stroke));

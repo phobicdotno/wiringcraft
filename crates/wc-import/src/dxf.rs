@@ -1,8 +1,10 @@
 //! ASCII DXF reading: symbols and whole drawings.
 //!
-//! Supported entities: LINE, CIRCLE, ARC, LWPOLYLINE, POLYLINE/VERTEX, TEXT, MTEXT, POINT and
-//! INSERT (block references, exploded or turned into library symbols). DXF has y pointing up;
-//! WiringCraft pages have y pointing down, so y is flipped on the way in.
+//! Supported entities: LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, LWPOLYLINE, POLYLINE/VERTEX,
+//! TEXT, MTEXT, POINT and INSERT (block references, exploded or turned into library symbols).
+//! Ellipses and splines become polylines through sampled points; a solid hatch becomes a filled
+//! outline, a patterned one its outline. Other entities are counted in one warning per kind.
+//! DXF has y pointing up; WiringCraft pages have y pointing down, so y is flipped on the way in.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -191,6 +193,7 @@ fn shapes(
     skip_layer: &dyn Fn(&str) -> bool,
     out: &mut Vec<(String, Shape)>,
     points: &mut Vec<(String, Point)>,
+    skipped: &mut BTreeMap<String, usize>,
 ) {
     if depth > 8 {
         return; // block nesting this deep is either a cycle or not worth drawing
@@ -231,7 +234,31 @@ fn shapes(
                 (pts.len() >= 2).then(|| Shape::Polyline {
                     points: pts,
                     closed: (e.f(70) as i64) & 1 == 1,
+                    filled: false,
                 })
+            }
+            "ELLIPSE" => {
+                let (pts, closed) = ellipse_points(
+                    (e.f(10), e.f(20)),
+                    (e.f(11), e.f(21)),
+                    e.f_or(40, 1.0),
+                    e.f_or(41, 0.0),
+                    e.f_or(42, std::f64::consts::TAU),
+                );
+                polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false)
+            }
+            "SPLINE" => {
+                let (pts, closed) = spline_points(e);
+                polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false)
+            }
+            "HATCH" => {
+                let solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
+                for lp in hatch_loops(e) {
+                    if let Some(s) = polyline(lp.into_iter().map(|(x, y)| p(x, y)).collect(), true, solid) {
+                        out.push((layer.clone(), s));
+                    }
+                }
+                None
             }
             "TEXT" | "MTEXT" | "ATTRIB" => {
                 let raw = e.get(1).unwrap_or("");
@@ -267,16 +294,343 @@ fn shapes(
                         rot: e.f(50),
                     }
                     .then(&xf);
-                    shapes(d, inner, ixf, scale, depth + 1, skip_layer, out, points);
+                    shapes(d, inner, ixf, scale, depth + 1, skip_layer, out, points, skipped);
                 }
                 None
             }
-            _ => None,
+            // Attribute templates of a block: their values come with the INSERT.
+            "ATTDEF" => None,
+            other => {
+                *skipped.entry(other.to_owned()).or_default() += 1;
+                None
+            }
         };
         if let Some(s) = shape {
             out.push((layer, s));
         }
     }
+}
+
+/// A polyline of at least two points, or nothing.
+fn polyline(points: Vec<Point>, closed: bool, filled: bool) -> Option<Shape> {
+    (points.len() >= 2).then_some(Shape::Polyline { points, closed, filled })
+}
+
+/// Segments per full turn when an ellipse or arc is sampled.
+const TURN_STEPS: f64 = 72.0;
+
+/// Points along an ellipse (DXF coordinates): centre, end of the major axis relative to the
+/// centre, minor/major ratio and the start and end parameters in radians. A full ellipse comes
+/// back closed, without repeating its first point.
+fn ellipse_points(c: (f64, f64), major: (f64, f64), ratio: f64, t0: f64, t1: f64) -> (Vec<(f64, f64)>, bool) {
+    let minor = (-major.1 * ratio, major.0 * ratio);
+    let mut sweep = t1 - t0;
+    if sweep <= 0.0 {
+        sweep += std::f64::consts::TAU;
+    }
+    let full = sweep >= std::f64::consts::TAU - 1e-9;
+    let n = ((TURN_STEPS * sweep / std::f64::consts::TAU).ceil() as usize).max(4);
+    let at = |t: f64| {
+        let (s, k) = t.sin_cos();
+        (c.0 + k * major.0 + s * minor.0, c.1 + k * major.1 + s * minor.1)
+    };
+    let last = if full { n - 1 } else { n };
+    let pts = (0..=last).map(|i| at(t0 + sweep * i as f64 / n as f64)).collect();
+    (pts, full)
+}
+
+/// Points along a circular arc (DXF coordinates, degrees), counter-clockwise from `a0` to `a1`,
+/// or clockwise when `ccw` is false (then `a1` is reached going down from `a0`).
+fn arc_points(c: (f64, f64), r: f64, a0: f64, a1: f64, ccw: bool) -> Vec<(f64, f64)> {
+    let mut sweep = if ccw { a1 - a0 } else { a0 - a1 };
+    if sweep <= 0.0 {
+        sweep += 360.0;
+    }
+    let n = ((TURN_STEPS * sweep / 360.0).ceil() as usize).max(2);
+    let dir = if ccw { 1.0 } else { -1.0 };
+    (0..=n)
+        .map(|i| {
+            let t = (a0 + dir * sweep * i as f64 / n as f64).to_radians();
+            (c.0 + r * t.cos(), c.1 + r * t.sin())
+        })
+        .collect()
+}
+
+/// A point on a B-spline (de Boor): homogeneous control points (x*w, y*w, w), knots, degree.
+fn de_boor(ctrl: &[(f64, f64, f64)], knots: &[f64], p: usize, u: f64) -> Option<(f64, f64)> {
+    let n = ctrl.len();
+    if n <= p || knots.len() != n + p + 1 {
+        return None;
+    }
+    let mut k = p;
+    while k + 1 < n && knots[k + 1] <= u {
+        k += 1;
+    }
+    let mut d: Vec<(f64, f64, f64)> = ctrl.get(k - p..=k)?.to_vec();
+    for r in 1..=p {
+        for j in (r..=p).rev() {
+            let i = j + k - p;
+            let denom = knots[i + p + 1 - r] - knots[i];
+            let a = if denom.abs() < 1e-12 {
+                0.0
+            } else {
+                (u - knots[i]) / denom
+            };
+            let (q, s) = (d[j - 1], d[j]);
+            d[j] = (
+                (1.0 - a) * q.0 + a * s.0,
+                (1.0 - a) * q.1 + a * s.1,
+                (1.0 - a) * q.2 + a * s.2,
+            );
+        }
+    }
+    let (x, y, w) = d[p];
+    (w.abs() > 1e-12).then(|| (x / w, y / w))
+}
+
+/// Points along a B-spline from its control points, knots and weights, sampled evenly over the
+/// knot range. `None` when the data do not make a spline.
+fn bspline_points(ctrl: &[(f64, f64)], knots: &[f64], weights: &[f64], degree: usize) -> Option<Vec<(f64, f64)>> {
+    let n = ctrl.len();
+    if degree == 0 || n <= degree || knots.len() != n + degree + 1 || knots.windows(2).any(|w| w[1] < w[0]) {
+        return None;
+    }
+    let w = |i: usize| {
+        weights
+            .get(i)
+            .copied()
+            .filter(|w| *w > 0.0 && weights.len() == n)
+            .unwrap_or(1.0)
+    };
+    let h: Vec<(f64, f64, f64)> = ctrl
+        .iter()
+        .enumerate()
+        .map(|(i, (x, y))| (x * w(i), y * w(i), w(i)))
+        .collect();
+    let (u0, u1) = (knots[degree], knots[n]);
+    if u1 <= u0 {
+        return None;
+    }
+    let steps = (n * 16).clamp(16, 2000);
+    let mut out = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        // The last sample sits a hair inside the range so it falls in the last span.
+        let u = if i == steps {
+            u1
+        } else {
+            u0 + (u1 - u0) * i as f64 / steps as f64
+        };
+        let u = if i == steps { u - (u1 - u0) * 1e-12 } else { u };
+        out.push(de_boor(&h, knots, degree, u)?);
+    }
+    if let (Some(last), Some(end)) = (out.last_mut(), ctrl.last()) {
+        // A clamped spline ends on its last control point; snap the rounding away.
+        if (last.0 - end.0).hypot(last.1 - end.1) < 1e-6 {
+            *last = *end;
+        }
+    }
+    Some(out)
+}
+
+/// Points of a SPLINE entity: the curve through its control points, else through its fit
+/// points; and whether it is closed.
+fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool) {
+    let closed = (e.f(70) as i64) & 1 == 1;
+    let ctrl: Vec<(f64, f64)> = e.all(10).into_iter().zip(e.all(20)).collect();
+    let fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).collect();
+    let degree = e.f_or(71, 3.0).max(0.0) as usize;
+    if let Some(pts) = bspline_points(&ctrl, &e.all(40), &e.all(41), degree) {
+        return (pts, closed);
+    }
+    if fit.len() >= 2 {
+        return (fit, closed);
+    }
+    (ctrl, closed)
+}
+
+/// Reads the group codes of an entity in order.
+struct Cursor<'a> {
+    codes: &'a [(i32, String)],
+    i: usize,
+}
+
+impl Cursor<'_> {
+    /// The value of the next pair when it has `code`; the cursor moves on only then.
+    fn take(&mut self, code: i32) -> Option<f64> {
+        let (c, v) = self.codes.get(self.i)?;
+        if *c != code {
+            return None;
+        }
+        self.i += 1;
+        v.trim().parse::<f64>().ok().filter(|v| v.is_finite()).or(Some(0.0))
+    }
+    fn count(&mut self, code: i32) -> usize {
+        self.take(code).map_or(0, |n| n.clamp(0.0, 100_000.0) as usize)
+    }
+    fn point(&mut self, x: i32, y: i32) -> Option<(f64, f64)> {
+        Some((self.take(x)?, self.take(y)?))
+    }
+}
+
+/// Points of a polyline vertex list with bulges: an arc between two points where the bulge is
+/// not zero (bulge = tan(sweep / 4), positive counter-clockwise).
+fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    let n = vertices.len();
+    for i in 0..n {
+        let (a, bulge) = vertices[i];
+        out.push(a);
+        let Some(&(b, _)) = vertices.get(i + 1).or(if closed { vertices.first() } else { None }) else {
+            continue;
+        };
+        if bulge.abs() < 1e-9 {
+            continue;
+        }
+        let chord = (b.0 - a.0).hypot(b.1 - a.1);
+        if chord < 1e-12 {
+            continue;
+        }
+        let sweep = 4.0 * bulge.atan();
+        let r = chord / (2.0 * (sweep / 2.0).sin()).abs();
+        // Centre: from the chord's midpoint along its normal.
+        let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let h = r * (sweep / 2.0).cos() * sweep.signum();
+        let (nx, ny) = (-(b.1 - a.1) / chord, (b.0 - a.0) / chord);
+        let c = (mid.0 + nx * h, mid.1 + ny * h);
+        let a0 = (a.1 - c.1).atan2(a.0 - c.0).to_degrees();
+        let a1 = (b.1 - c.1).atan2(b.0 - c.0).to_degrees();
+        let pts = arc_points(c, r, a0, a1, bulge > 0.0);
+        out.extend(pts.iter().skip(1).take(pts.len().saturating_sub(2)));
+    }
+    out
+}
+
+/// The boundary loops of a HATCH, as DXF points. Unreadable loops are left out.
+fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
+    let mut cur = Cursor { codes: &e.codes, i: 0 };
+    // Skip the elevation point, extrusion, pattern name and flags up to the loop count.
+    let Some(start) = e.codes.iter().position(|(c, _)| *c == 91) else {
+        return Vec::new();
+    };
+    cur.i = start;
+    let loops = cur.count(91);
+    let mut out = Vec::new();
+    for _ in 0..loops {
+        let Some(flags) = cur.take(92) else { break };
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        if (flags as i64) & 2 == 2 {
+            let has_bulge = cur.take(72).unwrap_or(0.0) != 0.0;
+            let _closed = cur.take(73);
+            let n = cur.count(93);
+            let mut vs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let Some(v) = cur.point(10, 20) else { break };
+                let bulge = if has_bulge { cur.take(42).unwrap_or(0.0) } else { 0.0 };
+                vs.push((v, bulge));
+            }
+            pts = bulged(&vs, true);
+        } else {
+            let edges = cur.count(93);
+            for _ in 0..edges {
+                let Some(kind) = cur.take(72) else { break };
+                let seg: Vec<(f64, f64)> = match kind as i64 {
+                    1 => match (cur.point(10, 20), cur.point(11, 21)) {
+                        (Some(a), Some(b)) => vec![a, b],
+                        _ => break,
+                    },
+                    2 => {
+                        let (Some(c), Some(r), Some(a0), Some(a1)) =
+                            (cur.point(10, 20), cur.take(40), cur.take(50), cur.take(51))
+                        else {
+                            break;
+                        };
+                        // A clockwise edge stores its angles mirrored.
+                        if cur.take(73).unwrap_or(1.0) != 0.0 {
+                            arc_points(c, r, a0, a1, true)
+                        } else {
+                            arc_points(c, r, -a0, -a1, false)
+                        }
+                    }
+                    3 => {
+                        let (Some(c), Some(m), Some(ratio), Some(a0), Some(a1)) = (
+                            cur.point(10, 20),
+                            cur.point(11, 21),
+                            cur.take(40),
+                            cur.take(50),
+                            cur.take(51),
+                        ) else {
+                            break;
+                        };
+                        let ccw = cur.take(73).unwrap_or(1.0) != 0.0;
+                        let (t0, t1) = if ccw { (a0, a1) } else { (a1, a0) };
+                        let (mut p, _) = ellipse_points(c, m, ratio, t0.to_radians(), t1.to_radians());
+                        if !ccw {
+                            p.reverse();
+                        }
+                        p
+                    }
+                    4 => {
+                        let degree = cur.count(94);
+                        let rational = cur.take(73).unwrap_or(0.0) != 0.0;
+                        let _periodic = cur.take(74);
+                        let nk = cur.count(95);
+                        let nc = cur.count(96);
+                        let knots: Vec<f64> = (0..nk).filter_map(|_| cur.take(40)).collect();
+                        let mut ctrl = Vec::with_capacity(nc);
+                        let mut weights = Vec::new();
+                        for _ in 0..nc {
+                            let Some(v) = cur.point(10, 20) else { break };
+                            ctrl.push(v);
+                            if rational && let Some(w) = cur.take(42) {
+                                weights.push(w);
+                            }
+                        }
+                        let nf = cur.count(97);
+                        let fit: Vec<(f64, f64)> = (0..nf).filter_map(|_| cur.point(11, 21)).collect();
+                        let _ = (cur.point(12, 22), cur.point(13, 23));
+                        bspline_points(&ctrl, &knots, &weights, degree)
+                            .or((fit.len() >= 2).then_some(fit))
+                            .unwrap_or(ctrl)
+                    }
+                    _ => break,
+                };
+                // Edges meet end to start: do not repeat the shared point.
+                let skip = usize::from(
+                    pts.last()
+                        .zip(seg.first())
+                        .is_some_and(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1) < 1e-9),
+                );
+                pts.extend(seg.into_iter().skip(skip));
+            }
+        }
+        // Source boundary objects: a count and that many handles.
+        let refs = cur.count(97);
+        for _ in 0..refs {
+            if cur.take(330).is_none() {
+                break;
+            }
+        }
+        if pts.len() >= 2
+            && pts
+                .first()
+                .zip(pts.last())
+                .is_some_and(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1) < 1e-9)
+        {
+            pts.pop();
+        }
+        if pts.len() >= 3 {
+            out.push(pts);
+        }
+    }
+    out
+}
+
+/// One warning per entity kind that was not read.
+fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
+    skipped
+        .into_iter()
+        .map(|(kind, n)| format!("{n} {kind} entit{} not read", if n == 1 { "y" } else { "ies" }))
+        .collect()
 }
 
 /// MTEXT carries inline formatting codes; keep only the text.
@@ -315,10 +669,26 @@ fn is_pin_layer(layer: &str) -> bool {
 /// Import a symbol drawing. Pins are POINT entities, or circles on a pin layer (`PIN`, `PINS`,
 /// `WC_PIN`, `CONNECTION`); a text on the pin layer names the nearest pin. Units are taken as mm.
 pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
+    symbol_with_warnings(text, id, name).map(|(s, _)| s)
+}
+
+/// Like [`symbol`], with one warning per kind of entity that was not read.
+pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core::Symbol, Vec<String>)> {
     let d = parse(text)?;
     let mut raw = Vec::new();
     let mut points = Vec::new();
-    shapes(&d, &d.entities, Xf::ID, 1.0, 0, &|_| false, &mut raw, &mut points);
+    let mut skipped = BTreeMap::new();
+    shapes(
+        &d,
+        &d.entities,
+        Xf::ID,
+        1.0,
+        0,
+        &|_| false,
+        &mut raw,
+        &mut points,
+        &mut skipped,
+    );
     let mut pins: Vec<(Option<String>, Point)> = points.into_iter().map(|(_, p)| (None, p)).collect();
     let mut labels = Vec::new();
     let mut graphics = Vec::new();
@@ -342,7 +712,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
     }
     // Top-to-bottom, left-to-right, so the first pin (the origin) is the top one.
     pins.sort_by(|a, b| a.1.y.total_cmp(&b.1.y).then(a.1.x.total_cmp(&b.1.x)));
-    make_symbol(id, name, graphics, pins)
+    Ok((make_symbol(id, name, graphics, pins)?, skipped_warnings(skipped)))
 }
 
 /// The result of importing a drawing onto a page.
@@ -350,6 +720,8 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
 pub struct ImportedPage {
     pub graphics: Vec<Shape>,
     pub symbols: Vec<PlacedSymbol>,
+    /// One per kind of entity that was not read: `3 3DFACE entities not read`.
+    pub warnings: Vec<String>,
 }
 
 fn normalise_block_name(n: &str) -> String {
@@ -412,8 +784,20 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         }
         i = j;
     }
-    shapes(&d, &plain, Xf::ID, scale, 0, &|_| false, &mut raw, &mut points);
+    let mut skipped = BTreeMap::new();
+    shapes(
+        &d,
+        &plain,
+        Xf::ID,
+        scale,
+        0,
+        &|_| false,
+        &mut raw,
+        &mut points,
+        &mut skipped,
+    );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
+    out.warnings = skipped_warnings(skipped);
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
         .graphics
@@ -528,5 +912,155 @@ mod tests {
     #[test]
     fn mtext_formatting_is_stripped() {
         assert_eq!(mtext_plain(r"{\fArial|b1;Motor}\PM1"), "Motor M1");
+    }
+
+    /// Every graphic of a drawing in DXF coordinates turned to page ones (y down, scale 1).
+    fn drawn(entities: &str, blocks: &str) -> Result<(Vec<Shape>, BTreeMap<String, usize>)> {
+        let d = parse(&dxf(entities, blocks))?;
+        let (mut raw, mut points, mut skipped) = (Vec::new(), Vec::new(), BTreeMap::new());
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            1.0,
+            0,
+            &|_| false,
+            &mut raw,
+            &mut points,
+            &mut skipped,
+        );
+        Ok((raw.into_iter().map(|(_, s)| s).collect(), skipped))
+    }
+
+    fn poly(s: &Shape) -> (&[Point], bool, bool) {
+        match s {
+            Shape::Polyline { points, closed, filled } => (points, *closed, *filled),
+            _ => (&[], false, false),
+        }
+    }
+
+    fn near(a: Point, b: Point) -> bool {
+        a.distance(b) < 1e-6
+    }
+
+    #[test]
+    fn full_and_half_ellipses_are_sampled_on_the_curve() -> Result<()> {
+        // Centre (10, 10), major axis 5 along x, ratio 0.5: the minor half axis is 2.5.
+        let ents = "0\nELLIPSE\n8\n0\n10\n10\n20\n10\n11\n5\n21\n0\n40\n0.5\n41\n0\n42\n6.283185307179586\n\
+                    0\nELLIPSE\n8\n0\n10\n10\n20\n10\n11\n5\n21\n0\n40\n0.5\n41\n0\n42\n3.141592653589793\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert!(skipped.is_empty());
+        assert_eq!(g.len(), 2);
+        let on = |q: &Point| (((q.x - 10.0) / 5.0).powi(2) + ((-q.y - 10.0) / 2.5).powi(2) - 1.0).abs() < 1e-9;
+        let (full, closed, _) = poly(&g[0]);
+        assert!(closed && full.len() > 30 && full.iter().all(on));
+        assert!(full.iter().any(|q| near(*q, Point::new(15.0, -10.0))));
+        assert!(
+            full.iter().any(|q| near(*q, Point::new(10.0, -12.5))),
+            "top of the ellipse, y flipped"
+        );
+        let (half, closed, _) = poly(&g[1]);
+        assert!(!closed && half.iter().all(on));
+        assert!(near(half[0], Point::new(15.0, -10.0)));
+        assert!(near(
+            *half.last().unwrap_or(&Point::new(0.0, 0.0)),
+            Point::new(5.0, -10.0)
+        ));
+        assert!(half.iter().all(|q| q.y <= -10.0 + 1e-9), "the upper half only");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rotated_ellipse_and_a_spline_inside_a_block_follow_the_insert() -> Result<()> {
+        // Block: ellipse at the origin, major 5 along x, ratio 0.5; a quadratic spline from
+        // (0,0) over (10,0) to (10,10). Inserted at (100, 0), turned 90 degrees.
+        let blocks = "0\nBLOCK\n2\nB\n\
+            0\nELLIPSE\n10\n0\n20\n0\n11\n5\n21\n0\n40\n0.5\n\
+            0\nSPLINE\n71\n2\n72\n6\n73\n3\n40\n0\n40\n0\n40\n0\n40\n1\n40\n1\n40\n1\n10\n0\n20\n0\n10\n10\n20\n0\n10\n10\n20\n10\n\
+            0\nENDBLK\n";
+        let (g, _) = drawn("0\nINSERT\n2\nB\n10\n100\n20\n0\n50\n90\n", blocks)?;
+        assert_eq!(g.len(), 2);
+        // Turned 90 degrees the major axis runs along y: x within 2.5 of 100, y within 5.
+        let (e, closed, _) = poly(&g[0]);
+        assert!(closed);
+        assert!(
+            e.iter()
+                .all(|q| (((q.x - 100.0) / 2.5).powi(2) + (q.y / 5.0).powi(2) - 1.0).abs() < 1e-9)
+        );
+        assert!(e.iter().any(|q| near(*q, Point::new(100.0, -5.0))));
+        // The spline: block (x, y) lands on page (100 - y, -x).
+        let (s, closed, _) = poly(&g[1]);
+        assert!(!closed);
+        assert!(near(s[0], Point::new(100.0, 0.0)));
+        assert!(near(
+            *s.last().unwrap_or(&Point::new(0.0, 0.0)),
+            Point::new(90.0, -10.0)
+        ));
+        // u = 0.5 of the quadratic: (7.5, 2.5) in the block.
+        assert!(s.iter().any(|q| near(*q, Point::new(97.5, -7.5))), "{s:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_spline_without_knots_goes_through_its_fit_points() -> Result<()> {
+        let ents = "0\nSPLINE\n71\n3\n74\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert_eq!(s, [Point::new(0.0, 0.0), Point::new(5.0, -5.0), Point::new(10.0, 0.0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn solid_hatches_become_filled_outlines() -> Result<()> {
+        // A polyline loop (square) and an edge loop (triangle of lines with one arc edge).
+        let ents = "0\nHATCH\n8\n0\n10\n0\n20\n0\n30\n0\n2\nSOLID\n70\n1\n71\n0\n91\n2\n\
+            92\n2\n72\n0\n73\n1\n93\n4\n10\n0\n20\n0\n10\n10\n20\n0\n10\n10\n20\n10\n10\n0\n20\n10\n97\n0\n\
+            92\n1\n93\n3\n72\n1\n10\n20\n20\n0\n11\n30\n21\n0\n72\n2\n10\n25\n20\n0\n40\n5\n50\n0\n51\n180\n73\n1\n72\n1\n10\n20\n20\n0\n11\n20\n21\n0\n97\n0\n\
+            75\n0\n76\n1\n98\n0\n\
+            0\nHATCH\n8\n0\n2\nANSI31\n70\n0\n91\n1\n92\n2\n72\n0\n73\n1\n93\n3\n10\n0\n20\n0\n10\n5\n20\n0\n10\n0\n20\n5\n97\n0\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(g.len(), 3);
+        let (sq, closed, filled) = poly(&g[0]);
+        assert!(closed && filled);
+        assert_eq!(
+            sq,
+            [
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(10.0, -10.0),
+                Point::new(0.0, -10.0)
+            ]
+        );
+        let (half_disc, _, filled) = poly(&g[1]);
+        assert!(filled);
+        assert!(
+            half_disc.iter().any(|q| near(*q, Point::new(25.0, -5.0))),
+            "top of the arc edge"
+        );
+        assert!(half_disc.iter().all(|q| q.x >= 20.0 - 1e-9 && q.x <= 30.0 + 1e-9));
+        let (_, closed, filled) = poly(&g[2]);
+        assert!(closed && !filled, "a patterned hatch keeps its outline");
+        Ok(())
+    }
+
+    #[test]
+    fn a_bulge_in_a_hatch_loop_is_an_arc() {
+        // From (0,0) to (10,0) with bulge 1: a half circle turning counter-clockwise around
+        // (5,0), so it passes (5,-5).
+        let pts = bulged(&[((0.0, 0.0), 1.0), ((10.0, 0.0), 0.0)], false);
+        assert!(
+            pts.iter().any(|p| (p.0 - 5.0).abs() < 1e-9 && (p.1 + 5.0).abs() < 1e-9),
+            "{pts:?}"
+        );
+        assert!(pts.iter().all(|p| ((p.0 - 5.0).hypot(p.1) - 5.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn entities_not_read_are_counted_per_kind() -> Result<()> {
+        let ents = "0\n3DFACE\n8\n0\n0\n3DFACE\n8\n0\n0\nSOLID\n8\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        assert_eq!(p.warnings, ["2 3DFACE entities not read", "1 SOLID entity not read"]);
+        Ok(())
     }
 }
