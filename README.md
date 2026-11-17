@@ -83,3 +83,4 @@ cargo run -p wc-cli -- --help
 
 - Original work only: no code, symbols, icons, templates or branding copied from other products.
 - No panics on user input: no `unwrap`/`expect`/`panic!` outside tests (enforced by clippy lints).
+- Every change is a pull request; work comes from the todo list and is claimed first. See [CONTRIBUTING.md](CONTRIBUTING.md).
