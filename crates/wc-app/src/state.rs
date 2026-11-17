@@ -69,6 +69,8 @@ pub struct Open {
     pub dirty: bool,
     undo: Vec<Project>,
     redo: Vec<Project>,
+    /// Snapshots dropped from the front of `undo` because it was full, so marks stay valid.
+    undo_dropped: usize,
     pub branch: String,
     /// Underlay pictures loaded as textures, by file; `None` when the file cannot be shown.
     pub underlays: BTreeMap<String, Option<egui::TextureHandle>>,
@@ -88,6 +90,7 @@ impl Open {
             dirty: false,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_dropped: 0,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
         };
@@ -207,9 +210,26 @@ impl Open {
         self.undo.push(self.project.clone());
         if self.undo.len() > 200 {
             self.undo.remove(0);
+            self.undo_dropped += 1;
         }
         self.redo.clear();
         self.dirty = true;
+    }
+
+    /// A mark in the undo history, for [`Open::squash_undo`].
+    pub fn undo_mark(&self) -> usize {
+        self.undo_dropped + self.undo.len()
+    }
+
+    /// Make every change since `mark` one undo step, so one Undo takes all of it back
+    /// (the assistant's changes in one turn, for example).
+    pub fn squash_undo(&mut self, mark: usize) {
+        let Some(start) = mark.checked_sub(self.undo_dropped) else {
+            return;
+        };
+        if self.undo.len() > start + 1 {
+            self.undo.truncate(start + 1);
+        }
     }
 
     pub fn can_undo(&self) -> bool {

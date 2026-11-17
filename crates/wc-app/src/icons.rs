@@ -46,6 +46,7 @@ pub enum Icon {
     Panel,
     Comment,
     Theme,
+    Assistant,
 }
 
 /// Draw `icon` inside `rect` (a square) with colour `c`; `accent` picks out the part that says
@@ -419,6 +420,29 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
             );
             aline((8.0, 9.0), (16.0, 9.0));
             aline((8.0, 12.5), (13.5, 12.5));
+        }
+        Icon::Assistant => {
+            // A speech bubble with a four-pointed spark inside: someone to talk to who draws.
+            poly(
+                &[
+                    (3.0, 5.0),
+                    (21.0, 5.0),
+                    (21.0, 17.0),
+                    (10.0, 17.0),
+                    (5.0, 21.0),
+                    (6.0, 17.0),
+                    (3.0, 17.0),
+                ],
+                true,
+            );
+            // The spark: a tall and a wide diamond, each convex so it fills cleanly.
+            for d in [
+                [(12.0, 6.8), (13.2, 11.0), (12.0, 15.2), (10.8, 11.0)],
+                [(7.8, 11.0), (12.0, 9.8), (16.2, 11.0), (12.0, 12.2)],
+            ] {
+                let v: Vec<Pos2> = d.iter().map(|(x, y)| at(*x, *y)).collect();
+                p.add(Shape::convex_polygon(v, accent, Stroke::NONE));
+            }
         }
         Icon::Theme => {
             // Half-filled disc: light on one side, dark on the other.

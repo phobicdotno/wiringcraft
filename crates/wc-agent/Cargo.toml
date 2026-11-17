@@ -1,0 +1,14 @@
+[package]
+name = "wc-agent"
+description = "WiringCraft's live assistant: a Claude conversation that edits the open project through tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "2", default-features = false, features = ["tls", "native-certs", "json", "gzip"] }
+
+[lints]
+workspace = true

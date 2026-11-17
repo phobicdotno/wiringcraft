@@ -3,6 +3,8 @@
 //! Usage: `wiringcraft-app [project-folder]`. Without a folder the last project is reopened.
 
 mod actions;
+mod agent;
+mod agent_panel;
 mod canvas;
 mod chrome;
 mod edit;
@@ -93,6 +95,8 @@ struct App {
     copied_text: Option<String>,
     /// The interface theme currently applied to the context.
     applied_theme: theme::Mode,
+    /// The AI assistant's conversation and panel.
+    assistant: agent::Assistant,
 }
 
 struct StatusView<'a> {
@@ -115,6 +119,7 @@ impl chrome::Status for StatusView<'_> {
             Action::ToggleGrid => self.prefs.show_grid,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
             Action::ToggleTheme => self.prefs.theme == theme::Mode::Dark,
+            Action::Assistant => self.prefs.show_assistant,
             _ => false,
         }
     }
@@ -122,7 +127,12 @@ impl chrome::Status for StatusView<'_> {
     fn enabled(&self, a: Action) -> bool {
         let has = self.open.is_some();
         match a {
-            Action::NewProject | Action::Open | Action::ToggleChrome | Action::ToggleTheme | Action::ToggleGrid => true,
+            Action::NewProject
+            | Action::Open
+            | Action::ToggleChrome
+            | Action::ToggleTheme
+            | Action::ToggleGrid
+            | Action::Assistant => true,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
             Action::PageUp => has && self.ed.page > 0,
@@ -156,6 +166,7 @@ impl App {
             clipboard: edit::Clipboard::default(),
             copied_text: None,
             applied_theme: prefs.theme,
+            assistant: agent::Assistant::default(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -217,6 +228,10 @@ impl App {
             }
             Action::ToggleGrid => {
                 self.prefs.show_grid = !self.prefs.show_grid;
+                self.prefs.save();
+            }
+            Action::Assistant => {
+                self.prefs.show_assistant = !self.prefs.show_assistant;
                 self.prefs.save();
             }
             Action::Select => {
@@ -495,6 +510,7 @@ impl App {
                 (Key::R, Action::Reports),
                 (Key::E, Action::Check),
                 (Key::A, Action::SelectAll),
+                (Key::J, Action::Assistant),
             ] {
                 if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
                     out.push(Action::NewProject);
@@ -1498,6 +1514,7 @@ impl eframe::App for App {
         for a in actions {
             self.run(a);
         }
+        self.assistant_poll(ctx);
         if self.applied_theme != self.prefs.theme {
             theme::apply(ctx, self.prefs.theme);
             self.applied_theme = self.prefs.theme;
@@ -1517,6 +1534,7 @@ impl eframe::App for App {
             .frame(side(t.toolbar_bg).inner_margin(egui::Margin::symmetric(10, 4)))
             .show_separator_line(false)
             .show(ctx, |ui| panels::status_bar(ui, self.open.as_ref(), &self.ed));
+        self.assistant_panel(ctx);
 
         let mut page_actions = Vec::new();
         if let Some(open) = self.open.as_mut() {

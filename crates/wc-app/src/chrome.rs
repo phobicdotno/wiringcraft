@@ -93,6 +93,8 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::ToggleGrid),
             Some(Action::ToggleChrome),
             Some(Action::ToggleTheme),
+            None,
+            Some(Action::Assistant),
         ],
     ),
     ("Library", &[Some(Action::LibraryStatus), Some(Action::LibraryUpdate)]),

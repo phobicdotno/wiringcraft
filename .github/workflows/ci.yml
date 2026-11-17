@@ -14,4 +14,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build -p wc-cli
       - run: cargo test --workspace
+        env:
+          WIRINGCRAFT_CLI: ${{ github.workspace }}/target/debug/wiringcraft
