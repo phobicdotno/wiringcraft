@@ -1548,15 +1548,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             );
-            let n_sym = built.symbols.iter().filter(|s| !choice.1.contains_key(&s.id)).count();
-            let from_library: Vec<String> = built
-                .symbols
-                .iter()
-                .filter(|s| choice.1.contains_key(&s.id))
-                .map(|s| s.id.clone())
-                .collect();
-            add_built(dir, &mut p, built, &source)?;
-            keep_library_sources(&mut p, &from_library, &choice.1);
+            let n_sym = add_swe_built(dir, &mut p, built, &source, &choice.1)?;
             save(dir, &p)?;
             println!(
                 "{:<18} {:>8} {:>9}  why the rest is not imported",
@@ -2228,6 +2220,28 @@ fn project_copy(dir: &Path, id: &str) -> Res<Option<wc_core::Symbol>> {
         .map_err(|why| format!("project copy of symbol {id} cannot be read: {why}"))
 }
 
+/// Adds a SolidWorks Electrical import to `p`, keeping the library symbols it used (named in
+/// `sources`, new to the project or pinned before) pinned to their libraries. Returns how many
+/// symbol shapes the import made itself.
+fn add_swe_built(
+    dir: &Path,
+    p: &mut Project,
+    built: wc_import::aml::Built,
+    source: &str,
+    sources: &std::collections::BTreeMap<String, String>,
+) -> Res<usize> {
+    let n_sym = built.symbols.iter().filter(|s| !sources.contains_key(&s.id)).count();
+    let from_library: Vec<String> = built
+        .symbols
+        .iter()
+        .filter(|s| sources.contains_key(&s.id))
+        .map(|s| s.id.clone())
+        .collect();
+    add_built(dir, p, built, source)?;
+    keep_library_sources(p, &from_library, sources);
+    Ok(n_sym)
+}
+
 /// Library symbols an import used stay pinned to the library they came from (`add_built` pins
 /// everything it adds to the import), whether they were pinned before or not.
 fn keep_library_sources(p: &mut Project, ids: &[String], sources: &std::collections::BTreeMap<String, String>) {
@@ -2481,6 +2495,47 @@ mod tests {
             "the readable library is still used"
         );
         assert_eq!(sources["wc.coil"], "starter");
+    }
+
+    #[test]
+    fn a_second_import_keeps_a_used_library_symbol_pinned_to_its_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.pages.clear();
+        let coil: wc_core::Symbol =
+            serde_json::from_str(r#"{"id":"wc.coil","name":"Coil","graphics":[],"pins":[]}"#).unwrap();
+        let sources: std::collections::BTreeMap<String, String> = [("wc.coil".into(), "starter".into())].into();
+        let import = |id: &str, number: &str| {
+            let mut page = Page::new(id, number, "");
+            page.symbols.push(PlacedSymbol {
+                id: "s1".into(),
+                symbol: "wc.coil".into(),
+                at: Point::new(10.0, 10.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: DeviceTag::parse("-K1").ok(),
+            });
+            wc_import::aml::Built {
+                symbols: vec![coil.clone()],
+                pages: vec![page],
+                ..Default::default()
+            }
+        };
+        add_swe_built(&dir, &mut p, import("i1", "1"), "import:first.db", &sources).unwrap();
+        save(&dir, &p).unwrap();
+        let mut p = load(&dir).unwrap();
+        assert_eq!(p.lock.symbols["wc.coil"].source, "starter");
+        assert!(
+            p.pages
+                .iter()
+                .any(|pg| pg.symbols.iter().any(|s| s.symbol == "wc.coil"))
+        );
+        // The second import uses the symbol that is pinned and used already.
+        add_swe_built(&dir, &mut p, import("i2", "2"), "import:second.db", &sources).unwrap();
+        save(&dir, &p).unwrap();
+        assert_eq!(load(&dir).unwrap().lock.symbols["wc.coil"].source, "starter");
     }
 
     #[test]
