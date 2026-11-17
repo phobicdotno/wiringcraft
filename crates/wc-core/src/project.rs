@@ -161,6 +161,10 @@ pub struct Page {
     /// A picture drawn under everything else, such as a scanned drawing to trace over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underlay: Option<Underlay>,
+    /// An overview (line diagram): it shows devices again that schematic pages draw in detail,
+    /// so its symbols do not count as the device's drawings in `check`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overview: bool,
 }
 
 /// A raster picture under a page: a JPEG or PNG file in the project folder, stretched over a
@@ -202,6 +206,7 @@ impl Page {
             wires: Vec::new(),
             graphics: Vec::new(),
             underlay: None,
+            overview: false,
         }
     }
 
@@ -342,6 +347,14 @@ fn natural_key(s: &str) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_without_the_overview_field_loads_as_a_normal_page() -> Result<(), serde_json::Error> {
+        let page: Page = serde_json::from_str(r#"{"id":"p1","number":"1","title":"Old"}"#)?;
+        assert!(!page.overview);
+        assert!(!serde_json::to_string(&page)?.contains("overview"));
+        Ok(())
+    }
 
     #[test]
     fn pages_sort_naturally() {

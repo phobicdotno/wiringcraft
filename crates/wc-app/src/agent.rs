@@ -320,8 +320,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_page",
-            "Change a page's number, title or sheet size.",
-            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}}),
+            "Change a page's number, title or sheet size, or mark it as an overview (a line diagram: its devices do not count as drawings in the project check).",
+            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}, "overview": {"type": "boolean"}}),
             &[],
         ),
         tool(
@@ -351,7 +351,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "edit_page_json",
             "Replace a whole page with new content in the page file format (as get_page returns it, without the extra pin and point fields). For bulk edits the other tools cannot do. The page id stays.",
-            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, symbols, wires, graphics, underlay."}}),
+            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), symbols, wires, graphics, underlay."}}),
             &["content"],
         ),
         tool(
@@ -923,8 +923,14 @@ impl App {
 
     /// Take the message a command left in a dialog, so the model gets it as a result.
     fn take_message(&mut self) -> Option<String> {
+        // Log it first: once taken, the frame's own logging never sees it.
+        self.log_messages();
         match self.dialog.take() {
-            Some(Dialog::Message(m)) => Some(m),
+            Some(Dialog::Message(m)) => {
+                // Closed now, so the same message is logged again the next time it shows.
+                self.logged.1.clear();
+                Some(m)
+            }
             other => {
                 self.dialog = other;
                 None
@@ -1059,7 +1065,7 @@ impl App {
                 let cur = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 let number = s(v, "number").unwrap_or(&cur.number).to_owned();
                 let title = s(v, "title").unwrap_or(&cur.title).to_owned();
-                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size))?;
+                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size), cur.overview)?;
                 let p = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 self.go_to(i);
                 Ok(format!("Added page {} ({}), id {}.", p.number, p.title, p.id))
@@ -1074,6 +1080,7 @@ impl App {
                     s(v, "number").unwrap_or(&cur.number),
                     s(v, "title").unwrap_or(&cur.title),
                     size.unwrap_or(cur.size),
+                    v.get("overview").and_then(Value::as_bool).unwrap_or(cur.overview),
                 )?;
                 if self.ed.page == page {
                     self.ed.page = i;
@@ -2041,6 +2048,7 @@ mod tests {
             applied_theme: crate::theme::Mode::Light,
             assistant: Assistant::with_transport(Arc::new(Script(Mutex::new(answers)))),
             open_url: Vec::new(),
+            logged: Default::default(),
         };
         (tmp, app)
     }
@@ -2051,6 +2059,63 @@ mod tests {
 
     fn page2(app: &App) -> &Page {
         app.open.as_ref().unwrap().project.page("p0002").unwrap()
+    }
+
+    #[test]
+    fn a_message_box_is_logged_again_after_it_closed() {
+        let (_tmp, mut a) = app(vec![]);
+        let fail = || Some(Dialog::Message("Saving failed:\ndisk full".into()));
+        let boxes = |a: &mut App| {
+            a.new_messages()
+                .into_iter()
+                .filter(|(l, _)| *l == crate::applog::Level::Warn)
+                .count()
+        };
+        a.dialog = fail();
+        assert_eq!(boxes(&mut a), 1);
+        assert_eq!(boxes(&mut a), 0, "once while it is open");
+        a.dialog = None;
+        assert_eq!(boxes(&mut a), 0);
+        // A save that worked, then the same failure again.
+        a.ed.message = "Saved".into();
+        a.new_messages();
+        a.dialog = fail();
+        assert_eq!(boxes(&mut a), 1, "the second failure is logged too");
+    }
+
+    #[test]
+    fn the_report_gets_the_log_only_when_chosen() {
+        let (request, copy) = crate::report_request("line one\nline two\n", false);
+        assert!(request.detail.is_empty() && copy.is_none());
+        let (request, copy) = crate::report_request("", true);
+        assert!(request.detail.is_empty() && copy.is_none(), "no empty log");
+        let (request, copy) = crate::report_request("line one\nline two\n", true);
+        assert!(request.detail.contains("line two"));
+        assert_eq!(copy.as_deref(), Some("line one\nline two\n"));
+    }
+
+    #[test]
+    fn a_taken_message_was_logged_first() {
+        let (_tmp, mut a) = app(vec![]);
+        crate::applog::take_captured();
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        // `take_message` logs before taking, and forgets the text once taken: the cache that
+        // stops a message from being logged twice must not hold it, or the same message taken
+        // again right after (no frame in between) would not be logged.
+        assert_eq!(a.take_message().as_deref(), Some("Export failed"));
+        assert!(a.logged.1.is_empty(), "the taken message no longer blocks the next one");
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        assert_eq!(a.take_message().as_deref(), Some("Export failed"));
+        assert!(a.logged.1.is_empty());
+        let warned = (crate::applog::Level::Warn, "Export failed".to_owned());
+        assert_eq!(
+            crate::applog::take_captured(),
+            [warned.clone(), warned],
+            "both reached the log"
+        );
+        // And the frame's own logging sees a third one as new.
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        assert_eq!(a.new_messages().len(), 1);
     }
 
     #[test]

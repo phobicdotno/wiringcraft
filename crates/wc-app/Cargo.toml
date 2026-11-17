@@ -1,4 +1,6 @@
 [package]
+# Windows icon resource, shared with the other program (see the script).
+build = "../../packaging/windows/icon_build.rs"
 name = "wc-app"
 description = "WiringCraft desktop application"
 version.workspace = true
@@ -29,3 +31,6 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[build-dependencies]
+winresource = "0.1"

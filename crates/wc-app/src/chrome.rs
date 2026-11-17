@@ -61,6 +61,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Select),
             Some(Action::PlaceSymbol),
             Some(Action::DrawWire),
+            Some(Action::ToggleAutoWire),
             None,
             Some(Action::InsertMacro),
             Some(Action::SaveMacro),
