@@ -866,3 +866,98 @@ fn a_pages_own_title_block_fields_win_over_the_projects_on_that_page() {
     assert!(on_plain.contains(&"Rev-A".to_owned()), "{on_plain:?}");
     assert!(!on_plain.contains(&"Rev-C".to_owned()), "{on_plain:?}");
 }
+
+#[test]
+fn long_title_block_values_stay_inside_their_boxes() {
+    let mut project = wc_core::Project::new("Pump station upgrade and refurbishment ".repeat(4));
+    for key in [
+        "customer",
+        "drawn_by",
+        "checked_by",
+        "project_number",
+        "plant",
+        "revision",
+        "date",
+        "location",
+    ] {
+        project.meta.title_block.insert(key.into(), "W".repeat(60));
+    }
+    let mut page = Page::new("p1", "8".repeat(30), "Motor starters and field wiring ".repeat(4));
+    for page_size in [wc_core::PageSize::A4, wc_core::PageSize::A3] {
+        page.size = page_size;
+        let marks = layout::frame_marks(&project, &page, 0, 1, "2026-11-17");
+        // The title block's dividers: every vertical line, with the band of y it covers.
+        let dividers: Vec<(f64, f64, f64)> = marks
+            .iter()
+            .filter_map(|m| match &m.shape {
+                Shape::Line { a, b } if (a.x - b.x).abs() < 1e-9 => Some((a.x, a.y.min(b.y), a.y.max(b.y))),
+                _ => None,
+            })
+            .collect();
+        let (w, h) = page.size.mm();
+        let (x0, x1, y1) = (
+            wc_core::project::FRAME_MARGIN,
+            w - wc_core::project::FRAME_MARGIN,
+            h - wc_core::project::FRAME_MARGIN,
+        );
+        let mut checked = 0;
+        for m in &marks {
+            let Shape::Text {
+                at,
+                text,
+                height,
+                align,
+                ..
+            } = &m.shape
+            else {
+                continue;
+            };
+            // Row letters stand in the margin outside the frame.
+            if at.y < y1 - 24.0 || at.y > y1 || at.x < x0 || at.x > x1 {
+                continue;
+            }
+            let width = crate::writer::text_width_mm(text, *height);
+            let (left, right) = match align {
+                wc_core::geom::Align::Left => (at.x, at.x + width),
+                wc_core::geom::Align::Right => (at.x - width, at.x),
+                _ => (at.x - width / 2.0, at.x + width / 2.0),
+            };
+            assert!(
+                left >= x0 && right <= x1,
+                "{text:?} runs over the frame: {left}..{right}"
+            );
+            // The text's middle height must not cross a divider standing at that height.
+            let y = at.y - height / 2.0;
+            for (x, top, bottom) in &dividers {
+                if y > *top && y < *bottom {
+                    assert!(
+                        !(left < *x - 1e-6 && right > *x + 1e-6),
+                        "{text:?} ({left}..{right}) crosses the divider at x = {x}"
+                    );
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked >= 15, "only {checked} title-block texts");
+    }
+}
+
+#[test]
+fn short_title_block_values_keep_their_height() {
+    let mut project = wc_core::Project::new("Pump station");
+    project.meta.title_block.insert("customer".into(), "ACME".into());
+    project.meta.title_block.insert("revision".into(), "B".into());
+    let page = Page::new("p1", "1", "Motors");
+    let marks = layout::frame_marks(&project, &page, 0, 1, "2026-11-17");
+    let height_of = |wanted: &str| {
+        marks.iter().find_map(|m| match &m.shape {
+            Shape::Text { text, height, .. } if text == wanted => Some(*height),
+            _ => None,
+        })
+    };
+    assert_eq!(height_of("ACME"), Some(3.0));
+    assert_eq!(height_of("B"), Some(2.5));
+    assert_eq!(height_of("Pump station"), Some(4.0));
+    assert_eq!(height_of("Motors"), Some(3.0));
+    assert_eq!(height_of("1 / 1"), Some(3.0));
+}
