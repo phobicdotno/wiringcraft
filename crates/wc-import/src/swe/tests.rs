@@ -114,7 +114,8 @@ fn read_pages_components_symbols_lines_and_cables() {
     assert_eq!(p.cables[&40].cores.len(), 3);
     assert_eq!(p.wires[&70].cable, Some(40));
     assert_eq!(p.wires[&71].cable, None);
-    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    // The only warning: K1's second part (see `extra_parts_of_a_component_are_reported`).
+    assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
 }
 
 #[test]
@@ -268,8 +269,80 @@ fn duplicate_tags_are_made_unique() {
          INSERT INTO tew_symbolpt VALUES (6, 0, 0, 0, 5);",
     )
     .unwrap();
-    let (built, _, _) = build(&read(&c).unwrap(), None);
+    let (built, warnings, _) = build(&read(&c).unwrap(), None);
     assert!(built.devices.contains_key(&DeviceTag::parse("=F1+L1.L2-K1_2").unwrap()));
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("1 device or cable tag(s) were already taken")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn extra_parts_of_a_component_are_reported() {
+    let p = read(&sample()).unwrap();
+    assert_eq!(p.components[&100].part_number, "RLY-24");
+    assert!(
+        p.warnings.iter().any(|w| w.starts_with("1 extra part(s) left out")),
+        "{:?}",
+        p.warnings
+    );
+}
+
+#[test]
+fn a_page_number_used_twice_is_reported() {
+    let c = sample();
+    c.execute_batch(
+        "INSERT INTO tew_file (fil_id, fil_orderno, fil_filetype, fil_title, fil_fol_id) VALUES (12, 3, 12, '01', 7);",
+    )
+    .unwrap();
+    let (built, warnings, _) = build(&read(&c).unwrap(), None);
+    assert_eq!(built.pages.len(), 2);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("1 page number(s) were used twice")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_line_with_several_wire_numbers_is_reported() {
+    let c = sample();
+    c.execute_batch(
+        "INSERT INTO tew_wire VALUES (73, NULL, -1, 'X8'), (74, NULL, -1, 'X7');
+         INSERT INTO tew_linewirepair VALUES (1, 73, 2), (1, 74, 3);",
+    )
+    .unwrap();
+    let (_, _, report) = build(&read(&c).unwrap(), None);
+    let wires = report.iter().find(|r| r.what == "wires").unwrap();
+    assert!(
+        wires.note.contains("1 line(s) carry several wire numbers"),
+        "{}",
+        wires.note
+    );
+    assert!(
+        wires
+            .note
+            .contains("1 other wire number(s) on those lines are left off that line's wire"),
+        "{}",
+        wires.note
+    );
+}
+
+#[test]
+fn a_wire_only_on_a_zero_length_line_is_reported_as_such() {
+    let c = sample();
+    c.execute_batch(
+        "INSERT INTO tew_line VALUES (3, 10, 300, 300, 300, 300, NULL);
+         INSERT INTO tew_wire VALUES (75, NULL, -1, 'Z1');
+         INSERT INTO tew_linewirepair VALUES (3, 75, 1);",
+    )
+    .unwrap();
+    let (_, _, report) = build(&read(&c).unwrap(), None);
+    let wires = report.iter().find(|r| r.what == "wires").unwrap();
+    assert!(wires.note.contains("1 only on lines of zero length"), "{}", wires.note);
 }
 
 #[test]

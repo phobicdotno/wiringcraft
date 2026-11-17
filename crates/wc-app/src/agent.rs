@@ -433,7 +433,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_command",
-            "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything: page, place, wire, device, number-wires, library (add, sync, status, update, lock, search, propose), import (DXF/SVG/KiCad symbols, parts CSV, PLC address CSV, archives, DWG, PDF, Eplan projects), pdf, drawing, report, nets, aml, plc-vars, check, inspect, vcs (commit, branch, switch, merge, history, page-log), comment, panel (new, arrange, step, list, remove). Use [\"--help\"] to list commands.",
+            "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything: page, place, wire, device, number-wires, library (add, sync, status, update, lock, search, propose), import (DXF/SVG/KiCad symbols, parts CSV, PLC address CSV, archives, DWG, PDF, Eplan and SolidWorks Electrical projects), pdf, drawing, report, nets, aml, plc-vars, check, inspect, vcs (commit, branch, switch, merge, history, page-log), comment, panel (new, arrange, step, list, remove). Use [\"--help\"] to list commands.",
             json!({"args": {"type": "array", "items": {"type": "string"}, "description": "Arguments, e.g. [\"plc-vars\", \"export/io.st\"]. The project folder is passed for you."}}),
             &["args"],
         ),
