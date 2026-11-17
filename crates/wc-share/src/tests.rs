@@ -839,3 +839,184 @@ fn an_edit_made_after_an_old_answer_keeps_the_newer_work() -> TestResult {
     assert_eq!(a.project.as_ref().and_then(|p| p.page("p0002")), Some(kept));
     Ok(())
 }
+
+/// Whole sessions over real sockets on this computer.
+mod network {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::net::{Listener, connect};
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    fn listen() -> std::result::Result<(Listener, std::net::SocketAddr), Box<dyn std::error::Error>> {
+        let l = Listener::bind("127.0.0.1:0")?;
+        let addr = l.local_addr()?;
+        Ok((l, addr))
+    }
+
+    /// Accept, deliver everything both ways and give the socket threads a moment.
+    fn step(s: &mut Session, l: &mut Listener, guests: &mut [(&GuestLink, &mut Guest)]) {
+        l.accept(&mut s.hub, &mut s.host);
+        s.pump(guests);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    #[test]
+    fn two_guests_over_tcp_one_approved_one_declined() -> TestResult {
+        let mut s = Session::new();
+        let (mut l, addr) = listen()?;
+
+        let a_link = connect(addr)?;
+        let mut a = Guest::new();
+        let b_link = connect(addr)?;
+        let mut b = Guest::new();
+        a_link.send(a.join("Ola", "ola@example.com"))?;
+        b_link.send(b.join("Kari", "kari@example.com"))?;
+
+        let start = Instant::now();
+        while s.host.pending().len() < 2 && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut [(&a_link, &mut a), (&b_link, &mut b)]);
+        }
+        let pending = s.host.pending();
+        let id_of = |name: &str| pending.iter().find(|p| p.1 == name).map(|p| p.0).ok_or("pending");
+        let (a_id, b_id) = (id_of("Ola")?, id_of("Kari")?);
+        assert!(s.host.approve(a_id));
+        assert!(s.host.decline(b_id));
+
+        let start = Instant::now();
+        while (a.status != GuestStatus::Joined || b.status != GuestStatus::Declined) && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut [(&a_link, &mut a), (&b_link, &mut b)]);
+        }
+        assert_eq!(a.status, GuestStatus::Joined);
+        assert_eq!(a.project.as_ref(), Some(&demo()), "the project travels on joining");
+        assert_eq!(b.status, GuestStatus::Declined);
+        assert!(b.project.is_none());
+        assert_eq!(s.hub.len(), 1, "the declined connection is dropped");
+
+        // The declined guest's socket is closed by the host.
+        let start = Instant::now();
+        let mut closed = false;
+        while !closed && start.elapsed() < PATIENCE {
+            closed = matches!(b_link.try_recv(), Err(Error::Closed));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(closed);
+
+        // Ola opens a page and edits it.
+        a_link.send(a.open(Some("p0002")))?;
+        let start = Instant::now();
+        while !a.can_edit("p0002") && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut [(&a_link, &mut a)]);
+        }
+        let mut page = a
+            .project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .cloned()
+            .ok_or("page")?;
+        place(&mut page, "s1", 40.0);
+        a_link.send(a.edit_page(page).ok_or("lock")?)?;
+        let start = Instant::now();
+        while s.log.0.borrow().is_empty() && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut [(&a_link, &mut a)]);
+        }
+        step(&mut s, &mut l, &mut [(&a_link, &mut a)]);
+        assert_eq!(s.host.project().page("p0002").map(|p| p.symbols.len()), Some(1));
+        assert_eq!(a.project.as_ref(), Some(s.host.project()));
+        assert_eq!(s.log.0.borrow()[0].author, "Ola <ola@example.com>");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dropped_socket_releases_its_locks() -> TestResult {
+        let mut s = Session::new();
+        let (mut l, addr) = listen()?;
+        let a_link = connect(addr)?;
+        let mut a = Guest::new();
+        a_link.send(a.join("Ola", "ola@example.com"))?;
+        let start = Instant::now();
+        while s.host.pending().is_empty() && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut [(&a_link, &mut a)]);
+        }
+        let id = s.host.pending().first().map(|p| p.0).ok_or("pending")?;
+        assert!(s.host.approve(id));
+        a_link.send(a.open(Some("p0003")))?;
+        let start = Instant::now();
+        while s.host.locks().get("p0003") != Some(&id) && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut [(&a_link, &mut a)]);
+        }
+        assert_eq!(s.host.locks().get("p0003"), Some(&id));
+
+        drop(a_link);
+        let start = Instant::now();
+        while !s.host.locks().is_empty() && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut []);
+        }
+        assert!(s.host.locks().is_empty());
+        assert!(s.hub.is_empty());
+        assert!(s.host.open(Some("p0003")).is_ok(), "the page is free again");
+        Ok(())
+    }
+
+    /// Read until the other side closes; true when it did within the patience.
+    fn closed_by_peer(mut raw: TcpStream) -> std::io::Result<bool> {
+        raw.set_read_timeout(Some(PATIENCE))?;
+        let mut buf = [0u8; 4096];
+        loop {
+            match raw.read(&mut buf) {
+                Ok(0) => return Ok(true),
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(true),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_line_closes_only_that_connection() -> TestResult {
+        let mut s = Session::new();
+        let (mut l, addr) = listen()?;
+        l.set_max_line(1024);
+
+        let good = connect(addr)?;
+        let mut g = Guest::new();
+        good.send(g.join("Ola", "ola@example.com"))?;
+
+        let mut long = TcpStream::connect(addr)?;
+        let mut junk = TcpStream::connect(addr)?;
+        let start = Instant::now();
+        while (s.hub.len() < 3 || s.host.pending().is_empty()) && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut [(&good, &mut g)]);
+        }
+        assert_eq!(s.hub.len(), 3);
+        let id = s.host.pending().first().map(|p| p.0).ok_or("pending")?;
+        assert!(s.host.approve(id));
+
+        // One sends a line with no end past the limit, the other a line that is not a message.
+        long.write_all(&vec![b'x'; 4096])?;
+        junk.write_all(b"{\"this is\": \"not a message\"}\n")?;
+        let start = Instant::now();
+        while s.hub.len() > 1 && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut [(&good, &mut g)]);
+        }
+        assert_eq!(s.hub.len(), 1, "both bad connections are dropped");
+        assert!(closed_by_peer(long)?);
+        assert!(closed_by_peer(junk)?);
+
+        // The good guest carries on.
+        good.send(g.open(Some("p0001")))?;
+        let start = Instant::now();
+        while !g.can_edit("p0001") && start.elapsed() < PATIENCE {
+            step(&mut s, &mut l, &mut [(&good, &mut g)]);
+        }
+        assert_eq!(g.status, GuestStatus::Joined);
+        assert!(g.can_edit("p0001"));
+        Ok(())
+    }
+}

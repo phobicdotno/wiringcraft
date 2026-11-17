@@ -1,8 +1,8 @@
 //! Moving session messages between a host and its guests.
 //!
-//! [`pair`] makes an in-process connection (two instances in one program, and tests). A network
-//! transport sends the same messages, one JSON object per line ([`encode`] / [`decode`]), and
-//! plugs into [`Hub`] the same way.
+//! [`pair`] makes an in-process connection (two instances in one program, and tests). The network
+//! transport ([`crate::net`]) sends the same messages over TCP, one JSON object per line
+//! ([`encode`] / [`decode`]), and plugs into [`Hub`] the same way.
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -20,6 +20,11 @@ pub struct Link<S, R> {
 }
 
 impl<S, R> Link<S, R> {
+    /// A link over existing channels; the network transport feeds them from a socket.
+    pub(crate) fn from_channels(tx: Sender<S>, rx: Receiver<R>) -> Self {
+        Self { tx, rx }
+    }
+
     pub fn send(&self, msg: S) -> Result<()> {
         self.tx.send(msg).map_err(|_| Error::Closed)
     }
