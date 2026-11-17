@@ -282,13 +282,7 @@ impl Open {
         let Some(sym) = self.symbols.get(&placed.symbol) else {
             return Some((placed.at + Point::new(-4.0, -4.0), placed.at + Point::new(4.0, 4.0)));
         };
-        let mut pts = vec![placed.at];
-        for g in &sym.graphics {
-            let (a, b) = g.placed(placed.at, placed.rotation, placed.mirror).bounds();
-            pts.push(a);
-            pts.push(b);
-        }
-        Some(wc_core::geom::bounds_of(&pts))
+        Some(sym.placed_bounds(placed.at, placed.rotation, placed.mirror))
     }
 
     /// Points of a wire, ends resolved; `None` when an end is on a missing symbol.
@@ -839,27 +833,34 @@ fn select_tool(
         _ => {}
     }
     if resp.drag_stopped() {
-        if let Some(Drag::Move { checkpoint: true, .. }) = ed.drag {
-            let moved = ed
-                .selection
-                .iter()
-                .filter_map(|s| match s {
-                    Selection::Symbol(id) => Some(id.clone()),
-                    _ => None,
-                })
-                .collect();
-            let wired = auto_wire(open, ed, &resp.ctx, moved);
-            if wired > 0 {
-                ed.message = wired_note(wired).trim_start().to_owned();
-            }
-        }
-        ed.drag = None;
+        let alt = resp.ctx.input(|i| i.modifiers.alt);
+        drag_released(open, ed, alt);
     }
 }
 
+/// The end of a select-tool drag: a finished move wires the moved symbols' pins that now line
+/// up (see [`auto_wire`]).
+fn drag_released(open: &mut Open, ed: &mut Editor, alt: bool) {
+    if let Some(Drag::Move { checkpoint: true, .. }) = ed.drag {
+        let moved = ed
+            .selection
+            .iter()
+            .filter_map(|s| match s {
+                Selection::Symbol(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let wired = auto_wire(open, ed, alt, moved);
+        if wired > 0 {
+            ed.message = wired_note(wired).trim_start().to_owned();
+        }
+    }
+    ed.drag = None;
+}
+
 /// Wire the pins of `items` that now line up, unless auto-wiring is off or Alt is held.
-fn auto_wire(open: &mut Open, ed: &Editor, ctx: &egui::Context, items: std::collections::BTreeSet<String>) -> usize {
-    if !ed.auto_wire || items.is_empty() || ctx.input(|i| i.modifiers.alt) {
+fn auto_wire(open: &mut Open, ed: &Editor, alt: bool, items: std::collections::BTreeSet<String>) -> usize {
+    if !ed.auto_wire || alt || items.is_empty() {
         return 0;
     }
     open.auto_wire(ed.page, &items)
@@ -951,7 +952,12 @@ fn place_tool(
         }
         match open.place(ed.page, &id, at) {
             Ok(sid) => {
-                let wired = auto_wire(open, ed, &resp.ctx, std::iter::once(sid.clone()).collect());
+                let wired = auto_wire(
+                    open,
+                    ed,
+                    resp.ctx.input(|i| i.modifiers.alt),
+                    std::iter::once(sid.clone()).collect(),
+                );
                 ed.select_only(Selection::Symbol(sid));
                 ed.message = format!("Placed {id}.{}", wired_note(wired));
             }
@@ -1050,4 +1056,86 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
     }
     open.add_wire(ed.page, start, end, via);
     ed.message = "Wire added.".into();
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::state::tests::project;
+    use wc_core::project::Endpoint;
+
+    /// A contact at (50, 20) and a coil placed off to the side, ready to be dragged under it.
+    fn moving_coil() -> (tempfile::TempDir, Open, Editor, String) {
+        let (tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.contact.no", Point::new(50.0, 20.0)).unwrap();
+        let coil = o.place(page, "wc.coil", Point::new(90.0, 60.0)).unwrap();
+        let ed = Editor {
+            page,
+            auto_wire: true,
+            selection: vec![Selection::Symbol(coil.clone())],
+            ..Editor::default()
+        };
+        (tmp, o, ed, coil)
+    }
+
+    /// Drag the selection by `d` the way the select tool does: one checkpoint, then the move.
+    fn drag(o: &mut Open, ed: &mut Editor, d: Point) {
+        o.checkpoint();
+        o.move_by(ed.page, &ed.selection.clone(), d);
+        ed.drag = Some(Drag::Move {
+            from: Point::new(0.0, 0.0),
+            checkpoint: true,
+        });
+    }
+
+    #[test]
+    fn a_finished_move_wires_pins_that_line_up() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let before = o.project.pages.clone();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        drag_released(&mut o, &mut ed, false);
+        let wires = &o.project.pages[ed.page].wires;
+        assert_eq!(wires.len(), 1);
+        assert!(matches!(&wires[0].from, Endpoint::Pin { item, .. } if *item == coil));
+        assert!(ed.message.contains("1 wire"), "{}", ed.message);
+        assert!(ed.drag.is_none());
+        assert!(o.undo());
+        assert_eq!(o.project.pages, before, "one undo takes back the move and its wire");
+    }
+
+    #[test]
+    fn a_move_released_with_alt_adds_no_wires() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        drag_released(&mut o, &mut ed, true);
+        assert!(o.project.pages[ed.page].wires.is_empty());
+        assert!(ed.message.is_empty());
+    }
+
+    #[test]
+    fn a_move_keeps_the_wires_that_were_there() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let other = o.place(page, "wc.coil", Point::new(150.0, 60.0)).unwrap();
+        o.add_wire(
+            page,
+            Endpoint::Pin {
+                item: coil,
+                pin: "A2".into(),
+            },
+            Endpoint::Pin {
+                item: other,
+                pin: "A2".into(),
+            },
+            Vec::new(),
+        );
+        let w = o.project.pages[page].wires[0].clone();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        drag_released(&mut o, &mut ed, false);
+        let wires = &o.project.pages[page].wires;
+        assert_eq!(wires.len(), 2);
+        assert!(wires.contains(&w));
+    }
 }

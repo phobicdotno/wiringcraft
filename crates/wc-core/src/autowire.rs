@@ -111,20 +111,14 @@ pub fn suggest<'a>(
         .symbols
         .iter()
         .filter_map(|s| {
-            let sym = symbol(&s.symbol)?;
-            let mut pts = vec![s.at];
-            for g in &sym.graphics {
-                let (a, b) = g.placed(s.at, s.rotation, s.mirror).bounds();
-                pts.extend([a, b]);
-            }
-            let (lo, hi) = bounds_of(&pts);
+            let (lo, hi) = symbol(&s.symbol)?.placed_bounds(s.at, s.rotation, s.mirror);
             Some((s.id.as_str(), lo, hi))
         })
         .collect();
 
     let mut used: BTreeSet<usize> = BTreeSet::new();
     let mut out = Vec::new();
-    let mut join = |i: usize, j: usize, used: &mut BTreeSet<usize>| {
+    let mut join = |(i, a): (usize, &PlacedPin), (j, b): (usize, &PlacedPin), used: &mut BTreeSet<usize>| {
         if used.contains(&i) || used.contains(&j) {
             return;
         }
@@ -134,7 +128,7 @@ pub fn suggest<'a>(
             item: p.item.clone(),
             pin: p.pin.clone(),
         };
-        out.push((end(&pins[i]), end(&pins[j])));
+        out.push((end(a), end(b)));
     };
 
     let moving = |p: &PlacedPin| items.contains(&p.item);
@@ -145,7 +139,7 @@ pub fn suggest<'a>(
         }
         for (j, b) in pins.iter().enumerate() {
             if a.item != b.item && free(b) && a.at.distance(b.at) < SAME && (!moving(b) || i < j) {
-                join(i, j, &mut used);
+                join((i, a), (j, b), &mut used);
             }
         }
     }
@@ -155,7 +149,7 @@ pub fn suggest<'a>(
         }
         let (dx, dy) = step(a.dir);
         // The nearest pin straight ahead, of any symbol.
-        let mut best: Option<(f64, usize)> = None;
+        let mut best: Option<(f64, usize, &PlacedPin)> = None;
         for (j, b) in pins.iter().enumerate() {
             if i == j {
                 continue;
@@ -163,19 +157,18 @@ pub fn suggest<'a>(
             let (vx, vy) = (b.at.x - a.at.x, b.at.y - a.at.y);
             let along = vx * dx + vy * dy;
             let across = (vx * dy - vy * dx).abs();
-            if along > SAME && across < SAME && best.is_none_or(|(d, _)| along < d) {
-                best = Some((along, j));
+            if along > SAME && across < SAME && best.is_none_or(|(d, _, _)| along < d) {
+                best = Some((along, j, b));
             }
         }
-        let Some((_, j)) = best else { continue };
-        let b = &pins[j];
+        let Some((_, j, b)) = best else { continue };
         if b.item == a.item || b.dir != opposite(a.dir) || !free(b) || used.contains(&j) {
             continue;
         }
         if blocked(a.at, b.at, &wire_ends, &boxes, [&a.item, &b.item]) {
             continue;
         }
-        join(i, j, &mut used);
+        join((i, a), (j, b), &mut used);
     }
     out
 }

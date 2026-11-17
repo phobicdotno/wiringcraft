@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::geom::{Point, Shape};
+use crate::geom::{Point, Rotation, Shape, bounds_of};
 use crate::hash::content_hash;
 
 /// Which way a wire leaves a pin; used by routing and by wire-end snapping.
@@ -70,5 +70,15 @@ impl Symbol {
 
     pub fn pin(&self, name: &str) -> Option<&Pin> {
         self.pins.iter().find(|p| p.name == name)
+    }
+
+    /// The box around the symbol's drawing when placed at `at`, origin included.
+    pub fn placed_bounds(&self, at: Point, rotation: Rotation, mirror: bool) -> (Point, Point) {
+        let mut pts = vec![at];
+        for g in &self.graphics {
+            let (a, b) = g.placed(at, rotation, mirror).bounds();
+            pts.extend([a, b]);
+        }
+        bounds_of(&pts)
     }
 }
