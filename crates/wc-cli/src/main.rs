@@ -1880,6 +1880,9 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
     for (t, d) in built.devices {
         p.devices.insert(t, d);
     }
+    for loc in built.locations {
+        p.meta.merge_location(loc);
+    }
     Ok(())
 }
 

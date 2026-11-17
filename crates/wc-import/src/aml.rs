@@ -251,6 +251,8 @@ pub struct Built {
     pub parts: Vec<wc_core::Part>,
     pub pages: Vec<Page>,
     pub devices: BTreeMap<DeviceTag, Device>,
+    /// Locations with their descriptions, for the project file (importers that have them).
+    pub locations: Vec<wc_core::Location>,
 }
 
 const PIN_STEP: f64 = 7.5;

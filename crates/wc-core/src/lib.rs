@@ -24,7 +24,9 @@ pub use error::{Error, Result};
 pub use geom::{Point, Shape};
 pub use lock::{LockEntry, Lockfile};
 pub use part::Part;
-pub use project::{CableCore, Device, Endpoint, Page, PageSize, PlacedSymbol, Project, ProjectMeta, Underlay, Wire};
+pub use project::{
+    CableCore, Device, Endpoint, Location, Page, PageSize, PlacedSymbol, Project, ProjectMeta, Underlay, Wire,
+};
 pub use review::{Comment, Reply};
 pub use symbol::{Pin, Symbol};
 pub use tag::DeviceTag;
