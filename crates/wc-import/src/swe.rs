@@ -1108,11 +1108,15 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let out_of_order: Vec<String> = on_strip
         .iter()
         .filter(|(_, list)| {
+            // In source order the numbers must rise strictly. Two numbers that sort alike (`1`
+            // and `01`) leave the plan's order to the drawing, so that strip is counted too.
             let mut by_order: Vec<&SweComponent> = list.to_vec();
             by_order.sort_by_key(|c| (c.order, c.id));
-            let mut by_number: Vec<&SweComponent> = list.to_vec();
-            by_number.sort_by_key(|c| (wc_core::project::natural_key(&number_of(c)), c.id));
-            by_order.iter().map(|c| c.id).ne(by_number.iter().map(|c| c.id))
+            let keys: Vec<_> = by_order
+                .iter()
+                .map(|c| wc_core::project::natural_key(&number_of(c)))
+                .collect();
+            keys.windows(2).any(|w| matches!(w, [a, b] if a >= b))
         })
         .filter_map(|(strip, _)| tags.get(strip).map(ToString::to_string))
         .collect();
@@ -1505,7 +1509,8 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         .map(|s| s.id.as_str())
         .collect();
     let mut probe = wc_core::Project::new("");
-    probe.pages = built.pages.clone();
+    // Schematic pages only: a line diagram's potential names could join nets no schematic joins.
+    probe.pages = built.pages.iter().filter(|pg| !pg.overview).cloned().collect();
     let mut net_of: BTreeMap<PinRef, usize> = BTreeMap::new();
     for (n, net) in nets_linked(&probe, |id| interruptions.contains(id))
         .into_iter()

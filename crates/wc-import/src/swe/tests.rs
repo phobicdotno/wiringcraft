@@ -1036,3 +1036,53 @@ fn a_wire_end_on_a_repeated_pin_name_is_found_on_the_right_pin() {
         .unwrap();
     assert_eq!((ends.source, ends.imported), (1, 1), "{} {warnings:?}", ends.note);
 }
+
+#[test]
+fn terminal_numbers_that_sort_alike_count_the_strip_as_out_of_order() {
+    let c = sample();
+    c.execute_batch(
+        "INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '01', '-X1-01', 4, 200, 1),
+           (202, '1', '-X1-1', 4, 200, 2), (210, 'X2', '-X2', 3, NULL, 0), (211, '1', '-X2-1', 4, 210, 1),
+           (212, '2', '-X2-2', 4, 210, 2), (213, '10', '-X2-10', 4, 210, 3);",
+    )
+    .unwrap();
+    let (_, warnings, report) = build(&read(&c).unwrap(), None);
+    let strips = report.iter().find(|c| c.what == "terminal strips").unwrap();
+    assert!(
+        strips.note.starts_with("1 whose source order differs"),
+        "{}",
+        strips.note
+    );
+    assert!(
+        warnings.iter().any(|w| w.starts_with("terminal strip(s) -X1 have")),
+        "only -X1 (1, 2, 10 rise naturally): {warnings:?}"
+    );
+}
+
+#[test]
+fn a_line_diagram_does_not_join_what_the_schematics_keep_apart() {
+    let c = sample_with_strip();
+    // Wire N2's ends are apart in the schematic: X1.2's upper end (given potential JOIN here) and
+    // K1:A1 (potential 101). A line diagram joins the two potentials at one pin; the check must
+    // not let that count as a connection.
+    c.execute_batch(
+        "INSERT INTO tew_file (fil_id, fil_orderno, fil_filetype, fil_title, fil_fol_id) VALUES (12, 3, 1, '02', 7);
+         INSERT INTO tew_equipotential VALUES (901, 'JOIN');
+         INSERT INTO tew_symbol VALUES (30, 12, 202, 'Terminal', 50, 50, 0, 1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (30, 0, 0, 0, 5);
+         INSERT INTO tew_line VALUES (20, 12, 50, 55, 50, 70, 901), (22, 12, 50, 55, 30, 55, 900),
+           (21, 10, 170, 205, 170, 230, 901);",
+    )
+    .unwrap();
+    let (built, _, report) = build(&read(&c).unwrap(), None);
+    assert!(built.pages.iter().any(|p| p.overview), "the line diagram is imported");
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(
+        ends.note.contains("1 join terminals that are not connected"),
+        "{}",
+        ends.note
+    );
+}
