@@ -50,6 +50,9 @@ pub struct Host {
     /// The recorded changes, oldest first, with what each changed, for undo.
     history: Vec<Entry>,
     next_change: u64,
+    /// Why guests' Undo, Redo and "Undo this change" are refused for now, if they are: the
+    /// host's project folder belongs to something else meanwhile (an assistant command).
+    take_backs_held: Option<String>,
 }
 
 /// A recorded change and the parts of the project it changed, before and after.
@@ -97,6 +100,7 @@ impl Host {
             journal_errors: Vec::new(),
             history: Vec::new(),
             next_change: 1,
+            take_backs_held: None,
         }
     }
 
@@ -248,6 +252,12 @@ impl Host {
         self.do_revert(HOST, change, ChangeKind::Undo)
     }
 
+    /// Refuse guests' Undo, Redo and "Undo this change" with `reason` while it is set; `None`
+    /// takes them again.
+    pub fn hold_take_backs(&mut self, reason: Option<String>) {
+        self.take_backs_held = reason;
+    }
+
     /// Handle one message from a guest. A refusal is also sent back to that guest.
     pub fn receive(&mut self, from: PeerId, msg: GuestMsg) -> Result<(), Refusal> {
         if from == HOST {
@@ -295,6 +305,13 @@ impl Host {
                 result
             }
             (Status::Joined, GuestMsg::EditProject { edit }) => self.do_edit_project(from, edit),
+            (Status::Joined, GuestMsg::Undo | GuestMsg::Redo | GuestMsg::Revert { .. })
+                if self.take_backs_held.is_some() =>
+            {
+                Err(Refusal::Invalid {
+                    reason: self.take_backs_held.clone().unwrap_or_default(),
+                })
+            }
             (Status::Joined, GuestMsg::Undo) => self.do_undo(from),
             (Status::Joined, GuestMsg::Redo) => self.do_redo(from),
             (Status::Joined, GuestMsg::Revert { change }) => self.do_revert(from, change, ChangeKind::Undo),

@@ -216,7 +216,16 @@ pub fn yield_to_session(local: &mut Project, base: &mut Project, auth: &Project)
         match a {
             Some(a) => {
                 match local.page_mut(&id) {
-                    Some(p) => *p = a.clone(),
+                    // A number only this window changed goes out on its own, as a renumbering.
+                    Some(p) => {
+                        let number = if p.number != b.number {
+                            p.number.clone()
+                        } else {
+                            a.number.clone()
+                        };
+                        *p = a.clone();
+                        p.number = number;
+                    }
                     None => {
                         let at = pos.min(local.pages.len());
                         local.pages.insert(at, a.clone());
@@ -647,6 +656,16 @@ pub struct Share {
 impl Share {
     pub fn active(&self) -> bool {
         self.role.is_some()
+    }
+
+    /// While an assistant command owns the project folder, a host refuses guests' Undo, Redo
+    /// and "Undo this change": each would write the folder through the session's history.
+    pub fn set_command_running(&mut self, running: bool) {
+        if let Some(Role::Host(h)) = self.role.as_mut() {
+            h.host.hold_take_backs(running.then(|| {
+                "the host's assistant is running a command on the project; try again once it has finished".to_owned()
+            }));
+        }
     }
 
     /// Show the share form, or the session window when a session is running.

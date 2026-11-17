@@ -719,6 +719,22 @@ fn a_page_numbered_on_both_sides_keeps_the_sessions_number() {
 }
 
 #[test]
+fn a_content_clash_keeps_a_number_only_this_window_changed() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "A"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    auth.pages[0].title = "B".into();
+    local.pages[0].number = "9".into();
+    local.pages[0].title = "C".into();
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["page 1"]);
+    assert_eq!(local.pages[0].title, "B", "the session's content wins");
+    assert_eq!(local.pages[0].number, "9", "the renumbering made here stays");
+    assert_eq!(base.pages[0].number, "1", "and still goes out on its own");
+}
+
+#[test]
 fn a_page_removed_while_its_undo_is_on_its_way_stays_in_the_session() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;

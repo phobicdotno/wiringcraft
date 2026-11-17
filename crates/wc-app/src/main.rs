@@ -214,6 +214,7 @@ impl App {
         let busy = ctx.input(|i| i.pointer.any_down())
             || matches!(self.dialog, Some(Dialog::Cover { .. }))
             || self.assistant.command_running();
+        self.share.set_command_running(self.assistant.command_running());
         self.sync_session_now(busy);
         // Others' changes arrive without any input here.
         ctx.request_repaint_after(std::time::Duration::from_millis(100));

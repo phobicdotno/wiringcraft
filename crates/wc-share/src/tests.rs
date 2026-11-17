@@ -1314,6 +1314,41 @@ fn several_pages_change_in_one_commit_unless_someone_else_has_one_open() -> Test
 }
 
 #[test]
+fn a_guest_undo_is_refused_while_the_host_holds_take_backs() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    let mut pa = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("no page")?;
+    place(&mut pa, "s1", 10.0);
+    a_link.send(a.edit_page(pa.clone()).ok_or("not editable")?)?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    let commits = s.log.0.borrow().len();
+
+    s.host
+        .hold_take_backs(Some("an assistant command is changing the project".into()));
+    for m in [a.undo(), GuestMsg::Redo, GuestMsg::Revert { change: 1 }] {
+        a_link.send(m)?;
+        s.pump(&mut [(&a_link, &mut a)]);
+        assert!(!a.taking_back(), "the refusal comes back as the answer");
+    }
+    assert_eq!(s.host.project().page("p0002"), Some(&pa), "nothing was taken back");
+    assert_eq!(s.log.0.borrow().len(), commits, "nothing was written");
+    assert!(a.refusals.iter().any(|r| r.to_string().contains("assistant command")));
+
+    s.host.hold_take_backs(None);
+    a_link.send(a.undo())?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(s.host.project().page("p0002").is_some_and(|p| p.symbols.is_empty()));
+    Ok(())
+}
+
+#[test]
 fn undo_takes_back_only_your_own_change() -> TestResult {
     let mut s = Session::new();
     let (_, a_link, mut a) = s.join("Ola")?;
