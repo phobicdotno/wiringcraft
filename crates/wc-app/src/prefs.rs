@@ -93,13 +93,60 @@ pub fn folder_name(name: &str) -> Option<String> {
 
 /// The folder a new project goes in: `location` (resolved like any typed folder) with the
 /// project name as the last folder, or `new-project` when there is no name yet.
-pub fn new_project_dir(location: &str, name: &str) -> Result<PathBuf, String> {
+pub fn new_project_dir(location: &Path, name: &str) -> Result<PathBuf, String> {
     let leaf = if name.trim().is_empty() {
         "new-project".to_owned()
     } else {
         folder_name(name).ok_or_else(|| format!("\"{}\" cannot be a folder name.", name.trim()))?
     };
-    Ok(project_path(location).join(leaf))
+    Ok(location.join(leaf))
+}
+
+/// A folder field in a dialog: what is typed, and the folder last picked with Browse (or from
+/// the recent list). A picked folder is used exactly as picked, spaces and all; typed text
+/// follows [`project_path`]. Editing the text after picking makes it typed again.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FolderField {
+    pub text: String,
+    picked: Option<PathBuf>,
+}
+
+impl FolderField {
+    pub fn typed(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            picked: None,
+        }
+    }
+
+    /// Take a folder from the picker. A name that is not valid text (possible on Linux) cannot
+    /// be shown in the field without changing it, so it is refused with the reason.
+    pub fn pick(&mut self, dir: PathBuf) -> Result<(), String> {
+        let text = dir
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "The folder name {} is not valid text; rename it or type another.",
+                    dir.display()
+                )
+            })?
+            .to_owned();
+        self.text = text;
+        self.picked = Some(dir);
+        Ok(())
+    }
+
+    /// The folder this field means now.
+    pub fn path(&self) -> PathBuf {
+        match &self.picked {
+            Some(p) if p.to_str() == Some(self.text.as_str()) => p.clone(),
+            _ => project_path(&self.text),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.picked.is_none()
+    }
 }
 
 /// A folder typed into a dialog: a relative one (just `test`) is taken inside
@@ -185,10 +232,31 @@ mod tests {
     fn the_new_project_folder_follows_the_name_whenever_it_is_typed() {
         let loc = std::env::temp_dir().join("wc-loc");
         let l = loc.display().to_string();
+        let l = FolderField::typed(l).path();
         assert_eq!(new_project_dir(&l, "").unwrap(), loc.join("new-project"));
         assert_eq!(new_project_dir(&l, "Motor").unwrap(), loc.join("Motor"));
         assert_eq!(new_project_dir(&l, "../Motor").unwrap(), loc.join("-Motor"));
         assert!(new_project_dir(&l, "..").is_err());
+    }
+
+    #[test]
+    fn a_picked_folder_is_used_exactly_and_typing_makes_it_typed_again() {
+        let picked = std::env::temp_dir().join("Motor ");
+        let mut f = FolderField::typed("");
+        f.pick(picked.clone()).unwrap();
+        assert_eq!(f.path(), picked, "the trailing space stays");
+        f.text.push('x');
+        assert_eq!(f.path(), project_path(&f.text), "edited text follows the typed rule");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_name_that_is_not_text_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let odd = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+        let mut f = FolderField::typed("keep");
+        assert!(f.pick(odd).is_err());
+        assert_eq!(f.text, "keep", "the field is left as it was");
     }
 
     #[test]

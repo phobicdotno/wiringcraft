@@ -39,11 +39,14 @@ const TITLE_FIELDS: &[(&str, &str)] = &[
 ];
 
 enum Dialog {
-    OpenPath(String),
+    /// The folder field, and why the last Browse could not be used.
+    OpenPath(prefs::FolderField, Option<String>),
     NewProject {
         /// The folder the project folder goes in.
-        location: String,
+        location: prefs::FolderField,
         name: String,
+        /// Why the last Browse could not be used.
+        error: Option<String>,
     },
     ProjectProps {
         name: String,
@@ -227,7 +230,7 @@ impl App {
                     .as_ref()
                     .map(|o| o.dir.display().to_string())
                     .unwrap_or_default();
-                self.dialog = Some(Dialog::OpenPath(start));
+                self.dialog = Some(Dialog::OpenPath(prefs::FolderField::typed(start), None));
             }
             Action::NewProject => {
                 let location = self
@@ -235,12 +238,15 @@ impl App {
                     .as_ref()
                     .and_then(|o| o.dir.parent())
                     .map(Path::to_path_buf)
-                    .unwrap_or_else(prefs::projects_dir)
-                    .display()
-                    .to_string();
+                    .unwrap_or_else(prefs::projects_dir);
+                let mut field = prefs::FolderField::default();
+                if field.pick(location.clone()).is_err() {
+                    field = prefs::FolderField::typed(location.to_string_lossy());
+                }
                 self.dialog = Some(Dialog::NewProject {
-                    location,
+                    location: field,
                     name: String::new(),
+                    error: None,
                 });
             }
             Action::ToggleChrome => {
@@ -600,7 +606,7 @@ impl App {
         let mut keep = true;
         let mut then: Option<Then> = None;
         let title = match &dialog {
-            Dialog::OpenPath(_) => "Open project",
+            Dialog::OpenPath(..) => "Open project",
             Dialog::NewProject { .. } => "New project",
             Dialog::ProjectProps { .. } => "Project properties",
             Dialog::PageProps { .. } => "Page properties",
@@ -716,27 +722,30 @@ impl App {
                         keep = false;
                     }
                 }
-                Dialog::OpenPath(path) => {
+                Dialog::OpenPath(path, error) => {
                     ui.label("Project folder (the one holding project.toml):");
                     let r = ui
                         .horizontal(|ui| {
-                            let r = ui.add(egui::TextEdit::singleline(path).desired_width(340.0));
+                            let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(340.0));
                             if ui.button("Browse…").clicked()
-                                && let Some(d) = pick_folder("Open project", path)
+                                && let Some(d) = pick_folder("Open project", &path.text)
                             {
-                                *path = d.display().to_string();
+                                *error = path.pick(d).err();
                             }
                             r
                         })
                         .inner;
                     for recent in &self.prefs.recent {
                         if ui.link(recent.display().to_string()).clicked() {
-                            *path = recent.display().to_string();
+                            *error = path.pick(recent.clone()).err();
                         }
+                    }
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Open").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
-                            let p = prefs::project_path(path);
+                            let p = path.path();
                             then = Some(Box::new(move |app: &mut App| {
                                 let mut prefs = std::mem::take(&mut app.prefs);
                                 app.open_dir(&p, &mut prefs);
@@ -749,7 +758,7 @@ impl App {
                         }
                     });
                 }
-                Dialog::NewProject { location, name } => {
+                Dialog::NewProject { location, name, error } => {
                     egui::Grid::new("newproj")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
@@ -763,18 +772,21 @@ impl App {
                             ui.end_row();
                             ui.label("Location");
                             ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(location).desired_width(300.0));
+                                ui.add(egui::TextEdit::singleline(&mut location.text).desired_width(300.0));
                                 if ui.button("Browse…").clicked()
-                                    && let Some(d) = pick_folder("Where to create the project", location)
+                                    && let Some(d) = pick_folder("Where to create the project", &location.text)
                                 {
-                                    *location = d.display().to_string();
+                                    *error = location.pick(d).err();
                                 }
                             });
                             ui.end_row();
                         });
                     // The folder follows the name and the location, whichever is typed last.
-                    let target = prefs::new_project_dir(location, name);
+                    let target = prefs::new_project_dir(&location.path(), name);
                     let t = theme::Theme::of(ui.ctx());
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(t.error));
+                    }
                     match &target {
                         Ok(d) => ui.label(RichText::new(format!("Creates {}", d.display())).color(t.muted)),
                         Err(e) => ui.label(RichText::new(e.as_str()).color(t.error)),
@@ -785,7 +797,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if let Ok(d) = target
                             && ui
-                                .add_enabled(!location.trim().is_empty(), egui::Button::new("Create"))
+                                .add_enabled(!location.is_empty(), egui::Button::new("Create"))
                                 .clicked()
                         {
                             let n = name.trim().to_owned();
