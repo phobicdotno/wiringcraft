@@ -27,7 +27,7 @@ See the feature list for the full plan.
 | `wc-report` | parts list, device list, wire list, net list, terminal plan, cable list, PLC I/O list, table of contents |
 | `wc-pdf` | vector PDF export (schematic pages plus report pages) |
 | `wc-vcs` | git versioning, subway-map history, schematic change lists |
-| `wc-agent` | the live AI assistant: Claude conversation, tool loop, HTTPS client |
+| `wc-agent` | the live AI assistant: Claude Code connection (your login), tool bridge, API client |
 | `wc-cli` | the `wiringcraft` command |
 | `wc-app` | the desktop editor (`wiringcraft-app`) |
 
@@ -65,10 +65,26 @@ runs checks, reports and exports, records versions, and can run any toolbar comm
 `wiringcraft` command-line command (imports, PLC variable lists, STEP export, merges ...).
 Everything it changes in one turn is a single undo step (Ctrl+Z).
 
-It needs an Anthropic API key: set `ANTHROPIC_API_KEY`, or paste one under Settings in the panel
-(kept in your WiringCraft preferences, never in a project). Settings also pick the model
-(Claude Opus 5.5 by default) and the effort. The conversation code is in `crates/wc-agent`; the
-tools are in `crates/wc-app/src/agent.rs`.
+By default it uses your own Claude login, the same way as SolidCraft: WiringCraft starts
+Claude Code through its connector and hands it the WiringCraft tools, so the chat runs on your
+Claude plan and no API key is needed. One-time setup:
+
+```sh
+npm install -g @agentclientprotocol/claude-agent-acp   # the Claude Code connector
+claude                                                 # then /login once
+```
+
+Claude Code only gets WiringCraft's tools in this chat (no shell, file or web tools), and it
+reaches them through a local port only this computer can use, with a fresh token each run. It
+starts in WiringCraft's own settings folder, never in the project folder, so settings inside
+a project you were sent cannot run anything when the assistant starts.
+
+To use an Anthropic API key instead, choose **API key** under Settings in the panel, then paste
+the key there or set `ANTHROPIC_API_KEY` (setting the variable alone does not switch). A pasted
+key is kept in your WiringCraft preferences, never in a project.
+Settings also pick the model and the effort. The connections are in `crates/wc-agent`
+(`acp.rs` for Claude Code, `bridge.rs` for the tool bridge); the tools are in
+`crates/wc-app/src/agent.rs`.
 
 ![assistant](docs/screenshots/assistant.png)
 
