@@ -1778,7 +1778,8 @@ fn picker_outcome(r: Option<PathBuf>, open_for: std::time::Duration, errors: &[S
             ));
             Picked::Failed(NO_PORTAL.to_owned())
         }
-        None if open_for < std::time::Duration::from_millis(150) => {
+        // Only when rfd logged nothing: a portal failure alone means zenity showed instead.
+        None if errors.is_empty() && open_for < std::time::Duration::from_millis(150) => {
             applog::warn(&format!(
                 "folder picker: no answer after {open_for:?}; taken as not opened"
             ));
