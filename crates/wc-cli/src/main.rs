@@ -472,6 +472,12 @@ enum ImportCmd {
         /// Number the pages from here instead of keeping the source's page numbers.
         #[arg(long)]
         first_page: Option<usize>,
+        /// Which library symbol to draw for which source block: a text file with one
+        /// `block name = symbol.id` per line. Without it, blocks whose pins match a built-in
+        /// symbol (coil A1/A2, contacts 13/14 and 11/12, lamp X1/X2, terminal 1/2) use it when
+        /// the pins sit where the block's points are; the rest are drawn as boxes.
+        #[arg(long)]
+        symbol_map: Option<PathBuf>,
     },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
     Aml {
@@ -1472,7 +1478,12 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 ep.connections.len()
             );
         }
-        ImportCmd::Swe { path, pick, first_page } => {
+        ImportCmd::Swe {
+            path,
+            pick,
+            first_page,
+            symbol_map,
+        } => {
             let project = pick;
             let started = std::time::Instant::now();
             let mut p = load(dir)?;
@@ -1514,7 +1525,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let conn = wc_import::swe::open(&db).map_err(e)?;
             let mut sw = wc_import::swe::read(&conn).map_err(e)?;
             sw.info = info;
-            let (built, warnings, report) = wc_import::swe::build(&sw, first_page);
+            let choice = swe_symbol_choice(dir, &p, symbol_map.as_deref())?;
+            let (built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);
             for w in sw.warnings.iter().chain(&warnings) {
                 eprintln!("warning: {w}");
             }
@@ -1524,8 +1536,20 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             );
-            let n_sym = built.symbols.len();
+            let n_sym = built.symbols.iter().filter(|s| !choice.1.contains_key(&s.id)).count();
+            let fresh: Vec<String> = built
+                .symbols
+                .iter()
+                .filter(|s| choice.1.contains_key(&s.id) && !p.lock.symbols.contains_key(&s.id))
+                .map(|s| s.id.clone())
+                .collect();
             add_built(dir, &mut p, built, &source)?;
+            // Library symbols are pinned to the library they came from, not to the import.
+            for id in fresh {
+                if let (Some(lib), Some(entry)) = (choice.1.get(&id), p.lock.symbols.get_mut(&id)) {
+                    entry.source = lib.clone();
+                }
+            }
             save(dir, &p)?;
             println!(
                 "{:<18} {:>8} {:>9}  why the rest is not imported",
@@ -2109,6 +2133,42 @@ fn eplan_tables(path: &Path) -> Result<wc_import::eplan::Tables, String> {
 
 /// Add imported symbols, parts, pages and devices to a project, pinning symbols and parts in
 /// the lockfile under `source`.
+/// The library symbols a SolidWorks import may draw, with the library each comes from: the
+/// project's own copy where it has one (so a repeated import matches it), otherwise the
+/// project's libraries. With `map`, the user's block map from that file.
+fn swe_symbol_choice(
+    dir: &Path,
+    p: &Project,
+    map: Option<&Path>,
+) -> Res<(wc_import::swe::SymbolChoice, std::collections::BTreeMap<String, String>)> {
+    let mut choice = wc_import::swe::SymbolChoice::default();
+    if let Some(path) = map {
+        let text = std::fs::read_to_string(path).map_err(|x| format!("{}: {x}", path.display()))?;
+        choice.by_block = wc_import::swe::parse_symbol_map(&text).map_err(|x| format!("{}: {x}", path.display()))?;
+    }
+    let mut wanted: std::collections::BTreeSet<String> = choice.by_block.values().cloned().collect();
+    wanted.extend(wc_import::swe::BUILTIN_BY_PINS.iter().map(|(_, id)| (*id).to_owned()));
+    let (vendored, _) = store::vendored_symbols(dir, p);
+    // A library that cannot be opened (a git source not synced yet) only means fewer matches.
+    let lib = wc_library::Library::open(dir, p)
+        .inspect_err(|x| eprintln!("warning: libraries not read, blocks may stay boxes: {x}"))
+        .ok();
+    let mut sources = std::collections::BTreeMap::new();
+    for id in wanted {
+        if let Some(s) = vendored.get(&id) {
+            let source = p.lock.symbols.get(&id).map(|l| l.source.clone()).unwrap_or_default();
+            sources.insert(id.clone(), source);
+            choice.library.insert(id, s.clone());
+        } else if let Some((s, source)) = lib.as_ref().and_then(|l| l.symbol(&id).ok()) {
+            sources.insert(id.clone(), source);
+            choice.library.insert(id, s);
+        } else if map.is_some() && choice.by_block.values().any(|v| *v == id) {
+            eprintln!("warning: symbol map names {id}, which no library has; those blocks stay boxes");
+        }
+    }
+    Ok((choice, sources))
+}
+
 fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Result<(), String> {
     let e = |x: wc_core::Error| x.to_string();
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of

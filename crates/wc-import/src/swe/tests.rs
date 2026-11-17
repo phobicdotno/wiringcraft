@@ -1632,3 +1632,117 @@ fn a_cable_core_keeps_its_own_wire_s_spec() {
     let wires = report.iter().find(|c| c.what == "wires").unwrap();
     assert!(wires.note.contains("no section or colour"), "{}", wires.note);
 }
+
+/// A library coil whose pins sit where the sample's coil block has its points: A1 5 mm above
+/// the origin, A2 5 mm below (page y runs down).
+fn lib_coil(id: &str, a2_at: f64) -> Symbol {
+    let pin = |name: &str, y: f64, dir| Pin {
+        name: name.into(),
+        at: Point::new(0.0, y),
+        dir,
+    };
+    Symbol {
+        id: id.into(),
+        name: "Relay coil".into(),
+        category: "relays".into(),
+        letter_code: "K".into(),
+        role: SymbolRole::Main,
+        graphics: vec![Shape::Rect {
+            min: Point::new(-4.0, -3.0),
+            max: Point::new(4.0, 3.0),
+        }],
+        pins: vec![pin("A1", -5.0, PinDir::Up), pin("A2", a2_at, PinDir::Down)],
+        tag_at: Point::new(5.0, 0.0),
+        description: String::new(),
+    }
+}
+
+fn choice(symbols: &[Symbol], map: &[(&str, &str)]) -> SymbolChoice {
+    SymbolChoice {
+        library: symbols.iter().map(|s| (s.id.clone(), s.clone())).collect(),
+        by_block: map.iter().map(|(b, i)| ((*b).to_owned(), (*i).to_owned())).collect(),
+    }
+}
+
+fn count<'a>(report: &'a [Count], what: &str) -> &'a Count {
+    report.iter().find(|c| c.what == what).unwrap()
+}
+
+#[test]
+fn a_mapped_block_is_drawn_as_the_library_symbol_and_keeps_its_wire() {
+    let sw = read(&sample()).unwrap();
+    let (built, _, report) = build_with(&sw, None, &choice(&[lib_coil("my.coil", 5.0)], &[("coil", "my.coil")]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert_eq!(k1.symbol, "my.coil", "the map matches the block name ignoring case");
+    assert!(
+        built.symbols.iter().any(|s| s.id == "my.coil"),
+        "used library symbols come along"
+    );
+    assert_eq!(
+        built.symbols.len(),
+        2,
+        "the coil from the library, one box for the fuse"
+    );
+    // The wire still ends on K1:A1.
+    let ends_on_a1 = page(&built, "01").wires.iter().any(|w| {
+        [&w.from, &w.to]
+            .iter()
+            .any(|e| matches!(e, Endpoint::Pin { item, pin } if item == "s1" && pin == "A1"))
+    });
+    assert!(ends_on_a1);
+    let c = count(&report, "library symbols");
+    assert_eq!((c.source, c.imported), (2, 1));
+    assert_eq!(c.note, "1 drawn as boxes: no library symbol fits");
+}
+
+#[test]
+fn a_built_in_match_needs_the_pins_where_the_points_are() {
+    let sw = read(&sample()).unwrap();
+    // Pins named A1 and A2 match wc.coil without a map, when they sit where the points do.
+    let (built, _, _) = build_with(&sw, None, &choice(&[lib_coil("wc.coil", 5.0)], &[]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert_eq!(k1.symbol, "wc.coil");
+    // A2 15 mm lower than the block's point: no fit, a box as before.
+    let (built, _, report) = build_with(&sw, None, &choice(&[lib_coil("wc.coil", 15.0)], &[]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert!(k1.symbol.starts_with("swe."), "{}", k1.symbol);
+    assert_eq!(count(&report, "library symbols").imported, 0);
+}
+
+#[test]
+fn a_mapped_block_that_does_not_fit_stays_a_box() {
+    let sw = read(&sample()).unwrap();
+    // Mapped to a symbol whose pins are elsewhere: a box, and no fallback to the built-in match.
+    let lib = [lib_coil("my.coil", 15.0), lib_coil("wc.coil", 5.0)];
+    let (built, _, _) = build_with(&sw, None, &choice(&lib, &[("Coil", "my.coil")]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert!(k1.symbol.starts_with("swe."), "{}", k1.symbol);
+    // Mapped to a symbol the library does not have: a box too.
+    let (built, _, _) = build_with(&sw, None, &choice(&lib, &[("Coil", "gone.coil")]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert!(k1.symbol.starts_with("swe."), "{}", k1.symbol);
+}
+
+#[test]
+fn a_terminal_block_only_becomes_a_terminal_symbol() {
+    let sw = read(&sample()).unwrap();
+    let mut terminal = lib_coil("my.terminal", 5.0);
+    terminal.role = SymbolRole::Terminal;
+    // The coil block belongs to an ordinary component: a terminal symbol does not fit it.
+    let (built, _, _) = build_with(&sw, None, &choice(&[terminal], &[("Coil", "my.terminal")]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert!(k1.symbol.starts_with("swe."), "{}", k1.symbol);
+}
+
+#[test]
+fn symbol_maps_are_read_line_by_line() {
+    let map = parse_symbol_map("# blocks\n\nCoil = wc.coil\n  NO contact =wc.contact.no \n").unwrap();
+    assert_eq!(map.get("Coil").map(String::as_str), Some("wc.coil"));
+    assert_eq!(map.get("NO contact").map(String::as_str), Some("wc.contact.no"));
+    assert_eq!(
+        parse_symbol_map("Coil wc.coil").unwrap_err(),
+        "line 1: expected `block name = symbol.id`"
+    );
+    assert!(parse_symbol_map("x\n = wc.coil").unwrap_err().starts_with("line 1"));
+    assert!(parse_symbol_map("# c\n = wc.coil").unwrap_err().starts_with("line 2"));
+}
