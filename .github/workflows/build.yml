@@ -1,0 +1,65 @@
+# Release builds to download and try: the app (`wiringcraft-app`) and the command line
+# (`wiringcraft`) for Windows, Linux and macOS, one download per system on the run's page under
+# "Artifacts". Linux and macOS hold a .tar.gz inside, because the artifact zip drops the
+# executable bit and the programs would not start without `chmod +x`. Runs on every push to main, on pull requests, and on demand (Actions > Build > Run
+# workflow). Installers are the next step (#47).
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: windows-x64, exe: .exe }
+          - { os: ubuntu-latest, name: linux-x64, exe: '' }
+          - { os: macos-latest, name: macos-arm64, exe: '' }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release
+      - run: cargo build --release -p wc-cli -p wc-app
+      - name: Collect
+        id: collect
+        shell: bash
+        run: |
+          d="wiringcraft-${{ matrix.name }}"
+          mkdir -p "$d"
+          cp "target/release/wiringcraft${{ matrix.exe }}" "target/release/wiringcraft-app${{ matrix.exe }}" "$d/"
+          cp README.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md "$d/"
+          "$d/wiringcraft${{ matrix.exe }}" --version
+          if [ -z "${{ matrix.exe }}" ]; then
+            tar -czf "$d.tar.gz" "$d"
+            rm -rf "$d" && mkdir check && tar -xzf "$d.tar.gz" -C check
+            test -x "check/$d/wiringcraft" && test -x "check/$d/wiringcraft-app"
+            "check/$d/wiringcraft" --version
+            echo "upload=$d.tar.gz" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload=$d" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wiringcraft-${{ matrix.name }}
+          path: ${{ steps.collect.outputs.upload }}
+          if-no-files-found: error
+          retention-days: 30
