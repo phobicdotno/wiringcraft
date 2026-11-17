@@ -657,6 +657,28 @@ impl Open {
         }
     }
 
+    /// Jumper terminals of a strip together, as one undo step. See [`ProjectMeta::add_jumper`].
+    pub fn add_jumper(&mut self, strip: &DeviceTag, terminals: &[String]) -> Result<(), String> {
+        let mut meta = self.project.meta.clone();
+        meta.add_jumper(strip, terminals)?;
+        if meta != self.project.meta {
+            self.checkpoint();
+            self.project.meta = meta;
+        }
+        Ok(())
+    }
+
+    /// Take a terminal of a strip out of its jumper, as one undo step. Returns whether it was in one.
+    pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        let mut meta = self.project.meta.clone();
+        if !meta.remove_from_jumper(strip, terminal) {
+            return false;
+        }
+        self.checkpoint();
+        self.project.meta = meta;
+        true
+    }
+
     /// Cables used anywhere in the project, for the cable picker.
     pub fn cables(&self) -> Vec<DeviceTag> {
         let set: std::collections::BTreeSet<DeviceTag> = self
@@ -1013,6 +1035,25 @@ pub(crate) mod tests {
             o.project.pages[page].wires[0].cable.as_ref().map(|c| c.core.as_str()),
             Some("BN")
         );
+    }
+
+    #[test]
+    fn jumpers_are_added_and_removed_in_one_undo_step_each() {
+        let (_tmp, mut o) = project();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mark = o.undo_mark();
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        assert_eq!(o.undo_mark(), mark + 1);
+        o.add_jumper(&x1, &["2".into(), "1".into()]).unwrap();
+        assert_eq!(o.undo_mark(), mark + 1, "the same jumper again is no change");
+        assert!(o.add_jumper(&x1, &["1".into()]).is_err());
+        o.save().unwrap();
+        assert_eq!(Open::load(&o.dir).unwrap().project.meta.jumpers.len(), 1);
+        assert!(o.remove_from_jumper(&x1, "1"));
+        assert!(o.project.meta.jumpers.is_empty());
+        assert!(!o.remove_from_jumper(&x1, "1"));
+        assert!(o.undo());
+        assert_eq!(o.project.meta.jumpers.len(), 1);
     }
 
     #[test]

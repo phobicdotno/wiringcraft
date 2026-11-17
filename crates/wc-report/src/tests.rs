@@ -194,6 +194,23 @@ fn terminal_plan_sorts_numbers_and_shows_both_sides() {
 }
 
 #[test]
+fn terminal_plan_shows_jumpers() {
+    let (mut p, s, parts) = fixture();
+    let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+    p.meta.add_jumper(&x1, &["1".to_owned(), "2".to_owned()]).unwrap();
+    let t = terminal_plan(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.columns.last().map(String::as_str), Some("Jumpered with"));
+    let row = |strip: &str, n: &str| t.rows.iter().find(|r| r[0] == strip && r[1] == n).unwrap().clone();
+    assert_eq!(row("-X1", "1")[6], "2");
+    assert_eq!(row("-X1", "2")[6], "1");
+    assert_eq!(row("-X2", "1")[6], "", "not jumpered");
+}
+
+#[test]
 fn net_list_joins_across_wires() {
     let (p, s, parts) = fixture();
     let t = net_list(&Inputs {

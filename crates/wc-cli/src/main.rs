@@ -84,6 +84,9 @@ enum Cmd {
         #[arg(long)]
         core: Option<String>,
     },
+    /// Jumpers (bridges) between terminals of one strip: jumpered terminals are one potential.
+    #[command(subcommand)]
+    Jumper(JumperCmd),
     /// Set a device's part and description.
     Device {
         tag: String,
@@ -227,6 +230,22 @@ enum PanelCmd {
     Remove {
         id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum JumperCmd {
+    /// Jumper terminals of a strip, e.g. `jumper add -- -X1 3 4 5`. A jumper that shares a
+    /// terminal with them becomes one with them.
+    Add {
+        /// The strip, e.g. `-X1` (after `--`, as it starts with `-`).
+        strip: String,
+        /// Terminal numbers, at least two.
+        terminals: Vec<String>,
+    },
+    /// Take terminals out of their jumper, e.g. `jumper remove -- -X1 4`.
+    Remove { strip: String, terminals: Vec<String> },
+    /// List the project's jumpers.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -715,6 +734,32 @@ fn run(cli: Cli) -> Res<()> {
             });
             save(dir, &p)?;
             println!("{id}");
+        }
+        Cmd::Jumper(jc) => {
+            let mut p = load(dir)?;
+            match jc {
+                JumperCmd::Add { strip, terminals } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    p.meta.add_jumper(&strip, &terminals)?;
+                    save(dir, &p)?;
+                }
+                JumperCmd::Remove { strip, terminals } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    let mut changed = false;
+                    for t in &terminals {
+                        changed |= p.meta.remove_from_jumper(&strip, t.trim());
+                    }
+                    if !changed {
+                        return Err(format!("no jumper of {strip} has terminal {}", terminals.join(", ")));
+                    }
+                    save(dir, &p)?;
+                }
+                JumperCmd::List => {
+                    for j in &p.meta.jumpers {
+                        println!("{} {}", j.strip, j.terminals.join(" "));
+                    }
+                }
+            }
         }
         Cmd::Device { tag, part, description } => {
             let mut p = load(dir)?;

@@ -118,6 +118,33 @@ pub fn wire_nets(project: &Project, is_interruption: impl Fn(&str) -> bool) -> (
             }
         }
     }
+    // Jumpers: the wired pins of every jumpered terminal, on any page, are one net.
+    for (k, j) in project.meta.jumpers.iter().enumerate() {
+        let link = Node::Link(format!("\u{0}jumper\u{0}{k}"));
+        for page in &project.pages {
+            for s in &page.symbols {
+                if !s.tag.as_ref().is_some_and(|t| j.terminal_of(t).is_some()) {
+                    continue;
+                }
+                let wired: Vec<usize> = page
+                    .wires
+                    .iter()
+                    .flat_map(|w| [&w.from, &w.to])
+                    .filter_map(|e| match e {
+                        Endpoint::Pin { item, pin } if item == &s.id => {
+                            Some(Node::Pin((page.id.clone(), item.clone(), pin.clone())))
+                        }
+                        _ => None,
+                    })
+                    .map(|n| id_of(n, &mut dsu))
+                    .collect();
+                for n in wired {
+                    let l = id_of(link.clone(), &mut dsu);
+                    dsu.union(n, l);
+                }
+            }
+        }
+    }
     let mut groups: BTreeMap<usize, Net> = BTreeMap::new();
     for (node, id) in &ids {
         let root = dsu.find(*id);
@@ -166,6 +193,38 @@ mod tests {
             item: item.into(),
             pin: pin.into(),
         }
+    }
+
+    #[test]
+    fn jumpered_terminals_are_one_net_across_pages() {
+        use crate::project::PlacedSymbol;
+        use crate::tag::DeviceTag;
+        let term = |id: &str, tag: &str| PlacedSymbol {
+            id: id.into(),
+            symbol: "wc.terminal".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: DeviceTag::parse(tag).ok(),
+        };
+        let mut p = Project::new("t");
+        let mut a = Page::new("a", "1", "");
+        a.symbols = vec![term("t3", "-X1.3"), term("t9", "-X1.9")];
+        a.wires = vec![
+            wire("w1", pin("t3", "1"), pin("k1", "A1"), None),
+            wire("w2", pin("t9", "2"), pin("k2", "A1"), None),
+        ];
+        let mut b = Page::new("b", "2", "");
+        b.symbols = vec![term("t4", "-X1.4")];
+        b.wires = vec![wire("w3", pin("t4", "1"), pin("m1", "U"), None)];
+        p.pages = vec![a, b];
+        assert_eq!(nets(&p).len(), 3, "no jumper, three nets");
+        let x1 = DeviceTag::parse("-X1").unwrap_or_default();
+        assert!(p.meta.add_jumper(&x1, &["3".to_owned(), "4".to_owned()]).is_ok());
+        let joined = nets(&p);
+        assert_eq!(joined.len(), 2, "3 and 4 jumpered, 9 not");
+        let big = joined.iter().find(|n| n.pins.len() == 4);
+        assert!(big.is_some_and(|n| n.pins.iter().any(|q| q.2 == "U") && n.pins.iter().any(|q| q.2 == "A1")));
     }
 
     #[test]

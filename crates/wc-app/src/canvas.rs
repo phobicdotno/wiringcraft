@@ -561,6 +561,31 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         }
     }
 
+    // Jumpers: a bar through the jumpered terminals drawn on this page, in strip order.
+    for j in &open.project.meta.jumpers {
+        let mut at: Vec<(Vec<(String, u64)>, Point)> = page
+            .symbols
+            .iter()
+            .filter_map(|s| {
+                let n = j.terminal_of(s.tag.as_ref()?)?;
+                Some((wc_core::project::natural_key(n), s.at))
+            })
+            .collect();
+        if at.len() < 2 {
+            continue;
+        }
+        at.sort_by(|a, b| a.0.cmp(&b.0));
+        let stroke = Stroke::new(xf.len(0.6).max(1.5), t.wire);
+        for pair in at.windows(2) {
+            if let [(_, a), (_, b)] = pair {
+                painter.line_segment([xf.s(*a), xf.s(*b)], stroke);
+            }
+        }
+        for (_, p) in &at {
+            painter.circle_filled(xf.s(*p), xf.len(0.9).max(2.0), t.wire);
+        }
+    }
+
     for s in &page.symbols {
         let selected = ed.is_selected(&Selection::Symbol(s.id.clone()));
         let c = if selected { t.selection } else { t.ink };

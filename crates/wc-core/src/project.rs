@@ -36,6 +36,30 @@ pub struct ProjectMeta {
     /// location through the `+` part of its tag, so `+L1.L3-K1` is in the location `L1.L3`.
     #[serde(default, rename = "location", skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
+    /// Jumpers (bridges) between terminals of one strip; jumpered terminals are one potential.
+    #[serde(default, rename = "jumper", skip_serializing_if = "Vec::is_empty")]
+    pub jumpers: Vec<Jumper>,
+}
+
+/// Terminals of one strip bridged together by a jumper: they form one potential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Jumper {
+    /// The strip, e.g. `-X1`.
+    pub strip: DeviceTag,
+    /// Terminal numbers on the strip, in strip order, e.g. `["3", "4", "5"]`. At least two.
+    pub terminals: Vec<String>,
+}
+
+impl Jumper {
+    /// The terminal number when `tag` is a terminal of this jumper (`-X1.4` on strip `-X1`).
+    pub fn terminal_of<'a>(&self, tag: &'a DeviceTag) -> Option<&'a str> {
+        let (last, rest) = tag.product.split_last()?;
+        (tag.function == self.strip.function
+            && tag.location == self.strip.location
+            && rest == self.strip.product.as_slice()
+            && self.terminals.contains(last))
+        .then_some(last.as_str())
+    }
 }
 
 /// A location of the project, such as a cabinet or a room.
@@ -91,7 +115,68 @@ impl ProjectMeta {
             title_block: BTreeMap::new(),
             libraries: Vec::new(),
             locations: Vec::new(),
+            jumpers: Vec::new(),
         }
+    }
+
+    /// Jumper `terminals` of `strip` together. Jumpers of the strip that share a terminal with
+    /// them become one. Refused when fewer than two different terminals result.
+    pub fn add_jumper(&mut self, strip: &DeviceTag, terminals: &[String]) -> Result<(), String> {
+        let mut set: Vec<String> = Vec::new();
+        for t in terminals.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            if !set.iter().any(|s| s == t) {
+                set.push(t.to_owned());
+            }
+        }
+        if set.len() < 2 {
+            return Err("a jumper needs at least two different terminals of the strip".into());
+        }
+        // Take in every jumper of this strip that shares a terminal.
+        let mut kept = Vec::new();
+        for j in std::mem::take(&mut self.jumpers) {
+            if &j.strip == strip && j.terminals.iter().any(|t| set.contains(t)) {
+                for t in j.terminals {
+                    if !set.contains(&t) {
+                        set.push(t);
+                    }
+                }
+            } else {
+                kept.push(j);
+            }
+        }
+        set.sort_by_key(|t| natural_key(t));
+        kept.push(Jumper {
+            strip: strip.clone(),
+            terminals: set,
+        });
+        kept.sort_by(|a, b| {
+            a.strip.to_string().cmp(&b.strip.to_string()).then_with(|| {
+                a.terminals
+                    .first()
+                    .map(|t| natural_key(t))
+                    .cmp(&b.terminals.first().map(|t| natural_key(t)))
+            })
+        });
+        self.jumpers = kept;
+        Ok(())
+    }
+
+    /// Take `terminal` of `strip` out of its jumper; a jumper left with one terminal goes.
+    /// Returns whether anything changed.
+    pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        let mut changed = false;
+        for j in self.jumpers.iter_mut().filter(|j| &j.strip == strip) {
+            let before = j.terminals.len();
+            j.terminals.retain(|t| t != terminal);
+            changed |= j.terminals.len() != before;
+        }
+        self.jumpers.retain(|j| j.terminals.len() >= 2);
+        changed
+    }
+
+    /// The jumper a terminal (`-X1.4`) is in, if any.
+    pub fn jumper_of(&self, terminal: &DeviceTag) -> Option<&Jumper> {
+        self.jumpers.iter().find(|j| j.terminal_of(terminal).is_some())
     }
 }
 
@@ -509,6 +594,36 @@ mod tests {
             tb.get("description").is_none_or(|d| d.trim().is_empty()),
             "a blank import fills nothing"
         );
+    }
+
+    #[test]
+    fn jumpers_merge_split_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let x2 = DeviceTag::parse("-X2")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        assert!(m.add_jumper(&x1, &s(&["3", "3"])).is_err(), "one terminal is no jumper");
+        m.add_jumper(&x1, &s(&["10", "9"]))?;
+        m.add_jumper(&x1, &s(&["2", "3"]))?;
+        m.add_jumper(&x2, &s(&["1", "2"]))?;
+        assert_eq!(m.jumpers.len(), 3);
+        // Sharing terminal 3 with one and 9 with the other joins all three of X1's.
+        m.add_jumper(&x1, &s(&["3", "9"]))?;
+        assert_eq!(m.jumpers.len(), 2);
+        assert_eq!(m.jumpers[0].terminals, s(&["2", "3", "9", "10"]), "natural order");
+        assert_eq!(m.jumper_of(&DeviceTag::parse("-X1.9")?).map(|j| &j.strip), Some(&x1));
+        assert!(m.jumper_of(&DeviceTag::parse("-X1.4")?).is_none());
+        assert!(m.jumper_of(&DeviceTag::parse("+A-X1.9")?).is_none(), "another location");
+        let text = toml::to_string(&m)?;
+        assert!(text.contains("[[jumper]]"), "{text}");
+        assert_eq!(toml::from_str::<ProjectMeta>(&text)?.jumpers, m.jumpers);
+        // Taking terminals out: a jumper left with one terminal goes.
+        assert!(m.remove_from_jumper(&x2, "1"));
+        assert_eq!(m.jumpers.len(), 1);
+        assert!(!m.remove_from_jumper(&x2, "1"));
+        let plain = toml::to_string(&ProjectMeta::new("t"))?;
+        assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
     }
 
     #[test]

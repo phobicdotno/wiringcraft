@@ -418,6 +418,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             "Lower (pin 2)",
             "Potential",
             "Page",
+            "Jumpered with",
         ],
     );
     let (nets, net_of) = net_names(i);
@@ -445,6 +446,8 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
         item: String,
         pins: Vec<String>,
         x: f64,
+        /// The other terminals of its jumper, e.g. `3, 5`.
+        jumpered: String,
     }
     let mut terms: Vec<Term> = Vec::new();
     // An overview (line diagram) draws terminals again; the plan lists each one once.
@@ -463,9 +466,26 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 Some(tag) => (tag.to_string(), None),
                 None => ("(untagged)".to_owned(), None),
             };
+            let jumpered = s
+                .tag
+                .as_ref()
+                .and_then(|tag| {
+                    let j = i.project.meta.jumper_of(tag)?;
+                    let own = j.terminal_of(tag)?;
+                    Some(
+                        j.terminals
+                            .iter()
+                            .filter(|t| *t != own)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                })
+                .unwrap_or_default();
             terms.push(Term {
                 strip,
                 number,
+                jumpered,
                 page: page.number.clone(),
                 page_id: page.id.clone(),
                 item: s.id.clone(),
@@ -519,6 +539,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 lower,
                 pa.or(pb).unwrap_or_default(),
                 term.page.clone(),
+                term.jumpered.clone(),
             ]);
         }
     }
