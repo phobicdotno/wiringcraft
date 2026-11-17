@@ -450,12 +450,16 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
             });
         }
     };
-    // Long texts are drawn smaller so they stay inside the frame (text is never wrapped).
-    let fit = |t: &str, height: f64| {
-        let room = x1 - x0 - 10.0;
+    // Long texts are drawn smaller so they stay inside their room (text is never wrapped).
+    let fit_in = |t: &str, height: f64, room: f64| {
         let w = text_width_mm(t, height);
-        if w > room { height * room / w } else { height }
+        if w > room && room > 0.0 {
+            height * room / w
+        } else {
+            height
+        }
     };
+    let fit = |t: &str, height: f64| fit_in(t, height, x1 - x0 - 10.0);
     let name_y = y0 + h * 0.2;
     let name = &project.meta.name;
     push_text((cx, name_y), fit(name, 9.0), Align::Center, name, Ink::Thin, out);
@@ -498,8 +502,10 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     for (i, (label, value)) in rows.iter().enumerate() {
         let ry = top + row_h * i as f64;
         let base = ry + row_h / 2.0 + size * 0.35;
-        push_text((tx0 + 1.5, base), size * 0.8, Align::Left, label, Ink::Label, out);
-        push_text((split + 1.5, base), size, Align::Left, value, Ink::Thin, out);
+        let label_h = fit_in(label, size * 0.8, split - tx0 - 3.0);
+        push_text((tx0 + 1.5, base), label_h, Align::Left, label, Ink::Label, out);
+        let value_h = fit_in(value, size, tx1 - split - 3.0);
+        push_text((split + 1.5, base), value_h, Align::Left, value, Ink::Thin, out);
         rule(ry + row_h, Ink::Thin, out);
     }
 }

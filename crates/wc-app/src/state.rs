@@ -645,7 +645,9 @@ impl Open {
             && first.underlay.is_none()
         {
             self.checkpoint();
-            self.project.pages[0].cover = true;
+            if let Some(first) = self.project.pages.first_mut() {
+                first.cover = true;
+            }
             return Ok(0);
         }
         // `0` sorts before every other number unless one sorts as low (`0`, `00`, an empty one).
@@ -695,11 +697,37 @@ impl Open {
         self.project.meta.title_block = block;
     }
 
+    /// The project name and fields as they are, for [`Open::revert_live`].
+    pub fn props_snapshot(&self) -> PropsSnapshot {
+        PropsSnapshot {
+            name: self.project.meta.name.clone(),
+            title_block: self.project.meta.title_block.clone(),
+        }
+    }
+
     /// Take back what [`Open::set_project_props_live`] changed since `since` (the form was
-    /// cancelled).
-    pub fn revert_live(&mut self, since: usize) {
-        if self.undo_mark() > since && self.undo() {
-            self.redo.clear();
+    /// cancelled), back to `before` (a [`Open::props_snapshot`] taken when the form opened).
+    /// When the form's own undo step is the last one and holds nothing else, it is undone;
+    /// otherwise (the page was edited meanwhile, or the assistant folded the step into its
+    /// own) only the name and fields are put back, as a new undo step.
+    pub fn revert_live(&mut self, since: usize, before: &PropsSnapshot) {
+        let only_the_form = self.undo_mark() == since + 1
+            && self.undo.last().is_some_and(|prev| {
+                let mut p = prev.clone();
+                p.meta.name.clone_from(&self.project.meta.name);
+                p.meta.title_block.clone_from(&self.project.meta.title_block);
+                p == self.project
+            });
+        if only_the_form {
+            if self.undo() {
+                self.redo.clear();
+            }
+            return;
+        }
+        if self.project.meta.name != before.name || self.project.meta.title_block != before.title_block {
+            self.checkpoint();
+            self.project.meta.name.clone_from(&before.name);
+            self.project.meta.title_block.clone_from(&before.title_block);
         }
     }
 
@@ -799,6 +827,13 @@ impl Open {
     }
 }
 
+/// The project name and title-block fields at one moment (see [`Open::props_snapshot`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropsSnapshot {
+    pub name: String,
+    pub title_block: std::collections::BTreeMap<String, String>,
+}
+
 /// The name review comments are signed with: `WIRINGCRAFT_USER`, then git's `user.name`, then
 /// the login name.
 /// Title-block fields from a form: trimmed, with empty keys and values dropped.
@@ -887,12 +922,40 @@ pub(crate) mod tests {
 
         // Cancel takes the typed changes back and leaves nothing to redo.
         let since = o.undo_mark();
+        let before = o.props_snapshot();
         o.set_project_props_live(since, "Test", &fields(&[("customer", "Other")]));
-        o.revert_live(since);
+        o.revert_live(since, &before);
         assert!(o.project.meta.title_block.is_empty());
         assert!(!o.can_redo());
-        o.revert_live(since);
+        o.revert_live(since, &before);
         assert!(!o.can_undo(), "nothing changed, nothing undone");
+    }
+
+    #[test]
+    fn cancel_puts_the_fields_back_when_the_form_step_is_not_the_last_or_was_folded_away() {
+        let (_tmp, mut o) = project();
+        // A page edit made while the form is open stays; only the fields go back.
+        let since = o.undo_mark();
+        let before = o.props_snapshot();
+        o.set_project_props_live(since, "Test", &fields(&[("customer", "ACME")]));
+        o.checkpoint();
+        o.project.pages[0].title = "Edited meanwhile".into();
+        o.revert_live(since, &before);
+        assert!(o.project.meta.title_block.is_empty());
+        assert_eq!(o.project.pages[0].title, "Edited meanwhile");
+
+        // An assistant turn that began before the form folds the form's step into its own.
+        let turn = o.undo_mark();
+        o.checkpoint();
+        o.project.pages[0].title = "By the assistant".into();
+        let since = o.undo_mark();
+        let before = o.props_snapshot();
+        o.set_project_props_live(since, "Test", &fields(&[("customer", "ACME")]));
+        o.squash_undo(turn);
+        assert!(o.undo_mark() <= since);
+        o.revert_live(since, &before);
+        assert!(o.project.meta.title_block.is_empty(), "the form's change is taken back");
+        assert_eq!(o.project.pages[0].title, "By the assistant", "the assistant's stays");
     }
 
     #[test]

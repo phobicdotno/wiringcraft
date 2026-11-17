@@ -544,3 +544,28 @@ fn a_blank_date_shows_the_export_date_on_the_cover_and_in_the_title_block() -> R
     );
     Ok(())
 }
+
+#[test]
+fn long_cover_table_labels_and_values_stay_in_their_columns() -> Result<(), String> {
+    let mut project = wc_core::Project::new("x");
+    let label = "Contractor reference for the site".repeat(3);
+    let value = "W".repeat(80);
+    project.meta.title_block.insert(label.clone(), value.clone());
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let width_of = |wanted: &str| {
+        marks
+            .iter()
+            .find_map(|m| match &m.shape {
+                Shape::Text { text, height, .. } if text == wanted => Some(crate::writer::text_width_mm(text, *height)),
+                _ => None,
+            })
+            .ok_or(format!("{wanted:?} not on the cover"))
+    };
+    // The table is at most 180 mm wide: 35 % for labels, 65 % for values, less 3 mm padding.
+    let (label_w, value_w) = (width_of(&label)?, width_of(&value)?);
+    assert!(label_w <= 180.0 * 0.35 - 3.0 + 1e-6, "label {label_w} mm");
+    assert!(value_w <= 180.0 * 0.65 - 3.0 + 1e-6, "value {value_w} mm");
+    Ok(())
+}

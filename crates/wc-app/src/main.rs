@@ -52,6 +52,7 @@ enum Dialog {
         name: String,
         fields: Vec<(String, String)>,
         since: usize,
+        before: state::PropsSnapshot,
     },
     PageProps {
         number: String,
@@ -504,6 +505,7 @@ impl App {
                     name: open.project.meta.name.clone(),
                     fields: form_fields(&open.project.meta.title_block),
                     since: open.undo_mark(),
+                    before: open.props_snapshot(),
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
@@ -964,7 +966,12 @@ impl App {
                         }
                     });
                 }
-                Dialog::Cover { name, fields, since } => {
+                Dialog::Cover {
+                    name,
+                    fields,
+                    since,
+                    before,
+                } => {
                     let mut changed = false;
                     egui::Grid::new("cover")
                         .num_columns(2)
@@ -995,7 +1002,7 @@ impl App {
                         }
                         if ui.button("Cancel").clicked() {
                             if let Some(o) = self.open.as_mut() {
-                                o.revert_live(*since);
+                                o.revert_live(*since, before);
                             }
                             keep = false;
                         }
