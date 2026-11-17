@@ -276,9 +276,20 @@ fn shapes(
                 // Style (75): 0 fills every other level, 1 only the outermost area, 2 ignores
                 // islands.
                 let style = hatch_style(e);
-                let outlines = if solid { with_holes(loops, style) } else { loops };
+                let (outlines, filled) = if solid {
+                    match with_holes(&loops, style) {
+                        Some(o) => (o, true),
+                        None => {
+                            // Too many holes to cut in: the boundaries, not a wrong fill.
+                            *skipped.entry(HATCH_UNFILLED.to_owned()).or_default() += 1;
+                            (loops, false)
+                        }
+                    }
+                } else {
+                    (loops, false)
+                };
                 for lp in outlines {
-                    if let Some(s) = polyline(lp.into_iter().map(|(x, y)| q(x, y)).collect(), true, solid) {
+                    if let Some(s) = polyline(lp.into_iter().map(|(x, y)| q(x, y)).collect(), true, filled) {
                         out.push((layer.clone(), s));
                     }
                 }
@@ -400,28 +411,25 @@ fn de_boor(ctrl: &[(f64, f64, f64)], knots: &[f64], p: usize, u: f64) -> Option<
         return None;
     }
     let mut k = p;
-    while k + 1 < n && knots[k + 1] <= u {
+    while k + 1 < n && knots.get(k + 1).is_some_and(|&t| t <= u) {
         k += 1;
     }
     let mut d: Vec<(f64, f64, f64)> = ctrl.get(k - p..=k)?.to_vec();
     for r in 1..=p {
         for j in (r..=p).rev() {
             let i = j + k - p;
-            let denom = knots[i + p + 1 - r] - knots[i];
-            let a = if denom.abs() < 1e-12 {
-                0.0
-            } else {
-                (u - knots[i]) / denom
-            };
-            let (q, s) = (d[j - 1], d[j]);
-            d[j] = (
+            let (ki, kr) = (*knots.get(i)?, *knots.get(i + p + 1 - r)?);
+            let denom = kr - ki;
+            let a = if denom.abs() < 1e-12 { 0.0 } else { (u - ki) / denom };
+            let (q, s) = (*d.get(j - 1)?, *d.get(j)?);
+            *d.get_mut(j)? = (
                 (1.0 - a) * q.0 + a * s.0,
                 (1.0 - a) * q.1 + a * s.1,
                 (1.0 - a) * q.2 + a * s.2,
             );
         }
     }
-    let (x, y, w) = d[p];
+    let (x, y, w) = *d.get(p)?;
     (w.abs() > 1e-12).then(|| (x / w, y / w))
 }
 
@@ -430,8 +438,15 @@ fn de_boor(ctrl: &[(f64, f64, f64)], knots: &[f64], p: usize, u: f64) -> Option<
 const MAX_SPLINE_DEGREE: usize = 15;
 
 /// The most point pairs tried as a bridge from one hole to the outline around it; a larger hole
-/// is filled over rather than searched for longer.
+/// leaves the hatch unfilled rather than searched for longer.
 const BRIDGE_BUDGET: usize = 4_000_000;
+
+/// The most vertex visits spent finding which loop of a hatch lies in which; past it the hatch
+/// is left unfilled.
+const NESTING_BUDGET: usize = 20_000_000;
+
+/// The `skipped` key of a solid hatch drawn as its boundaries because its holes could not be cut.
+const HATCH_UNFILLED: &str = "solid HATCH (holes too complex)";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -458,7 +473,7 @@ fn bspline_points(ctrl: &[(f64, f64)], knots: &[f64], weights: &[f64], degree: u
         .enumerate()
         .map(|(i, (x, y))| (x * w(i), y * w(i), w(i)))
         .collect();
-    let (u0, u1) = (knots[degree], knots[n]);
+    let (u0, u1) = (*knots.get(degree)?, *knots.get(n)?);
     if u1 <= u0 {
         return None;
     }
@@ -692,23 +707,24 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
     out
 }
 
-/// Twice the signed area of a loop (positive when counter-clockwise).
+/// The edges of a loop as point pairs, the last one closing it.
+fn loop_edges(lp: &[(f64, f64)]) -> impl Iterator<Item = ((f64, f64), (f64, f64))> + '_ {
+    lp.iter().copied().zip(lp.iter().copied().cycle().skip(1))
+}
+
+/// Twice the signed area of a loop (positive when counter-clockwise). Taken relative to its first
+/// point, so loops far from the origin keep their small area terms.
 fn area2(lp: &[(f64, f64)]) -> f64 {
-    let n = lp.len();
-    (0..n)
-        .map(|i| {
-            let (a, b) = (lp[i], lp[(i + 1) % n]);
-            a.0 * b.1 - b.0 * a.1
-        })
+    let Some(&o) = lp.first() else { return 0.0 };
+    loop_edges(lp)
+        .map(|(a, b)| (a.0 - o.0) * (b.1 - o.1) - (b.0 - o.0) * (a.1 - o.1))
         .sum()
 }
 
 /// Whether `pt` lies inside the loop (even-odd rule).
 fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
     let mut odd = false;
-    let n = lp.len();
-    for i in 0..n {
-        let (a, b) = (lp[i], lp[(i + n - 1) % n]);
+    for (b, a) in loop_edges(lp) {
         if (a.1 > pt.1) != (b.1 > pt.1) && pt.0 < (b.0 - a.0) * (pt.1 - a.1) / (b.1 - a.1) + a.0 {
             odd = !odd;
         }
@@ -737,22 +753,41 @@ fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
 /// The loops of a solid fill as outlines that fill right with the non-zero and even-odd rules
 /// alike: every loop inside an odd number of others is a hole, cut into the loop just around it
 /// along the shortest bridge, so one outline goes round the solid part and back round the hole.
-fn with_holes(loops: Vec<Vec<(f64, f64)>>, style: i64) -> Vec<Vec<(f64, f64)>> {
-    let mut loops: Vec<Vec<(f64, f64)>> = loops.into_iter().filter(|l| l.len() >= 3).collect();
+/// `None` when the loops are too many or too big to work out within the budgets: a fill that
+/// covered the holes would be wrong.
+fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64)>>> {
+    let mut loops: Vec<Vec<(f64, f64)>> = loops.iter().filter(|l| l.len() >= 3).cloned().collect();
     loops.sort_by(|a, b| area2(b).abs().total_cmp(&area2(a).abs()));
-    // For each loop, the loops around it (they are all bigger, so earlier).
-    let around: Vec<Vec<usize>> = (0..loops.len())
-        .map(|i| (0..i).filter(|&k| inside(loops[i][0], &loops[k])).collect())
-        .collect();
+    // For each loop, the smallest loop around it (bigger, so earlier) and its nesting depth.
+    let mut parent: Vec<Option<usize>> = Vec::with_capacity(loops.len());
+    let mut depth: Vec<usize> = Vec::with_capacity(loops.len());
+    let mut work = 0usize;
+    for (i, lp) in loops.iter().enumerate() {
+        let pt = *lp.first()?;
+        let mut found = None;
+        for k in (0..i).rev() {
+            let other = loops.get(k)?;
+            work = work.saturating_add(other.len());
+            if work > NESTING_BUDGET {
+                return None;
+            }
+            if inside(pt, other) {
+                found = Some(k);
+                break;
+            }
+        }
+        depth.push(found.and_then(|k| depth.get(k)).map_or(0, |d| d + 1));
+        parent.push(found);
+    }
     let mut outer: Vec<Option<Vec<(f64, f64)>>> = vec![None; loops.len()];
-    for i in 0..loops.len() {
+    for (i, lp) in loops.iter().enumerate() {
         // Outer style keeps the outermost level and its holes; Ignore only the outermost.
-        let depth = around[i].len();
-        if (style == 1 && depth >= 2) || (style == 2 && depth >= 1) {
+        let level = *depth.get(i)?;
+        if (style == 1 && level >= 2) || (style == 2 && level >= 1) {
             continue;
         }
-        let mut lp = loops[i].clone();
-        if around[i].len().is_multiple_of(2) {
+        let mut lp = lp.clone();
+        if level.is_multiple_of(2) {
             // A solid part: counter-clockwise.
             if area2(&lp) < 0.0 {
                 lp.reverse();
@@ -764,15 +799,22 @@ fn with_holes(loops: Vec<Vec<(f64, f64)>>, style: i64) -> Vec<Vec<(f64, f64)>> {
         if area2(&lp) > 0.0 {
             lp.reverse();
         }
-        let Some(&host) = around[i].iter().rev().find(|&&k| outer[k].is_some()) else {
+        // The innermost solid part around it.
+        let mut host = *parent.get(i)?;
+        while let Some(k) = host
+            && outer.get(k)?.is_none()
+        {
+            host = *parent.get(k)?;
+        }
+        let Some(host) = host else { continue };
+        let Some(o) = outer.get_mut(host)?.as_mut() else {
             continue;
         };
-        let Some(o) = outer[host].as_mut() else { continue };
         // The shortest bridge from the hole to the outline that crosses no edge of the outline,
         // of this hole or of any other loop.
         // A bounded search: the pairs, then the crossing tests, each within a budget.
         if o.len().saturating_mul(lp.len()) > BRIDGE_BUDGET {
-            continue;
+            return None;
         }
         let mut pairs: Vec<(f64, usize, usize)> = Vec::with_capacity(o.len() * lp.len());
         for (a, p) in o.iter().enumerate() {
@@ -781,34 +823,40 @@ fn with_holes(loops: Vec<Vec<(f64, f64)>>, style: i64) -> Vec<Vec<(f64, f64)>> {
             }
         }
         pairs.sort_by(|x, y| x.0.total_cmp(&y.0));
-        let edges_of = |l: &[(f64, f64)]| -> Vec<((f64, f64), (f64, f64))> {
-            (0..l.len()).map(|k| (l[k], l[(k + 1) % l.len()])).collect()
-        };
-        let mut walls = edges_of(o);
-        walls.extend(edges_of(&lp));
+        let mut walls: Vec<((f64, f64), (f64, f64))> = loop_edges(o).collect();
+        walls.extend(loop_edges(&lp));
         for (k, other) in loops.iter().enumerate() {
             if k != i && k != host {
-                walls.extend(edges_of(other));
+                walls.extend(loop_edges(other));
             }
         }
         let tries = (BRIDGE_BUDGET * 4 / walls.len().max(1)).max(1);
         let clear = |p: (f64, f64), h: (f64, f64)| !walls.iter().any(|&(c, d)| crosses(p, h, c, d));
-        let Some(&(_, a, b)) = pairs.iter().take(tries).find(|(_, a, b)| clear(o[*a], lp[*b])) else {
-            continue;
-        };
-        let mut cut: Vec<(f64, f64)> = o[..=a].to_vec();
-        cut.extend(lp[b..].iter().chain(&lp[..=b]));
-        cut.extend(&o[a..]);
+        // No clear bridge within the budget: leave the hatch unfilled rather than fill the hole.
+        let (_, a, b) = *pairs
+            .iter()
+            .take(tries)
+            .find(|(_, a, b)| o.get(*a).zip(lp.get(*b)).is_some_and(|(p, h)| clear(*p, *h)))?;
+        let mut cut: Vec<(f64, f64)> = o.get(..=a)?.to_vec();
+        cut.extend(lp.get(b..)?.iter().chain(lp.get(..=b)?));
+        cut.extend(o.get(a..)?);
         *o = cut;
     }
-    outer.into_iter().flatten().collect()
+    Some(outer.into_iter().flatten().collect())
 }
 
 /// One warning per entity kind that was not read.
 fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
     skipped
         .into_iter()
-        .map(|(kind, n)| format!("{n} {kind} entit{} not read", if n == 1 { "y" } else { "ies" }))
+        .map(|(kind, n)| {
+            if kind == HATCH_UNFILLED {
+                let s = if n == 1 { "" } else { "es" };
+                format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
+            } else {
+                format!("{n} {kind} entit{} not read", if n == 1 { "y" } else { "ies" })
+            }
+        })
         .collect()
 }
 
@@ -1341,9 +1389,10 @@ mod tests {
         let sq = |x0: f64, y0: f64, x1: f64, y1: f64| vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
         // A small hole sits between the big hole's corner and the outline's corner.
         let out = with_holes(
-            vec![sq(0.0, 0.0, 10.0, 10.0), sq(3.0, 3.0, 9.0, 9.0), sq(9.3, 9.3, 9.6, 9.6)],
+            &[sq(0.0, 0.0, 10.0, 10.0), sq(3.0, 3.0, 9.0, 9.0), sq(9.3, 9.3, 9.6, 9.6)],
             0,
-        );
+        )
+        .expect("small enough");
         assert_eq!(out.len(), 1);
         let want = 100.0 - 36.0 - 0.09;
         assert!((filled_area(&out[0]) - want).abs() < 1e-9, "{}", filled_area(&out[0]));
@@ -1373,7 +1422,7 @@ mod tests {
             (4.9, 10.0),
             (0.0, 10.0),
         ];
-        let out = with_holes(vec![slotted.clone(), sq(4.6, 5.9, 4.8, 6.1)], 0);
+        let out = with_holes(&[slotted.clone(), sq(4.6, 5.9, 4.8, 6.1)], 0).expect("small enough");
         let want = filled_area(&slotted) - 0.04;
         assert!((filled_area(&out[0]) - want).abs() < 1e-9);
         let lp = &out[0];
@@ -1465,13 +1514,19 @@ mod tests {
     fn hatch_styles_decide_which_islands_are_filled() {
         let sq = |a: f64, b: f64| vec![(a, a), (b, a), (b, b), (a, b)];
         let loops = || vec![sq(0.0, 10.0), sq(2.0, 8.0), sq(4.0, 6.0)];
-        let area = |v: &[Vec<(f64, f64)>]| v.iter().map(|l| area2(l).abs() / 2.0).sum::<f64>();
+        let area = |style| {
+            with_holes(&loops(), style)
+                .expect("small enough")
+                .iter()
+                .map(|l| area2(l).abs() / 2.0)
+                .sum::<f64>()
+        };
         // Normal: ring, hole, island again.
-        assert!((area(&with_holes(loops(), 0)) - (100.0 - 36.0 + 4.0)).abs() < 1e-9);
+        assert!((area(0) - (100.0 - 36.0 + 4.0)).abs() < 1e-9);
         // Outer: the outermost ring only.
-        assert!((area(&with_holes(loops(), 1)) - 64.0).abs() < 1e-9);
+        assert!((area(1) - 64.0).abs() < 1e-9);
         // Ignore: the whole outer loop.
-        assert!((area(&with_holes(loops(), 2)) - 100.0).abs() < 1e-9);
+        assert!((area(2) - 100.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1501,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hole_too_big_to_search_is_filled_over_not_hung_on() {
+    fn a_hole_too_big_to_search_leaves_the_hatch_unfilled_not_hung_on() {
         let ring = |r: f64, n: usize| -> Vec<(f64, f64)> {
             (0..n)
                 .map(|i| {
@@ -1511,8 +1566,59 @@ mod tests {
                 .collect()
         };
         let started = std::time::Instant::now();
-        let out = with_holes(vec![ring(10.0, 3000), ring(5.0, 3000)], 0);
-        assert_eq!(out.len(), 1, "the outer part is kept");
+        let out = with_holes(&[ring(10.0, 3000), ring(5.0, 3000)], 0);
+        assert!(out.is_none(), "no fill over the hole");
         assert!(started.elapsed().as_secs() < 5);
+    }
+
+    #[test]
+    fn many_nested_loops_stop_at_the_budget() {
+        // 5000 nested squares: each inside the one before.
+        let loops: Vec<Vec<(f64, f64)>> = (0..5000)
+            .map(|i| {
+                let (a, b) = (i as f64, 20_000.0 - i as f64);
+                vec![(a, a), (b, a), (b, b), (a, b)]
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        // Nesting found walking out from the smallest loop around: cheap for proper nesting.
+        assert!(with_holes(&loops[..40], 1).is_some());
+        // Side by side loops need every pair compared; that many stop at the budget.
+        let apart: Vec<Vec<(f64, f64)>> = (0..5000)
+            .map(|i| {
+                let a = i as f64 * 3.0;
+                vec![(a, 0.0), (a + 1.0, 0.0), (a + 1.0, 1.0), (a, 1.0)]
+            })
+            .collect();
+        assert!(with_holes(&apart, 0).is_none());
+        assert!(started.elapsed().as_secs() < 5);
+    }
+
+    #[test]
+    fn a_hole_far_from_the_origin_keeps_its_winding() {
+        let c = f64::from(1u32 << 30);
+        let sq = |a: f64, b: f64| vec![(c + a, c + a), (c + b, c + a), (c + b, c + b), (c + a, c + b)];
+        assert!((area2(&sq(0.0, 4.0)) - 32.0).abs() < 1e-6);
+        let out = with_holes(&[sq(0.0, 4.0), sq(1.0, 2.0)], 0).expect("small enough");
+        assert_eq!(out.len(), 1);
+        assert!((area2(&out[0]) / 2.0 - 15.0).abs() < 1e-6, "{}", area2(&out[0]) / 2.0);
+    }
+
+    #[test]
+    fn spline_weights_pull_the_curve() {
+        // A rational quadratic with these weights is an exact quarter circle.
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        let ctrl = [(1.0, 0.0, 1.0), (h, h, h), (0.0, 1.0, 1.0)];
+        let knots = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let mid = de_boor(&ctrl, &knots, 2, 0.5).expect("a point");
+        assert!((mid.0 - h).abs() < 1e-9 && (mid.1 - h).abs() < 1e-9, "{mid:?}");
+        // And bspline_points applies the weights it is given: every sample on the unit circle.
+        let pts = bspline_points(&[(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], &knots, &[1.0, h, 1.0], 2).expect("a curve");
+        assert!(pts.iter().all(|p| (p.0.hypot(p.1) - 1.0).abs() < 1e-9));
+        let plain = bspline_points(&[(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], &knots, &[], 2).expect("a curve");
+        assert!(
+            plain.iter().any(|p| (p.0.hypot(p.1) - 1.0).abs() > 0.01),
+            "unweighted is no circle"
+        );
     }
 }
