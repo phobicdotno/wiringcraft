@@ -53,6 +53,8 @@ pub enum Action {
     Commit,
     NewBranch,
     History,
+    ShareSession,
+    JoinSession,
     CommentTool,
     PageHistory,
     ReportProblem,
@@ -121,6 +123,8 @@ impl Action {
         Action::Commit,
         Action::NewBranch,
         Action::History,
+        Action::ShareSession,
+        Action::JoinSession,
         Action::CommentTool,
         Action::PageHistory,
         Action::ToggleChrome,
@@ -342,6 +346,18 @@ impl Action {
             Action::Commit => i("Commit", "Record a version of the project", Icon::Commit, "Ctrl+K"),
             Action::NewBranch => i("Branch", "Start a branch from this version", Icon::Branch, ""),
             Action::History => i("History", "Show the version history as a subway map", Icon::History, ""),
+            Action::ShareSession => i(
+                "Share session",
+                "Let colleagues on the network work in this project with you; you let each one in",
+                Icon::Share,
+                "",
+            ),
+            Action::JoinSession => i(
+                "Join session",
+                "Work in a colleague's shared project: pick their session and ask to join",
+                Icon::Join,
+                "",
+            ),
             Action::ToggleChrome => i(
                 "Layout",
                 "Switch between classic toolbars and the ribbon",
@@ -388,6 +404,7 @@ pub const TOOLBAR: &[&[Action]] = &[
     &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
     &[Action::LibraryStatus, Action::LibraryUpdate],
     &[Action::Commit, Action::NewBranch, Action::History],
+    &[Action::ShareSession, Action::JoinSession],
     &[Action::CommentTool, Action::PageHistory],
     &[Action::Check, Action::Reports, Action::ExportPdf],
     &[Action::Assistant],
@@ -470,6 +487,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
         &[
             ("Versions", &[Action::Commit, Action::NewBranch, Action::History]),
             ("Review", &[Action::CommentTool, Action::PageHistory]),
+            ("Session", &[Action::ShareSession, Action::JoinSession]),
         ],
     ),
     (

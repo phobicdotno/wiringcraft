@@ -1180,3 +1180,22 @@ mod discovery {
         Ok(())
     }
 }
+
+#[test]
+fn project_properties_go_through_the_host() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    let mut meta = s.host.project().meta.clone();
+    meta.name = "Pump station".into();
+    meta.title_block.insert("customer".into(), "Kommune".into());
+    a_link.send(a.edit_project(ProjectEdit::SetMeta {
+        meta: Box::new(meta.clone()),
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(s.host.project().meta, meta);
+    assert_eq!(b.project.as_ref(), Some(s.host.project()));
+    let messages: Vec<_> = s.log.0.borrow().iter().map(|c| c.message.clone()).collect();
+    assert_eq!(messages, ["Change project properties"]);
+    Ok(())
+}

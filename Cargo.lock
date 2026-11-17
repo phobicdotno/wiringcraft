@@ -3715,6 +3715,7 @@ dependencies = [
  "wc-library",
  "wc-pdf",
  "wc-report",
+ "wc-share",
  "wc-vcs",
  "wgpu",
  "winresource",

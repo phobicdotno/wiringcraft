@@ -1,0 +1,493 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use wc_core::{Comment, Device, DeviceTag};
+use wc_share::transport::pair;
+use wc_share::{Change, Journal};
+
+use super::*;
+
+type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+/// A journal the test can look at.
+#[derive(Clone, Default)]
+struct Log(Rc<RefCell<Vec<Change>>>);
+
+impl Journal for Log {
+    fn record(&mut self, _project: &Project, change: &Change) -> wc_share::Result<()> {
+        self.0.borrow_mut().push(change.clone());
+        Ok(())
+    }
+}
+
+impl Log {
+    fn messages(&self) -> Vec<String> {
+        self.0.borrow().iter().map(|c| c.message.clone()).collect()
+    }
+}
+
+/// A project folder with a cover and two pages, opened as the app opens it.
+fn project(dir: &Path) -> std::result::Result<Open, Box<dyn std::error::Error>> {
+    let mut p = store::create(dir, "Pump station")?;
+    p.pages.push(Page::new("p0002", "2", "Motor"));
+    p.pages.push(Page::new("p0003", "3", "Valves"));
+    store::save(dir, &p)?;
+    Ok(Open::load(dir)?)
+}
+
+/// Share the open project in-process (no network), with a journal the test reads.
+fn host(open: &Open) -> (Share, Log) {
+    let log = Log::default();
+    let share = Share {
+        role: Some(Role::Host(Box::new(Hosting {
+            host: Host::new(
+                open.project.clone(),
+                "Hanna",
+                "hanna@example.com",
+                Box::new(log.clone()),
+            ),
+            hub: Hub::new(),
+            listener: None,
+            announcer: None,
+            port: 0,
+            dir: open.dir.clone(),
+        }))),
+        base: Some(open.project.clone()),
+        ..Default::default()
+    };
+    (share, log)
+}
+
+/// Connect a guest to the host in-process and ask to join; the copy goes under `folder`.
+fn guest(host: &mut Share, name: &str, folder: &Path) -> Share {
+    let (guest_end, host_end) = pair();
+    match host.role.as_mut() {
+        Some(Role::Host(h)) => {
+            h.hub.add(&mut h.host, host_end);
+        }
+        _ => unreachable!("the test shares first"),
+    }
+    let mut g = Guest::new();
+    assert!(guest_end.send(g.join(name, &format!("{name}@example.com"))).is_ok());
+    Share {
+        role: Some(Role::Guest(Box::new(Joining {
+            guest: g,
+            link: guest_end,
+            addr: "in-process".into(),
+            folder: folder.to_path_buf(),
+            dir: None,
+        }))),
+        ..Default::default()
+    }
+}
+
+fn pending(host: &Share) -> Vec<PeerId> {
+    match &host.role {
+        Some(Role::Host(h)) => h.host.pending().into_iter().map(|(id, ..)| id).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn approve(host: &mut Share, id: PeerId, yes: bool) {
+    if let Some(Role::Host(h)) = host.role.as_mut() {
+        if yes {
+            assert!(h.host.approve(id));
+        } else {
+            assert!(h.host.decline(id));
+        }
+        h.hub.flush(&mut h.host);
+    }
+}
+
+/// Run a few frames of both windows: each shows `page`, nothing is held down.
+fn frames(a: (&mut Share, &mut Open, &str), b: (&mut Share, &mut Open, &str)) {
+    for _ in 0..4 {
+        a.0.frame(Some(a.1), Some(a.2.to_owned()), false);
+        b.0.frame(Some(b.1), Some(b.2.to_owned()), false);
+    }
+}
+
+/// The host's share, its journal and project, then the guest's share and project.
+type Session = (Share, Log, Open, Share, Open);
+
+/// Host and guest, joined, each in its own folder.
+fn session(tmp: &Path) -> std::result::Result<Session, Box<dyn std::error::Error>> {
+    let mut host_open = project(&tmp.join("host"))?;
+    let (mut h, log) = host(&host_open);
+    let mut g = guest(&mut h, "Ola", &tmp.join("guest"));
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    let ids = pending(&h);
+    assert_eq!(ids.len(), 1, "the join request waits for the host");
+    approve(&mut h, ids[0], true);
+    let guest_open = g.frame(None, None, false).ok_or("the guest got no project")?;
+    Ok((h, log, host_open, g, guest_open))
+}
+
+#[test]
+fn a_joined_guest_gets_its_own_copy_on_disk() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (_h, _log, host_open, _g, guest_open) = session(tmp.path())?;
+    assert_eq!(guest_open.dir, tmp.path().join("guest").join("Pump station"));
+    assert_eq!(guest_open.project.pages, host_open.project.pages);
+    assert_eq!(store::load(&guest_open.dir)?.pages, host_open.project.pages);
+    Ok(())
+}
+
+#[test]
+fn a_declined_guest_is_told_and_the_session_ends_for_them() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    let (mut h, _) = host(&host_open);
+    let mut g = guest(&mut h, "Kari", &tmp.path().join("guest"));
+    h.frame(Some(&mut host_open), None, false);
+    let ids = pending(&h);
+    approve(&mut h, ids[0], false);
+    assert!(g.frame(None, None, false).is_none());
+    assert!(!g.active());
+    assert!(
+        g.take_notes().iter().any(|n| n.contains("declined")),
+        "the guest is told why"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_edit_reaches_the_other_and_the_page_is_read_only_there() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(h.held_by_others().get("p0003").map(String::as_str), Some("Ola"));
+    assert_eq!(g.held_by_others().get("p0002").map(String::as_str), Some("Hanna"));
+
+    // The guest changes its page; the host sees it.
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves and pumps".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        host_open.project.page("p0003").map(|p| p.title.as_str()),
+        Some("Valves and pumps")
+    );
+
+    // The host cannot change the guest's page: the change is put back and the host is told.
+    h.take_notes();
+    host_open.project.page_mut("p0003").ok_or("no page")?.title = "Mine now".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        host_open.project.page("p0003").map(|p| p.title.as_str()),
+        Some("Valves and pumps")
+    );
+    assert_eq!(
+        guest_open.project.page("p0003").map(|p| p.title.as_str()),
+        Some("Valves and pumps")
+    );
+    assert!(h.take_notes().iter().any(|n| n.contains("page 3")));
+
+    // The host's own page goes the other way.
+    host_open.project.page_mut("p0002").ok_or("no page")?.title = "Motor starter".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        guest_open.project.page("p0002").map(|p| p.title.as_str()),
+        Some("Motor starter")
+    );
+    assert_eq!(
+        log.messages(),
+        ["Edit page 3 Valves and pumps", "Edit page 2 Motor starter"]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_drag_over_many_frames_is_one_change() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for i in 0..10 {
+        guest_open.project.page_mut("p0003").ok_or("no page")?.title = format!("Moving {i}");
+        g.frame(Some(&mut guest_open), Some("p0003".into()), true);
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    }
+    assert!(log.messages().is_empty(), "nothing goes out while the button is down");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages(), ["Edit page 3 Moving 9"]);
+    assert_eq!(
+        host_open.project.page("p0003").map(|p| p.title.as_str()),
+        Some("Moving 9")
+    );
+    Ok(())
+}
+
+#[test]
+fn project_level_changes_go_through_the_host_to_everyone() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    let tag = DeviceTag::parse("-K1")?;
+    guest_open.project.devices.insert(
+        tag.clone(),
+        Device {
+            description: "Main contactor".into(),
+            ..Default::default()
+        },
+    );
+    guest_open.project.comments.push(Comment {
+        id: "c1".into(),
+        page: "p0003".into(),
+        at: None,
+        author: "Ola".into(),
+        time: 0,
+        text: "Check the valve size".into(),
+        resolved: false,
+        replies: Vec::new(),
+    });
+    guest_open
+        .project
+        .meta
+        .title_block
+        .insert("customer".into(), "Kommune".into());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        host_open.project.devices.get(&tag).map(|d| d.description.as_str()),
+        Some("Main contactor")
+    );
+    assert_eq!(host_open.project.comments.len(), 1);
+    assert_eq!(
+        host_open.project.meta.title_block.get("customer").map(String::as_str),
+        Some("Kommune")
+    );
+
+    // A page added by the host and renumbered reaches the guest.
+    let mut extra = Page::new("p0004", "4", "Terminals");
+    extra.title = "Terminals".into();
+    host_open.project.pages.push(extra);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(guest_open.project.page("p0004").is_some());
+    assert_eq!(
+        log.messages(),
+        [
+            "Change project properties",
+            "Change device -K1",
+            "Comments on page p0003",
+            "Add page 4 Terminals"
+        ]
+    );
+    assert_eq!(guest_open.project.devices, host_open.project.devices);
+    assert_eq!(guest_open.project.pages, host_open.project.pages);
+    Ok(())
+}
+
+#[test]
+fn removing_a_page_someone_else_has_open_is_not_asked_for() {
+    let mut base = Project::new("Demo");
+    base.pages.push(Page::new("p0001", "1", "One"));
+    base.pages.push(Page::new("p0002", "2", "Two"));
+    let mut local = base.clone();
+    local.pages.retain(|p| p.id != "p0002");
+    let held = BTreeMap::from([("p0002".to_owned(), 7)]);
+    let out = outgoing(&local, &base, Some("p0001"), &held, HOST);
+    assert!(out.edits.is_empty());
+    assert_eq!(out.dropped, ["2"]);
+    // Not held: the removal goes to the host.
+    let out = outgoing(&local, &base, Some("p0001"), &BTreeMap::new(), HOST);
+    assert_eq!(out.edits, [ProjectEdit::RemovePage { id: "p0002".into() }]);
+}
+
+#[test]
+fn a_new_page_number_is_a_renumber_not_a_page_edit() {
+    let mut base = Project::new("Demo");
+    base.pages.push(Page::new("p0001", "1", "One"));
+    let mut local = base.clone();
+    local.pages[0].number = "10".into();
+    let out = outgoing(&local, &base, None, &BTreeMap::new(), HOST);
+    assert_eq!(out.page, None);
+    assert!(out.dropped.is_empty());
+    assert_eq!(
+        out.edits,
+        [ProjectEdit::Renumber {
+            numbers: vec![("p0001".into(), "10".into())]
+        }]
+    );
+}
+
+#[test]
+fn coming_in_changes_only_what_differs_and_keeps_the_local_symbol_lock() {
+    let mut auth = Project::new("Demo");
+    auth.pages.push(Page::new("p0001", "1", "One"));
+    let mut local = auth.clone();
+    assert!(!incoming(&mut local, &auth));
+    local.lock.symbols.insert(
+        "wc.coil".into(),
+        wc_core::LockEntry {
+            hash: "abc".into(),
+            source: "starter".into(),
+        },
+    );
+    auth.pages[0].title = "Changed".into();
+    assert!(incoming(&mut local, &auth));
+    assert_eq!(local.pages, auth.pages);
+    assert!(local.lock.symbols.contains_key("wc.coil"));
+}
+
+/// Run frames of both windows until `done` or a few seconds have passed.
+fn until(
+    a: (&mut Share, &mut Open, &str),
+    b: (&mut Share, &mut Open, &str),
+    done: impl Fn(&Open, &Open) -> bool,
+) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        a.0.frame(Some(a.1), Some(a.2.to_owned()), false);
+        b.0.frame(Some(b.1), Some(b.2.to_owned()), false);
+        if done(a.1, b.1) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
+#[test]
+fn two_windows_share_over_the_network_and_every_change_is_a_commit() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    let mut h = Share::default();
+    h.start_host(&mut host_open, "Hanna", "hanna@example.com")?;
+    let port = match &h.role {
+        Some(Role::Host(x)) => x.port,
+        _ => 0,
+    };
+    let mut g = Share::default();
+    g.join(
+        &format!("127.0.0.1:{port}"),
+        "Ola",
+        "ola@example.com",
+        tmp.path().join("guest"),
+    )?;
+
+    let start = std::time::Instant::now();
+    let mut guest_open = None;
+    while guest_open.is_none() && start.elapsed() < std::time::Duration::from_secs(10) {
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        for id in pending(&h) {
+            approve(&mut h, id, true);
+        }
+        guest_open = g.frame(None, None, false);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let mut guest_open = guest_open.ok_or("the guest was not let in")?;
+
+    // The guest's page is editable once the host has given it the page.
+    let start = std::time::Instant::now();
+    while !h.held_by_others().contains_key("p0003") && start.elapsed() < std::time::Duration::from_secs(10) {
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(h.held_by_others().get("p0003").map(String::as_str), Some("Ola"));
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves over TCP".into();
+    let seen = until(
+        (&mut h, &mut host_open, "p0002"),
+        (&mut g, &mut guest_open, "p0003"),
+        |host, _| host.project.page("p0003").map(|p| p.title.as_str()) == Some("Valves over TCP"),
+    );
+    assert!(seen, "the guest's change did not reach the host");
+    let log = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%an <%ae>|%s"])
+        .current_dir(&host_open.dir)
+        .output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout).trim(),
+        "Ola <ola@example.com>|Edit page 3 Valves over TCP"
+    );
+
+    // The host ends the session; the guest is told.
+    h.stop();
+    let start = std::time::Instant::now();
+    while g.active() && start.elapsed() < std::time::Duration::from_secs(10) {
+        g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!g.active());
+    assert!(g.take_notes().iter().any(|n| n.contains("ended")));
+    Ok(())
+}
+
+#[test]
+fn a_second_join_never_writes_over_an_earlier_copy() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (_h, _log, _host_open, _g, first) = session(tmp.path())?;
+    let mut h2_open = Open::load(&tmp.path().join("host"))?;
+    let (mut h2, _) = host(&h2_open);
+    let mut g2 = guest(&mut h2, "Kari", &tmp.path().join("guest"));
+    h2.frame(Some(&mut h2_open), None, false);
+    let ids = pending(&h2);
+    approve(&mut h2, ids[0], true);
+    let second = g2.frame(None, None, false).ok_or("the second guest got no project")?;
+    assert_eq!(first.dir, tmp.path().join("guest").join("Pump station"));
+    assert_eq!(second.dir, tmp.path().join("guest").join("Pump station (2)"));
+    Ok(())
+}
+
+#[test]
+fn a_change_reaching_a_page_held_by_someone_else_is_not_sent_at_all() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    let k1 = DeviceTag::parse("-K1")?;
+    host_open.project.devices.insert(k1.clone(), Device::default());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(guest_open.project.devices.contains_key(&k1));
+    let before = log.messages().len();
+
+    // The guest renames -K1 to -K2 everywhere, including on the host's page.
+    let k2 = DeviceTag::parse("-K2")?;
+    let d = guest_open.project.devices.remove(&k1).ok_or("no -K1")?;
+    guest_open.project.devices.insert(k2.clone(), d);
+    guest_open.project.page_mut("p0002").ok_or("no page")?.title = "Motor -K2".into();
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves -K2".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    assert_eq!(log.messages().len(), before, "nothing of the action was recorded");
+    assert!(host_open.project.devices.contains_key(&k1));
+    assert!(!host_open.project.devices.contains_key(&k2));
+    assert!(
+        guest_open.project.devices.contains_key(&k1),
+        "the guest's copy is put back whole"
+    );
+    assert_eq!(
+        guest_open.project.page("p0003").map(|p| p.title.as_str()),
+        Some("Valves")
+    );
+    assert!(g.take_notes().iter().any(|n| n.contains("page 2")));
+    Ok(())
+}
+
+#[test]
+fn a_change_from_someone_else_marks_the_copy_unsaved() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.save()?;
+    host_open.project.page_mut("p0002").ok_or("no page")?.title = "Motor starter".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(guest_open.dirty);
+    Ok(())
+}
+
+#[test]
+fn a_joined_copy_waits_while_the_window_is_busy() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    let (mut h, _) = host(&host_open);
+    let mut g = guest(&mut h, "Ola", &tmp.path().join("guest"));
+    h.frame(Some(&mut host_open), None, false);
+    let ids = pending(&h);
+    approve(&mut h, ids[0], true);
+    // An assistant command is running (or a button is held): the copy is not opened yet.
+    assert!(g.frame(None, None, true).is_none());
+    assert!(!tmp.path().join("guest").join("Pump station").exists());
+    assert!(g.active());
+    let joined = g.frame(None, None, false).ok_or("the copy never opened")?;
+    assert_eq!(joined.project.pages, host_open.project.pages);
+    Ok(())
+}

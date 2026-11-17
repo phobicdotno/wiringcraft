@@ -48,6 +48,8 @@ pub enum Icon {
     Comment,
     Theme,
     Assistant,
+    Share,
+    Join,
 }
 
 /// Draw `icon` inside `rect` (a square) with colour `c`; `accent` picks out the part that says
@@ -389,6 +391,25 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
             poly(&[(6.0, 8.0), (11.0, 13.0), (17.0, 13.0), (17.0, 21.0)], false);
             p.circle_filled(at(6.0, 4.0), 2.3 * s, c);
             p.circle_filled(at(17.0, 20.0), 2.3 * s, accent);
+        }
+        Icon::Share => {
+            // Three people on one network: a node in the middle, two others reached from it.
+            line((12.0, 12.0), (5.0, 6.0));
+            line((12.0, 12.0), (19.0, 6.0));
+            line((12.0, 12.0), (12.0, 20.0));
+            p.circle_filled(at(5.0, 6.0), 2.3 * s, c);
+            p.circle_filled(at(19.0, 6.0), 2.3 * s, c);
+            p.circle_filled(at(12.0, 20.0), 2.3 * s, c);
+            p.circle_filled(at(12.0, 12.0), 2.8 * s, accent);
+        }
+        Icon::Join => {
+            // An arrow into a node that already has a link.
+            line((14.0, 12.0), (20.0, 5.0));
+            p.circle_filled(at(20.0, 5.0), 2.3 * s, c);
+            p.circle_filled(at(14.0, 12.0), 2.8 * s, c);
+            aline((3.0, 19.0), (11.0, 14.0));
+            aline((11.0, 14.0), (6.5, 13.5));
+            aline((11.0, 14.0), (9.5, 18.0));
         }
         Icon::History => {
             arc(12.0, 12.0, 8.5, 0.0, 360.0);

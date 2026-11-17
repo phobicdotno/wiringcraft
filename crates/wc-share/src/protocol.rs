@@ -54,6 +54,8 @@ pub enum ProjectEdit {
     RemovePage { id: String },
     /// Give pages new display numbers: `(page id, number)`.
     Renumber { numbers: Vec<(String, String)> },
+    /// Replace the project's properties (name, title block, locations, jumpers, settings).
+    SetMeta { meta: Box<ProjectMeta> },
 }
 
 impl ProjectEdit {
@@ -68,6 +70,7 @@ impl ProjectEdit {
             Self::AddPage { page } => format!("Add page {} {}", page.number, page.title),
             Self::RemovePage { id } => format!("Remove page {id}"),
             Self::Renumber { numbers } => format!("Renumber {} pages", numbers.len()),
+            Self::SetMeta { .. } => "Change project properties".to_owned(),
         }
     }
 
@@ -218,6 +221,7 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
             }
             project.sort_pages();
         }
+        ProjectEdit::SetMeta { meta } => project.meta = (**meta).clone(),
     }
 }
 
@@ -279,5 +283,6 @@ pub(crate) fn check_edit(
             }
             Ok(())
         }
+        ProjectEdit::SetMeta { .. } => Ok(()),
     }
 }

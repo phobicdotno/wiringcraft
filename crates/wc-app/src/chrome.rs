@@ -110,6 +110,9 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             None,
             Some(Action::CommentTool),
             Some(Action::PageHistory),
+            None,
+            Some(Action::ShareSession),
+            Some(Action::JoinSession),
         ],
     ),
     (

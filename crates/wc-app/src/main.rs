@@ -15,6 +15,7 @@ mod panel_view;
 mod panels;
 mod prefs;
 mod screenshot;
+mod share;
 mod state;
 mod theme;
 
@@ -63,6 +64,9 @@ enum Dialog {
         seen: u64,
     },
     PageProps {
+        /// The page the dialog edits, by id: in a shared session someone else can remove an
+        /// earlier page while it is open, which moves every later page's index.
+        id: String,
         number: String,
         title: String,
         size: PageSize,
@@ -123,6 +127,8 @@ struct App {
     open_url: Vec<String>,
     /// The last status message and message box written to the log, so each is logged once.
     logged: (String, String),
+    /// The shared work session, when one is running, and its windows.
+    share: share::Share,
 }
 
 struct StatusView<'a> {
@@ -130,6 +136,7 @@ struct StatusView<'a> {
     ed: &'a Editor,
     prefs: &'a Prefs,
     clipboard: &'a edit::Clipboard,
+    sharing: bool,
 }
 
 impl chrome::Status for StatusView<'_> {
@@ -163,7 +170,11 @@ impl chrome::Status for StatusView<'_> {
             | Action::Assistant
             | Action::ReportProblem
             | Action::RequestFunction
-            | Action::ReportMissing => true,
+            | Action::ReportMissing
+            | Action::JoinSession => true,
+            Action::ShareSession => has || self.sharing,
+            // Undo swaps the whole project, which would take back other people's work too.
+            Action::Undo | Action::Redo if self.sharing => false,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
             Action::PageUp => has && self.ed.page > 0,
@@ -183,6 +194,66 @@ impl chrome::Status for StatusView<'_> {
 }
 
 impl App {
+    /// Keep the open project in step with the shared session, at the end of the frame so this
+    /// frame's change goes out. Nothing goes out while a button is held or the live cover form
+    /// is open, so one action is one change.
+    fn sync_session(&mut self, ctx: &egui::Context) {
+        if !self.share.active() {
+            self.ed.held_by.clear();
+            return;
+        }
+        // While an assistant command runs, its files are its own: nothing is sent, and a joined
+        // copy waits, so the dirty project is not saved over the command's changes.
+        let busy = ctx.input(|i| i.pointer.any_down())
+            || matches!(self.dialog, Some(Dialog::Cover { .. }))
+            || self.assistant.command_running();
+        let page = self.open.as_ref().and_then(|o| match self.ed.panel {
+            Some(_) => None,
+            None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
+        });
+        let mut shown = page.clone();
+        if let Some(joined) = self.share.frame(self.open.as_mut(), page, busy) {
+            // The joined copy replaces the open project: keep its unsaved work first.
+            if let Some(o) = self.open.as_mut()
+                && o.dirty
+                && let Err(e) = o.save()
+            {
+                self.share.stop();
+                self.dialog = Some(Dialog::Message(format!(
+                    "Left the session: the open project could not be saved before switching to the shared copy:\n{e}"
+                )));
+                return;
+            }
+            self.ed = Editor::default();
+            self.panels.reset();
+            self.dialog = None;
+            self.prefs.remember(joined.dir.clone());
+            self.prefs.save();
+            self.open = Some(joined);
+            // The id belonged to the project left behind.
+            shown = None;
+        }
+        // Others may have added or removed pages before this one: keep showing the same page.
+        if let (Some(id), Some(o)) = (&shown, &self.open)
+            && let Some(i) = o.project.pages.iter().position(|p| &p.id == id)
+        {
+            self.ed.page = i;
+        }
+        // A page shown in the navigator may have been removed by someone else.
+        if let Some(o) = &self.open
+            && self.ed.page >= o.project.pages.len()
+        {
+            self.ed.page = o.project.pages.len().saturating_sub(1);
+        }
+        self.ed.held_by = self.share.held_by_others();
+        if let Some(note) = self.share.take_notes().pop() {
+            applog::info(&format!("shared session: {note}"));
+            self.ed.message = note;
+        }
+        // Others' changes arrive without any input here.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     fn new(cc: &eframe::CreationContext<'_>, dir: Option<PathBuf>) -> Self {
         let mut prefs = Prefs::load();
         theme::install_fonts(&cc.egui_ctx);
@@ -200,6 +271,7 @@ impl App {
             assistant: agent::Assistant::default(),
             open_url: Vec::new(),
             logged: Default::default(),
+            share: Default::default(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -253,6 +325,22 @@ impl App {
                 .push(feedback::form_url(kind, &feedback::Request::default()));
             self.ed.message = "Opened the form on GitHub in your browser; what you send goes on the todo list.".into();
             return;
+        }
+        match a {
+            Action::ShareSession => {
+                self.share.show_share();
+                return;
+            }
+            Action::JoinSession => {
+                self.share.show_join();
+                return;
+            }
+            Action::Undo | Action::Redo if self.share.active() => {
+                self.ed.message =
+                    "Undo is off in a shared session: it would take back other people's work too. Use the page history.".into();
+                return;
+            }
+            _ => {}
         }
         match a {
             Action::Open => {
@@ -477,6 +565,7 @@ impl App {
             Action::PageProps => {
                 if let Some(p) = open.project.pages.get(page) {
                     self.dialog = Some(Dialog::PageProps {
+                        id: p.id.clone(),
                         number: p.number.clone(),
                         title: p.title.clone(),
                         size: p.size,
@@ -1058,6 +1147,7 @@ impl App {
                     });
                 }
                 Dialog::PageProps {
+                    id,
                     number,
                     title,
                     size,
@@ -1096,7 +1186,11 @@ impl App {
                         if ui.button("OK").clicked()
                             && let Some(o) = self.open.as_mut()
                         {
-                            match o.set_page_props(self.ed.page, number, title, *size, *overview) {
+                            let at = o.project.pages.iter().position(|p| p.id == *id);
+                            match at
+                                .ok_or_else(|| "This page was removed by another participant.".to_owned())
+                                .and_then(|i| o.set_page_props(i, number, title, *size, *overview))
+                            {
                                 Ok(i) => {
                                     self.ed.page = i;
                                     self.ed.view.fit = true;
@@ -1351,7 +1445,13 @@ impl App {
                             )
                         })
                         .unwrap_or_default();
-                    ui.label(format!("Delete {what}? Undo brings it back."));
+                    // Undo is off in a shared session, so it is not promised there.
+                    let undo = if self.share.active() {
+                        " It cannot be undone in a shared session."
+                    } else {
+                        " Undo brings it back."
+                    };
+                    ui.label(format!("Delete {what}?{undo}"));
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
                             if let Some(o) = self.open.as_mut() {
@@ -1932,6 +2032,7 @@ impl eframe::App for App {
             ed: &self.ed,
             prefs: &self.prefs,
             clipboard: &self.clipboard,
+            sharing: self.share.active(),
         };
         for url in std::mem::take(&mut self.open_url) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
@@ -1987,6 +2088,16 @@ impl eframe::App for App {
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 self.ed.auto_wire = self.prefs.auto_wire;
                 canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
+                let held = open
+                    .project
+                    .pages
+                    .get(self.ed.page)
+                    .and_then(|p| self.ed.held_by.get(&p.id));
+                if let Some(name) = held
+                    && self.ed.panel.is_none()
+                {
+                    read_only_banner(ui, &t, name);
+                }
             });
         } else {
             let mut start = None;
@@ -2015,6 +2126,8 @@ impl eframe::App for App {
             self.dialog = Some(Dialog::Comment(at, String::new(), false));
         }
         self.dialogs(ctx);
+        self.share.windows(ctx, self.open.as_mut());
+        self.sync_session(ctx);
 
         let title = match &self.open {
             Some(o) => format!(
@@ -2026,6 +2139,24 @@ impl eframe::App for App {
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
+}
+
+/// A note across the top of the canvas: someone else has this page open, so it is read-only.
+fn read_only_banner(ui: &egui::Ui, t: &theme::Theme, name: &str) {
+    let p = ui.painter();
+    let galley = p.layout_no_wrap(
+        format!("Read-only: {name} has this page open"),
+        egui::FontId::proportional(13.0),
+        t.text,
+    );
+    let top = ui.max_rect().center_top() + Vec2::new(0.0, 12.0);
+    let rect = egui::Rect::from_center_size(
+        top + Vec2::new(0.0, galley.size().y / 2.0 + 6.0),
+        galley.size() + Vec2::new(24.0, 12.0),
+    );
+    p.rect_filled(rect, 6.0, t.surface);
+    p.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, t.warning), egui::StrokeKind::Inside);
+    p.galley(rect.min + Vec2::new(12.0, 6.0), galley, t.text);
 }
 
 /// The start screen shown when no project is open: a card with the two ways in and the
