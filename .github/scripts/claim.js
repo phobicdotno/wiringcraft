@@ -73,7 +73,9 @@ async function canWrite(github, owner, repo, login, association) {
     let ok = false;
     try {
       const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: login });
-      ok = WRITE.has(data.role_name || data.permission);
+      // `permission` is always one of admin, write, read, none (maintain counts as write);
+      // `role_name` can be a custom role's name.
+      ok = WRITE.has(data.permission);
     } catch (e) {
       if (e.status !== 404) throw e;
     }
@@ -177,7 +179,9 @@ function parseRefs(title, body) {
 
 /** The `Agent: <name>` line in a pull request body, or null. */
 function parseAgent(body) {
-  const m = /^\s*Agent\s*:\s*(\S+)\s*$/im.exec(String(body || ''));
+  // Spaces and tabs only around the label and value: an empty `Agent:` line must not take a word
+  // from the next line.
+  const m = /^[ \t]*Agent[ \t]*:[ \t]*(\S+)[ \t]*$/im.exec(String(body || ''));
   return m && AGENT.test(m[1]) ? m[1] : null;
 }
 

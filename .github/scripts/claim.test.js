@@ -121,6 +121,7 @@ function fakeGithub(issues) {
       calls.push(['perm', p.username]);
       if (p.username === 'owner') return { data: { permission: 'admin', role_name: 'admin' } };
       if (p.username === 'reader') return { data: { permission: 'read', role_name: 'read' } };
+      if (p.username === 'custom') return { data: { permission: 'write', role_name: 'release-managers' } };
       const e = new Error('not found'); e.status = 404; throw e;
     },
   };
@@ -311,4 +312,18 @@ test('a collaborator with read access only cannot claim', async () => {
   const out = await c.backlog({ github, context: { repo }, now: T0 });
   assert.match(out[0], /write access/);
   assert.equal(c.readState(issues[3].comments).agent, null);
+});
+
+test('an empty Agent line does not take a word from the next line', () => {
+  assert.equal(c.parseAgent('Fixes #3\nAgent:\n\nChanges a default: no'), null);
+  assert.equal(c.parseAgent('Agent:   \nnext'), null);
+  assert.equal(c.parseAgent('Agent:\tworker-1\t'), 'worker-1');
+});
+
+test('write permission with a custom role name is accepted', async () => {
+  const custom = { id: 1, user: { type: 'User', login: 'custom' }, author_association: 'COLLABORATOR', body: '/claim cu', created_at: new Date(T0 - 60000).toISOString() };
+  const issues = { 3: { comments: [custom], labels: [], state: 'open' } };
+  const { github } = fakeGithub(issues);
+  const out = await c.backlog({ github, context: { repo }, now: T0 });
+  assert.match(out[0], /Claimed by `cu`/);
 });
