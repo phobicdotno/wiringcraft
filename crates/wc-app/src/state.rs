@@ -382,7 +382,14 @@ impl Open {
     }
 
     /// Change a page's number, title and size. A number another page already uses is refused.
-    pub fn set_page_props(&mut self, page: usize, number: &str, title: &str, size: PageSize) -> Result<usize, String> {
+    pub fn set_page_props(
+        &mut self,
+        page: usize,
+        number: &str,
+        title: &str,
+        size: PageSize,
+        overview: bool,
+    ) -> Result<usize, String> {
         let number = number.trim();
         if number.is_empty() {
             return Err("The page number cannot be empty.".into());
@@ -394,7 +401,7 @@ impl Open {
         if self.project.pages.iter().any(|p| p.number == number && p.id != id) {
             return Err(format!("Page {number} already exists."));
         }
-        if current.number == number && current.title == title && current.size == size {
+        if current.number == number && current.title == title && current.size == size && current.overview == overview {
             return Ok(page);
         }
         self.checkpoint();
@@ -402,6 +409,7 @@ impl Open {
             p.number = number.to_owned();
             p.title = title.trim().to_owned();
             p.size = size;
+            p.overview = overview;
         }
         self.project.sort_pages();
         Ok(self.index_of(&id))
@@ -786,8 +794,9 @@ pub(crate) mod tests {
         let (_tmp, mut o) = project();
         assert_eq!(o.project.pages.len(), 2);
         // Renumbering resorts; a taken number is refused.
-        assert!(o.set_page_props(0, "2", "Cover", PageSize::A3).is_err());
-        let i = o.set_page_props(0, "10", "Cover sheet", PageSize::A4).unwrap();
+        assert!(o.set_page_props(0, "2", "Cover", PageSize::A3, false).is_err());
+        let i = o.set_page_props(0, "10", "Cover sheet", PageSize::A4, true).unwrap();
+        assert!(o.project.pages[i].overview);
         assert_eq!(i, 1);
         assert_eq!(o.project.pages[1].title, "Cover sheet");
         assert_eq!(o.project.pages[1].size, PageSize::A4);

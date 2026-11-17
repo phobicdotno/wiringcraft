@@ -3,10 +3,11 @@
 use eframe::egui::{self, Key, RichText, Stroke};
 use std::sync::Arc;
 
-use wc_agent::{Backend, EFFORTS, Entry, KEY_VAR, MODELS, acp};
+use wc_agent::{Backend, EFFORTS, Entry, KEY_VAR, MODELS, acp, shown_text};
 
 use crate::App;
 use crate::agent::{AppTools, SYSTEM};
+use crate::screenshot::{self, MAX_WAITING, Shot};
 use crate::theme::Theme;
 
 impl App {
@@ -14,30 +15,115 @@ impl App {
         self.prefs.assistant.backend == Backend::ClaudeLogin
     }
 
-    /// Send the input box's text to the assistant.
+    /// A line in the conversation that is showing.
+    fn assistant_log(&mut self, e: Entry) {
+        if self.uses_login() {
+            self.assistant.login_log.push(e);
+        } else {
+            self.assistant.session.log.push(e);
+        }
+    }
+
+    /// Send the input box's text, and the screenshots waiting, to the assistant.
     pub(crate) fn assistant_send(&mut self, ctx: &egui::Context) {
+        let shots: Vec<Shot> = self.assistant.waiting.iter().map(|(s, _)| s.clone()).collect();
+        let images = match shots.iter().map(Shot::to_agent).collect::<Result<Vec<_>, _>>() {
+            Ok(i) => i,
+            Err(e) => {
+                self.assistant_log(Entry::Error(e));
+                return;
+            }
+        };
         let text = std::mem::take(&mut self.assistant.input);
         let context = self.agent_context();
         let ok = if self.uses_login() {
-            self.login_send(ctx, &text, &context)
+            self.login_send(ctx, &text, &images, &context)
         } else {
             let settings = self.prefs.assistant.clone();
             let specs = self.assistant.specs().to_vec();
             self.assistant
                 .session
-                .send(&text, &context, &settings, SYSTEM, &specs)
+                .send(&text, &images, &context, &settings, SYSTEM, &specs)
                 .map_err(|e| self.assistant.session.log.push(Entry::Error(e)))
                 .is_ok()
         };
         if ok {
             self.assistant.turn = self.open.as_ref().map(|o| (o.dir.clone(), o.undo_mark()));
+            self.assistant.waiting.clear();
+            let a = &mut self.assistant;
+            a.shared.extend(shots.iter().cloned());
+            let extra = a.shared.len().saturating_sub(MAX_WAITING);
+            a.shared.drain(..extra);
+            a.sent = shots;
+            a.sent_text = text;
         } else {
             self.assistant.input = text;
         }
     }
 
+    /// Add a screenshot to the next message.
+    fn add_screenshot(&mut self, shot: Shot) {
+        if self.assistant.waiting.len() >= MAX_WAITING {
+            self.assistant_log(Entry::Error(format!(
+                "At most {MAX_WAITING} screenshots go with one message."
+            )));
+            return;
+        }
+        self.assistant.waiting.push((shot, None));
+    }
+
+    /// The picture on the clipboard goes with the next message. `quiet` (after Ctrl+V in the
+    /// text box) says nothing when there is no picture, or when text was pasted instead.
+    fn paste_screenshot(&mut self, quiet: bool) {
+        if quiet && self.assistant.clipboard.has_text() {
+            return;
+        }
+        match self.assistant.clipboard.paste() {
+            Ok(Some(shot)) => self.add_screenshot(shot),
+            Ok(None) if quiet => {}
+            Ok(None) => self.assistant_log(Entry::Note(
+                "There is no picture on the clipboard. Take a screenshot (on Windows Win+Shift+S, on a Mac Cmd+Ctrl+Shift+4) and try again.".into(),
+            )),
+            Err(e) => self.assistant_log(Entry::Error(e)),
+        }
+    }
+
+    /// Put an unanswered message back in the box, saying if screenshots did not fit.
+    fn give_back(&mut self, text: Option<String>) {
+        let left_out = self.assistant.give_back(text);
+        if left_out > 0 {
+            self.assistant_log(Entry::Note(format!(
+                "{left_out} newer screenshot(s) did not fit next to the message given back (at most {MAX_WAITING})."
+            )));
+        }
+    }
+
+    /// Pictures dropped on the window go to the assistant, once it is not working on a message.
+    fn take_dropped_pictures(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .filter(|p| screenshot::is_picture(p))
+                .collect()
+        });
+        if !dropped.is_empty() && self.assistant.busy() {
+            self.assistant_log(Entry::Note(
+                "The assistant is still working; drop the screenshot again when it has answered.".into(),
+            ));
+            return;
+        }
+        for path in dropped {
+            match Shot::from_file(&path) {
+                Ok(shot) => self.add_screenshot(shot),
+                Err(e) => self.assistant_log(Entry::Error(e)),
+            }
+        }
+    }
+
     /// Claude login: start the bridge and Claude Code when needed, then send.
-    fn login_send(&mut self, ctx: &egui::Context, text: &str, context: &str) -> bool {
+    fn login_send(&mut self, ctx: &egui::Context, text: &str, images: &[wc_agent::Image], context: &str) -> bool {
         let wake: Arc<dyn Fn() + Send + Sync> = {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint())
@@ -89,13 +175,22 @@ impl App {
             }
         }
         let Some(c) = a.acp.as_mut() else { return false };
-        a.login_log.push(Entry::User(text.to_owned()));
-        c.prompt(&format!("<context>\n{}\n</context>\n\n{text}", context.trim()));
+        let text = text.trim();
+        if text.is_empty() && images.is_empty() {
+            return false;
+        }
+        a.login_log.push(Entry::User(shown_text(text, images.len())));
+        c.prompt(&format!("<context>\n{}\n</context>\n\n{text}", context.trim()), images);
         true
     }
 
     /// Pick up the assistant's answers and run its tools. Called every frame.
     pub(crate) fn assistant_poll(&mut self, ctx: &egui::Context) {
+        // Drops are taken before the answer is looked at, so a screenshot dropped in the frame
+        // where a message fails is refused rather than joined to the message given back.
+        if self.prefs.show_assistant {
+            self.take_dropped_pictures(ctx);
+        }
         let mut finished = false;
         // Claude login: tool calls from Claude Code, then what it said.
         // Calls outside a running turn (after Stop, or late) are refused, never run.
@@ -111,6 +206,9 @@ impl App {
         if let Some(c) = self.assistant.acp.as_mut() {
             let p = c.poll(&mut self.assistant.login_log);
             finished |= p.finished;
+            if p.unanswered {
+                self.give_back(None);
+            }
         }
         // API key.
         if self.assistant.session.busy() {
@@ -119,10 +217,8 @@ impl App {
             let polled = session.poll(&mut AppTools(self), &settings, SYSTEM, false);
             self.assistant.session = session;
             finished |= polled.finished;
-            if let Some(text) = self.assistant.session.returned.take()
-                && self.assistant.input.is_empty()
-            {
-                self.assistant.input = text;
+            if let Some(text) = self.assistant.session.returned.take() {
+                self.give_back(Some(text));
             }
         }
         if finished {
@@ -188,6 +284,9 @@ impl App {
                     self.assistant.session.clear();
                     self.assistant.login_log.clear();
                     self.assistant.acp = None;
+                    self.assistant.waiting.clear();
+                    self.assistant.sent.clear();
+                    self.assistant.shared.clear();
                 }
                 if ui.selectable_label(self.assistant.show_settings, "Settings").clicked() {
                     self.assistant.show_settings = !self.assistant.show_settings;
@@ -228,11 +327,18 @@ impl App {
                         });
                     });
                 }
+                self.waiting_screenshots(ui, t);
                 let edit = egui::TextEdit::multiline(&mut self.assistant.input)
                     .hint_text("Tell the assistant what to draw or change…  (Enter sends, Shift+Enter for a new line)")
                     .desired_rows(3)
                     .desired_width(f32::INFINITY);
                 let r = ui.add_enabled(!busy, edit);
+                // Ctrl+V with a picture on the clipboard: the toolkit only pastes text, so the
+                // key's release is the sign to look for a picture.
+                let paste = r.has_focus() && ui.input(|i| paste_released(&i.events));
+                if paste {
+                    self.paste_screenshot(true);
+                }
                 let enter = r.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
                 if enter {
                     // The key press already added a line break.
@@ -242,10 +348,20 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(self.backend_label()).small().color(t.faint));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can = !busy && ready && !self.assistant.input.trim().is_empty();
+                        let words = !self.assistant.input.trim().is_empty();
+                        let can = !busy && ready && (words || !self.assistant.waiting.is_empty());
                         if ui.add_enabled(can, egui::Button::new("Send")).clicked() || (enter && can) {
                             let ctx = ui.ctx().clone();
                             self.assistant_send(&ctx);
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Paste screenshot"))
+                            .on_hover_text(
+                                "Send a picture from the clipboard with your message. Ctrl+V in the box works too (Windows and Linux), and so does dropping a PNG or JPEG file on the window.",
+                            )
+                            .clicked()
+                        {
+                            self.paste_screenshot(false);
                         }
                     });
                 });
@@ -276,6 +392,48 @@ impl App {
                     entry(ui, t, e);
                 }
             });
+    }
+
+    /// The screenshots that go with the next message, each with a button to take it off.
+    fn waiting_screenshots(&mut self, ui: &mut egui::Ui, t: &Theme) {
+        if self.assistant.waiting.is_empty() {
+            return;
+        }
+        let mut remove = None;
+        ui.horizontal_wrapped(|ui| {
+            for (n, (shot, texture)) in self.assistant.waiting.iter_mut().enumerate() {
+                let tex = texture.get_or_insert_with(|| {
+                    ui.ctx().load_texture(
+                        format!("assistant_shot_{n}"),
+                        shot.color_image(),
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
+                let size = tex.size_vec2();
+                let thumb = size * (48.0 / size.y.max(1.0)).min(96.0 / size.x.max(1.0));
+                let preview = size * (480.0 / size.x.max(size.y).max(1.0)).min(1.0);
+                ui.vertical(|ui| {
+                    ui.add(egui::Image::new((tex.id(), thumb))).on_hover_ui(|ui| {
+                        ui.add(egui::Image::new((tex.id(), preview)));
+                    });
+                    if ui
+                        .small_button("Remove")
+                        .on_hover_text("Do not send this screenshot")
+                        .clicked()
+                    {
+                        remove = Some(n);
+                    }
+                });
+            }
+        });
+        ui.label(
+            RichText::new("Screenshots go with your next message. Leave out anything private.")
+                .small()
+                .color(t.faint),
+        );
+        if let Some(n) = remove {
+            self.assistant.waiting.remove(n);
+        }
     }
 
     /// The line under the input: who answers.
@@ -499,11 +657,45 @@ fn entry(ui: &mut egui::Ui, t: &Theme, e: &Entry) {
     }
 }
 
+/// Whether Ctrl+V (Cmd+V) was let go in this frame. The window turns the key press into a text
+/// paste and drops it when the clipboard holds only a picture, but the release still arrives.
+/// macOS sends no release while Cmd is held, so there the button and dropping a file are the ways in.
+fn paste_released(events: &[egui::Event]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, egui::Event::Key { key: Key::V, pressed: false, modifiers, .. } if modifiers.command))
+}
+
 /// Stands in for the real transport while the session is lent out for a poll.
 struct Idle;
 
 impl wc_agent::Transport for Idle {
     fn send(&self, _key: &str, _body: &serde_json::Value) -> Result<serde_json::Value, String> {
         Err("busy".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(key: Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn ctrl_v_let_go_asks_for_a_picture() {
+        let ctrl = egui::Modifiers::COMMAND;
+        assert!(paste_released(&[key(Key::V, false, ctrl)]));
+        assert!(!paste_released(&[key(Key::V, true, ctrl)]));
+        assert!(!paste_released(&[key(Key::V, false, egui::Modifiers::NONE)]));
+        assert!(!paste_released(&[key(Key::C, false, ctrl)]));
+        assert!(!paste_released(&[]));
     }
 }

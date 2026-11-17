@@ -12,12 +12,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use eframe::egui;
 use serde_json::{Value, json};
 use wc_core::geom::{Point, Rotation, Shape};
 use wc_core::project::PageSize;
 use wc_core::{DeviceTag, Endpoint, Page};
 
 use crate::actions::Action;
+use crate::screenshot::{self, Shot};
 use crate::state::{Open, Selection};
 use crate::{App, Dialog};
 
@@ -79,6 +81,14 @@ pub struct Assistant {
     pub acp: Option<wc_agent::acp::Acp>,
     /// Claude login: the conversation as shown.
     pub login_log: Vec<wc_agent::Entry>,
+    /// Screenshots waiting to go with the next message, with their thumbnails once shown.
+    pub waiting: Vec<(Shot, Option<egui::TextureHandle>)>,
+    /// The last message's words and screenshots, offered again if it could not be sent.
+    pub sent_text: String,
+    pub sent: Vec<Shot>,
+    /// The latest screenshots of this conversation, for a request the assistant files.
+    pub shared: Vec<Shot>,
+    pub clipboard: screenshot::Clipboard,
 }
 
 impl Default for Assistant {
@@ -98,11 +108,33 @@ impl Assistant {
             bridge: None,
             acp: None,
             login_log: Vec::new(),
+            waiting: Vec::new(),
+            sent_text: String::new(),
+            sent: Vec::new(),
+            shared: Vec::new(),
+            clipboard: screenshot::Clipboard::default(),
         }
     }
 
     pub fn specs(&self) -> &[Value] {
         &self.specs
+    }
+
+    /// The last message was not answered: put its words (unless something new was typed) and
+    /// its screenshots back in the box. Screenshots added since stay, after the given-back ones,
+    /// as far as there is room; returns how many of those did not fit. (Drops are refused while
+    /// a message is on its way, so normally nothing was added.)
+    pub fn give_back(&mut self, text: Option<String>) -> usize {
+        let text = text.unwrap_or_else(|| std::mem::take(&mut self.sent_text));
+        if self.input.trim().is_empty() {
+            self.input = text;
+        }
+        let newer = std::mem::take(&mut self.waiting);
+        self.waiting = std::mem::take(&mut self.sent).into_iter().map(|s| (s, None)).collect();
+        let room = screenshot::MAX_WAITING.saturating_sub(self.waiting.len());
+        let left_out = newer.len().saturating_sub(room);
+        self.waiting.extend(newer.into_iter().take(room));
+        left_out
     }
 
     /// Working on a message, with either backend.
@@ -288,8 +320,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_page",
-            "Change a page's number, title or sheet size.",
-            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}}),
+            "Change a page's number, title or sheet size, or mark it as an overview (a line diagram: its devices do not count as drawings in the project check).",
+            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}, "overview": {"type": "boolean"}}),
             &[],
         ),
         tool(
@@ -319,7 +351,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "edit_page_json",
             "Replace a whole page with new content in the page file format (as get_page returns it, without the extra pin and point fields). For bulk edits the other tools cannot do. The page id stays.",
-            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, symbols, wires, graphics, underlay."}}),
+            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), symbols, wires, graphics, underlay."}}),
             &["content"],
         ),
         tool(
@@ -1027,7 +1059,7 @@ impl App {
                 let cur = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 let number = s(v, "number").unwrap_or(&cur.number).to_owned();
                 let title = s(v, "title").unwrap_or(&cur.title).to_owned();
-                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size))?;
+                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size), cur.overview)?;
                 let p = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 self.go_to(i);
                 Ok(format!("Added page {} ({}), id {}.", p.number, p.title, p.id))
@@ -1042,6 +1074,7 @@ impl App {
                     s(v, "number").unwrap_or(&cur.number),
                     s(v, "title").unwrap_or(&cur.title),
                     size.unwrap_or(cur.size),
+                    v.get("overview").and_then(Value::as_bool).unwrap_or(cur.overview),
                 )?;
                 if self.ed.page == page {
                     self.ed.page = i;
@@ -1870,6 +1903,23 @@ impl App {
                     return Err("`title` and `what` must not be empty.".into());
                 }
                 let confirmed = v["confirmed"].as_bool().unwrap_or(false);
+                // gh cannot attach pictures, so with a screenshot the form opens and the latest
+                // screenshot goes on the clipboard, ready to paste into it.
+                if let Some(shot) = self.assistant.shared.last().cloned() {
+                    self.open_url.push(feedback::form_url(kind, &r));
+                    let pasted = self.assistant.clipboard.copy(&shot);
+                    self.ed.message = match &pasted {
+                        Ok(()) => {
+                            "Opened the request on GitHub; press Ctrl+V in its Screenshots box to add the screenshot."
+                                .into()
+                        }
+                        Err(_) => "Opened the request on GitHub; drag the screenshot into its Screenshots box.".into(),
+                    };
+                    return Ok(match pasted {
+                        Ok(()) => "Opened the filled-in form in the user's browser and put the latest screenshot on their clipboard. Tell them to click the form's Screenshots box, press Ctrl+V (Cmd+V on a Mac), then Submit.".into(),
+                        Err(e) => format!("Opened the filled-in form in the user's browser. The screenshot could not go on the clipboard ({e}); tell them to drag their screenshot file into the form's Screenshots box, then Submit."),
+                    });
+                }
                 if confirmed && feedback::gh_ready() {
                     let url = feedback::file(kind, &r)?;
                     self.ed.message = format!("Filed {url}");
@@ -2220,6 +2270,45 @@ mod tests {
             .is_err()
         );
         assert!(call(&mut a, "todo", json!({"action": "other"})).is_err());
+        // With a screenshot in the conversation the form opens even with the go-ahead, since
+        // pictures can only be added there.
+        a.assistant
+            .shared
+            .push(Shot::from_rgba(1, 1, vec![0, 0, 0, 255]).unwrap());
+        let out = call(
+            &mut a,
+            "todo",
+            json!({"action": "file", "kind": "problem", "title": "Wrong arrow", "what": "See screenshot", "confirmed": true}),
+        )
+        .unwrap();
+        assert!(out.contains("Screenshots box"), "{out}");
+        assert_eq!(a.open_url.len(), 3);
+    }
+
+    #[test]
+    fn an_unanswered_message_gets_its_screenshots_back() {
+        let shot = |w| Shot::from_rgba(w, 1, vec![0; w * 4]).unwrap();
+        let mut s = Assistant::with_transport(Arc::new(Script(Mutex::new(Vec::new()))));
+        s.sent_text = "look at this".into();
+        s.sent = vec![shot(1), shot(2)];
+        // A picture dropped while the message was on its way stays, after the given-back ones.
+        s.waiting = vec![(shot(3), None)];
+        assert_eq!(s.give_back(None), 0);
+        let widths: Vec<u32> = s.waiting.iter().map(|(x, _)| x.image.width()).collect();
+        assert_eq!(widths, vec![1, 2, 3]);
+        assert_eq!(s.input, "look at this");
+        assert!(s.sent.is_empty());
+        // Words typed since are kept; the given-back words come from the API.
+        s.input = "new words".into();
+        s.give_back(Some("old".into()));
+        assert_eq!(s.input, "new words");
+        assert_eq!(s.waiting.len(), 3);
+        // Full: every given-back screenshot stays, newer ones that do not fit are counted.
+        s.sent = (1..=5).map(shot).collect();
+        s.waiting = vec![(shot(9), None)];
+        assert_eq!(s.give_back(None), 1);
+        let widths: Vec<u32> = s.waiting.iter().map(|(x, _)| x.image.width()).collect();
+        assert_eq!(widths, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]

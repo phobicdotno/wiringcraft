@@ -154,6 +154,34 @@ pub struct Reply {
     pub output_tokens: u64,
 }
 
+/// A picture sent with the user's words, such as a screenshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    /// `image/png` or `image/jpeg`.
+    pub media_type: String,
+    /// The bytes, base64 (standard alphabet, padded).
+    pub data: String,
+}
+
+/// How a message with pictures reads in the panel: the words, then how many pictures came with them.
+pub fn shown_text(text: &str, images: usize) -> String {
+    match images {
+        0 => text.to_owned(),
+        n => {
+            let what = if n == 1 {
+                "1 screenshot".to_owned()
+            } else {
+                format!("{n} screenshots")
+            };
+            if text.is_empty() {
+                format!("({what})")
+            } else {
+                format!("{text}\n({what})")
+            }
+        }
+    }
+}
+
 /// The messages so far, exactly as the API needs them back: assistant content (thinking
 /// blocks included) is kept unchanged.
 #[derive(Debug, Clone, Default)]
@@ -173,15 +201,26 @@ impl Conversation {
     /// Add the user's words. When the last message is already the user's (tool results of a
     /// turn that was stopped), the text joins it, so roles keep alternating.
     pub fn user(&mut self, text: &str) {
-        let block = json!({"type": "text", "text": text});
+        self.user_with(text, &[]);
+    }
+
+    /// The user's words with pictures; the pictures go first, so the words can refer to them.
+    pub fn user_with(&mut self, text: &str, images: &[Image]) {
+        let mut blocks: Vec<Value> = images
+            .iter()
+            .map(|i| json!({"type": "image", "source": {"type": "base64", "media_type": i.media_type, "data": i.data}}))
+            .collect();
+        if !text.is_empty() || blocks.is_empty() {
+            blocks.push(json!({"type": "text", "text": text}));
+        }
         if let Some(last) = self.messages.last_mut()
             && last["role"] == "user"
             && let Some(content) = last["content"].as_array_mut()
         {
-            content.push(block);
+            content.extend(blocks);
             return;
         }
-        self.messages.push(json!({"role": "user", "content": [block]}));
+        self.messages.push(json!({"role": "user", "content": blocks}));
     }
 
     /// The request body for the next answer.
@@ -280,7 +319,8 @@ impl Conversation {
             return None;
         }
         let blocks = last["content"].as_array()?;
-        if blocks.iter().any(|b| b["type"] != "text") {
+        // Pictures sent with the words go too; the app keeps its own copy to offer again.
+        if blocks.iter().any(|b| b["type"] != "text" && b["type"] != "image") {
             return None;
         }
         let text: Vec<&str> = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
@@ -472,13 +512,14 @@ impl Session {
     pub fn send(
         &mut self,
         text: &str,
+        images: &[Image],
         context: &str,
         settings: &Settings,
         system: &str,
         tools: &[Value],
     ) -> Result<(), String> {
         let text = text.trim();
-        if text.is_empty() {
+        if text.is_empty() && images.is_empty() {
             return Err("Write something first.".into());
         }
         if self.busy() {
@@ -488,12 +529,12 @@ impl Session {
             .key()
             .ok_or_else(|| format!("No API key: set {KEY_VAR} or add one in the assistant settings."))?;
         if context.trim().is_empty() {
-            self.conversation.user(text);
+            self.conversation.user_with(text, images);
         } else {
             self.conversation
-                .user(&format!("<context>\n{}\n</context>\n\n{text}", context.trim()));
+                .user_with(&format!("<context>\n{}\n</context>\n\n{text}", context.trim()), images);
         }
-        self.log.push(Entry::User(text.to_owned()));
+        self.log.push(Entry::User(shown_text(text, images.len())));
         self.rounds = 0;
         self.stop = false;
         self.request(key, settings, system, tools);
@@ -694,7 +735,10 @@ mod tests {
         let mut s = Session::new(t.clone());
         let mut tools = Counter::default();
         let set = settings();
-        assert!(s.send("draw a relay", "page 1", &set, "sys", &tools.specs()).is_ok());
+        assert!(
+            s.send("draw a relay", &[], "page 1", &set, "sys", &tools.specs())
+                .is_ok()
+        );
         let first = s.poll(&mut tools, &set, "sys", true);
         assert!(first.tools_ran && !first.finished);
         let second = s.poll(&mut tools, &set, "sys", true);
@@ -717,12 +761,40 @@ mod tests {
     }
 
     #[test]
+    fn screenshots_go_ahead_of_the_words() {
+        let t = script(vec![Err("offline".into())]);
+        let mut s = Session::new(t);
+        let set = settings();
+        let shot = Image {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        };
+        assert!(s.send("", &[], "", &set, "sys", &[]).is_err());
+        assert!(
+            s.send("  ", std::slice::from_ref(&shot), "page 1", &set, "sys", &[])
+                .is_ok()
+        );
+        let msg = &s.conversation.messages()[0]["content"];
+        assert_eq!(msg[0]["type"], "image");
+        assert_eq!(msg[0]["source"]["media_type"], "image/png");
+        assert_eq!(msg[0]["source"]["data"], "iVBORw0KGgo=");
+        assert!(msg[1]["text"].as_str().is_some_and(|t| t.starts_with("<context>")));
+        assert_eq!(s.log, vec![Entry::User("(1 screenshot)".into())]);
+        assert_eq!(shown_text("look", 2), "look\n(2 screenshots)");
+        // A failed request gives the words back and leaves no half message behind.
+        let p = s.poll(&mut Counter::default(), &set, "sys", true);
+        assert!(p.finished);
+        assert_eq!(s.returned.as_deref(), Some(""));
+        assert!(s.conversation.is_empty());
+    }
+
+    #[test]
     fn a_failed_first_request_gives_the_text_back() {
         let t = script(vec![Err("offline".into())]);
         let mut s = Session::new(t);
         let mut tools = Counter::default();
         let set = settings();
-        assert!(s.send("hello", "page 2", &set, "sys", &[]).is_ok());
+        assert!(s.send("hello", &[], "page 2", &set, "sys", &[]).is_ok());
         let p = s.poll(&mut tools, &set, "sys", true);
         assert!(p.finished);
         assert_eq!(s.returned.as_deref(), Some("hello"));
@@ -738,7 +810,7 @@ mod tests {
         let mut s = Session::new(t);
         let mut tools = Counter::default();
         let set = settings();
-        assert!(s.send("go", "", &set, "sys", &[]).is_ok());
+        assert!(s.send("go", &[], "", &set, "sys", &[]).is_ok());
         s.stop();
         let p = s.poll(&mut tools, &set, "sys", true);
         assert!(p.finished);

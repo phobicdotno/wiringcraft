@@ -288,6 +288,44 @@ fn project_check_finds_the_usual_mistakes() {
 }
 
 #[test]
+fn a_device_repeated_on_an_overview_page_is_not_drawn_twice() {
+    let (mut p, s, parts) = fixture();
+    // The coil -K1 again, on a line diagram.
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.symbols.push(place("s20", "coil", 100.0, Some("=A+C1-K1")));
+    p.pages.push(overview);
+    let drawn_twice = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i).iter().any(|f| f.message.contains("is drawn 2 times"))
+    };
+    assert!(drawn_twice(&p), "on a normal page the repeat is an error");
+    p.pages[1].overview = true;
+    assert!(!drawn_twice(&p), "on an overview page it is not");
+}
+
+#[test]
+fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
+    // Decided on purpose: the contact's cross-reference shows that coil, so the contact is not
+    // reported as having none. Only the drawn-twice count leaves overview pages out.
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s11", "no", 320.0, Some("-K9")));
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s20", "coil", 100.0, Some("-K9")));
+    p.pages.push(overview);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(!check(&i).iter().any(|f| f.message.contains("contact -K9 has no coil")));
+}
+
+#[test]
 fn automationml_has_devices_pins_and_one_link_per_join() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
