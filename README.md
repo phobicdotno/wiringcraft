@@ -100,3 +100,9 @@ cargo run -p wc-cli -- --help
 - Original work only: no code, symbols, icons, templates or branding copied from other products.
 - No panics on user input: no `unwrap`/`expect`/`panic!` outside tests (enforced by clippy lints).
 - Every change is a pull request; work comes from the todo list and is claimed first. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Licence and disclaimer
+
+MIT OR Apache-2.0, at your option: [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE). WiringCraft is
+provided as is, without warranty; check its output before building anything, and read
+[DISCLAIMER.md](DISCLAIMER.md) on safety, harmful or unlawful use, and imported data.
