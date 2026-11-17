@@ -16,6 +16,8 @@ pub enum Kind {
     Dxf,
     Dwg,
     AutomationMl,
+    /// A KiCad symbol library (`.kicad_sym`).
+    KicadSymbols,
     Xml,
     Csv,
     Spreadsheet,
@@ -29,7 +31,10 @@ pub enum Kind {
 
 impl Kind {
     pub fn importable(self) -> bool {
-        matches!(self, Kind::Pdf | Kind::Dxf | Kind::AutomationMl | Kind::Csv)
+        matches!(
+            self,
+            Kind::Pdf | Kind::Dxf | Kind::AutomationMl | Kind::Csv | Kind::KicadSymbols
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -38,6 +43,7 @@ impl Kind {
             Kind::Dxf => "DXF drawing (importable)",
             Kind::Dwg => "DWG drawing (needs a converter)",
             Kind::AutomationMl => "AutomationML (importable)",
+            Kind::KicadSymbols => "KiCad symbol library (importable into a library)",
             Kind::Xml => "XML (vendor data)",
             Kind::Csv => "CSV list (importable)",
             Kind::Spreadsheet => "spreadsheet",
@@ -83,6 +89,9 @@ pub fn classify(name: &str, head: &[u8]) -> Kind {
     let text = String::from_utf8_lossy(&head[..head.len().min(512)]);
     if text.contains("<CAEXFile") || ext == "aml" {
         return Kind::AutomationMl;
+    }
+    if ext == "kicad_sym" || text.trim_start().starts_with("(kicad_symbol_lib") {
+        return Kind::KicadSymbols;
     }
     if ext == "dxf" || text.trim_start().starts_with("0\r\nSECTION") || text.trim_start().starts_with("0\nSECTION") {
         return Kind::Dxf;
@@ -212,6 +221,8 @@ mod tests {
             ("export.aml", b"<?xml version=\"1.0\"?><CAEXFile/>"),
             ("cache.db", b"SQLite format 3\0..."),
             ("readme.bin", b"\x00\x01"),
+            ("lib/Relays.kicad_sym", b"(kicad_symbol_lib (version 20231120))"),
+            ("lib/unnamed", b"  (kicad_symbol_lib)"),
         ]);
         let r = inspect(&z)?;
         assert_eq!(r.container, "zip");
@@ -221,6 +232,9 @@ mod tests {
         assert_eq!(kind("coil.dxf"), Some(Kind::Dxf));
         assert_eq!(kind("export.aml"), Some(Kind::AutomationMl));
         assert_eq!(kind("cache.db"), Some(Kind::SqliteDb));
+        assert_eq!(kind("Relays.kicad_sym"), Some(Kind::KicadSymbols));
+        assert_eq!(kind("unnamed"), Some(Kind::KicadSymbols));
+        assert!(Kind::KicadSymbols.importable());
         let got = open_entries(&z, &[Kind::Pdf, Kind::Dxf])?;
         assert_eq!(got.len(), 2);
         Ok(())

@@ -3,8 +3,10 @@
 //! The file is an S-expression: `(kicad_symbol_lib (symbol "Name" (property ...) (symbol
 //! "Name_0_1" graphics...) (symbol "Name_1_1" pins...)) ...)`. Coordinates are millimetres with
 //! y pointing up. Graphics (polylines, rectangles, circles, arcs, texts) and pins of the common
-//! unit and the first unit, body style 1, become one WiringCraft symbol; derived symbols
-//! (`extends`) take their parent's drawing. Written from the published file format description.
+//! unit and each unit, body style 1, become one WiringCraft symbol per unit: a symbol with one
+//! unit keeps its name, one with several becomes `<name>_A`, `<name>_B`, ... (a relay's coil
+//! and its contacts). Derived symbols (`extends`) take their parent's drawing. Written from the
+//! published file format description.
 
 use std::collections::BTreeMap;
 
@@ -157,15 +159,72 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
             },
             None => *sym,
         };
-        match convert(name, sym, body, prefix, scale, &mut warnings) {
-            Ok(symbol) => out.push(Imported {
-                symbol,
-                kicad_name: (*name).to_owned(),
-            }),
-            Err(e) => warnings.push(format!("{name}: {e}, skipped")),
+        let base = body.arg(1).unwrap_or(name);
+        let (units, styles) = units_of(body, base);
+        if styles {
+            warnings.push(format!("{name}: alternate body styles were skipped"));
+        }
+        // Unit 0 (common to every unit) alone: one symbol, as for a single unit.
+        let several = units.len() > 1;
+        for unit in units.into_iter().take(MAX_UNITS) {
+            let unit_name = if several {
+                format!("{name}_{}", unit_letter(unit))
+            } else {
+                (*name).to_owned()
+            };
+            match convert(&unit_name, sym, body, base, unit, prefix, scale) {
+                Ok(symbol) => out.push(Imported {
+                    symbol,
+                    kicad_name: unit_name,
+                }),
+                Err(e) => warnings.push(format!("{unit_name}: {e}, skipped")),
+            }
         }
     }
     Ok((out, warnings))
+}
+
+/// Most units read from one symbol; real parts stay far below (a quad gate has four).
+const MAX_UNITS: usize = 64;
+
+/// A sub-symbol's unit and body style from its name, `<base>_<unit>_<style>`.
+fn unit_and_style(unit: &Sexp, base: &str) -> (u32, u32) {
+    let suffix = unit.arg(1).and_then(|n| n.strip_prefix(base)).unwrap_or("");
+    let mut parts = suffix.trim_start_matches('_').split('_');
+    (
+        parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
+        parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1),
+    )
+}
+
+/// The units to import (each above 0, in order; `[1]` when only the common unit draws), and
+/// whether alternate body styles were seen.
+fn units_of(body: &Sexp, base: &str) -> (Vec<u32>, bool) {
+    let mut units = std::collections::BTreeSet::new();
+    let mut styles = false;
+    for unit in body.all("symbol") {
+        let (u, style) = unit_and_style(unit, base);
+        if style > 1 {
+            styles = true;
+        } else if u > 0 {
+            units.insert(u);
+        }
+    }
+    if units.is_empty() {
+        units.insert(1);
+    }
+    (units.into_iter().collect(), styles)
+}
+
+/// The letter of a unit as KiCad shows it: 1 is A, 26 is Z, 27 is AA.
+fn unit_letter(mut unit: u32) -> String {
+    let mut s = Vec::new();
+    while unit > 0 {
+        unit -= 1;
+        s.push(char::from(b'A' + (unit % 26) as u8));
+        unit /= 26;
+    }
+    s.iter().rev().collect()
 }
 
 fn id_part(s: &str) -> String {
@@ -187,14 +246,8 @@ fn property<'a>(sym: &'a Sexp, key: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty() && *v != "~")
 }
 
-fn convert(
-    name: &str,
-    sym: &Sexp,
-    body: &Sexp,
-    prefix: &str,
-    scale: f64,
-    warnings: &mut Vec<String>,
-) -> Result<Symbol> {
+/// One unit of a symbol: the common unit's drawing and pins plus those of `wanted`.
+fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix: &str, scale: f64) -> Result<Symbol> {
     let id = format!("{}.{}", prefix.trim_end_matches('.'), id_part(name));
     store::check_id(&id)?;
     // KiCad y points up; the page's points down.
@@ -205,21 +258,10 @@ fn convert(
     };
     let mut graphics = Vec::new();
     let mut pins: Vec<Pin> = Vec::new();
-    let mut extra_units = false;
-    let base = body.arg(1).unwrap_or(name);
     for unit in body.all("symbol") {
         // Unit names end in `_<unit>_<style>`; unit 0 is common to all units.
-        let suffix = unit.arg(1).and_then(|n| n.strip_prefix(base)).unwrap_or("");
-        let mut parts = suffix.trim_start_matches('_').split('_');
-        let (u, style) = (
-            parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
-            parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1),
-        );
-        if u > 1 {
-            extra_units = true;
-            continue;
-        }
-        if style > 1 {
+        let (u, style) = unit_and_style(unit, base);
+        if (u != 0 && u != wanted) || style > 1 {
             continue;
         }
         for g in unit.items() {
@@ -325,9 +367,6 @@ fn convert(
                 _ => {}
             }
         }
-    }
-    if extra_units {
-        warnings.push(format!("{name}: only the first unit was imported"));
     }
     if graphics.is_empty() && pins.is_empty() {
         return Err(Error::Format("the symbol draws nothing".into()));
@@ -436,15 +475,23 @@ mod tests {
     #[test]
     fn reads_units_pins_graphics_and_derived_symbols() -> Result<()> {
         let (syms, warnings) = symbols(LIB, "kicad.relays", 1.0)?;
-        assert_eq!(syms.len(), 2, "{warnings:?}");
+        // Two units each for the relay and the derived 24 V relay.
+        assert_eq!(syms.len(), 4, "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("Orphan")), "{warnings:?}");
         assert!(
-            warnings.iter().any(|w| w.contains("only the first unit")),
+            !warnings.iter().any(|w| w.contains("only the first unit")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Relay_Coil:") && w.contains("alternate body styles")),
             "{warnings:?}"
         );
         let coil = &syms[0].symbol;
-        assert_eq!(coil.id, "kicad.relays.relay_coil");
-        assert_eq!(coil.name, "Relay Coil");
+        assert_eq!(syms[0].kicad_name, "Relay_Coil_A");
+        assert_eq!(coil.id, "kicad.relays.relay_coil_a");
+        assert_eq!(coil.name, "Relay Coil A");
         assert_eq!(coil.letter_code, "K");
         assert_eq!(coil.description, "Relay coil, \"generic\"");
         // Pin A1 at the top is the origin; A2 is 7.62 mm below it; the hidden pin is left out.
@@ -494,10 +541,41 @@ mod tests {
             a: Point::new(0.0, 0.0),
             b: Point::new(0.0, 2.54)
         }));
-        let derived = &syms[1].symbol;
-        assert_eq!(derived.id, "kicad.relays.relay_coil_24v");
+        // Unit B: the common drawing with its own pin only.
+        let contacts = &syms[1].symbol;
+        assert_eq!(contacts.id, "kicad.relays.relay_coil_b");
+        let names: Vec<&str> = contacts.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["8"]);
+        assert!(
+            contacts
+                .graphics
+                .iter()
+                .any(|g| matches!(g, Shape::Circle { filled: true, .. }))
+        );
+        let derived = &syms[2].symbol;
+        assert_eq!(derived.id, "kicad.relays.relay_coil_24v_a");
         assert_eq!(derived.description, "24 V coil");
         assert_eq!(derived.pins.len(), 2);
+        assert_eq!(syms[3].symbol.id, "kicad.relays.relay_coil_24v_b");
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_unit_keeps_its_name_and_unit_letters_count_like_kicad() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "Fuse" (property "Reference" "F" (at 0 0 0))
+    (symbol "Fuse_0_1" (rectangle (start -1 2) (end 1 -2)))
+    (symbol "Fuse_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "1"))
+                       (pin passive line (at 0 -3 90) (length 1) (name "~") (number "2")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].symbol.id, "k.fuse");
+        assert_eq!(syms[0].kicad_name, "Fuse");
+        assert_eq!(
+            [1, 2, 26, 27, 28, 52, 53].map(unit_letter),
+            ["A", "B", "Z", "AA", "AB", "AZ", "BA"]
+        );
         Ok(())
     }
 

@@ -15,7 +15,7 @@ From `crates/wc-import`:
 | Format | Module | Notes |
 |---|---|---|
 | ASCII DXF | `dxf` | Symbols and whole drawings, from the entities LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, LWPOLYLINE, POLYLINE, TEXT, MTEXT, POINT and INSERT. Ellipses and splines become polylines through sampled points; a solid hatch becomes a filled outline, a patterned one its outline. Other entities (for example 3DFACE, SOLID, IMAGE) are skipped, with one warning per kind. Binary DXF and DWG are **not** read. |
-| KiCad symbol libraries (`.kicad_sym`, KiCad 6+) | `kicad` | Graphics and visible pins of the common unit and the first unit (body style 1) become a WiringCraft symbol. Later units are skipped with a warning; alternate body styles and hidden pins are left out without one. |
+| KiCad symbol libraries (`.kicad_sym`, KiCad 6+) | `kicad` | Graphics and visible pins of the common unit plus each unit (body style 1) become one WiringCraft symbol per unit: a single-unit symbol keeps its name, a multi-unit one becomes `<name>_A`, `<name>_B`, ... (a relay's coil and contacts), each with the common unit's graphics and pins. Alternate body styles are skipped with a warning; hidden pins are left out. |
 | QElectroTech elements (`.elmt`) | `qet` | `wiringcraft import symbol-qet <files> --lib <folder>`: lines, rectangles, circles, ellipses, arcs, polygons and static texts become graphics (ellipses and elliptic arcs as polylines); terminals become pins with their direction; the label's place becomes the tag place; `link_type` sets the role (master, slave, terminal, report). 10 px of QElectroTech is 5 mm by default (`--scale`). Unknown items are counted in a warning. |
 | SVG | `svg` | Graphics. |
 | PDF (vector) | `pdf` | Traced drawings. |
@@ -25,7 +25,7 @@ From `crates/wc-import`:
 | AutomationML (IEC 62714, CAEX XML) | `aml` | Devices, properties, connection points, links. |
 | EPLAN P8 projects (`.elk` + `.edb`) | `eplan` | Projects. Parts from EDZ files: see `edz` above. |
 | SolidWorks Electrical archives (`.tewzip`) | `swe` | Projects. Content Portal parts also arrive as `.tewzip`; `import swe-library` reads their parts, cable types and symbol blocks (blocks as placeholder boxes with their connection points; the original graphics need the DWG reader, #59). |
-| Plain zip | `archive` | Opens the container and imports PDF, DXF, AutomationML and CSV entries inside. Other entries (including `.kicad_sym`) are listed, not imported. |
+| Plain zip | `archive` | Opens the container and imports PDF, DXF and AutomationML entries inside; `.kicad_sym` entries go through the KiCad importer into the folder given with `--lib` (listed with a warning without it). Other entries are listed, not imported. |
 
 Not read today: EPLAN macros inside EDZ files (#144), **DWG**, **STEP** (3D), ECLASS data
 outside a BMEcat catalogue.
