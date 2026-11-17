@@ -894,7 +894,11 @@ impl App {
         // Log it first: once taken, the frame's own logging never sees it.
         self.log_messages();
         match self.dialog.take() {
-            Some(Dialog::Message(m)) => Some(m),
+            Some(Dialog::Message(m)) => {
+                // Closed now, so the same message is logged again the next time it shows.
+                self.logged.1.clear();
+                Some(m)
+            }
             other => {
                 self.dialog = other;
                 None
@@ -2044,8 +2048,13 @@ mod tests {
     fn a_taken_message_was_logged_first() {
         let (_tmp, mut a) = app(vec![]);
         a.dialog = Some(Dialog::Message("Export failed".into()));
+        // `take_message` logs before taking: nothing is left for the frame to log, and the same
+        // message shown again is new.
         assert_eq!(a.take_message().as_deref(), Some("Export failed"));
-        assert_eq!(a.logged.1, "Export failed");
+        assert!(a.new_messages().is_empty(), "it was logged when taken");
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        let again = a.new_messages();
+        assert_eq!(again.len(), 1, "a second occurrence is logged too");
     }
 
     #[test]

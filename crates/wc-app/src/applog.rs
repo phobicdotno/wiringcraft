@@ -88,10 +88,12 @@ impl Logger {
             Ok(()) => self.error = None,
             Err(e) => {
                 let reason = format!("{}: {e}", self.dir.display());
-                if self.error.as_deref() != Some(reason.as_str()) {
-                    eprintln!("WiringCraft could not write its log in {reason}");
-                }
+                let new = self.error.as_deref() != Some(reason.as_str());
                 self.error = Some(reason);
+                if new && let Some(r) = &self.error {
+                    // `eprintln!` would panic if stderr is gone; a failed note is ignored.
+                    let _ = writeln!(std::io::stderr(), "WiringCraft could not write its log in {r}");
+                }
             }
         }
     }
