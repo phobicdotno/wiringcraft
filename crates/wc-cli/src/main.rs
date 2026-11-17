@@ -471,7 +471,8 @@ enum ImportCmd {
     /// A SolidWorks Electrical project archive (.tewzip) or project database
     /// (tew_project_data.sqlite): its schematic and line-diagram pages, symbols as boxes with
     /// their connection points at the original positions, wires joined to them, and devices with
-    /// part data. Symbol graphics (DWG) are not read.
+    /// part data, linked to the archive catalog's part when it has it. Symbol graphics (DWG) are
+    /// not read.
     Swe {
         path: PathBuf,
         /// Which project of the archive, counted from 1 (archives can hold several).
@@ -486,6 +487,15 @@ enum ImportCmd {
         /// the pins sit where the block's points are; the rest are drawn as boxes.
         #[arg(long)]
         symbol_map: Option<PathBuf>,
+    },
+    /// The libraries of a SolidWorks Electrical archive (.tewzip): catalog parts with their
+    /// terminals, cable types with their cores, and symbol blocks as box symbols with their
+    /// connection points. Into a library folder with --lib, else vendored into the project.
+    SweLibrary {
+        path: PathBuf,
+        /// A library folder to write into instead of the project.
+        #[arg(long)]
+        lib: Option<PathBuf>,
     },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
     Aml {
@@ -1559,10 +1569,30 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             for w in &choice.2 {
                 eprintln!("warning: {w}");
             }
-            let (built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);
+            let (mut built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);
             for w in sw.warnings.iter().chain(&warnings) {
                 eprintln!("warning: {w}");
             }
+            // Devices whose part the archive's catalog has are linked to it; the part comes along.
+            let linked = if is_db {
+                None
+            } else {
+                let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
+                match wc_import::swe::library::from_archive(file) {
+                    Ok(lib) => {
+                        // Why a catalog row was left out, so a device it would have matched is
+                        // not left unlinked without a reason.
+                        for w in &lib.warnings {
+                            eprintln!("warning: catalog: {w}");
+                        }
+                        Some(wc_import::swe::library::link_parts(&mut built, &lib.parts))
+                    }
+                    Err(x) => {
+                        eprintln!("warning: devices keep their part numbers as text: {x}");
+                        None
+                    }
+                }
+            };
             let source = format!(
                 "import:{}",
                 path.file_name()
@@ -1578,10 +1608,32 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             for r in &report {
                 println!("{:<18} {:>8} {:>9}  {}", r.what, r.source, r.imported, r.note);
             }
+            if let Some(n) = linked {
+                println!("{n} device(s) and cable(s) linked to a part from the archive's catalog");
+            }
             println!(
                 "{n_sym} symbol shape(s) for the boxes; done in {} ms",
                 started.elapsed().as_millis()
             );
+        }
+        ImportCmd::SweLibrary { path, lib } => {
+            let source = format!(
+                "import:{}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+            let (report, warnings) = import_swe_library(dir, &path, lib.as_deref(), &source)?;
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+            for line in report.lines() {
+                println!("{line}");
+            }
+            match lib {
+                Some(lib) => println!("written to {}", lib.display()),
+                None => println!("vendored into the project"),
+            }
         }
         ImportCmd::Aml { file, first_page } => {
             let mut p = load(dir)?;
@@ -2031,6 +2083,39 @@ fn import_edz(file: &Path, lib: &Path) -> Res<(usize, wc_import::edz::Report, Ve
         wc_library::write_part(lib, p).map_err(e)?;
     }
     Ok((parts.len(), report, warnings))
+}
+
+/// Import a SolidWorks Electrical archive's libraries into a library folder, or vendor them into
+/// the project (pinned to `source`) when no folder is given. Returns the report and warnings.
+fn import_swe_library(
+    dir: &Path,
+    file: &Path,
+    lib: Option<&Path>,
+    source: &str,
+) -> Res<(wc_import::swe::library::LibraryReport, Vec<String>)> {
+    let reader = std::io::BufReader::new(std::fs::File::open(file).map_err(|x| format!("{}: {x}", file.display()))?);
+    let got = wc_import::swe::library::from_archive(reader).map_err(|x| format!("{}: {x}", file.display()))?;
+    match lib {
+        Some(lib) => {
+            for p in &got.parts {
+                wc_library::write_part(lib, p).map_err(e)?;
+            }
+            for s in &got.symbols {
+                wc_library::write_symbol(lib, s).map_err(e)?;
+            }
+        }
+        None => {
+            let mut p = load(dir)?;
+            let built = wc_import::aml::Built {
+                symbols: got.symbols,
+                parts: got.parts,
+                ..Default::default()
+            };
+            add_built(dir, &mut p, built, source)?;
+            save(dir, &p)?;
+        }
+    }
+    Ok((got.report, got.warnings))
 }
 
 /// Import QElectroTech elements into a symbol library folder, one symbol per file. A file that
@@ -2801,6 +2886,63 @@ mod tests {
             "no part file written"
         );
         assert_eq!(std::fs::read(dir.join("project.toml")).unwrap(), project_file);
+    }
+
+    #[test]
+    fn swe_libraries_land_in_a_library_folder_or_the_project() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = rusqlite::Connection::open_in_memory().unwrap();
+        catalog
+            .execute_batch(
+                "CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+                 INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');",
+            )
+            .unwrap();
+        let app = rusqlite::Connection::open_in_memory().unwrap();
+        app.execute_batch(
+            "CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT);
+             CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+             INSERT INTO tew_block VALUES (1, 'Coil');
+             INSERT INTO tew_blockpt VALUES (1, 'A1', 0, 5), (1, 'A2', 0, -5);",
+        )
+        .unwrap();
+        let file = tmp.path().join("plant.tewzip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            for (name, c) in [
+                ("Database/tew_catalog.sqlite", &catalog),
+                ("Database/tew_app_data.sqlite", &app),
+            ] {
+                z.start_file(name, opt).unwrap();
+                z.write_all(&c.serialize(rusqlite::MAIN_DB).unwrap()).unwrap();
+            }
+            z.finish().unwrap();
+        }
+        let lib = tmp.path().join("lib");
+        let args = [
+            "import",
+            "swe-library",
+            file.to_str().unwrap(),
+            "--lib",
+            lib.to_str().unwrap(),
+        ];
+        cli(tmp.path(), &args).unwrap();
+        assert!(lib.join("parts").join("maker-a.rly-24.json").exists());
+        assert!(lib.join("symbols").join("swe.lib.coil.json").exists());
+
+        // Without --lib the items are vendored into the project and pinned to the import.
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["import", "swe-library", file.to_str().unwrap()]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.lock.parts["maker-a.rly-24"].source, "import:plant.tewzip");
+        assert!(p.lock.symbols.contains_key("swe.lib.coil"));
+        assert!(store::read_vendored_part(&dir, "maker-a.rly-24").is_ok());
+
+        std::fs::write(&file, "not an archive").unwrap();
+        assert!(cli(&dir, &["import", "swe-library", file.to_str().unwrap()]).is_err());
     }
 
     #[test]

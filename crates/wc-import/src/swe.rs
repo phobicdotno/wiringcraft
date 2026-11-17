@@ -42,6 +42,8 @@ use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymb
 use crate::aml::Built;
 use crate::{Error, Result};
 
+pub mod library;
+
 /// `tew_file.fil_filetype` values (the product's `EwFileType`). Drawn as schematics: schematic
 /// sheet, line diagram, mixed schematic, P&ID, fluid. The others are folders, reports (bill of
 /// materials, terminal tables), cover pages, cabinet layouts and appendices.
