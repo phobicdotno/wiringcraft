@@ -159,6 +159,25 @@ fn arc_points(center: Point, r: f64, start: f64, end: f64) -> Vec<Point> {
         .collect()
 }
 
+/// Whether an outline turns the same way at every corner (straight corners do not count).
+fn convex(pts: &[Pos2]) -> bool {
+    let n = pts.len();
+    let mut sign = 0.0f32;
+    for i in 0..n {
+        let (a, b, c) = (pts[i], pts[(i + 1) % n], pts[(i + 2) % n]);
+        let t = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        if t.abs() < 1e-6 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = t.signum();
+        } else if t.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
 /// Triangles (vertex indexes) covering a simple polygon, by ear clipping. A polygon with a hole
 /// cut in along a bridge (its two sides on top of each other) comes out right too.
 fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
@@ -217,7 +236,10 @@ fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
         }
         Shape::Polyline { points, closed, filled } => {
             let pts: Vec<Pos2> = points.iter().map(|q| xf.s(*q)).collect();
-            if *filled {
+            if *filled && convex(&pts) {
+                p.add(EShape::convex_polygon(pts.clone(), stroke.color, Stroke::NONE));
+                p.add(EShape::closed_line(pts, stroke));
+            } else if *filled {
                 // egui fills only convex paths itself, so cut the outline into triangles.
                 let mut mesh = egui::Mesh::default();
                 for p in &pts {

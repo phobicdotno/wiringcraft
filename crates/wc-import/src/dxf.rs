@@ -548,7 +548,7 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
             pts = bulged(&vs, true);
         } else {
             let edges = cur.count(93);
-            for _ in 0..edges {
+            for edge in 0..edges {
                 let Some(kind) = cur.take(72) else { break };
                 let seg: Vec<(f64, f64)> = match kind as i64 {
                     1 => match (cur.point(10, 20), cur.point(11, 21)) {
@@ -605,9 +605,12 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                                 weights.push(w);
                             }
                         }
-                        // Fit points (R2010 and later): a count followed by the points or the
-                        // tangents. Older files go straight on; their 97 is the loop's own.
-                        let fit_follows = matches!(cur.codes.get(cur.i + 1), Some((11 | 12, _)));
+                        // Fit points (R2010 and later): a count, then the points or the tangents.
+                        // Older files have no count; a 97 there is the loop's own. Before
+                        // another edge a 97 can only be the count (often 0, with nothing after).
+                        let next_is_count = matches!(cur.codes.get(cur.i), Some((97, _)));
+                        let fit_follows = matches!(cur.codes.get(cur.i + 1), Some((11 | 12, _)))
+                            || (next_is_count && edge + 1 < edges);
                         let nf = if fit_follows { cur.count(97) } else { 0 };
                         let fit: Vec<(f64, f64)> = (0..nf).filter_map(|_| cur.point(11, 21)).collect();
                         let _ = (cur.point(12, 22), cur.point(13, 23));
@@ -674,6 +677,15 @@ fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
     odd
 }
 
+/// Whether segments p-q and c-d cross at a point inside both (touching at an end does not count).
+fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    let side = |a: (f64, f64), b: (f64, f64), x: (f64, f64)| (b.0 - a.0) * (x.1 - a.1) - (b.1 - a.1) * (x.0 - a.0);
+    let eps = 1e-12;
+    let (d1, d2) = (side(p, q, c), side(p, q, d));
+    let (d3, d4) = (side(c, d, p), side(c, d, q));
+    ((d1 > eps && d2 < -eps) || (d1 < -eps && d2 > eps)) && ((d3 > eps && d4 < -eps) || (d3 < -eps && d4 > eps))
+}
+
 /// The loops of a solid fill as outlines that fill right with the non-zero and even-odd rules
 /// alike: every loop inside an odd number of others is a hole, cut into the loop just around it
 /// along the shortest bridge, so one outline goes round the solid part and back round the hole.
@@ -703,16 +715,29 @@ fn with_holes(loops: Vec<Vec<(f64, f64)>>) -> Vec<Vec<(f64, f64)>> {
             continue;
         };
         let Some(o) = outer[host].as_mut() else { continue };
-        let mut best = (0, 0, f64::INFINITY);
+        // The shortest bridge from the hole to the outline that crosses no edge of the outline,
+        // of this hole or of any other loop.
+        let mut pairs: Vec<(f64, usize, usize)> = Vec::with_capacity(o.len() * lp.len());
         for (a, p) in o.iter().enumerate() {
             for (b, h) in lp.iter().enumerate() {
-                let d = (p.0 - h.0).hypot(p.1 - h.1);
-                if d < best.2 {
-                    best = (a, b, d);
-                }
+                pairs.push(((p.0 - h.0).hypot(p.1 - h.1), a, b));
             }
         }
-        let (a, b, _) = best;
+        pairs.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let edges_of = |l: &[(f64, f64)]| -> Vec<((f64, f64), (f64, f64))> {
+            (0..l.len()).map(|k| (l[k], l[(k + 1) % l.len()])).collect()
+        };
+        let mut walls = edges_of(o);
+        walls.extend(edges_of(&lp));
+        for (k, other) in loops.iter().enumerate() {
+            if k != i && k != host {
+                walls.extend(edges_of(other));
+            }
+        }
+        let clear = |p: (f64, f64), h: (f64, f64)| !walls.iter().any(|&(c, d)| crosses(p, h, c, d));
+        let Some(&(_, a, b)) = pairs.iter().find(|(_, a, b)| clear(o[*a], lp[*b])) else {
+            continue;
+        };
         let mut cut: Vec<(f64, f64)> = o[..=a].to_vec();
         cut.extend(lp[b..].iter().chain(&lp[..=b]));
         cut.extend(&o[a..]);
@@ -1245,6 +1270,83 @@ mod tests {
         assert!(
             near(*e.last().unwrap_or(&Point::new(0.0, 0.0)), Point::new(0.0, 2.5)),
             "{e:?}"
+        );
+        Ok(())
+    }
+
+    fn filled_area(lp: &[(f64, f64)]) -> f64 {
+        area2(lp).abs() / 2.0
+    }
+
+    #[test]
+    fn a_bridge_never_crosses_another_hole_or_the_outline() {
+        let sq = |x0: f64, y0: f64, x1: f64, y1: f64| vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+        // A small hole sits between the big hole's corner and the outline's corner.
+        let out = with_holes(vec![
+            sq(0.0, 0.0, 10.0, 10.0),
+            sq(3.0, 3.0, 9.0, 9.0),
+            sq(9.3, 9.3, 9.6, 9.6),
+        ]);
+        assert_eq!(out.len(), 1);
+        let want = 100.0 - 36.0 - 0.09;
+        assert!((filled_area(&out[0]) - want).abs() < 1e-9, "{}", filled_area(&out[0]));
+        // Every bridge leaves the hole without crossing any edge of the result.
+        let lp = &out[0];
+        let n = lp.len();
+        for i in 0..n {
+            for j in (i + 2)..n {
+                if i == 0 && j == n - 1 {
+                    continue;
+                }
+                assert!(
+                    !crosses(lp[i], lp[(i + 1) % n], lp[j], lp[(j + 1) % n]),
+                    "edges {i} and {j} cross"
+                );
+            }
+        }
+        // An outline with a slot: the hole must not bridge across the slot.
+        let slotted = vec![
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (5.5, 10.0),
+            (5.05, 6.0),
+            (5.5, 2.0),
+            (4.9, 2.0),
+            (4.9, 10.0),
+            (0.0, 10.0),
+        ];
+        let out = with_holes(vec![slotted.clone(), sq(4.6, 5.9, 4.8, 6.1)]);
+        let want = filled_area(&slotted) - 0.04;
+        assert!((filled_area(&out[0]) - want).abs() < 1e-9);
+        let lp = &out[0];
+        let n = lp.len();
+        for i in 0..n {
+            for j in (i + 2)..n {
+                if i == 0 && j == n - 1 {
+                    continue;
+                }
+                assert!(
+                    !crosses(lp[i], lp[(i + 1) % n], lp[j], lp[(j + 1) % n]),
+                    "edges {i} and {j} cross"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_spline_edge_with_no_fit_points_keeps_the_edges_after_it() -> Result<()> {
+        // R2010: spline edge with `97 0`, then two line edges closing the triangle.
+        let ents = "0\nHATCH\n2\nSOLID\n70\n1\n91\n1\n92\n1\n93\n3\n\
+            72\n4\n94\n1\n73\n0\n74\n0\n95\n4\n96\n2\n40\n0\n40\n0\n40\n1\n40\n1\n10\n0\n20\n0\n10\n10\n20\n0\n97\n0\n\
+            72\n1\n10\n10\n20\n0\n11\n5\n21\n5\n\
+            72\n1\n10\n5\n20\n5\n11\n0\n21\n0\n97\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        assert_eq!(g.len(), 1);
+        let (pts, _, _) = poly(&g[0]);
+        assert!(
+            pts.iter().any(|q| near(*q, Point::new(5.0, -5.0))),
+            "the line edges came in: {pts:?}"
         );
         Ok(())
     }
