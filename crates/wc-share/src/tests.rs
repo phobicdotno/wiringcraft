@@ -1020,3 +1020,89 @@ mod network {
         Ok(())
     }
 }
+
+/// Finding sessions on the network, with beacons sent to a browser on this computer.
+mod discovery {
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+
+    use super::TestResult;
+    use crate::discovery::{Announcer, Beacon, Browser, Session};
+    use crate::net::{Listener, connect};
+
+    const EVERY: Duration = Duration::from_millis(50);
+    const FORGET: Duration = Duration::from_millis(400);
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    fn beacon(project: &str, host: &str, port: u16) -> Beacon {
+        Beacon {
+            project: project.into(),
+            host: host.into(),
+            port,
+        }
+    }
+
+    /// Poll until `done` holds for the list, or fail after a while.
+    fn poll_until(b: &mut Browser, done: impl Fn(&[Session]) -> bool) -> std::result::Result<Vec<Session>, String> {
+        let start = Instant::now();
+        loop {
+            let list = b.poll().map_err(|e| e.to_string())?;
+            if done(&list) {
+                return Ok(list);
+            }
+            if start.elapsed() > PATIENCE {
+                return Err(format!("gave up waiting; last list {list:?}"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn two_announced_sessions_are_listed_and_a_stopped_one_is_forgotten() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let to = b.local_addr()?;
+        let pumps = Announcer::start_to(beacon("Pump station", "Ola", 7001), to, EVERY)?;
+        let mill = Announcer::start_to(beacon("Mill", "Kari", 7002), to, EVERY)?;
+        let list = poll_until(&mut b, |l| l.len() == 2)?;
+        assert_eq!(
+            list.iter()
+                .map(|s| (s.project.as_str(), s.host.as_str(), s.addr.port()))
+                .collect::<Vec<_>>(),
+            [("Mill", "Kari", 7002), ("Pump station", "Ola", 7001)]
+        );
+        assert!(
+            list.iter().all(|s| s.addr.ip().is_loopback()),
+            "joined at the sender's address"
+        );
+
+        mill.stop();
+        let list = poll_until(&mut b, |l| l.len() == 1)?;
+        assert_eq!(list[0].project, "Pump station", "the running one stays");
+        drop(pumps);
+        poll_until(&mut b, <[Session]>::is_empty)?;
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_is_heard_unless_sharing_was_turned_on_and_other_traffic_is_ignored() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let to = b.local_addr()?;
+        let other = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        other.send_to(b"hello", to)?;
+        other.send_to(br#"{"magic":"something-else","project":"x","host":"y","port":1}"#, to)?;
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(b.poll()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn joining_by_a_typed_address_works_without_discovery() -> TestResult {
+        let l = Listener::bind("127.0.0.1:0")?;
+        let port = l.local_addr()?.port();
+        // What a person types when the network passes no broadcasts.
+        let typed = format!(" 127.0.0.1:{port} ");
+        let addr: SocketAddr = typed.trim().parse()?;
+        assert!(connect(addr).is_ok());
+        Ok(())
+    }
+}
