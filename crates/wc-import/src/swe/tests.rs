@@ -982,13 +982,15 @@ fn imported_terminals_show_in_the_terminal_plan_per_strip() {
     let c = sample_with_strip();
     // A terminal whose number has a dot, and a wire record with only one end.
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (203, '3.1', '-X1-3.1', 4, 200, 3);
+        "INSERT INTO tew_component VALUES (203, '3.1', '-X1-3.1', 4, 200, 3), (204, '1+2', '-X1-1+2', 4, 200, 4);
          INSERT INTO tew_wire VALUES (84, NULL, -1, '', 60, 0, NULL, NULL);",
     )
     .unwrap();
     let (built, _, report) = build(&read(&c).unwrap(), None);
     assert!(
-        built.devices.contains_key(&DeviceTag::parse("-X1.3_1").unwrap()),
+        ["-X1.3_1", "-X1.1_2"]
+            .iter()
+            .all(|t| built.devices.contains_key(&DeviceTag::parse(t).unwrap())),
         "one level: {:?}",
         built.devices.keys()
     );
@@ -1076,6 +1078,17 @@ fn a_line_diagram_does_not_join_what_the_schematics_keep_apart() {
     .unwrap();
     let (built, _, report) = build(&read(&c).unwrap(), None);
     assert!(built.pages.iter().any(|p| p.overview), "the line diagram is imported");
+    // The line diagram draws X1.2 again; the terminal plan lists it once.
+    let mut project = wc_core::Project::new("t");
+    project.pages = built.pages.clone();
+    let symbols: BTreeMap<String, Symbol> = built.symbols.iter().map(|s| (s.id.clone(), s.clone())).collect();
+    let parts = BTreeMap::new();
+    let plan = wc_report::terminal_plan(&wc_report::Inputs {
+        project: &project,
+        symbols: &symbols,
+        parts: &parts,
+    });
+    assert_eq!(plan.rows.len(), 2, "{:?}", plan.rows);
     let ends = report
         .iter()
         .find(|c| c.what == "wire ends (from/to terminals)")

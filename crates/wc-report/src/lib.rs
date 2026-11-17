@@ -447,7 +447,8 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
         x: f64,
     }
     let mut terms: Vec<Term> = Vec::new();
-    for page in &i.project.pages {
+    // An overview (line diagram) draws terminals again; the plan lists each one once.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for s in &page.symbols {
             let Some(sym) = i.symbols.get(&s.symbol) else { continue };
             if sym.role != SymbolRole::Terminal {

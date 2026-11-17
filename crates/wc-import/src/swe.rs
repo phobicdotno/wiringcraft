@@ -863,6 +863,18 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     Ok(p)
 }
 
+/// A terminal number as one product level: letters, digits and `_` kept, everything else
+/// (`.`, `+`, `-`, `=`, spaces) becomes `_`, so `1.2` is `1_2` and `1+2` is `1_2`. `None` when
+/// nothing is left.
+fn terminal_level(name: &str) -> Option<String> {
+    let level: String = name
+        .trim()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    (!level.is_empty()).then_some(level)
+}
+
 /// A tag WiringCraft accepts, from a SolidWorks tag path (`=F1+L1+L3-K3`, or a bare `K3`):
 /// repeated aspects become levels (`+L1.L3`), other characters become `_`.
 pub fn device_tag(path: &str) -> Option<DeviceTag> {
@@ -1221,9 +1233,8 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         } else if let Some(strip) = strip_of(c) {
             // `-X1` and terminal 3 make `-X1.3`, whatever separator the source's tag path uses.
             // One level, whatever the number contains: `1.2` must not become a strip `-X1.1`.
-            let number = device_tag(&c.name)
-                .map(|n| n.product.join("_"))
-                .filter(|n| !n.is_empty());
+            // Cleaned as text, not parsed as a tag: `1+2` would otherwise lose `+2` as a location.
+            let number = terminal_level(&c.name);
             match (tags.get(&strip.id), number) {
                 (Some(strip_tag), Some(number)) => {
                     let mut t = strip_tag.clone();
