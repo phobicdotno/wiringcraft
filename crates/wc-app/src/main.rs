@@ -8,6 +8,7 @@ mod agent_panel;
 mod canvas;
 mod chrome;
 mod edit;
+mod feedback;
 mod icons;
 mod panel_view;
 mod panels;
@@ -97,6 +98,8 @@ struct App {
     applied_theme: theme::Mode,
     /// The AI assistant's conversation and panel.
     assistant: agent::Assistant,
+    /// A web page to open in the browser on the next frame.
+    open_url: Option<String>,
 }
 
 struct StatusView<'a> {
@@ -132,7 +135,10 @@ impl chrome::Status for StatusView<'_> {
             | Action::ToggleChrome
             | Action::ToggleTheme
             | Action::ToggleGrid
-            | Action::Assistant => true,
+            | Action::Assistant
+            | Action::ReportProblem
+            | Action::RequestFunction
+            | Action::ReportMissing => true,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
             Action::PageUp => has && self.ed.page > 0,
@@ -167,6 +173,7 @@ impl App {
             copied_text: None,
             applied_theme: prefs.theme,
             assistant: agent::Assistant::default(),
+            open_url: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -191,6 +198,17 @@ impl App {
 
     fn run(&mut self, a: Action) {
         let page = self.ed.page;
+        let kind = match a {
+            Action::ReportProblem => Some(feedback::Kind::Problem),
+            Action::RequestFunction => Some(feedback::Kind::Function),
+            Action::ReportMissing => Some(feedback::Kind::Missing),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            self.open_url = Some(feedback::form_url(kind, &feedback::Request::default()));
+            self.ed.message = "Opened the form on GitHub in your browser; what you send goes on the todo list.".into();
+            return;
+        }
         match a {
             Action::Open => {
                 let start = self
@@ -1509,6 +1527,9 @@ impl eframe::App for App {
             prefs: &self.prefs,
             clipboard: &self.clipboard,
         };
+        if let Some(url) = self.open_url.take() {
+            ctx.open_url(egui::OpenUrl::new_tab(url));
+        }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
         actions.extend(self.shortcuts(ctx));
         for a in actions {

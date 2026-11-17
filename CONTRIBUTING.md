@@ -5,6 +5,12 @@
 Work is tracked as GitHub issues with the `todo` label. Add one with the "Todo" issue form or
 `python tools/todo.py add "Title" --body "..."`.
 
+Users add to the same list. The "Something is broken", "Request a function" and "Something is
+missing" forms label what they send `todo`, the app's Help menu opens them, and the assistant
+files them through its `todo` tool when a user asks for something WiringCraft cannot do yet or
+when it hits a bug or a gap itself. Agents that finish a todo file what they found missing on the
+way as new todos, so the list keeps the app growing toward what people use it for.
+
 ## Claim before you start
 
 A todo is claimed before anyone works on it, so two people or agents never build the same thing.

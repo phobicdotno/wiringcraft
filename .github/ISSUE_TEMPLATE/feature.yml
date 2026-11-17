@@ -1,0 +1,21 @@
+name: Request a function
+description: Something WiringCraft should be able to do. It goes on the todo list and is built in turn.
+labels: [todo, enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: What you want to be able to do, in plain words, and why it helps.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: How you would use it, or how another tool does it (described in your own words; no screenshots of other products' symbols or templates).
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: How anyone can check it is finished (a test, a command, what a user sees).
