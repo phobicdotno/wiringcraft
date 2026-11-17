@@ -777,10 +777,8 @@ fn select_tool(
     // styles for every selected wire.
     if resp.secondary_clicked()
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
-        && let Some(h @ Selection::Wire(_)) = open.hit(page, at, tol)
-        && !ed.is_selected(&h)
     {
-        ed.select_only(h);
+        right_clicked(ed, open.hit(page, at, tol));
     }
     if !selected_wires(ed).is_empty() {
         resp.context_menu(|ui| route_menu(ui, open, ed));
@@ -884,6 +882,17 @@ fn wired_note(n: usize) -> String {
         0 => String::new(),
         1 => " Connected 1 wire to pins that line up (hold Alt to skip).".into(),
         n => format!(" Connected {n} wires to pins that line up (hold Alt to skip)."),
+    }
+}
+
+/// A right-click on `hit`: a wire that is not selected becomes the only selection; a selected
+/// one keeps the selection it is part of, so the menu acts on all of it. Anything else leaves
+/// the selection alone.
+fn right_clicked(ed: &mut Editor, hit: Option<Selection>) {
+    if let Some(h @ Selection::Wire(_)) = hit
+        && !ed.is_selected(&h)
+    {
+        ed.select_only(h);
     }
 }
 
@@ -1148,6 +1157,23 @@ mod tests {
             from: Point::new(0.0, 0.0),
             checkpoint: true,
         });
+    }
+
+    #[test]
+    fn right_click_keeps_a_selection_it_is_part_of() {
+        let wire = |id: &str| Selection::Wire(id.into());
+        let mut ed = Editor {
+            selection: vec![wire("w1"), wire("w2")],
+            ..Editor::default()
+        };
+        right_clicked(&mut ed, Some(wire("w1")));
+        assert_eq!(ed.selection, [wire("w1"), wire("w2")]);
+        right_clicked(&mut ed, Some(Selection::Symbol("s1".into())));
+        right_clicked(&mut ed, None);
+        assert_eq!(ed.selection, [wire("w1"), wire("w2")], "only wires change it");
+        right_clicked(&mut ed, Some(wire("w3")));
+        assert_eq!(ed.selection, [wire("w3")]);
+        assert_eq!(selected_wires(&ed), ["w3"]);
     }
 
     #[test]
