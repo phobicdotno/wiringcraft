@@ -1,12 +1,13 @@
 //! Parts from BMEcat catalogues (XML, versions 1.2 and 2005).
 //!
 //! A catalogue has a `HEADER` (supplier, default language) and products: `PRODUCT` (2005) or
-//! `ARTICLE` (1.2) inside `T_NEW_CATALOG`, `T_UPDATE_PRODUCTS` or `T_UPDATE_PRICES`. Each one
+//! `ARTICLE` (1.2) inside `T_NEW_CATALOG` or `T_UPDATE_PRODUCTS` (`T_UPDATE_PRICES` only carries
+//! prices and is skipped with a warning). Each one
 //! carries the supplier's order number (`SUPPLIER_PID` / `SUPPLIER_AID`), details
 //! (`DESCRIPTION_SHORT`, `MANUFACTURER_NAME`, `MANUFACTURER_PID` / `MANUFACTURER_AID`,
 //! `INTERNATIONAL_PID` / `EAN`) and feature blocks (`PRODUCT_FEATURES` / `ARTICLE_FEATURES`)
-//! that name a classification such as ECLASS with its class and features (`FNAME`, `FVALUE`,
-//! `FUNIT`). Written from the published BMEcat specification; prices are not read.
+//! that name a classification such as ECLASS with its class and features (`FNAME` or
+//! `FT_IDREF`, `FVALUE`, `FUNIT`). Written from the published BMEcat specification; prices are not read.
 
 use std::collections::BTreeMap;
 
@@ -39,9 +40,11 @@ struct Product {
     classes: Vec<String>,
     /// Feature system name of the block being read.
     system: String,
-    features: Vec<(String, String)>,
-    /// The feature being read: name, values, unit.
+    /// (feature system, name, value)
+    features: Vec<(String, String, String)>,
+    /// The feature being read: name (or its reference id), values, unit.
     fname: String,
+    fidref: String,
     fvalues: Vec<String>,
     funit: String,
 }
@@ -56,6 +59,11 @@ fn pick<'a>(texts: &'a [(String, String)], lang: &str) -> Option<&'a str> {
         .map(|(_, t)| t.as_str())
 }
 
+/// Whether an `INTERNATIONAL_PID` type names a GTIN (EAN and UPC are GTINs too).
+fn is_gtin(kind: &str) -> bool {
+    kind.starts_with("gtin") || kind.starts_with("ean") || kind == "upc"
+}
+
 /// Read a BMEcat catalogue into parts. Returns the parts (sorted by id) and warnings.
 pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
     let mut reader = Reader::from_str(text);
@@ -68,7 +76,9 @@ pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
     let mut warnings = Vec::new();
     let mut count = 0usize;
     let mut deleted = 0usize;
+    let mut price_entries = 0usize;
     let mut lang_attr = String::new();
+    let mut type_attr = String::new();
     let mut text_buf = String::new();
 
     loop {
@@ -87,21 +97,31 @@ pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
                     }
                     seen_root = true;
                 }
-                let attr = |name: &str| {
-                    e.attributes()
-                        .flatten()
-                        .find(|a| a.key.local_name().as_ref() == name.as_bytes())
-                        .and_then(|a| a.unescape_value().ok())
-                        .map(|v| v.trim().to_owned())
-                        .unwrap_or_default()
+                let attr = |name: &str| -> Result<String> {
+                    for a in e.attributes() {
+                        let a = a.map_err(|err| Error::Format(format!("bad attribute in <{tag}>: {err}")))?;
+                        if a.key.local_name().as_ref() == name.as_bytes() {
+                            let v = a
+                                .unescape_value()
+                                .map_err(|err| Error::Format(format!("bad value of {name} in <{tag}>: {err}")))?;
+                            return Ok(v.trim().to_owned());
+                        }
+                    }
+                    Ok(String::new())
                 };
                 if matches!(tag.as_str(), "PRODUCT" | "ARTICLE") && product.is_none() {
-                    product = Some(Product {
-                        mode: attr("mode"),
-                        ..Default::default()
-                    });
+                    // Price updates carry no product details; reading them would blank parts.
+                    if path.iter().any(|t| t == "T_UPDATE_PRICES") {
+                        price_entries += 1;
+                    } else {
+                        product = Some(Product {
+                            mode: attr("mode")?,
+                            ..Default::default()
+                        });
+                    }
                 }
-                lang_attr = attr("lang");
+                lang_attr = attr("lang")?;
+                type_attr = attr("type")?.to_lowercase();
                 text_buf.clear();
                 path.push(tag);
             }
@@ -114,9 +134,11 @@ pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
                 }
             }
             Event::Text(t) => {
-                if let Ok(v) = t.unescape() {
-                    text_buf.push_str(&v);
-                }
+                let v = t.unescape().map_err(|e| {
+                    let at = path.last().map(String::as_str).unwrap_or("");
+                    Error::Format(format!("bad text in <{at}>: {e}"))
+                })?;
+                text_buf.push_str(&v);
             }
             Event::CData(t) => text_buf.push_str(&String::from_utf8_lossy(&t)),
             Event::End(_) => {
@@ -133,7 +155,9 @@ pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
                         }
                         "MANUFACTURER_NAME" => p.manufacturer = v,
                         "MANUFACTURER_PID" | "MANUFACTURER_AID" => p.manufacturer_pid = v,
-                        "INTERNATIONAL_PID" | "EAN" if p.gtin.is_empty() && !v.is_empty() => p.gtin = v,
+                        "INTERNATIONAL_PID" if p.gtin.is_empty() && !v.is_empty() && is_gtin(&type_attr) => p.gtin = v,
+                        // BMEcat 1.2 has a plain EAN element.
+                        "EAN" if p.gtin.is_empty() && !v.is_empty() => p.gtin = v,
                         "DESCRIPTION_SHORT" if !v.is_empty() => p.short.push((lang_attr.clone(), v)),
                         "DESCRIPTION_LONG" if !v.is_empty() => p.long.push((lang_attr.clone(), v)),
                         "REFERENCE_FEATURE_SYSTEM_NAME" => p.system = v,
@@ -148,10 +172,14 @@ pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
                             }
                         }
                         "FNAME" => p.fname = v,
+                        "FT_IDREF" => p.fidref = v,
                         "FVALUE" if !v.is_empty() => p.fvalues.push(v),
                         "FUNIT" => p.funit = v,
                         "FEATURE" => {
-                            let name = std::mem::take(&mut p.fname);
+                            let fname = std::mem::take(&mut p.fname);
+                            let fidref = std::mem::take(&mut p.fidref);
+                            // Without a name the feature id from the classification is the key.
+                            let name = if fname.is_empty() { fidref } else { fname };
                             let values = std::mem::take(&mut p.fvalues);
                             let unit = std::mem::take(&mut p.funit);
                             if !name.is_empty() && !values.is_empty() {
@@ -159,7 +187,7 @@ pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
                                 if !unit.is_empty() {
                                     value = format!("{value} {unit}");
                                 }
-                                p.features.push((name, value));
+                                p.features.push((p.system.clone(), name, value));
                             }
                         }
                         "PRODUCT_FEATURES" | "ARTICLE_FEATURES" => p.system.clear(),
@@ -197,6 +225,9 @@ pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
     if !path.is_empty() {
         return Err(Error::Format("the file ends inside an element".into()));
     }
+    if price_entries > 0 {
+        warnings.push(format!("{price_entries} price update(s) skipped, prices are not read"));
+    }
     if deleted > 0 {
         warnings.push(format!("{deleted} product(s) marked for deletion, skipped"));
     }
@@ -231,7 +262,6 @@ fn finish(
         p.manufacturer.clone()
     };
     let mut part = Part {
-        id: Part::make_id(&manufacturer, &order_number),
         manufacturer,
         description: pick(&p.short, language)
             .or_else(|| pick(&p.long, language))
@@ -240,13 +270,6 @@ fn finish(
         order_number,
         ..Default::default()
     };
-    if wc_core::store::check_id(&part.id).is_err() {
-        warnings.push(format!(
-            "product {n}: cannot make an id from {:?}, skipped",
-            part.order_number
-        ));
-        return;
-    }
     if !p.manufacturer_pid.is_empty() && p.manufacturer_pid != part.order_number {
         part.properties.insert(PROP_MANUFACTURER_PID.into(), p.manufacturer_pid);
     }
@@ -256,12 +279,22 @@ fn finish(
     if !p.classes.is_empty() {
         part.properties.insert(PROP_CLASS.into(), p.classes.join("; "));
     }
-    for (name, value) in p.features {
-        part.properties.insert(name, value);
+    for (system, name, value) in p.features {
+        // A name already taken (by our own keys or another system's feature) gets the system
+        // added, then a number, so no value is lost.
+        let mut key = name.clone();
+        if part.properties.contains_key(&key) && !system.is_empty() {
+            key = format!("{name} ({system})");
+        }
+        let base = key.clone();
+        let mut i = 2;
+        while part.properties.contains_key(&key) {
+            key = format!("{base} #{i}");
+            i += 1;
+        }
+        part.properties.insert(key, value);
     }
-    if out.insert(part.id.clone(), part).is_some() {
-        warnings.push(format!("product {n}: duplicate order number, the later product wins"));
-    }
+    crate::add_part(out, part, &format!("product {n}"), warnings);
 }
 
 #[cfg(test)]
@@ -391,5 +424,93 @@ mod tests {
             "<BMECAT><T_NEW_CATALOG><PRODUCT/><PRODUCT><SUPPLIER_PID>  </SUPPLIER_PID></PRODUCT></T_NEW_CATALOG></BMECAT>",
         );
         assert!(r.is_ok_and(|(p, w)| p.is_empty() && w.len() == 1), "");
+    }
+
+    #[test]
+    fn price_updates_do_not_blank_parts() -> Result<()> {
+        // A price-only transfer must not produce parts that would overwrite full ones.
+        let (parts, warnings) = parts(
+            "<BMECAT><HEADER><SUPPLIER><SUPPLIER_NAME>Acme</SUPPLIER_NAME></SUPPLIER></HEADER>\
+             <T_UPDATE_PRICES><PRODUCT mode=\"update\"><SUPPLIER_PID>K1</SUPPLIER_PID>\
+             <PRODUCT_PRICE_DETAILS/></PRODUCT><PRODUCT><SUPPLIER_PID>K2</SUPPLIER_PID></PRODUCT>\
+             </T_UPDATE_PRICES></BMECAT>",
+        )?;
+        assert!(parts.is_empty(), "{parts:?}");
+        assert_eq!(
+            warnings,
+            vec!["2 price update(s) skipped, prices are not read".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gtin_by_type_feature_references_and_name_collisions() -> Result<()> {
+        let (parts, warnings) = parts(
+            r#"<BMECAT><HEADER><SUPPLIER><SUPPLIER_NAME>Acme</SUPPLIER_NAME></SUPPLIER></HEADER>
+<T_NEW_CATALOG><PRODUCT><SUPPLIER_PID>K1</SUPPLIER_PID>
+  <PRODUCT_DETAILS>
+    <INTERNATIONAL_PID type="acme_internal">X-77</INTERNATIONAL_PID>
+    <INTERNATIONAL_PID type="GTIN">4017918186722</INTERNATIONAL_PID>
+  </PRODUCT_DETAILS>
+  <PRODUCT_FEATURES>
+    <REFERENCE_FEATURE_SYSTEM_NAME>ECLASS-11.0</REFERENCE_FEATURE_SYSTEM_NAME>
+    <FEATURE><FT_IDREF>BAF016001</FT_IDREF><FVALUE>240</FVALUE></FEATURE>
+    <FEATURE><FNAME>Width</FNAME><FVALUE>5.2</FVALUE><FUNIT>mm</FUNIT></FEATURE>
+    <FEATURE><FNAME>GTIN</FNAME><FVALUE>bogus</FVALUE></FEATURE>
+  </PRODUCT_FEATURES>
+  <PRODUCT_FEATURES>
+    <REFERENCE_FEATURE_SYSTEM_NAME>ETIM-8.0</REFERENCE_FEATURE_SYSTEM_NAME>
+    <FEATURE><FNAME>Width</FNAME><FVALUE>5</FVALUE><FUNIT>mm</FUNIT></FEATURE>
+  </PRODUCT_FEATURES>
+</PRODUCT></T_NEW_CATALOG></BMECAT>"#,
+        )?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let [p] = parts.as_slice() else {
+            return Err(Error::Format(format!("{parts:?}")));
+        };
+        let props: Vec<(&str, &str)> = p.properties.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            props,
+            vec![
+                ("BAF016001", "240"),
+                ("GTIN", "4017918186722"),
+                ("GTIN (ECLASS-11.0)", "bogus"),
+                ("Width", "5.2 mm"),
+                ("Width (ETIM-8.0)", "5 mm"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bad_entities_and_attributes_are_errors_with_their_reason() {
+        let text = parts(
+            "<BMECAT><T_NEW_CATALOG><PRODUCT><SUPPLIER_PID>K1</SUPPLIER_PID>\
+             <DESCRIPTION_SHORT>Relay &bogus;</DESCRIPTION_SHORT></PRODUCT></T_NEW_CATALOG></BMECAT>",
+        );
+        assert!(
+            matches!(&text, Err(Error::Format(m)) if m.contains("DESCRIPTION_SHORT") && m.contains("bogus")),
+            "{text:?}"
+        );
+        let attr = parts(
+            "<BMECAT><T_NEW_CATALOG><PRODUCT><SUPPLIER_PID>K1</SUPPLIER_PID>\
+             <DESCRIPTION_SHORT lang=\"&nope;\">Relay</DESCRIPTION_SHORT></PRODUCT></T_NEW_CATALOG></BMECAT>",
+        );
+        assert!(
+            matches!(&attr, Err(Error::Format(m)) if m.contains("lang") && m.contains("nope")),
+            "{attr:?}"
+        );
+    }
+
+    #[test]
+    fn an_id_that_is_too_long_says_why() -> Result<()> {
+        let maker = "M".repeat(200);
+        let (parts, warnings) = parts(&format!(
+            "<BMECAT><T_NEW_CATALOG><PRODUCT><SUPPLIER_PID>K1</SUPPLIER_PID>\
+             <MANUFACTURER_NAME>{maker}</MANUFACTURER_NAME></PRODUCT></T_NEW_CATALOG></BMECAT>"
+        ))?;
+        assert!(parts.is_empty());
+        assert!(warnings.len() == 1 && warnings[0].contains("1-128"), "{warnings:?}");
+        Ok(())
     }
 }

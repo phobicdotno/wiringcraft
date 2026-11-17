@@ -135,18 +135,7 @@ pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
             warnings.push(format!("row {}: no order number, skipped", i + 2));
             continue;
         }
-        p.id = Part::make_id(&p.manufacturer, &p.order_number);
-        if wc_core::store::check_id(&p.id).is_err() {
-            warnings.push(format!(
-                "row {}: cannot make an id from {:?}, skipped",
-                i + 2,
-                p.order_number
-            ));
-            continue;
-        }
-        if out.insert(p.id.clone(), p).is_some() {
-            warnings.push(format!("row {}: duplicate part, the later row wins", i + 2));
-        }
+        crate::add_part(&mut out, p, &format!("row {}", i + 2), &mut warnings);
     }
     Ok((out.into_values().collect(), warnings))
 }
