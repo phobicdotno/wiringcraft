@@ -231,7 +231,10 @@ impl Open {
             .devices
             .values()
             .flat_map(|d| d.all_parts())
-            .filter_map(|(id, _)| {
+            .map(|(id, _)| id)
+            .collect::<std::collections::BTreeSet<&str>>()
+            .into_iter()
+            .filter_map(|id| {
                 store::read_vendored_part(&self.dir, id)
                     .ok()
                     .map(|p| (id.to_owned(), p))
