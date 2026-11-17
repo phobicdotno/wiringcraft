@@ -1,6 +1,6 @@
 //! Page layout: frame, column grid, title block, symbols, wires and cross-references.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::geom::{Align, Point, Shape};
 use wc_core::symbol::SymbolRole;
@@ -161,6 +161,17 @@ impl CrossRefs {
                     _ => {}
                 }
             }
+        }
+        // A contact points to its coil's first drawing: the detailed one on a schematic page,
+        // not a repeat on an overview page (line diagram) that may come first in page order.
+        let overview: BTreeSet<&str> = project
+            .pages
+            .iter()
+            .filter(|p| p.overview)
+            .map(|p| p.id.as_str())
+            .collect();
+        for list in x.mains.values_mut() {
+            list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
         }
         x
     }

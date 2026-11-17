@@ -771,3 +771,15 @@ fn a_fallback_net_name_never_takes_a_source_name() {
     assert_eq!(fallback_net(7, &taken), "net7_3");
     assert_eq!(fallback_net(8, &taken), "net8");
 }
+
+#[test]
+fn a_line_diagram_page_is_marked_as_an_overview() {
+    let c = sample();
+    c.execute_batch(
+        "INSERT INTO tew_file (fil_id, fil_orderno, fil_filetype, fil_title, fil_fol_id) VALUES (12, 3, 1, '02', 7);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    assert!(!page(&built, "01").overview, "a schematic page is not");
+    assert!(page(&built, "02").overview, "a line diagram is");
+}

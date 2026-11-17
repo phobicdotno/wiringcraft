@@ -396,3 +396,26 @@ fn panel_layouts_print_after_the_schematic_pages() {
         "Cabinet CAB1  ·  plate 600 x 800 mm  ·  scale 1:5  ·  1 device(s)"
     )));
 }
+
+#[test]
+fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let mut project = wc_core::Project::new("x");
+    // The line diagram comes first in page order, as in many imported projects.
+    let mut overview = Page::new("p1", "1", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    let mut schematic = Page::new("p2", "2", "Control");
+    schematic.symbols.push(place("s2", "coil", 50.0, "-K1"));
+    project.pages = vec![overview, schematic];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let tag = DeviceTag::parse("-K1").ok();
+    let mains = tag
+        .as_ref()
+        .and_then(|t| x.mains.get(t))
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let pages: Vec<&str> = mains.iter().map(|a| a.page_id.as_str()).collect();
+    assert_eq!(pages, ["p2", "p1"], "the schematic first, the overview still listed");
+}

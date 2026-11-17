@@ -20,6 +20,8 @@ pub struct Prefs {
     /// Light or dark interface.
     pub theme: crate::theme::Mode,
     pub show_grid: bool,
+    /// Draw wires between pins that line up when a symbol is placed or moved.
+    pub auto_wire: bool,
     /// Snap step in mm.
     pub snap: f64,
     pub recent: Vec<PathBuf>,
@@ -35,6 +37,7 @@ impl Default for Prefs {
             chrome: Chrome::Classic,
             theme: crate::theme::Mode::Light,
             show_grid: true,
+            auto_wire: true,
             snap: 2.5,
             recent: Vec::new(),
             show_assistant: false,
@@ -43,7 +46,7 @@ impl Default for Prefs {
     }
 }
 
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))

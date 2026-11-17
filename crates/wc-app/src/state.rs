@@ -360,6 +360,35 @@ impl Open {
         }
     }
 
+    /// Draw a wire between each pair of pins that line up or touch, for the symbols in `items`
+    /// (just placed or moved). Part of the caller's undo step: no checkpoint is taken here.
+    /// Returns how many wires were added.
+    pub fn auto_wire(&mut self, page: usize, items: &std::collections::BTreeSet<String>) -> usize {
+        let Some(pg) = self.project.pages.get(page) else {
+            return 0;
+        };
+        let pairs = wc_core::autowire::suggest(pg, |id| self.symbols.get(id), items);
+        let Some(pg) = self.project.pages.get_mut(page) else {
+            return 0;
+        };
+        for (from, to) in &pairs {
+            let id = pg.next_id("w");
+            pg.wires.push(Wire {
+                id,
+                from: from.clone(),
+                to: to.clone(),
+                via: Vec::new(),
+                number: None,
+                potential: None,
+                cable: None,
+            });
+        }
+        if !pairs.is_empty() {
+            self.dirty = true;
+        }
+        pairs.len()
+    }
+
     pub fn add_page(&mut self) -> usize {
         self.checkpoint();
         let id = self.free_page_id();
@@ -382,7 +411,14 @@ impl Open {
     }
 
     /// Change a page's number, title and size. A number another page already uses is refused.
-    pub fn set_page_props(&mut self, page: usize, number: &str, title: &str, size: PageSize) -> Result<usize, String> {
+    pub fn set_page_props(
+        &mut self,
+        page: usize,
+        number: &str,
+        title: &str,
+        size: PageSize,
+        overview: bool,
+    ) -> Result<usize, String> {
         let number = number.trim();
         if number.is_empty() {
             return Err("The page number cannot be empty.".into());
@@ -394,7 +430,7 @@ impl Open {
         if self.project.pages.iter().any(|p| p.number == number && p.id != id) {
             return Err(format!("Page {number} already exists."));
         }
-        if current.number == number && current.title == title && current.size == size {
+        if current.number == number && current.title == title && current.size == size && current.overview == overview {
             return Ok(page);
         }
         self.checkpoint();
@@ -402,6 +438,7 @@ impl Open {
             p.number = number.to_owned();
             p.title = title.trim().to_owned();
             p.size = size;
+            p.overview = overview;
         }
         self.project.sort_pages();
         Ok(self.index_of(&id))
@@ -696,6 +733,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn auto_wiring_is_part_of_the_placing_undo_step() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.contact.no", Point::new(50.0, 20.0)).unwrap();
+        let before = o.project.pages.clone();
+        let coil = o.place(page, "wc.coil", Point::new(50.0, 60.0)).unwrap();
+        let items = std::iter::once(coil.clone()).collect();
+        assert_eq!(o.auto_wire(page, &items), 1);
+        let w = &o.project.pages[page].wires[0];
+        assert_eq!(
+            (&w.from, &w.to),
+            (
+                &Endpoint::Pin {
+                    item: coil,
+                    pin: "A1".into()
+                },
+                &Endpoint::Pin {
+                    item: "s1".into(),
+                    pin: "14".into()
+                }
+            )
+        );
+        assert_eq!(o.auto_wire(page, &items), 0, "a wired pin is not wired again");
+        assert!(o.undo());
+        assert_eq!(o.project.pages, before, "one undo removes the symbol and its wire");
+    }
+
+    #[test]
     fn placing_vendors_the_symbol_and_tags_the_device() {
         let (_tmp, mut o) = project();
         assert!(o.library.iter().any(|(id, _)| id == "wc.coil"));
@@ -786,8 +851,9 @@ pub(crate) mod tests {
         let (_tmp, mut o) = project();
         assert_eq!(o.project.pages.len(), 2);
         // Renumbering resorts; a taken number is refused.
-        assert!(o.set_page_props(0, "2", "Cover", PageSize::A3).is_err());
-        let i = o.set_page_props(0, "10", "Cover sheet", PageSize::A4).unwrap();
+        assert!(o.set_page_props(0, "2", "Cover", PageSize::A3, false).is_err());
+        let i = o.set_page_props(0, "10", "Cover sheet", PageSize::A4, true).unwrap();
+        assert!(o.project.pages[i].overview);
         assert_eq!(i, 1);
         assert_eq!(o.project.pages[1].title, "Cover sheet");
         assert_eq!(o.project.pages[1].size, PageSize::A4);

@@ -15,6 +15,11 @@ body:
       label: Example
       description: How you would use it, or how another tool does it (described in your own words; no screenshots of other products' symbols or templates).
   - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Paste a screenshot of WiringCraft here (Ctrl+V, or Cmd+V on a Mac), or drag picture files in. Leave out anything private.
+  - type: textarea
     id: done
     attributes:
       label: Done when

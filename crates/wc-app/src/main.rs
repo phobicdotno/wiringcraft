@@ -5,6 +5,7 @@
 mod actions;
 mod agent;
 mod agent_panel;
+mod applog;
 mod canvas;
 mod chrome;
 mod edit;
@@ -13,6 +14,7 @@ mod icons;
 mod panel_view;
 mod panels;
 mod prefs;
+mod screenshot;
 mod state;
 mod theme;
 
@@ -52,6 +54,7 @@ enum Dialog {
         number: String,
         title: String,
         size: PageSize,
+        overview: bool,
         error: Option<String>,
     },
     DeletePage(usize),
@@ -70,6 +73,11 @@ enum Dialog {
     History(Vec<wc_vcs::subway::Row>),
     Library(Vec<wc_library::ItemStatus>),
     Message(String),
+    /// Help, Report a problem: the masked log to look at before anything is sent.
+    Report {
+        log: String,
+        include: bool,
+    },
     /// Name and description for a macro made from the copied selection.
     SaveMacro {
         clip: edit::Clipboard,
@@ -101,6 +109,8 @@ struct App {
     assistant: agent::Assistant,
     /// Web pages to open in the browser on the next frame.
     open_url: Vec<String>,
+    /// The last status message and message box written to the log, so each is logged once.
+    logged: (String, String),
 }
 
 struct StatusView<'a> {
@@ -121,6 +131,7 @@ impl chrome::Status for StatusView<'_> {
             Action::LineTool => self.ed.tool == Tool::Line,
             Action::RectTool => self.ed.tool == Tool::Rect,
             Action::ToggleGrid => self.prefs.show_grid,
+            Action::ToggleAutoWire => self.prefs.auto_wire,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
             Action::ToggleTheme => self.prefs.theme == theme::Mode::Dark,
             Action::Assistant => self.prefs.show_assistant,
@@ -136,6 +147,7 @@ impl chrome::Status for StatusView<'_> {
             | Action::ToggleChrome
             | Action::ToggleTheme
             | Action::ToggleGrid
+            | Action::ToggleAutoWire
             | Action::Assistant
             | Action::ReportProblem
             | Action::RequestFunction
@@ -175,6 +187,7 @@ impl App {
             applied_theme: prefs.theme,
             assistant: agent::Assistant::default(),
             open_url: Vec::new(),
+            logged: Default::default(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -193,14 +206,24 @@ impl App {
                 prefs.remember(dir.to_path_buf());
                 prefs.save();
             }
-            Err(e) => self.dialog = Some(Dialog::Message(format!("Could not open {}:\n{e}", dir.display()))),
+            Err(e) => {
+                applog::warn(&format!("could not open {}: {e}", dir.display()));
+                self.dialog = Some(Dialog::Message(format!("Could not open {}:\n{e}", dir.display())));
+            }
         }
     }
 
     fn run(&mut self, a: Action) {
         let page = self.ed.page;
+        applog::info(&format!("command {a:?}"));
+        if a == Action::ReportProblem {
+            self.dialog = Some(Dialog::Report {
+                log: applog::tail(REPORT_LOG_BYTES),
+                include: false,
+            });
+            return;
+        }
         let kind = match a {
-            Action::ReportProblem => Some(feedback::Kind::Problem),
             Action::RequestFunction => Some(feedback::Kind::Function),
             Action::ReportMissing => Some(feedback::Kind::Missing),
             _ => None,
@@ -249,6 +272,15 @@ impl App {
             Action::ToggleGrid => {
                 self.prefs.show_grid = !self.prefs.show_grid;
                 self.prefs.save();
+            }
+            Action::ToggleAutoWire => {
+                self.prefs.auto_wire = !self.prefs.auto_wire;
+                self.prefs.save();
+                self.ed.message = if self.prefs.auto_wire {
+                    "Auto-wiring is on: pins that line up get a wire (hold Alt to skip once).".into()
+                } else {
+                    "Auto-wiring is off.".into()
+                };
             }
             Action::Assistant => {
                 self.prefs.show_assistant = !self.prefs.show_assistant;
@@ -420,6 +452,7 @@ impl App {
                         number: p.number.clone(),
                         title: p.title.clone(),
                         size: p.size,
+                        overview: p.overview,
                         error: None,
                     });
                 }
@@ -605,6 +638,7 @@ impl App {
             Dialog::Message(_) => "WiringCraft",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
+            Dialog::Report { .. } => "Report a problem",
         };
         let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_));
         let screen = ctx.screen_rect();
@@ -697,6 +731,56 @@ impl App {
                     if ui.button("Close").clicked() {
                         keep = false;
                     }
+                }
+                Dialog::Report { log, include } => {
+                    ui.label(
+                        "This is WiringCraft's log of what happened recently. Home folders, keys, tokens, \
+                         email addresses and device tags are already hidden, and no drawing is in it. Messages \
+                         WiringCraft showed are in it and can name a page, so look it over first. Nothing is \
+                         sent unless you choose to.",
+                    );
+                    if let Some(e) = applog::error() {
+                        ui.colored_label(
+                            theme::Theme::of(ui.ctx()).error,
+                            format!("The log could not be written: {e}"),
+                        );
+                    }
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        let shown = if log.is_empty() {
+                            "(The log is empty.)"
+                        } else {
+                            log.as_str()
+                        };
+                        ui.add(egui::Label::new(RichText::new(shown).monospace().small()).wrap());
+                    });
+                    ui.checkbox(include, "Include this log in my report");
+                    ui.horizontal(|ui| {
+                        if ui.button("Open the report form").clicked() {
+                            let (request, copy) = report_request(log, *include);
+                            if let Some(copy) = copy {
+                                self.copied_text = Some(copy);
+                                self.ed.message = "The log is on the clipboard: paste it into the report if the \
+                                                   form shows only its end."
+                                    .into();
+                            }
+                            self.open_url
+                                .push(feedback::form_url(feedback::Kind::Problem, &request));
+                            applog::info(if *include {
+                                "report form opened with the log"
+                            } else {
+                                "report form opened without the log"
+                            });
+                            keep = false;
+                        }
+                        if let Some(dir) = applog::dir()
+                            && ui.button("Show the log folder").clicked()
+                        {
+                            self.open_url.push(format!("file://{}", dir.display()));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
                 }
                 Dialog::Message(m) => {
                     ui.label(m.as_str());
@@ -806,6 +890,7 @@ impl App {
                     number,
                     title,
                     size,
+                    overview,
                     error,
                 } => {
                     egui::Grid::new("pageprops")
@@ -827,6 +912,11 @@ impl App {
                                     }
                                 });
                             ui.end_row();
+                            ui.label("Overview");
+                            ui.checkbox(overview, "Line diagram").on_hover_text(
+                                "Shows devices again that schematic pages draw in detail. Its symbols do not count as drawings in the project check.",
+                            );
+                            ui.end_row();
                         });
                     if let Some(e) = error {
                         ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
@@ -835,7 +925,7 @@ impl App {
                         if ui.button("OK").clicked()
                             && let Some(o) = self.open.as_mut()
                         {
-                            match o.set_page_props(self.ed.page, number, title, *size) {
+                            match o.set_page_props(self.ed.page, number, title, *size, *overview) {
                                 Ok(i) => {
                                     self.ed.page = i;
                                     self.ed.view.fit = true;
@@ -1278,6 +1368,35 @@ fn size_label(s: PageSize) -> &'static str {
     }
 }
 
+/// The window and taskbar icon (assets/icon, made by tools/gen_icon.py), built into the
+/// program. An unreadable picture gives an empty icon, so the system default shows.
+fn window_icon() -> egui::IconData {
+    const PNG: &[u8] = include_bytes!("../../../assets/icon/wiringcraft-256.png");
+    image::load_from_memory_with_format(PNG, image::ImageFormat::Png)
+        .map(|img| {
+            let img = img.into_rgba8();
+            let (width, height) = img.dimensions();
+            egui::IconData {
+                rgba: img.into_raw(),
+                width,
+                height,
+            }
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("wiringcraft-app: the built-in icon could not be read ({e}); using the system default");
+            egui::IconData::default()
+        })
+}
+
+/// The main window: size, title and icon.
+fn main_viewport() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_inner_size([1400.0, 860.0])
+        .with_min_inner_size([900.0, 560.0])
+        .with_title("WiringCraft")
+        .with_icon(window_icon())
+}
+
 /// The starter symbol library: `library/` beside the executable or in the source tree.
 fn starter_library() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
@@ -1547,6 +1666,7 @@ impl eframe::App for App {
         for a in actions {
             self.run(a);
         }
+        self.log_messages();
         self.assistant_poll(ctx);
         if self.applied_theme != self.prefs.theme {
             theme::apply(ctx, self.prefs.theme);
@@ -1590,6 +1710,7 @@ impl eframe::App for App {
                     });
                 });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
+                self.ed.auto_wire = self.prefs.auto_wire;
                 canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
             });
         } else {
@@ -1695,6 +1816,65 @@ fn welcome(
     });
 }
 
+/// How much of the log a problem report shows and copies (GitHub takes about 65 000 characters).
+const REPORT_LOG_BYTES: usize = 60_000;
+/// How much of the log's end goes into the report form itself (the link has a size limit).
+const REPORT_FORM_BYTES: usize = 1_500;
+
+/// The report form's fields and the text for the clipboard: the log goes in only when the person
+/// chose to include it and there is one.
+fn report_request(log: &str, include: bool) -> (feedback::Request, Option<String>) {
+    let mut request = feedback::Request::default();
+    if include && !log.is_empty() {
+        request.detail = report_detail(log);
+        return (request, Some(log.to_owned()));
+    }
+    (request, None)
+}
+
+/// The "how to make it happen again" field of a report: the end of the log.
+fn report_detail(log: &str) -> String {
+    let mut start = log.len().saturating_sub(REPORT_FORM_BYTES);
+    while !log.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &log[start..];
+    let tail = if start > 0 {
+        tail.split_once('\n').map_or(tail, |(_, rest)| rest)
+    } else {
+        tail
+    };
+    format!("End of the WiringCraft log (paste the whole log from the clipboard if it helps):\n```\n{tail}```\n")
+}
+
+impl App {
+    /// Write new status messages and message boxes to the log, once each.
+    fn log_messages(&mut self) {
+        for (level, text) in self.new_messages() {
+            applog::log(level, &text);
+        }
+    }
+
+    /// Status messages and message boxes not logged yet. A message box is logged once while it
+    /// is open; after it closes, the same text is logged again the next time it shows.
+    fn new_messages(&mut self) -> Vec<(applog::Level, String)> {
+        let mut new = Vec::new();
+        if !self.ed.message.is_empty() && self.ed.message != self.logged.0 {
+            self.logged.0 = self.ed.message.clone();
+            new.push((applog::Level::Info, self.logged.0.clone()));
+        }
+        match &self.dialog {
+            Some(Dialog::Message(m)) if *m != self.logged.1 => {
+                self.logged.1 = m.clone();
+                new.push((applog::Level::Warn, m.clone()));
+            }
+            Some(Dialog::Message(_)) => {}
+            _ => self.logged.1.clear(),
+        }
+        new
+    }
+}
+
 fn main() -> eframe::Result {
     // Started by Claude Code as the assistant's MCP server: pass messages to the running app.
     let mut args = std::env::args_os();
@@ -1710,13 +1890,11 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    applog::init();
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let wanted = std::env::var(RENDERER_VAR).ok();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 860.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("WiringCraft"),
+        viewport: main_viewport(),
         renderer: renderer_for(wanted.as_deref()),
         ..Default::default()
     };
@@ -1851,5 +2029,21 @@ mod library_tests {
         let source = lib(t.path(), "source/library");
         assert_eq!(find_library(Some(&app), &source), Some(beside));
         assert_eq!(find_library(None, &source), Some(source));
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    #[test]
+    fn the_window_icon_is_built_in() {
+        let icon = super::window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
+
+    #[test]
+    fn the_main_window_carries_the_icon() {
+        let icon = super::main_viewport().icon;
+        assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
     }
 }
