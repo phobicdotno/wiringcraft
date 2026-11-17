@@ -1864,6 +1864,10 @@ fn export_drawings(open: &Open) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The last edit is done: jumpers follow their terminals before anything shows or copies them.
+        if let Some(o) = self.open.as_mut() {
+            o.follow_terminals();
+        }
         let status = StatusView {
             open: self.open.as_ref(),
             ed: &self.ed,

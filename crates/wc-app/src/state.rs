@@ -288,11 +288,8 @@ impl Open {
         let Some(before) = self.terminals_before.take() else {
             return false;
         };
-        if self.project.meta.jumpers.is_empty() {
-            return false;
-        }
-        let after = self.terminal_numbers();
-        self.project.meta.follow_terminals(&before, &after)
+        let symbols = &self.symbols;
+        wc_core::project::follow_terminals_in(&mut self.project, &before, |id| symbols.get(id).map(|s| s.role))
     }
 
     /// Forget the change in progress without following it: the project was replaced as a whole
@@ -327,6 +324,8 @@ impl Open {
     }
 
     pub fn undo(&mut self) -> bool {
+        // The change being undone is followed first, so redo brings it back whole.
+        self.follow_terminals();
         match self.undo.pop() {
             Some(prev) => {
                 self.forget_terminal_change();
@@ -340,6 +339,7 @@ impl Open {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.follow_terminals();
         match self.redo.pop() {
             Some(next) => {
                 self.forget_terminal_change();
@@ -618,6 +618,7 @@ impl Open {
     /// Number the wires by `rule`, keeping numbers already given. One undo step; nothing is
     /// recorded when no number changes.
     pub fn number_wires(&mut self, rule: wc_core::numbering::Rule) -> wc_core::numbering::Numbered {
+        self.follow_terminals();
         let mut project = self.project.clone();
         let symbols = &self.symbols;
         let done = wc_core::numbering::number_wires(
@@ -883,6 +884,7 @@ impl Open {
 
     /// Jumper terminals of a strip together, as one undo step. See [`ProjectMeta::add_jumper`].
     pub fn add_jumper(&mut self, strip: &DeviceTag, terminals: &[String]) -> Result<(), String> {
+        self.follow_terminals();
         let mut meta = self.project.meta.clone();
         meta.add_jumper(strip, terminals)?;
         if meta != self.project.meta {
@@ -902,6 +904,7 @@ impl Open {
 
     /// Take a terminal of a strip out of its jumper, as one undo step. Returns whether it was in one.
     pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        self.follow_terminals();
         let mut meta = self.project.meta.clone();
         if !meta.remove_from_jumper(strip, terminal) {
             return false;
@@ -1652,5 +1655,36 @@ pub(crate) mod tests {
         assert!(o.undo());
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
         assert!(!o.follow_terminals());
+    }
+
+    #[test]
+    fn redo_brings_back_a_followed_move_and_an_overview_page_keeps_its_jumpers() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            o.project.pages[page]
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == id)
+                .unwrap()
+                .tag = Some(x1.clone());
+            id
+        };
+        let (a, _b, _c) = (put(10.0), put(20.0), put(30.0));
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        o.checkpoint();
+        o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(40.0, 20.0);
+        // Undo right away (no checkpoint in between), then redo: the move comes back followed.
+        assert!(o.undo());
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+        assert!(o.redo());
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "3"]);
+        // Marking the page as an overview does not delete the jumper.
+        o.checkpoint();
+        o.project.pages[page].overview = true;
+        o.follow_terminals();
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "3"]);
     }
 }

@@ -550,12 +550,10 @@ fn save(dir: &Path, p: &Project) -> Res<()> {
     if !p.meta.jumpers.is_empty()
         && let Ok(old) = store::load(dir)
     {
-        let numbers = |q: &Project| {
-            let (symbols, _) = store::vendored_symbols(dir, q);
-            wc_core::project::terminal_numbers(q, |id| symbols.get(id).map(|s| s.role))
-        };
-        let (before, after) = (numbers(&old), numbers(&p));
-        p.meta.follow_terminals(&before, &after);
+        let (old_symbols, _) = store::vendored_symbols(dir, &old);
+        let before = wc_core::project::terminal_numbers(&old, |id| old_symbols.get(id).map(|s| s.role));
+        let (symbols, _) = store::vendored_symbols(dir, &p);
+        wc_core::project::follow_terminals_in(&mut p, &before, |id| symbols.get(id).map(|s| s.role));
     }
     store::save(dir, &p).map(|_| ()).map_err(e)
 }

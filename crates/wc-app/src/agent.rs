@@ -800,6 +800,10 @@ impl wc_agent::Tools for AppTools<'_> {
     }
 
     fn run(&mut self, name: &str, input: &Value) -> Result<String, String> {
+        // The previous tool's change is followed first, so this one sees the jumpers right.
+        if let Some(o) = self.0.open.as_mut() {
+            o.follow_terminals();
+        }
         let r = self.0.agent_tool(name, input);
         // Items the assistant removed must not stay selected.
         self.0.prune_selection();

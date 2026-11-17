@@ -242,7 +242,14 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
         let numbers = wc_core::project::terminal_numbers(p, role);
         for j in &p.meta.jumpers {
             for t in &j.terminals {
-                if !numbers.values().any(|(s, n)| *s == j.strip && n == t) {
+                let on_overview = || {
+                    p.pages.iter().filter(|pg| pg.overview).any(|pg| {
+                        pg.symbols
+                            .iter()
+                            .any(|s| s.tag.as_ref().and_then(|tag| j.terminal_of(tag)) == Some(t.as_str()))
+                    })
+                };
+                if !numbers.values().any(|(s, n)| *s == j.strip && n == t) && !on_overview() {
                     out.push(Finding {
                         severity: Severity::Warning,
                         page_id: None,
