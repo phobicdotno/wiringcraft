@@ -2900,6 +2900,16 @@ mod tests {
         assert_eq!(covers(&a), std::slice::from_ref(&new_id));
         a.open.as_mut().unwrap().undo();
         assert_eq!(covers(&a), ["p0002"]);
+        // Page content with `cover: true` on a normal page takes the mark from the cover page,
+        // and one undo gives it back.
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": new_id})).unwrap()).unwrap();
+        assert_eq!(content["cover"], json!(false));
+        content["cover"] = json!(true);
+        call(&mut a, "edit_page_json", json!({"page": new_id, "content": content})).unwrap();
+        assert_eq!(covers(&a), std::slice::from_ref(&new_id));
+        a.open.as_mut().unwrap().undo();
+        assert_eq!(covers(&a), ["p0002"]);
         // `cover: false` makes it a normal page.
         call(&mut a, "update_page", json!({"page": "p0002", "cover": false})).unwrap();
         assert!(covers(&a).is_empty());
