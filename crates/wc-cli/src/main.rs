@@ -439,14 +439,14 @@ enum ImportCmd {
         lib: PathBuf,
     },
     /// The open-format parts of another tool's project archive (PDF pages as trace pages,
-    /// DXF drawings as pages, AutomationML devices and connections, KiCad symbol libraries
-    /// into `--lib`).
+    /// DXF drawings as pages, AutomationML devices and connections, PLC address lists onto the
+    /// project's devices, KiCad symbol libraries and CSV parts lists into `--lib`).
     Archive {
         file: PathBuf,
         #[arg(long, default_value_t = 300)]
         first_page: usize,
-        /// Library folder for the symbols of `.kicad_sym` entries; without it they are listed,
-        /// not imported.
+        /// Library folder for the symbols of `.kicad_sym` entries and the parts of CSV parts
+        /// lists; without it they are listed, not imported.
         #[arg(long)]
         lib: Option<PathBuf>,
     },
@@ -1638,12 +1638,12 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let bytes = std::fs::read(&file).map_err(e)?;
             let entries = wc_import::archive::open_entries(
                 &bytes,
-                &[Kind::Pdf, Kind::Dxf, Kind::AutomationMl, Kind::KicadSymbols],
+                &[Kind::Pdf, Kind::Dxf, Kind::AutomationMl, Kind::KicadSymbols, Kind::Csv],
             )
             .map_err(e)?;
             if entries.is_empty() {
                 return Err(
-                    "no importable PDF, DXF, AutomationML or KiCad symbols inside; run `wiringcraft inspect` to see what is there"
+                    "no importable PDF, DXF, AutomationML, KiCad symbols or CSV lists inside; run `wiringcraft inspect` to see what is there"
                         .into(),
                 );
             }
@@ -1651,6 +1651,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let (symbols, entries): (Vec<_>, Vec<_>) = entries
                 .into_iter()
                 .partition(|(_, kind, _)| *kind == Kind::KicadSymbols);
+            // CSV lists come last, so PLC addresses reach devices that pages in the same archive add.
+            let (csvs, entries): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, kind, _)| *kind == Kind::Csv);
             // Two entries with the same file name would write the same ids over each other.
             let mut prefixes = std::collections::BTreeSet::new();
             for (name, _, data) in symbols {
@@ -1678,7 +1680,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     eprintln!("warning: {name}: {err}");
                 }
             }
-            if entries.is_empty() {
+            if entries.is_empty() && csvs.is_empty() {
                 return Ok(());
             }
             let tmp = std::env::temp_dir().join(format!("wiringcraft-archive-{}", std::process::id()));
@@ -1735,6 +1737,34 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     }
                 };
                 if let Err(err) = r {
+                    eprintln!("warning: {name}: {err}");
+                }
+            }
+            for (i, (name, _, data)) in csvs.into_iter().enumerate() {
+                println!("{name}:");
+                // Told apart by header, the same column names `plc-csv` and `parts-csv` read.
+                let path = tmp.join(format!("list-{i}.csv"));
+                let cmd = match wc_import::csv::kind(&wc_import::csv::decode(&data)) {
+                    Some(wc_import::csv::CsvKind::PlcAddresses) => ImportCmd::PlcCsv { file: path.clone() },
+                    Some(wc_import::csv::CsvKind::Parts) => match &lib {
+                        Some(lib) => ImportCmd::PartsCsv {
+                            file: path.clone(),
+                            lib: lib.clone(),
+                        },
+                        None => {
+                            eprintln!("warning: {name}: parts list, not imported: pass --lib <folder>");
+                            continue;
+                        }
+                    },
+                    None => {
+                        eprintln!(
+                            "warning: {name}: not a parts list (order number column) or PLC address list (device and address columns), skipped"
+                        );
+                        continue;
+                    }
+                };
+                std::fs::write(&path, &data).map_err(e)?;
+                if let Err(err) = import_cmd(dir, cmd) {
                     eprintln!("warning: {name}: {err}");
                 }
             }
@@ -3041,6 +3071,61 @@ mod tests {
         let a = std::fs::read_to_string(symbols.join("kicad.my_relays.k_a.json")).unwrap();
         assert!(a.contains("\"A1\""), "{a}");
         assert_eq!(kicad_prefix("a/b\\Std Relays.v2.kicad_sym"), "kicad.std_relays_v2");
+    }
+
+    #[test]
+    fn a_zip_with_csv_lists_imports_plc_addresses_and_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.devices.insert(DeviceTag::parse("-K1").unwrap(), Default::default());
+        save(&dir, &p).unwrap();
+        use std::io::Write;
+        let file = tmp.path().join("vendor.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            z.start_file("io/plc.csv", opt).unwrap();
+            z.write_all(b"Device;Address;Comment\r\n-K1;%I0.0;Start\r\n").unwrap();
+            z.start_file("parts.csv", opt).unwrap();
+            z.write_all(b"Manufacturer;Order number;Description\r\nAcme;R-24;Relay\r\n")
+                .unwrap();
+            z.start_file("notes.csv", opt).unwrap();
+            z.write_all(b"Name;Value\r\na;1\r\n").unwrap();
+            z.finish().unwrap();
+        }
+        let lib = tmp.path().join("lib");
+        // Without --lib the parts list is listed, not imported; the PLC list still applies.
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
+        assert!(!lib.exists());
+        let k1 = DeviceTag::parse("-K1").unwrap();
+        let dev = &load(&dir).unwrap().devices[&k1];
+        assert_eq!(dev.properties.get("Address").map(String::as_str), Some("%I0.0"));
+        assert_eq!(dev.description, "Start");
+        cli(
+            &dir,
+            &[
+                "import",
+                "archive",
+                file.to_str().unwrap(),
+                "--lib",
+                lib.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let parts: Vec<_> = std::fs::read_dir(lib.join("parts")).unwrap().collect();
+        assert_eq!(parts.len(), 1, "one part from parts.csv, nothing from notes.csv");
+        // A zip with only a list that neither reader takes still opens and imports nothing.
+        let only = tmp.path().join("only.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&only).unwrap());
+            z.start_file("notes.csv", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(b"Name;Value\r\na;1\r\n").unwrap();
+            z.finish().unwrap();
+        }
+        cli(&dir, &["import", "archive", only.to_str().unwrap()]).unwrap();
     }
 
     #[test]

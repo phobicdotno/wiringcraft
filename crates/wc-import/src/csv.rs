@@ -100,6 +100,31 @@ fn classify(h: &str) -> Col {
     }
 }
 
+/// What a CSV list holds, told from its header row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsvKind {
+    /// A device column and an address column: read with [`plc_addresses`].
+    PlcAddresses,
+    /// An order/part number column: read with [`parts`].
+    Parts,
+}
+
+/// Tell a PLC address list from a parts list by its header, the same column names the two
+/// readers accept. A header with both a device and an address column is a PLC list, even when
+/// it also names a type or article; `None` when neither reader would take the file.
+pub fn kind(text: &str) -> Option<CsvKind> {
+    let first_line = text.lines().next().unwrap_or("");
+    let header = records(first_line, guess_delimiter(first_line)).into_iter().next()?;
+    let plc: Vec<PlcCol> = header.iter().map(|h| classify_plc(h)).collect();
+    if plc.contains(&PlcCol::Tag) && plc.contains(&PlcCol::Address) {
+        return Some(CsvKind::PlcAddresses);
+    }
+    header
+        .iter()
+        .any(|h| classify(h) == Col::OrderNumber)
+        .then_some(CsvKind::Parts)
+}
+
 /// Parse a parts list. The first row is the header; columns are matched by name (several
 /// languages), anything unrecognised becomes a part property. Returns parts and warnings.
 pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
@@ -263,6 +288,20 @@ pub fn apply_plc_addresses(project: &mut Project, rows: &[PlcAddress]) -> PlcApp
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn kind_tells_plc_lists_from_parts_lists_by_header() {
+        assert_eq!(kind("Device;Address;Comment\n-K1;%I0.0;x"), Some(CsvKind::PlcAddresses));
+        // A PLC list that also names the type is still a PLC list.
+        assert_eq!(kind("Tag,Type,PLC address\n-K1,X,%Q0.1"), Some(CsvKind::PlcAddresses));
+        assert_eq!(
+            kind(&decode(b"\xEF\xBB\xBFHersteller;Artikelnummer\nSIE;3RT2015")),
+            Some(CsvKind::Parts)
+        );
+        assert_eq!(kind("Manufacturer,Order number\nABB,1SBL"), Some(CsvKind::Parts));
+        assert_eq!(kind("Name,Value\na,1"), None);
+        assert_eq!(kind(""), None);
+    }
     use super::*;
 
     #[test]
