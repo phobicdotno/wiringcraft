@@ -571,9 +571,15 @@ fn long_cover_table_labels_and_values_stay_in_their_columns() -> Result<(), Stri
 }
 
 #[test]
-fn helvetica_w_is_944_units_wide() {
-    let height = 10.0;
-    let expected = 944.0 / 1000.0 * (height / 0.72);
-    let measured = crate::writer::text_width_mm("W", height);
-    assert!((measured - expected).abs() < 1e-9, "W width {measured} mm");
+fn text_widths_are_helvetica_advance_widths() {
+    // Adobe Helvetica AFM: W 944, O 778, H 722, e 556, l 222, o 556, i 222, space 278.
+    let em_mm = |units: f64| units / 1000.0 * (10.0 / 0.72);
+    for (text, units) in [("W", 944.0), ("O", 778.0), ("Hello", 2278.0), ("i i", 722.0)] {
+        let measured = crate::writer::text_width_mm(text, 10.0);
+        assert!(
+            (measured - em_mm(units)).abs() < 1e-9,
+            "{text:?}: {measured} mm, want {} mm",
+            em_mm(units)
+        );
+    }
 }
