@@ -71,14 +71,26 @@ pub fn follow_terminals_in(
     }
     let mut after = terminal_numbers(project, role);
     for (key, was) in before {
-        let placed = project
+        // Only a page turned into an overview keeps its terminals' numbers; a symbol that is no
+        // longer a terminal leaves its jumper like a deleted one.
+        let on_overview = project
             .page(&key.0)
-            .is_some_and(|pg| pg.symbols.iter().any(|s| s.id == key.1));
-        if placed && !after.contains_key(key) {
+            .is_some_and(|pg| pg.overview && pg.symbols.iter().any(|s| s.id == key.1));
+        if on_overview && !after.contains_key(key) {
             after.insert(key.clone(), was.clone());
         }
     }
     project.meta.follow_terminals(before, &after)
+}
+
+/// Whether a placed symbol with `tag` and symbol `role` counts as a terminal: a terminal symbol,
+/// or a symbol of unknown role tagged with a terminal level (`-X1.4`).
+pub fn is_terminal(tag: &DeviceTag, role: Option<SymbolRole>) -> bool {
+    let terminal = match role {
+        Some(r) => r == SymbolRole::Terminal,
+        None => tag.product.len() > 1,
+    };
+    terminal && !tag.product.is_empty()
 }
 
 /// Which terminal of which strip each placed terminal is, keyed by (page id, symbol id).
@@ -100,11 +112,7 @@ pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolR
     for (pi, page) in project.pages.iter().enumerate().filter(|(_, p)| !p.overview) {
         for s in &page.symbols {
             let Some(tag) = &s.tag else { continue };
-            let terminal = match role(&s.symbol) {
-                Some(r) => r == SymbolRole::Terminal,
-                None => tag.product.len() > 1,
-            };
-            if !terminal || tag.product.is_empty() {
+            if !is_terminal(tag, role(&s.symbol)) {
                 continue;
             }
             let mut strip = tag.clone();

@@ -244,9 +244,12 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
             for t in &j.terminals {
                 let on_overview = || {
                     p.pages.iter().filter(|pg| pg.overview).any(|pg| {
-                        pg.symbols
-                            .iter()
-                            .any(|s| s.tag.as_ref().and_then(|tag| j.terminal_of(tag)) == Some(t.as_str()))
+                        pg.symbols.iter().any(|s| {
+                            s.tag.as_ref().is_some_and(|tag| {
+                                wc_core::project::is_terminal(tag, role(&s.symbol))
+                                    && j.terminal_of(tag) == Some(t.as_str())
+                            })
+                        })
                     })
                 };
                 if !numbers.values().any(|(s, n)| *s == j.strip && n == t) && !on_overview() {

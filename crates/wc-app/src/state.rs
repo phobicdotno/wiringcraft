@@ -289,7 +289,14 @@ impl Open {
             return false;
         };
         let symbols = &self.symbols;
-        wc_core::project::follow_terminals_in(&mut self.project, &before, |id| symbols.get(id).map(|s| s.role))
+        let changed =
+            wc_core::project::follow_terminals_in(&mut self.project, &before, |id| symbols.get(id).map(|s| s.role));
+        // Keep tracking: the next change before a checkpoint (the next frame of one drag) is
+        // measured from here. Without jumpers there is nothing to follow until the next one.
+        if !self.project.meta.jumpers.is_empty() {
+            self.terminals_before = Some(self.terminal_numbers());
+        }
+        changed
     }
 
     /// Forget the change in progress without following it: the project was replaced as a whole
@@ -1658,6 +1665,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_drag_followed_frame_by_frame_keeps_the_jumper() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        let (a, b, _c) = (put(10.0), put(20.0), put(30.0));
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        // One drag, one checkpoint, two frames: a passes b, then c.
+        o.checkpoint();
+        let mut to = |x: f64| {
+            o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(x, 20.0);
+            o.follow_terminals();
+        };
+        to(25.0);
+        to(40.0);
+        let n = o.terminal_numbers();
+        let num = |id: &str| n[&(o.project.pages[page].id.clone(), id.to_owned())].1.clone();
+        let mut want = vec![num(&a), num(&b)];
+        want.sort();
+        assert_eq!(o.project.meta.jumpers[0].terminals, want);
+    }
+
+    #[test]
+    fn a_terminal_turned_into_another_symbol_leaves_its_jumper() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        let (a, _b, _c, _d) = (put(10.0), put(20.0), put(30.0), put(40.0));
+        o.add_jumper(&x1, &["1".into(), "2".into(), "3".into()]).unwrap();
+        // a becomes a coil: b, c, d are now 1, 2, 3 and the jumper keeps b and c only.
+        o.checkpoint();
+        o.project.pages[page]
+            .symbols
+            .iter_mut()
+            .find(|s| s.id == a)
+            .unwrap()
+            .symbol = "wc.coil".into();
+        o.follow_terminals();
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
     fn an_edit_after_a_move_keeps_the_followed_jumper() {
         let (_tmp, mut o) = project();
         let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
@@ -1677,9 +1737,18 @@ pub(crate) mod tests {
         let x2 = DeviceTag::parse("-X2").unwrap();
         assert!(!o.remove_from_jumper(&x2, "1"));
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "3"]);
+        // An unnumbered wire, so numbering really replaces the project with its copy.
+        let k1 = o.place(page, "wc.coil", Point::new(20.0, 120.0)).unwrap();
+        let k2 = o.place(page, "wc.coil", Point::new(60.0, 160.0)).unwrap();
+        let pin = |item: &str, pin: &str| Endpoint::Pin {
+            item: item.into(),
+            pin: pin.into(),
+        };
+        o.add_wire(page, pin(&k1, "A2"), pin(&k2, "A1"), Vec::new());
         o.checkpoint();
         o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(5.0, 20.0);
-        o.number_wires(wc_core::numbering::Rule::Sequential);
+        assert!(o.number_wires(wc_core::numbering::Rule::Sequential).wires > 0);
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
         o.set_device_property(&x2, "note", "x");
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
     }

@@ -811,6 +811,10 @@ impl wc_agent::Tools for AppTools<'_> {
     }
 
     fn start(&mut self, name: &str, input: &Value) -> Started {
+        // As in `run`: the previous tool's change is followed before this one starts.
+        if let Some(o) = self.0.open.as_mut() {
+            o.follow_terminals();
+        }
         let r = self.0.agent_start(name, input);
         if matches!(r, Started::Done(_)) {
             self.0.prune_selection();
