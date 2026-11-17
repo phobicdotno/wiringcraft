@@ -21,7 +21,7 @@ mod tests;
 
 pub use aml::{AmlCounts, automationml};
 pub use check::{Finding, Severity, check, check_table};
-pub use marking::{MarkerKind, marking_list, parse_kinds, to_smartscript_csv};
+pub use marking::{MarkerKind, formula_warnings, marking_list, parse_kinds, to_smartscript_csv};
 pub use plc::{PlcVariables, plc_variables};
 
 /// A finished report: a title, column headings and rows of text.

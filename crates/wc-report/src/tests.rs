@@ -628,6 +628,28 @@ fn smartscript_csv_is_semicolon_separated_utf8_with_bom() {
 }
 
 #[test]
+fn wire_numbers_that_look_like_formulas_are_warned_about_and_kept() {
+    let t = Table {
+        title: "Marking list".into(),
+        columns: vec!["Type".into(), "Group".into(), "Marker".into(), "Count".into()],
+        rows: vec![
+            vec!["Terminal".into(), "-X1".into(), "-1".into(), "1".into()],
+            vec!["Wire".into(), String::new(), "=1".into(), "2".into()],
+            vec!["Wire".into(), String::new(), "@L1".into(), "2".into()],
+            vec!["Wire".into(), String::new(), "101".into(), "2".into()],
+            vec!["Device".into(), String::new(), "-K1".into(), "1".into()],
+            vec!["Cable".into(), "+C1".into(), "+C1-W1".into(), "2".into()],
+        ],
+        ..Default::default()
+    };
+    let w = formula_warnings(&t);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("\"=1\"") && w[0].contains("formula"), "{}", w[0]);
+    assert!(w[1].contains("\"@L1\""));
+    assert!(to_smartscript_csv(&t).contains("Wire;;=1;2"), "the marker text is kept");
+}
+
+#[test]
 fn a_cable_drawn_only_as_a_symbol_gets_its_markers() {
     let (mut p, s, parts) = fixture();
     p.pages[0].symbols.push(place("s9", "lamp", 200.0, Some("-W2")));

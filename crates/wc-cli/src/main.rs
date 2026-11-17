@@ -2156,7 +2156,7 @@ fn export_wago_marking(dir: &Path, out: &Path, kinds: &[String]) -> Res<Exported
     let kinds = wc_report::parse_kinds(kinds)?;
     let p = load(dir)?;
     let (symbols, missing) = store::vendored_symbols(dir, &p);
-    let warnings = missing
+    let mut warnings: Vec<String> = missing
         .iter()
         .map(|m| {
             format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals are not in the list")
@@ -2170,6 +2170,7 @@ fn export_wago_marking(dir: &Path, out: &Path, kinds: &[String]) -> Res<Exported
     };
     let t = wc_report::marking_list(&inputs, &kinds);
     std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+    warnings.extend(wc_report::formula_warnings(&t));
     Ok(Exported {
         markers: t.rows.len(),
         warnings,
@@ -3503,5 +3504,19 @@ mod tests {
             "{:?}",
             done.warnings
         );
+        assert!(!done.warnings.iter().any(|w| w.contains("formula")), "tags give none");
+
+        // A wire numbered like a formula is written as it is, with a warning.
+        let wire: wc_core::Wire = serde_json::from_str(
+            r#"{"id":"w1","from":{"at":{"x":1.0,"y":2.0}},"to":{"at":{"x":9.0,"y":2.0}},"number":"=1"}"#,
+        )
+        .unwrap();
+        p.pages[0].wires.push(wire);
+        store::save(&dir, &p).unwrap();
+        let done = export_wago_marking(&dir, &out, &["wires".into()]).unwrap();
+        assert!(std::fs::read_to_string(&out).unwrap().contains("Wire;;=1;2"));
+        let formula: Vec<&String> = done.warnings.iter().filter(|w| w.contains("formula")).collect();
+        assert_eq!(formula.len(), 1, "{:?}", done.warnings);
+        assert!(formula[0].contains("\"=1\""));
     }
 }

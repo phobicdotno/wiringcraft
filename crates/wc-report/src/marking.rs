@@ -188,6 +188,27 @@ fn is_cable_tag(tag: &DeviceTag) -> bool {
     })
 }
 
+/// Warnings for wire numbers in a marking list that a spreadsheet could run as a formula: those
+/// starting with `=`, `+`, `-` or `@` (CWE-1236). The file keeps them as they are, since
+/// smartScript prints the text on the marker; the warning lets the user change the number before
+/// opening the file in a spreadsheet. Device, cable and terminal markers are tags or numbers
+/// that start with these by design, so they give none.
+pub fn formula_warnings(t: &Table) -> Vec<String> {
+    t.rows
+        .iter()
+        .filter(|r| r.first().map(String::as_str) == Some(MarkerKind::Wires.label()))
+        .filter_map(|r| r.get(2))
+        .filter(|n| n.starts_with(['=', '+', '-', '@']))
+        .map(|n| {
+            format!(
+                "wire number {n:?} starts with {:?}: a spreadsheet opening the file may run it as a formula \
+                 (smartScript prints it as it is)",
+                &n[..1]
+            )
+        })
+        .collect()
+}
+
 /// The marker list as smartScript reads it: semicolon-separated UTF-8 with a byte-order mark,
 /// a header row and CRLF line ends. Fields are quoted when they contain `;`, `"` or a line end.
 pub fn to_smartscript_csv(t: &Table) -> String {
