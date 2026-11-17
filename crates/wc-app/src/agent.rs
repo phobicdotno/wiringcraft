@@ -1875,7 +1875,7 @@ impl App {
                     self.ed.message = format!("Filed {url}");
                     return Ok(format!("Filed on the todo list: {url}"));
                 }
-                self.open_url = Some(feedback::form_url(kind, &r));
+                self.open_url.push(feedback::form_url(kind, &r));
                 self.ed.message = "Opened a filled-in request on GitHub in your browser.".into();
                 Ok(
                     "Opened the filled-in form in the user's browser; it is on the todo list once they press Submit."
@@ -1991,7 +1991,7 @@ mod tests {
             copied_text: None,
             applied_theme: crate::theme::Mode::Light,
             assistant: Assistant::with_transport(Arc::new(Script(Mutex::new(answers)))),
-            open_url: None,
+            open_url: Vec::new(),
         };
         (tmp, app)
     }
@@ -2180,6 +2180,49 @@ mod tests {
 
     /// Runs when `WIRINGCRAFT_CLI` points at a built `wiringcraft` program.
     #[test]
+    fn todo_requests_open_the_filled_in_form_without_the_go_ahead() {
+        let (_tmp, mut a) = app(vec![]);
+        let out = call(
+            &mut a,
+            "todo",
+            json!({"action": "file", "kind": "missing", "title": "4-pole breaker symbol", "what": "No 4-pole breaker in the library"}),
+        )
+        .unwrap();
+        assert!(out.contains("browser"), "{out}");
+        // A second request in the same reply opens its own form too.
+        call(
+            &mut a,
+            "todo",
+            json!({"action": "file", "kind": "function", "title": "Cable plan per cabinet", "what": "Group the cable plan by cabinet"}),
+        )
+        .unwrap();
+        assert_eq!(a.open_url.len(), 2);
+        assert!(
+            a.open_url[0].contains("template=missing.yml&title=4-pole%20breaker%20symbol"),
+            "{:?}",
+            a.open_url
+        );
+        assert!(a.open_url[1].contains("template=feature.yml"), "{:?}", a.open_url);
+        assert!(
+            call(
+                &mut a,
+                "todo",
+                json!({"action": "file", "kind": "nope", "title": "x", "what": "y"})
+            )
+            .is_err()
+        );
+        assert!(
+            call(
+                &mut a,
+                "todo",
+                json!({"action": "file", "kind": "problem", "title": " ", "what": "y"})
+            )
+            .is_err()
+        );
+        assert!(call(&mut a, "todo", json!({"action": "other"})).is_err());
+    }
+
+    #[test]
     fn run_command_saves_runs_and_reloads() {
         if std::env::var_os("WIRINGCRAFT_CLI").is_none() {
             return;
@@ -2199,36 +2242,6 @@ mod tests {
         assert!(out.is_ok(), "{out:?}");
         assert_eq!(page2(&a).symbols.len(), 2, "the command's change is loaded back");
         let help = call(&mut a, "run_command", json!({"args": ["--help"]})).unwrap();
-
-        // A request without the user's go-ahead opens the filled-in form instead of filing it.
-        let out = call(
-            &mut a,
-            "todo",
-            json!({"action": "file", "kind": "missing", "title": "4-pole breaker symbol", "what": "No 4-pole breaker in the library"}),
-        )
-        .unwrap();
-        assert!(out.contains("browser"), "{out}");
-        let url = a.open_url.take().unwrap_or_default();
-        assert!(
-            url.contains("template=missing.yml&title=4-pole%20breaker%20symbol"),
-            "{url}"
-        );
-        assert!(
-            call(
-                &mut a,
-                "todo",
-                json!({"action": "file", "kind": "nope", "title": "x", "what": "y"})
-            )
-            .is_err()
-        );
-        assert!(
-            call(
-                &mut a,
-                "todo",
-                json!({"action": "file", "kind": "problem", "title": " ", "what": "y"})
-            )
-            .is_err()
-        );
         assert!(help.contains("plc-vars"));
     }
 }

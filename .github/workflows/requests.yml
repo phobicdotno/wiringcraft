@@ -1,0 +1,32 @@
+# Requests the WiringCraft assistant files go on the todo list. The assistant files them as the
+# user, who often has no write access, and GitHub drops labels such a user sets, so this adds them
+# from the marker the assistant writes at the end of the issue. The marker only picks from a fixed
+# set of labels; anyone can already add the same labels through the issue forms.
+name: Requests
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  label:
+    name: Label assistant requests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: contains(github.event.issue.body, '<!-- wiringcraft-request:')
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const kinds = { problem: ['todo', 'bug'], function: ['todo', 'enhancement'], missing: ['todo'] };
+            const m = /<!-- wiringcraft-request: (problem|function|missing) -->/.exec(context.payload.issue.body || '');
+            if (!m) return;
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              labels: kinds[m[1]],
+            });

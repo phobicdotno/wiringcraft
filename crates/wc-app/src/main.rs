@@ -98,8 +98,8 @@ struct App {
     applied_theme: theme::Mode,
     /// The AI assistant's conversation and panel.
     assistant: agent::Assistant,
-    /// A web page to open in the browser on the next frame.
-    open_url: Option<String>,
+    /// Web pages to open in the browser on the next frame.
+    open_url: Vec<String>,
 }
 
 struct StatusView<'a> {
@@ -173,7 +173,7 @@ impl App {
             copied_text: None,
             applied_theme: prefs.theme,
             assistant: agent::Assistant::default(),
-            open_url: None,
+            open_url: Vec::new(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -205,7 +205,8 @@ impl App {
             _ => None,
         };
         if let Some(kind) = kind {
-            self.open_url = Some(feedback::form_url(kind, &feedback::Request::default()));
+            self.open_url
+                .push(feedback::form_url(kind, &feedback::Request::default()));
             self.ed.message = "Opened the form on GitHub in your browser; what you send goes on the todo list.".into();
             return;
         }
@@ -1527,7 +1528,7 @@ impl eframe::App for App {
             prefs: &self.prefs,
             clipboard: &self.clipboard,
         };
-        if let Some(url) = self.open_url.take() {
+        for url in std::mem::take(&mut self.open_url) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);

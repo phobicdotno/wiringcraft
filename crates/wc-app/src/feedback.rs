@@ -7,7 +7,9 @@
 //! Submit. When the GitHub command line (`gh`) is installed and signed in and the person has
 //! agreed to the text, the assistant can file it directly.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub const REPO: &str = "phobicdotno/wiringcraft";
 
@@ -40,12 +42,12 @@ impl Kind {
         }
     }
 
-    /// The labels the form gives an issue.
-    fn labels(self) -> &'static str {
+    /// The word in an issue's request marker; `.github/workflows/requests.yml` labels by it.
+    fn marker(self) -> &'static str {
         match self {
-            Self::Problem => "todo,bug",
-            Self::Function => "todo,enhancement",
-            Self::Missing => "todo",
+            Self::Problem => "problem",
+            Self::Function => "function",
+            Self::Missing => "missing",
         }
     }
 
@@ -92,16 +94,25 @@ fn query_escape(s: &str) -> String {
     out
 }
 
-/// Longest text put in a form link, in characters per field; browsers refuse very long links.
-const MAX_FIELD: usize = 1500;
+/// Longest form link, in bytes. GitHub and some browsers refuse links much past 8 KB, so the
+/// fields are cut (whole characters) to keep the link under this.
+pub const MAX_URL: usize = 6000;
 
 /// The issue form in the browser, with the request filled in.
 pub fn form_url(kind: Kind, r: &Request) -> String {
     let mut url = format!("https://github.com/{REPO}/issues/new?template={}", kind.template());
     let mut put = |key: &str, value: &str| {
-        let v: String = value.trim().chars().take(MAX_FIELD).collect();
+        let room = MAX_URL.saturating_sub(url.len() + key.len() + 2);
+        let mut v = String::new();
+        for c in value.trim().chars() {
+            let e = query_escape(c.encode_utf8(&mut [0; 4]));
+            if v.len() + e.len() > room {
+                break;
+            }
+            v.push_str(&e);
+        }
         if !v.is_empty() {
-            url.push_str(&format!("&{key}={}", query_escape(&v)));
+            url.push_str(&format!("&{key}={v}"));
         }
     };
     put("title", &r.title);
@@ -138,19 +149,61 @@ pub fn body(kind: Kind, r: &Request) -> String {
     }
     section("Done when", &r.done);
     out.push_str("_Filed from the WiringCraft assistant._\n");
+    // The request workflow labels the issue from this, since GitHub drops labels set by
+    // someone without write access to the repository.
+    out.push_str(&format!("\n<!-- wiringcraft-request: {} -->\n", kind.marker()));
     out
 }
 
+/// How long a `gh` call may take before it is stopped, so a stalled network never holds the
+/// window for long.
+const GH_TIMEOUT: Duration = Duration::from_secs(20);
+
 fn gh(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("gh")
+    let mut child = Command::new("gh")
         .args(args)
         .env("GH_PROMPT_DISABLED", "1")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("The GitHub command line (gh) is not available: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    // Read the pipes on their own threads so a full pipe never stalls gh.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_string(&mut text);
+        }
+        text
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_string(&mut text);
+        }
+        text
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() < GH_TIMEOUT => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("gh did not answer within {} s.", GH_TIMEOUT.as_secs()));
+            }
+            Err(e) => return Err(format!("Waiting for gh failed: {e}")),
+        }
+    };
+    let out = out_reader.join().unwrap_or_default();
+    let err = err_reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(out)
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+        Err(err.trim().to_owned())
     }
 }
 
@@ -200,8 +253,6 @@ pub fn file(kind: Kind, r: &Request) -> Result<String, String> {
         r.title.trim(),
         "--body",
         &body,
-        "--label",
-        kind.labels(),
     ])?;
     Ok(out.trim().to_owned())
 }
@@ -234,15 +285,20 @@ mod tests {
             },
         );
         assert!(missing.ends_with("template=missing.yml&title=x"));
-        // Long text is cut so the link stays usable.
-        let long = form_url(
-            Kind::Missing,
-            &Request {
-                what: "a".repeat(10_000),
-                ..Request::default()
-            },
-        );
-        assert!(long.len() < 2_000);
+        // Long text is cut, by whole characters, so the link stays usable.
+        for filler in ["a", "界"] {
+            let long = form_url(
+                Kind::Problem,
+                &Request {
+                    title: filler.repeat(3000),
+                    what: filler.repeat(3000),
+                    detail: filler.repeat(3000),
+                    done: filler.repeat(3000),
+                },
+            );
+            assert!(long.len() <= MAX_URL, "{}", long.len());
+            assert!(long.contains("&title="));
+        }
     }
 
     #[test]
@@ -262,7 +318,7 @@ mod tests {
         );
         assert_eq!(
             b,
-            "### What is missing\n\nA 4-pole breaker symbol\n\n### Done when\n\nIt is in the library\n\n_Filed from the WiringCraft assistant._\n"
+            "### What is missing\n\nA 4-pole breaker symbol\n\n### Done when\n\nIt is in the library\n\n_Filed from the WiringCraft assistant._\n\n<!-- wiringcraft-request: missing -->\n"
         );
     }
 }
