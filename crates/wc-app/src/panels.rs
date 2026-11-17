@@ -142,11 +142,10 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
             .symbols
             .get(&s.symbol)
             .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal);
-        let Some(tag) = s.tag.clone().filter(|t| is_terminal && t.product.len() > 1) else {
+        let Some(tag) = s.tag.clone().filter(|_| is_terminal) else {
             return;
         };
-        let mut strip = tag.clone();
-        let Some(n) = strip.product.pop() else { return };
+        let (strip, Some(n)) = tag.terminal_parts() else { return };
         terms.push((strip, n, tag));
     }
     let Some((strip, number, tag)) = terms.first().cloned() else {
@@ -441,8 +440,35 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
                 ed.select_only(Selection::Symbol(item.clone()));
                 ed.view.fit = true;
             }
+            // A terminal's strip can have its markers exported on their own.
+            if let Some(strip) = terminal_strip_of(open, &tag, &uses) {
+                r.context_menu(|ui| {
+                    if ui.button(format!("Export markers of {strip}...")).clicked() {
+                        ed.marking_strip = Some(strip.clone());
+                        out.push(Action::ExportWagoMarking);
+                        ui.close_menu();
+                    }
+                });
+            }
         }
     });
+}
+
+/// The strip a terminal tag belongs to, named as the terminal plan names it (`-X1` of
+/// `-X1.3`; a terminal tagged with only its strip is that strip), or `None` when no use of the
+/// tag is a terminal.
+pub fn terminal_strip_of(open: &Open, tag: &DeviceTag, uses: &[(String, String)]) -> Option<String> {
+    let terminal = uses.iter().any(|(page, item)| {
+        open.project
+            .page(page)
+            .and_then(|p| p.symbol(item))
+            .and_then(|s| open.symbols.get(&s.symbol))
+            .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal)
+    });
+    if !terminal {
+        return None;
+    }
+    Some(tag.terminal_parts().0.to_string())
 }
 
 pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelState) {

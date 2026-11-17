@@ -105,6 +105,18 @@ enum Dialog {
     },
     /// Macros to insert.
     Macros(Vec<state::MacroEntry>),
+    /// WAGO smartScript marker export: which markers, the text lines of each, the language of
+    /// the header row, and optionally one terminal strip.
+    WagoMarking {
+        /// Terminals, wires, devices, cables (the order of [`wc_report::MarkerKind::ALL`]).
+        kinds: [bool; 4],
+        /// The first line, and up to two more.
+        lines: [Option<wc_report::LineField>; 3],
+        language: wc_report::Language,
+        strip: Option<String>,
+        /// The project's terminal strips, for the strip menu.
+        strips: Vec<String>,
+    },
 }
 
 /// Work a dialog asks for after it closes.
@@ -683,7 +695,10 @@ impl App {
             Action::InsertMacro => self.dialog = Some(Dialog::Macros(open.macros())),
             Action::ExportDrawings => self.dialog = Some(Dialog::Message(export_drawings(open))),
             Action::ExportAml => self.dialog = Some(Dialog::Message(export_aml(open))),
-            Action::ExportWagoMarking => self.dialog = Some(Dialog::Message(export_wago_marking(open))),
+            Action::ExportWagoMarking => {
+                let strip = self.ed.marking_strip.take();
+                self.dialog = Some(wago_marking_dialog(open, strip));
+            }
             Action::NumberWires => {
                 let done = open.number_wires(wc_core::numbering::Rule::PageColumn);
                 self.dialog = Some(Dialog::Message(done.report()));
@@ -857,6 +872,7 @@ impl App {
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
             Dialog::Report { .. } => "Report a problem",
+            Dialog::WagoMarking { .. } => "WAGO marking",
         };
         let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_));
         let screen = ctx.screen_rect();
@@ -1558,6 +1574,106 @@ impl App {
                         keep = false;
                     }
                 }
+                Dialog::WagoMarking {
+                    kinds,
+                    lines,
+                    language,
+                    strip,
+                    strips,
+                } => {
+                    use wc_report::{Language, LineField, MarkerKind};
+                    let field_label = |f: LineField| match f {
+                        LineField::Marker => "Marker text",
+                        LineField::Tag => "Tag",
+                        LineField::Description => "Description",
+                        LineField::Location => "Location",
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label("Markers");
+                        for (k, on) in MarkerKind::ALL.iter().zip(kinds.iter_mut()) {
+                            ui.checkbox(on, k.name());
+                        }
+                    });
+                    egui::Grid::new("wago-marking")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Terminal strip");
+                            egui::ComboBox::from_id_salt("wago-strip")
+                                .selected_text(strip.clone().unwrap_or_else(|| "All strips".into()))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(strip, None, "All strips");
+                                    for s in strips.iter() {
+                                        ui.selectable_value(strip, Some(s.clone()), s);
+                                    }
+                                });
+                            ui.end_row();
+                            // A line is offered only after a chosen one, so the columns stay
+                            // in order; clearing a line clears the ones after it.
+                            let mut open_line = true;
+                            for (n, line) in lines.iter_mut().enumerate() {
+                                if !open_line {
+                                    *line = None;
+                                }
+                                ui.label(format!("Line {}", n + 1));
+                                ui.add_enabled_ui(open_line, |ui| {
+                                    egui::ComboBox::from_id_salt(("wago-line", n))
+                                        .selected_text(line.map_or("(none)", field_label))
+                                        .show_ui(ui, |ui| {
+                                            if n > 0 {
+                                                ui.selectable_value(line, None, "(none)");
+                                            }
+                                            for f in LineField::ALL {
+                                                ui.selectable_value(line, Some(f), field_label(f));
+                                            }
+                                        });
+                                });
+                                open_line = line.is_some();
+                                ui.end_row();
+                            }
+                            ui.label("Language");
+                            egui::ComboBox::from_id_salt("wago-language")
+                                .selected_text(language.name())
+                                .show_ui(ui, |ui| {
+                                    for l in Language::ALL {
+                                        ui.selectable_value(language, l, l.name());
+                                    }
+                                });
+                            ui.end_row();
+                        });
+                    ui.weak(
+                        "The marker text is a device's Marker property when it has one, otherwise its tag. \
+                         With more than one line, smartScript maps the Line columns to the marker's lines.",
+                    );
+                    if strip.is_some() && kinds.iter().skip(1).any(|k| *k) {
+                        ui.weak("The strip limits the terminals; the other kinds are exported in full.");
+                    }
+                    let none = !kinds.iter().any(|k| *k);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!none, egui::Button::new("Export")).clicked() {
+                            let options = wc_report::MarkingOptions {
+                                kinds: MarkerKind::ALL
+                                    .into_iter()
+                                    .zip(kinds.iter())
+                                    .filter(|(_, on)| **on)
+                                    .map(|(k, _)| k)
+                                    .collect(),
+                                lines: chosen_lines(lines),
+                                language: *language,
+                                strip: strip.clone(),
+                            };
+                            then = Some(Box::new(move |app: &mut App| {
+                                if let Some(o) = app.open.as_ref() {
+                                    app.dialog = Some(Dialog::Message(export_wago_marking(o, &options)));
+                                }
+                            }));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::DeletePage(i) => {
                     let i = *i;
                     let what = self
@@ -2131,21 +2247,67 @@ fn export_aml(open: &Open) -> String {
     }
 }
 
-/// Every marker (terminals, wires, devices, cables) as a smartScript CSV in `export`.
-fn export_wago_marking(open: &Open) -> String {
-    let dir = open.dir.join("export");
-    let path = dir.join("wago-marking.csv");
+/// The marker lines chosen in the dialog, up to the first one left at (none): a later line never
+/// moves up into an empty one's column.
+fn chosen_lines(lines: &[Option<wc_report::LineField>]) -> Vec<wc_report::LineField> {
+    lines.iter().map_while(|l| *l).collect()
+}
+
+/// The WAGO marking dialog: every kind (only terminals when a strip is given), one marker line.
+fn wago_marking_dialog(open: &Open, strip: Option<String>) -> Dialog {
     let inputs = wc_report::Inputs {
         project: &open.project,
         symbols: &open.symbols,
         parts: &open.parts,
     };
-    let t = wc_report::marking_list(&inputs, &[]);
+    Dialog::WagoMarking {
+        kinds: if strip.is_some() {
+            [true, false, false, false]
+        } else {
+            [true; 4]
+        },
+        lines: [Some(wc_report::LineField::Marker), None, None],
+        language: wc_report::Language::En,
+        strip,
+        strips: wc_report::terminal_strips(&inputs),
+    }
+}
+
+/// The markers `options` asks for as a smartScript CSV in `export`: `wago-marking.csv`, or
+/// `wago-marking-<strip>.csv` for one strip.
+fn export_wago_marking(open: &Open, options: &wc_report::MarkingOptions) -> String {
+    let dir = open.dir.join("export");
+    let name = match &options.strip {
+        Some(s) => format!("wago-marking-{}.csv", file_stem(s)),
+        None => "wago-marking.csv".to_owned(),
+    };
+    let path = dir.join(name);
+    let inputs = wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    };
+    // The strip may have no numbered terminal on a schematic page (only on an overview), or be
+    // gone since the dialog opened: say so instead of writing an empty list.
+    if let Some(s) = &options.strip
+        && !wc_report::terminal_strips(&inputs).contains(s)
+    {
+        return format!(
+            "Nothing exported: terminal strip {s} has no terminals on the schematic pages (terminals drawn \
+             only on an overview page are not listed)."
+        );
+    }
+    let t = wc_report::marking_list_with(&inputs, options);
     let csv = wc_report::to_smartscript_csv(&t);
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, csv)) {
         Ok(()) => {
+            let columns = if t.columns.len() > 4 {
+                "Line columns"
+            } else {
+                "marker column"
+            };
             let mut msg = format!(
-                "Exported {} markers to\n{}\n\nIn WAGO smartScript, import it as Excel/CSV data and map the Marker column.",
+                "Exported {} markers to\n{}\n\nIn WAGO smartScript, import it as Excel/CSV data and map the {columns}.",
                 t.rows.len(),
                 path.display()
             );
@@ -2157,6 +2319,20 @@ fn export_wago_marking(open: &Open) -> String {
         }
         Err(e) => format!("Export failed: {e}"),
     }
+}
+
+/// A strip tag as part of a file name: characters a file name cannot hold become `_`
+/// (`-X1` stays, `a/b` becomes `a_b`).
+fn file_stem(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || "-+=._".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Every page as SVG and DXF in `export/drawings`, named by page number.
@@ -2926,5 +3102,89 @@ mod picker_tests {
             picker_start(&deep.display().to_string()),
             Some(tmp.path().to_path_buf())
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod marking_tests {
+    use super::*;
+
+    #[test]
+    fn one_strips_markers_are_exported_from_its_menu_with_the_chosen_lines() {
+        let (_tmp, mut o) = state::tests::project();
+        let a = o
+            .place(1, "wc.terminal", wc_core::geom::Point::new(20.0, 20.0))
+            .unwrap();
+        let b = o
+            .place(1, "wc.terminal", wc_core::geom::Point::new(40.0, 20.0))
+            .unwrap();
+        let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+        o.project.devices.entry(x1).or_default().description = "Field terminals".into();
+        for (id, tag) in [(&a, "-X1.1"), (&b, "-X2.1")] {
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == *id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse(tag).unwrap());
+        }
+
+        // The devices list offers the strip of a terminal, and nothing for other devices.
+        let index = o.project.tag_index();
+        let uses = |t: &str| index.get(&wc_core::DeviceTag::parse(t).unwrap()).cloned().unwrap();
+        assert_eq!(
+            panels::terminal_strip_of(&o, &wc_core::DeviceTag::parse("-X1.1").unwrap(), &uses("-X1.1")),
+            Some("-X1".into())
+        );
+        let c = o.place(1, "wc.coil", wc_core::geom::Point::new(60.0, 20.0)).unwrap();
+        let coil = o.project.pages[1]
+            .symbols
+            .iter()
+            .find(|s| s.id == c)
+            .unwrap()
+            .tag
+            .clone()
+            .unwrap();
+        let index = o.project.tag_index();
+        assert_eq!(panels::terminal_strip_of(&o, &coil, &index[&coil]), None);
+
+        // From that menu the dialog opens with only the strip's terminals.
+        let Dialog::WagoMarking {
+            kinds, strip, strips, ..
+        } = wago_marking_dialog(&o, Some("-X1".into()))
+        else {
+            unreachable!("not the marking dialog");
+        };
+        assert_eq!(kinds, [true, false, false, false]);
+        assert_eq!(strip.as_deref(), Some("-X1"));
+        assert_eq!(strips, ["-X1", "-X2"]);
+
+        let options = wc_report::MarkingOptions {
+            kinds: vec![wc_report::MarkerKind::Terminals],
+            lines: vec![wc_report::LineField::Marker, wc_report::LineField::Description],
+            language: wc_report::Language::De,
+            strip,
+        };
+        let msg = export_wago_marking(&o, &options);
+        assert!(
+            msg.contains("Exported 1 markers") && msg.contains("Line columns"),
+            "{msg}"
+        );
+        let csv = std::fs::read_to_string(o.dir.join("export").join("wago-marking--X1.csv")).unwrap();
+        assert_eq!(
+            csv,
+            "\u{feff}Typ;Gruppe;Zeile 1;Zeile 2;Anzahl\r\nKlemme;-X1;1;Field terminals;1\r\n"
+        );
+        assert_eq!(file_stem("=A+C1/X1"), "=A+C1_X1");
+        use wc_report::LineField::{Description, Marker};
+        assert_eq!(chosen_lines(&[Some(Marker), None, Some(Description)]), [Marker]);
+        assert_eq!(
+            chosen_lines(&[Some(Description), Some(Marker), None]),
+            [Description, Marker]
+        );
+
+        // A strip drawn only on an overview page has nothing to export: no file is written.
+        o.project.pages[1].overview = true;
+        std::fs::remove_file(o.dir.join("export").join("wago-marking--X1.csv")).unwrap();
+        let msg = export_wago_marking(&o, &options);
+        assert!(msg.starts_with("Nothing exported") && msg.contains("-X1"), "{msg}");
+        assert!(!o.dir.join("export").join("wago-marking--X1.csv").exists());
     }
 }

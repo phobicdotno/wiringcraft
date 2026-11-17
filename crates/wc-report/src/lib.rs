@@ -21,7 +21,10 @@ mod tests;
 
 pub use aml::{AmlCounts, automationml};
 pub use check::{Finding, Severity, check, check_table};
-pub use marking::{MarkerKind, formula_warnings, marking_list, parse_kinds, to_smartscript_csv};
+pub use marking::{
+    Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,
+    marking_list_with, parse_kinds, parse_lines, terminal_strips, to_smartscript_csv,
+};
 pub use plc::{PlcVariables, plc_variables};
 
 /// A finished report: a title, column headings and rows of text.
@@ -540,12 +543,10 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 continue;
             }
             let (strip, number) = match &s.tag {
-                Some(tag) if tag.product.len() > 1 => {
-                    let mut strip = tag.clone();
-                    let number = strip.product.pop();
+                Some(tag) => {
+                    let (strip, number) = tag.terminal_parts();
                     (strip.to_string(), number)
                 }
-                Some(tag) => (tag.to_string(), None),
                 None => ("(untagged)".to_owned(), None),
             };
             let assigned = numbers.get(&(page.id.clone(), s.id.clone()));

@@ -689,6 +689,165 @@ fn marking_list_drops_repeated_terminals_even_between_equal_sorting_numbers() {
 }
 
 #[test]
+fn marker_lines_put_the_engraving_text_and_the_description_on_lines_of_their_own() {
+    let (mut p, s, parts) = fixture();
+    let k1 = DeviceTag::parse("=A+C1-K1").unwrap();
+    let dev = p.devices.entry(k1).or_default();
+    dev.description = "Pump contactor".into();
+    dev.properties.insert(MARKER_PROPERTY.into(), "PUMP 1".into());
+    let p1 = DeviceTag::parse("-P1").unwrap();
+    p.devices
+        .entry(p1)
+        .or_default()
+        .properties
+        .insert(MARKER_PROPERTY.into(), "  ".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // One line: the engraving text replaces the tag; an empty one falls back to the tag.
+    let one = marking_list(&i, &[MarkerKind::Devices]);
+    let rows: Vec<String> = one.rows.iter().map(|r| r.join("|")).collect();
+    assert_eq!(rows, ["Device||-P1|1", "Device|+C1|PUMP 1|1"]);
+    assert_eq!(one.columns, ["Type", "Group", "Marker", "Count"]);
+
+    let o = MarkingOptions {
+        kinds: vec![MarkerKind::Devices, MarkerKind::Wires],
+        lines: vec![LineField::Tag, LineField::Description, LineField::Location],
+        ..MarkingOptions::default()
+    };
+    let t = marking_list_with(&i, &o);
+    assert_eq!(t.columns, ["Type", "Group", "Line 1", "Line 2", "Line 3", "Count"]);
+    let k1 = t.rows.iter().find(|r| r[2] == "=A+C1-K1").unwrap();
+    assert_eq!(k1.join("|"), "Device|+C1|=A+C1-K1|Pump contactor|+C1|1");
+    // A wire has no description or location: those lines stay empty.
+    let wire = t.rows.iter().find(|r| r[0] == "Wire").unwrap();
+    assert_eq!((wire[3].as_str(), wire[4].as_str()), ("", ""));
+    assert_eq!(
+        parse_lines(&["Tag".into(), "description".into()]),
+        Ok(vec![LineField::Tag, LineField::Description])
+    );
+    assert!(parse_lines(&["colour".into()]).is_err());
+}
+
+#[test]
+fn marker_list_headers_and_types_follow_the_language_and_warnings_still_find_wires() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].wires[0].number = Some("=1".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let de = marking_list_with(
+        &i,
+        &MarkingOptions {
+            language: Language::De,
+            ..MarkingOptions::default()
+        },
+    );
+    assert_eq!(de.columns, ["Typ", "Gruppe", "Beschriftung", "Anzahl"]);
+    assert!(de.rows.iter().any(|r| r[0] == "Klemme"));
+    assert!(de.rows.iter().any(|r| r[0] == "Leiter"));
+    assert_eq!(formula_warnings(&de).len(), 1);
+    let nb = marking_list_with(
+        &i,
+        &MarkingOptions {
+            language: Language::Nb,
+            lines: vec![LineField::Marker, LineField::Description],
+            ..MarkingOptions::default()
+        },
+    );
+    assert_eq!(nb.columns, ["Type", "Gruppe", "Linje 1", "Linje 2", "Antall"]);
+    assert!(nb.rows.iter().any(|r| r[0] == "Komponent"));
+    assert_eq!(Language::parse("NO"), Some(Language::Nb));
+    assert_eq!(Language::parse("fr"), None);
+}
+
+#[test]
+fn formula_warnings_check_every_marker_line_and_free_marker_texts() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].wires[0].number = Some("=1".into());
+    let k1 = DeviceTag::parse("=A+C1-K1").unwrap();
+    let dev = p.devices.entry(k1).or_default();
+    dev.properties
+        .insert(MARKER_PROPERTY.into(), "=HYPERLINK(\"x\")".into());
+    dev.description = "@pump".into();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // The wire number is in the second line column here.
+    let t = marking_list_with(
+        &i,
+        &MarkingOptions {
+            kinds: vec![MarkerKind::Wires],
+            lines: vec![LineField::Description, LineField::Marker],
+            ..MarkingOptions::default()
+        },
+    );
+    let w = formula_warnings(&t);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("\"=1\""));
+    // Free texts warn; tags such as `=A+C1-K1` and `-P1` do not.
+    let t = marking_list_with(
+        &i,
+        &MarkingOptions {
+            kinds: vec![MarkerKind::Devices],
+            lines: vec![LineField::Marker, LineField::Tag, LineField::Description],
+            ..MarkingOptions::default()
+        },
+    );
+    let w = formula_warnings(&t);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("HYPERLINK") && w[1].contains("@pump"), "{w:?}");
+    assert!(to_smartscript_csv(&t).contains("=HYPERLINK"), "the text is kept");
+}
+
+#[test]
+fn one_strips_markers_are_only_that_strips_terminals() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s7", "term", 140.0, Some("-X1.10")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert_eq!(terminal_strips(&i), ["-X1", "-X2"]);
+    // Strips that sort alike are each listed once.
+    let mut q = p.clone();
+    for (id, tag) in [("z1", "-X01.1"), ("z2", "-X01.3"), ("z3", "-X1.2")] {
+        q.pages[0].symbols.push(place(id, "term", 160.0, Some(tag)));
+    }
+    let strips = terminal_strips(&Inputs {
+        project: &q,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(strips.iter().filter(|s| *s == "-X1").count(), 1, "{strips:?}");
+    assert_eq!(strips.iter().filter(|s| *s == "-X01").count(), 1, "{strips:?}");
+    let o = MarkingOptions {
+        strip: Some("-X1".into()),
+        ..MarkingOptions::default()
+    };
+    let t = marking_list_with(&i, &o);
+    let rows: Vec<String> = t.rows.iter().map(|r| r.join("|")).collect();
+    assert_eq!(rows, ["Terminal|-X1|1|1", "Terminal|-X1|2|1", "Terminal|-X1|10|1"]);
+    // Asking for other kinds as well keeps them; the strip limits only the terminals.
+    let both = marking_list_with(
+        &i,
+        &MarkingOptions {
+            kinds: vec![MarkerKind::Terminals, MarkerKind::Wires],
+            ..o
+        },
+    );
+    assert!(both.rows.iter().any(|r| r[0] == "Wire"));
+    assert!(!both.rows.iter().any(|r| r[1] == "-X2"));
+}
+
+#[test]
 fn check_names_a_jumper_terminal_drawn_nowhere() {
     let (mut p, s, parts) = fixture();
     let x1 = DeviceTag::parse("-X1").unwrap();
