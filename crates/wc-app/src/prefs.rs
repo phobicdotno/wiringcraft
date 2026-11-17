@@ -60,13 +60,17 @@ pub fn projects_dir() -> PathBuf {
     match home {
         Some(h) if h.join("Documents").is_dir() => h.join("Documents").join("WiringCraft"),
         Some(h) => h.join("WiringCraft"),
-        None => absolute(Path::new("WiringCraft")),
+        None => absolute(Path::new("WiringCraft")).unwrap_or_else(|e| {
+            eprintln!("wiringcraft-app: no home folder, and {e}; new projects go in ./WiringCraft");
+            PathBuf::from("WiringCraft")
+        }),
     }
 }
 
-/// `p` as an absolute path (against the current folder), without touching the disk.
-pub fn absolute(p: &Path) -> PathBuf {
-    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+/// `p` as an absolute path (against the current folder), without touching the disk. Fails for
+/// an empty path or when the current folder cannot be read.
+pub fn absolute(p: &Path) -> Result<PathBuf, String> {
+    std::path::absolute(p).map_err(|e| format!("{} cannot be made a full path: {e}", p.display()))
 }
 
 /// A project name as one folder name: separators and characters Windows does not allow become
@@ -138,9 +142,16 @@ impl Prefs {
         }
     }
 
+    /// Put `dir` first in the recent projects. Kept absolute, so a recent entry means the same
+    /// folder however the app was started; a folder that cannot be made absolute is not kept.
     pub fn remember(&mut self, dir: PathBuf) {
-        // Kept absolute, so a recent entry means the same folder however the app was started.
-        let dir = absolute(&dir);
+        let dir = match absolute(&dir) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("wiringcraft-app: not kept in the recent projects: {e}");
+                return;
+            }
+        };
         self.recent.retain(|d| d != &dir);
         self.recent.insert(0, dir);
         self.recent.truncate(8);
@@ -185,6 +196,10 @@ mod tests {
         let mut p = Prefs::default();
         p.remember(PathBuf::from("projects/demo"));
         assert!(p.recent[0].is_absolute());
+        // An empty path cannot be made absolute: it is left out, with no relative entry kept.
+        p.remember(PathBuf::new());
+        assert_eq!(p.recent.len(), 1);
+        assert!(absolute(Path::new("")).is_err());
     }
 
     #[test]

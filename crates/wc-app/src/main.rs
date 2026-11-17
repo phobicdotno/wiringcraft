@@ -17,7 +17,7 @@ mod screenshot;
 mod state;
 mod theme;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, Pos2, RichText, Stroke, Vec2};
 
@@ -187,7 +187,13 @@ impl App {
     }
 
     fn open_dir(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
-        let dir = &prefs::absolute(dir);
+        let dir = &match prefs::absolute(dir) {
+            Ok(d) => d,
+            Err(e) => {
+                self.dialog = Some(Dialog::Message(format!("Could not open the project: {e}")));
+                return;
+            }
+        };
         match Open::load(dir) {
             Ok(o) => {
                 self.ed = Editor::default();
@@ -228,7 +234,7 @@ impl App {
                     .open
                     .as_ref()
                     .and_then(|o| o.dir.parent())
-                    .map(prefs::absolute)
+                    .map(Path::to_path_buf)
                     .unwrap_or_else(prefs::projects_dir)
                     .display()
                     .to_string();
@@ -1320,16 +1326,25 @@ fn size_label(s: PageSize) -> &'static str {
 /// the user cancels. Blocks the window while open, like any modal dialog.
 fn pick_folder(title: &str, start: &str) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new().set_title(title);
-    // The same rule as the dialogs: a typed name is inside the projects folder.
-    let start = if start.trim().is_empty() {
-        prefs::projects_dir()
-    } else {
-        prefs::project_path(start)
-    };
-    if let Some(d) = start.ancestors().find(|d| !d.as_os_str().is_empty() && d.is_dir()) {
+    if let Some(d) = picker_start(start) {
         dialog = dialog.set_directory(d);
     }
     dialog.pick_folder()
+}
+
+/// Where the folder picker opens for what is typed in a dialog: the projects folder for a blank
+/// field, otherwise the same rule as the dialogs (a bare name is inside the projects folder),
+/// then the nearest folder of that path that exists.
+fn picker_start(typed: &str) -> Option<PathBuf> {
+    let start = if typed.trim().is_empty() {
+        prefs::projects_dir()
+    } else {
+        prefs::project_path(typed)
+    };
+    start
+        .ancestors()
+        .find(|d| !d.as_os_str().is_empty() && d.is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// The window and taskbar icon (assets/icon, made by tools/gen_icon.py), built into the
@@ -1804,5 +1819,25 @@ mod icon_tests {
     fn the_main_window_carries_the_icon() {
         let icon = super::main_viewport().icon;
         assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    #[test]
+    fn the_picker_opens_where_the_dialog_would_put_the_project() {
+        // A bare name is not looked up in the folder the app started in.
+        let want = prefs::projects_dir()
+            .ancestors()
+            .find(|d| !d.as_os_str().is_empty() && d.is_dir())
+            .map(Path::to_path_buf);
+        assert_eq!(picker_start("some-project-name"), want);
+        assert_eq!(picker_start("  "), want);
+        // A full path opens at its nearest existing folder.
+        let tmp = std::env::temp_dir();
+        let deep = tmp.join("wc-not-there").join("deeper");
+        assert_eq!(picker_start(&deep.display().to_string()), Some(tmp));
     }
 }
