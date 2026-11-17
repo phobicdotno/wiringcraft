@@ -2102,6 +2102,7 @@ impl App {
         } else if by_command {
             open.checkpoint();
             open.project = fresh.project;
+            open.forget_terminal_change();
             open.dirty = false;
         }
         open.refresh_library();

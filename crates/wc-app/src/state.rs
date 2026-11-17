@@ -119,6 +119,9 @@ pub struct Open {
     pub branch: String,
     /// Underlay pictures loaded as textures, by file; `None` when the file cannot be shown.
     pub underlays: BTreeMap<String, Option<egui::TextureHandle>>,
+    /// The terminal numbering before the change in progress (taken at its checkpoint), so
+    /// jumpers can follow their terminals once it is done.
+    terminals_before: Option<wc_core::project::TerminalNumbers>,
 }
 
 impl Open {
@@ -138,6 +141,7 @@ impl Open {
             undo_dropped: 0,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
+            terminals_before: None,
         };
         me.refresh_library();
         Ok(me)
@@ -252,6 +256,10 @@ impl Open {
 
     /// Take a snapshot before a change, so it can be undone.
     pub fn checkpoint(&mut self) {
+        // The change before this one is done: its jumpers follow their terminals first, so the
+        // snapshot and this change start from that.
+        self.follow_terminals();
+        self.terminals_before = Some(self.terminal_numbers());
         self.undo.push(self.project.clone());
         if self.undo.len() > 200 {
             self.undo.remove(0);
@@ -259,6 +267,30 @@ impl Open {
         }
         self.redo.clear();
         self.dirty = true;
+    }
+
+    /// Which terminal each placed terminal symbol is, as the terminal plan numbers them.
+    pub fn terminal_numbers(&self) -> wc_core::project::TerminalNumbers {
+        wc_core::project::terminal_numbers(&self.project, |id| self.symbols.get(id).map(|s| s.role))
+    }
+
+    /// Keep jumpers on the terminals they joined, after the change since the last checkpoint
+    /// (a terminal renamed, moved along its strip or deleted). Returns whether a jumper changed.
+    pub fn follow_terminals(&mut self) -> bool {
+        let Some(before) = self.terminals_before.take() else {
+            return false;
+        };
+        if self.project.meta.jumpers.is_empty() {
+            return false;
+        }
+        let after = self.terminal_numbers();
+        self.project.meta.follow_terminals(&before, &after)
+    }
+
+    /// Forget the change in progress without following it: the project was replaced as a whole
+    /// (undo, redo, a command's result), and its jumpers already belong to its drawing.
+    pub fn forget_terminal_change(&mut self) {
+        self.terminals_before = None;
     }
 
     /// A mark in the undo history, for [`Open::squash_undo`].
@@ -288,6 +320,7 @@ impl Open {
     pub fn undo(&mut self) -> bool {
         match self.undo.pop() {
             Some(prev) => {
+                self.forget_terminal_change();
                 self.redo.push(std::mem::replace(&mut self.project, prev));
                 self.dirty = true;
                 true
@@ -299,6 +332,7 @@ impl Open {
     pub fn redo(&mut self) -> bool {
         match self.redo.pop() {
             Some(next) => {
+                self.forget_terminal_change();
                 self.undo.push(std::mem::replace(&mut self.project, next));
                 self.dirty = true;
                 true
@@ -308,6 +342,7 @@ impl Open {
     }
 
     pub fn save(&mut self) -> Result<usize, String> {
+        self.follow_terminals();
         let n = store::save(&self.dir, &self.project).map_err(|e| e.to_string())?.len();
         self.dirty = false;
         Ok(n)
@@ -1227,5 +1262,33 @@ pub(crate) mod tests {
         assert_eq!(o.project.meta.title_block.len(), 1);
         assert!(o.undo());
         assert_eq!(o.project.meta.name, "Test");
+    }
+
+    #[test]
+    fn a_jumper_stays_on_its_terminals_when_one_moves_past_another() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        let (a, b, c) = (put(10.0), put(20.0), put(30.0));
+        // Numbered by drawing order: a 1, b 2, c 3. Jumper a and b.
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        // Move a to the far right: now b 1, c 2, a 3. The jumper must still join a and b.
+        o.checkpoint();
+        o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(40.0, 20.0);
+        assert!(o.follow_terminals());
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "3"]);
+        let n = o.terminal_numbers();
+        let num = |id: &str| n[&(o.project.pages[page].id.clone(), id.to_owned())].1.clone();
+        assert_eq!((num(&a), num(&b), num(&c)), ("3".into(), "1".into(), "2".into()));
+        // Undo puts drawing and jumper back together, with nothing left to follow.
+        assert!(o.undo());
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+        assert!(!o.follow_terminals());
     }
 }
