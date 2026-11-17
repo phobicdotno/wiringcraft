@@ -201,7 +201,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
         if el.interfaces.is_empty() {
             // Structure (function, location), not a device. A location goes to the project.
             let own = designation(&el);
-            if own.trim_start().starts_with('+') {
+            // Only an element that is itself a location (`+L1`, not `+L1-K1`) names one.
+            if own.trim_start().starts_with('+') && wc_core::project::location_path(&own).is_ok() {
                 let levels = location_levels(&outer, &own);
                 if !levels.is_empty() {
                     let description = ["Description", "description", "Beschreibung"]
@@ -210,8 +211,12 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                         .cloned()
                         .unwrap_or_default();
                     let path = levels.join(".");
-                    if !out.locations.iter().any(|l| l.path == path) {
-                        out.locations.push(wc_core::Location { path, description });
+                    match out.locations.iter_mut().find(|l| l.path == path) {
+                        // Children come before their parents: a description found later fills
+                        // an entry that has none.
+                        Some(l) if l.description.is_empty() => l.description = description,
+                        Some(_) => {}
+                        None => out.locations.push(wc_core::Location { path, description }),
                     }
                 }
             }
@@ -748,6 +753,11 @@ mod tests {
       </InternalElement>
       <InternalElement Name="+L1.L4" ID="l4"/>
     </InternalElement>
+    <InternalElement Name="+L9" ID="l9">
+      <Attribute Name="Description"><Value>Engine room</Value></Attribute>
+      <InternalElement Name="+L9-K2" ID="k2"/>
+      <InternalElement Name="+L9" ID="l9b"/>
+    </InternalElement>
     <InternalElement Name="Cabinet" ID="c2">
       <Attribute Name="RefDes"><Value>+L2</Value></Attribute>
       <InternalElement Name="+L5" ID="l5"/>
@@ -768,7 +778,8 @@ mod tests {
                 ("L1.L3", ""),
                 ("L1.L4", ""),
                 ("L2", ""),
-                ("L2.L5", "")
+                ("L2.L5", ""),
+                ("L9", "Engine room")
             ]
         );
         assert_eq!(imp.devices.len(), 1, "locations are not devices");
