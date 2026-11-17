@@ -268,13 +268,16 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_wire",
-            "Change a wire: its ends, bends, number, potential, or the cable it is a core of. Empty strings clear number, potential or cable.",
+            "Change a wire: its ends, bends, number, potential, the cable it is a core of, or its cross-section, colour and type. Empty strings clear number, potential, cable, section, colour or type.",
             json!({
                 "id": {"type": "string"}, "page": page_arg(),
                 "from": end_arg("New start"), "to": end_arg("New end"), "via": point_list(),
                 "number": {"type": "string"}, "potential": {"type": "string"},
                 "cable": {"type": "string", "description": "Cable device tag, e.g. -W1"},
-                "core": {"type": "string", "description": "Core name in the cable, e.g. 1 or BN"}
+                "core": {"type": "string", "description": "Core name in the cable, e.g. 1 or BN"},
+                "section": {"type": "string", "description": "Cross-section with unit, e.g. 1.5 mm² or 18 AWG"},
+                "colour": {"type": "string", "description": "Colour code, e.g. BU or GNYE"},
+                "type": {"type": "string", "description": "Wire type, e.g. H07V-K"}
             }),
             &["id"],
         ),
@@ -1594,6 +1597,11 @@ impl App {
         {
             return Err(format!("No wire {id:?} on that page."));
         }
+        // Check the cable tag before changing anything, so a bad one leaves the wire as it was.
+        let cable_tag = match s(v, "cable") {
+            Some(c) if !c.trim().is_empty() => Some(tag(c)?),
+            _ => None,
+        };
         open.checkpoint();
         if let Some(w) = open
             .project
@@ -1616,16 +1624,21 @@ impl App {
             if let Some(n) = s(v, "potential") {
                 w.potential = Some(n.trim().to_owned()).filter(|n| !n.is_empty());
             }
+            if let Some(x) = s(v, "section") {
+                w.spec.section = wc_core::WireSpec::value(x);
+            }
+            if let Some(x) = s(v, "colour") {
+                w.spec.colour = wc_core::WireSpec::value(x);
+            }
+            if let Some(x) = s(v, "type") {
+                w.spec.kind = wc_core::WireSpec::value(x);
+            }
         }
-        if let Some(c) = s(v, "cable") {
-            let cable = if c.trim().is_empty() {
-                None
-            } else {
-                Some(wc_core::CableCore {
-                    cable: tag(c)?,
-                    core: s(v, "core").unwrap_or_default().trim().to_owned(),
-                })
-            };
+        if s(v, "cable").is_some() {
+            let cable = cable_tag.map(|cable| wc_core::CableCore {
+                cable,
+                core: s(v, "core").unwrap_or_default().trim().to_owned(),
+            });
             open.set_wire_cable(page, &id, cable);
         } else if let Some(core) = s(v, "core")
             && let Some(mut cc) = open
@@ -2264,6 +2277,42 @@ mod tests {
                 assert!(!e.starts_with("Unknown tool"), "{name}: {e}");
             }
         }
+    }
+
+    #[test]
+    fn a_bad_cable_tag_leaves_the_wire_unchanged() {
+        let (_tmp, mut a) = app(vec![]);
+        let coil: Value = serde_json::from_str(
+            &call(
+                &mut a,
+                "place_symbol",
+                json!({"symbol": "wc.coil", "x": 60, "y": 120, "page": "2", "tag": "-K1"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let c = coil["id"].as_str().unwrap().to_owned();
+        call(
+            &mut a,
+            "add_wire",
+            json!({"page": "2", "from": {"item": c, "pin": "A1"}, "to": {"item": c, "pin": "A2"}}),
+        )
+        .unwrap();
+        let id = page2(&a).wires[0].id.clone();
+        let bad = call(
+            &mut a,
+            "update_wire",
+            json!({"page": "2", "id": id, "section": "1.5 mm²", "cable": "?"}),
+        );
+        assert!(bad.is_err());
+        assert_eq!(page2(&a).wires[0].spec.section, None, "nothing changed");
+        call(
+            &mut a,
+            "update_wire",
+            json!({"page": "2", "id": id, "section": "1.5 mm²"}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).wires[0].spec.section.as_deref(), Some("1.5 mm²"));
     }
 
     #[test]

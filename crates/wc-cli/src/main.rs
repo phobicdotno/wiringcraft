@@ -83,6 +83,15 @@ enum Cmd {
         /// The core's name in the cable, e.g. `1` or `BN`.
         #[arg(long)]
         core: Option<String>,
+        /// Cross-section with its unit, e.g. `"1.5 mm²"` or `"18 AWG"`.
+        #[arg(long)]
+        section: Option<String>,
+        /// Colour code, e.g. `BU`.
+        #[arg(long)]
+        colour: Option<String>,
+        /// Wire type, e.g. `H07V-K`.
+        #[arg(long = "type")]
+        kind: Option<String>,
     },
     /// Set a device's part and description.
     Device {
@@ -138,6 +147,9 @@ enum Cmd {
     /// Export devices, their part data and connection points, and the connections between them
     /// as AutomationML (CAEX 3.0), for tools that take engineering data rather than drawings.
     Aml { out: PathBuf },
+    /// Export data for other tools: marker lists for printing marking strips.
+    #[command(subcommand)]
+    Export(ExportCmd),
     /// Write the PLC inputs and outputs as an IEC 61131-3 global variable list (structured
     /// text) for TwinCAT, CODESYS and similar tools: one variable per point, named after its
     /// device tag and located at its address (`%I*`/`%Q*` when it has none).
@@ -158,6 +170,19 @@ enum Cmd {
     /// Review comments pinned on pages: add, reply, resolve, list.
     #[command(subcommand)]
     Comment(CommentCmd),
+}
+
+#[derive(Subcommand)]
+enum ExportCmd {
+    /// Terminal, wire, device and cable markers for WAGO smartScript: a semicolon-separated
+    /// CSV (UTF-8) with one row per marker (type, group, marker text, copies), in natural
+    /// tag order. In smartScript, import it as Excel/CSV data and map the Marker column.
+    WagoMarking {
+        out: PathBuf,
+        /// Only these marker kinds: terminals, wires, devices, cables (default: all).
+        #[arg(long = "kind", value_delimiter = ',')]
+        kinds: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -685,6 +710,9 @@ fn run(cli: Cli) -> Res<()> {
             potential,
             cable,
             core,
+            section,
+            colour,
+            kind,
         } => {
             let mut p = load(dir)?;
             let cable = match cable {
@@ -712,6 +740,11 @@ fn run(cli: Cli) -> Res<()> {
                 potential,
                 cable,
                 route: Default::default(),
+                spec: wc_core::WireSpec {
+                    section: section.as_deref().and_then(wc_core::WireSpec::value),
+                    colour: colour.as_deref().and_then(wc_core::WireSpec::value),
+                    kind: kind.as_deref().and_then(wc_core::WireSpec::value),
+                },
             });
             save(dir, &p)?;
             println!("{id}");
@@ -897,6 +930,13 @@ fn run(cli: Cli) -> Res<()> {
                 Some(path) => std::fs::write(&path, text).map_err(e)?,
                 None => print!("{text}"),
             }
+        }
+        Cmd::Export(ExportCmd::WagoMarking { out, kinds }) => {
+            let done = export_wago_marking(dir, &out, &kinds)?;
+            for w in &done.warnings {
+                eprintln!("warning: {w}");
+            }
+            println!("wrote {} ({} markers)", out.display(), done.markers);
         }
         Cmd::Aml { out } => {
             let p = load(dir)?;
@@ -1749,6 +1789,39 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
 }
 
 /// The project's vendored parts by id (parts referenced by devices).
+/// What [`export_wago_marking`] wrote.
+struct Exported {
+    markers: usize,
+    warnings: Vec<String>,
+}
+
+/// Write the WAGO smartScript marker list of the project in `dir` to `out`. Unknown kinds are
+/// refused before anything is written. Symbols without a vendored copy are warned about: their
+/// terminals cannot be recognised and are left out.
+fn export_wago_marking(dir: &Path, out: &Path, kinds: &[String]) -> Res<Exported> {
+    let kinds = wc_report::parse_kinds(kinds)?;
+    let p = load(dir)?;
+    let (symbols, missing) = store::vendored_symbols(dir, &p);
+    let warnings = missing
+        .iter()
+        .map(|m| {
+            format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals are not in the list")
+        })
+        .collect();
+    let parts = vendored_parts(dir, &p);
+    let inputs = wc_report::Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let t = wc_report::marking_list(&inputs, &kinds);
+    std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+    Ok(Exported {
+        markers: t.rows.len(),
+        warnings,
+    })
+}
+
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
     p.devices
         .values()
@@ -1943,4 +2016,76 @@ fn file_stem(number: &str, id: &str) -> String {
         .collect();
     let stem = stem.trim_start_matches('.').to_owned();
     if stem.is_empty() { "page".into() } else { stem }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wago_marking_kind_option_splits_on_commas_and_repeats() {
+        let cli = Cli::try_parse_from([
+            "wiringcraft",
+            "-C",
+            "proj",
+            "export",
+            "wago-marking",
+            "out.csv",
+            "--kind",
+            "terminals,wires",
+            "--kind",
+            "cables",
+        ])
+        .unwrap();
+        assert_eq!(cli.project, PathBuf::from("proj"));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Export(ExportCmd::WagoMarking { ref out, ref kinds })
+                if out == &PathBuf::from("out.csv") && kinds == &["terminals", "wires", "cables"]
+        ));
+
+        let cli = Cli::try_parse_from(["wiringcraft", "export", "wago-marking", "out.csv"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Export(ExportCmd::WagoMarking { ref kinds, .. }) if kinds.is_empty()
+        ));
+        assert!(Cli::try_parse_from(["wiringcraft", "export", "wago-marking"]).is_err());
+    }
+
+    #[test]
+    fn wago_marking_export_writes_the_list_and_refuses_unknown_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        let mut p = store::create(&dir, "Test").unwrap();
+        p.devices
+            .insert(wc_core::DeviceTag::parse("-W1").unwrap(), Default::default());
+        p.pages[0].symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "no.such.symbol".into(),
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(wc_core::DeviceTag::parse("-X1.1").unwrap()),
+        });
+        store::save(&dir, &p).unwrap();
+
+        let out = tmp.path().join("bad.csv");
+        let err = export_wago_marking(&dir, &out, &["rails".into()]).err().unwrap();
+        assert!(err.contains("rails"), "{err}");
+        assert!(!out.exists(), "nothing written for an unknown kind");
+
+        let out = tmp.path().join("m.csv");
+        let done = export_wago_marking(&dir, &out, &["cables".into(), "devices".into()]).unwrap();
+        assert_eq!(done.markers, 2);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "\u{feff}Type;Group;Marker;Count\r\nDevice;;-X1.1;1\r\nCable;;-W1;2\r\n"
+        );
+        assert!(
+            done.warnings.iter().any(|w| w.contains("no.such.symbol")),
+            "{:?}",
+            done.warnings
+        );
+    }
 }

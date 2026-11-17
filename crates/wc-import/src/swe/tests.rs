@@ -11,7 +11,7 @@ CREATE TABLE tew_file (fil_id INTEGER, fil_orderno INTEGER, fil_filetype INTEGER
 CREATE TABLE tew_folder (fol_id INTEGER, fol_name TEXT);
 CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0 TEXT);
 CREATE TABLE tew_component (com_id INTEGER, com_tag TEXT, com_tagpath TEXT, com_type INTEGER,
-  com_com_id INTEGER, com_tagorderno INTEGER);
+  com_com_id INTEGER, com_tagorderno INTEGER, com_fun_id INTEGER, com_loc_id INTEGER, com_parenttagpath TEXT);
 CREATE TABLE tew_buildofmaterial (bom_id INTEGER, bom_objectid INTEGER, bom_orderno INTEGER, bom_reference TEXT, bom_manufacturer TEXT);
 CREATE TABLE tew_symbol (sym_id INTEGER, sym_fil_id INTEGER, sym_com_id INTEGER, sym_blockname TEXT, sym_posx REAL, sym_posy REAL,
   sym_angle REAL, sym_scalex REAL, sym_scaley REAL, sym_posendx REAL, sym_posendy REAL);
@@ -23,7 +23,8 @@ CREATE TABLE tew_equipotential (equ_id INTEGER, equ_text TEXT);
 CREATE TABLE tew_cable (cab_id INTEGER, cab_tag TEXT, cab_reference TEXT, cab_manufacturer TEXT);
 CREATE TABLE tew_cablewire (caw_cab_id INTEGER, caw_no INTEGER, caw_color TEXT);
 CREATE TABLE tew_wire (wir_id INTEGER, wir_cab_id INTEGER, wir_caw_no INTEGER, wir_tag TEXT,
-  wir_cel_idfrom INTEGER, wir_cte_nofrom INTEGER, wir_cel_idto INTEGER, wir_cte_noto INTEGER);
+  wir_cel_idfrom INTEGER, wir_cte_nofrom INTEGER, wir_cel_idto INTEGER, wir_cte_noto INTEGER,
+  wir_sectiontype INTEGER, wir_sectionorgauge TEXT, wir_color TEXT);
 CREATE TABLE tew_linewirepair (lwp_lin_id INTEGER, lwp_wir_id INTEGER, lwp_wir_orderno INTEGER);
 ";
 
@@ -899,7 +900,7 @@ fn sample_with_strip() -> Connection {
     let c = sample();
     c.execute_batch(
         "
-INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1 1', 4, 200, 2), (202, '2', '-X1 2', 4, 200, 1);
+INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1 1', 4, 200, 2), (202, '2', '-X1 2', 4, 200, 1);
 INSERT INTO tew_symbol VALUES (20, 10, 201, 'Terminal', 150, 200, 0, 1, 1, NULL, NULL),
   (21, 10, 202, 'Terminal', 170, 200, 0, 1, 1, NULL, NULL);
 INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5), (21, 0, 0, 0, 5), (21, 0, 1, 0, -5);
@@ -907,7 +908,7 @@ INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0), (61, 21, 0, 202, 0)
 INSERT INTO tew_componentterminal VALUES (60, 0, NULL), (60, 1, NULL), (61, 0, NULL), (61, 1, NULL);
 INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL), (11, 10, 170, 205, 170, 215, NULL);
 INSERT INTO tew_linewirepair VALUES (10, 80, 1), (11, 81, 1);
-INSERT INTO tew_wire VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1), (81, NULL, -1, 'N2', 61, 0, 50, 0),
+INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto) VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1), (81, NULL, -1, 'N2', 61, 0, 50, 0),
   (82, NULL, -1, '', 60, 0, 99, 0), (83, NULL, -1, '', 0, 0, 0, 0);
 ",
     )
@@ -981,7 +982,7 @@ fn terminal_strips_come_in_with_their_terminals_and_wire_ends_are_checked() {
 #[test]
 fn a_terminal_without_a_strip_keeps_its_own_tag() {
     let c = sample();
-    c.execute_batch("INSERT INTO tew_component VALUES (300, '5', '-X9-5', 4, NULL, 0);")
+    c.execute_batch("INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (300, '5', '-X9-5', 4, NULL, 0);")
         .unwrap();
     let (built, _, report) = build(&read(&c).unwrap(), None);
     assert!(built.devices.contains_key(&DeviceTag::parse("-X9.5").unwrap()));
@@ -995,8 +996,8 @@ fn imported_terminals_show_in_the_terminal_plan_per_strip() {
     let c = sample_with_strip();
     // A terminal whose number has a dot, and a wire record with only one end.
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (203, '3.1', '-X1-3.1', 4, 200, 3), (204, '1+2', '-X1-1+2', 4, 200, 4);
-         INSERT INTO tew_wire VALUES (84, NULL, -1, '', 60, 0, NULL, NULL);",
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (203, '3.1', '-X1-3.1', 4, 200, 3), (204, '1+2', '-X1-1+2', 4, 200, 4);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto) VALUES (84, NULL, -1, '', 60, 0, NULL, NULL);",
     )
     .unwrap();
     let (built, _, report) = build(&read(&c).unwrap(), None);
@@ -1035,13 +1036,13 @@ fn a_wire_end_on_a_repeated_pin_name_is_found_on_the_right_pin() {
     // A strip terminal whose two points are both called `1`: the lower one becomes `1#2`.
     // The line reaches only the lower one, and the wire record names that one.
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1-1', 4, 200, 1);
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1-1', 4, 200, 1);
          INSERT INTO tew_symbol VALUES (20, 10, 201, 'Terminal', 150, 200, 0, 1, 1, NULL, NULL);
          INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5);
          INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0);
          INSERT INTO tew_componentterminal VALUES (60, 0, '1'), (60, 1, '1');
          INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL);
-         INSERT INTO tew_wire VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1);",
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto) VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1);",
     )
     .unwrap();
     let (_, warnings, report) = build(&read(&c).unwrap(), None);
@@ -1056,7 +1057,7 @@ fn a_wire_end_on_a_repeated_pin_name_is_found_on_the_right_pin() {
 fn terminal_numbers_that_sort_alike_count_the_strip_as_out_of_order() {
     let c = sample();
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '01', '-X1-01', 4, 200, 1),
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '01', '-X1-01', 4, 200, 1),
            (202, '1', '-X1-1', 4, 200, 2), (210, 'X2', '-X2', 3, NULL, 0), (211, '1', '-X2-1', 4, 210, 1),
            (212, '2', '-X2-2', 4, 210, 2), (213, '10', '-X2-10', 4, 210, 3);",
     )
@@ -1282,6 +1283,135 @@ fn a_blank_english_translation_does_not_hide_another_language() {
     assert!(info.warnings.is_empty(), "{:?}", info.warnings);
 }
 
+/// A database in the space form: function F1, locations L1 and L1 L11, and components whose
+/// tag paths have no signs, as some SolidWorks Electrical projects store them.
+fn space_form() -> Connection {
+    let c = sample();
+    c.execute_batch(
+        "CREATE TABLE tew_function (fun_id INTEGER, fun_tagpath TEXT);
+         CREATE TABLE tew_location (loc_id INTEGER, loc_tagpath TEXT);
+         INSERT INTO tew_function VALUES (2, 'F1');
+         INSERT INTO tew_location VALUES (3, 'L1'), (2450, 'L1 L11');
+         INSERT INTO tew_component VALUES (500, 'CR1', 'F1 L1 L11 CR1', -1, NULL, 0, 2, 2450, 'CR1'),
+           (501, 'TB1', 'F1 L1 L11 TB1', 3, NULL, 0, 2, 2450, 'TB1'),
+           (502, '4', 'F1 L1 L11 TB1 4', 4, 501, 4, 2, 2450, 'TB1 4'),
+           (503, 'M2', 'F1 L1 M2', -1, NULL, 0, 2, 3, 'M2');",
+    )
+    .unwrap();
+    c
+}
+
+#[test]
+fn tag_paths_stored_with_spaces_keep_function_and_location() {
+    let p = read(&space_form()).unwrap();
+    assert_eq!(p.components[&500].tag, "=F1+L1+L11-CR1");
+    assert_eq!(p.components[&503].tag, "=F1+L1-M2");
+    assert_eq!(p.components[&100].tag, "=F1+L1+L2-K1", "a signed path stays as it is");
+    assert_eq!(
+        p.components[&101].tag, "F1",
+        "a bare tag without function or location stays"
+    );
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.starts_with("4 component tag path(s) are stored with spaces")),
+        "{:?}",
+        p.warnings
+    );
+    let (built, _, _) = build(&p, None);
+    // Not every device has =F1 (the sample's F1 has none), so the function stays in the tags.
+    for t in ["=F1+L1.L11-CR1", "=F1+L1-M2", "=F1+L1.L11-TB1", "=F1+L1.L11-TB1.4"] {
+        assert!(
+            built.devices.contains_key(&DeviceTag::parse(t).unwrap()),
+            "{t}: {:?}",
+            built.devices.keys()
+        );
+    }
+    let paths: Vec<&str> = built.locations.iter().map(|l| l.path.as_str()).collect();
+    assert_eq!(paths, ["L1", "L1.L11"], "location paths in the space form");
+}
+
+#[test]
+fn signed_paths_and_space_paths_compose_alike() {
+    assert_eq!(signed("L1 L11", '+'), "+L1+L11");
+    assert_eq!(signed("+L1+L11", '+'), "+L1+L11");
+    assert_eq!(signed("  ", '+'), "");
+    assert_eq!(composed_path(Some("F1"), Some("L1 L11"), "TB1 4"), "=F1+L1+L11-TB1-4");
+    assert_eq!(composed_path(None, None, "K1"), "-K1");
+    assert_eq!(location_path("L1 L11"), "L1.L11");
+    assert_eq!(location_path("+L1+L11"), "L1.L11");
+}
+
+#[test]
+fn space_form_edge_cases_keep_their_levels() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_location VALUES (7, 'Deck-2');
+         INSERT INTO tew_component VALUES (510, 'K-1', 'F1 Deck-2 K-1', -1, NULL, 0, 2, 7, 'K-1'),
+           (511, 'CR9', 'F1 L1 L11 CR9', -1, NULL, 0, 2, 2450, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let (built, _, _) = build(&p, None);
+    for t in ["=F1+Deck_2-K_1", "=F1+L1.L11-CR9"] {
+        assert!(
+            built.devices.contains_key(&DeviceTag::parse(t).unwrap()),
+            "{t}: {:?}",
+            built.devices.keys()
+        );
+    }
+    assert!(
+        built.locations.iter().any(|l| l.path == "Deck_2"),
+        "{:?}",
+        built.locations
+    );
+    assert!(has_signs(" -X1 1") && !has_signs("Deck-2"));
+}
+
+#[test]
+fn a_bare_tag_with_spaces_and_no_function_or_location_stays_one_name() {
+    let c = space_form();
+    c.execute_batch("INSERT INTO tew_component VALUES (520, 'X 1/2', 'X 1/2', -1, NULL, 0, NULL, NULL, '');")
+        .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.components[&520].tag, "X 1/2", "as written");
+    let (built, _, _) = build(&p, None);
+    assert!(
+        built.devices.contains_key(&DeviceTag::parse("-X_1_2").unwrap()),
+        "one product level: {:?}",
+        built.devices.keys()
+    );
+}
+
+#[test]
+fn wires_carry_their_section_and_colour() {
+    assert_eq!(wire_section(Some(0), "1.5").as_deref(), Some("1.5 mm²"));
+    assert_eq!(wire_section(Some(1), " 20 ").as_deref(), Some("20 AWG"));
+    assert_eq!(wire_section(Some(0), "0"), None, "0 is no section");
+    assert_eq!(wire_section(Some(-1), ""), None);
+    assert_eq!(
+        wire_section(None, "2,5").as_deref(),
+        Some("2,5"),
+        "unknown type: as written"
+    );
+
+    let c = sample();
+    c.execute_batch(
+        "UPDATE tew_wire SET wir_sectiontype = 0, wir_sectionorgauge = '0.75', wir_color = 'BN' WHERE wir_id = 70;",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.wires[&70].spec.section.as_deref(), Some("0.75 mm²"));
+    assert_eq!(p.wires[&71].spec, WireSpec::default());
+    let (built, _, _) = build(&p, None);
+    let drawn: Vec<&Wire> = page(&built, "01").wires.iter().filter(|w| w.cable.is_some()).collect();
+    assert!(!drawn.is_empty());
+    for w in drawn {
+        assert_eq!(w.spec.section.as_deref(), Some("0.75 mm²"));
+        assert_eq!(w.spec.colour.as_deref(), Some("BN"));
+    }
+}
+
 #[test]
 fn a_mirrored_symbol_turned_90_degrees_meets_its_line() {
     let c = sample();
@@ -1320,6 +1450,39 @@ fn a_mirrored_box_turned_90_degrees_has_its_corner_mirrored_too() {
     assert!(
         (corner.x - 110.0).abs() < 1e-9 && (corner.y - 135.0).abs() < 1e-9,
         "{corner:?}"
+    );
+}
+
+#[test]
+fn an_empty_function_path_does_not_rebuild_the_stored_tag() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_function (fun_id, fun_tagpath) VALUES (930, '');
+         INSERT INTO tew_component VALUES (530, 'K2', 'K1', -1, NULL, 0, 930, NULL, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(
+        p.components[&530].tag, "K1",
+        "no function resolved, the stored path stays"
+    );
+}
+
+#[test]
+fn a_component_name_used_as_product_stays_one_level() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_function (fun_id, fun_tagpath) VALUES (931, 'F1');
+         INSERT INTO tew_component VALUES (531, 'X 1/2', 'F1 X 1/2', -1, NULL, 0, 931, NULL, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.components[&531].tag, "=F1-X_1/2");
+    let (built, _, _) = build(&p, None);
+    assert!(
+        built.devices.contains_key(&DeviceTag::parse("=F1-X_1_2").unwrap()),
+        "one product level: {:?}",
+        built.devices.keys()
     );
 }
 
@@ -1414,4 +1577,58 @@ fn a_wire_on_a_line_without_usable_end_points_still_counts_as_drawn() {
         .find(|w| w.contains("not connected on the imported drawing"))
         .unwrap();
     assert!(apart.contains("wire N8"), "{apart}");
+}
+
+#[test]
+fn a_component_name_with_a_leading_sign_stays_the_product() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_function (fun_id, fun_tagpath) VALUES (932, 'F1');
+         INSERT INTO tew_component VALUES (532, '+24V', 'F1 +24V', -1, NULL, 0, 932, NULL, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.components[&532].tag, "=F1-_24V");
+}
+
+#[test]
+fn a_spaced_location_path_counts_as_the_space_form() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_location (loc_id, loc_tagpath) VALUES (940, 'L1 L11');
+         INSERT INTO tew_component VALUES (540, 'K1', 'K1', -1, NULL, 0, NULL, 940, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.components[&540].tag, "+L1+L11-K1");
+    assert!(
+        p.warnings.iter().any(|w| w.contains("stored with spaces")),
+        "{:?}",
+        p.warnings
+    );
+}
+
+#[test]
+fn a_cable_core_keeps_its_own_wire_s_spec() {
+    let c = sample();
+    // Line 1 carries the cable wire 70 (no spec) and wire 71 (with one).
+    c.execute_batch(
+        "UPDATE tew_wire SET wir_sectiontype = 0, wir_sectionorgauge = '1.5', wir_color = 'RD' WHERE wir_id = 71;
+         INSERT INTO tew_linewirepair VALUES (1, 71, 2);",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let (built, _, report) = build(&p, None);
+    let cabled: Vec<&Wire> = built
+        .pages
+        .iter()
+        .flat_map(|pg| pg.wires.iter())
+        .filter(|w| w.cable.is_some())
+        .collect();
+    assert!(!cabled.is_empty());
+    for w in cabled {
+        assert_eq!(w.spec, WireSpec::default(), "71's section is not put on 70's core");
+    }
+    let wires = report.iter().find(|c| c.what == "wires").unwrap();
+    assert!(wires.note.contains("no section or colour"), "{}", wires.note);
 }
