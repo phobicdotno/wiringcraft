@@ -453,12 +453,16 @@ impl App {
                 // Changes not synced yet (an assistant's, made with no frame in between) go into
                 // the session's history first, so Undo takes back the latest one.
                 self.sync_session_now(false);
-                // A refusal is in the session's notes, which the status line shows.
-                let _ = if a == Action::Undo {
+                let r = if a == Action::Undo {
                     self.share.undo()
                 } else {
                     self.share.redo()
                 };
+                // The host's refusal comes back in the session's notes, which the status line
+                // shows; one made here is shown now.
+                if let Err(e) = r {
+                    self.ed.message = e;
+                }
                 self.ed.selection.clear();
                 return;
             }
@@ -2193,7 +2197,8 @@ impl eframe::App for App {
             self.dialog = Some(Dialog::Comment(at, String::new(), false));
         }
         self.dialogs(ctx);
-        self.share.windows(ctx, self.open.as_mut());
+        self.share
+            .windows(ctx, self.open.as_mut(), self.assistant.command_running());
         self.sync_session(ctx);
 
         let title = match &self.open {

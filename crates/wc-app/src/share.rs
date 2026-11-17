@@ -190,6 +190,15 @@ pub fn yield_to_session(local: &mut Project, base: &mut Project, auth: &Project)
         let Some(pos) = base.pages.iter().position(|p| p.id == id) else {
             continue;
         };
+        // The number on its own: both gave the page another number, the session's stays.
+        if let (Some(a), Some(l)) = (auth.page(&id), local.page_mut(&id)) {
+            let was = &base.pages[pos].number;
+            if a.number != *was && l.number != *was && l.number != a.number {
+                dropped.push(format!("the number of page {was}"));
+                l.number = a.number.clone();
+                base.pages[pos].number = a.number.clone();
+            }
+        }
         let b = &base.pages[pos];
         let a = auth.page(&id);
         let l = local.page(&id);
@@ -702,6 +711,11 @@ impl Share {
 
     fn take_back(&mut self, redo: bool, change: Option<u64>) -> Result<(), String> {
         let role = self.role.as_mut().ok_or("Not in a shared session.")?;
+        // Changes made since wait in the window until the first answer is back: a second undo
+        // sent now would reach the host ahead of them and take back an older change instead.
+        if role.taking_back() {
+            return Err("Your last undo is still on its way to the session; try again once it has come back.".into());
+        }
         role.take_back(redo, change, &mut self.notes)?;
         self.took_back = true;
         Ok(())
@@ -921,13 +935,27 @@ impl Share {
     }
 
     /// The session windows: the share and join forms, the participants, and join requests.
-    pub fn windows(&mut self, ctx: &egui::Context, open: Option<&mut Open>) {
+    /// `busy`: an assistant command owns the project files, so nothing is taken back now.
+    pub fn windows(&mut self, ctx: &egui::Context, open: Option<&mut Open>, busy: bool) {
         self.requests(ctx);
         match self.view {
             View::Closed => {}
             View::Share => self.share_window(ctx, open),
             View::Join => self.join_window(ctx),
-            View::Status => self.status_window(ctx),
+            View::Status => self.status_window(ctx, busy),
+        }
+    }
+
+    /// "Undo this change" from the session window. Refused while an assistant command owns the
+    /// project files: the host's restore writes them. A refusal goes to the notes.
+    pub(crate) fn ask_revert(&mut self, change: u64, busy: bool) {
+        let r = if busy {
+            Err("Undo waits until the assistant's command has finished.".to_owned())
+        } else {
+            self.revert(change)
+        };
+        if let Err(e) = r {
+            self.notes.push(e);
         }
     }
 
@@ -1081,7 +1109,7 @@ impl Share {
         }
     }
 
-    fn status_window(&mut self, ctx: &egui::Context) {
+    fn status_window(&mut self, ctx: &egui::Context, busy: bool) {
         let Some(role) = self.role.as_ref() else {
             self.view = View::Closed;
             return;
@@ -1145,7 +1173,11 @@ impl Share {
                                     ChangeKind::Edit => "Put back what this change touched, for everyone",
                                     _ => "Take this undo or redo back, for everyone",
                                 };
-                                if ui.small_button("Undo this change").on_hover_text(tip).clicked() {
+                                let button = ui
+                                    .add_enabled(!busy, egui::Button::new("Undo this change").small())
+                                    .on_hover_text(tip)
+                                    .on_disabled_hover_text("Waits until the assistant's command has finished");
+                                if button.clicked() {
                                     revert = Some(c.id);
                                 }
                             }
@@ -1160,8 +1192,7 @@ impl Share {
                 stop = ui.button(label).clicked();
             });
         if let Some(id) = revert {
-            // A refusal is in the notes.
-            let _ = self.revert(id);
+            self.ask_revert(id, busy);
         }
         if stop {
             self.stop();

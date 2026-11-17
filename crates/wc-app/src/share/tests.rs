@@ -690,6 +690,35 @@ fn a_page_removed_while_its_renumbering_is_undone_stays() {
 }
 
 #[test]
+fn a_page_numbered_on_both_sides_keeps_the_sessions_number() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    // The undo gave page 1 its old number back; this window gave it another one.
+    auth.pages[0].number = "7".into();
+    local.pages[0].number = "9".into();
+    local.pages[0].title = "Mine".into();
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["the number of page 1"]);
+    assert_eq!(
+        (local.pages[0].number.as_str(), base.pages[0].number.as_str()),
+        ("7", "7")
+    );
+    assert_eq!(
+        local.pages[0].title, "Mine",
+        "the content change is a part of its own and stays"
+    );
+    // The same new number on both sides is no clash.
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let mut auth = base.clone();
+    auth.pages[0].number = "7".into();
+    let mut local = auth.clone();
+    assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
+}
+
+#[test]
 fn a_page_removed_while_its_undo_is_on_its_way_stays_in_the_session() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
@@ -740,6 +769,62 @@ fn a_title_block_field_changed_while_an_undo_is_on_its_way_does_not_cancel_it() 
         g.take_notes()
             .iter()
             .any(|n| n.contains("project properties") && n.contains("was not kept"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_second_guest_undo_waits_for_the_first_to_come_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "First".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Second".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    // Made while the first undo is on its way, so not sent yet: a second undo now would take
+    // back "Second" ahead of it.
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Third".into();
+    let err = g.undo().err().ok_or("a second undo was sent")?;
+    assert!(err.contains("still on its way"), "{err}");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        log.messages().iter().filter(|m| m.starts_with("Undo")).count(),
+        1,
+        "only one undo reached the host"
+    );
+    Ok(())
+}
+
+#[test]
+fn undo_this_change_waits_while_an_assistant_command_owns_the_files() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let original = host_open.project.page("p0002").ok_or("no page")?.title.clone();
+    host_open.project.page_mut("p0002").ok_or("no page")?.title = "First".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let change = h
+        .role
+        .as_ref()
+        .ok_or("no session")?
+        .history()
+        .last()
+        .map(|c| c.id)
+        .ok_or("no change")?;
+    let before = log.messages().len();
+    h.ask_revert(change, true);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages().len(), before, "nothing was taken back");
+    assert!(h.take_notes().iter().any(|n| n.contains("assistant's command")));
+    assert_eq!(host_open.project.page("p0002").map(|p| p.title.as_str()), Some("First"));
+    h.ask_revert(change, false);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        host_open.project.page("p0002").map(|p| p.title.as_str()),
+        Some(original.as_str()),
+        "taken back once the command is done"
     );
     Ok(())
 }
