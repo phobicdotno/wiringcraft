@@ -81,6 +81,9 @@ pub enum Item {
     Pin(usize),
 }
 
+/// Reads a library symbol by id: the symbol and the source it came from, or why not.
+pub type OpenSymbol<'a> = dyn FnMut(&str) -> Result<(Symbol, String), String> + 'a;
+
 /// A library folder the symbol can be saved into: `(source name, folder)`.
 pub type Target = (String, PathBuf);
 
@@ -95,6 +98,13 @@ pub struct SymbolEditor {
     pub target: usize,
     /// The id the symbol had when it was opened (`None` for a new symbol).
     pub opened_as: Option<String>,
+    /// The library folder it was opened from (or last saved into). Only that file may be
+    /// replaced by a save; a symbol with the same id in another folder is not overwritten.
+    opened_from: Option<PathBuf>,
+    /// The project folder the editor belongs to; it closes when another project is opened.
+    pub owner: Option<PathBuf>,
+    /// True while property edits run on: they join one undo step until something else happens.
+    props_dirty: bool,
     /// Text the Text tool places.
     pub text: String,
     /// Name the Pin tool gives the next pin.
@@ -110,6 +120,10 @@ pub struct SymbolEditor {
 pub struct Saved {
     pub id: String,
     pub path: PathBuf,
+    /// The library source it was saved into.
+    pub source: String,
+    /// The symbol as saved.
+    pub symbol: Symbol,
 }
 
 fn blank() -> Symbol {
@@ -139,9 +153,9 @@ fn next_name(name: &str) -> String {
         return name.to_owned();
     }
     let (head, num) = name.split_at(name.len() - digits);
-    match num.parse::<u64>() {
-        Ok(n) => format!("{head}{}", n + 1),
-        Err(_) => name.to_owned(),
+    match num.parse::<u64>().ok().and_then(|n| n.checked_add(1)) {
+        Some(n) => format!("{head}{n}"),
+        None => name.to_owned(),
     }
 }
 
@@ -186,6 +200,9 @@ impl SymbolEditor {
             targets,
             target: 0,
             opened_as: None,
+            opened_from: None,
+            owner: None,
+            props_dirty: false,
             text: String::new(),
             pin_name: "1".into(),
             message: String::new(),
@@ -198,7 +215,9 @@ impl SymbolEditor {
     /// `targets`.
     pub fn edit(symbol: Symbol, source: &str, targets: Vec<Target>) -> Self {
         let mut e = Self::new(targets);
-        e.target = e.targets.iter().position(|(n, _)| n == source).unwrap_or(0);
+        let from = e.targets.iter().position(|(n, _)| n == source);
+        e.target = from.unwrap_or(0);
+        e.opened_from = from.and_then(|i| e.targets.get(i)).map(|(_, root)| root.clone());
         e.opened_as = Some(symbol.id.clone());
         e.pin_name = symbol.pins.last().map_or_else(|| "1".into(), |p| next_name(&p.name));
         e.symbol = symbol;
@@ -207,6 +226,7 @@ impl SymbolEditor {
     }
 
     fn checkpoint(&mut self) {
+        self.props_dirty = false;
         self.undo.push(self.symbol.clone());
         if self.undo.len() > 100 {
             self.undo.remove(0);
@@ -219,6 +239,7 @@ impl SymbolEditor {
 
     pub fn undo(&mut self) {
         if let Some(s) = self.undo.pop() {
+            self.props_dirty = false;
             self.symbol = s;
             self.selected = None;
             self.clicks.clear();
@@ -231,12 +252,29 @@ impl SymbolEditor {
         self.clicks.clear();
     }
 
-    /// A click on the drawing at `p` (mm, symbol coordinates), snapped to the grid.
+    /// The properties (id, name, a pin's name or direction...) were changed from `before` by
+    /// the form. Typing on in the form stays one undo step until something else happens.
+    pub fn note_property_edit(&mut self, before: Symbol) {
+        if self.symbol == before {
+            return;
+        }
+        if !self.props_dirty {
+            self.undo.push(before);
+            if self.undo.len() > 100 {
+                self.undo.remove(0);
+            }
+            self.props_dirty = true;
+        }
+    }
+
+    /// A click on the drawing at `p` (mm, symbol coordinates). Drawing snaps to the grid;
+    /// selecting uses the point as clicked, so shapes off the grid can be picked too.
     pub fn click(&mut self, p: Point) {
+        let raw = p;
         let p = snap(p);
         self.message.clear();
         match self.tool {
-            Tool::Select => self.selected = self.pick(p),
+            Tool::Select => self.selected = self.pick(raw),
             Tool::Line | Tool::Rect | Tool::Circle => {
                 let Some(&a) = self.clicks.first() else {
                     self.clicks.push(p);
@@ -301,8 +339,8 @@ impl SymbolEditor {
                     self.message = format!("There is already a pin {name}.");
                     return;
                 }
-                if let Some(i) = self.symbol.pins.iter().position(|q| q.at == p) {
-                    self.message = format!("Pin {} is already there.", self.symbol.pins[i].name);
+                if let Some(q) = self.symbol.pins.iter().find(|q| q.at == p) {
+                    self.message = format!("Pin {} is already there.", q.name);
                     return;
                 }
                 self.checkpoint();
@@ -405,24 +443,28 @@ impl SymbolEditor {
         self.symbol.id = self.symbol.id.trim().to_owned();
         let id = self.symbol.id.clone();
         let file = root.join("symbols").join(format!("{id}.json"));
-        if self.opened_as.as_deref() != Some(id.as_str()) && file.exists() {
+        let same =
+            self.opened_as.as_deref() == Some(id.as_str()) && self.opened_from.as_deref() == Some(root.as_path());
+        if !same && file.exists() {
             return Err(format!(
                 "Library {source} already has a symbol {id}; choose another id, or open that symbol to change it."
             ));
         }
         let path = wc_library::write_symbol(&root, &self.symbol).map_err(|e| e.to_string())?;
         self.opened_as = Some(id.clone());
+        self.opened_from = Some(root.clone());
         self.message = format!("Saved {id} into library {source}.");
-        Ok(Saved { id, path })
+        Ok(Saved {
+            id,
+            path,
+            source,
+            symbol: self.symbol.clone(),
+        })
     }
 
     /// The editor window. Returns what was saved this frame, and false once it was closed.
     /// `open_symbol` is asked for a library symbol picked in "Open", by id.
-    pub fn show(
-        &mut self,
-        ctx: &egui::Context,
-        open_symbol: &mut dyn FnMut(&str) -> Option<(Symbol, String)>,
-    ) -> (Option<Saved>, bool) {
+    pub fn show(&mut self, ctx: &egui::Context, open_symbol: &mut OpenSymbol<'_>) -> (Option<Saved>, bool) {
         let mut keep = true;
         let mut saved = None;
         let mut close = false;
@@ -485,7 +527,7 @@ impl SymbolEditor {
         (saved, keep && !close)
     }
 
-    fn properties(&mut self, ui: &mut egui::Ui, open_symbol: &mut dyn FnMut(&str) -> Option<(Symbol, String)>) {
+    fn properties(&mut self, ui: &mut egui::Ui, open_symbol: &mut OpenSymbol<'_>) {
         if !self.choices.is_empty() {
             let mut pick = None;
             egui::ComboBox::from_id_salt("symbol_editor_open")
@@ -500,15 +542,18 @@ impl SymbolEditor {
                 });
             if let Some(id) = pick {
                 match open_symbol(&id) {
-                    Some((s, source)) => {
+                    Ok((s, source)) => {
                         let choices = std::mem::take(&mut self.choices);
+                        let owner = self.owner.take();
                         *self = Self::edit(s, &source, std::mem::take(&mut self.targets));
                         self.choices = choices;
+                        self.owner = owner;
                     }
-                    None => self.message = format!("Symbol {id} could not be read."),
+                    Err(e) => self.message = format!("Symbol {id} could not be read: {e}"),
                 }
             }
         }
+        let before = self.symbol.clone();
         egui::Grid::new("symbol_editor_props").num_columns(2).show(ui, |ui| {
             ui.label("Id");
             ui.text_edit_singleline(&mut self.symbol.id);
@@ -578,6 +623,7 @@ impl SymbolEditor {
                 }
             });
         }
+        self.note_property_edit(before);
     }
 
     fn drawing(&mut self, ui: &mut egui::Ui) {
@@ -750,7 +796,13 @@ mod tests {
         e.pin_name = "A1".into();
         e.click(Point::new(10.0, 0.0));
         assert_eq!(e.symbol.pins.len(), 2);
-        assert!(!e.message.is_empty());
+        assert!(e.message.contains("already a pin A1"), "{}", e.message);
+        e.pin_name = "X9".into();
+        e.click(Point::new(0.0, 5.0));
+        assert_eq!(e.symbol.pins.len(), 2);
+        assert!(e.message.contains("Pin A2 is already there"), "{}", e.message);
+        // The last possible number does not overflow.
+        assert_eq!(next_name("18446744073709551615"), "18446744073709551615");
         // No library folder: cannot be saved, and says why.
         assert!(e.problems().iter().any(|p| p.contains("library folder")));
     }
@@ -784,6 +836,15 @@ mod tests {
         e.set_tool(Tool::Select);
         e.click(Point::new(10.0, 12.5));
         assert_eq!(e.selected, Some(Item::Shape(1)));
+        // A shape off the grid (from an import) is picked where it is clicked, not snapped.
+        e.symbol.graphics.push(Shape::Line {
+            a: Point::new(20.0, 1.25),
+            b: Point::new(30.0, 1.25),
+        });
+        e.click(Point::new(25.0, 1.3));
+        assert_eq!(e.selected, Some(Item::Shape(3)));
+        e.symbol.graphics.pop();
+        e.selected = Some(Item::Shape(1));
         e.delete_selected();
         assert_eq!(e.symbol.graphics.len(), 2);
         e.undo();
@@ -858,6 +919,61 @@ mod tests {
         let mut dup = SymbolEditor::new(vec![("mine".into(), lib)]);
         draw_coil(&mut dup);
         assert!(dup.save().is_err_and(|m| m.contains("already has")));
+        Ok(())
+    }
+
+    #[test]
+    fn property_edits_are_one_undo_step_each() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        let drawn = e.symbol.clone();
+        // Typing the name letter by letter: one step.
+        for name in ["R", "Re", "Relay"] {
+            let before = e.symbol.clone();
+            e.symbol.name = name.into();
+            e.note_property_edit(before);
+        }
+        let before = e.symbol.clone();
+        e.note_property_edit(before); // a frame without a change adds nothing
+        e.undo();
+        assert_eq!(e.symbol, drawn, "the drawing stays, only the typing is undone");
+        // A property edit after drawing does not take the drawing with it.
+        e.set_tool(Tool::Line);
+        e.click(Point::new(-10.0, -10.0));
+        e.click(Point::new(-5.0, -10.0));
+        let lines = e.symbol.graphics.len();
+        let before = e.symbol.clone();
+        e.symbol.pins[0].name = "X1".into();
+        e.note_property_edit(before);
+        e.undo();
+        assert_eq!(e.symbol.pins[0].name, "A1");
+        assert_eq!(e.symbol.graphics.len(), lines);
+    }
+
+    #[test]
+    fn a_symbol_with_the_same_id_in_another_folder_is_not_overwritten() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        let targets = vec![("a".to_owned(), a.clone()), ("b".to_owned(), b.clone())];
+        let mut first = SymbolEditor::new(targets.clone());
+        draw_coil(&mut first);
+        first.save()?;
+        let mut other = SymbolEditor::new(targets.clone());
+        draw_coil(&mut other);
+        other.symbol.name = "Folder B's coil".into();
+        other.target = 1;
+        other.save()?;
+
+        // Opened from A, then pointed at B: B's own symbol stays.
+        let (s, _) = (first.symbol.clone(), ());
+        let mut e = SymbolEditor::edit(s, "a", targets);
+        e.target = 1;
+        assert!(e.save().is_err_and(|m| m.contains("already has")));
+        let kept: Symbol = wc_core::store::read_json(&b.join("symbols").join("test.coil.json"))?;
+        assert_eq!(kept.name, "Folder B's coil");
+        // Back to A it saves.
+        e.target = 0;
+        assert_eq!(e.save()?.source, "a");
         Ok(())
     }
 }
