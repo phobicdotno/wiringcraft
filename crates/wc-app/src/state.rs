@@ -159,11 +159,12 @@ pub struct Open {
     /// and Redo can put back the version the restored lock names.
     symbol_versions: BTreeMap<String, Symbol>,
     /// Symbols whose vendored file may hold another version than the one loaded, after a
-    /// failed Undo or Redo could not put a file back. The next Undo or Redo writes them again.
+    /// failed Undo or Redo (or a command's result) could not be put back. The next Undo, Redo
+    /// or save writes them again.
     stale_symbol_files: std::collections::BTreeSet<String>,
     /// Tests: whether each coming symbol file write fails, in order.
     #[cfg(test)]
-    fail_symbol_writes: std::collections::VecDeque<bool>,
+    pub(crate) fail_symbol_writes: std::collections::VecDeque<bool>,
     /// Tests: a file that turns into a folder once the update's backups are taken, so the
     /// update's write of it fails after other items were already written.
     #[cfg(test)]
@@ -573,6 +574,28 @@ impl Open {
             .map_err(|e| e.to_string())
     }
 
+    /// Remember that a symbol's vendored file may hold another version than the loaded one;
+    /// the next save, Undo or Redo writes the loaded version again.
+    pub(crate) fn mark_symbol_file_stale(&mut self, id: &str) {
+        self.stale_symbol_files.insert(id.to_owned());
+    }
+
+    /// Write the loaded version of every symbol whose file may hold another one. A save does
+    /// not go ahead while one of them cannot be written, since the saved lock would not match.
+    fn rewrite_stale_symbol_files(&mut self) -> Result<(), String> {
+        for id in self.stale_symbol_files.clone() {
+            let Some(sym) = self.symbols.get(&id).cloned() else {
+                self.stale_symbol_files.remove(&id);
+                continue;
+            };
+            self.write_symbol_file(&sym).map_err(|e| {
+                format!("not saved: the file of symbol {id} still holds another version and cannot be written: {e}")
+            })?;
+            self.stale_symbol_files.remove(&id);
+        }
+        Ok(())
+    }
+
     /// Keep the loaded symbol versions, so a step that replaces them can be undone.
     pub fn archive_symbols(&mut self) {
         for sym in self.symbols.values() {
@@ -704,6 +727,7 @@ impl Open {
 
     pub fn save(&mut self) -> Result<usize, String> {
         self.follow_terminals();
+        self.rewrite_stale_symbol_files()?;
         let n = store::save(&self.dir, &self.project).map_err(|e| e.to_string())?.len();
         self.dirty = false;
         Ok(n)

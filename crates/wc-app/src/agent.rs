@@ -2105,12 +2105,17 @@ impl App {
         if by_command && by_window {
             // The window's project, and so its symbol lock, is kept: its symbol files go back
             // over the ones the command wrote, so the lock and the files still match.
+            // A symbol the pages use counts too: a project from before the lock can use one
+            // without a lock entry, and it is loaded from its file all the same.
+            let used = open.project.used_symbols();
             let mut unrestored = Vec::new();
             for (id, sym) in open.symbols.clone() {
                 if fresh.symbols.get(&id) != Some(&sym)
-                    && open.project.lock.symbols.contains_key(&id)
+                    && (open.project.lock.symbols.contains_key(&id) || used.contains(&id))
                     && let Err(e) = open.write_symbol_file(&sym)
                 {
+                    // Saving writes it again, and does not go ahead until it can.
+                    open.mark_symbol_file_stale(&id);
                     unrestored.push(format!("{id} ({e})"));
                 }
             }
@@ -2122,7 +2127,8 @@ impl App {
                 format!(
                     "The project was edited in the window while the command ran, so the command's changes were \
                      not loaded: the window's edits are kept, and saving writes them over the command's result. \
-                     The command's version of these symbols is still in the project folder: {}.",
+                     The command's version of these symbols is still in the project folder, and saving \
+                     writes the window's version over it first: {}.",
                     unrestored.join(", ")
                 )
             });
@@ -2409,6 +2415,70 @@ mod tests {
         let saved = Open::load(&open.dir).unwrap();
         assert_eq!(saved.project.lock.symbols["wc.coil"].hash, old.hash());
         assert_eq!(saved.symbols["wc.coil"], old);
+    }
+
+    #[test]
+    fn a_used_symbol_without_a_lock_entry_is_put_back_when_the_window_changed_the_project_too() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        // A project from before the lock: the coil is used and loaded, but not pinned.
+        open.project.lock.symbols.remove("wc.coil");
+        open.save().unwrap();
+        let old = open.symbols["wc.coil"].clone();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut new = old.clone();
+        new.name = "Coil, from the command".into();
+        wc_core::store::write_vendored_symbol(&open.dir, &new).unwrap();
+        open.project.pages[0].title = "Edited in the window".into();
+        let on_disk = {
+            let mut p = a.assistant.command_base.as_ref().unwrap().1.clone();
+            p.pages[0].title = "Changed by the command".into();
+            p
+        };
+        wc_core::store::save(&a.open.as_ref().unwrap().dir, &on_disk).unwrap();
+        assert!(a.command_finish(Ok("Done.".into())).is_err());
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.symbols["wc.coil"], old);
+        assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), old);
+        open.save().unwrap();
+        assert_eq!(Open::load(&open.dir).unwrap().symbols["wc.coil"], old);
+    }
+
+    #[test]
+    fn a_symbol_file_that_could_not_be_put_back_is_written_before_the_next_save() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        open.save().unwrap();
+        let old = open.symbols["wc.coil"].clone();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut new = old.clone();
+        new.name = "Coil, from the command".into();
+        wc_core::store::write_vendored_symbol(&open.dir, &new).unwrap();
+        let mut on_disk = open.project.clone();
+        on_disk.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        wc_core::store::save(&open.dir, &on_disk).unwrap();
+        open.project.pages[0].title = "Edited in the window".into();
+        // Putting the window's version back fails, and so does the first save's retry.
+        open.fail_symbol_writes = [true, true].into();
+        let Err(answer) = a.command_finish(Ok("Done.".into())) else {
+            unreachable!("both sides changed the project")
+        };
+        assert!(answer.contains("wc.coil"), "{answer}");
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), new);
+        assert!(open.save().is_err(), "a save waits until the file is right again");
+        assert_eq!(
+            Open::load(&open.dir).unwrap().project.lock.symbols["wc.coil"].hash,
+            new.hash(),
+            "nothing was saved"
+        );
+        open.save().unwrap();
+        let saved = Open::load(&open.dir).unwrap();
+        assert_eq!(saved.project.lock.symbols["wc.coil"].hash, old.hash());
+        assert_eq!(saved.symbols["wc.coil"], old);
+        assert_eq!(saved.project.pages[0].title, "Edited in the window");
     }
 
     /// A second library folder after the starter one, holding its own `wc.coil`.
