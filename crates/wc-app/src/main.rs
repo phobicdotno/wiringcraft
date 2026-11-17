@@ -1291,7 +1291,19 @@ fn window_icon() -> egui::IconData {
                 height,
             }
         })
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            eprintln!("wiringcraft-app: the built-in icon could not be read ({e}); using the system default");
+            egui::IconData::default()
+        })
+}
+
+/// The main window: size, title and icon.
+fn main_viewport() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_inner_size([1400.0, 860.0])
+        .with_min_inner_size([900.0, 560.0])
+        .with_title("WiringCraft")
+        .with_icon(window_icon())
 }
 
 /// The starter symbol library: `library/` beside the executable or in the source tree.
@@ -1718,11 +1730,7 @@ fn main() -> eframe::Result {
     }
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 860.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("WiringCraft")
-            .with_icon(window_icon()),
+        viewport: main_viewport(),
         ..Default::default()
     };
     eframe::run_native("WiringCraft", options, Box::new(|cc| Ok(Box::new(App::new(cc, dir)))))
@@ -1735,5 +1743,11 @@ mod icon_tests {
         let icon = super::window_icon();
         assert_eq!((icon.width, icon.height), (256, 256));
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
+
+    #[test]
+    fn the_main_window_carries_the_icon() {
+        let icon = super::main_viewport().icon;
+        assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
     }
 }
