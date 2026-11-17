@@ -1666,28 +1666,24 @@ enum Picked {
 /// The system's folder picker, starting in `start` (or its nearest existing parent). Blocks the
 /// window while open, like any modal dialog.
 fn pick_folder(title: &str, start: &str) -> Picked {
-    // On Linux the picker is the desktop portal, reached over the session bus.
-    let bus = !cfg!(target_os = "linux") || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
-    if !bus {
-        return picker_outcome(None, std::time::Duration::ZERO, false);
-    }
+    // On Linux rfd tries the desktop portal, then zenity; both are given their chance.
     let mut dialog = rfd::FileDialog::new().set_title(title);
     if let Some(d) = picker_start(start) {
         dialog = dialog.set_directory(d);
     }
     let shown = std::time::Instant::now();
     let r = dialog.pick_folder();
-    picker_outcome(r, shown.elapsed(), true)
+    picker_outcome(r, shown.elapsed())
 }
 
 /// The picker reports a failure the same way as Cancel, so an answer quicker than anyone can
 /// click means it never showed.
-fn picker_outcome(r: Option<PathBuf>, open_for: std::time::Duration, bus: bool) -> Picked {
+fn picker_outcome(r: Option<PathBuf>, open_for: std::time::Duration) -> Picked {
     const NO_PORTAL: &str = "The folder picker could not open. On Linux it needs a desktop portal \
-                             (xdg-desktop-portal) in a desktop session. Type the folder instead.";
+                             (xdg-desktop-portal) or zenity in a desktop session. Type the folder instead.";
     match r {
         Some(d) => Picked::Folder(d),
-        None if !bus || open_for < std::time::Duration::from_millis(150) => {
+        None if open_for < std::time::Duration::from_millis(150) => {
             applog::warn(&format!(
                 "folder picker: no answer after {open_for:?}; taken as not opened"
             ));
@@ -2528,15 +2524,11 @@ mod picker_tests {
     fn a_picker_that_never_showed_says_so_instead_of_doing_nothing() {
         use std::time::Duration;
         let d = PathBuf::from("/x");
-        assert_eq!(picker_outcome(Some(d.clone()), Duration::ZERO, true), Picked::Folder(d));
-        assert_eq!(picker_outcome(None, Duration::from_secs(2), true), Picked::Cancelled);
+        assert_eq!(picker_outcome(Some(d.clone()), Duration::ZERO), Picked::Folder(d));
+        assert_eq!(picker_outcome(None, Duration::from_secs(2)), Picked::Cancelled);
         assert!(matches!(
-            picker_outcome(None, Duration::from_millis(5), true),
+            picker_outcome(None, Duration::from_millis(5)),
             Picked::Failed(e) if e.contains("desktop portal")
-        ));
-        assert!(matches!(
-            picker_outcome(None, Duration::from_secs(2), false),
-            Picked::Failed(_)
         ));
         // Typed text the dialogs refuse opens the picker in the projects folder.
         if cfg!(windows) {

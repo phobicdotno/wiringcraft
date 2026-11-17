@@ -179,6 +179,13 @@ fn resolve_typed(typed: &str, home: Option<&Path>, windows: bool, projects: &Pat
     {
         let home = home.ok_or("~ means the home folder, and this system has none; type a full path.")?;
         let rest = rest.trim_start_matches(sep);
+        // `~\C:foo` would join as `C:foo` and leave the home folder behind.
+        let b = rest.as_bytes();
+        if windows && b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return Err(format!(
+                "{t} names a drive after ~; type either ~\\folder or a full path."
+            ));
+        }
         return Ok(if rest.is_empty() {
             home.to_path_buf()
         } else {
@@ -342,6 +349,8 @@ mod tests {
         assert_eq!(r("~", false), Ok(home.clone()));
         assert_eq!(r(" ~/work/plant ", false), Ok(home.join("work/plant")));
         assert_eq!(r("~\\work", true), Ok(home.join("work")));
+        assert!(r("~\\C:foo", true).is_err());
+        assert!(r("~/d:\\x", true).is_err());
         // Only `~` alone or before a separator: `~work` is an ordinary name.
         assert_eq!(r("~work", false), Ok(projects.join("~work")));
         assert!(resolve_typed("~/x", None, false, &projects).is_err());
