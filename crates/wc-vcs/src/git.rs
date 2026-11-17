@@ -105,7 +105,7 @@ impl Git {
         let index_before = self.run(&["write-tree"]).ok().map(|t| t.trim().to_owned());
         self.run(&["add", "-A"])?;
         let staged = self.run(&["status", "--porcelain"])?;
-        let merging = self.git_path("MERGE_HEAD").exists();
+        let merging = self.git_path("MERGE_HEAD")?.exists();
         if staged.trim().is_empty() && !merging && self.head().is_some() {
             return Ok(None);
         }
@@ -141,9 +141,13 @@ impl Git {
         if self.run(&["config", "user.email"]).is_err() {
             args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"]);
         }
-        let busy = ["REVERT_HEAD", "CHERRY_PICK_HEAD", "MERGE_HEAD", "sequencer"]
-            .iter()
-            .find(|f| self.git_path(f).exists());
+        let mut busy = None;
+        for f in ["REVERT_HEAD", "CHERRY_PICK_HEAD", "MERGE_HEAD", "sequencer"] {
+            if self.git_path(f)?.exists() {
+                busy = Some(f);
+                break;
+            }
+        }
         if let Some(f) = busy {
             return Err(Error::Git {
                 args: format!("revert {commit}"),
@@ -154,7 +158,8 @@ impl Git {
         if let Err(e) = self.run(&args) {
             // Only this call's revert can be in progress here (checked above), so aborting it
             // cannot throw away earlier work.
-            if self.git_path("REVERT_HEAD").exists()
+            // When the lookup itself fails, try the abort anyway: no other operation was running.
+            if !self.git_path("REVERT_HEAD").is_ok_and(|p| !p.exists())
                 && let Err(abort) = self.run(&["revert", "--abort"])
             {
                 return Err(Error::Git {
@@ -171,11 +176,9 @@ impl Git {
 
     /// Where git keeps an operation file such as `REVERT_HEAD`. In a linked worktree `.git` is a
     /// file pointing elsewhere, so git is asked.
-    fn git_path(&self, name: &str) -> PathBuf {
-        match self.run(&["rev-parse", "--git-path", name]) {
-            Ok(out) => self.dir.join(out.trim()),
-            Err(_) => self.dir.join(".git").join(name),
-        }
+    fn git_path(&self, name: &str) -> Result<PathBuf> {
+        let out = self.run(&["rev-parse", "--git-path", name])?;
+        Ok(self.dir.join(out.trim()))
     }
 
     /// The author (`Name <email>`) and subject of a commit.
