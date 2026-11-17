@@ -1126,6 +1126,36 @@ mod discovery {
         Ok(())
     }
 
+    #[test]
+    fn one_poll_reads_at_most_its_budget_from_a_queue_that_never_empties() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let from: SocketAddr = "127.0.0.1:5000".parse()?;
+        let mut calls = 0usize;
+        let read = b.receive(|buf| {
+            calls += 1;
+            buf[..5].copy_from_slice(b"noise");
+            Ok((5, from))
+        })?;
+        assert_eq!(read, crate::discovery::MAX_PER_POLL);
+        assert_eq!(calls, crate::discovery::MAX_PER_POLL);
+
+        // A beacon behind the budget is picked up by the next poll, not lost.
+        let wire = beacon("Control", "Ola", 7003).encode();
+        let mut left = 3;
+        b.receive(|buf| {
+            if left == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            left -= 1;
+            buf[..wire.len()].copy_from_slice(&wire);
+            Ok((wire.len(), from))
+        })?;
+        let list = b.poll()?;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].addr, SocketAddr::new(from.ip(), 7003));
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_failing_announcement_keeps_its_reason() -> TestResult {

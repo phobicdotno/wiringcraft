@@ -40,7 +40,7 @@ pub const MAX_BEACON: usize = 2048;
 
 /// The most datagrams one [`Browser::poll`] reads, so a flood cannot hold up the window.
 /// The rest wait for the next poll.
-const MAX_PER_POLL: usize = 256;
+pub(crate) const MAX_PER_POLL: usize = 256;
 
 /// What a host announces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,14 +201,19 @@ impl Browser {
         Ok(self.socket.local_addr()?)
     }
 
-    /// Read the beacons that have arrived (at most a few hundred per call) and return the
-    /// sessions heard within the timeout, sorted by project name and host.
-    pub fn poll(&mut self) -> Result<Vec<Session>> {
+    /// Take datagrams from `recv` until it would block, at most [`MAX_PER_POLL`] of them, so
+    /// a sender that keeps the queue full cannot hold up a poll. Returns how many were read.
+    pub(crate) fn receive(
+        &mut self,
+        mut recv: impl FnMut(&mut [u8]) -> io::Result<(usize, SocketAddr)>,
+    ) -> Result<usize> {
         let mut buf = [0u8; MAX_BEACON];
+        let mut read = 0;
         for _ in 0..MAX_PER_POLL {
-            match self.socket.recv_from(&mut buf) {
+            match recv(&mut buf) {
                 Ok((n, from)) => {
-                    if let Some(b) = Beacon::decode(&buf[..n]) {
+                    read += 1;
+                    if let Some(b) = Beacon::decode(&buf[..n.min(buf.len())]) {
                         let addr = SocketAddr::new(from.ip(), b.port);
                         let s = Session {
                             project: b.project,
@@ -226,6 +231,14 @@ impl Browser {
                 Err(e) => return Err(e.into()),
             }
         }
+        Ok(read)
+    }
+
+    /// Read the beacons that have arrived (at most a few hundred per call) and return the
+    /// sessions heard within the timeout, sorted by project name and host.
+    pub fn poll(&mut self) -> Result<Vec<Session>> {
+        let socket = self.socket.try_clone()?;
+        self.receive(|buf| socket.recv_from(buf))?;
         let now = Instant::now();
         let keep = self.forget_after;
         self.heard.retain(|_, (_, at)| now.duration_since(*at) <= keep);
