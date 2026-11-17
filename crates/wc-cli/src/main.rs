@@ -2419,6 +2419,16 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
             ));
         }
     }
+    if let Some(panel) = built
+        .panels
+        .iter()
+        .find(|n| p.panels.iter().any(|have| have.id == n.id))
+    {
+        return Err(format!(
+            "panel {} exists; remove it or import into a fresh project",
+            panel.id
+        ));
+    }
     // A device the project already has under the same tag may come again only unchanged.
     if let Some((tag, _)) = built
         .devices
@@ -2465,6 +2475,8 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
     for loc in built.locations {
         p.meta.merge_location(loc);
     }
+    p.panels.extend(built.panels);
+    p.panels.sort_by(|a, b| a.id.cmp(&b.id));
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
     p.meta.fill_title_block(built.title_block);
     Ok(())
@@ -2834,6 +2846,46 @@ mod tests {
 
         std::fs::write(&file, "<catalog/>").unwrap();
         assert!(import_bmecat(&file, &lib).is_err());
+    }
+
+    #[test]
+    fn imported_panels_are_sorted_and_a_taken_panel_id_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let panel = |id: &str| wc_core::panel::Panel::new(id, id, 600.0, 800.0);
+        let mut p = load(&dir).unwrap();
+        let built = wc_import::aml::Built {
+            panels: vec![panel("swe-layout-b"), panel("swe-layout-a")],
+            ..Default::default()
+        };
+        add_built(&dir, &mut p, built, "import:a.tewzip").unwrap();
+        let ids = |p: &Project| p.panels.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+        // Sorted by the import itself, before saving (loading sorts too).
+        assert_eq!(ids(&p), ["swe-layout-a", "swe-layout-b"]);
+        save(&dir, &p).unwrap();
+
+        // A second import with a taken id is refused before anything changes.
+        let mut p = load(&dir).unwrap();
+        let before = p.clone();
+        let project_file = std::fs::read(dir.join("project.toml")).unwrap();
+        let part = wc_core::Part {
+            id: "maker.new-part".into(),
+            ..Default::default()
+        };
+        let built = wc_import::aml::Built {
+            panels: vec![panel("swe-layout-c"), panel("swe-layout-a")],
+            parts: vec![part],
+            ..Default::default()
+        };
+        let err = add_built(&dir, &mut p, built, "import:b.tewzip").unwrap_err();
+        assert!(err.contains("panel swe-layout-a exists"), "{err}");
+        assert_eq!(p, before);
+        assert!(
+            store::read_vendored_part(&dir, "maker.new-part").is_err(),
+            "no part file written"
+        );
+        assert_eq!(std::fs::read(dir.join("project.toml")).unwrap(), project_file);
     }
 
     #[test]

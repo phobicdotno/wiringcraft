@@ -197,7 +197,7 @@ For the other areas, the chapter to read in each help is:
 | 3D model export (STEP) | add-on | yes | yes | done |
 | 3D cabinet design with wire routing | add-on (Pro Panel) | yes (Electrical 3D) | no | later: one-way export to SolidCraft (phase 5) |
 | Drilling and NC data for plates | add-on | partly | no | not planned for now: belongs to the 3D side (SolidCraft) |
-| SolidWorks cabinet layouts on import | - | - | no | todo (#60) |
+| SolidWorks cabinet layouts on import | - | - | yes: each 2D cabinet layout page becomes a panel with its plate, rails, ducts and device footprints | done (#60) |
 
 ## 12. Checks
 
@@ -216,7 +216,7 @@ For the other areas, the chapter to read in each help is:
 | DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | yes: sampled curves, solid hatches filled | done |
 | DWG read and write | yes | yes | no | not planned: closed format; DXF covers it. SWE DWGs are #59 |
 | Import EPLAN projects | - | yes (some) | yes | done |
-| Import SolidWorks Electrical projects | no | - | yes | done; library parts, cable types and symbol blocks with `import swe-library` (#62); follow-ups #59, #60, #61, #108 |
+| Import SolidWorks Electrical projects | no | - | yes | done; library parts, cable types and symbol blocks with `import swe-library` (#62); cabinet layouts as panels (#60); follow-ups #59, #61, #108, #149 |
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |
 | AutomationML export | yes | partly | yes | done |
 | List exchange as CSV (import and export) | yes | yes | yes | done |

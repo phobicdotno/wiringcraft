@@ -1421,6 +1421,7 @@ pub fn build_with(
         devices: BTreeMap::new(),
         locations: Vec::new(),
         title_block: p.info.as_ref().map(SweProjectInfo::title_block).unwrap_or_default(),
+        panels: Vec::new(),
     };
     // Locations, with their descriptions. One without a usable tag path cannot be named.
     let mut locations_untagged = 0;
@@ -2114,6 +2115,10 @@ pub fn build_with(
         );
     }
 
+    // Cabinet layout pages become panel layouts with the devices placed on them.
+    let layouts = cabinet::layouts(p, &tags, &built.devices);
+    built.panels.clone_from(&layouts.panels);
+
     if unknown_component > 0 {
         warnings.push(format!(
             "{unknown_component} symbol(s) refer to a component the database does not have; they are drawn without a tag"
@@ -2150,8 +2155,12 @@ pub fn build_with(
             note: note(vec![
                 (covers, "cover page(s)"),
                 (
-                    others.saturating_sub(covers),
-                    "report, layout or other non-schematic page(s) (WiringCraft makes its own reports)",
+                    layouts.panels.len(),
+                    "cabinet layout page(s), imported as panel layouts",
+                ),
+                (
+                    others.saturating_sub(covers).saturating_sub(layouts.panels.len()),
+                    "report or other non-schematic page(s) (WiringCraft makes its own reports), or empty layout page(s)",
                 ),
             ]),
         },
@@ -2292,6 +2301,26 @@ pub fn build_with(
     ];
     // The project's own fields: which ones print, and which are only kept in the project.
     let mut report = report;
+    if layouts.items_in > 0 {
+        report.push(Count {
+            what: "cabinet layout items",
+            source: layouts.items_in,
+            imported: layouts.rails + layouts.ducts + layouts.devices,
+            note: note(vec![
+                (
+                    layouts.estimated,
+                    "device(s) placed with an estimated 18 x 90 mm footprint: no box size in the source",
+                ),
+                (layouts.no_size, "rail(s) or duct(s) without a length"),
+                (layouts.upright, "upright rail(s): WiringCraft rails run left to right"),
+                (layouts.plates, "plate(s) giving the panel size"),
+                (
+                    layouts.other,
+                    "other plate, text, frame or other graphics, or a device that was not imported",
+                ),
+            ]),
+        });
+    }
     if let Some(info) = &p.info {
         let fields = info.title_block();
         let printed = ["customer", "project_number", "drawn_by", "date"];
@@ -2316,6 +2345,8 @@ pub fn build_with(
     }
     (built, warnings, report)
 }
+
+pub mod cabinet;
 
 #[cfg(test)]
 mod tests;
