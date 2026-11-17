@@ -904,7 +904,8 @@ INSERT INTO tew_symbol VALUES (20, 10, 201, 'Terminal', 150, 200, 0, 1, 1, NULL,
 INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5), (21, 0, 0, 0, 5), (21, 0, 1, 0, -5);
 INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0), (61, 21, 0, 202, 0);
 INSERT INTO tew_componentterminal VALUES (60, 0, NULL), (60, 1, NULL), (61, 0, NULL), (61, 1, NULL);
-INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL);
+INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL), (11, 10, 170, 205, 170, 215, NULL);
+INSERT INTO tew_linewirepair VALUES (10, 80, 1), (11, 81, 1);
 INSERT INTO tew_wire VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1), (81, NULL, -1, 'N2', 61, 0, 50, 0),
   (82, NULL, -1, '', 60, 0, 99, 0), (83, NULL, -1, '', 0, 0, 0, 0);
 ",
@@ -1319,4 +1320,41 @@ fn a_mirrored_box_turned_90_degrees_has_its_corner_mirrored_too() {
         (corner.x - 110.0).abs() < 1e-9 && (corner.y - 135.0).abs() < 1e-9,
         "{corner:?}"
     );
+}
+
+#[test]
+fn wire_records_without_a_drawn_line_are_counted_with_their_reason() {
+    let c = sample_with_strip();
+    // A jumper X1.1 upper to X1.2 lower, and a record X1.2 lower to K1:A2, neither on a line.
+    c.execute_batch(
+        "INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 60, 0, 61, 1), (91, NULL, -1, '', 61, 1, 50, 1);",
+    )
+    .unwrap();
+    let (_, warnings, report) = build(&read(&c).unwrap(), None);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(
+        ends.note.contains("1 are jumpers between terminals of one strip"),
+        "{}",
+        ends.note
+    );
+    assert!(
+        ends.note
+            .contains("1 are in the source's wire list but on no drawn line"),
+        "{}",
+        ends.note
+    );
+    assert!(
+        ends.note.contains("1 join terminals that are not connected"),
+        "only N2: {}",
+        ends.note
+    );
+    let apart = warnings
+        .iter()
+        .find(|w| w.contains("not connected on the imported drawing"))
+        .unwrap();
+    assert!(apart.starts_with("1 wire(s)"), "{apart}");
 }
