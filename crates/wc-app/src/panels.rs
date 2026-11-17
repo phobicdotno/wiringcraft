@@ -255,18 +255,28 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
                 if r.clicked() {
                     pick(ed);
                 }
+                // The cover page opens its form; other pages their properties.
+                let r = if p.cover {
+                    r.on_hover_text("Cover page: double-click to edit the project's name and fields")
+                } else {
+                    r
+                };
                 if r.double_clicked() {
-                    out.push(Action::PageProps);
+                    out.push(if p.cover { Action::CoverPage } else { Action::PageProps });
                 }
                 r.context_menu(|ui| {
                     pick(ed);
                     for a in [
+                        Action::CoverPage,
                         Action::PageProps,
                         Action::DuplicatePage,
                         Action::PageUp,
                         Action::PageDown,
                         Action::DeletePage,
                     ] {
+                        if a == Action::CoverPage && !p.cover {
+                            continue;
+                        }
                         let enabled = match a {
                             Action::PageUp => i > 0,
                             Action::PageDown => i + 1 < open.project.pages.len(),
@@ -279,6 +289,16 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
                         }
                     }
                 });
+            }
+            if open.project.cover_page().is_none() {
+                ui.add_space(4.0);
+                if ui
+                    .small_button("+ Cover page")
+                    .on_hover_text(Action::CoverPage.info().tip)
+                    .clicked()
+                {
+                    out.push(Action::CoverPage);
+                }
             }
         });
     if !open.project.panels.is_empty() {

@@ -294,7 +294,9 @@ pub fn create(dir: &Path, name: &str) -> Result<Project> {
         return Err(Error::Invalid(format!("{} already holds a project", dir.display())));
     }
     let mut project = Project::new(name);
-    project.pages.push(Page::new("p0001", "1", "Cover"));
+    let mut cover = Page::new("p0001", "1", "Cover");
+    cover.cover = true;
+    project.pages.push(cover);
     save(dir, &project)?;
     Ok(project)
 }
@@ -425,6 +427,24 @@ mod tests {
         p.panels.clear();
         save(dir.path(), &p)?;
         assert!(!dir.path().join("panels/main.panel.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_project_starts_with_its_cover_page_and_older_pages_load_as_normal_pages() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let p = create(dir.path(), "A")?;
+        assert_eq!(p.cover_page(), Some(0));
+        assert_eq!(load(dir.path())?.cover_page(), Some(0), "saved with the project");
+        // A page written before cover pages existed has no `cover` key and is a normal page.
+        let old: Page = serde_json::from_str(r#"{"id":"p0001","number":"1","title":"Cover"}"#)
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        assert!(!old.cover);
+        let normal = serde_json::to_string(&Page::new("p2", "2", "x")).map_err(|e| Error::Invalid(e.to_string()))?;
+        assert!(
+            !normal.contains("cover"),
+            "normal pages keep their files as before: {normal}"
+        );
         Ok(())
     }
 
