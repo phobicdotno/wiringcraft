@@ -17,7 +17,7 @@ wc-pdf.workspace = true
 wc-report.workspace = true
 wc-agent.workspace = true
 serde_json.workspace = true
-eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.31", default-features = false, features = ["glow", "wgpu", "default_fonts", "x11", "wayland"] }
 serde.workspace = true
 toml.workspace = true
 image.workspace = true

@@ -1710,14 +1710,52 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
+    let wanted = std::env::var(RENDERER_VAR).ok();
+    let renderer = match wanted.as_deref() {
+        Some("wgpu") => eframe::Renderer::Wgpu,
+        _ => eframe::Renderer::Glow,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([900.0, 560.0])
             .with_title("WiringCraft"),
+        renderer,
         ..Default::default()
     };
-    eframe::run_native("WiringCraft", options, Box::new(|cc| Ok(Box::new(App::new(cc, dir)))))
+    let result = eframe::run_native("WiringCraft", options, Box::new(|cc| Ok(Box::new(App::new(cc, dir)))));
+    // No usable OpenGL (a remote desktop session, a virtual machine, a missing graphics driver
+    // often offer only OpenGL 1.1): start again on wgpu (Direct3D, Metal or Vulkan, with a
+    // software fallback). A window system cannot be started twice in one process, so this is a
+    // new process. Set WIRINGCRAFT_RENDERER=wgpu to skip the first try.
+    if let Err(e) = &result
+        && wanted.is_none()
+        && opengl_failed(e)
+    {
+        eprintln!("wiringcraft-app: OpenGL is not usable ({e}); starting again with wgpu");
+        let status = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env(RENDERER_VAR, "wgpu")
+                .status()
+        });
+        match status {
+            Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+            Err(err) => eprintln!("wiringcraft-app: could not start again with wgpu: {err}"),
+        }
+    }
+    result
+}
+
+/// Environment variable that picks the graphics backend: `glow` (OpenGL, the default) or `wgpu`.
+const RENDERER_VAR: &str = "WIRINGCRAFT_RENDERER";
+
+/// Whether starting the app failed because OpenGL is missing or too old.
+fn opengl_failed(e: &eframe::Error) -> bool {
+    matches!(
+        e,
+        eframe::Error::OpenGL(_) | eframe::Error::Glutin(_) | eframe::Error::NoGlutinConfigs(..)
+    )
 }
 
 #[cfg(test)]
