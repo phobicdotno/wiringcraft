@@ -243,7 +243,7 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
                 ItemKind::Part => project
                     .devices
                     .iter()
-                    .filter(|(_, d)| d.part.as_deref() == Some(id.as_str()))
+                    .filter(|(_, d)| d.uses_part(&id))
                     .map(|(t, _)| t.to_string())
                     .collect(),
             };

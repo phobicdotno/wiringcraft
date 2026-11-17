@@ -131,6 +131,55 @@ fn parts_list_groups_by_part_and_lists_gaps() {
 }
 
 #[test]
+fn parts_list_counts_accessories_with_their_quantity() {
+    let (mut p, s, mut parts) = fixture();
+    let marker = wc_core::Part {
+        id: "acme.marker".into(),
+        manufacturer: "Acme".into(),
+        order_number: "MK-1".into(),
+        description: "Marker".into(),
+        ..Default::default()
+    };
+    parts.insert(marker.id.clone(), marker);
+    let relay = parts.keys().find(|k| *k != "acme.marker").cloned().unwrap();
+    let k1 = DeviceTag::parse("=A+C1-K1").unwrap();
+    let d = p.devices.get_mut(&k1).unwrap();
+    // Two markers, and the relay again as a spare: 1 + 1 relays.
+    d.accessories = vec![
+        wc_core::DevicePart {
+            part: "acme.marker".into(),
+            qty: 2,
+        },
+        wc_core::DevicePart {
+            part: relay.clone(),
+            qty: 1,
+        },
+    ];
+    // -P1 has only accessories: it is no longer a gap.
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            accessories: vec![wc_core::DevicePart {
+                part: "acme.marker".into(),
+                qty: 3,
+            }],
+            ..Default::default()
+        },
+    );
+    let t = parts_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let row = |order: &str| t.rows.iter().find(|r| r[3] == order).unwrap().clone();
+    assert_eq!(row("MK-1")[1], "5");
+    assert_eq!(row("MK-1")[5], "-P1, =A+C1-K1");
+    assert_eq!(row("R-24, DC")[1], "2");
+    assert_eq!(row("R-24, DC")[5], "=A+C1-K1");
+    assert_eq!(t.rows.iter().filter(|r| r[4] == "no part assigned").count(), 3);
+}
+
+#[test]
 fn interruption_points_are_not_devices() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);

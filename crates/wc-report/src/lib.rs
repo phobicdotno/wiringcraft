@@ -233,27 +233,36 @@ fn pages_of(p: &Project, uses: &[(String, String)]) -> String {
 }
 
 /// Parts list (bill of materials): one row per part, with quantity and the devices using it.
-/// Devices without a part come last so the gaps are visible.
+/// A device's accessories count with their quantity. Devices without any part come last so the
+/// gaps are visible.
 pub fn parts_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Parts list",
         &["Pos", "Qty", "Manufacturer", "Order number", "Description", "Devices"],
     );
-    let mut by_part: BTreeMap<String, Vec<DeviceTag>> = BTreeMap::new();
+    let mut by_part: BTreeMap<String, (u64, Vec<DeviceTag>)> = BTreeMap::new();
     let mut without: Vec<DeviceTag> = Vec::new();
     for tag in all_tags(i) {
-        match i.project.devices.get(&tag).and_then(|d| d.part.clone()) {
-            Some(part) => by_part.entry(part).or_default().push(tag),
-            None => without.push(tag),
+        let parts = i.project.devices.get(&tag).map(|d| d.all_parts()).unwrap_or_default();
+        if parts.is_empty() {
+            without.push(tag);
+            continue;
+        }
+        for (part, qty) in parts {
+            let (n, tags) = by_part.entry(part.to_owned()).or_default();
+            *n += u64::from(qty);
+            if tags.last() != Some(&tag) {
+                tags.push(tag.clone());
+            }
         }
     }
     let mut pos = 0;
-    for (part_id, tags) in &by_part {
+    for (part_id, (qty, tags)) in &by_part {
         pos += 1;
         let part = i.parts.get(part_id);
         t.rows.push(vec![
             pos.to_string(),
-            tags.len().to_string(),
+            qty.to_string(),
             part.map(|p| p.manufacturer.clone()).unwrap_or_default(),
             part.map(|p| p.order_number.clone()).unwrap_or_else(|| part_id.clone()),
             part.map(|p| p.description.clone())
