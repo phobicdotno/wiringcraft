@@ -94,6 +94,16 @@ fn load_spec(open: &Open, page: usize, ids: &[String], ps: &mut PanelState) {
     }
 }
 
+/// Forget the wire spec drafts when this frame shows no wire rows (a panel, a symbol, a comment,
+/// the page): coming back to the same wires then reloads their values instead of an old draft.
+fn forget_spec_unless_wires(ed: &Editor, ps: &mut PanelState) {
+    let wires =
+        ed.panel.is_none() && !ed.selection.is_empty() && ed.selection.iter().all(|s| matches!(s, Selection::Wire(_)));
+    if !wires {
+        ps.spec_for = Default::default();
+    }
+}
+
 /// Rows for cross-section, colour and type of the given wires, inside a two-column grid. A value
 /// typed in is set on all of them; emptying a field clears it on all of them. A field nobody typed
 /// in changes nothing, so tabbing through a field the wires differ in keeps their own values.
@@ -429,6 +439,7 @@ fn committed(r: &egui::Response) -> bool {
 pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState) {
     let t = Theme::of(ui.ctx());
     section(ui, "Properties", None);
+    forget_spec_unless_wires(ed, ps);
     if let Some(pi) = ed.panel {
         panel_properties(ui, open, ed, pi);
         return;
@@ -1091,5 +1102,24 @@ fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
             ui.label(RichText::new(m).monospace());
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_drafts_are_forgotten_when_no_wire_rows_show() {
+        let mut ps = PanelState::default();
+        let mut wire = Editor::default();
+        wire.selection = vec![Selection::Wire("w1".into())];
+        ps.spec_for = (0, vec!["w1".into()]);
+        forget_spec_unless_wires(&wire, &mut ps);
+        assert_eq!(ps.spec_for, (0, vec!["w1".into()]), "the wire rows show: kept");
+        let mut symbol = Editor::default();
+        symbol.selection = vec![Selection::Symbol("s1".into())];
+        forget_spec_unless_wires(&symbol, &mut ps);
+        assert_eq!(ps.spec_for, (0, Vec::new()), "a symbol shows: forgotten");
     }
 }

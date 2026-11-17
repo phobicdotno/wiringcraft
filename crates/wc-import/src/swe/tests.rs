@@ -1445,3 +1445,28 @@ fn a_wire_on_a_line_without_usable_end_points_still_counts_as_drawn() {
         .unwrap();
     assert!(apart.contains("wire N8"), "{apart}");
 }
+
+#[test]
+fn a_cable_core_keeps_its_own_wire_s_spec() {
+    let c = sample();
+    // Line 1 carries the cable wire 70 (no spec) and wire 71 (with one).
+    c.execute_batch(
+        "UPDATE tew_wire SET wir_sectiontype = 0, wir_sectionorgauge = '1.5', wir_color = 'RD' WHERE wir_id = 71;
+         INSERT INTO tew_linewirepair VALUES (1, 71, 2);",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    let (built, _, report) = build(&p, None);
+    let cabled: Vec<&Wire> = built
+        .pages
+        .iter()
+        .flat_map(|pg| pg.wires.iter())
+        .filter(|w| w.cable.is_some())
+        .collect();
+    assert!(!cabled.is_empty());
+    for w in cabled {
+        assert_eq!(w.spec, WireSpec::default(), "71's section is not put on 70's core");
+    }
+    let wires = report.iter().find(|c| c.what == "wires").unwrap();
+    assert!(wires.note.contains("no section or colour"), "{}", wires.note);
+}

@@ -1380,6 +1380,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut cores_not_shown = 0usize;
     let mut multi_number_lines = 0usize;
     let mut numbers_not_shown = 0usize;
+    let mut specs_not_shown = 0usize;
     let mut wires_on_zero_length: BTreeSet<i64> = BTreeSet::new();
     // Component terminal (`cel_id`, `cte_no`) -> the pin drawn for it, and a label for messages.
     let mut drawn_at: BTreeMap<(i64, i64), (PinRef, String)> = BTreeMap::new();
@@ -1679,12 +1680,21 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 .map(|w| w.tag.trim())
                 .find(|t| !t.is_empty())
                 .map(str::to_owned);
-            // Section and colour of the first wire that has them, like the number.
-            let spec = wires
-                .iter()
-                .map(|w| w.spec.clone())
-                .find(|s| !s.is_empty())
-                .unwrap_or_default();
+            // Section and colour: those of the wire whose cable core the line shows, so core and
+            // spec belong to one wire; without a cable, those of the first wire that has them.
+            let spec = match cored {
+                Some(w) => {
+                    if w.spec.is_empty() && wires.iter().any(|o| !o.spec.is_empty()) {
+                        specs_not_shown += 1;
+                    }
+                    w.spec.clone()
+                }
+                None => wires
+                    .iter()
+                    .map(|w| w.spec.clone())
+                    .find(|s| !s.is_empty())
+                    .unwrap_or_default(),
+            };
             // Without a number the equipotential is still one net: name it after its id, so its
             // wires stay connected and two such nets stay apart.
             let potential = l
@@ -1940,6 +1950,10 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 (
                     numbers_not_shown,
                     "other wire number(s) on those lines are left off that line's wire",
+                ),
+                (
+                    specs_not_shown,
+                    "line(s) show a cable core whose wire has no section or colour; another wire's are left off",
                 ),
                 (
                     multi_core_lines,
