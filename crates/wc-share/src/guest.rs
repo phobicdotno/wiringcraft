@@ -39,6 +39,9 @@ pub struct Guest {
     /// it kept it; only the answer to the last one is applied, so an answer to an older edit
     /// never replaces newer work.
     in_flight: BTreeMap<String, usize>,
+    /// Undo, redo and revert requests sent and not answered yet. The host answers each with
+    /// its restoration (a `Restore` edit by this guest) or a refusal.
+    taking_back: usize,
 }
 
 impl Default for Guest {
@@ -59,6 +62,7 @@ impl Guest {
             refusals: Vec::new(),
             switching: None,
             in_flight: BTreeMap::new(),
+            taking_back: 0,
         }
     }
 
@@ -131,17 +135,26 @@ impl Guest {
 
     /// Take back this guest's last change. The host puts back only what that change touched
     /// and sends the result to everyone.
-    pub fn undo(&self) -> GuestMsg {
+    pub fn undo(&mut self) -> GuestMsg {
+        self.taking_back += 1;
         GuestMsg::Undo
     }
 
-    pub fn redo(&self) -> GuestMsg {
+    pub fn redo(&mut self) -> GuestMsg {
+        self.taking_back += 1;
         GuestMsg::Redo
     }
 
     /// Take back one change from the session's list, also someone else's.
-    pub fn revert(&self, change: u64) -> GuestMsg {
+    pub fn revert(&mut self, change: u64) -> GuestMsg {
+        self.taking_back += 1;
         GuestMsg::Revert { change }
+    }
+
+    /// Whether an undo, redo or revert is on its way and its result has not arrived: a page
+    /// built from this copy now would still hold what the host is putting back.
+    pub fn taking_back(&self) -> bool {
+        self.taking_back > 0
     }
 
     pub fn handle(&mut self, msg: HostMsg) {
@@ -165,6 +178,7 @@ impl Guest {
             HostMsg::Closed => {
                 self.status = GuestStatus::Closed;
                 self.locks.clear();
+                self.taking_back = 0;
             }
             HostMsg::PageChanged { page, .. } => {
                 if self.answered(&page.id) {
@@ -174,7 +188,10 @@ impl Guest {
                     *p = page;
                 }
             }
-            HostMsg::ProjectChanged { edit, .. } => {
+            HostMsg::ProjectChanged { edit, by } => {
+                if matches!(edit, ProjectEdit::Restore { .. }) && Some(by) == self.me {
+                    self.taking_back = self.taking_back.saturating_sub(1);
+                }
                 if let Some(p) = self.project.as_mut() {
                     apply_edit(p, &edit);
                 }
@@ -194,6 +211,10 @@ impl Guest {
             }
             HostMsg::Peers { peers } => self.peers = peers,
             HostMsg::Refused { refusal } => {
+                // The host answers in order and the app sends nothing while a take-back is on
+                // its way, so a refusal now is most likely its answer. One for an earlier
+                // message ends the wait early at worst, as before this was tracked.
+                self.taking_back = self.taking_back.saturating_sub(1);
                 match &refusal {
                     Refusal::PageLocked { page, .. } if self.switching_to(page) => self.switching = None,
                     Refusal::UnknownPage { page } if self.switching_to(page) => self.switching = None,

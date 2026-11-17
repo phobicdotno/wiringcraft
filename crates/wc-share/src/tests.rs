@@ -1344,7 +1344,9 @@ fn undo_takes_back_only_your_own_change() -> TestResult {
 
     // Ola's undo takes back Ola's page only; Kari's later change stays.
     a_link.send(a.undo())?;
+    assert!(a.taking_back(), "waiting for the host's restoration");
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(!a.taking_back() && !b.taking_back());
     let host = s.host.project();
     assert!(host.page("p0002").is_some_and(|p| p.symbols.is_empty()));
     assert_eq!(host.page("p0003"), Some(&pb));
@@ -1469,6 +1471,7 @@ fn undoing_a_removed_page_brings_it_back_with_its_comments_unless_someone_holds_
     a_link.send(a.undo())?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     assert!(matches!(a.refusals.last(), Some(Refusal::PageLocked { .. })));
+    assert!(!a.taking_back(), "a refusal answers the undo too");
     assert_eq!(s.host.project(), &before);
 
     // A restore sent as a plain edit is refused: only undo makes one, after its checks.

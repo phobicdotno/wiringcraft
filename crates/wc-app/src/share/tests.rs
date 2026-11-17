@@ -606,3 +606,52 @@ fn wire_numbering_in_a_session_leaves_pages_others_hold_and_says_so() -> TestRes
     assert_eq!(log.messages()[before..], ["Edit page 1 Cover", "Edit page 2 Motor"]);
     Ok(())
 }
+
+#[test]
+fn a_page_changed_on_both_sides_takes_the_sessions_version() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    base.pages.push(Page::new("p2", "2", "Two"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    // Both changed page 1; only this window changed page 2.
+    auth.pages[0].title = "Restored".into();
+    local.pages[0].title = "Local".into();
+    local.pages[1].title = "Mine".into();
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["1"]);
+    assert_eq!(
+        (local.pages[0].title.as_str(), base.pages[0].title.as_str()),
+        ("Restored", "Restored")
+    );
+    assert_eq!(local.pages[1].title, "Mine", "kept");
+}
+
+#[test]
+fn a_guest_sends_nothing_until_its_undo_has_come_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "First".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    // Edited before the host answered: this page still holds "First" under the edit.
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "First, then more".into();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert_eq!(
+        guest_open.project.page("p0003").map(|p| p.title.as_str()),
+        Some("First, then more"),
+        "the change waits in the window"
+    );
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for open in [&host_open, &guest_open] {
+        assert_eq!(open.project.page("p0003").map(|p| p.title.as_str()), Some("Valves"));
+    }
+    assert_eq!(
+        log.messages(),
+        ["Edit page 3 First", "Undo: Edit page 3 First"],
+        "the stale page never went out"
+    );
+    assert!(g.take_notes().iter().any(|n| n.contains("was not kept")));
+    Ok(())
+}

@@ -444,6 +444,9 @@ impl App {
             // Undoing in a shared session takes back only this person's own change: the whole
             // project is not swapped, so other people's work stays.
             Action::Undo | Action::Redo if self.share.active() => {
+                // Changes not synced yet (an assistant's, made with no frame in between) go into
+                // the session's history first, so Undo takes back the latest one.
+                self.sync_session_now(false);
                 // A refusal is in the session's notes, which the status line shows.
                 let _ = if a == Action::Undo {
                     self.share.undo()

@@ -2507,6 +2507,50 @@ mod tests {
     }
 
     #[test]
+    fn undo_from_the_toolbar_first_sends_what_was_not_synced() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let k7 = wc_core::DeviceTag::parse("-K7").unwrap();
+        let k8 = wc_core::DeviceTag::parse("-K8").unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.project.devices.insert(k7.clone(), wc_core::Device::default());
+        a.share.frame(a.open.as_mut(), None, false);
+        // -K8 is made with no frame before Undo: Undo takes back -K8, not -K7.
+        let open = a.open.as_mut().unwrap();
+        open.project.devices.insert(k8.clone(), wc_core::Device::default());
+        a.run(Action::Undo);
+        a.share.frame(a.open.as_mut(), None, false);
+        let devices = &a.open.as_ref().unwrap().project.devices;
+        assert!(!devices.contains_key(&k8) && devices.contains_key(&k7));
+        a.share.stop();
+    }
+
+    #[test]
+    fn a_page_edit_made_right_after_an_undo_does_not_bring_back_what_it_took_back() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let shown = Some("p0002".to_owned());
+        a.share.frame(a.open.as_mut(), shown.clone(), false);
+        let original = page2(&a).title.clone();
+        a.open.as_mut().unwrap().project.page_mut("p0002").unwrap().title = "First".into();
+        a.share.frame(a.open.as_mut(), shown.clone(), false);
+        assert!(a.share.undo().is_ok());
+        // Edited before the frame that brings the undo's result: built on the old page.
+        a.open.as_mut().unwrap().project.page_mut("p0002").unwrap().title = "First, then more".into();
+        a.share.frame(a.open.as_mut(), shown.clone(), false);
+        assert_eq!(page2(&a).title, original, "the undo is kept");
+        a.share.frame(a.open.as_mut(), shown, false);
+        assert_eq!(page2(&a).title, original, "and not sent over afterwards");
+        assert!(
+            a.share.take_notes().iter().any(|n| n.contains("was not kept")),
+            "the dropped change is reported"
+        );
+        a.share.stop();
+    }
+
+    #[test]
     fn undo_in_a_shared_session_does_not_take_back_work_from_before_it() {
         let (_tmp, mut a) = app(vec![]);
         call(

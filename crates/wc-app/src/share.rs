@@ -169,6 +169,25 @@ pub fn outgoing(
     out
 }
 
+/// Pages changed both in this window and in the session since the last sync (`base`): the
+/// session's version wins on them, in `local` and in `base`, so the page sent next is not built
+/// on content an undo has just put back. Returns the numbers of the pages whose local change
+/// was dropped.
+pub fn yield_to_session(local: &mut Project, base: &mut Project, auth: &Project) -> Vec<String> {
+    let mut dropped = Vec::new();
+    for p in &mut local.pages {
+        let (Some(b), Some(a)) = (base.page_mut(&p.id), auth.page(&p.id)) else {
+            continue;
+        };
+        if !same_content(p, b) && !same_content(a, b) {
+            dropped.push(p.number.clone());
+            *p = a.clone();
+            *b = a.clone();
+        }
+    }
+    dropped
+}
+
 /// Make `local` the session's project `auth`, changing only what differs. The symbol lock stays
 /// local: each person's copy keeps its own symbol files. Returns whether anything changed.
 pub fn incoming(local: &mut Project, auth: &Project) -> bool {
@@ -256,6 +275,14 @@ impl Role {
         match self {
             Role::Host(h) => Some(h.host.project()),
             Role::Guest(j) => j.guest.project.as_ref(),
+        }
+    }
+
+    /// Whether an undo, redo or revert of this person's is still on its way to the host.
+    fn taking_back(&self) -> bool {
+        match self {
+            Role::Host(_) => false,
+            Role::Guest(j) => j.guest.taking_back(),
         }
     }
 
@@ -492,6 +519,9 @@ pub struct Share {
     form: Option<Form>,
     /// Messages for the status line, oldest first.
     notes: Vec<String>,
+    /// An undo, redo or revert was asked for since the last sync: its restoration wins over
+    /// local changes made in the meantime to the same pages.
+    took_back: bool,
 }
 
 impl Share {
@@ -541,26 +571,24 @@ impl Share {
     /// parts that change touched, so other people's work stays; the result reaches this
     /// window with the next frame's sync.
     pub fn undo(&mut self) -> Result<(), String> {
-        match self.role.as_mut() {
-            Some(role) => role.take_back(false, None, &mut self.notes),
-            None => Err("Not in a shared session.".into()),
-        }
+        self.take_back(false, None)
     }
 
     /// Take back this person's own last undo in the session.
     pub fn redo(&mut self) -> Result<(), String> {
-        match self.role.as_mut() {
-            Some(role) => role.take_back(true, None, &mut self.notes),
-            None => Err("Not in a shared session.".into()),
-        }
+        self.take_back(true, None)
     }
 
     /// Take back one change from the session's list, also someone else's.
     pub fn revert(&mut self, change: u64) -> Result<(), String> {
-        match self.role.as_mut() {
-            Some(role) => role.take_back(false, Some(change), &mut self.notes),
-            None => Err("Not in a shared session.".into()),
-        }
+        self.take_back(false, Some(change))
+    }
+
+    fn take_back(&mut self, redo: bool, change: Option<u64>) -> Result<(), String> {
+        let role = self.role.as_mut().ok_or("Not in a shared session.")?;
+        role.take_back(redo, change, &mut self.notes)?;
+        self.took_back = true;
+        Ok(())
     }
 
     pub fn take_notes(&mut self) -> Vec<String> {
@@ -660,6 +688,7 @@ impl Share {
         }
         self.base = None;
         self.opened = None;
+        self.took_back = false;
         if self.view == View::Status {
             self.view = View::Closed;
         }
@@ -708,7 +737,9 @@ impl Share {
             return None;
         }
         role.project()?;
-        if busy {
+        // Until the host's answer to an undo is here, a page built from this copy would still
+        // hold what the undo puts back: changes wait in the window, unsent.
+        if busy || role.taking_back() {
             return None;
         }
         // Open the shown page in the session; a page someone else held is asked for again once
@@ -725,6 +756,17 @@ impl Share {
             self.asked_at = Some(std::time::Instant::now());
         }
         let base = self.base.get_or_insert_with(|| open.project.clone());
+        if std::mem::take(&mut self.took_back)
+            && let Some(auth) = role.project()
+        {
+            let lost = yield_to_session(&mut open.project, base, auth);
+            if !lost.is_empty() {
+                self.notes.push(format!(
+                    "Your change on page {} was not kept: the undo changed that page at the same time.",
+                    lost.join(", ")
+                ));
+            }
+        }
         let mine = page.as_deref().filter(|p| role.holds(p));
         let me = role.me().unwrap_or(HOST);
         let mut out = outgoing(&open.project, base, mine, &role.locks(), me);
