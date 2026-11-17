@@ -1,12 +1,13 @@
 # Release builds to download and try: the app (`wiringcraft-app`) and the command line
 # (`wiringcraft`) for Windows, Linux and macOS, as one zip per system on the run's page under
-# "Artifacts". Runs on every push to main and on demand (Actions > Build > Run workflow), also for
-# a pull request's branch. Installers are the next step (#47).
+# "Artifacts". Runs on every push to main, on pull requests, and on demand (Actions > Build > Run
+# workflow). Installers are the next step (#47).
 name: Build
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
