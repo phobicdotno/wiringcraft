@@ -737,5 +737,100 @@ fn a_failed_commit_leaves_the_folder_as_it_was() -> TestResult {
     assert!(matches!(added, Err(Refusal::NotRecorded { .. })), "{added:?}");
     assert_eq!(host.project(), &project);
     assert_eq!(store::load(dir)?, project, "the saved files are put back too");
+    let staged = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["diff", "--cached", "--name-only"])
+        .output()?;
+    assert!(
+        staged.stdout.is_empty(),
+        "nothing of the refused change stays staged: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+    Ok(())
+}
+
+#[test]
+fn an_old_lock_list_does_not_reopen_a_page_while_switching() -> TestResult {
+    let mut s = Session::new();
+    let (a_id, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(a.can_edit("p0002"));
+
+    a_link.send(a.open(Some("p0003")))?;
+    // A lock list sent before the host saw the switch arrives now.
+    a.handle(HostMsg::Locks {
+        locks: [("p0002".to_owned(), a_id)].into_iter().collect(),
+    });
+    assert!(!a.can_edit("p0002"), "no edits while the switch is unanswered");
+    let page = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    assert!(a.edit_page(page).is_none());
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(a.can_edit("p0003"));
+    assert!(!a.can_edit("p0002"));
+    Ok(())
+}
+
+#[test]
+fn an_edit_made_after_an_old_answer_keeps_the_newer_work() -> TestResult {
+    let log = Shared::default();
+    let mut s = Session {
+        host: Host::new(
+            demo(),
+            "Hanna Host",
+            "h@x.no",
+            Box::new(Flaky {
+                fail: 1,
+                log: log.clone(),
+            }),
+        ),
+        hub: Hub::new(),
+        log,
+    };
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+
+    // Edit A (will fail to record) and edit B go out; the host answers both.
+    let mut page = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place(&mut page, "s1", 10.0);
+    a_link.send(a.edit_page(page.clone()).ok_or("lock")?)?;
+    place(&mut page, "s2", 20.0);
+    a_link.send(a.edit_page(page).ok_or("lock")?)?;
+    s.hub.pump(&mut s.host);
+    let mut answers = a_link.drain().into_iter();
+    // Only the answer to A is read before Ola makes edit C from the copy.
+    for msg in answers.by_ref() {
+        let is_page = matches!(msg, HostMsg::PageChanged { .. });
+        a.handle(msg);
+        if is_page {
+            break;
+        }
+    }
+    let mut c = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    assert_eq!(c.symbols.len(), 2, "the answer to A did not wipe B from the copy");
+    place(&mut c, "s3", 30.0);
+    a_link.send(a.edit_page(c).ok_or("lock")?)?;
+    answers.for_each(|m| a.handle(m));
+    s.pump(&mut [(&a_link, &mut a)]);
+    let kept = s.host.project().page("p0002").ok_or("page")?;
+    assert_eq!(kept.symbols.len(), 3, "B and C are both kept");
+    assert_eq!(a.project.as_ref().and_then(|p| p.page("p0002")), Some(kept));
     Ok(())
 }

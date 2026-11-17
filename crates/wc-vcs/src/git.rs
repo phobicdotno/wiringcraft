@@ -101,9 +101,11 @@ impl Git {
     }
 
     fn commit_inner(&self, message: &str, author: Option<&str>) -> Result<Option<String>> {
+        // What was staged before, so a failed commit can put the index back as it was.
+        let index_before = self.run(&["write-tree"]).ok().map(|t| t.trim().to_owned());
         self.run(&["add", "-A"])?;
         let staged = self.run(&["status", "--porcelain"])?;
-        let merging = self.dir.join(".git").join("MERGE_HEAD").exists();
+        let merging = self.git_path("MERGE_HEAD").exists();
         if staged.trim().is_empty() && !merging && self.head().is_some() {
             return Ok(None);
         }
@@ -117,7 +119,17 @@ impl Git {
         if let Some(a) = &author_arg {
             args.push(a);
         }
-        self.run(&args)?;
+        if let Err(e) = self.run(&args) {
+            if let Some(tree) = &index_before
+                && let Err(undo) = self.run(&["read-tree", tree])
+            {
+                return Err(Error::Git {
+                    args: "commit".into(),
+                    message: format!("{e}; putting the staged files back also failed: {undo}"),
+                });
+            }
+            return Err(e);
+        }
         Ok(self.head())
     }
 

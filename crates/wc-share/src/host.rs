@@ -316,6 +316,10 @@ impl Host {
         // The display number is project-level: only `Renumber` changes it.
         page.number = current.number.clone();
         if *current == page {
+            // Nothing changed, but the author still gets its answer (see `Guest::edit_page`).
+            if by != HOST {
+                self.outbox.push((by, HostMsg::PageChanged { page, by }));
+            }
             return Ok(());
         }
         let before = std::mem::replace(current, page.clone());

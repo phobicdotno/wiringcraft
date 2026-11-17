@@ -30,6 +30,12 @@ pub struct Guest {
     pub peers: Vec<Peer>,
     /// Refusals from the host not yet shown to the user.
     pub refusals: Vec<Refusal>,
+    /// A page switch the host has not answered yet: the page asked for.
+    switching: Option<Option<String>>,
+    /// Page edits sent and not answered yet, by page. The host answers each with the page as
+    /// it kept it; only the answer to the last one is applied, so an answer to an older edit
+    /// never replaces newer work.
+    in_flight: BTreeMap<String, usize>,
 }
 
 impl Default for Guest {
@@ -47,6 +53,8 @@ impl Guest {
             locks: BTreeMap::new(),
             peers: Vec::new(),
             refusals: Vec::new(),
+            switching: None,
+            in_flight: BTreeMap::new(),
         }
     }
 
@@ -69,7 +77,7 @@ impl Guest {
 
     /// Whether this guest may edit the page now (it has the page open).
     pub fn can_edit(&self, page: &str) -> bool {
-        self.me.is_some() && self.locks.get(page) == self.me.as_ref()
+        self.me.is_some() && self.switching.is_none() && self.locks.get(page) == self.me.as_ref()
     }
 
     /// Ask to open a page. The page held so far is given up at once, so nothing is edited
@@ -79,6 +87,9 @@ impl Guest {
         if let Some(me) = self.me {
             self.locks.retain(|_, holder| *holder != me);
         }
+        // Nothing is editable until the host answers: a lock list already on its way could
+        // otherwise hand the old page back.
+        self.switching = Some(page.map(str::to_owned));
         GuestMsg::Open {
             page: page.map(str::to_owned),
         }
@@ -94,6 +105,7 @@ impl Guest {
         let mut page = page;
         page.number = current.number.clone();
         *current = page.clone();
+        *self.in_flight.entry(page.id.clone()).or_default() += 1;
         Some(GuestMsg::EditPage { page })
     }
 
@@ -124,6 +136,9 @@ impl Guest {
                 self.locks.clear();
             }
             HostMsg::PageChanged { page, .. } => {
+                if self.answered(&page.id) {
+                    return;
+                }
                 if let Some(p) = self.project.as_mut().and_then(|p| p.page_mut(&page.id)) {
                     *p = page;
                 }
@@ -133,9 +148,49 @@ impl Guest {
                     apply_edit(p, &edit);
                 }
             }
-            HostMsg::Locks { locks } => self.locks = locks,
+            HostMsg::Locks { locks } => {
+                if let Some(asked) = &self.switching {
+                    let done = match asked {
+                        Some(page) => self.me.is_some() && locks.get(page) == self.me.as_ref(),
+                        None => !locks.values().any(|h| Some(*h) == self.me),
+                    };
+                    if done {
+                        self.switching = None;
+                    }
+                }
+                self.locks = locks;
+            }
             HostMsg::Peers { peers } => self.peers = peers,
-            HostMsg::Refused { refusal } => self.refusals.push(refusal),
+            HostMsg::Refused { refusal } => {
+                match &refusal {
+                    Refusal::PageLocked { page, .. } if self.switching_to(page) => self.switching = None,
+                    Refusal::UnknownPage { page } if self.switching_to(page) => self.switching = None,
+                    // An edit of a page that is gone gets no page back.
+                    Refusal::UnknownPage { page } => {
+                        self.answered(page);
+                    }
+                    _ => {}
+                }
+                self.refusals.push(refusal);
+            }
         }
+    }
+
+    fn switching_to(&self, page: &str) -> bool {
+        matches!(&self.switching, Some(Some(p)) if p == page)
+    }
+
+    /// Count one answer to an edit of `page`; true while newer edits of it are still unanswered,
+    /// so this answer must not replace the guest's copy.
+    fn answered(&mut self, page: &str) -> bool {
+        let Some(n) = self.in_flight.get_mut(page) else {
+            return false;
+        };
+        *n -= 1;
+        if *n == 0 {
+            self.in_flight.remove(page);
+            return false;
+        }
+        true
     }
 }

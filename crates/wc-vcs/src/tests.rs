@@ -158,6 +158,7 @@ fn a_failed_revert_in_a_linked_worktree_is_undone() -> Result<()> {
         .map_err(|e| wc_core::Error::io("git", e))?;
     assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
     let text = std::fs::read_to_string(wt.join("note.txt")).map_err(|e| wc_core::Error::io("read", e))?;
-    assert_eq!(text, "three\n");
+    // Windows checkouts may turn the line end into CRLF.
+    assert_eq!(text.trim_end(), "three");
     Ok(())
 }
