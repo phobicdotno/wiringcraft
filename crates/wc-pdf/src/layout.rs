@@ -242,6 +242,21 @@ pub struct FrameMark {
 /// The page frame: border, numbered column strip and title block, filled from the project's
 /// title-block fields. The editor and the PDF both draw this list, so they always match.
 /// `date` is shown when the project has no `date` field of its own.
+/// The text height for `t` so it is at most `room` millimetres wide: `height` when it fits,
+/// smaller when it does not. Long texts are drawn smaller so they stay inside their box; text is
+/// never wrapped.
+fn fit_height(t: &str, height: f64, room: f64) -> f64 {
+    let w = text_width_mm(t, height);
+    if w > room && room > 0.0 {
+        height * room / w
+    } else {
+        height
+    }
+}
+
+/// Padding between a title-block text and its box's sides, in millimetres.
+const PAD: f64 = 1.5;
+
 pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, date: &str) -> Vec<FrameMark> {
     let (w, h) = page.size.mm();
     let (x0, y0, x1, y1) = (MARGIN, MARGIN, w - MARGIN, h - MARGIN);
@@ -334,32 +349,46 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
     line((fx[2], mid), (x1, mid), Ink::Thin, &mut out);
     // The page's own fields (its revision, date, ...) win over the project's.
     let get = |k: &str| page.title_field(&project.meta, k);
-    let field = |x: f64, y: f64, label: &str, value: &str, height: f64, out: &mut Vec<FrameMark>| {
-        text((x + 1.5, y + 3.0), 1.8, Align::Left, label, Ink::Label, out);
-        text((x + 1.5, y + 9.5), height, Align::Left, value, Ink::Thin, out);
+    // Each value is shrunk to the width of its box (less padding), so a long one never runs into
+    // the next box or over the frame.
+    let field = |x: f64, w: f64, y: f64, label: &str, value: &str, height: f64, out: &mut Vec<FrameMark>| {
+        text((x + PAD, y + 3.0), 1.8, Align::Left, label, Ink::Label, out);
+        let h = fit_height(value, height, w - 2.0 * PAD);
+        text((x + PAD, y + 9.5), h, Align::Left, value, Ink::Thin, out);
     };
-    field(fx[0], ty, "Customer", get("customer"), 3.0, &mut out);
-    field(fx[0], mid, "Drawn by", get("drawn_by"), 2.5, &mut out);
-    field(fx[0] + 40.0, mid, "Checked by", get("checked_by"), 2.5, &mut out);
+    // A centred value in a box from `x` that is `w` wide.
+    let centred = |x: f64, w: f64, y: f64, value: &str, height: f64, out: &mut Vec<FrameMark>| {
+        let h = fit_height(value, height, w - 2.0 * PAD);
+        text((x + w / 2.0, y), h, Align::Center, value, Ink::Thin, out);
+    };
+    field(fx[0], fx[1] - fx[0], ty, "Customer", get("customer"), 3.0, &mut out);
+    field(fx[0], 40.0, mid, "Drawn by", get("drawn_by"), 2.5, &mut out);
+    field(
+        fx[0] + 40.0,
+        fx[1] - fx[0] - 40.0,
+        mid,
+        "Checked by",
+        get("checked_by"),
+        2.5,
+        &mut out,
+    );
     text(
-        (fx[1] + 1.5, ty + 3.0),
+        (fx[1] + PAD, ty + 3.0),
         1.8,
         Align::Left,
         "Project",
         Ink::Label,
         &mut out,
     );
-    text(
-        (fx[1] + 3.0, ty + 11.0),
-        4.0,
-        Align::Left,
-        &project.meta.name,
-        Ink::Thin,
-        &mut out,
-    );
+    // The project box's texts start 3 mm in.
+    let project_room = fx[2] - fx[1] - 3.0 - PAD;
+    let name = &project.meta.name;
+    let name_h = fit_height(name, 4.0, project_room);
+    text((fx[1] + 3.0, ty + 11.0), name_h, Align::Left, name, Ink::Thin, &mut out);
+    let title_h = fit_height(&page.title, 3.0, project_room);
     text(
         (fx[1] + 3.0, ty + 19.5),
-        3.0,
+        title_h,
         Align::Left,
         &page.title,
         Ink::Thin,
@@ -369,55 +398,37 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect();
+    let numbers = numbers.join("  \u{b7}  ");
+    let numbers_h = fit_height(&numbers, 2.2, fx[2] - fx[1] - 2.0 - PAD);
     text(
         (fx[2] - 2.0, ty + 22.0),
-        2.2,
+        numbers_h,
         Align::Right,
-        &numbers.join("  \u{b7}  "),
+        &numbers,
         Ink::Thin,
         &mut out,
     );
-    field(fx[2], ty, "Revision", get("revision"), 2.5, &mut out);
+    field(fx[2], fx[3] - fx[2], ty, "Revision", get("revision"), 2.5, &mut out);
     let d = if get("date").trim().is_empty() {
         date
     } else {
         get("date")
     };
-    field(fx[2], mid, "Date", d, 2.5, &mut out);
-    text((fx[3] + 1.5, ty + 3.0), 1.8, Align::Left, "Page", Ink::Label, &mut out);
+    field(fx[2], fx[3] - fx[2], mid, "Date", d, 2.5, &mut out);
+    text((fx[3] + PAD, ty + 3.0), 1.8, Align::Left, "Page", Ink::Label, &mut out);
+    centred(fx[3], fx[4] - fx[3], ty + 10.5, &page.number, 4.0, &mut out);
     text(
-        (fx[3] + 15.0, ty + 10.5),
-        4.0,
-        Align::Center,
-        &page.number,
-        Ink::Thin,
-        &mut out,
-    );
-    text(
-        (fx[3] + 1.5, mid + 3.0),
+        (fx[3] + PAD, mid + 3.0),
         1.8,
         Align::Left,
         "Location",
         Ink::Label,
         &mut out,
     );
-    text(
-        (fx[3] + 15.0, mid + 9.5),
-        2.5,
-        Align::Center,
-        get("location"),
-        Ink::Thin,
-        &mut out,
-    );
-    text((fx[4] + 1.5, ty + 3.0), 1.8, Align::Left, "Sheet", Ink::Label, &mut out);
-    text(
-        (fx[4] + 15.0, ty + 10.0),
-        3.0,
-        Align::Center,
-        &format!("{} / {}", index + 1, total),
-        Ink::Thin,
-        &mut out,
-    );
+    centred(fx[3], fx[4] - fx[3], mid + 9.5, get("location"), 2.5, &mut out);
+    text((fx[4] + PAD, ty + 3.0), 1.8, Align::Left, "Sheet", Ink::Label, &mut out);
+    let sheet = format!("{} / {}", index + 1, total);
+    centred(fx[4], x1 - fx[4], ty + 10.0, &sheet, 3.0, &mut out);
     // The project's logo takes this box when it has one (see `title_logo_box`).
     if project.meta.logo.is_none() {
         text(
@@ -520,16 +531,7 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
             });
         }
     };
-    // Long texts are drawn smaller so they stay inside their room (text is never wrapped).
-    let fit_in = |t: &str, height: f64, room: f64| {
-        let w = text_width_mm(t, height);
-        if w > room && room > 0.0 {
-            height * room / w
-        } else {
-            height
-        }
-    };
-    let fit = |t: &str, height: f64| fit_in(t, height, x1 - x0 - 10.0);
+    let fit = |t: &str, height: f64| fit_height(t, height, x1 - x0 - 10.0);
     let name_y = y0 + h * 0.2;
     let name = &project.meta.name;
     push_text((cx, name_y), fit(name, 9.0), Align::Center, name, Ink::Thin, out);
@@ -572,9 +574,9 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     for (i, (label, value)) in rows.iter().enumerate() {
         let ry = top + row_h * i as f64;
         let base = ry + row_h / 2.0 + size * 0.35;
-        let label_h = fit_in(label, size * 0.8, split - tx0 - 3.0);
+        let label_h = fit_height(label, size * 0.8, split - tx0 - 3.0);
         push_text((tx0 + 1.5, base), label_h, Align::Left, label, Ink::Label, out);
-        let value_h = fit_in(value, size, tx1 - split - 3.0);
+        let value_h = fit_height(value, size, tx1 - split - 3.0);
         push_text((split + 1.5, base), value_h, Align::Left, value, Ink::Thin, out);
         rule(ry + row_h, Ink::Thin, out);
     }
