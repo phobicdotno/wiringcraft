@@ -891,9 +891,10 @@ fn location_descriptions_survive_blank_english_and_a_late_repeat_and_bad_rows_sa
 }
 
 /// The sample plus terminal strip X1 with terminals 1 and 2 (source order 2, 1; tag paths written
-/// with a space), drawn at (150, 200) and (170, 200); a line joins X1.1's lower point to K1:A2.
-/// Wire records: X1.1 lower to K1:A2 (drawn so), X1.2 upper to K1:A1 (not drawn so), and one to
-/// a terminal that is not drawn.
+/// with a space), drawn at (150, 200) and (170, 200); line 10 joins X1.1's lower point to K1:A2
+/// and carries wire record N1; line 11 runs up from X1.2's upper point and carries N2.
+/// Wire records: N1 X1.1 lower to K1:A2 (drawn so), N2 X1.2 upper to K1:A1 (not drawn so), one to
+/// a terminal that is not drawn, and one with no ends.
 fn sample_with_strip() -> Connection {
     let c = sample();
     c.execute_batch(
@@ -1357,4 +1358,34 @@ fn wire_records_without_a_drawn_line_are_counted_with_their_reason() {
         .find(|w| w.contains("not connected on the imported drawing"))
         .unwrap();
     assert!(apart.starts_with("1 wire(s)"), "{apart}");
+}
+
+#[test]
+fn a_wire_on_a_zero_length_line_still_counts_as_drawn() {
+    let c = sample_with_strip();
+    // A record X1.2 lower to K1:A2 whose only line has no length: the source draws it, so it is
+    // a mismatch to report, not a record without a line.
+    c.execute_batch(
+        "INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (92, NULL, -1, 'N9', 61, 1, 50, 1);
+         INSERT INTO tew_line VALUES (12, 10, 170, 195, 170, 195, NULL);
+         INSERT INTO tew_linewirepair VALUES (12, 92, 1);",
+    )
+    .unwrap();
+    let (_, warnings, report) = build(&read(&c).unwrap(), None);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(!ends.note.contains("on no drawn line"), "{}", ends.note);
+    assert!(
+        ends.note.contains("2 join terminals that are not connected"),
+        "{}",
+        ends.note
+    );
+    let apart = warnings
+        .iter()
+        .find(|w| w.contains("not connected on the imported drawing"))
+        .unwrap();
+    assert!(apart.contains("wire N9"), "{apart}");
 }

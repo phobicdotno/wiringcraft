@@ -1706,6 +1706,9 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut ends_apart: Vec<String> = Vec::new();
     // Wire records no drawn line carries: the source has the connection but not the drawing.
     let mut jumpers_undrawn = 0usize;
+    // Judged on the source, not on what was imported: a wire whose line collapsed to zero length
+    // or sits on a page left out is still drawn there, and stays a mismatch.
+    let carried: BTreeSet<i64> = p.lines.iter().flat_map(|l| l.wires.iter().copied()).collect();
     let mut records_undrawn = 0usize;
     let strip_of_element = |el: i64| {
         element_component
@@ -1728,7 +1731,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         };
         match (net_of.get(pa), net_of.get(pb)) {
             (Some(x), Some(y)) if x == y => ends_agree += 1,
-            _ if !wires_drawn.contains(&w.id) => {
+            _ if !carried.contains(&w.id) => {
                 // Not on any drawn line: a jumper made in the terminal strip editor, or a
                 // connection the source keeps only in its wire list.
                 match (strip_of_element(a.0), strip_of_element(b.0)) {
