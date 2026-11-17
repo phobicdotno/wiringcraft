@@ -1,6 +1,6 @@
 //! User preferences, stored as TOML in the user's config folder.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -60,8 +60,42 @@ pub fn projects_dir() -> PathBuf {
     match home {
         Some(h) if h.join("Documents").is_dir() => h.join("Documents").join("WiringCraft"),
         Some(h) => h.join("WiringCraft"),
-        None => PathBuf::from("WiringCraft"),
+        None => absolute(Path::new("WiringCraft")),
     }
+}
+
+/// `p` as an absolute path (against the current folder), without touching the disk.
+pub fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// A project name as one folder name: separators and characters Windows does not allow become
+/// `-`, and leading or trailing dots and spaces go. `None` when nothing usable is left (empty,
+/// `.` or `..`), so a name can never point outside the chosen location.
+pub fn folder_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    (!cleaned.is_empty()).then(|| cleaned.to_owned())
+}
+
+/// The folder a new project goes in: `location` (resolved like any typed folder) with the
+/// project name as the last folder, or `new-project` when there is no name yet.
+pub fn new_project_dir(location: &str, name: &str) -> Result<PathBuf, String> {
+    let leaf = if name.trim().is_empty() {
+        "new-project".to_owned()
+    } else {
+        folder_name(name).ok_or_else(|| format!("\"{}\" cannot be a folder name.", name.trim()))?
+    };
+    Ok(project_path(location).join(leaf))
 }
 
 /// A folder typed into a dialog: a relative one (just `test`) is taken inside
@@ -105,6 +139,8 @@ impl Prefs {
     }
 
     pub fn remember(&mut self, dir: PathBuf) {
+        // Kept absolute, so a recent entry means the same folder however the app was started.
+        let dir = absolute(&dir);
         self.recent.retain(|d| d != &dir);
         self.recent.insert(0, dir);
         self.recent.truncate(8);
@@ -112,8 +148,44 @@ impl Prefs {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_projects_folder_is_absolute() {
+        assert!(projects_dir().is_absolute());
+        // Shown as the default location, then typed back: the same folder, not nested twice.
+        let shown = projects_dir().display().to_string();
+        assert_eq!(project_path(&shown), projects_dir());
+    }
+
+    #[test]
+    fn a_project_name_is_one_safe_folder_name() {
+        assert_eq!(folder_name(" Motor control ").as_deref(), Some("Motor control"));
+        assert_eq!(folder_name("../Motor").as_deref(), Some("-Motor"));
+        assert_eq!(folder_name("/tmp/Motor").as_deref(), Some("-tmp-Motor"));
+        assert_eq!(folder_name("a:b*c").as_deref(), Some("a-b-c"));
+        assert_eq!(folder_name(".."), None);
+        assert_eq!(folder_name("  "), None);
+    }
+
+    #[test]
+    fn the_new_project_folder_follows_the_name_whenever_it_is_typed() {
+        let loc = std::env::temp_dir().join("wc-loc");
+        let l = loc.display().to_string();
+        assert_eq!(new_project_dir(&l, "").unwrap(), loc.join("new-project"));
+        assert_eq!(new_project_dir(&l, "Motor").unwrap(), loc.join("Motor"));
+        assert_eq!(new_project_dir(&l, "../Motor").unwrap(), loc.join("-Motor"));
+        assert!(new_project_dir(&l, "..").is_err());
+    }
+
+    #[test]
+    fn recent_projects_are_kept_absolute() {
+        let mut p = Prefs::default();
+        p.remember(PathBuf::from("projects/demo"));
+        assert!(p.recent[0].is_absolute());
+    }
 
     #[test]
     fn a_typed_name_goes_into_the_projects_folder_and_a_full_path_stays() {
