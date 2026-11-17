@@ -1816,6 +1816,37 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
             page.number
         ));
     }
+    // A library item already in the project may come again only unchanged (same content hash).
+    for s in &built.symbols {
+        if let Some(entry) = p.lock.symbols.get(&s.id)
+            && entry.hash != s.hash()
+        {
+            return Err(format!(
+                "symbol {} exists with other content; import into a fresh project",
+                s.id
+            ));
+        }
+    }
+    for part in &built.parts {
+        if let Some(entry) = p.lock.parts.get(&part.id)
+            && entry.hash != part.hash()
+        {
+            return Err(format!(
+                "part {} exists with other content; import into a fresh project",
+                part.id
+            ));
+        }
+    }
+    // A device the project already has under the same tag may come again only unchanged.
+    if let Some((tag, _)) = built
+        .devices
+        .iter()
+        .find(|(t, d)| p.devices.get(*t).is_some_and(|have| have != *d))
+    {
+        return Err(format!(
+            "device {tag} exists with other data; rename it or import into a fresh project"
+        ));
+    }
     for s in &built.symbols {
         store::write_vendored_symbol(dir, s).map_err(e)?;
         p.lock.symbols.insert(

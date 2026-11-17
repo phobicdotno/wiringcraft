@@ -957,6 +957,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut segments_out = 0usize;
     let mut wires_drawn: BTreeSet<i64> = BTreeSet::new();
     let mut cables_used: BTreeSet<i64> = BTreeSet::new();
+    let mut multi_core_lines = 0usize;
 
     for (i, pg) in drawn.iter().enumerate() {
         let syms: Vec<&SweSymbol> = syms_of.remove(&pg.id).unwrap_or_default();
@@ -1080,12 +1081,33 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         // Ends only join ends of the same net (or of a line without one): two nets drawn close
         // together stay apart.
         let same_net = |x: Option<i64>, y: Option<i64>| x.is_none() || y.is_none() || x == y;
+        // The nets that touch each pin exactly: a pin one net reaches is that net's, and a nearby
+        // end of another net stays off it (the source gave them different nets on purpose).
+        let mut pin_nets: Vec<BTreeSet<i64>> = vec![BTreeSet::new(); pin_at.len()];
+        for l in &lines {
+            for q in [flip(l.a), flip(l.b)] {
+                for (k, (at, _, _)) in pin_at.iter().enumerate() {
+                    if let Some(net) = l.net
+                        && near(*at, q)
+                    {
+                        pin_nets[k].insert(net);
+                    }
+                }
+            }
+        }
         let mut seen: Vec<(Point, Option<i64>)> = Vec::new();
         let mut snap = |q: Point, net: Option<i64>| -> Point {
             let pin = pin_at
                 .iter()
-                .map(|(at, _, _)| *at)
-                .filter(|at| dist(*at, q) <= JOIN)
+                .enumerate()
+                .filter(|(k, (at, _, _))| {
+                    dist(*at, q) <= JOIN
+                        && (near(*at, q)
+                            || net.is_none()
+                            || pin_nets[*k].is_empty()
+                            || net.is_some_and(|n| pin_nets[*k].contains(&n)))
+                })
+                .map(|(_, (at, _, _))| *at)
                 .min_by(|x, y| dist(*x, q).total_cmp(&dist(*y, q)));
             if let Some(at) = pin {
                 return at;
@@ -1136,6 +1158,14 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             // The cable core the line carries: its first wire in a cable.
             let wires: Vec<&SweWire> = l.wires.iter().filter_map(|w| p.wires.get(w)).collect();
             wires_drawn.extend(wires.iter().map(|w| w.id));
+            // A WiringCraft wire is on one cable core; a line carrying several shows the first.
+            let cores: BTreeSet<(i64, i64)> = wires
+                .iter()
+                .filter_map(|w| w.cable.filter(|c| cable_tags.contains_key(c)).map(|c| (c, w.core)))
+                .collect();
+            if cores.len() > 1 {
+                multi_core_lines += 1;
+            }
             let cored = wires
                 .iter()
                 .find(|w| w.cable.is_some_and(|c| cable_tags.contains_key(&c)));
@@ -1165,7 +1195,9 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 .map(|w| w.tag.trim())
                 .find(|t| !t.is_empty())
                 .map(str::to_owned);
-            let potential = l.potential.clone();
+            // Without a number the equipotential is still one net: name it after its id, so its
+            // wires stay connected and two such nets stay apart.
+            let potential = l.potential.clone().or_else(|| l.net.map(|id| format!("net{id}")));
             for pair in points.windows(2) {
                 let (from, to) = (pair[0], pair[1]);
                 if near(from, to) {
@@ -1310,7 +1342,13 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             what: "wires",
             source: p.wires.len(),
             imported: wires_drawn.len(),
-            note: note(vec![(wires_missing, "not on an imported page's line")]),
+            note: note(vec![
+                (wires_missing, "not on an imported page's line"),
+                (
+                    multi_core_lines,
+                    "line(s) carry several cable cores; their wire shows the first core only",
+                ),
+            ]),
         },
         Count {
             what: "cables",

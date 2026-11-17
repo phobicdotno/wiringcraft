@@ -562,3 +562,76 @@ fn ends_of_different_nets_drawn_close_stay_apart() {
     let lines = report.iter().find(|r| r.what == "wire lines").unwrap();
     assert!(!lines.note.contains("extra segments"), "no T-joint across nets");
 }
+
+#[test]
+fn a_net_without_a_number_keeps_its_own_name() {
+    let c = sample();
+    c.execute_batch(
+        "INSERT INTO tew_equipotential VALUES (905, ''), (906, '');
+         INSERT INTO tew_line VALUES (3, 10, 20, 150, 40, 150, 905), (4, 10, 20, 120, 40, 120, 906);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    let names: BTreeSet<Option<String>> = built.pages[0]
+        .wires
+        .iter()
+        .filter(|w| {
+            w.from
+                == Endpoint::Point {
+                    at: Point::new(20.0, 147.0),
+                }
+                || w.from
+                    == Endpoint::Point {
+                        at: Point::new(20.0, 177.0),
+                    }
+        })
+        .map(|w| w.potential.clone())
+        .collect();
+    let want: BTreeSet<Option<String>> = [Some("net905".to_owned()), Some("net906".to_owned())]
+        .into_iter()
+        .collect();
+    assert_eq!(names, want);
+}
+
+#[test]
+fn a_line_on_two_cable_cores_is_reported() {
+    let c = sample();
+    c.execute_batch(
+        "INSERT INTO tew_wire VALUES (72, 40, 2, '');
+         INSERT INTO tew_linewirepair VALUES (1, 72, 2);",
+    )
+    .unwrap();
+    let (built, _, report) = build(&read(&c).unwrap(), None);
+    let core = built.pages[0].wires[0].cable.as_ref().unwrap();
+    assert_eq!(core.core, "1 BN", "the first core is shown");
+    let wires = report.iter().find(|r| r.what == "wires").unwrap();
+    assert!(
+        wires.note.contains("1 line(s) carry several cable cores"),
+        "{}",
+        wires.note
+    );
+}
+
+#[test]
+fn a_near_end_of_another_net_does_not_snap_onto_a_taken_pin() {
+    let c = sample();
+    // Net 101 reaches K1:A1 (100, 205) exactly in the sample; a line of net 202 ends 0.3 mm off it.
+    c.execute_batch(
+        "INSERT INTO tew_equipotential VALUES (901, '202');
+         INSERT INTO tew_line VALUES (3, 10, 100.3, 205, 130, 205, 901);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    let other = built.pages[0]
+        .wires
+        .iter()
+        .find(|w| w.potential.as_deref() == Some("202"))
+        .unwrap();
+    assert_eq!(
+        other.from,
+        Endpoint::Point {
+            at: Point::new(100.3, 92.0)
+        },
+        "stays off the pin"
+    );
+}
