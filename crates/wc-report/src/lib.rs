@@ -282,9 +282,23 @@ fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
     (nets, by_pin)
 }
 
-/// Wire list: every drawn wire with both ends. A free end is reported as a junction point.
+/// Wire list: every drawn wire with both ends, then its cross-section, colour and type. A free
+/// end is reported as a junction point.
 pub fn wire_list(i: &Inputs<'_>) -> Table {
-    let mut t = Table::new("Wire list", &["Page", "Wire", "Potential", "Cable", "From", "To"]);
+    let mut t = Table::new(
+        "Wire list",
+        &[
+            "Page",
+            "Wire",
+            "Potential",
+            "Cable",
+            "From",
+            "To",
+            "Section",
+            "Colour",
+            "Type",
+        ],
+    );
     let (_, net_of) = net_names(i);
     for page in &i.project.pages {
         for w in &page.wires {
@@ -305,6 +319,9 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
                 w.cable.as_ref().map(cable_core_label).unwrap_or_default(),
                 end(&w.from),
                 end(&w.to),
+                w.spec.section.clone().unwrap_or_default(),
+                w.spec.colour.clone().unwrap_or_default(),
+                w.spec.kind.clone().unwrap_or_default(),
             ]);
         }
     }

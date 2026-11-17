@@ -212,6 +212,7 @@ impl App {
         match Open::load(dir) {
             Ok(o) => {
                 self.ed = Editor::default();
+                self.panels.reset();
                 self.ed.message = format!("Opened {}", dir.display());
                 self.open = Some(o);
                 prefs.remember(dir.to_path_buf());
