@@ -301,6 +301,8 @@ pub fn replace(
                             changed += 1;
                         }
                     }
+                } else {
+                    return Err(stale());
                 }
             }
             (FindKind::Description, FindTarget::Device { tag, .. }) => {
@@ -313,6 +315,8 @@ pub fn replace(
                         d.description = new;
                         changed += 1;
                     }
+                } else {
+                    return Err(stale());
                 }
             }
             (FindKind::Tag, target @ (FindTarget::Symbol { .. } | FindTarget::Device { .. })) => {
@@ -380,7 +384,8 @@ pub fn replace(
         placed.push((temp, to.clone()));
     }
     for (temp, to) in &placed {
-        changed += p.rename_device(temp, to);
+        // A device no page draws changes only its entry: still one change.
+        changed += p.rename_device(temp, to).max(1);
     }
     *project = p;
     Ok(changed)
@@ -593,7 +598,11 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].kind, FindKind::Tag);
         assert_eq!(hits[0].target.page(), None);
-        assert_eq!(replace(&mut p, &hits, "Q5", "Q6", opts), Ok(0));
+        assert_eq!(
+            replace(&mut p, &hits, "Q5", "Q6", opts),
+            Ok(1),
+            "a change, so it is kept"
+        );
         assert!(p.devices.contains_key(&tag("-Q6")) && !p.devices.contains_key(&tag("-Q5")));
         // A drawn device is found by its symbols only, not once more as a device.
         assert!(
@@ -637,6 +646,24 @@ mod tests {
         }
         let before = p.clone();
         assert!(replace(&mut p, &hits, "pump", "fan", opts).is_err());
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn a_deleted_target_changes_nothing() {
+        let mut p = sample();
+        let opts = FindOptions::default();
+        // A text that is still there, then a wire that was deleted after the search.
+        let hits = find(&p, "1", opts);
+        assert!(hits.iter().any(|h| h.kind == FindKind::Text));
+        p.pages[1].wires.clear();
+        let before = p.clone();
+        assert!(replace(&mut p, &hits, "1", "2", opts).is_err());
+        assert_eq!(p, before);
+        let hits = find(&p, "Spare", opts);
+        p.devices.remove(&tag("-X9"));
+        let before = p.clone();
+        assert!(replace(&mut p, &hits, "Spare", "Used", opts).is_err());
         assert_eq!(p, before);
     }
 

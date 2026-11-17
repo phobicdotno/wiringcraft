@@ -639,7 +639,8 @@ fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
 }
 
 /// A value as one tab-separated field: backslash, tab and line breaks written as `\\`, `\t`,
-/// `\n` and `\r`, so a multi-line text stays one hit per line.
+/// `\n` and `\r`, other control characters (such as ESC) as `\u{1b}`, so a multi-line text
+/// stays one hit per line and a found value cannot send the terminal control sequences.
 fn escape_field(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for c in v.chars() {
@@ -648,6 +649,8 @@ fn escape_field(v: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            // ESC and other control characters could steer the terminal.
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", u32::from(c))),
             c => out.push(c),
         }
     }
@@ -3084,6 +3087,7 @@ mod tests {
     fn a_found_value_stays_on_one_line() {
         assert_eq!(escape_field("Motor\nStart\tA\\B\r"), "Motor\\nStart\\tA\\\\B\\r");
         assert_eq!(escape_field("-K1"), "-K1");
+        assert_eq!(escape_field("a\u{1b}]52;c;x\u{7}"), "a\\u{1b}]52;c;x\\u{7}");
     }
 
     #[test]

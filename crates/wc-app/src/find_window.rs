@@ -41,13 +41,28 @@ pub enum FindOutcome {
 
 impl FindState {
     /// Search again when the text, the case option or the project changed since the last search.
+    /// A new text or case option ticks every hit; a changed project keeps the ticks of the hits
+    /// that are still there unchanged, so an untick survives others' edits.
     pub fn refresh(&mut self, project: &Project) {
         let key = (self.query.clone(), self.match_case);
-        if self.searched.as_ref() == Some(&key) && self.searched_in.as_ref() == Some(project) {
+        let same_search = self.searched.as_ref() == Some(&key);
+        if same_search && self.searched_in.as_ref() == Some(project) {
             return;
         }
-        self.hits = find(project, &self.query, self.options());
-        self.chosen = vec![true; self.hits.len()];
+        let hits = find(project, &self.query, self.options());
+        self.chosen = hits
+            .iter()
+            .map(|h| {
+                !same_search
+                    || self
+                        .hits
+                        .iter()
+                        .zip(&self.chosen)
+                        .find(|(old, _)| *old == h)
+                        .is_none_or(|(_, c)| *c)
+            })
+            .collect();
+        self.hits = hits;
         self.searched = Some(key);
         self.searched_in = Some(project.clone());
     }
@@ -220,6 +235,33 @@ mod tests {
         f.query = "K1".into();
         f.refresh(&p);
         assert_eq!(f.chosen_hits().len(), 1);
+    }
+
+    #[test]
+    fn an_untick_survives_an_unrelated_change() {
+        let mut p = project();
+        p.pages[0].graphics.push(Shape::Text {
+            at: Point::new(0.0, 10.0),
+            text: "K1 coil".into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        let mut f = FindState {
+            query: "K1".into(),
+            ..Default::default()
+        };
+        f.refresh(&p);
+        assert!(f.hits.len() >= 2, "{:?}", f.hits);
+        f.chosen[0] = false;
+        p.pages[0].title = "Renamed".into();
+        f.refresh(&p);
+        assert!(!f.chosen[0], "still left alone after another edit");
+        assert!(f.chosen[1..].iter().all(|c| *c));
+        // A new search ticks everything again.
+        f.match_case = true;
+        f.refresh(&p);
+        assert!(f.chosen.iter().all(|c| *c));
     }
 
     #[test]
