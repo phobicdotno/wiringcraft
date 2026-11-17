@@ -98,12 +98,53 @@ pub fn find_in(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Split a command line into words. Double or single quotes keep spaces in a word
+/// (`"/opt/Claude Tools/claude-agent-acp" --flag`); inside double quotes a backslash makes the
+/// next quote or backslash literal. No shell is involved.
+pub fn split_command(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') if matches!(chars.peek(), Some('"' | '\\')) => {
+                if let Some(n) = chars.next() {
+                    word.push(n);
+                }
+            }
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    out.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        out.push(word);
+    }
+    out
+}
+
 /// The command that starts the adapter: the user's own command line when given, else an
 /// installed adapter, else `npx` fetching it. `None` when there is no way.
 pub fn agent_command(custom: &str) -> Option<Vec<String>> {
     let custom = custom.trim();
     if !custom.is_empty() {
-        return Some(custom.split_whitespace().map(str::to_owned).collect());
+        let argv = split_command(custom);
+        return (!argv.is_empty()).then_some(argv);
     }
     let dirs = search_dirs();
     for p in PROGRAMS {
@@ -222,12 +263,13 @@ enum FromAgent {
     Closed,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Pending {
     Initialize,
     SessionNew,
     Prompt,
-    SetModel,
+    /// The model asked for, kept so a late answer records the model it was for.
+    SetModel(String),
 }
 
 /// A running Claude Code session.
@@ -400,7 +442,7 @@ impl Acp {
         self.wanted_model = id.to_owned();
         if let Some(s) = self.session.clone() {
             self.request(
-                Pending::SetModel,
+                Pending::SetModel(id.to_owned()),
                 "session/set_model",
                 json!({"sessionId": s, "modelId": id}),
             );
@@ -555,8 +597,8 @@ impl Acp {
                     _ => {}
                 }
             }
-            Pending::SetModel => {
-                self.model = self.wanted_model.clone();
+            Pending::SetModel(id) => {
+                self.model = id;
             }
         }
     }
@@ -567,7 +609,7 @@ impl Acp {
         let auth =
             code == -32000 || message.to_lowercase().contains("auth") || message.to_lowercase().contains("login");
         match kind {
-            Pending::SetModel => log.push(Entry::Note(format!("The model was not changed: {message}"))),
+            Pending::SetModel(_) => log.push(Entry::Note(format!("The model was not changed: {message}"))),
             Pending::Prompt if !auth => {
                 self.state = State::Ready;
                 out.finished = true;
@@ -618,6 +660,21 @@ mod tests {
         assert_eq!(no["outcome"]["optionId"], "r");
         assert!(!is_bridge_tool("mcp__wiringcraft-app__rm -rf /"));
         assert!(!is_bridge_tool("mcp__other__place_symbol"));
+    }
+
+    #[test]
+    fn a_command_line_keeps_quoted_spaces() {
+        assert_eq!(
+            split_command(r#" "/opt/Claude Tools/acp" --flag 'a b' "e\"f" "#),
+            vec!["/opt/Claude Tools/acp", "--flag", "a b", "e\"f"]
+        );
+        assert_eq!(split_command("npx -y pkg"), vec!["npx", "-y", "pkg"]);
+        assert_eq!(split_command(r#""""#), vec![""]);
+        assert!(split_command("   ").is_empty());
+        assert_eq!(
+            agent_command(r#""/x y/z" -q"#),
+            Some(vec!["/x y/z".to_owned(), "-q".to_owned()])
+        );
     }
 
     #[test]

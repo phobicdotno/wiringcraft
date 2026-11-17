@@ -82,6 +82,8 @@ impl App {
                         .map(Into::into)
                 })
                 .unwrap_or_else(|| ".".into());
+            // Claude Code needs an absolute folder, and it is also the folder it starts in.
+            let cwd = cwd.canonicalize().or_else(|_| std::path::absolute(&cwd)).unwrap_or(cwd);
             match acp::Acp::start(&argv, &cwd, bridge, SYSTEM, &self.prefs.assistant.login_model, wake) {
                 Ok(c) => a.acp = Some(c),
                 Err(e) => {

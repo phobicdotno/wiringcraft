@@ -77,8 +77,9 @@ claude                                                 # then /login once
 Claude Code only gets WiringCraft's tools in this chat (no shell, file or web tools), and it
 reaches them through a local port only this computer can use, with a fresh token each run.
 
-You can switch to an Anthropic API key instead under Settings in the panel (or set
-`ANTHROPIC_API_KEY`); the key is kept in your WiringCraft preferences, never in a project.
+To use an Anthropic API key instead, choose **API key** under Settings in the panel, then paste
+the key there or set `ANTHROPIC_API_KEY` (setting the variable alone does not switch). A pasted
+key is kept in your WiringCraft preferences, never in a project.
 Settings also pick the model and the effort. The connections are in `crates/wc-agent`
 (`acp.rs` for Claude Code, `bridge.rs` for the tool bridge); the tools are in
 `crates/wc-app/src/agent.rs`.

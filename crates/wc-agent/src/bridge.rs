@@ -10,6 +10,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -25,12 +26,18 @@ pub const TOKEN_VAR: &str = "WIRINGCRAFT_BRIDGE_TOKEN";
 pub const MCP_VERSION: &str = "2025-06-18";
 /// How long a tool call waits for the window thread.
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a new connection has to send the token.
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connections served at once; more are closed straight away.
+const MAX_CONNECTIONS: usize = 8;
 
 /// A tool call waiting for the window thread.
 pub struct ToolRequest {
     pub name: String,
     pub input: Value,
     reply: Sender<Result<String, String>>,
+    /// Set when the caller stopped waiting, so the call is not run late.
+    gave_up: Arc<AtomicBool>,
 }
 
 /// The listening side, owned by the app.
@@ -68,12 +75,23 @@ impl Bridge {
         let token = new_token();
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new((specs, instructions, token.clone()));
-        std::thread::spawn(move || {
+        let live = Arc::new(AtomicUsize::new(0));
+        std::thread::Builder::new().name("wc-bridge".into()).spawn(move || {
             for stream in listener.incoming().map_while(Result::ok) {
-                let (tx, shared, wake) = (tx.clone(), Arc::clone(&shared), Arc::clone(&wake));
-                std::thread::spawn(move || serve(stream, &shared, &tx, &*wake));
+                if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                let (tx, shared, wake, done) = (tx.clone(), Arc::clone(&shared), Arc::clone(&wake), Arc::clone(&live));
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    serve(stream, &shared, &tx, &*wake);
+                    done.fetch_sub(1, Ordering::SeqCst);
+                });
+                if spawned.is_err() {
+                    live.fetch_sub(1, Ordering::SeqCst);
+                }
             }
-        });
+        })?;
         Ok(Self { port, token, rx })
     }
 
@@ -92,6 +110,9 @@ impl Bridge {
     pub fn poll(&self, tools: &mut dyn Tools) -> Vec<Entry> {
         let mut out = Vec::new();
         while let Ok(req) = self.rx.try_recv() {
+            if req.gave_up.load(Ordering::SeqCst) {
+                continue;
+            }
             let what = tools.describe(&req.name, &req.input);
             let r = tools.run(&req.name, &req.input);
             out.push(Entry::Tool {
@@ -116,10 +137,18 @@ fn serve(
 ) {
     let (specs, instructions, token) = shared;
     let Ok(mut writer) = stream.try_clone() else { return };
+    // The token must come quickly; after that the agent may stay quiet as long as it likes.
+    if stream.set_read_timeout(Some(TOKEN_TIMEOUT)).is_err() {
+        return;
+    }
+    let Ok(reading) = stream.try_clone() else { return };
     let mut lines = BufReader::new(stream).lines();
     match lines.next() {
         Some(Ok(first)) if first.trim() == token => {}
         _ => return,
+    }
+    if reading.set_read_timeout(None).is_err() {
+        return;
     }
     for line in lines.map_while(Result::ok) {
         let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
@@ -127,15 +156,19 @@ fn serve(
         };
         let reply = handle(&msg, specs, instructions, &mut |name, input| {
             let (rtx, rrx) = mpsc::channel();
+            let gave_up = Arc::new(AtomicBool::new(false));
             tx.send(ToolRequest {
                 name: name.to_owned(),
                 input: input.clone(),
                 reply: rtx,
+                gave_up: Arc::clone(&gave_up),
             })
             .map_err(|_| "WiringCraft has closed.".to_owned())?;
             wake();
-            rrx.recv_timeout(CALL_TIMEOUT)
-                .map_err(|_| "WiringCraft did not answer in time.".to_owned())?
+            rrx.recv_timeout(CALL_TIMEOUT).map_err(|_| {
+                gave_up.store(true, Ordering::SeqCst);
+                "WiringCraft did not answer in time.".to_owned()
+            })?
         });
         if let Some(reply) = reply {
             let text = reply.to_string();
@@ -308,6 +341,46 @@ mod tests {
         assert_eq!(reply["id"], 9);
         assert_eq!(reply["result"]["content"][0]["text"], "show {\"page\":\"2\"}");
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn a_call_the_agent_gave_up_on_is_not_run() {
+        let (tx, rx) = mpsc::channel();
+        let bridge = Bridge {
+            port: 0,
+            token: String::new(),
+            rx,
+        };
+        let (rtx, _rrx) = mpsc::channel();
+        let _ = tx.send(ToolRequest {
+            name: "late".into(),
+            input: json!({}),
+            reply: rtx.clone(),
+            gave_up: Arc::new(AtomicBool::new(true)),
+        });
+        let _ = tx.send(ToolRequest {
+            name: "now".into(),
+            input: json!({}),
+            reply: rtx,
+            gave_up: Arc::new(AtomicBool::new(false)),
+        });
+        let entries = bridge.poll(&mut Echo);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0], Entry::Tool { detail, .. } if detail.starts_with("now")));
+    }
+
+    #[test]
+    fn a_silent_connection_is_closed() {
+        let Ok(bridge) = Bridge::start(Vec::new(), String::new(), Arc::new(|| {})) else {
+            return;
+        };
+        let Ok(s) = TcpStream::connect(("127.0.0.1", bridge.port)) else {
+            return;
+        };
+        let _ = s.set_read_timeout(Some(TOKEN_TIMEOUT + Duration::from_secs(10)));
+        let mut line = String::new();
+        let n = BufReader::new(s).read_line(&mut line).unwrap_or(1);
+        assert_eq!(n, 0, "closed after the token wait");
     }
 
     #[test]
