@@ -186,6 +186,11 @@ impl App {
 
     /// Pick up the assistant's answers and run its tools. Called every frame.
     pub(crate) fn assistant_poll(&mut self, ctx: &egui::Context) {
+        // Drops are taken before the answer is looked at, so a screenshot dropped in the frame
+        // where a message fails is refused rather than joined to the message given back.
+        if self.prefs.show_assistant {
+            self.take_dropped_pictures(ctx);
+        }
         let mut finished = false;
         // Claude login: tool calls from Claude Code, then what it said.
         // Calls outside a running turn (after Stop, or late) are refused, never run.
@@ -241,7 +246,6 @@ impl App {
         if !self.prefs.show_assistant {
             return;
         }
-        self.take_dropped_pictures(ctx);
         let t = Theme::of(ctx);
         egui::SidePanel::right("assistant")
             .frame(
