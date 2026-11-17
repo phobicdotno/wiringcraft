@@ -2367,6 +2367,45 @@ mod tests {
     }
 
     #[test]
+    fn an_import_uses_the_pinned_project_copy_even_when_no_page_uses_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        p.meta.libraries.push(LibrarySource {
+            name: "starter".into(),
+            kind: "folder".into(),
+            location: starter.to_string_lossy().into_owned(),
+            reference: None,
+        });
+        let (mut coil, source) = wc_library::Library::open(&dir, &p).unwrap().symbol("wc.coil").unwrap();
+        // The pinned copy differs from what the library has now (a changed library).
+        coil.name = "Pinned coil".into();
+        store::write_vendored_symbol(&dir, &coil).unwrap();
+        p.lock.symbols.insert(
+            "wc.coil".into(),
+            wc_core::LockEntry {
+                source: source.clone(),
+                hash: "h".into(),
+            },
+        );
+        assert!(
+            p.pages
+                .iter()
+                .all(|pg| pg.symbols.iter().all(|s| s.symbol != "wc.coil")),
+            "no page uses the pinned symbol"
+        );
+        let (choice, sources) = swe_symbol_choice(&dir, &p, None).unwrap();
+        assert_eq!(choice.library["wc.coil"].name, "Pinned coil", "the project copy wins");
+        assert_eq!(sources["wc.coil"], source, "it stays pinned to its library");
+        // A library that is gone does not lose the pinned copy either.
+        p.meta.libraries.clear();
+        let (choice, _) = swe_symbol_choice(&dir, &p, None).unwrap();
+        assert_eq!(choice.library["wc.coil"].name, "Pinned coil");
+    }
+
+    #[test]
     fn an_import_keeps_library_symbols_pinned_to_their_library() {
         let mut p = Project::new("t");
         let entry = |source: &str| wc_core::LockEntry {
