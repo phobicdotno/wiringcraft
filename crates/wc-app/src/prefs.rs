@@ -51,6 +51,27 @@ fn config_dir() -> Option<PathBuf> {
     Some(base.join("wiringcraft"))
 }
 
+/// Where new projects go by default: `Documents/WiringCraft` in the user's home folder (the
+/// home folder itself when it has no Documents), or the current folder when there is no home.
+pub fn projects_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    match home {
+        Some(h) if h.join("Documents").is_dir() => h.join("Documents").join("WiringCraft"),
+        Some(h) => h.join("WiringCraft"),
+        None => PathBuf::from("WiringCraft"),
+    }
+}
+
+/// A folder typed into a dialog: a relative one (just `test`) is taken inside
+/// [`projects_dir`], never the folder the app happened to start in (on Windows that can be
+/// `C:\Windows\System32` or the install folder).
+pub fn project_path(typed: &str) -> PathBuf {
+    let p = PathBuf::from(typed.trim());
+    if p.is_absolute() { p } else { projects_dir().join(p) }
+}
+
 fn path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("prefs.toml"))
 }
@@ -87,5 +108,17 @@ impl Prefs {
         self.recent.retain(|d| d != &dir);
         self.recent.insert(0, dir);
         self.recent.truncate(8);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_typed_name_goes_into_the_projects_folder_and_a_full_path_stays() {
+        assert_eq!(project_path(" test "), projects_dir().join("test"));
+        let full = std::env::temp_dir().join("wc-elsewhere");
+        assert_eq!(project_path(&full.display().to_string()), full);
     }
 }

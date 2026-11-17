@@ -16,7 +16,7 @@ mod prefs;
 mod state;
 mod theme;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, Pos2, RichText, Stroke, Vec2};
 
@@ -224,8 +224,11 @@ impl App {
                     .open
                     .as_ref()
                     .and_then(|o| o.dir.parent())
-                    .map(|d| d.join("new-project").display().to_string())
-                    .unwrap_or_default();
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(prefs::projects_dir)
+                    .join("new-project")
+                    .display()
+                    .to_string();
                 self.dialog = Some(Dialog::NewProject {
                     dir: parent,
                     name: String::new(),
@@ -705,7 +708,17 @@ impl App {
                 }
                 Dialog::OpenPath(path) => {
                     ui.label("Project folder (the one holding project.toml):");
-                    let r = ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                    let r = ui
+                        .horizontal(|ui| {
+                            let r = ui.add(egui::TextEdit::singleline(path).desired_width(340.0));
+                            if ui.button("Browse…").clicked()
+                                && let Some(d) = pick_folder("Open project", path)
+                            {
+                                *path = d.display().to_string();
+                            }
+                            r
+                        })
+                        .inner;
                     for recent in &self.prefs.recent {
                         if ui.link(recent.display().to_string()).clicked() {
                             *path = recent.display().to_string();
@@ -713,7 +726,7 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Open").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
-                            let p = PathBuf::from(path.trim());
+                            let p = prefs::project_path(path);
                             then = Some(Box::new(move |app: &mut App| {
                                 let mut prefs = std::mem::take(&mut app.prefs);
                                 app.open_dir(&p, &mut prefs);
@@ -732,7 +745,22 @@ impl App {
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
                             ui.label("Folder");
-                            ui.add(egui::TextEdit::singleline(dir).desired_width(380.0));
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(dir).desired_width(300.0));
+                                // Pick where it goes; the new project is a folder inside it.
+                                if ui.button("Browse…").clicked() {
+                                    let parent = Path::new(dir.trim()).parent().map(Path::to_path_buf);
+                                    let start = parent.map(|p| p.display().to_string()).unwrap_or_default();
+                                    if let Some(d) = pick_folder("Where to create the project", &start) {
+                                        let leaf = if name.trim().is_empty() {
+                                            "new-project"
+                                        } else {
+                                            name.trim()
+                                        };
+                                        *dir = d.join(leaf).display().to_string();
+                                    }
+                                }
+                            });
                             ui.end_row();
                             ui.label("Name");
                             ui.add(
@@ -751,7 +779,7 @@ impl App {
                             .add_enabled(!dir.trim().is_empty(), egui::Button::new("Create"))
                             .clicked()
                         {
-                            let d = PathBuf::from(dir.trim());
+                            let d = prefs::project_path(dir);
                             let n = name.trim().to_owned();
                             then = Some(Box::new(move |app: &mut App| app.new_project(&d, &n)));
                             keep = false;
@@ -1203,7 +1231,10 @@ impl App {
             name.to_owned()
         };
         if let Err(e) = wc_core::store::create(dir, &name) {
-            self.dialog = Some(Dialog::Message(format!("Could not create the project:\n{e}")));
+            self.dialog = Some(Dialog::Message(format!(
+                "Could not create the project in\n{}:\n{e}",
+                dir.display()
+            )));
             return;
         }
         // A starter library next to the app, when there is one, so the symbol picker is not empty.
@@ -1275,6 +1306,17 @@ fn size_label(s: PageSize) -> &'static str {
         PageSize::A3 => "A3 landscape",
         PageSize::A2 => "A2 landscape",
     }
+}
+
+/// The system's folder picker, starting in `start` (or its nearest existing parent). `None` when
+/// the user cancels. Blocks the window while open, like any modal dialog.
+fn pick_folder(title: &str, start: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title(title);
+    let start = Path::new(start.trim());
+    if let Some(d) = start.ancestors().find(|d| !d.as_os_str().is_empty() && d.is_dir()) {
+        dialog = dialog.set_directory(d);
+    }
+    dialog.pick_folder()
 }
 
 /// The starter symbol library: `library/` beside the executable or in the source tree.
