@@ -26,6 +26,7 @@ pub struct PanelState {
     cable_error: Option<String>,
     part_search: String,
     part_error: Option<String>,
+    accessory_search: String,
     new_key: String,
     new_value: String,
     /// Edit buffers for the device's own properties, by key.
@@ -861,6 +862,83 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
     }
 }
 
+/// More parts of the device (auxiliary contact block, marker, end plate), each with a quantity.
+fn accessories_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: &DeviceTag, t: &Theme) {
+    subsection(ui, "Accessories");
+    let current: Vec<wc_core::DevicePart> = open
+        .project
+        .devices
+        .get(tag)
+        .map(|d| d.accessories.clone())
+        .unwrap_or_default();
+    let label = |id: &str| {
+        open.part_library
+            .iter()
+            .find(|(p, _)| p == id)
+            .map_or_else(|| id.to_owned(), |(_, l)| l.clone())
+    };
+    // Row edits are noted while drawing and applied after, so no index is shared between lists.
+    let mut edit: Option<(usize, i8)> = None;
+    for (i, a) in current.iter().enumerate() {
+        ui.horizontal(|ui| {
+            if ui.small_button("\u{2212}").on_hover_text("One less").clicked() {
+                edit = Some((i, -1));
+            }
+            ui.label(format!("{} x", a.qty));
+            if ui.small_button("+").on_hover_text("One more").clicked() {
+                edit = Some((i, 1));
+            }
+            ui.add(egui::Label::new(label(&a.part)).truncate())
+                .on_hover_text(&a.part);
+        });
+    }
+    let mut next = current.clone();
+    if let Some((i, step)) = edit
+        && let Some(a) = next.get_mut(i)
+    {
+        if step > 0 {
+            a.qty = a.qty.saturating_add(1);
+        } else if a.qty > 1 {
+            a.qty -= 1;
+        } else {
+            next.remove(i);
+        }
+    }
+    let mut add = None;
+    egui::ComboBox::from_id_salt("accessory")
+        .width(ui.available_width().min(240.0))
+        .selected_text("Add a part\u{2026}")
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut ps.accessory_search).hint_text("Search parts"));
+            let q = ps.accessory_search.to_lowercase();
+            for (id, l) in &open.part_library {
+                if !q.is_empty() && !id.to_lowercase().contains(&q) && !l.to_lowercase().contains(&q) {
+                    continue;
+                }
+                if ui.selectable_label(false, l).on_hover_text(id).clicked() {
+                    add = Some(id.clone());
+                }
+            }
+        });
+    if let Some(id) = add {
+        match next.iter_mut().find(|a| a.part == id) {
+            Some(a) => a.qty = a.qty.saturating_add(1),
+            None => next.push(wc_core::DevicePart { part: id, qty: 1 }),
+        }
+    }
+    if next != current {
+        ps.part_error = open.set_device_accessories(tag, next).err();
+    }
+    if current.is_empty() {
+        ui.label(
+            RichText::new("None. Add parts that come with the main part.")
+                .color(t.faint)
+                .small(),
+        );
+    }
+}
+
 /// Part and own properties of the selected symbol's device.
 fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: &DeviceTag, t: &Theme) {
     subsection(ui, "Part");
@@ -931,6 +1009,8 @@ fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: 
             }
         }
     }
+
+    accessories_section(ui, open, ps, tag, t);
 
     subsection(ui, "Device properties");
     egui::Grid::new("dev-props")

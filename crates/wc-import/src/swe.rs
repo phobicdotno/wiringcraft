@@ -160,6 +160,8 @@ pub struct SweComponent {
     pub description: String,
     pub part_number: String,
     pub manufacturer: String,
+    /// The component's further parts after the first, in order: `(part number, manufacturer)`.
+    pub extra_parts: Vec<(String, String)>,
     /// The component this one belongs to (`com_com_id`): a terminal's strip.
     pub parent: Option<i64>,
     /// Place among its parent's children (`com_tagorderno`): a terminal's place on its strip.
@@ -712,21 +714,15 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
         })
         .map_err(sql)?;
-    let mut extra_parts = 0;
     for (id, part, maker) in readable(rows, "part", &mut warnings) {
         if let Some(c) = p.components.get_mut(&id) {
             if c.part_number.is_empty() {
                 c.part_number = part;
                 c.manufacturer = maker;
             } else {
-                extra_parts += 1;
+                c.extra_parts.push((part, maker));
             }
         }
-    }
-    if extra_parts > 0 {
-        warnings.push(format!(
-            "{extra_parts} extra part(s) left out: a component keeps only its first part"
-        ));
     }
 
     // Cables, their cores, and the wires.
@@ -2081,6 +2077,15 @@ pub fn build_with(
         if !c.manufacturer.is_empty() {
             properties.insert("Manufacturer".to_owned(), c.manufacturer.clone());
         }
+        // Further parts as numbered properties ("PartNumber 2", "Manufacturer 2", ...), so they
+        // stay with the device even when no library part matches; `link_parts` makes them
+        // accessories when one does.
+        for (n, (number, maker)) in c.extra_parts.iter().enumerate() {
+            properties.insert(format!("PartNumber {}", n + 2), number.clone());
+            if !maker.is_empty() {
+                properties.insert(format!("Manufacturer {}", n + 2), maker.clone());
+            }
+        }
         if let Some(f) = &shared_function {
             properties.insert("Function".to_owned(), format!("={}", f.join(".")));
         }
@@ -2089,6 +2094,7 @@ pub fn build_with(
             tag.clone(),
             Device {
                 part: None,
+                accessories: Vec::new(),
                 description: c.description.clone(),
                 properties,
             },
@@ -2112,6 +2118,7 @@ pub fn build_with(
             tag.clone(),
             Device {
                 part: None,
+                accessories: Vec::new(),
                 description: "Cable".to_owned(),
                 properties,
             },

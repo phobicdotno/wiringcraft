@@ -1024,7 +1024,7 @@ impl App {
                             })
                             .collect();
                         Some(json!({
-                            "tag": t.to_string(), "description": d.description, "part": d.part,
+                            "tag": t.to_string(), "description": d.description, "part": d.part, "accessories": d.accessories,
                             "properties": d.properties, "drawn": drawn
                         }))
                     })

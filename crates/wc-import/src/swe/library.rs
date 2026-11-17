@@ -25,7 +25,7 @@ use std::io::Read;
 
 use rusqlite::Connection;
 use wc_core::geom::Point;
-use wc_core::{Part, Symbol};
+use wc_core::{Device, DevicePart, Part, Symbol};
 
 use super::{MAX_DATABASE_BYTES, box_symbol, open, readable, slug, sql};
 use crate::aml::Built;
@@ -785,17 +785,39 @@ pub fn link_parts(built: &mut Built, parts: &[Part]) -> usize {
     let mut used: BTreeSet<String> = BTreeSet::new();
     let mut linked = 0;
     for d in built.devices.values_mut() {
-        if d.part.is_some() {
-            continue;
-        }
-        let Some(number) = d.properties.get("PartNumber").filter(|n| !n.trim().is_empty()) else {
-            continue;
+        let find = |d: &Device, number: &str, maker: &str| {
+            let number = d.properties.get(number).filter(|n| !n.trim().is_empty())?;
+            let maker = d.properties.get(maker).map(String::as_str).unwrap_or_default();
+            by_name.get(&key(maker, number)).copied()
         };
-        let maker = d.properties.get("Manufacturer").map(String::as_str).unwrap_or_default();
-        if let Some(p) = by_name.get(&key(maker, number)) {
+        if d.part.is_none()
+            && let Some(p) = find(d, "PartNumber", "Manufacturer")
+        {
             d.part = Some(p.id.clone());
             used.insert(p.id.clone());
             linked += 1;
+        }
+        // Further parts ("PartNumber 2", ...) become accessories; the same part twice counts 2.
+        if d.accessories.is_empty() {
+            let mut accessories: Vec<DevicePart> = Vec::new();
+            for n in 2.. {
+                let number = format!("PartNumber {n}");
+                if !d.properties.contains_key(&number) {
+                    break;
+                }
+                let Some(p) = find(d, &number, &format!("Manufacturer {n}")) else {
+                    continue;
+                };
+                match accessories.iter_mut().find(|a| a.part == p.id) {
+                    Some(a) => a.qty += 1,
+                    None => accessories.push(DevicePart {
+                        part: p.id.clone(),
+                        qty: 1,
+                    }),
+                }
+                used.insert(p.id.clone());
+            }
+            d.accessories = accessories;
         }
     }
     for id in used {
