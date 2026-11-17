@@ -466,22 +466,47 @@ impl Open {
     /// in memory and in the project folder, so the pages draw what the lock says. When a file
     /// cannot be written, the files already written are put back and nothing changes.
     fn sync_symbols(&mut self) -> Result<(), String> {
-        let wanted: Vec<(String, Symbol)> = self
-            .project
-            .lock
-            .symbols
-            .iter()
-            .filter(|(id, entry)| !self.symbols.get(*id).is_some_and(|s| s.hash() == entry.hash))
-            .filter_map(|(id, entry)| Some((id.clone(), self.symbol_versions.get(&entry.hash)?.clone())))
-            .collect();
+        let mut wanted: Vec<(String, Symbol)> = Vec::new();
+        for (id, entry) in &self.project.lock.symbols {
+            if self.symbols.get(id).is_some_and(|s| s.hash() == entry.hash) {
+                continue;
+            }
+            // The version the lock names: kept from earlier, or still in the project folder.
+            let known = self.symbol_versions.get(&entry.hash).cloned().or_else(|| {
+                store::read_vendored_symbol(&self.dir, id)
+                    .ok()
+                    .filter(|s| s.hash() == entry.hash)
+            });
+            match known {
+                Some(sym) => wanted.push((id.clone(), sym)),
+                None => {
+                    return Err(format!(
+                        "the version of symbol {id} this step names is not known any more"
+                    ));
+                }
+            }
+        }
         for (n, (id, want)) in wanted.iter().enumerate() {
             if let Err(e) = store::write_vendored_symbol(&self.dir, want) {
-                for (done, _) in wanted.iter().take(n) {
-                    if let Some(old) = self.symbols.get(done) {
-                        let _ = store::write_vendored_symbol(&self.dir, old);
-                    }
+                // Put back the files already written; say which could not be.
+                let unrestored: Vec<String> = wanted
+                    .iter()
+                    .take(n)
+                    .filter_map(|(done, _)| {
+                        let old = self.symbols.get(done)?;
+                        store::write_vendored_symbol(&self.dir, old)
+                            .err()
+                            .map(|e| format!("{done} ({e})"))
+                    })
+                    .collect();
+                let mut msg = format!("symbol {id} could not be put back: {e}");
+                if !unrestored.is_empty() {
+                    msg.push_str(&format!(
+                        "; these symbol files now hold the other version and could not be restored: {}",
+                        unrestored.join(", ")
+                    ));
                 }
-                return Err(format!("symbol {id} could not be put back: {e}"));
+                return Err(msg);
             }
         }
         for (id, want) in wanted {
@@ -492,6 +517,13 @@ impl Open {
         Ok(())
     }
 
+    /// Keep the loaded symbol versions, so a step that replaces them can be undone.
+    pub fn archive_symbols(&mut self) {
+        for sym in self.symbols.values() {
+            self.symbol_versions.insert(sym.hash(), sym.clone());
+        }
+    }
+
     /// Take the newer library versions of the project's items (only `only`, when given), as
     /// one undo step. An update that would leave wires on pins a new symbol version no longer
     /// has is taken back, and the wires are named.
@@ -500,8 +532,21 @@ impl Open {
         lib: &wc_library::Library,
         only: Option<&[String]>,
     ) -> Result<Vec<(ItemKind, String)>, String> {
+        self.archive_symbols();
         self.checkpoint();
-        let done = wc_library::update(&self.dir, &mut self.project, lib, only).map_err(|e| e.to_string())?;
+        let done = match wc_library::update(&self.dir, &mut self.project, lib, only) {
+            Ok(done) => done,
+            Err(e) => {
+                // Some items may have been taken already: take them back too.
+                self.reload_symbols();
+                let undone = self.undo();
+                self.redo.clear();
+                return Err(match (undone, self.take_undo_error()) {
+                    (false, Some(why)) => format!("{e}; what was already updated could not be taken back: {why}"),
+                    _ => e.to_string(),
+                });
+            }
+        };
         self.reload_symbols();
         let mut dangling: Vec<String> = done
             .iter()
@@ -534,8 +579,13 @@ impl Open {
     /// After the symbol editor saved symbol `id` into the library: take that symbol (only the
     /// symbol, never a part with the same id) into the project, as one undo step.
     pub fn take_saved_symbol(&mut self, lib: &wc_library::Library, id: &str) -> Result<(), String> {
+        // Taken into a copy first: a failure leaves the project and its history as they were
+        // (take writes the file only once the library symbol is read, and nothing after).
+        self.archive_symbols();
+        let mut next = self.project.clone();
+        let entry = wc_library::take(&self.dir, &mut next, lib, ItemKind::Symbol, id).map_err(|e| e.to_string())?;
         self.checkpoint();
-        wc_library::take(&self.dir, &mut self.project, lib, ItemKind::Symbol, id).map_err(|e| e.to_string())?;
+        self.project.lock.symbols.insert(id.to_owned(), entry);
         self.reload_symbols();
         Ok(())
     }
@@ -1502,6 +1552,18 @@ pub(crate) mod tests {
         assert!(o.project.lock.symbols.contains_key(pid));
         assert_eq!(o.project.lock.parts[pid], locked, "the part's lock entry is unchanged");
         assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), part, "and its copy");
+    }
+
+    #[test]
+    fn a_symbol_save_that_fails_leaves_the_history_alone() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let before = o.project.clone();
+        let steps = o.undo.len();
+        let lib = wc_library::Library::open(&o.dir, &o.project).unwrap();
+        assert!(o.take_saved_symbol(&lib, "no.such-symbol").is_err());
+        assert_eq!(o.project, before, "the project stays as it was");
+        assert_eq!(o.undo.len(), steps, "and no empty undo step was added");
     }
 
     fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

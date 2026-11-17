@@ -2098,6 +2098,8 @@ impl App {
         // (not saved yet, so not on disk) stay.
         // Pending window changes follow their terminals under the roles they were made with.
         open.follow_terminals();
+        // The versions the command replaced are kept, so its undo step can put them back.
+        open.archive_symbols();
         open.symbols.extend(fresh.symbols);
         open.branch = fresh.branch;
         let by_command = fresh.project != base;
@@ -2323,6 +2325,37 @@ mod tests {
         let _ = ctx.run(Default::default(), |ctx| a.symbol_editor_window(ctx));
         assert!(a.symbol_editor.is_none(), "it belonged to the first project");
         assert_eq!(a.open.as_ref().unwrap().project, other_before);
+    }
+
+    #[test]
+    fn undo_puts_back_a_symbol_a_command_replaced() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        open.save().unwrap();
+        let old = open.symbols["wc.coil"].clone();
+        let old_lock = open.project.lock.symbols["wc.coil"].clone();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        // What a command does on disk: a new version of the symbol, and the lock naming it.
+        let mut new = old.clone();
+        new.name = "Coil, from the command".into();
+        wc_core::store::write_vendored_symbol(&open.dir, &new).unwrap();
+        let mut on_disk = open.project.clone();
+        on_disk.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        wc_core::store::save(&open.dir, &on_disk).unwrap();
+        a.command_finish(Ok("Done.".into())).unwrap();
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.symbols["wc.coil"], new);
+        assert!(open.undo());
+        assert_eq!(open.project.lock.symbols["wc.coil"], old_lock);
+        assert_eq!(
+            open.symbols["wc.coil"], old,
+            "the version from before the command is back"
+        );
+        assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), old);
+        assert!(open.redo());
+        assert_eq!(open.symbols["wc.coil"], new);
+        assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), new);
     }
 
     #[test]
