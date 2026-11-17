@@ -319,7 +319,7 @@ impl Action {
             ),
             Action::Reports => i(
                 "Reports",
-                "Contents, parts, devices, wires, nets, terminals, cables and PLC I/O as tables",
+                "Contents, parts, devices, wires, nets, terminals, cables, PLC I/O and locations as tables",
                 Icon::Reports,
                 "Ctrl+R",
             ),

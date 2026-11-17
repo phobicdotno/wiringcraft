@@ -152,8 +152,8 @@ pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
 }
 
 /// Locations: every location of the project with its description and how many devices are in
-/// it (by the `+` part of their tags), then locations device tags use that the project does not
-/// list.
+/// it (by the `+` part of their tags; a device in `+L1.L3` counts for `L1.L3`, not for `L1`), then
+/// locations device tags use that the project does not list.
 pub fn location_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Locations", &["Location", "Description", "Devices", "Note"]);
     let mut count: BTreeMap<String, usize> = BTreeMap::new();

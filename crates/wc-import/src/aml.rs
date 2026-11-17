@@ -101,7 +101,16 @@ pub fn parse(text: &str) -> Result<AmlImport> {
     let mut raw_links: Vec<(String, String, String)> = Vec::new();
     let mut iface_index: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut elem_ids: BTreeMap<String, usize> = BTreeMap::new();
-    let mut pending: Vec<(Vec<String>, Elem)> = Vec::new();
+    // Each finished element with the names of its parents and their designations (the tag
+    // attribute when they have one, else the name).
+    let mut pending: Vec<(Vec<String>, Vec<String>, Elem)> = Vec::new();
+    let designation = |e: &Elem| {
+        TAG_ATTRIBUTES
+            .iter()
+            .find_map(|k| e.attributes.get(*k))
+            .cloned()
+            .unwrap_or_else(|| e.name.clone())
+    };
     let mut seen_caex = false;
     let mut events = 0usize;
     loop {
@@ -126,7 +135,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                         };
                         if empty {
                             let path = stack.iter().map(|s| s.name.clone()).collect();
-                            pending.push((path, el));
+                            let outer = stack.iter().map(designation).collect();
+                            pending.push((path, outer, el));
                         } else {
                             stack.push(el);
                         }
@@ -169,7 +179,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                     "InternalElement" => {
                         if let Some(el) = stack.pop() {
                             let path = stack.iter().map(|s| s.name.clone()).collect();
-                            pending.push((path, el));
+                            let outer = stack.iter().map(designation).collect();
+                            pending.push((path, outer, el));
                         }
                     }
                     "ExternalInterface" | "Attribute" => {
@@ -186,15 +197,12 @@ pub fn parse(text: &str) -> Result<AmlImport> {
     if !seen_caex {
         return Err(Error::Format("not an AutomationML (CAEX) file".into()));
     }
-    for (path, el) in pending {
+    for (path, outer, el) in pending {
         if el.interfaces.is_empty() {
             // Structure (function, location), not a device. A location goes to the project.
-            let own = TAG_ATTRIBUTES
-                .iter()
-                .find_map(|k| el.attributes.get(*k))
-                .unwrap_or(&el.name);
+            let own = designation(&el);
             if own.trim_start().starts_with('+') {
-                let levels = location_levels(&path, own);
+                let levels = location_levels(&outer, &own);
                 if !levels.is_empty() {
                     let description = ["Description", "description", "Beschreibung"]
                         .iter()
@@ -740,6 +748,10 @@ mod tests {
       </InternalElement>
       <InternalElement Name="+L1.L4" ID="l4"/>
     </InternalElement>
+    <InternalElement Name="Cabinet" ID="c2">
+      <Attribute Name="RefDes"><Value>+L2</Value></Attribute>
+      <InternalElement Name="+L5" ID="l5"/>
+    </InternalElement>
     <InternalElement Name="=PUMP" ID="f1"/>
   </InstanceHierarchy></CAEXFile>"#;
         let imp = parse(text)?;
@@ -749,7 +761,16 @@ mod tests {
             .iter()
             .map(|l| (l.path.as_str(), l.description.as_str()))
             .collect();
-        assert_eq!(got, [("L1", "Main cabinet"), ("L1.L3", ""), ("L1.L4", "")]);
+        assert_eq!(
+            got,
+            [
+                ("L1", "Main cabinet"),
+                ("L1.L3", ""),
+                ("L1.L4", ""),
+                ("L2", ""),
+                ("L2.L5", "")
+            ]
+        );
         assert_eq!(imp.devices.len(), 1, "locations are not devices");
         Ok(())
     }

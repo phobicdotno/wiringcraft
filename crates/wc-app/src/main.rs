@@ -66,7 +66,7 @@ enum Dialog {
     DeletePage(usize),
     /// Project check findings.
     Check(Vec<wc_report::Finding>),
-    /// Reports (parts, devices, wires, nets, terminals, cables, PLC I/O, contents) as tables.
+    /// Reports (parts, devices, wires, nets, terminals, cables, PLC I/O, contents, locations) as tables.
     Reports(wc_report::Kind),
     /// Write a new text at this point on the current page.
     Text(wc_core::geom::Point, String, bool),
@@ -948,10 +948,7 @@ impl App {
                     if ui.button("Add location").clicked() {
                         locations.push((String::new(), String::new()));
                     }
-                    let bad = locations
-                        .iter()
-                        .filter(|(p, _)| !p.trim().is_empty())
-                        .find_map(|(p, _)| wc_core::project::location_path(p).err());
+                    let bad = wc_core::project::location_rows(locations).err();
                     if let Some(why) = &bad {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
                     }

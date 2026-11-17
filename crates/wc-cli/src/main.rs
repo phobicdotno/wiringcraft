@@ -109,7 +109,7 @@ enum Cmd {
         pages: Vec<String>,
         #[arg(long, default_value = "")]
         date: String,
-        /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, or all.
+        /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, locations, or all.
         #[arg(long = "report")]
         reports: Vec<String>,
     },
@@ -127,7 +127,7 @@ enum Cmd {
         #[arg(long, default_value = "")]
         date: String,
     },
-    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc) as a table, CSV or Markdown.
+    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, locations) as a table, CSV or Markdown.
     Report {
         kind: String,
         #[arg(long, default_value = "text")]
@@ -240,9 +240,8 @@ enum LocationCmd {
     Set {
         /// The location, with or without its `+`.
         path: String,
-        /// What it is; empty clears it.
-        #[arg(default_value = "")]
-        description: String,
+        /// What it is; left out keeps the one it has, `""` clears it.
+        description: Option<String>,
     },
     /// Remove a location from the list (devices keep their tags).
     Remove { path: String },
@@ -748,6 +747,15 @@ fn run(cli: Cli) -> Res<()> {
                     }
                 }
                 LocationCmd::Set { path, description } => {
+                    let description = description.unwrap_or_else(|| {
+                        let have = wc_core::project::location_path(&path).ok();
+                        p.meta
+                            .locations
+                            .iter()
+                            .find(|l| Some(&l.path) == have.as_ref())
+                            .map(|l| l.description.clone())
+                            .unwrap_or_default()
+                    });
                     if p.meta.set_location(&path, &description)? {
                         save(dir, &p)?;
                     }
@@ -1778,7 +1786,9 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
             continue;
         }
         let k = wc_report::Kind::parse(n).ok_or_else(|| {
-            format!("unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, all)")
+            format!(
+                "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, locations, all)"
+            )
         })?;
         out.push(k);
     }
@@ -2000,6 +2010,7 @@ mod tests {
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         cli(&dir, &["location", "set", "+L1.L3", "Cabinet 3"]).unwrap();
         cli(&dir, &["location", "set", "L1"]).unwrap();
+        cli(&dir, &["location", "set", "L1.L3"]).unwrap();
         let locs = |d: &Path| {
             load(d)
                 .unwrap()
@@ -2017,6 +2028,8 @@ mod tests {
             ]
         );
         cli(&dir, &["location", "list"]).unwrap();
+        cli(&dir, &["location", "set", "L1.L3", ""]).unwrap();
+        assert_eq!(locs(&dir)[1].1, "", "an empty description clears it");
         cli(&dir, &["location", "remove", "+L1"]).unwrap();
         assert_eq!(locs(&dir).len(), 1);
         assert!(

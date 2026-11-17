@@ -51,6 +51,34 @@ pub fn location_path(s: &str) -> Result<String, String> {
     Ok(tag.location.join("."))
 }
 
+/// The locations of a list of (path, description) rows, as the project keeps them. Rows that
+/// are empty are skipped; a row with a description but no path, a bad path, or a path given
+/// twice is refused with the reason.
+pub fn location_rows(rows: &[(String, String)]) -> Result<Vec<Location>, String> {
+    let mut out: Vec<Location> = Vec::new();
+    for (path, description) in rows {
+        if path.trim().is_empty() {
+            if description.trim().is_empty() {
+                continue;
+            }
+            return Err(format!(
+                "the location described as {:?} has no path",
+                description.trim()
+            ));
+        }
+        let path = location_path(path)?;
+        if out.iter().any(|l| l.path == path) {
+            return Err(format!("the location +{path} is listed twice"));
+        }
+        out.push(Location {
+            path,
+            description: description.trim().to_owned(),
+        });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
 /// A location of the project, such as a cabinet or a room.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {

@@ -423,7 +423,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "get_report",
             "A report as a Markdown table.",
-            json!({"kind": {"type": "string", "enum": ["contents", "parts", "devices", "wires", "nets", "terminals", "cables", "plc"]}}),
+            json!({"kind": {"type": "string", "enum": ["contents", "parts", "devices", "wires", "nets", "terminals", "cables", "plc", "locations"]}}),
             &["kind"],
         ),
         tool(
