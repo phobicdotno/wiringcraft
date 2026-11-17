@@ -144,7 +144,27 @@ pub struct SweProject {
     pub wires: BTreeMap<i64, SweWire>,
     pub cables: BTreeMap<i64, SweCable>,
     pub components: BTreeMap<i64, SweComponent>,
+    pub locations: Vec<SweLocation>,
     pub warnings: Vec<String>,
+}
+
+/// A location (`tew_location`): a cabinet, room or panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SweLocation {
+    pub id: i64,
+    /// Full tag path as written in the database, e.g. `+L1+L3`.
+    pub tag_path: String,
+    pub description: String,
+}
+
+/// A location tag path as WiringCraft writes the location part of a tag: `+L1+L3` is `L1.L3`.
+fn location_path(tag_path: &str) -> String {
+    tag_path
+        .split(['+', '.'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// One row of the import report: how many of a kind the source has and how many came in.
@@ -617,6 +637,30 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     if unusable > 0 {
         warnings.push(format!("{unusable} line(s) without usable end points were left out"));
     }
+    // Locations, when the database has them (older or trimmed databases may not).
+    let has_locations = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'tew_location'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(sql)?
+        > 0;
+    if has_locations {
+        let mut st = conn
+            .prepare("SELECT loc_id, COALESCE(loc_tagpath, '') FROM tew_location ORDER BY loc_tagpath")
+            .map_err(sql)?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(sql)?;
+        for (id, tag_path) in readable(rows, "location", &mut warnings) {
+            p.locations.push(SweLocation {
+                id,
+                tag_path,
+                description: text.get(&id).cloned().unwrap_or_default(),
+            });
+        }
+    }
     p.warnings = warnings;
     Ok(p)
 }
@@ -903,7 +947,24 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         parts: Vec::new(),
         pages: Vec::new(),
         devices: BTreeMap::new(),
+        locations: Vec::new(),
     };
+    // Locations, with their descriptions. One without a usable tag path cannot be named.
+    let mut locations_untagged = 0;
+    for l in &p.locations {
+        let path = location_path(&l.tag_path);
+        if path.is_empty() {
+            locations_untagged += 1;
+            continue;
+        }
+        if !built.locations.iter().any(|have| have.path == path) {
+            built.locations.push(wc_core::Location {
+                path,
+                description: l.description.trim().to_owned(),
+            });
+        }
+    }
+    let locations_merged = p.locations.len() - locations_untagged - built.locations.len();
     let drawn: Vec<&SwePage> = p.pages.iter().filter(|pg| DRAWN_KINDS.contains(&pg.kind)).collect();
     let others = p.pages.len() - drawn.len();
     let covers = p.pages.iter().filter(|pg| pg.kind == KIND_COVER).count();
@@ -1468,6 +1529,15 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     cables_out.saturating_sub(cables_used.len()),
                     "not on any imported wire (device only)",
                 ),
+            ]),
+        },
+        Count {
+            what: "locations",
+            source: p.locations.len(),
+            imported: built.locations.len(),
+            note: note(vec![
+                (locations_untagged, "without a usable tag path"),
+                (locations_merged, "with the same tag path as another (merged)"),
             ]),
         },
     ];

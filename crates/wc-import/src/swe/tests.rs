@@ -783,3 +783,40 @@ fn a_line_diagram_page_is_marked_as_an_overview() {
     assert!(!page(&built, "01").overview, "a schematic page is not");
     assert!(page(&built, "02").overview, "a line diagram is");
 }
+
+#[test]
+fn locations_come_in_with_their_descriptions_and_devices_point_to_them() {
+    let c = sample();
+    c.execute_batch(
+        "CREATE TABLE tew_location (loc_id INTEGER, loc_loc_id INTEGER, loc_tagpath TEXT);
+         INSERT INTO tew_location VALUES (30, -1, '+L1'), (31, 30, '+L1+L2'), (32, -1, ''), (33, -1, '+L1');
+         INSERT INTO tew_translatedtext VALUES (30, -1, 'de', 'Schrank'), (30, -1, 'en', 'Cabinet'),
+           (31, -1, 'en', 'Door');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.locations.len(), 4);
+    let (built, _, report) = build(&p, None);
+    let got: Vec<(&str, &str)> = built
+        .locations
+        .iter()
+        .map(|l| (l.path.as_str(), l.description.as_str()))
+        .collect();
+    assert_eq!(got, [("L1", "Cabinet"), ("L1.L2", "Door")], "English wins");
+    // -K1 is tagged =F1+L1+L2-K1 in the sample: its location is one of the imported ones.
+    let k1 = built.devices.keys().find(|t| t.product == ["K1"]).unwrap();
+    assert_eq!(k1.location.join("."), "L1.L2");
+    let row = report.iter().find(|r| r.what == "locations").unwrap();
+    assert_eq!((row.source, row.imported), (4, 2));
+    assert!(row.note.contains("1 without a usable tag path"), "{}", row.note);
+    assert!(row.note.contains("1 with the same tag path as another"), "{}", row.note);
+}
+
+#[test]
+fn a_database_without_a_location_table_still_imports() {
+    let (built, warnings, report) = build(&read(&sample()).unwrap(), None);
+    assert!(built.locations.is_empty());
+    assert!(!warnings.iter().any(|w| w.contains("location")), "{warnings:?}");
+    let row = report.iter().find(|r| r.what == "locations").unwrap();
+    assert_eq!((row.source, row.imported), (0, 0));
+}
