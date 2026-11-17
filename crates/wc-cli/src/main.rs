@@ -1569,14 +1569,10 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             for w in &choice.2 {
                 eprintln!("warning: {w}");
             }
-            let (mut built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);
-            for w in sw.warnings.iter().chain(&warnings) {
-                eprintln!("warning: {w}");
-            }
-            // Devices whose part the archive's catalog has are linked to it; the part comes along.
-            let linked = if is_db {
-                None
-            } else {
+            // The archive's catalog: devices that name one of its parts are linked to it, the part
+            // comes along, and its size is used for layout footprints the source gives no box.
+            let catalog_read = !is_db;
+            if catalog_read {
                 let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
                 match wc_import::swe::library::from_archive(file) {
                     Ok(lib) => {
@@ -1585,14 +1581,17 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                         for w in &lib.warnings {
                             eprintln!("warning: catalog: {w}");
                         }
-                        Some(wc_import::swe::library::link_parts(&mut built, &lib.parts))
+                        sw.catalog = lib.parts;
                     }
-                    Err(x) => {
-                        eprintln!("warning: devices keep their part numbers as text: {x}");
-                        None
-                    }
+                    Err(x) => eprintln!("warning: devices keep their part numbers as text: {x}"),
                 }
-            };
+            }
+            let (built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);
+            for w in sw.warnings.iter().chain(&warnings) {
+                eprintln!("warning: {w}");
+            }
+            let linked = (catalog_read && !sw.catalog.is_empty())
+                .then(|| built.devices.values().filter(|d| d.part.is_some()).count());
             let source = format!(
                 "import:{}",
                 path.file_name()

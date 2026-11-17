@@ -129,7 +129,7 @@ fn every_layout_item_is_accounted_for() {
             Some((c.id, t.clone()))
         })
         .collect();
-    let l = layouts(&sw, &tags, &built.devices);
+    let l = layouts(&sw, &tags, &built.devices, &built.parts);
     assert_eq!(
         l.rails + l.ducts + l.devices + l.plates + l.no_size + l.upright + l.other,
         l.items_in
@@ -186,4 +186,68 @@ fn words_match_whole_tokens() {
     ] {
         assert_eq!(has_word(name, DUCT), want, "{name}");
     }
+}
+
+#[test]
+fn a_footprint_without_a_box_takes_its_catalog_part_size() {
+    // F1 (no box) names part FUSE-1 by Maker F, which the catalog has with a size; K1 has a box
+    // and keeps it although its part has a size too; the test's third device has neither.
+    let c = with_layout();
+    c.execute_batch(
+        "
+UPDATE tew_buildofmaterial SET bom_reference = 'FUSE-1', bom_manufacturer = 'Maker F' WHERE bom_id = 2;
+UPDATE tew_buildofmaterial SET bom_objectid = 101 WHERE bom_id = 2;
+INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (105, 'S1', '', -1);
+INSERT INTO tew_symbol VALUES (40, 12, 105, 'FP_SWITCH', 300, 640, 0, 1, 1, NULL, NULL);
+",
+    )
+    .unwrap();
+    let mut sw = read(&c).unwrap();
+    let part = |maker: &str, number: &str, w: &str, h: &str| Part {
+        id: Part::make_id(maker, number),
+        manufacturer: maker.into(),
+        order_number: number.into(),
+        properties: BTreeMap::from([("Width".to_owned(), w.to_owned()), ("Height".to_owned(), h.to_owned())]),
+        ..Default::default()
+    };
+    sw.catalog = vec![
+        part("Maker F", "FUSE-1", "9 mm", "60 mm"),
+        part("Maker A", "RLY-24", "50", "50"),
+    ];
+    let (built, _, report) = build(&sw, None);
+    let panel = &built.panels[0];
+    let device = |end: &str| {
+        panel
+            .items
+            .iter()
+            .find_map(|i| match i {
+                PanelItem::Device { tag, at, width, height } if tag.to_string().ends_with(end) => {
+                    Some((*at, *width, *height))
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(device("-F1"), (Point::new(200.0, 160.0), 9.0, 60.0));
+    assert_eq!(device("-K1"), (Point::new(100.0, 160.0), 18.0, 90.0), "the box wins");
+    assert_eq!(
+        device("-S1"),
+        (Point::new(300.0, 160.0), 18.0, 90.0),
+        "neither: default"
+    );
+    // The parts came along with the devices that use them.
+    assert!(built.parts.iter().any(|p| p.id == "maker-f.fuse-1"));
+    let items = report.iter().find(|r| r.what == "cabinet layout items").unwrap();
+    assert!(
+        items
+            .note
+            .contains("1 device(s) placed with their catalog part's width and height"),
+        "{}",
+        items.note
+    );
+    assert!(
+        items.note.contains("1 device(s) placed with an estimated"),
+        "{}",
+        items.note
+    );
 }
