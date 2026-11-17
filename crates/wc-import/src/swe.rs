@@ -973,6 +973,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut wires_drawn: BTreeSet<i64> = BTreeSet::new();
     let mut cables_used: BTreeSet<i64> = BTreeSet::new();
     let mut multi_core_lines = 0usize;
+    let mut cores_not_shown = 0usize;
 
     for (i, pg) in drawn.iter().enumerate() {
         let syms: Vec<&SweSymbol> = syms_of.remove(&pg.id).unwrap_or_default();
@@ -1111,7 +1112,15 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             }
         }
         let mut seen: Vec<(Point, Option<i64>)> = Vec::new();
-        let mut snap = |q: Point, net: Option<i64>| -> Point {
+        // Where an end lands: a pin (and its index), a wire end seen before, or itself (new).
+        // Nothing is recorded here: a line that turns out to have zero length is left out and
+        // must not take a pin or leave an end for others to join.
+        enum Landing {
+            Pin(usize, Point),
+            Seen(Point),
+            New(Point),
+        }
+        let snap = |q: Point, net: Option<i64>, pin_nets: &[BTreeSet<i64>], seen: &[(Point, Option<i64>)]| -> Landing {
             let pin = pin_at
                 .iter()
                 .enumerate()
@@ -1125,24 +1134,38 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 .map(|(k, (at, _, _))| (k, *at))
                 .min_by(|x, y| dist(x.1, q).total_cmp(&dist(y.1, q)));
             if let Some((k, at)) = pin {
-                // The first net that snaps onto a free pin takes it.
-                if let Some(n) = net {
-                    pin_nets[k].insert(n);
-                }
-                return at;
+                return Landing::Pin(k, at);
             }
-            if let Some((s, _)) = seen.iter().find(|(s, n)| dist(*s, q) <= JOIN && same_net(*n, net)) {
-                return *s;
+            match seen.iter().find(|(s, n)| dist(*s, q) <= JOIN && same_net(*n, net)) {
+                Some((s, _)) => Landing::Seen(*s),
+                None => Landing::New(q),
             }
-            seen.push((q, net));
-            q
         };
         let mut flipped: Vec<(Point, Point, &SweLine)> = Vec::new();
         for l in &lines {
-            let (a, b) = (snap(flip(l.a), l.net), snap(flip(l.b), l.net));
+            let ends = [
+                snap(flip(l.a), l.net, &pin_nets, &seen),
+                snap(flip(l.b), l.net, &pin_nets, &seen),
+            ];
+            let [a, b] = [&ends[0], &ends[1]].map(|e| match e {
+                Landing::Pin(_, p) | Landing::Seen(p) | Landing::New(p) => *p,
+            });
             if near(a, b) {
                 zero_length += 1;
                 continue;
+            }
+            // The line stays: the first net that snaps onto a free pin takes it, and its new
+            // ends are there for later lines to join.
+            for e in ends {
+                match e {
+                    Landing::Pin(k, _) => {
+                        if let Some(n) = l.net {
+                            pin_nets[k].insert(n);
+                        }
+                    }
+                    Landing::New(q) => seen.push((q, l.net)),
+                    Landing::Seen(_) => {}
+                }
             }
             flipped.push((a, b, *l));
         }
@@ -1184,6 +1207,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 .collect();
             if cores.len() > 1 {
                 multi_core_lines += 1;
+                cores_not_shown += cores.len() - 1;
             }
             let cored = wires
                 .iter()
@@ -1369,6 +1393,10 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 (
                     multi_core_lines,
                     "line(s) carry several cable cores; their wire shows the first core only",
+                ),
+                (
+                    cores_not_shown,
+                    "other cable core(s) on those lines are not shown on any imported wire",
                 ),
             ]),
         },

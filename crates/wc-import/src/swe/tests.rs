@@ -610,6 +610,39 @@ fn a_line_on_two_cable_cores_is_reported() {
         "{}",
         wires.note
     );
+    assert!(
+        wires
+            .note
+            .contains("1 other cable core(s) on those lines are not shown"),
+        "{}",
+        wires.note
+    );
+}
+
+#[test]
+fn a_zero_length_line_left_out_does_not_take_a_pin() {
+    let c = sample();
+    // Net 202's line has both ends within 0.5 mm of the free K1:A2 (100, 195): it snaps to zero
+    // length and is left out. Net 203, ending 0.3 mm off the pin, must still get it.
+    c.execute_batch(
+        "INSERT INTO tew_equipotential VALUES (901, '202'), (902, '203');
+         INSERT INTO tew_line VALUES (3, 10, 100.2, 195, 100.3, 195, 901), (4, 10, 99.7, 195, 70, 195, 902);",
+    )
+    .unwrap();
+    let (built, _, report) = build(&read(&c).unwrap(), None);
+    let a2 = Endpoint::Pin {
+        item: "s1".into(),
+        pin: "A2".into(),
+    };
+    let on_a2: Vec<Option<&str>> = built.pages[0]
+        .wires
+        .iter()
+        .filter(|w| w.from == a2 || w.to == a2)
+        .map(|w| w.potential.as_deref())
+        .collect();
+    assert_eq!(on_a2, [Some("203")]);
+    let lines = report.iter().find(|r| r.what == "wire lines").unwrap();
+    assert!(lines.note.contains("1 of zero length"), "{}", lines.note);
 }
 
 #[test]
