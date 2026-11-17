@@ -2221,6 +2221,27 @@ mod tests {
     }
 
     #[test]
+    fn undo_in_a_shared_session_goes_through_the_host() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let tag = wc_core::DeviceTag::parse("-K7").unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.devices.insert(tag.clone(), wc_core::Device::default());
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(a.share.can_undo());
+        a.run(Action::Undo);
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(!a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        assert!(a.share.can_redo());
+        a.run(Action::Redo);
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        a.share.stop();
+    }
+
+    #[test]
     fn a_message_box_is_logged_again_after_it_closed() {
         let (_tmp, mut a) = app(vec![]);
         let fail = || Some(Dialog::Message("Saving failed:\ndisk full".into()));
