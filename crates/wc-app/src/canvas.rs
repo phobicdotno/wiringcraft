@@ -68,6 +68,9 @@ pub struct Editor {
     pub auto_wire: bool,
     /// In a shared session: pages other people have open (read-only here), page id to name.
     pub held_by: std::collections::BTreeMap<String, String>,
+    /// The terminal strip a navigator menu asked to export markers of; the WAGO marking dialog
+    /// opens with only that strip when it is set.
+    pub marking_strip: Option<String>,
 }
 
 impl Default for Editor {
@@ -86,6 +89,7 @@ impl Default for Editor {
             ask_comment: None,
             comment: None,
             message: String::new(),
+            marking_strip: None,
             panel: None,
             panel_pick: None,
             panel_drag: None,

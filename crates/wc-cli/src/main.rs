@@ -195,13 +195,31 @@ enum Cmd {
 enum ExportCmd {
     /// Terminal, wire, device and cable markers for WAGO smartScript: a semicolon-separated
     /// CSV (UTF-8) with one row per marker (type, group, marker text, copies), in natural
-    /// tag order. In smartScript, import it as Excel/CSV data and map the Marker column.
+    /// tag order. In smartScript, import it as Excel/CSV data and map the Marker column (or
+    /// the Line columns, one per text line of the marker).
     WagoMarking {
         out: PathBuf,
-        /// Only these marker kinds: terminals, wires, devices, cables (default: all).
-        #[arg(long = "kind", value_delimiter = ',')]
-        kinds: Vec<String>,
+        #[command(flatten)]
+        args: MarkingArgs,
     },
+}
+
+/// Options of `export wago-marking`.
+#[derive(clap::Args, Debug, Default, PartialEq)]
+struct MarkingArgs {
+    /// Only these marker kinds: terminals, wires, devices, cables (default: all).
+    #[arg(long = "kind", value_delimiter = ',')]
+    kinds: Vec<String>,
+    /// The text lines of each marker, one column each: marker (the engraving text, a device's
+    /// `Marker` property, or its tag), tag, description, location. Default: one marker line.
+    #[arg(long = "line", value_delimiter = ',')]
+    lines: Vec<String>,
+    /// Language of the header row and the type column: en, de, nb.
+    #[arg(long, default_value = "en")]
+    lang: String,
+    /// Only the terminals of this strip (as the terminal plan names it, e.g. -X1).
+    #[arg(long, allow_hyphen_values = true)]
+    strip: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -1167,8 +1185,8 @@ fn run(cli: Cli) -> Res<()> {
                 None => print!("{text}"),
             }
         }
-        Cmd::Export(ExportCmd::WagoMarking { out, kinds }) => {
-            let done = export_wago_marking(dir, &out, &kinds)?;
+        Cmd::Export(ExportCmd::WagoMarking { out, args }) => {
+            let done = export_wago_marking(dir, &out, &args)?;
             for w in &done.warnings {
                 eprintln!("warning: {w}");
             }
@@ -2149,11 +2167,14 @@ struct Exported {
     warnings: Vec<String>,
 }
 
-/// Write the WAGO smartScript marker list of the project in `dir` to `out`. Unknown kinds are
-/// refused before anything is written. Symbols without a vendored copy are warned about: their
-/// terminals cannot be recognised and are left out.
-fn export_wago_marking(dir: &Path, out: &Path, kinds: &[String]) -> Res<Exported> {
-    let kinds = wc_report::parse_kinds(kinds)?;
+/// Write the WAGO smartScript marker list of the project in `dir` to `out`. Unknown kinds, lines,
+/// languages and strips are refused before anything is written. Symbols without a vendored copy
+/// are warned about: their terminals cannot be recognised and are left out.
+fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Exported> {
+    let kinds = wc_report::parse_kinds(&args.kinds)?;
+    let lines = wc_report::parse_lines(&args.lines)?;
+    let language = wc_report::Language::parse(&args.lang)
+        .ok_or_else(|| format!("unknown language {:?} (en, de, nb)", args.lang))?;
     let p = load(dir)?;
     let (symbols, missing) = store::vendored_symbols(dir, &p);
     let mut warnings: Vec<String> = missing
@@ -2168,7 +2189,24 @@ fn export_wago_marking(dir: &Path, out: &Path, kinds: &[String]) -> Res<Exported
         symbols: &symbols,
         parts: &parts,
     };
-    let t = wc_report::marking_list(&inputs, &kinds);
+    let strip = args.strip.as_deref().map(str::trim).map(str::to_owned);
+    if let Some(s) = &strip {
+        let strips = wc_report::terminal_strips(&inputs);
+        if !strips.contains(s) {
+            return Err(if strips.is_empty() {
+                format!("no terminal strip {s:?}: the project has no numbered terminals")
+            } else {
+                format!("no terminal strip {s:?} (strips: {})", strips.join(", "))
+            });
+        }
+    }
+    let options = wc_report::MarkingOptions {
+        kinds,
+        lines,
+        language,
+        strip,
+    };
+    let t = wc_report::marking_list_with(&inputs, &options);
     std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::formula_warnings(&t));
     Ok(Exported {
@@ -3458,16 +3496,43 @@ mod tests {
         assert_eq!(cli.project, PathBuf::from("proj"));
         assert!(matches!(
             cli.cmd,
-            Cmd::Export(ExportCmd::WagoMarking { ref out, ref kinds })
-                if out == &PathBuf::from("out.csv") && kinds == &["terminals", "wires", "cables"]
+            Cmd::Export(ExportCmd::WagoMarking { ref out, ref args })
+                if out == &PathBuf::from("out.csv") && args.kinds == ["terminals", "wires", "cables"]
         ));
 
         let cli = Cli::try_parse_from(["wiringcraft", "export", "wago-marking", "out.csv"]).unwrap();
         assert!(matches!(
             cli.cmd,
-            Cmd::Export(ExportCmd::WagoMarking { ref kinds, .. }) if kinds.is_empty()
+            Cmd::Export(ExportCmd::WagoMarking { ref args, .. })
+                if args.kinds.is_empty() && args.lines.is_empty() && args.lang == "en" && args.strip.is_none()
+        ));
+        let cli = Cli::try_parse_from([
+            "wiringcraft",
+            "export",
+            "wago-marking",
+            "out.csv",
+            "--line",
+            "marker,description",
+            "--lang",
+            "de",
+            "--strip",
+            "-X1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Export(ExportCmd::WagoMarking { ref args, .. })
+                if args.lines == ["marker", "description"] && args.lang == "de" && args.strip.as_deref() == Some("-X1")
         ));
         assert!(Cli::try_parse_from(["wiringcraft", "export", "wago-marking"]).is_err());
+    }
+
+    fn kinds(k: &[&str]) -> MarkingArgs {
+        MarkingArgs {
+            kinds: k.iter().map(|s| (*s).to_owned()).collect(),
+            lang: "en".into(),
+            ..MarkingArgs::default()
+        }
     }
 
     #[test]
@@ -3488,12 +3553,12 @@ mod tests {
         store::save(&dir, &p).unwrap();
 
         let out = tmp.path().join("bad.csv");
-        let err = export_wago_marking(&dir, &out, &["rails".into()]).err().unwrap();
+        let err = export_wago_marking(&dir, &out, &kinds(&["rails"])).err().unwrap();
         assert!(err.contains("rails"), "{err}");
         assert!(!out.exists(), "nothing written for an unknown kind");
 
         let out = tmp.path().join("m.csv");
-        let done = export_wago_marking(&dir, &out, &["cables".into(), "devices".into()]).unwrap();
+        let done = export_wago_marking(&dir, &out, &kinds(&["cables", "devices"])).unwrap();
         assert_eq!(done.markers, 2);
         assert_eq!(
             std::fs::read_to_string(&out).unwrap(),
@@ -3513,10 +3578,67 @@ mod tests {
         .unwrap();
         p.pages[0].wires.push(wire);
         store::save(&dir, &p).unwrap();
-        let done = export_wago_marking(&dir, &out, &["wires".into()]).unwrap();
+        let done = export_wago_marking(&dir, &out, &kinds(&["wires"])).unwrap();
         assert!(std::fs::read_to_string(&out).unwrap().contains("Wire;;=1;2"));
         let formula: Vec<&String> = done.warnings.iter().filter(|w| w.contains("formula")).collect();
         assert_eq!(formula.len(), 1, "{:?}", done.warnings);
         assert!(formula[0].contains("\"=1\""));
+    }
+
+    #[test]
+    fn wago_marking_export_takes_lines_language_and_one_strip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        let mut p = store::create(&dir, "Test").unwrap();
+        let w1 = wc_core::DeviceTag::parse("-W1").unwrap();
+        let dev = p.devices.entry(w1).or_default();
+        dev.description = "Motor cable".into();
+        dev.properties
+            .insert(wc_report::MARKER_PROPERTY.into(), "M1 FEED".into());
+        store::save(&dir, &p).unwrap();
+        let out = tmp.path().join("m.csv");
+
+        let args = MarkingArgs {
+            kinds: vec!["cables".into()],
+            lines: vec!["marker".into(), "tag".into(), "description".into()],
+            lang: "de".into(),
+            strip: None,
+        };
+        let done = export_wago_marking(&dir, &out, &args).unwrap();
+        assert_eq!(done.markers, 1);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "\u{feff}Typ;Gruppe;Zeile 1;Zeile 2;Zeile 3;Anzahl\r\nKabel;;M1 FEED;-W1;Motor cable;2\r\n"
+        );
+
+        // Unknown options and strips are refused before anything is written.
+        let bad = tmp.path().join("bad.csv");
+        for (args, word) in [
+            (
+                MarkingArgs {
+                    lang: "fr".into(),
+                    ..kinds(&[])
+                },
+                "fr",
+            ),
+            (
+                MarkingArgs {
+                    lines: vec!["colour".into()],
+                    ..kinds(&[])
+                },
+                "colour",
+            ),
+            (
+                MarkingArgs {
+                    strip: Some("-X9".into()),
+                    ..kinds(&[])
+                },
+                "-X9",
+            ),
+        ] {
+            let err = export_wago_marking(&dir, &bad, &args).err().unwrap();
+            assert!(err.contains(word), "{err}");
+            assert!(!bad.exists());
+        }
     }
 }

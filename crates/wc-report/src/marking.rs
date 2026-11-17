@@ -47,12 +47,21 @@ impl MarkerKind {
     }
 
     /// The marker type as written in the file's first column.
-    fn label(self) -> &'static str {
-        match self {
-            MarkerKind::Terminals => "Terminal",
-            MarkerKind::Wires => "Wire",
-            MarkerKind::Devices => "Device",
-            MarkerKind::Cables => "Cable",
+    fn label(self, lang: Language) -> &'static str {
+        use Language::*;
+        match (self, lang) {
+            (MarkerKind::Terminals, En) => "Terminal",
+            (MarkerKind::Wires, En) => "Wire",
+            (MarkerKind::Devices, En) => "Device",
+            (MarkerKind::Cables, En) => "Cable",
+            (MarkerKind::Terminals, De) => "Klemme",
+            (MarkerKind::Wires, De) => "Leiter",
+            (MarkerKind::Devices, De) => "Betriebsmittel",
+            (MarkerKind::Cables, De) => "Kabel",
+            (MarkerKind::Terminals, Nb) => "Klemme",
+            (MarkerKind::Wires, Nb) => "Leder",
+            (MarkerKind::Devices, Nb) => "Komponent",
+            (MarkerKind::Cables, Nb) => "Kabel",
         }
     }
 
@@ -64,41 +73,225 @@ impl MarkerKind {
     }
 }
 
+/// The language of the header row and of the marker type column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Language {
+    #[default]
+    En,
+    De,
+    Nb,
+}
+
+impl Language {
+    pub const ALL: [Language; 3] = [Language::En, Language::De, Language::Nb];
+
+    /// The code used on the command line (`en`, `de`, `nb`).
+    pub fn code(self) -> &'static str {
+        match self {
+            Language::En => "en",
+            Language::De => "de",
+            Language::Nb => "nb",
+        }
+    }
+
+    /// The language's own name, for a menu.
+    pub fn name(self) -> &'static str {
+        match self {
+            Language::En => "English",
+            Language::De => "Deutsch",
+            Language::Nb => "Norsk",
+        }
+    }
+
+    /// A language by its code; `no` is taken as Norwegian Bokmål too.
+    pub fn parse(s: &str) -> Option<Language> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "en" => Some(Language::En),
+            "de" => Some(Language::De),
+            "nb" | "no" => Some(Language::Nb),
+            _ => None,
+        }
+    }
+
+    /// Header words: type, group, marker, line (followed by its number), count.
+    fn words(self) -> [&'static str; 5] {
+        match self {
+            Language::En => ["Type", "Group", "Marker", "Line", "Count"],
+            Language::De => ["Typ", "Gruppe", "Beschriftung", "Zeile", "Anzahl"],
+            Language::Nb => ["Type", "Gruppe", "Merking", "Linje", "Antall"],
+        }
+    }
+}
+
+/// What one line of a marker shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineField {
+    /// The marker text: a device's or cable's engraving text (its [`MARKER_PROPERTY`]) when it
+    /// has one, otherwise its tag; a terminal's number; a wire's number.
+    Marker,
+    /// The tag itself, ignoring any engraving text (a terminal shows its strip).
+    Tag,
+    /// The device's description (a terminal: its strip's description); empty for wires.
+    Description,
+    /// The location part of the tag (`+C1`); empty for wires.
+    Location,
+}
+
+impl LineField {
+    pub const ALL: [LineField; 4] = [
+        LineField::Marker,
+        LineField::Tag,
+        LineField::Description,
+        LineField::Location,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LineField::Marker => "marker",
+            LineField::Tag => "tag",
+            LineField::Description => "description",
+            LineField::Location => "location",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LineField> {
+        let s = s.trim().to_ascii_lowercase();
+        LineField::ALL.into_iter().find(|f| f.name() == s)
+    }
+}
+
+/// The device property holding a marker (engraving) text that differs from the tag, such as a
+/// customer's own name for a device. Devices and cables without it are marked with their tag.
+pub const MARKER_PROPERTY: &str = "Marker";
+
+/// What a marker list holds and how it is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkingOptions {
+    /// The kinds of marker; empty means all of them (or only terminals with `strip`).
+    pub kinds: Vec<MarkerKind>,
+    /// The lines of each marker, one column each; empty means one line with the marker text.
+    pub lines: Vec<LineField>,
+    pub language: Language,
+    /// Only this terminal strip's terminals (as the terminal plan names it, e.g. `-X1`).
+    pub strip: Option<String>,
+}
+
+impl Default for MarkingOptions {
+    fn default() -> Self {
+        Self {
+            kinds: Vec::new(),
+            lines: vec![LineField::Marker],
+            language: Language::En,
+            strip: None,
+        }
+    }
+}
+
 /// The marker list for the chosen kinds (all of them when `kinds` is empty), in the order
 /// terminals, wires, devices, cables, each sorted in natural order.
 pub fn marking_list(i: &Inputs<'_>, kinds: &[MarkerKind]) -> Table {
-    let mut t = Table::new("Marking list", &["Type", "Group", "Marker", "Count"]);
-    let wanted = |k: MarkerKind| kinds.is_empty() || kinds.contains(&k);
-    let row = |k: MarkerKind, group: &str, text: &str, count: usize| {
-        vec![
-            k.label().to_owned(),
-            group.to_owned(),
-            text.to_owned(),
-            count.to_string(),
-        ]
+    marking_list_with(
+        i,
+        &MarkingOptions {
+            kinds: kinds.to_vec(),
+            ..MarkingOptions::default()
+        },
+    )
+}
+
+/// The terminal strips that have numbered terminals, in natural order: what
+/// [`MarkingOptions::strip`] can name.
+pub fn terminal_strips(i: &Inputs<'_>) -> Vec<String> {
+    let mut strips: Vec<String> = terminal_rows(i).into_iter().map(|(s, _)| s).collect();
+    strips.dedup();
+    strips
+}
+
+/// (strip, number) of every numbered terminal, sorted and without repeats.
+fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String)> {
+    // The terminal plan already numbers terminals and sorts strips and numbers.
+    let mut rows: Vec<(String, String)> = terminal_plan(i)
+        .rows
+        .into_iter()
+        .filter_map(|r| match (r.first(), r.get(1)) {
+            (Some(strip), Some(number)) if strip != "(untagged)" => Some((strip.clone(), number.clone())),
+            _ => None,
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        natural_key(&a.0)
+            .cmp(&natural_key(&b.0))
+            .then(natural_key(&a.1).cmp(&natural_key(&b.1)))
+            // `1` and `01` have equal keys: order them exactly too, so `dedup` sees
+            // repeats side by side.
+            .then_with(|| a.cmp(b))
+    });
+    rows.dedup();
+    rows
+}
+
+/// The marker list as `o` asks for it: columns type, group, one per line, count.
+pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
+    let [w_type, w_group, w_marker, w_line, w_count] = o.language.words();
+    let lines: Vec<LineField> = if o.lines.is_empty() {
+        vec![LineField::Marker]
+    } else {
+        o.lines.clone()
+    };
+    let mut columns: Vec<String> = vec![w_type.into(), w_group.into()];
+    if lines.len() == 1 {
+        columns.push(w_marker.into());
+    } else {
+        columns.extend((1..=lines.len()).map(|n| format!("{w_line} {n}")));
+    }
+    columns.push(w_count.into());
+    let mut t = Table::new("Marking list", &[]);
+    t.columns = columns;
+    let wanted = |k: MarkerKind| {
+        if o.kinds.is_empty() {
+            o.strip.is_none() || k == MarkerKind::Terminals
+        } else {
+            o.kinds.contains(&k)
+        }
+    };
+    let description = |tag: &str| -> String {
+        tag.parse::<DeviceTag>()
+            .ok()
+            .and_then(|t| i.project.devices.get(&t))
+            .map(|d| d.description.clone())
+            .unwrap_or_default()
+    };
+    let engraving = |tag: &DeviceTag| -> Option<String> {
+        i.project
+            .devices
+            .get(tag)
+            .and_then(|d| d.properties.get(MARKER_PROPERTY))
+            .map(|m| m.trim().to_owned())
+            .filter(|m| !m.is_empty())
+    };
+    // One marker row: `marker` is the marker text, `tag` the tag (or strip, or number).
+    let mut push = |k: MarkerKind, group: &str, marker: &str, tag: &str, location: &str, count: usize| {
+        let mut r = vec![k.label(o.language).to_owned(), group.to_owned()];
+        for f in &lines {
+            r.push(match (f, k) {
+                (LineField::Marker, _) => marker.to_owned(),
+                (LineField::Tag, _) => tag.to_owned(),
+                (LineField::Description, MarkerKind::Wires) => String::new(),
+                (LineField::Description, _) => description(tag),
+                (LineField::Location, _) => location.to_owned(),
+            });
+        }
+        r.push(count.to_string());
+        t.rows.push(r);
     };
 
     if wanted(MarkerKind::Terminals) {
-        // The terminal plan already numbers terminals and sorts strips and numbers.
-        let mut rows: Vec<(String, String)> = terminal_plan(i)
-            .rows
-            .into_iter()
-            .filter_map(|r| match (r.first(), r.get(1)) {
-                (Some(strip), Some(number)) if strip != "(untagged)" => Some((strip.clone(), number.clone())),
-                _ => None,
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            natural_key(&a.0)
-                .cmp(&natural_key(&b.0))
-                .then(natural_key(&a.1).cmp(&natural_key(&b.1)))
-                // `1` and `01` have equal keys: order them exactly too, so `dedup` sees
-                // repeats side by side.
-                .then_with(|| a.cmp(b))
-        });
-        rows.dedup();
-        for (strip, number) in rows {
-            t.rows.push(row(MarkerKind::Terminals, &strip, &number, 1));
+        for (strip, number) in terminal_rows(i) {
+            if o.strip.as_ref().is_some_and(|s| s.trim() != strip) {
+                continue;
+            }
+            let location = strip.parse::<DeviceTag>().map(|t| location_of(&t)).unwrap_or_default();
+            push(MarkerKind::Terminals, &strip, &number, &strip, &location, 1);
         }
     }
 
@@ -124,7 +317,7 @@ pub fn marking_list(i: &Inputs<'_>, kinds: &[MarkerKind]) -> Table {
         let mut list: Vec<(String, usize)> = ends.into_iter().collect();
         list.sort_by_key(|(n, _)| natural_key(n));
         for (n, count) in list {
-            t.rows.push(row(MarkerKind::Wires, "", &n, count));
+            push(MarkerKind::Wires, "", &n, &n, "", count);
         }
     }
 
@@ -148,8 +341,10 @@ pub fn marking_list(i: &Inputs<'_>, kinds: &[MarkerKind]) -> Table {
             .collect();
         list.sort_by_key(|t| natural_key(&t.to_string()));
         for tag in list {
-            t.rows
-                .push(row(MarkerKind::Devices, &location_of(&tag), &tag.to_string(), 1));
+            let text = tag.to_string();
+            let location = location_of(&tag);
+            let marker = engraving(&tag).unwrap_or_else(|| text.clone());
+            push(MarkerKind::Devices, &location, &marker, &text, &location, 1);
         }
     }
 
@@ -161,8 +356,10 @@ pub fn marking_list(i: &Inputs<'_>, kinds: &[MarkerKind]) -> Table {
         let mut list: Vec<DeviceTag> = list.into_iter().collect();
         list.sort_by_key(|t| natural_key(&t.to_string()));
         for tag in list {
-            t.rows
-                .push(row(MarkerKind::Cables, &location_of(&tag), &tag.to_string(), 2));
+            let text = tag.to_string();
+            let location = location_of(&tag);
+            let marker = engraving(&tag).unwrap_or_else(|| text.clone());
+            push(MarkerKind::Cables, &location, &marker, &text, &location, 2);
         }
     }
     t
@@ -196,14 +393,22 @@ fn is_cable_tag(tag: &DeviceTag) -> bool {
 pub fn formula_warnings(t: &Table) -> Vec<String> {
     t.rows
         .iter()
-        .filter(|r| r.first().map(String::as_str) == Some(MarkerKind::Wires.label()))
+        .filter(|r| {
+            Language::ALL
+                .iter()
+                .any(|l| r.first().map(String::as_str) == Some(MarkerKind::Wires.label(*l)))
+        })
         .filter_map(|r| r.get(2))
-        .filter(|n| n.starts_with(['=', '+', '-', '@']))
-        .map(|n| {
+        .filter_map(|n| {
+            n.chars()
+                .next()
+                .filter(|c| ['=', '+', '-', '@'].contains(c))
+                .map(|c| (n, c))
+        })
+        .map(|(n, c)| {
             format!(
-                "wire number {n:?} starts with {:?}: a spreadsheet opening the file may run it as a formula \
-                 (smartScript prints it as it is)",
-                &n[..1]
+                "wire number {n:?} starts with {c:?}: a spreadsheet opening the file may run it as a formula \
+                 (smartScript prints it as it is)"
             )
         })
         .collect()
@@ -224,6 +429,16 @@ pub fn parse_kinds(names: &[String]) -> Result<Vec<MarkerKind>, String> {
         .iter()
         .map(|k| {
             MarkerKind::parse(k).ok_or_else(|| format!("unknown marker kind {k:?} (terminals, wires, devices, cables)"))
+        })
+        .collect()
+}
+
+/// Parse line field names (`marker`, `tag`, `description`, `location`).
+pub fn parse_lines(names: &[String]) -> Result<Vec<LineField>, String> {
+    names
+        .iter()
+        .map(|f| {
+            LineField::parse(f).ok_or_else(|| format!("unknown marker line {f:?} (marker, tag, description, location)"))
         })
         .collect()
 }
