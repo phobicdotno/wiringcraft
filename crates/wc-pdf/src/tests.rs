@@ -946,7 +946,7 @@ fn long_title_block_values_stay_inside_their_boxes() {
 fn short_title_block_values_keep_their_height() {
     let mut project = wc_core::Project::new("Pump station");
     project.meta.title_block.insert("customer".into(), "ACME".into());
-    project.meta.title_block.insert("revision".into(), "B".into());
+    project.meta.title_block.insert("revision".into(), "Rev-B".into());
     let page = Page::new("p1", "1", "Motors");
     let marks = layout::frame_marks(&project, &page, 0, 1, "2026-11-17");
     let height_of = |wanted: &str| {
@@ -956,8 +956,29 @@ fn short_title_block_values_keep_their_height() {
         })
     };
     assert_eq!(height_of("ACME"), Some(3.0));
-    assert_eq!(height_of("B"), Some(2.5));
+    // Not "B": that is also a frame row letter, drawn at 2.5 mm too.
+    assert_eq!(height_of("Rev-B"), Some(2.5));
     assert_eq!(height_of("Pump station"), Some(4.0));
     assert_eq!(height_of("Motors"), Some(3.0));
     assert_eq!(height_of("1 / 1"), Some(3.0));
+}
+
+#[test]
+fn fractions_are_measured_at_their_helvetica_width() -> Result<(), String> {
+    // Helvetica's AFM gives ¼ ½ ¾ 834 units; a 1000-unit em is the text height / 0.72.
+    let mut project = wc_core::Project::new("x");
+    let value = "\u{bd}".repeat(60);
+    project.meta.title_block.insert("customer".into(), value.clone());
+    let marks = layout::frame_marks(&project, &Page::new("p1", "1", ""), 0, 1, "2026-11-17");
+    let height = marks
+        .iter()
+        .find_map(|m| match &m.shape {
+            Shape::Text { text, height, .. } if *text == value => Some(*height),
+            _ => None,
+        })
+        .ok_or("the customer value is not drawn")?;
+    let rendered = 60.0 * 0.834 * height / 0.72;
+    // The customer box is 80 mm wide, less 1.5 mm padding each side.
+    assert!(rendered <= 77.0 + 1e-6, "{rendered} mm");
+    Ok(())
 }

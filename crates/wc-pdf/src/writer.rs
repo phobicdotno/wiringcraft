@@ -688,6 +688,8 @@ pub fn text_width_mm(s: &str, height_mm: f64) -> f64 {
                 '\u{2014}' => 1000.0,
                 '\u{2022}' => 350.0,
                 '\u{2192}' => 584.0,
+                // Helvetica's widths for the WinAnsi fractions ¼ ½ ¾.
+                '\u{bc}' | '\u{bd}' | '\u{be}' => 834.0,
                 // Other Latin-1 letters: a wide estimate, so fitted text never overflows.
                 '\u{a0}'..='\u{ff}' => 778.0,
                 // Anything else is written as `?`.
