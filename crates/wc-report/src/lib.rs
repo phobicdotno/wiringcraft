@@ -251,7 +251,7 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
         for (part, qty) in parts {
             let (n, tags) = by_part.entry(part.to_owned()).or_default();
             *n += u64::from(qty);
-            if !tags.contains(&tag) {
+            if tags.last() != Some(&tag) {
                 tags.push(tag.clone());
             }
         }

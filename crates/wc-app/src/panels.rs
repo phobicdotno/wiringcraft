@@ -877,23 +877,32 @@ fn accessories_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, 
             .find(|(p, _)| p == id)
             .map_or_else(|| id.to_owned(), |(_, l)| l.clone())
     };
-    let mut next = current.clone();
+    // Row edits are noted while drawing and applied after, so no index is shared between lists.
+    let mut edit: Option<(usize, i8)> = None;
     for (i, a) in current.iter().enumerate() {
         ui.horizontal(|ui| {
             if ui.small_button("\u{2212}").on_hover_text("One less").clicked() {
-                if a.qty > 1 {
-                    next[i].qty -= 1;
-                } else {
-                    next.remove(i);
-                }
+                edit = Some((i, -1));
             }
             ui.label(format!("{} x", a.qty));
             if ui.small_button("+").on_hover_text("One more").clicked() {
-                next[i].qty += 1;
+                edit = Some((i, 1));
             }
             ui.add(egui::Label::new(label(&a.part)).truncate())
                 .on_hover_text(&a.part);
         });
+    }
+    let mut next = current.clone();
+    if let Some((i, step)) = edit
+        && let Some(a) = next.get_mut(i)
+    {
+        if step > 0 {
+            a.qty = a.qty.saturating_add(1);
+        } else if a.qty > 1 {
+            a.qty -= 1;
+        } else {
+            next.remove(i);
+        }
     }
     let mut add = None;
     egui::ComboBox::from_id_salt("accessory")
@@ -914,7 +923,7 @@ fn accessories_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, 
         });
     if let Some(id) = add {
         match next.iter_mut().find(|a| a.part == id) {
-            Some(a) => a.qty += 1,
+            Some(a) => a.qty = a.qty.saturating_add(1),
             None => next.push(wc_core::DevicePart { part: id, qty: 1 }),
         }
     }

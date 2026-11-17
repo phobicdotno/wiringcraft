@@ -301,7 +301,8 @@ pub fn create(dir: &Path, name: &str) -> Result<Project> {
     Ok(project)
 }
 
-fn vendor_path(dir: &Path, kind: ItemKind, id: &str) -> Result<PathBuf> {
+/// Where a vendored item of this kind and id lives in the project folder.
+pub fn vendor_path(dir: &Path, kind: ItemKind, id: &str) -> Result<PathBuf> {
     check_id(id)?;
     Ok(dir.join(VENDOR_DIR).join(kind.dir()).join(format!("{id}.json")))
 }

@@ -269,14 +269,13 @@ impl Open {
         if self.parts.contains_key(id) {
             return Ok(());
         }
-        let p = match store::read_vendored_part(&self.dir, id) {
-            Ok(p) => p,
-            Err(_) => {
-                let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
-                wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
-                store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?
-            }
-        };
+        // Only go to the library when the project has no copy; a broken copy is reported as is.
+        let vendored = store::vendor_path(&self.dir, ItemKind::Part, id).map_err(|e| e.to_string())?;
+        if !vendored.exists() {
+            let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
+            wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
+        }
+        let p = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
         self.parts.insert(id.to_owned(), p);
         Ok(())
     }
