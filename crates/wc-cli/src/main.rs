@@ -1683,12 +1683,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             if entries.is_empty() && csvs.is_empty() {
                 return Ok(());
             }
-            // Unique and readable only by this user, so nobody can plant a file or link there;
-            // removed when it goes out of scope, also on an early return.
-            let staging = tempfile::Builder::new()
-                .prefix("wiringcraft-archive-")
-                .tempdir()
-                .map_err(e)?;
+            // Removed when it goes out of scope, also on an early return.
+            let staging = staging_dir().map_err(e)?;
             let tmp = staging.path();
             let mut next = first_page;
             for (i, (name, kind, data)) in entries.into_iter().enumerate() {
@@ -2604,10 +2600,33 @@ fn file_stem(number: &str, id: &str) -> String {
     if stem.is_empty() { "page".into() } else { stem }
 }
 
+/// A fresh folder for files taken out of an archive: unique, and on Unix readable only by
+/// this user (mode 0700, set as it is created), so nobody can plant a file or link there.
+/// Removed when the returned value is dropped.
+fn staging_dir() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("wiringcraft-archive-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_archive_staging_folder_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = staging_dir().unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
 
     fn cli(dir: &Path, args: &[&str]) -> Res<()> {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
