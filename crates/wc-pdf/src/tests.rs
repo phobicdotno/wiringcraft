@@ -421,3 +421,35 @@ fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
     let pages: Vec<&str> = mains.iter().map(|a| a.page_id.as_str()).collect();
     assert_eq!(pages, ["p2", "p1"], "the schematic first, the overview still listed");
 }
+
+#[test]
+fn cross_references_give_page_column_and_row() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let mut project = wc_core::Project::new("x");
+    let mut page = Page::new("p1", "12", "Control");
+    // place() puts symbols at y 60: on A3 the rows are 46.17 mm high from 10 mm, so row B.
+    page.symbols.push(place("s1", "coil", 100.0, "-K1"));
+    project.pages = vec![page];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let tag = DeviceTag::parse("-K1").ok();
+    let first = tag.as_ref().and_then(|t| x.mains.get(t)).and_then(|m| m.first());
+    assert_eq!(first.map(|a| a.location()).as_deref(), Some("12/3.B"));
+}
+
+#[test]
+fn the_frame_shows_row_letters_on_both_sides() {
+    let project = wc_core::Project::new("x");
+    let mut page = Page::new("p1", "1", "");
+    page.size = wc_core::PageSize::A2;
+    let marks = layout::frame_marks(&project, &page, 0, 1, "");
+    let count = |l: &str| {
+        marks
+            .iter()
+            .filter(|m| matches!(&m.shape, Shape::Text { text, .. } if text == l))
+            .count()
+    };
+    assert_eq!(count("A"), 2, "left and right");
+    assert_eq!(count("H"), 2, "A2 has eight rows");
+    assert_eq!(count("I"), 0);
+}

@@ -108,6 +108,34 @@ impl PageSize {
         }
         (col as i64).saturating_add(1).clamp(1, FRAME_COLUMNS as i64) as usize
     }
+
+    /// How many reference rows run down the sides of the frame: A to F on A4 and A3, A to H
+    /// on A2. Fixed per sheet size, so a reference never moves.
+    pub fn frame_rows(self) -> usize {
+        match self {
+            PageSize::A4 | PageSize::A3 => 6,
+            PageSize::A2 => 8,
+        }
+    }
+
+    /// The reference row (1-based, 1 to [`Self::frame_rows`], counted from the top) that `y`
+    /// millimetres falls into.
+    pub fn row_of(self, y: f64) -> usize {
+        let (_, h) = self.mm();
+        let rows = self.frame_rows();
+        let row_h = (h - 2.0 * FRAME_MARGIN) / rows as f64;
+        let row = ((y - FRAME_MARGIN) / row_h).floor();
+        if row.is_nan() {
+            return 1;
+        }
+        (row as i64).saturating_add(1).clamp(1, rows as i64) as usize
+    }
+}
+
+/// The letter of a reference row: 1 is `A`, 2 is `B`, and so on.
+pub fn row_letter(row: usize) -> char {
+    let i = row.saturating_sub(1).min(25) as u8;
+    char::from(b'A' + i)
 }
 
 /// Number of reference columns across a page's drawing area.
@@ -380,6 +408,24 @@ fn natural_key(s: &str) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_cover_the_frame_height_for_each_sheet_size() {
+        for (size, rows) in [(PageSize::A4, 6), (PageSize::A3, 6), (PageSize::A2, 8)] {
+            let (_, h) = size.mm();
+            assert_eq!(size.frame_rows(), rows);
+            assert_eq!(size.row_of(0.0), 1, "above the frame is row A");
+            assert_eq!(size.row_of(FRAME_MARGIN + 0.1), 1);
+            assert_eq!(size.row_of(h - FRAME_MARGIN - 0.1), rows);
+            assert_eq!(size.row_of(h), rows, "below the frame is the last row");
+            assert_eq!(size.row_of(f64::NAN), 1);
+            let row_h = (h - 2.0 * FRAME_MARGIN) / rows as f64;
+            assert_eq!(size.row_of(FRAME_MARGIN + 2.5 * row_h), 3, "the middle of row C");
+        }
+        assert_eq!(row_letter(1), 'A');
+        assert_eq!(row_letter(8), 'H');
+        assert_eq!(row_letter(0), 'A');
+    }
 
     #[test]
     fn locations_are_saved_only_when_there_are_some_and_merge_by_path() -> Result<(), toml::de::Error> {

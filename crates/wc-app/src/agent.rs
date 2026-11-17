@@ -33,7 +33,8 @@ one Undo (Ctrl+Z) takes back everything you changed in a turn.
 How the drawing works:
 - Coordinates are millimetres on the sheet, origin at the top-left corner, x to the right, y DOWN. Sheets are \
 landscape: A4 297x210, A3 420x297 (default), A2 594x420. The frame is 10 mm in from the edge and divided into 10 \
-reference columns; the title block sits at the bottom. Keep drawings inside roughly x 20..(width-20), y 20..(height-45).
+reference columns (1-10 along the top) and rows (A-F on A4 and A3, A-H on A2, down both sides); cross-references \
+give page, column and row, such as 12/3.C. The title block sits at the bottom. Keep drawings inside roughly x 20..(width-20), y 20..(height-45).
 - Put symbols and wire bends on a 5 mm grid (the editor snaps to 2.5 mm). Leave room: about 20-30 mm between \
 neighbouring symbols, current paths drawn as vertical columns from a top supply rail down to a bottom rail.
 - A placed symbol has a page-unique id (s1, s2, ...) and pins with names (13, 14, A1, A2, L1 ...). Wires go from \
