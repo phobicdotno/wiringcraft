@@ -56,6 +56,11 @@ pub enum ProjectEdit {
     Renumber { numbers: Vec<(String, String)> },
     /// Replace the project's properties (name, title block, locations, jumpers, settings).
     SetMeta { meta: Box<ProjectMeta> },
+    /// Replace the content of several existing pages at once, for a tool that changes pages
+    /// other than the one the author has open (wire numbering, a device tag renamed on every
+    /// page). Display numbers are kept: only `Renumber` changes them. Refused as a whole when
+    /// someone else has one of the pages open.
+    SetPages { pages: Vec<Page> },
 }
 
 impl ProjectEdit {
@@ -71,6 +76,10 @@ impl ProjectEdit {
             Self::RemovePage { id } => format!("Remove page {id}"),
             Self::Renumber { numbers } => format!("Renumber {} pages", numbers.len()),
             Self::SetMeta { .. } => "Change project properties".to_owned(),
+            Self::SetPages { pages } => match pages.as_slice() {
+                [p] => format!("Edit page {} {}", p.number, p.title),
+                _ => format!("Edit {} pages", pages.len()),
+            },
         }
     }
 
@@ -80,6 +89,10 @@ impl ProjectEdit {
             Self::SetComments { page, .. } => Some(page),
             Self::AddPage { page } => Some(&page.id),
             Self::RemovePage { id } => Some(id),
+            Self::SetPages { pages } => match pages.as_slice() {
+                [p] => Some(&p.id),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -222,6 +235,15 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
             project.sort_pages();
         }
         ProjectEdit::SetMeta { meta } => project.meta = (**meta).clone(),
+        ProjectEdit::SetPages { pages } => {
+            for page in pages {
+                if let Some(p) = project.page_mut(&page.id) {
+                    let number = std::mem::take(&mut p.number);
+                    *p = page.clone();
+                    p.number = number;
+                }
+            }
+        }
     }
 }
 
@@ -284,5 +306,24 @@ pub(crate) fn check_edit(
             Ok(())
         }
         ProjectEdit::SetMeta { .. } => Ok(()),
+        ProjectEdit::SetPages { pages } => {
+            let mut ids = std::collections::BTreeSet::new();
+            for page in pages {
+                known(&page.id)?;
+                if !ids.insert(page.id.as_str()) {
+                    return invalid(format!("page {} is listed twice", page.id));
+                }
+                match locks.get(&page.id) {
+                    Some(&holder) if holder != by => {
+                        return Err(Refusal::PageLocked {
+                            page: page.id.clone(),
+                            by: holder,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
     }
 }

@@ -200,6 +200,9 @@ impl App {
     fn sync_session(&mut self, ctx: &egui::Context) {
         if !self.share.active() {
             self.ed.held_by.clear();
+            if let Some(o) = self.open.as_mut() {
+                o.held_by_others.clear();
+            }
             return;
         }
         // While an assistant command runs, its files are its own: nothing is sent, and a joined
@@ -246,6 +249,9 @@ impl App {
             self.ed.page = o.project.pages.len().saturating_sub(1);
         }
         self.ed.held_by = self.share.held_by_others();
+        if let Some(o) = self.open.as_mut() {
+            o.held_by_others = self.ed.held_by.clone();
+        }
         if let Some(note) = self.share.take_notes().pop() {
             applog::info(&format!("shared session: {note}"));
             self.ed.message = note;
@@ -634,10 +640,7 @@ impl App {
             Action::ExportWagoMarking => self.dialog = Some(Dialog::Message(export_wago_marking(open))),
             Action::NumberWires => {
                 let done = open.number_wires(wc_core::numbering::Rule::PageColumn);
-                self.dialog = Some(Dialog::Message(format!(
-                    "Numbered {} connection(s); {} wire(s) changed.\nExisting numbers were kept.",
-                    done.connections, done.wires
-                )));
+                self.dialog = Some(Dialog::Message(done.report()));
             }
             Action::Reports => self.dialog = Some(Dialog::Reports(wc_report::Kind::Parts)),
             Action::Check => {

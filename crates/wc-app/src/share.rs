@@ -4,8 +4,10 @@
 //! Each frame, [`Share::frame`] compares the open project with what it was after the last
 //! frame's sync. Changes to the page this person holds go out as one page edit; changes to
 //! project-level data (devices, comments, panels, pages added, removed or renumbered, project
-//! properties) go out as project edits. Then the session's project comes back in, so pages
-//! other people hold are read-only: a local change to one of them is put back. Nothing goes out
+//! properties) go out as project edits, and changes a tool made to pages nobody else holds
+//! (wire numbering, a tag renamed on every page) go out together as one `SetPages`. Then the
+//! session's project comes back in, so pages other people hold are read-only: a local change
+//! to one of them is put back, and the whole action with it. Nothing goes out
 //! while a mouse button is down or a live form is open, so a drag over many frames is one
 //! change, and one commit on the host.
 
@@ -46,8 +48,9 @@ fn same_content(a: &Page, b: &Page) -> bool {
 }
 
 /// What changed in `local` since `base` (the project after the last sync), as session messages.
-/// `mine` is the page this person holds; changes to other existing pages cannot be sent and are
-/// listed in `dropped`. `held` tells who holds which page, so removing a page someone else has
+/// `mine` is the page this person holds and goes out as a page edit; changes to pages nobody
+/// else holds go out together as one `SetPages`; changes to pages someone else holds cannot be
+/// sent and are listed in `dropped`. `held` tells who holds which page, so removing a page someone else has
 /// open is not even asked for.
 pub fn outgoing(
     local: &Project,
@@ -73,6 +76,7 @@ pub fn outgoing(
         }
     }
     let mut numbers = Vec::new();
+    let mut others = Vec::new();
     for p in &local.pages {
         let Some(b) = base.page(&p.id) else {
             out.edits.push(ProjectEdit::AddPage { page: p.clone() });
@@ -85,7 +89,12 @@ pub fn outgoing(
             if mine == Some(p.id.as_str()) {
                 out.page = Some(p.clone());
             } else {
-                out.dropped.push(p.number.clone());
+                match held.get(&p.id) {
+                    Some(&holder) if holder != me => out.dropped.push(p.number.clone()),
+                    // A page nobody has open, changed by a tool that works on several pages
+                    // (wire numbering, a tag renamed everywhere): one edit for all of them.
+                    _ => others.push(p.clone()),
+                }
             }
         }
     }
@@ -148,6 +157,11 @@ pub fn outgoing(
         if !local.panels.iter().any(|p| p.id == b.id) {
             out.edits.push(ProjectEdit::RemovePanel { id: b.id.clone() });
         }
+    }
+
+    // Last, so the devices the pages name are there before them.
+    if !others.is_empty() {
+        out.edits.push(ProjectEdit::SetPages { pages: others });
     }
     out
 }

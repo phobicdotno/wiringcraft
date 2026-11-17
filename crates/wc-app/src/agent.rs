@@ -1214,11 +1214,7 @@ impl App {
                     _ => Rule::PageColumn,
                 };
                 let open = need_open(self.open.as_mut())?;
-                let done = open.number_wires(rule);
-                Ok(format!(
-                    "Numbered {} connection(s); {} wire(s) changed. Existing numbers were kept.",
-                    done.connections, done.wires
-                ))
+                Ok(open.number_wires(rule).report())
             }
             "run_check" => {
                 let open = need_open(self.open.as_mut())?;
