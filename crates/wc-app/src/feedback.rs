@@ -171,20 +171,8 @@ fn gh(args: &[&str]) -> Result<String, String> {
     // Read the pipes on their own threads so a full pipe never stalls gh.
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
-    let out_reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(p) = out_pipe.as_mut() {
-            let _ = p.read_to_string(&mut text);
-        }
-        text
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(p) = err_pipe.as_mut() {
-            let _ = p.read_to_string(&mut text);
-        }
-        text
-    });
+    let out_reader = std::thread::spawn(move || read_all("output", out_pipe.as_mut().map(|p| p as &mut dyn Read)));
+    let err_reader = std::thread::spawn(move || read_all("errors", err_pipe.as_mut().map(|p| p as &mut dyn Read)));
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -198,13 +186,31 @@ fn gh(args: &[&str]) -> Result<String, String> {
             Err(e) => return Err(format!("Waiting for gh failed: {e}")),
         }
     };
-    let out = out_reader.join().unwrap_or_default();
-    let err = err_reader.join().unwrap_or_default();
+    let join = |h: std::thread::JoinHandle<Result<String, String>>| {
+        h.join()
+            .unwrap_or_else(|_| Err("reading gh's output stopped unexpectedly".into()))
+    };
+    let out = join(out_reader);
+    let err = join(err_reader);
     if status.success() {
-        Ok(out)
+        out
     } else {
-        Err(err.trim().to_owned())
+        Err(match err {
+            Ok(text) => text.trim().to_owned(),
+            Err(e) => e,
+        })
     }
+}
+
+/// Everything a pipe holds, as text (bytes that are not UTF-8 shown as �); a failed read says
+/// which stream it was and why.
+fn read_all(stream: &str, pipe: Option<&mut dyn Read>) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    if let Some(p) = pipe {
+        p.read_to_end(&mut bytes)
+            .map_err(|e| format!("Could not read gh's {stream}: {e}"))?;
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Whether `gh` is installed and signed in.
@@ -258,6 +264,7 @@ pub fn file(kind: Kind, r: &Request) -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -299,6 +306,21 @@ mod tests {
             assert!(long.len() <= MAX_URL, "{}", long.len());
             assert!(long.contains("&title="));
         }
+    }
+
+    #[test]
+    fn pipe_reads_keep_their_reason() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("pipe closed"))
+            }
+        }
+        let e = read_all("output", Some(&mut Broken)).unwrap_err();
+        assert!(e.contains("output") && e.contains("pipe closed"), "{e}");
+        let mut bad_utf8: &[u8] = b"ok \xff";
+        assert_eq!(read_all("output", Some(&mut bad_utf8)).unwrap(), "ok \u{fffd}");
+        assert_eq!(read_all("errors", None).unwrap(), "");
     }
 
     #[test]
