@@ -1013,3 +1013,26 @@ fn imported_terminals_show_in_the_terminal_plan_per_strip() {
     // X1.1's lower side is wired to K1:A2.
     assert!(plan.rows[0][3].contains("A2"), "{:?}", plan.rows[0]);
 }
+
+#[test]
+fn a_wire_end_on_a_repeated_pin_name_is_found_on_the_right_pin() {
+    let c = sample();
+    // A strip terminal whose two points are both called `1`: the lower one becomes `1#2`.
+    // The line reaches only the lower one, and the wire record names that one.
+    c.execute_batch(
+        "INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1-1', 4, 200, 1);
+         INSERT INTO tew_symbol VALUES (20, 10, 201, 'Terminal', 150, 200, 0, 1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5);
+         INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0);
+         INSERT INTO tew_componentterminal VALUES (60, 0, '1'), (60, 1, '1');
+         INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL);
+         INSERT INTO tew_wire VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1);",
+    )
+    .unwrap();
+    let (_, warnings, report) = build(&read(&c).unwrap(), None);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert_eq!((ends.source, ends.imported), (1, 1), "{} {warnings:?}", ends.note);
+}

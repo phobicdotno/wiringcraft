@@ -1278,21 +1278,21 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             let item = format!("s{}", s.id);
             if !page.overview {
                 let label = s.component.and_then(|c| tags.get(&c)).map(ToString::to_string);
-                for q in &s.pins {
+                // `box_symbol` gives one pin per point, in order; a repeated name became `A#2`,
+                // so the pin is taken by position, not by name.
+                for (q, o) in s.pins.iter().zip(&out_pins) {
                     let Some(t) = q.terminal else { continue };
-                    if out_pins.iter().any(|o| o.name == q.name) {
-                        drawn_at.entry(t).or_insert_with(|| {
-                            (
-                                (page.id.clone(), item.clone(), q.name.clone()),
-                                format!(
-                                    "{}:{} (page {})",
-                                    label.clone().unwrap_or_else(|| "?".to_owned()),
-                                    q.name,
-                                    page.number
-                                ),
-                            )
-                        });
-                    }
+                    drawn_at.entry(t).or_insert_with(|| {
+                        (
+                            (page.id.clone(), item.clone(), o.name.clone()),
+                            format!(
+                                "{}:{} (page {})",
+                                label.clone().unwrap_or_else(|| "?".to_owned()),
+                                o.name,
+                                page.number
+                            ),
+                        )
+                    });
                 }
             }
             for pin in &out_pins {
