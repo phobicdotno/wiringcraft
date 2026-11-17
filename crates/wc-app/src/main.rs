@@ -345,11 +345,6 @@ impl App {
                 self.share.show_join();
                 return;
             }
-            Action::Undo | Action::Redo if self.share.active() => {
-                self.ed.message =
-                    "Undo is off in a shared session: it would take back other people's work too. Use the page history.".into();
-                return;
-            }
             _ => {}
         }
         match a {

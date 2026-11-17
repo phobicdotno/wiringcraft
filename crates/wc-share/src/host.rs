@@ -384,6 +384,13 @@ impl Host {
     }
 
     fn do_edit_project(&mut self, by: PeerId, edit: ProjectEdit) -> Result<(), Refusal> {
+        // A restore is made only by the host's own undo (`do_revert`), after it checked that
+        // every part is still as the undone change left it.
+        if matches!(edit, ProjectEdit::Restore { .. }) {
+            return Err(Refusal::Invalid {
+                reason: "a restore comes only from Undo; use Undo or \"Undo this change\"".into(),
+            });
+        }
         check_edit(&self.project, &self.locks, by, &edit)?;
         let before = self.project.clone();
         apply_edit(&mut self.project, &edit);

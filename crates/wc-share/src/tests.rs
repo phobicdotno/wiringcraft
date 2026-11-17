@@ -1471,6 +1471,14 @@ fn undoing_a_removed_page_brings_it_back_with_its_comments_unless_someone_holds_
     assert!(matches!(a.refusals.last(), Some(Refusal::PageLocked { .. })));
     assert_eq!(s.host.project(), &before);
 
+    // A restore sent as a plain edit is refused: only undo makes one, after its checks.
+    let mut parts = Parts::default();
+    parts.pages.insert("p0001".into(), None);
+    a_link.send(a.edit_project(ProjectEdit::Restore { parts: Box::new(parts) }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(matches!(a.refusals.last(), Some(Refusal::Invalid { .. })));
+    assert!(s.host.project().page("p0001").is_some());
+
     // The host's own undo works the same way.
     s.host.edit_project(ProjectEdit::AddPage {
         page: Page::new("p0009", "9.1", "Spare"),

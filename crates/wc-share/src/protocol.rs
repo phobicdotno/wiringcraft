@@ -71,8 +71,9 @@ pub enum ProjectEdit {
     /// since, the edit is refused, so a copy that had not yet seen someone else's change cannot
     /// undo it. Also refused as a whole when someone else has one of the pages open.
     SetPages { pages: Vec<Page>, before: Vec<Page> },
-    /// Put parts of the project back as they were: what an undo sends. The host makes it
-    /// only after checking the parts are still as the undone change left them.
+    /// Put parts of the project back as they were: what an undo sends. Only the host makes it,
+    /// after checking the parts are still as the undone change left them; sent as a plain edit
+    /// (by a guest or the host's user) it is refused.
     Restore { parts: Box<Parts> },
 }
 
