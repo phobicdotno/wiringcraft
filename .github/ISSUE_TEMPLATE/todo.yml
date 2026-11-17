@@ -1,0 +1,23 @@
+name: Todo
+description: A piece of work for the todo list. People and agents claim it before they start.
+labels: [todo]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: What should exist or work when this is done, in plain words.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: How anyone can check it is finished (a test, a command, what a user sees).
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Pointers to code, constraints, open questions.
