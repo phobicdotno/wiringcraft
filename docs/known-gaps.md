@@ -7,7 +7,7 @@ the todo that covers it, or why it has none. New gaps go straight to the todo li
 ## How the audit was done
 
 - **Code markers:** searched `crates/` and `tools/` for `TODO`, `FIXME` and `XXX`. None are left
-  (the only hit is the `\U+XXXX` escape described in `wc-pdf/src/vector.rs`).
+  (the only hit is the `\U+XXXX` escape described in `crates/wc-pdf/src/vector.rs`).
 - **Limits in code:** searched for "not supported", "not yet", "left out" and "skipped" in
   `crates/`. Most hits are deliberate, documented behaviour (hostile input is skipped with a
   warning); the real feature gaps are listed below.
@@ -40,13 +40,13 @@ These branches can be deleted once their pull requests are merged.
 | QElectroTech `.elmt` elements are not read | `docs/manufacturer-data.md` | #91 |
 | BMEcat (and ECLASS features) part data is not read | `docs/manufacturer-data.md` | #92 |
 | EDZ exchange files (EPLAN macros and parts) are not read | `docs/manufacturer-data.md` | #93 (parts first; macros follow) |
-| DXF: ELLIPSE, SPLINE and HATCH are skipped | `wc-import/src/dxf.rs`, `docs/manufacturer-data.md` | #95 |
-| KiCad: only the first unit of a multi-unit symbol; `.kicad_sym` inside a zip is listed, not imported | `wc-import/src/kicad.rs`, `wc-import/src/archive.rs` | #96 |
-| SolidWorks Electrical: symbol and page graphics from DWG | `wc-import/src/swe.rs` | #59 |
-| SolidWorks Electrical: cabinet layouts, cover page, library parts, locations, terminal strips, own symbols | `wc-import/src/swe.rs` | #60, #61, #62, #69, #70, #71 |
-| SolidWorks Electrical: a component keeps only its first part ("extra part(s) left out") | `wc-import/src/swe.rs` | To file next (todo limit per run reached) |
-| PDF trace: pictures compressed other than Flate or DCT, or not 1-bit gray, 8-bit gray or 8-bit RGB, are refused ("not supported yet") | `wc-import/src/pdf.rs` | To file next (todo limit per run reached) |
-| Binary DXF | `wc-import/src/dxf.rs` | Not planned: the error tells the user to save as ASCII DXF, which every CAD program can do. |
+| DXF: ELLIPSE, SPLINE and HATCH are skipped | `crates/wc-import/src/dxf.rs`, `docs/manufacturer-data.md` | #95 |
+| KiCad: only the first unit of a multi-unit symbol; `.kicad_sym` inside a zip is listed, not imported | `crates/wc-import/src/kicad.rs`, `crates/wc-import/src/archive.rs` | #96 |
+| SolidWorks Electrical: symbol and page graphics from DWG | `crates/wc-import/src/swe.rs` | #59 |
+| SolidWorks Electrical: cabinet layouts, cover page, library parts, locations, terminal strips, own symbols | `crates/wc-import/src/swe.rs` | #60, #61, #62, #69, #70, #71 |
+| SolidWorks Electrical: a component keeps only its first part ("extra part(s) left out") | `crates/wc-import/src/swe.rs` | To file next (todo limit per run reached) |
+| PDF trace: pictures compressed other than Flate or DCT, or not 1-bit gray, 8-bit gray or 8-bit RGB, are refused ("not supported yet") | `crates/wc-import/src/pdf.rs` | To file next (todo limit per run reached) |
+| Binary DXF | `crates/wc-import/src/dxf.rs` | Not planned: the error tells the user to save as ASCII DXF, which every CAD program can do. |
 | DWG | `docs/manufacturer-data.md` | Not planned for now: closed format, and makers offer DXF next to it. SolidWorks Electrical DWGs are #59. |
 | STEP (3D) | `docs/manufacturer-data.md` | Later: 3D belongs to the one-way export to SolidCraft (phase 5). |
 
