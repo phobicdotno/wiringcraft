@@ -512,3 +512,22 @@ fn a_cable_drawn_only_as_a_symbol_gets_its_markers() {
     );
     assert!(parse_kinds(&["rails".into()]).is_err());
 }
+
+#[test]
+fn marking_list_drops_repeated_terminals_even_between_equal_sorting_numbers() {
+    let (mut p, s, parts) = fixture();
+    // `-X1.1`, `-X1.01`, `-X1.1`: `1` and `01` sort alike, but only the exact repeat goes.
+    for (id, tag) in [("t1", "-X1.1"), ("t2", "-X1.01"), ("t3", "-X1.1")] {
+        p.pages[0].symbols.push(place(id, "term", 150.0, Some(tag)));
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[MarkerKind::Terminals]);
+    let x1: Vec<&str> = t.rows.iter().filter(|r| r[1] == "-X1").map(|r| r[2].as_str()).collect();
+    let ones = x1.iter().filter(|n| **n == "1").count();
+    assert_eq!(ones, 1, "{x1:?}");
+    assert_eq!(x1.iter().filter(|n| **n == "01").count(), 1, "{x1:?}");
+}

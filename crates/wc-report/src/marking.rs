@@ -92,6 +92,9 @@ pub fn marking_list(i: &Inputs<'_>, kinds: &[MarkerKind]) -> Table {
             natural_key(&a.0)
                 .cmp(&natural_key(&b.0))
                 .then(natural_key(&a.1).cmp(&natural_key(&b.1)))
+                // `1` and `01` have equal keys: order them exactly too, so `dedup` sees
+                // repeats side by side.
+                .then_with(|| a.cmp(b))
         });
         rows.dedup();
         for (strip, number) in rows {
