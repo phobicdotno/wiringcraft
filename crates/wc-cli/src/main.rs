@@ -448,12 +448,17 @@ enum ImportCmd {
         lib: PathBuf,
     },
     /// Parts from an EDZ file (EPLAN Data Exchange archive, 7-Zip or zip): part number, maker,
-    /// description and the EPLAN part properties. Macros and pictures in it are counted, not
-    /// imported.
+    /// description and the EPLAN part properties. Macros are listed, with the macro each part
+    /// names and whether the archive holds it, but not drawn; pictures are counted.
     PartsEdz {
         file: PathBuf,
         #[arg(long)]
         lib: PathBuf,
+        /// Which library symbol to give parts by their macro: a text file with one
+        /// `macro = symbol.id` per line. The macro is matched by its full name, its file name or
+        /// its file name without `.ema`, ignoring case.
+        #[arg(long)]
+        symbol_map: Option<PathBuf>,
     },
     /// QElectroTech elements (`.elmt`), one symbol per file. Ids are `<prefix>.<file name>`;
     /// the first terminal becomes the origin.
@@ -1514,8 +1519,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             println!("imported {n} part(s) into {}", lib.display());
         }
-        ImportCmd::PartsEdz { file, lib } => {
-            let (n, report, warnings) = import_edz(&file, &lib)?;
+        ImportCmd::PartsEdz { file, lib, symbol_map } => {
+            let (n, report, warnings) = import_edz(&file, &lib, symbol_map.as_deref())?;
             for w in warnings {
                 eprintln!("warning: {w}");
             }
@@ -2266,9 +2271,21 @@ fn import_bmecat(file: &Path, lib: &Path) -> Res<(usize, Vec<String>)> {
 
 /// Import an EDZ archive's parts into a library folder. Returns the count, what the archive
 /// held and warnings.
-fn import_edz(file: &Path, lib: &Path) -> Res<(usize, wc_import::edz::Report, Vec<String>)> {
+fn import_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>) -> Res<(usize, wc_import::edz::Report, Vec<String>)> {
+    // The map is read first, so a bad one stops the import before anything is written.
+    let map = match symbol_map {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|x| format!("{}: {x}", path.display()))?;
+            Some(wc_import::swe::parse_symbol_map(&text).map_err(|x| format!("{}: {x}", path.display()))?)
+        }
+        None => None,
+    };
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
-    let (parts, report, warnings) = wc_import::edz::read(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    let (mut parts, mut report, warnings) =
+        wc_import::edz::read(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    if let Some(map) = &map {
+        wc_import::edz::apply_symbol_map(&mut parts, map, &mut report);
+    }
     for p in &parts {
         wc_library::write_part(lib, p).map_err(e)?;
     }
@@ -3461,7 +3478,7 @@ mod tests {
     fn edz_parts_land_in_the_library_and_macros_are_counted() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("contactor.edz");
-        let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="SIE.3RT2015" P_ARTICLE_MANUFACTURER="SIE" P_ARTICLE_DESCR1="de_DE@Schütz;en_US@Contactor;"/></partsmanagement>"#;
+        let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="SIE.3RT2015" P_ARTICLE_MANUFACTURER="SIE" P_ARTICLE_DESCR1="de_DE@Schütz;en_US@Contactor;" P_ARTICLE_MACRO="SIE\SIE_3RT2015.ema"/></partsmanagement>"#;
         let mut w = sevenz_rust2::ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
         w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("parts.xml"), Some(xml.as_bytes()))
             .unwrap();
@@ -3482,15 +3499,29 @@ mod tests {
         .unwrap();
         assert!(lib.join("parts").join("sie.3rt2015.json").exists());
         std::fs::remove_dir_all(&lib).unwrap();
-        let (n, report, warnings) = import_edz(&file, &lib).unwrap();
+        let (n, report, warnings) = import_edz(&file, &lib, None).unwrap();
         assert_eq!(n, 1, "{warnings:?}");
         assert_eq!(report.macros, 1);
         let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
         let p: wc_core::Part = serde_json::from_str(&json).unwrap();
         assert_eq!(p.description, "Contactor");
+        assert_eq!(p.symbol, None);
+
+        // With a symbol map, the part's macro picks its library symbol.
+        let map = tmp.path().join("macros.txt");
+        std::fs::write(&map, "SIE_3RT2015 = wc.coil\n").unwrap();
+        let (_, report, _) = import_edz(&file, &lib, Some(&map)).unwrap();
+        assert_eq!(report.part_macros.len(), 1);
+        assert!(report.part_macros[0].in_archive);
+        let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+        let p: wc_core::Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(p.symbol.as_deref(), Some("wc.coil"));
+        // A bad map is refused.
+        std::fs::write(&map, "no equals sign\n").unwrap();
+        assert!(import_edz(&file, &lib, Some(&map)).unwrap_err().contains("line 1"));
 
         std::fs::write(&file, "not an archive").unwrap();
-        assert!(import_edz(&file, &lib).is_err());
+        assert!(import_edz(&file, &lib, None).is_err());
         let err = cli(
             tmp.path(),
             &[
