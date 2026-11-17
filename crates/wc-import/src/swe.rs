@@ -185,6 +185,9 @@ pub struct SweProject {
     /// The project's own fields (name, customer, ...), from the archive's project list. Not in
     /// the project database itself, so a bare database import has none.
     pub info: Option<SweProjectInfo>,
+    /// The archive's catalog parts ([`library::from_archive`]), set by the caller. Devices and
+    /// cables that name one of them are linked to it, and their layout footprints take its size.
+    pub catalog: Vec<wc_core::Part>,
     pub warnings: Vec<String>,
 }
 
@@ -2115,8 +2118,10 @@ pub fn build_with(
         );
     }
 
+    // Devices that name a catalog part get it, so the layouts can size their footprints.
+    library::link_parts(&mut built, &p.catalog);
     // Cabinet layout pages become panel layouts with the devices placed on them.
-    let layouts = cabinet::layouts(p, &tags, &built.devices);
+    let layouts = cabinet::layouts(p, &tags, &built.devices, &built.parts);
     built.panels.clone_from(&layouts.panels);
 
     if unknown_component > 0 {
@@ -2309,7 +2314,11 @@ pub fn build_with(
             note: note(vec![
                 (
                     layouts.estimated,
-                    "device(s) placed with an estimated 18 x 90 mm footprint: no box size in the source",
+                    "device(s) placed with an estimated 18 x 90 mm footprint: no box size in the source and no part size",
+                ),
+                (
+                    layouts.from_part,
+                    "device(s) placed with their catalog part's width and height: no box size in the source",
                 ),
                 (layouts.no_size, "rail(s) or duct(s) without a length"),
                 (layouts.upright, "upright rail(s): WiringCraft rails run left to right"),

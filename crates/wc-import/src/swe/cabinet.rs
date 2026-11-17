@@ -4,8 +4,10 @@
 //! wire ducts and the devices' footprints. The database has no item kind of its own for them, so
 //! an item is sorted by its block name first (`Rail 35`, `Duct 40x60`, `Mounting plate`), then by
 //! whether its component is an imported device, then by its component's description and part
-//! number. A footprint's size is the symbol's box (`sym_posend*`); without one a device gets the
-//! [`DEFAULT_SIZE`] footprint at its insertion point and is counted as estimated, and a rail or
+//! number. A footprint's size is the symbol's box (`sym_posend*`); without one a device takes its
+//! part's width and height (`wc_core::panel::part_size`, the part linked from the archive's
+//! catalog), else the [`DEFAULT_SIZE`] footprint, counted as estimated; either way at its
+//! insertion point as the top-left corner. A rail or
 //! duct, which has no length then, is left out. WiringCraft rails run left to right, so an
 //! upright rail is left out too. Everything left out is counted with the reason.
 //!
@@ -15,8 +17,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::geom::Point;
-use wc_core::panel::{DEFAULT_SIZE, Panel, PanelItem};
-use wc_core::{Device, DeviceTag};
+use wc_core::panel::{DEFAULT_SIZE, Panel, PanelItem, part_size};
+use wc_core::{Device, DeviceTag, Part};
 
 use super::{SweProject, SweSymbol, round, slug};
 
@@ -41,8 +43,10 @@ pub struct Layouts {
     pub rails: usize,
     pub ducts: usize,
     pub devices: usize,
-    /// Devices drawn with the default footprint: their symbol has no box.
+    /// Devices drawn with the default footprint: their symbol has no box and their part no size.
     pub estimated: usize,
+    /// Devices whose symbol has no box, sized from their part's width and height.
+    pub from_part: usize,
     /// Rails and ducts without a box, so without a length.
     pub no_size: usize,
     /// Rails that run up and down.
@@ -122,8 +126,18 @@ fn boxed(a: Point, b: Point) -> (Point, Point) {
 }
 
 /// One panel per cabinet layout page that has something to place. `tags` are the components'
-/// device tags; only components that became devices (`devices`) are placed as devices.
-pub fn layouts(p: &SweProject, tags: &BTreeMap<i64, DeviceTag>, devices: &BTreeMap<DeviceTag, Device>) -> Layouts {
+/// device tags; only components that became devices (`devices`) are placed as devices. `parts`
+/// are the parts the devices may name (`Device::part`), for footprints without a box.
+pub fn layouts(
+    p: &SweProject,
+    tags: &BTreeMap<i64, DeviceTag>,
+    devices: &BTreeMap<DeviceTag, Device>,
+    parts: &[Part],
+) -> Layouts {
+    let part_sizes: BTreeMap<&str, (f64, f64)> = parts
+        .iter()
+        .filter_map(|part| part_size(part).map(|size| (part.id.as_str(), size)))
+        .collect();
     let mut out = Layouts::default();
     let mut ids: BTreeSet<String> = BTreeSet::new();
     for page in p.pages.iter().filter(|pg| pg.kind == KIND_CABINET) {
@@ -151,12 +165,22 @@ pub fn layouts(p: &SweProject, tags: &BTreeMap<i64, DeviceTag>, devices: &BTreeM
                 (Kind::Device, b) => {
                     let Some(tag) = tag else { continue };
                     let (min, max) = b.unwrap_or_else(|| {
-                        out.estimated += 1;
+                        let from_part = devices
+                            .get(tag)
+                            .and_then(|d| d.part.as_deref())
+                            .and_then(|id| part_sizes.get(id).copied());
+                        let (w, h) = match from_part {
+                            Some(size) => {
+                                out.from_part += 1;
+                                size
+                            }
+                            None => {
+                                out.estimated += 1;
+                                DEFAULT_SIZE
+                            }
+                        };
                         // The insertion point as the top-left corner.
-                        (
-                            Point::new(s.at.x, s.at.y - DEFAULT_SIZE.1),
-                            Point::new(s.at.x + DEFAULT_SIZE.0, s.at.y),
-                        )
+                        (Point::new(s.at.x, s.at.y - h), Point::new(s.at.x + w, s.at.y))
                     });
                     placed.push((tag.clone(), min, max));
                 }
