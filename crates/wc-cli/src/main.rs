@@ -93,6 +93,9 @@ enum Cmd {
         #[arg(long = "type")]
         kind: Option<String>,
     },
+    /// The project's locations (cabinets, rooms, panels): the `+` part of device tags.
+    #[command(subcommand)]
+    Location(LocationCmd),
     /// Jumpers (bridges) between terminals of one strip: jumpered terminals are one potential.
     #[command(subcommand)]
     Jumper(JumperCmd),
@@ -118,7 +121,7 @@ enum Cmd {
         pages: Vec<String>,
         #[arg(long, default_value = "")]
         date: String,
-        /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, or all.
+        /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, locations, or all.
         #[arg(long = "report")]
         reports: Vec<String>,
     },
@@ -136,7 +139,7 @@ enum Cmd {
         #[arg(long, default_value = "")]
         date: String,
     },
-    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc) as a table, CSV or Markdown.
+    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, locations) as a table, CSV or Markdown.
     Report {
         kind: String,
         #[arg(long, default_value = "text")]
@@ -255,6 +258,21 @@ enum PanelCmd {
     Remove {
         id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum LocationCmd {
+    /// List the locations with their descriptions.
+    List,
+    /// Add a location or change its description, e.g. `location set +L1.L3 "Cabinet 3"`.
+    Set {
+        /// The location, with or without its `+`.
+        path: String,
+        /// What it is; left out keeps the one it has, `""` clears it.
+        description: Option<String>,
+    },
+    /// Remove a location from the list (devices keep their tags).
+    Remove { path: String },
 }
 
 #[derive(Subcommand)]
@@ -547,6 +565,19 @@ fn save(dir: &Path, p: &Project) -> Res<()> {
     store::save(dir, p).map(|_| ()).map_err(e)
 }
 
+/// The `location list` output: one location per line, `+path`, then a tab and the description
+/// when it has one.
+fn write_locations(out: &mut impl std::io::Write, locations: &[wc_core::project::Location]) -> std::io::Result<()> {
+    for l in locations {
+        if l.description.is_empty() {
+            writeln!(out, "+{}", l.path)?;
+        } else {
+            writeln!(out, "+{}\t{}", l.path, l.description)?;
+        }
+    }
+    Ok(())
+}
+
 fn page_mut<'a>(p: &'a mut Project, id: &str) -> Res<&'a mut Page> {
     p.page_mut(id).ok_or_else(|| format!("no page {id:?}"))
 }
@@ -793,6 +824,32 @@ fn run(cli: Cli) -> Res<()> {
             });
             save(dir, &p)?;
             println!("{id}");
+        }
+        Cmd::Location(lc) => {
+            let mut p = load(dir)?;
+            match lc {
+                LocationCmd::List => {
+                    write_locations(&mut std::io::stdout(), &p.meta.locations).map_err(e)?;
+                }
+                LocationCmd::Set { path, description } => {
+                    let description = description.unwrap_or_else(|| {
+                        let have = wc_core::project::location_path(&path).ok();
+                        p.meta
+                            .locations
+                            .iter()
+                            .find(|l| have.is_some() && wc_core::project::location_path(&l.path).ok() == have)
+                            .map(|l| l.description.clone())
+                            .unwrap_or_default()
+                    });
+                    if p.meta.set_location(&path, &description)? {
+                        save(dir, &p)?;
+                    }
+                }
+                LocationCmd::Remove { path } => {
+                    p.meta.remove_location(&path)?;
+                    save(dir, &p)?;
+                }
+            }
         }
         Cmd::Jumper(jc) => {
             let mut p = load(dir)?;
@@ -1860,7 +1917,9 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
             continue;
         }
         let k = wc_report::Kind::parse(n).ok_or_else(|| {
-            format!("unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, all)")
+            format!(
+                "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, locations, all)"
+            )
         })?;
         out.push(k);
     }
@@ -2185,6 +2244,46 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn locations_are_set_listed_and_removed_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["location", "set", "+L1.L3", "Cabinet 3"]).unwrap();
+        cli(&dir, &["location", "set", "L1"]).unwrap();
+        cli(&dir, &["location", "set", "L1.L3"]).unwrap();
+        let locs = |d: &Path| {
+            load(d)
+                .unwrap()
+                .meta
+                .locations
+                .into_iter()
+                .map(|l| (l.path, l.description))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            locs(&dir),
+            [
+                ("L1".to_owned(), String::new()),
+                ("L1.L3".to_owned(), "Cabinet 3".to_owned())
+            ]
+        );
+        cli(&dir, &["location", "list"]).unwrap();
+        let mut listed = Vec::new();
+        write_locations(&mut listed, &load(&dir).unwrap().meta.locations).unwrap();
+        assert_eq!(String::from_utf8(listed).unwrap(), "+L1\n+L1.L3\tCabinet 3\n");
+        cli(&dir, &["location", "set", "L1.L3", ""]).unwrap();
+        assert_eq!(locs(&dir)[1].1, "", "an empty description clears it");
+        cli(&dir, &["location", "remove", "+L1"]).unwrap();
+        assert_eq!(locs(&dir).len(), 1);
+        assert!(
+            cli(&dir, &["location", "remove", "L1"])
+                .unwrap_err()
+                .contains("no location")
+        );
+        assert!(cli(&dir, &["location", "set", "+L1-K1", "x"]).is_err());
     }
 
     #[test]

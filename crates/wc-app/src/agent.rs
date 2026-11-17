@@ -426,7 +426,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "get_report",
             "A report as a Markdown table.",
-            json!({"kind": {"type": "string", "enum": ["contents", "parts", "devices", "wires", "nets", "terminals", "cables", "plc"]}}),
+            json!({"kind": {"type": "string", "enum": ["contents", "parts", "devices", "wires", "nets", "terminals", "cables", "plc", "locations"]}}),
             &["kind"],
         ),
         tool(
@@ -1193,7 +1193,7 @@ impl App {
                     }
                 }
                 let fields: Vec<(String, String)> = fields.into_iter().collect();
-                open.set_project_props(&name, &fields)?;
+                open.set_project_props(&name, &fields, None)?;
                 Ok("Project properties set.".into())
             }
             "comments" => self.tool_comments(v),

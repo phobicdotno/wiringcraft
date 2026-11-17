@@ -484,6 +484,31 @@ fn plc_io_list_and_contents() {
 }
 
 #[test]
+fn the_location_list_counts_devices_and_names_unlisted_locations() {
+    let mut p = Project::new("t");
+    for t in ["+L1-K1", "+L1-K2", "+L2.A-K3", "-K4"] {
+        p.devices.insert(DeviceTag::parse(t).unwrap(), Default::default());
+    }
+    p.meta.set_location("L1", "Main cabinet").unwrap();
+    p.meta.set_location("L9", "").unwrap();
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let t = build(Kind::Locations, &i);
+    assert_eq!(
+        t.rows,
+        [
+            ["+L1", "Main cabinet", "2", ""],
+            ["+L9", "", "0", ""],
+            ["+L2.A", "", "1", "not in the project's locations"],
+        ]
+    );
+}
+
+#[test]
 fn marking_list_has_every_marker_in_natural_order() {
     let (mut p, s, parts) = fixture();
     let w1 = DeviceTag::parse("-W1").unwrap();

@@ -169,6 +169,47 @@ pub fn title_field_label(key: &str) -> &str {
         .map_or(key, |(_, label)| label)
 }
 
+/// A location path as the project stores it (`L1.L3`), from what was typed (`+L1.L3` or
+/// `L1.L3`). Refused when it is not just the `+` part of a tag.
+pub fn location_path(s: &str) -> Result<String, String> {
+    let s = s.trim();
+    let s = s.strip_prefix('+').unwrap_or(s);
+    // A tag needs a product, so try it with one; a product or function in `s` is refused.
+    let tag = DeviceTag::parse(&format!("+{s}-X")).map_err(|e| format!("{s:?} is not a location: {e}"))?;
+    if !tag.function.is_empty() || tag.product != ["X"] {
+        return Err(format!("{s:?} is not a location: give only the + part of a tag"));
+    }
+    Ok(tag.location.join("."))
+}
+
+/// The locations of a list of (path, description) rows, as the project keeps them. Rows that
+/// are empty are skipped; a row with a description but no path, a bad path, or a path given
+/// twice is refused with the reason.
+pub fn location_rows(rows: &[(String, String)]) -> Result<Vec<Location>, String> {
+    let mut out: Vec<Location> = Vec::new();
+    for (path, description) in rows {
+        if path.trim().is_empty() {
+            if description.trim().is_empty() {
+                continue;
+            }
+            return Err(format!(
+                "the location described as {:?} has no path",
+                description.trim()
+            ));
+        }
+        let path = location_path(path)?;
+        if out.iter().any(|l| l.path == path) {
+            return Err(format!("the location +{path} is listed twice"));
+        }
+        out.push(Location {
+            path,
+            description: description.trim().to_owned(),
+        });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
 /// A location of the project, such as a cabinet or a room.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
@@ -192,6 +233,54 @@ impl ProjectMeta {
             }
         }
         filled
+    }
+
+    /// Add a location or change its description (an empty one clears it). The path may be
+    /// typed with or without its `+`. Returns whether anything changed.
+    pub fn set_location(&mut self, path: &str, description: &str) -> Result<bool, String> {
+        let path = location_path(path)?;
+        let description = description.trim().to_owned();
+        // Stored paths may be as typed (`+L1`), so compare their normal form.
+        let found = self
+            .locations
+            .iter_mut()
+            .find(|l| location_path(&l.path).is_ok_and(|p| p == path));
+        match found {
+            Some(l) if l.path == path && l.description == description => Ok(false),
+            Some(l) => {
+                l.path = path;
+                l.description = description;
+                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                Ok(true)
+            }
+            None => {
+                self.locations.push(Location { path, description });
+                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                Ok(true)
+            }
+        }
+    }
+
+    /// Remove a location from the list (its devices keep their tags). A path stored as it was
+    /// typed is found too. When nothing goes, the reason: not a location, or not in the list.
+    pub fn remove_location(&mut self, path: &str) -> Result<(), String> {
+        let parsed = location_path(path);
+        let raw = path.trim();
+        let before = self.locations.len();
+        // The normal form first, then the path as typed (an entry stored as `+L1`).
+        if let Ok(key) = &parsed {
+            self.locations.retain(|l| l.path != *key);
+        }
+        if self.locations.len() == before {
+            self.locations.retain(|l| l.path != raw);
+        }
+        if self.locations.len() != before {
+            return Ok(());
+        }
+        match parsed {
+            Ok(p) => Err(format!("no location +{p}")),
+            Err(why) => Err(why),
+        }
     }
 
     /// Add a location, or fill in the description of one the project already has. A description
@@ -833,6 +922,40 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn locations_are_set_and_removed_by_path_with_or_without_the_plus() {
+        let mut m = ProjectMeta::new("t");
+        assert_eq!(m.set_location("+L1.L3", " Cabinet 3 "), Ok(true));
+        assert_eq!(m.set_location("L1.L3", "Cabinet 3"), Ok(false), "same description");
+        assert_eq!(m.set_location("L1", ""), Ok(true));
+        let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["L1", "L1.L3"]);
+        assert_eq!(m.locations[1].description, "Cabinet 3");
+        assert!(m.set_location("+L1-K1", "x").is_err(), "a device tag is no location");
+        assert!(m.set_location("", "x").is_err());
+        assert_eq!(m.remove_location("+L1"), Ok(()));
+        assert_eq!(m.remove_location("L1"), Err("no location +L1".into()));
+        // An entry stored with its sign, as an older or hand-edited file may have it.
+        m.locations.push(Location {
+            path: "+L5".into(),
+            description: String::new(),
+        });
+        assert_eq!(m.remove_location("+L5"), Ok(()));
+        assert!(!m.locations.iter().any(|l| l.path == "+L5"));
+        let why = m.remove_location("+L1-K1");
+        assert!(why.as_ref().is_err_and(|e| e.contains("not a location")), "{why:?}");
+        assert_eq!(m.locations.len(), 1);
+        // Setting a path stored with its sign updates that entry, in normal form.
+        m.locations.push(Location {
+            path: "+L7".into(),
+            description: "Desk".into(),
+        });
+        assert_eq!(m.set_location("L7", "Desk 2"), Ok(true));
+        let l7: Vec<&Location> = m.locations.iter().filter(|l| l.path.ends_with("L7")).collect();
+        assert_eq!(l7.len(), 1, "no second entry");
+        assert_eq!((l7[0].path.as_str(), l7[0].description.as_str()), ("L7", "Desk 2"));
     }
 
     #[test]
