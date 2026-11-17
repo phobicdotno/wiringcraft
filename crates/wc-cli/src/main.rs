@@ -1860,7 +1860,10 @@ fn import_qet(
     category: &str,
     letter_code: &str,
 ) -> Res<(usize, usize)> {
+    use std::io::Read;
     let (mut written, mut failed) = (0, 0);
+    // Two files whose names give the same id would overwrite each other: the later one fails.
+    let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for file in files {
         let stem: String = file
             .file_stem()
@@ -1876,9 +1879,18 @@ fn import_qet(
             })
             .collect();
         let id = format!("{}.{stem}", prefix.trim_end_matches('.'));
-        let read = std::fs::read_to_string(file)
-            .map_err(e)
-            .and_then(|text| wc_import::qet::element(&text, &id, scale).map_err(e));
+        let read = match ids.get(&id) {
+            Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
+            None => std::fs::File::open(file)
+                .and_then(|f| {
+                    // Read at most one byte past the limit, so a huge file is refused cheaply.
+                    let mut text = String::new();
+                    f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
+                    Ok(text)
+                })
+                .map_err(e)
+                .and_then(|text| wc_import::qet::element(&text, &id, scale).map_err(e)),
+        };
         let (mut imp, warnings) = match read {
             Ok(r) => r,
             Err(err) => {
@@ -1887,6 +1899,7 @@ fn import_qet(
                 continue;
             }
         };
+        ids.insert(id, file.clone());
         for w in warnings {
             eprintln!("warning: {}: {w}", file.display());
         }
@@ -2119,9 +2132,19 @@ mod tests {
         .unwrap();
         let bad = tmp.path().join("bad.elmt");
         std::fs::write(&bad, "<svg/>").unwrap();
+        // Same id as the good file once normalised: refused, the first one is kept.
+        let same = tmp.path().join("lamp_red.elmt");
+        std::fs::write(
+            &same,
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>",
+        )
+        .unwrap();
+        // Over the size limit: refused without reading it all.
+        let huge = tmp.path().join("huge.elmt");
+        std::fs::write(&huge, vec![b' '; wc_import::qet::MAX_LEN + 10]).unwrap();
         let lib = tmp.path().join("lib");
-        let (written, failed) = import_qet(&[good, bad], &lib, "qet.", 0.5, "Lamps", "P").unwrap();
-        assert_eq!((written, failed), (1, 1));
+        let (written, failed) = import_qet(&[good, bad, same, huge], &lib, "qet.", 0.5, "Lamps", "P").unwrap();
+        assert_eq!((written, failed), (1, 3));
         let json = std::fs::read_to_string(lib.join("symbols").join("qet.lamp_red.json")).unwrap();
         let s: wc_core::Symbol = serde_json::from_str(&json).unwrap();
         assert_eq!(

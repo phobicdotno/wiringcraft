@@ -19,7 +19,11 @@ use crate::{Error, Result};
 pub const DEFAULT_SCALE: f64 = 0.5;
 
 /// Largest element file read; real elements are a few kilobytes.
-const MAX_LEN: usize = 4 << 20;
+pub const MAX_LEN: usize = 4 << 20;
+/// Most terminals read from one element; real ones have a few dozen at most.
+const MAX_TERMINALS: usize = 1000;
+/// Most reasons listed for values that could not be read; the rest are counted.
+const MAX_REASONS: usize = 20;
 /// Points used for an ellipse that is not a circle, or an elliptic arc.
 const ELLIPSE_STEPS: usize = 48;
 
@@ -39,8 +43,42 @@ fn attr(e: &BytesStart, name: &str) -> Option<String> {
         .map(|v| v.into_owned())
 }
 
-fn num(e: &BytesStart, name: &str) -> Option<f64> {
-    attr(e, name)?.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+/// The number in attribute `name`. A value that is there but not a finite number is `None`
+/// with its reason in `bad`.
+fn num(e: &BytesStart, tag: &str, name: &str, bad: &mut Vec<String>) -> Option<f64> {
+    let raw = e.attributes().flatten().find(|a| a.key.as_ref() == name.as_bytes())?;
+    let v = match raw.unescape_value() {
+        Ok(v) => v,
+        Err(err) => {
+            bad.push(format!("<{tag}> {name}: {err}"));
+            return None;
+        }
+    };
+    match v.trim().parse::<f64>() {
+        Ok(n) if n.is_finite() => Some(n),
+        _ => {
+            bad.push(format!("<{tag}> {name} = {:?} is not a number", v.trim()));
+            None
+        }
+    }
+}
+
+/// Every coordinate and size of `s` is a finite number.
+fn finite(s: &Shape) -> bool {
+    let p = |p: &Point| p.x.is_finite() && p.y.is_finite();
+    match s {
+        Shape::Line { a, b } => p(a) && p(b),
+        Shape::Polyline { points, .. } => points.iter().all(p),
+        Shape::Rect { min, max } => p(min) && p(max),
+        Shape::Circle { center, radius, .. } => p(center) && radius.is_finite(),
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => p(center) && radius.is_finite() && start.is_finite() && end.is_finite(),
+        Shape::Text { at, height, angle, .. } => p(at) && height.is_finite() && angle.is_finite(),
+    }
 }
 
 /// `filling:...` from a QElectroTech style string; anything but `none` fills.
@@ -92,6 +130,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     // A dynamic text waiting for its `<info_name>`: its position.
     let mut dynamic_at: Option<Point> = None;
     let mut unknown: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut bad: Vec<String> = Vec::new();
 
     loop {
         let ev = reader
@@ -124,7 +163,11 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                         &mut tag_at,
                         &mut dynamic_at,
                         &mut unknown,
+                        &mut bad,
                     );
+                    if pins.len() > MAX_TERMINALS {
+                        return Err(Error::Format(format!("more than {MAX_TERMINALS} terminals")));
+                    }
                 }
                 _ => {}
             }
@@ -172,6 +215,11 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     for (kind, n) in unknown {
         warnings.push(format!("{n} <{kind}> item(s) not read"));
     }
+    let more = bad.len().saturating_sub(MAX_REASONS);
+    warnings.extend(bad.into_iter().take(MAX_REASONS));
+    if more > 0 {
+        warnings.push(format!("{more} more value(s) not read"));
+    }
     if graphics.is_empty() && pins.is_empty() {
         return Err(Error::Format("the element draws nothing".into()));
     }
@@ -182,17 +230,26 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
         .map(|(_, n)| n.clone())
         .unwrap_or_else(|| id.rsplit('.').next().unwrap_or(id).to_owned());
 
-    // Unnamed terminals are numbered in order; repeated names get a mark.
+    // Unnamed terminals are numbered in order; a repeated name gets a mark and a count
+    // (`x`, `x'`, `x'2`, ...), so names stay short however often one repeats.
     let mut used = std::collections::BTreeSet::new();
+    let mut repeats: std::collections::BTreeMap<String, usize> = Default::default();
     let mut out_pins: Vec<Pin> = Vec::new();
     for (i, (name, at, dir)) in pins.into_iter().enumerate() {
-        let mut name = if name.trim().is_empty() {
+        let base = if name.trim().is_empty() {
             (i + 1).to_string()
         } else {
             name
         };
+        let mut name = base.clone();
         while !used.insert(name.clone()) {
-            name.push('\'');
+            let n = repeats.entry(base.clone()).or_insert(0);
+            *n += 1;
+            name = if *n == 1 {
+                format!("{base}'")
+            } else {
+                format!("{base}'{n}")
+            };
         }
         out_pins.push(Pin { name, at, dir });
     }
@@ -212,6 +269,13 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
             Point::new(snap(xs.fold(0.0, f64::min) - 3.0), 0.0)
         }
     };
+    if !(graphics.iter().all(finite)
+        && out_pins.iter().all(|p| p.at.x.is_finite() && p.at.y.is_finite())
+        && tag_at.x.is_finite()
+        && tag_at.y.is_finite())
+    {
+        return Err(Error::Format("coordinates are out of range".into()));
+    }
     let role = match link_type.as_str() {
         "master" => SymbolRole::Main,
         "slave" => SymbolRole::Auxiliary,
@@ -244,9 +308,11 @@ fn shape(
     tag_at: &mut Option<Point>,
     dynamic_at: &mut Option<Point>,
     unknown: &mut std::collections::BTreeMap<String, usize>,
+    bad: &mut Vec<String>,
 ) {
     let pt = |x: f64, y: f64| Point::new(x * scale, y * scale);
-    let n = |k: &str| num(e, k);
+    let bad = std::cell::RefCell::new(bad);
+    let n = |k: &str| num(e, tag, k, &mut bad.borrow_mut());
     let mut skip = || *unknown.entry(tag.to_owned()).or_default() += 1;
     match tag {
         "line" => match (n("x1"), n("y1"), n("x2"), n("y2")) {
@@ -509,6 +575,37 @@ mod tests {
             filled: false
         }));
         Ok(())
+    }
+
+    #[test]
+    fn a_bad_value_keeps_its_reason_and_repeated_names_stay_short() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<circle x="-5" y="-5" diameter="10"/>
+<line x1="oops" y1="0" x2="1" y2="1"/>
+<terminal x="0" y="0" orientation="n" name="x"/>
+<terminal x="0" y="10" orientation="s" name="x"/>
+<terminal x="0" y="20" orientation="s" name="x"/>
+</description></definition>"#;
+        let (imp, warnings) = element(el, "qet.x", 1.0)?;
+        assert!(
+            warnings.contains(&"<line> x1 = \"oops\" is not a number".to_owned()),
+            "{warnings:?}"
+        );
+        let names: Vec<&str> = imp.symbol.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["x", "x'", "x'2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn too_many_terminals_and_huge_coordinates_are_errors() {
+        let many = format!(
+            "<definition type=\"element\"><description>{}</description></definition>",
+            "<terminal x=\"0\" y=\"0\" name=\"x\"/>".repeat(MAX_TERMINALS + 1)
+        );
+        assert!(element(&many, "qet.x", 1.0).is_err_and(|e| e.to_string().contains("terminals")));
+        let huge = r#"<definition type="element"><description>
+<terminal x="1e308" y="0"/><terminal x="-1e308" y="0"/></description></definition>"#;
+        assert!(element(huge, "qet.x", 100.0).is_err_and(|e| e.to_string().contains("out of range")));
     }
 
     #[test]
