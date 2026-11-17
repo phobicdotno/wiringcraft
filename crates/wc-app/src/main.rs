@@ -1835,21 +1835,28 @@ mod icon_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod picker_tests {
     use super::*;
 
     #[test]
     fn the_picker_opens_where_the_dialog_would_put_the_project() {
-        // A bare name is not looked up in the folder the app started in.
-        let want = prefs::projects_dir()
-            .ancestors()
-            .find(|d| !d.as_os_str().is_empty() && d.is_dir())
-            .map(Path::to_path_buf);
-        assert_eq!(picker_start("some-project-name"), want);
-        assert_eq!(picker_start("  "), want);
-        // A full path opens at its nearest existing folder.
-        let tmp = std::env::temp_dir();
-        let deep = tmp.join("wc-not-there").join("deeper");
-        assert_eq!(picker_start(&deep.display().to_string()), Some(tmp));
+        let nearest = |p: PathBuf| {
+            p.ancestors()
+                .find(|d| !d.as_os_str().is_empty() && d.is_dir())
+                .map(Path::to_path_buf)
+        };
+        // A bare name is looked up under the projects folder, never the folder the app started
+        // in, whether or not that name exists there.
+        let name = "some-project-name";
+        assert_eq!(picker_start(name), nearest(prefs::projects_dir().join(name)));
+        assert_eq!(picker_start("  "), nearest(prefs::projects_dir()));
+        // A full path opens at its nearest existing folder (inside a fresh, empty folder).
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("not-there").join("deeper");
+        assert_eq!(
+            picker_start(&deep.display().to_string()),
+            Some(tmp.path().to_path_buf())
+        );
     }
 }
