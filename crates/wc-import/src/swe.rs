@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use wc_core::geom::{Point, Shape};
 use wc_core::symbol::{Pin, PinDir, SymbolRole};
 use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Symbol, Wire};
@@ -145,7 +145,112 @@ pub struct SweProject {
     pub cables: BTreeMap<i64, SweCable>,
     pub components: BTreeMap<i64, SweComponent>,
     pub locations: Vec<SweLocation>,
+    /// The project's own fields (name, customer, ...), from the archive's project list. Not in
+    /// the project database itself, so a bare database import has none.
+    pub info: Option<SweProjectInfo>,
     pub warnings: Vec<String>,
+}
+
+/// A project's own fields, from `tew_project` in the archive's `Database/tew_app_project.sqlite`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SweProjectInfo {
+    pub name: String,
+    /// The project description (translated text, English first).
+    pub description: String,
+    pub customer: String,
+    /// The customer's address lines that are filled.
+    pub customer_address: Vec<String>,
+    pub drawing_office: String,
+    pub drawing_office_address: Vec<String>,
+    pub contract_number: String,
+    pub created_by: String,
+    pub modified_by: String,
+    /// `YYYY-MM-DD`, from the source's `YYYYMMDD hh:mm:ss`.
+    pub created: String,
+    pub modified: String,
+}
+
+impl SweProjectInfo {
+    /// The WiringCraft title-block fields these fill. Empty values are left out.
+    pub fn title_block(&self) -> BTreeMap<String, String> {
+        let fields = [
+            ("description", self.description.clone()),
+            ("customer", self.customer.clone()),
+            ("customer_address", self.customer_address.join(", ")),
+            ("drawing_office", self.drawing_office.clone()),
+            ("drawing_office_address", self.drawing_office_address.join(", ")),
+            ("project_number", self.contract_number.clone()),
+            ("drawn_by", self.created_by.clone()),
+            ("modified_by", self.modified_by.clone()),
+            ("date", self.created.clone()),
+            ("modified", self.modified.clone()),
+        ];
+        fields
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
+            .filter(|(_, v)| !v.is_empty())
+            .collect()
+    }
+}
+
+/// `YYYYMMDD hh:mm:ss` as `YYYY-MM-DD`; anything else is kept as written.
+fn source_date(s: &str) -> String {
+    let d = s.trim();
+    let day: String = d.chars().take(8).collect();
+    if day.len() == 8 && day.chars().all(|c| c.is_ascii_digit()) {
+        format!("{}-{}-{}", &day[..4], &day[4..6], &day[6..])
+    } else {
+        d.to_owned()
+    }
+}
+
+/// The fields of the project in archive folder `Projects/<directory>`, read from the archive's
+/// project list database. `Ok(None)` when the list has no row for it.
+pub fn project_info(conn: &Connection, directory: &str) -> Result<Option<SweProjectInfo>> {
+    let mut st = conn
+        .prepare(
+            "SELECT pro_id, COALESCE(pro_name, ''), COALESCE(pro_customername, ''), COALESCE(pro_custaddress1, ''), \
+             COALESCE(pro_custaddress2, ''), COALESCE(pro_custaddress3, ''), COALESCE(pro_drawingofficename, ''), \
+             COALESCE(pro_doaddress1, ''), COALESCE(pro_doaddress2, ''), COALESCE(pro_doaddress3, ''), \
+             COALESCE(pro_contractnb, ''), COALESCE(pro_createdby, ''), COALESCE(pro_modifiedby, ''), \
+             COALESCE(pro_creationdate, ''), COALESCE(pro_modificationdate, '') \
+             FROM tew_project WHERE TRIM(pro_directory) = ?1",
+        )
+        .map_err(sql)?;
+    let row = st
+        .query_row([directory.trim()], |r| {
+            let mut v: Vec<String> = Vec::new();
+            for i in 1..15 {
+                v.push(r.get::<_, String>(i)?);
+            }
+            Ok((r.get::<_, i64>(0)?, v))
+        })
+        .optional()
+        .map_err(sql)?;
+    let Some((id, v)) = row else {
+        return Ok(None);
+    };
+    let lines = |a: &[String]| -> Vec<String> {
+        a.iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let mut ignored = Vec::new();
+    let description = texts(conn, &mut ignored)?.remove(&id).unwrap_or_default();
+    Ok(Some(SweProjectInfo {
+        name: v[0].trim().to_owned(),
+        description: description.trim().to_owned(),
+        customer: v[1].trim().to_owned(),
+        customer_address: lines(&v[2..5]),
+        drawing_office: v[5].trim().to_owned(),
+        drawing_office_address: lines(&v[6..9]),
+        contract_number: v[9].trim().to_owned(),
+        created_by: v[10].trim().to_owned(),
+        modified_by: v[11].trim().to_owned(),
+        created: source_date(&v[12]),
+        modified: source_date(&v[13]),
+    }))
 }
 
 /// A location (`tew_location`): a cabinet, room or panel.
@@ -213,6 +318,10 @@ pub struct ArchiveDatabase {
     /// How many projects the archive holds.
     pub count: usize,
     pub bytes: Vec<u8>,
+    /// The project's own fields from the archive's project list, when it has them.
+    pub info: Option<SweProjectInfo>,
+    /// Why the project's own fields could not be read, when they could not.
+    pub info_warning: Option<String>,
 }
 
 /// Take project number `pick` (counted from 1, in project folder order) out of an archive. Only
@@ -246,7 +355,41 @@ pub fn database_from_archive<R: Read + std::io::Seek>(reader: R, pick: usize) ->
         )));
     }
     let folder = name.rsplitn(3, '/').nth(2).unwrap_or_default().to_owned();
-    Ok(ArchiveDatabase { folder, count, bytes })
+    // The project's own fields live in the archive's project list, keyed by folder number.
+    let directory = folder.rsplit('/').next().unwrap_or_default().to_owned();
+    let (info, info_warning) = match read_project_list(&mut zip, &directory) {
+        Ok(info) => (info, None),
+        Err(e) => (
+            None,
+            Some(format!("the project's name, customer and dates were not read: {e}")),
+        ),
+    };
+    Ok(ArchiveDatabase {
+        folder,
+        count,
+        bytes,
+        info,
+        info_warning,
+    })
+}
+
+/// The archive's project list (`Database/tew_app_project.sqlite`), row for `directory`.
+fn read_project_list<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    directory: &str,
+) -> Result<Option<SweProjectInfo>> {
+    const LIST: &str = "Database/tew_app_project.sqlite";
+    let Ok(f) = zip.by_name(LIST) else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    f.take(MAX_DATABASE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::Format(format!("{LIST}: {e}")))?;
+    if bytes.len() as u64 > MAX_DATABASE_BYTES {
+        return Err(Error::Format(format!("{LIST} is too large")));
+    }
+    project_info(&open(&bytes)?, directory)
 }
 
 /// The project database paths in an archive, in project folder order.
@@ -954,6 +1097,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         pages: Vec::new(),
         devices: BTreeMap::new(),
         locations: Vec::new(),
+        title_block: p.info.as_ref().map(SweProjectInfo::title_block).unwrap_or_default(),
     };
     // Locations, with their descriptions. One without a usable tag path cannot be named.
     let mut locations_untagged = 0;
@@ -1464,7 +1608,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 (covers, "cover page(s)"),
                 (
                     others.saturating_sub(covers),
-                    "report, layout or other non-schematic page(s)",
+                    "report, layout or other non-schematic page(s) (WiringCraft makes its own reports)",
                 ),
             ]),
         },
