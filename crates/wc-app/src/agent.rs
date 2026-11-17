@@ -2048,13 +2048,17 @@ mod tests {
     fn a_taken_message_was_logged_first() {
         let (_tmp, mut a) = app(vec![]);
         a.dialog = Some(Dialog::Message("Export failed".into()));
-        // `take_message` logs before taking: nothing is left for the frame to log, and the same
-        // message shown again is new.
+        // `take_message` logs before taking, and forgets the text once taken: the cache that
+        // stops a message from being logged twice must not hold it, or the same message taken
+        // again right after (no frame in between) would not be logged.
         assert_eq!(a.take_message().as_deref(), Some("Export failed"));
-        assert!(a.new_messages().is_empty(), "it was logged when taken");
+        assert!(a.logged.1.is_empty(), "the taken message no longer blocks the next one");
         a.dialog = Some(Dialog::Message("Export failed".into()));
-        let again = a.new_messages();
-        assert_eq!(again.len(), 1, "a second occurrence is logged too");
+        assert_eq!(a.take_message().as_deref(), Some("Export failed"));
+        assert!(a.logged.1.is_empty());
+        // And the frame's own logging sees a third one as new.
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        assert_eq!(a.new_messages().len(), 1);
     }
 
     #[test]
