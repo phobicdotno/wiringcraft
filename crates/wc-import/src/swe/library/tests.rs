@@ -168,12 +168,17 @@ fn rows_of_the_wrong_type_are_counted_not_fatal() {
             .any(|w| w.contains("catalog part row(s) could not be read")),
         "{warnings:?}"
     );
+    // The unreadable row still counts as a row of the source.
+    assert_eq!(report.parts_in, 5);
 
     let c = db(APP_DATA);
     c.execute_batch("INSERT INTO tew_blockpt VALUES (1, 3, 'B', 'far', 0);")
         .unwrap();
+    c.execute_batch("INSERT INTO tew_block VALUES ('bad id', 'Odd', '');")
+        .unwrap();
     let mut warnings = Vec::new();
     let symbols = read_blocks(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(report.blocks_in, 4);
     assert_eq!(symbols[0].pins.len(), 2);
     assert!(!warnings.is_empty());
 }
@@ -259,12 +264,21 @@ fn devices_and_cables_get_the_library_part_they_name() {
     built
         .devices
         .insert(DeviceTag::parse("-X1").unwrap(), Device::default());
-    assert_eq!(link_parts(&mut built, &parts), 3);
+    // `RLY/24` gives the same id as `RLY-24` but is another part; case and spaces do not count.
+    built
+        .devices
+        .insert(DeviceTag::parse("-K3").unwrap(), device("RLY/24", "Maker A"));
+    built
+        .devices
+        .insert(DeviceTag::parse("-K4").unwrap(), device(" rly-24", "MAKER A "));
+    assert_eq!(link_parts(&mut built, &parts), 4);
     let part = |t: &str| built.devices[&DeviceTag::parse(t).unwrap()].part.clone();
     assert_eq!(part("-K1").as_deref(), Some("maker-a.rly-24"));
     assert_eq!(part("-K2").as_deref(), Some("maker-a.rly-24"));
     assert_eq!(part("-W1").as_deref(), Some("maker-c.cbl-3g1"));
     assert_eq!(part("-F1"), None);
+    assert_eq!(part("-K3"), None);
+    assert_eq!(part("-K4").as_deref(), Some("maker-a.rly-24"));
     // The text properties stay; each used part is added once.
     assert_eq!(
         built.devices[&DeviceTag::parse("-K1").unwrap()].properties["PartNumber"],

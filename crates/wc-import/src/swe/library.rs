@@ -239,8 +239,10 @@ pub fn read_catalog(conn: &Connection, report: &mut LibraryReport, warnings: &mu
             ))
         })
         .map_err(sql)?;
-    let rows = readable(rows, "catalog part", warnings);
+    // Every row the source has counts, also one that cannot be read.
+    let rows: Vec<rusqlite::Result<_>> = rows.collect();
     report.parts_in = rows.len();
+    let rows = readable(rows.into_iter(), "catalog part", warnings);
 
     let terminals = catalog_terminals(conn, &refs, report, warnings)?;
     let mut by_id: BTreeMap<String, Part> = BTreeMap::new();
@@ -440,8 +442,10 @@ pub fn read_cable_types(
             ))
         })
         .map_err(sql)?;
-    let rows = readable(rows, "cable type", warnings);
+    // Every row the source has counts, also one that cannot be read.
+    let rows: Vec<rusqlite::Result<_>> = rows.collect();
     report.cables_in = rows.len();
+    let rows = readable(rows.into_iter(), "cable type", warnings);
 
     // Cores: (number, colour, cross-section) by cable row.
     let mut cores: BTreeMap<i64, Vec<(String, String, String)>> = BTreeMap::new();
@@ -590,8 +594,10 @@ pub fn read_blocks(conn: &Connection, report: &mut LibraryReport, warnings: &mut
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
         })
         .map_err(sql)?;
-    let rows = readable(rows, "symbol block", warnings);
+    // Every row the source has counts, also one that cannot be read.
+    let rows: Vec<rusqlite::Result<_>> = rows.collect();
     report.blocks_in = rows.len();
+    let rows = readable(rows.into_iter(), "symbol block", warnings);
 
     let no = points.field(&["no", "orderno"]);
     let pin_name = points.field(&["txt", "name", "label", "tag"]);
@@ -766,10 +772,16 @@ pub fn from_archive<R: Read + std::io::Seek>(reader: R) -> Result<SweLibrary> {
 
 /// Give each imported device and cable the library part its `Manufacturer` and `PartNumber`
 /// name, when `parts` has it, and add those parts to the import so they are vendored with it.
-/// The text properties stay, so reports that read them are unchanged. Returns how many devices
-/// got a part.
+/// A part matches on its manufacturer and order number as written (case and outer spaces aside),
+/// not on its id, which `RLY-24` and `RLY/24` share. The text properties stay, so reports that
+/// read them are unchanged. Returns how many devices got a part.
 pub fn link_parts(built: &mut Built, parts: &[Part]) -> usize {
+    let key = |maker: &str, number: &str| (maker.trim().to_lowercase(), number.trim().to_lowercase());
     let by_id: BTreeMap<&str, &Part> = parts.iter().map(|p| (p.id.as_str(), p)).collect();
+    let by_name: BTreeMap<(String, String), &Part> = parts
+        .iter()
+        .map(|p| (key(&p.manufacturer, &p.order_number), p))
+        .collect();
     let mut used: BTreeSet<String> = BTreeSet::new();
     let mut linked = 0;
     for d in built.devices.values_mut() {
@@ -780,8 +792,7 @@ pub fn link_parts(built: &mut Built, parts: &[Part]) -> usize {
             continue;
         };
         let maker = d.properties.get("Manufacturer").map(String::as_str).unwrap_or_default();
-        let id = Part::make_id(maker, number);
-        if let Some(p) = by_id.get(id.as_str()) {
+        if let Some(p) = by_name.get(&key(maker, number)) {
             d.part = Some(p.id.clone());
             used.insert(p.id.clone());
             linked += 1;
