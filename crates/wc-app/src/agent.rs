@@ -288,8 +288,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_page",
-            "Change a page's number, title or sheet size.",
-            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}}),
+            "Change a page's number, title or sheet size, or mark it as an overview (a line diagram: its devices do not count as drawings in the project check).",
+            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}, "overview": {"type": "boolean"}}),
             &[],
         ),
         tool(
@@ -319,7 +319,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "edit_page_json",
             "Replace a whole page with new content in the page file format (as get_page returns it, without the extra pin and point fields). For bulk edits the other tools cannot do. The page id stays.",
-            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, symbols, wires, graphics, underlay."}}),
+            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), symbols, wires, graphics, underlay."}}),
             &["content"],
         ),
         tool(
@@ -1027,7 +1027,7 @@ impl App {
                 let cur = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 let number = s(v, "number").unwrap_or(&cur.number).to_owned();
                 let title = s(v, "title").unwrap_or(&cur.title).to_owned();
-                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size))?;
+                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size), cur.overview)?;
                 let p = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 self.go_to(i);
                 Ok(format!("Added page {} ({}), id {}.", p.number, p.title, p.id))
@@ -1042,6 +1042,7 @@ impl App {
                     s(v, "number").unwrap_or(&cur.number),
                     s(v, "title").unwrap_or(&cur.title),
                     size.unwrap_or(cur.size),
+                    v.get("overview").and_then(Value::as_bool).unwrap_or(cur.overview),
                 )?;
                 if self.ed.page == page {
                     self.ed.page = i;

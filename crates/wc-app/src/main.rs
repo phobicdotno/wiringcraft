@@ -51,6 +51,7 @@ enum Dialog {
         number: String,
         title: String,
         size: PageSize,
+        overview: bool,
         error: Option<String>,
     },
     DeletePage(usize),
@@ -419,6 +420,7 @@ impl App {
                         number: p.number.clone(),
                         title: p.title.clone(),
                         size: p.size,
+                        overview: p.overview,
                         error: None,
                     });
                 }
@@ -805,6 +807,7 @@ impl App {
                     number,
                     title,
                     size,
+                    overview,
                     error,
                 } => {
                     egui::Grid::new("pageprops")
@@ -826,6 +829,11 @@ impl App {
                                     }
                                 });
                             ui.end_row();
+                            ui.label("Overview");
+                            ui.checkbox(overview, "Line diagram").on_hover_text(
+                                "Shows devices again that schematic pages draw in detail. Its symbols do not count as drawings in the project check.",
+                            );
+                            ui.end_row();
                         });
                     if let Some(e) = error {
                         ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
@@ -834,7 +842,7 @@ impl App {
                         if ui.button("OK").clicked()
                             && let Some(o) = self.open.as_mut()
                         {
-                            match o.set_page_props(self.ed.page, number, title, *size) {
+                            match o.set_page_props(self.ed.page, number, title, *size, *overview) {
                                 Ok(i) => {
                                     self.ed.page = i;
                                     self.ed.view.fit = true;
