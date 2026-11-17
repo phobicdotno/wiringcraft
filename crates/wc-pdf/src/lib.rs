@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use wc_core::{Project, Symbol};
 
 pub use layout::{
-    CrossRefs, FRAME_COLUMNS, FrameMark, Ink, XREF_HEIGHT, XrefMark, column_of, frame_marks, junctions, pin_position,
-    xref_marks,
+    CrossRefs, FRAME_COLUMNS, FrameMark, Ink, XREF_HEIGHT, XrefMark, column_of, cover_logo_box, cover_logo_default,
+    fit_picture, frame_marks, junctions, logo_boxes, pin_position, title_logo_box, xref_marks,
 };
 pub use picture::read_underlays;
 pub use vector::{PageDrawing, dxf, page_drawings, svg};
@@ -32,8 +32,8 @@ pub struct Options {
     pub wire_labels: bool,
     /// Report tables appended after the schematic pages, each starting on a new page.
     pub reports: Vec<wc_report::Table>,
-    /// Underlay picture files by path (see [`read_underlays`]), drawn under their pages on
-    /// a layer of their own.
+    /// Picture files by path (see [`read_underlays`]): underlays, drawn under their pages on
+    /// a layer of their own, and the project logo.
     pub underlays: BTreeMap<String, Vec<u8>>,
     /// Panel layouts printed after the schematic pages, one sheet each.
     pub panels: Vec<wc_core::panel::Panel>,
@@ -70,6 +70,26 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         pages: 0,
         warnings: Vec::new(),
     };
+    // The logo is read once and stored in the file once, however many pages show it.
+    let logo = project.meta.logo.as_ref().and_then(|l| {
+        let found = match options.underlays.get(&l.file) {
+            Some(bytes) => picture::decode(bytes).map_err(|why| format!("logo {}: {why}", l.file)),
+            None => Err(format!("logo picture {} is missing", l.file)),
+        };
+        found.map_err(|w| report.warnings.push(w)).ok().map(std::sync::Arc::new)
+    });
+    // Every sheet shows the logo in its title block; the cover page also shows it larger.
+    let place_logo = |drawn: &mut writer::Drawn, page: &wc_core::Page| {
+        let Some(img) = &logo else { return };
+        for b in layout::logo_boxes(project, page) {
+            let (min, max) = layout::fit_picture(b, (img.width, img.height));
+            drawn.pictures.push(writer::Placed {
+                image: img.clone(),
+                min: (min.x, min.y),
+                max: (max.x, max.y),
+            });
+        }
+    };
     let xref = layout::CrossRefs::build(project, symbols);
     // Report pages use the size of the first schematic page and are counted in the sheet total.
     let size = pages.first().map(|p| p.size).unwrap_or_default();
@@ -104,7 +124,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
                 table.title.clone(),
             );
             page.size = size;
-            let drawn = layout::draw_table_page(
+            let mut drawn = layout::draw_table_page(
                 project,
                 &page,
                 *sheet,
@@ -114,6 +134,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
                 (part, parts),
                 &options.date,
             );
+            place_logo(&mut drawn, &page);
             let title = if parts > 1 {
                 format!("{} {} ({part}/{parts})", page.number, table.title)
             } else {
@@ -149,6 +170,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
                     .push(format!("page {}: underlay picture {} is missing", page.number, u.file)),
             }
         }
+        place_logo(&mut drawn, page);
         doc.add_page(page.size.mm(), &format!("{} {}", page.number, page.title), drawn);
         sheet += 1;
     }
@@ -156,7 +178,8 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     for (k, panel) in options.panels.iter().enumerate() {
         let mut page = wc_core::Page::new(format!("panel-{}", panel.id), format!("P{}", k + 1), panel.name.clone());
         page.size = size;
-        let drawn = layout::draw_panel_page(project, &page, sheet, total, panel, &options.date);
+        let mut drawn = layout::draw_panel_page(project, &page, sheet, total, panel, &options.date);
+        place_logo(&mut drawn, &page);
         doc.add_page(size.mm(), &format!("{} {}", page.number, panel.name), drawn);
         sheet += 1;
     }

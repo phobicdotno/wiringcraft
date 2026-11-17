@@ -1,5 +1,5 @@
-//! Underlay pictures (scanned sheets) as PDF image objects: JPEG files are embedded as they
-//! are, PNG files are decoded and stored Flate-compressed.
+//! Pictures (underlays such as scanned sheets, and the project logo) as PDF image objects: JPEG
+//! files are embedded as they are, PNG files are decoded and stored Flate-compressed.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -12,20 +12,37 @@ use crate::writer::PageImage;
 /// Largest picture embedded, in pixels; bigger ones are skipped with a warning.
 const MAX_PIXELS: u64 = 200_000_000;
 
-/// Read every underlay picture the project's pages use, by file. Files that are missing or
-/// outside the project are left out; the export then warns about them.
+/// Read every picture the project uses, by file: the pages' underlays and the project logo.
+/// Files that are missing or outside the project are left out; the export then warns about them.
 pub fn read_underlays(dir: &Path, project: &Project) -> BTreeMap<String, Vec<u8>> {
-    project
+    let underlays = project
         .pages
         .iter()
         .filter_map(|p| p.underlay.as_ref())
         .filter(|u| u.file_is_safe())
-        .filter_map(|u| Some((u.file.clone(), std::fs::read(dir.join(&u.file)).ok()?)))
+        .map(|u| u.file.as_str());
+    let logo = project
+        .meta
+        .logo
+        .as_ref()
+        .filter(|l| l.file_is_safe())
+        .map(|l| l.file.as_str());
+    underlays
+        .chain(logo)
+        .filter_map(|f| Some((f.to_owned(), std::fs::read(dir.join(f)).ok()?)))
         .collect()
 }
 
 /// A picture file as an image object placed over the underlay's rectangle.
 pub fn page_image(u: &Underlay, bytes: &[u8]) -> Result<PageImage, String> {
+    let mut img = decode(bytes)?;
+    img.min = (u.min.x.min(u.max.x), u.min.y.min(u.max.y));
+    img.max = (u.min.x.max(u.max.x), u.min.y.max(u.max.y));
+    Ok(img)
+}
+
+/// A picture file as an image object, not yet placed (`min` and `max` are zero).
+pub fn decode(bytes: &[u8]) -> Result<PageImage, String> {
     let place = |width: u32, height: u32, colour_space, filter, extra, data| PageImage {
         width,
         height,
@@ -33,8 +50,8 @@ pub fn page_image(u: &Underlay, bytes: &[u8]) -> Result<PageImage, String> {
         filter,
         extra,
         data,
-        min: (u.min.x.min(u.max.x), u.min.y.min(u.max.y)),
-        max: (u.min.x.max(u.max.x), u.min.y.max(u.max.y)),
+        min: (0.0, 0.0),
+        max: (0.0, 0.0),
     };
     if bytes.starts_with(&[0xFF, 0xD8]) {
         let j = jpeg_info(bytes).ok_or("the JPEG file is damaged")?;
@@ -80,7 +97,7 @@ pub fn page_image(u: &Underlay, bytes: &[u8]) -> Result<PageImage, String> {
         let data = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
         return Ok(place(w, h, colour_space, "FlateDecode", "", data));
     }
-    Err("only JPEG and PNG pictures can be shown under a page".into())
+    Err("only JPEG and PNG pictures can be shown".into())
 }
 
 struct JpegInfo {

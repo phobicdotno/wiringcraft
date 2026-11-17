@@ -362,6 +362,91 @@ fn underlay_pictures_go_under_the_page_on_their_own_layer() {
 }
 
 #[test]
+fn the_logo_shows_in_every_title_block_and_on_the_cover_stored_once() {
+    let mut png = Vec::new();
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 2, image::Rgb([200, 30, 30])));
+    assert!(
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+    );
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p0", "0", "Cover");
+    cover.cover = true;
+    project.pages = vec![cover, Page::new("p1", "1", "Mains")];
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: Some((Point::new(100.0, 40.0), Point::new(140.0, 60.0))),
+    });
+    let mut underlays = BTreeMap::new();
+    underlays.insert("pictures/logo.png".to_string(), png);
+    let opts = Options {
+        underlays,
+        reports: vec![wc_report::Table {
+            title: "Parts list".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(
+        text.matches("/Subtype /Image").count(),
+        1,
+        "one image object for every page"
+    );
+    assert!(text.contains("/Width 4 /Height 2 /ColorSpace /DeviceRGB"));
+    // Title blocks on both schematic pages and the report page, plus the cover's own place.
+    assert_eq!(text.matches("cm /Pic0 Do Q").count(), 3);
+    assert_eq!(text.matches("cm /Pic1 Do Q").count(), 1);
+    // On the cover: 40 x 20 mm fills the 40 x 20 mm box exactly (same proportions).
+    let mm = |v: f64| v * writer::PT_PER_MM;
+    let cover_op = format!(
+        "q {:.3} 0 0 {:.3} {:.3} {:.3} cm /Pic1 Do Q",
+        mm(40.0),
+        mm(20.0),
+        mm(100.0),
+        mm(297.0 - 60.0)
+    );
+    assert!(text.contains(&cover_op), "{cover_op}");
+    // "WiringCraft" gives way to the logo in the title block.
+    let brand = format!("{} Tj", writer::pdf_text("WiringCraft"));
+    assert!(!text.contains(&brand));
+    project.meta.logo = None;
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(
+        String::from_utf8_lossy(&pdf).contains(&brand),
+        "shown again without a logo"
+    );
+}
+
+#[test]
+fn a_missing_logo_is_a_warning_and_the_export_still_works() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/gone.png".into(),
+        cover: None,
+    });
+    let (pdf, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(report.pages, 1);
+    assert!(pdf.starts_with(b"%PDF"));
+    assert_eq!(report.warnings, ["logo picture pictures/gone.png is missing"]);
+    assert!(!String::from_utf8_lossy(&pdf).contains("/Subtype /Image"));
+}
+
+#[test]
+fn a_logo_keeps_its_proportions_in_its_box() {
+    let (min, max) = fit_picture((Point::new(0.0, 0.0), Point::new(30.0, 10.0)), (100, 100));
+    assert_eq!((min, max), (Point::new(10.0, 0.0), Point::new(20.0, 10.0)));
+    let (min, max) = fit_picture((Point::new(0.0, 0.0), Point::new(10.0, 30.0)), (200, 100));
+    assert_eq!((min, max), (Point::new(0.0, 12.5), Point::new(10.0, 17.5)));
+    let page = Page::new("p", "1", "x");
+    let (a, b) = title_logo_box(&page);
+    assert!(a.x < b.x && a.y < b.y && b.x < 420.0 && b.y < 297.0);
+}
+
+#[test]
 fn panel_layouts_print_after_the_schematic_pages() {
     use wc_core::panel::{Panel, PanelItem};
     let mut project = Project::new("x");
