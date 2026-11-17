@@ -10,7 +10,8 @@ CREATE TABLE tew_file (fil_id INTEGER, fil_orderno INTEGER, fil_filetype INTEGER
   fil_titleblock TEXT DEFAULT '', fil_bun_id INTEGER DEFAULT 1);
 CREATE TABLE tew_folder (fol_id INTEGER, fol_name TEXT);
 CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0 TEXT);
-CREATE TABLE tew_component (com_id INTEGER, com_tag TEXT, com_tagpath TEXT, com_type INTEGER);
+CREATE TABLE tew_component (com_id INTEGER, com_tag TEXT, com_tagpath TEXT, com_type INTEGER,
+  com_com_id INTEGER, com_tagorderno INTEGER);
 CREATE TABLE tew_buildofmaterial (bom_id INTEGER, bom_objectid INTEGER, bom_orderno INTEGER, bom_reference TEXT, bom_manufacturer TEXT);
 CREATE TABLE tew_symbol (sym_id INTEGER, sym_fil_id INTEGER, sym_com_id INTEGER, sym_blockname TEXT, sym_posx REAL, sym_posy REAL,
   sym_angle REAL, sym_scalex REAL, sym_scaley REAL, sym_posendx REAL, sym_posendy REAL);
@@ -21,7 +22,8 @@ CREATE TABLE tew_line (lin_id INTEGER, lin_fil_id INTEGER, lin_ptstartx REAL, li
 CREATE TABLE tew_equipotential (equ_id INTEGER, equ_text TEXT);
 CREATE TABLE tew_cable (cab_id INTEGER, cab_tag TEXT, cab_reference TEXT, cab_manufacturer TEXT);
 CREATE TABLE tew_cablewire (caw_cab_id INTEGER, caw_no INTEGER, caw_color TEXT);
-CREATE TABLE tew_wire (wir_id INTEGER, wir_cab_id INTEGER, wir_caw_no INTEGER, wir_tag TEXT);
+CREATE TABLE tew_wire (wir_id INTEGER, wir_cab_id INTEGER, wir_caw_no INTEGER, wir_tag TEXT,
+  wir_cel_idfrom INTEGER, wir_cte_nofrom INTEGER, wir_cel_idto INTEGER, wir_cte_noto INTEGER);
 CREATE TABLE tew_linewirepair (lwp_lin_id INTEGER, lwp_wir_id INTEGER, lwp_wir_orderno INTEGER);
 ";
 
@@ -38,7 +40,7 @@ INSERT INTO tew_folder VALUES (7, 'Power');
 INSERT INTO tew_file (fil_id, fil_orderno, fil_filetype, fil_title, fil_fol_id) VALUES (10, 2, 12, '01', 7), (11, 1, 2, '00', 7);
 INSERT INTO tew_translatedtext VALUES (10, -1, 'de', 'Stromlaufplan'), (10, -1, 'en', 'Main supply'),
   (100, -1, 'en', 'Pump relay');
-INSERT INTO tew_component VALUES (100, 'K1', '=F1+L1+L2-K1', -1), (101, 'F1', '', -1), (102, '', '', -1);
+INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (100, 'K1', '=F1+L1+L2-K1', -1), (101, 'F1', '', -1), (102, '', '', -1);
 INSERT INTO tew_buildofmaterial VALUES (1, 100, 1, 'RLY-24', 'Maker A'), (2, 100, 2, 'SOCKET', 'Maker B');
 -- K1 at (100, 200): A1 5 mm above, A2 5 mm below (y up).
 INSERT INTO tew_symbol VALUES (1, 10, 100, 'Coil', 100, 200, 0, 1, 1, NULL, NULL);
@@ -56,7 +58,7 @@ INSERT INTO tew_equipotential VALUES (900, '101');
 INSERT INTO tew_line VALUES (1, 10, 60, 224, 100, 224, 900), (2, 10, 100, 224, 100, 205, 900);
 INSERT INTO tew_cable VALUES (40, 'W1', 'CBL-3G1', 'Maker C'), (41, 'W2', '', '');
 INSERT INTO tew_cablewire VALUES (40, 1, 'BN'), (40, 2, 'BU'), (40, 3, 'GNYE');
-INSERT INTO tew_wire VALUES (70, 40, 1, ''), (71, NULL, -1, 'X9');
+INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag) VALUES (70, 40, 1, ''), (71, NULL, -1, 'X9');
 INSERT INTO tew_linewirepair VALUES (1, 70, 1), (2, 70, 1);
 ",
     )
@@ -256,7 +258,7 @@ fn a_t_joint_splits_the_line_it_lands_on() {
 fn identical_symbols_share_one_library_symbol() {
     let c = sample();
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (103, 'K2', '', -1);
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (103, 'K2', '', -1);
          INSERT INTO tew_symbol VALUES (5, 10, 103, 'Coil', 150, 200, 0, 1, 1, NULL, NULL);
          INSERT INTO tew_symbolpt VALUES (5, 0, 0, 0, 5), (5, 0, 1, 0, -5);
          INSERT INTO tew_componentelement (cel_id, cel_sym_id, cel_sct_no) VALUES (51, 5, 0);
@@ -275,7 +277,7 @@ fn identical_symbols_share_one_library_symbol() {
 fn duplicate_tags_are_made_unique() {
     let c = sample();
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (104, 'K1', '=F1+L1+L2-K1', -1);
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (104, 'K1', '=F1+L1+L2-K1', -1);
          INSERT INTO tew_symbol VALUES (6, 10, 104, 'Coil', 200, 200, 0, 1, 1, NULL, NULL);
          INSERT INTO tew_symbolpt VALUES (6, 0, 0, 0, 5);",
     )
@@ -322,7 +324,7 @@ fn a_page_number_used_twice_is_reported() {
 fn a_line_with_several_wire_numbers_is_reported() {
     let c = sample();
     c.execute_batch(
-        "INSERT INTO tew_wire VALUES (73, NULL, -1, 'X8'), (74, NULL, -1, 'X7');
+        "INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag) VALUES (73, NULL, -1, 'X8'), (74, NULL, -1, 'X7');
          INSERT INTO tew_linewirepair VALUES (1, 73, 2), (1, 74, 3);",
     )
     .unwrap();
@@ -347,7 +349,7 @@ fn a_wire_only_on_a_zero_length_line_is_reported_as_such() {
     let c = sample();
     c.execute_batch(
         "INSERT INTO tew_line VALUES (3, 10, 300, 300, 300, 300, NULL);
-         INSERT INTO tew_wire VALUES (75, NULL, -1, 'Z1');
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag) VALUES (75, NULL, -1, 'Z1');
          INSERT INTO tew_linewirepair VALUES (3, 75, 1);",
     )
     .unwrap();
@@ -406,7 +408,7 @@ fn arrows_become_interruption_points_with_one_tag_per_pair() {
     let c = sample();
     c.execute_batch(
         "INSERT INTO tew_file (fil_id, fil_orderno, fil_filetype, fil_title, fil_fol_id) VALUES (12, 3, 0, '02', 7);
-         INSERT INTO tew_component VALUES (200, '', '=F1+L1-', 5);
+         INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (200, '', '=F1+L1-', 5);
          INSERT INTO tew_symbol VALUES (8, 10, 200, 'Arrow out', 140, 224, 0, 1, 1, NULL, NULL);
          INSERT INTO tew_symbolpt VALUES (8, 0, 0, 0, 0);
          INSERT INTO tew_symbol VALUES (9, 12, 200, 'Arrow in', 20, 100, 0, 1, 1, NULL, NULL);
@@ -434,7 +436,7 @@ fn a_strip_drawn_as_several_symbols_gets_distinct_pin_names() {
     let c = sample();
     // Strip X1: two terminal symbols, each two points, terminals without text.
     c.execute_batch(
-        "INSERT INTO tew_component VALUES (300, 'X1', '-X1', 3);
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (300, 'X1', '-X1', 3);
          INSERT INTO tew_symbol VALUES (20, 10, 300, 'Terminal', 200, 100, 0, 1, 1, NULL, NULL),
                                        (21, 10, 300, 'Terminal', 205, 100, 0, 1, 1, NULL, NULL);
          INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5), (21, 0, 0, 0, 5), (21, 0, 1, 0, -5);
@@ -474,7 +476,7 @@ fn box_size_is_relative_and_a_shared_function_becomes_a_property() {
     // A black box 35 wide and 40 high below its insertion point, on an A2 frame page.
     c.execute_batch(
         "UPDATE tew_file SET fil_titleblock = 'SHEET_A2_X' WHERE fil_id = 10;
-         INSERT INTO tew_component VALUES (105, 'A1', '=F1+L1-A1', -1);
+         INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (105, 'A1', '=F1+L1-A1', -1);
          INSERT INTO tew_symbol VALUES (10, 10, 105, 'Box', 20, 300, 0, 1, 1, 35, -40);",
     )
     .unwrap();
@@ -681,7 +683,7 @@ fn a_net_without_a_number_keeps_its_own_name() {
 fn a_line_on_two_cable_cores_is_reported() {
     let c = sample();
     c.execute_batch(
-        "INSERT INTO tew_wire VALUES (72, 40, 2, '');
+        "INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag) VALUES (72, 40, 2, '');
          INSERT INTO tew_linewirepair VALUES (1, 72, 2);",
     )
     .unwrap();
@@ -838,7 +840,7 @@ fn a_location_path_is_cleaned_up_like_the_tags_of_its_devices() {
     c.execute_batch(
         "CREATE TABLE tew_location (loc_id INTEGER, loc_loc_id INTEGER, loc_tagpath TEXT);
          INSERT INTO tew_location VALUES (40, -1, '+Room 1'), (41, -1, '+A/B');
-         INSERT INTO tew_component VALUES (105, 'K5', '+Room 1-K5', -1), (106, 'K6', '+A/B-K6', -1);
+         INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (105, 'K5', '+Room 1-K5', -1), (106, 'K6', '+A/B-K6', -1);
          INSERT INTO tew_symbol VALUES (7, 10, 105, 'Coil', 250, 200, 0, 1, 1, NULL, NULL),
            (8, 10, 106, 'Coil', 280, 200, 0, 1, 1, NULL, NULL);
          INSERT INTO tew_symbolpt VALUES (7, 0, 0, 0, 5), (8, 0, 0, 0, 5);",
@@ -886,6 +888,396 @@ fn location_descriptions_survive_blank_english_and_a_late_repeat_and_bad_rows_sa
         got.contains(&("L8", "Cabinet")),
         "a later repeat fills the description: {got:?}"
     );
+}
+
+/// The sample plus terminal strip X1 with terminals 1 and 2 (source order 2, 1; tag paths written
+/// with a space), drawn at (150, 200) and (170, 200); a line joins X1.1's lower point to K1:A2.
+/// Wire records: X1.1 lower to K1:A2 (drawn so), X1.2 upper to K1:A1 (not drawn so), and one to
+/// a terminal that is not drawn.
+fn sample_with_strip() -> Connection {
+    let c = sample();
+    c.execute_batch(
+        "
+INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1 1', 4, 200, 2), (202, '2', '-X1 2', 4, 200, 1);
+INSERT INTO tew_symbol VALUES (20, 10, 201, 'Terminal', 150, 200, 0, 1, 1, NULL, NULL),
+  (21, 10, 202, 'Terminal', 170, 200, 0, 1, 1, NULL, NULL);
+INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5), (21, 0, 0, 0, 5), (21, 0, 1, 0, -5);
+INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0), (61, 21, 0, 202, 0);
+INSERT INTO tew_componentterminal VALUES (60, 0, NULL), (60, 1, NULL), (61, 0, NULL), (61, 1, NULL);
+INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL);
+INSERT INTO tew_wire VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1), (81, NULL, -1, 'N2', 61, 0, 50, 0),
+  (82, NULL, -1, '', 60, 0, 99, 0), (83, NULL, -1, '', 0, 0, 0, 0);
+",
+    )
+    .unwrap();
+    c
+}
+
+#[test]
+fn terminal_strips_come_in_with_their_terminals_and_wire_ends_are_checked() {
+    let p = read(&sample_with_strip()).unwrap();
+    assert_eq!(p.components[&201].parent, Some(200));
+    assert_eq!((p.components[&202].order, p.components[&202].name.as_str()), (1, "2"));
+    assert_eq!((p.wires[&80].from, p.wires[&80].to), (Some((60, 1)), Some((50, 1))));
+    assert_eq!(p.wires[&83].from, None, "element 0 is no end");
+    let x1 = p.symbols.iter().find(|s| s.id == 20).unwrap();
+    assert_eq!(x1.pins[1].terminal, Some((60, 1)));
+
+    let (built, warnings, report) = build(&p, None);
+    for t in ["-X1", "-X1.1", "-X1.2"] {
+        assert!(
+            built.devices.contains_key(&DeviceTag::parse(t).unwrap()),
+            "{t}: {:?}",
+            built.devices.keys()
+        );
+    }
+    let pg = page(&built, "01");
+    let placed = pg.symbols.iter().find(|s| s.id == "s20").unwrap();
+    assert_eq!(placed.tag.as_ref().unwrap().to_string(), "-X1.1");
+    let sym = built.symbols.iter().find(|s| s.id == placed.symbol).unwrap();
+    assert_eq!(sym.role, SymbolRole::Terminal);
+    let coil = pg.symbols.iter().find(|s| s.id == "s1").unwrap();
+    let coil_sym = built.symbols.iter().find(|s| s.id == coil.symbol).unwrap();
+    assert_eq!(coil_sym.role, SymbolRole::Standalone);
+
+    let row = |what: &str| report.iter().find(|c| c.what == what).unwrap().clone();
+    let strips = row("terminal strips");
+    assert_eq!((strips.source, strips.imported), (1, 1));
+    assert!(
+        strips.note.starts_with("1 whose source order differs"),
+        "{}",
+        strips.note
+    );
+    let terms = row("terminals");
+    assert_eq!((terms.source, terms.imported, terms.note.as_str()), (2, 2, ""));
+    let ends = row("wire ends (from/to terminals)");
+    assert_eq!((ends.source, ends.imported), (3, 1), "{}", ends.note);
+    assert!(
+        ends.note.contains("1 join terminals that are not connected"),
+        "{}",
+        ends.note
+    );
+    assert!(
+        ends.note.contains("1 with a terminal that is not drawn"),
+        "{}",
+        ends.note
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("terminal strip(s) -X1 have their terminals in another order")),
+        "{warnings:?}"
+    );
+    let apart = warnings
+        .iter()
+        .find(|w| w.contains("not connected on the imported drawing"))
+        .unwrap();
+    assert!(apart.contains("wire N2: -X1.2:1 (page 01)"), "{apart}");
+    assert!(!apart.contains("N1"), "{apart}");
+}
+
+#[test]
+fn a_terminal_without_a_strip_keeps_its_own_tag() {
+    let c = sample();
+    c.execute_batch("INSERT INTO tew_component VALUES (300, '5', '-X9-5', 4, NULL, 0);")
+        .unwrap();
+    let (built, _, report) = build(&read(&c).unwrap(), None);
+    assert!(built.devices.contains_key(&DeviceTag::parse("-X9.5").unwrap()));
+    let terms = report.iter().find(|c| c.what == "terminals").unwrap();
+    assert_eq!((terms.source, terms.imported), (1, 0));
+    assert!(terms.note.starts_with("1 not on a strip"), "{}", terms.note);
+}
+
+#[test]
+fn imported_terminals_show_in_the_terminal_plan_per_strip() {
+    let c = sample_with_strip();
+    // A terminal whose number has a dot, and a wire record with only one end.
+    c.execute_batch(
+        "INSERT INTO tew_component VALUES (203, '3.1', '-X1-3.1', 4, 200, 3), (204, '1+2', '-X1-1+2', 4, 200, 4);
+         INSERT INTO tew_wire VALUES (84, NULL, -1, '', 60, 0, NULL, NULL);",
+    )
+    .unwrap();
+    let (built, _, report) = build(&read(&c).unwrap(), None);
+    assert!(
+        ["-X1.3_1", "-X1.1_2"]
+            .iter()
+            .all(|t| built.devices.contains_key(&DeviceTag::parse(t).unwrap())),
+        "one level: {:?}",
+        built.devices.keys()
+    );
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(ends.note.contains("1 more name only one terminal"), "{}", ends.note);
+
+    let mut project = wc_core::Project::new("t");
+    project.pages = built.pages.clone();
+    project.devices = built.devices.clone();
+    let symbols: BTreeMap<String, Symbol> = built.symbols.iter().map(|s| (s.id.clone(), s.clone())).collect();
+    let parts = BTreeMap::new();
+    let plan = wc_report::terminal_plan(&wc_report::Inputs {
+        project: &project,
+        symbols: &symbols,
+        parts: &parts,
+    });
+    let rows: Vec<(&str, &str)> = plan.rows.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+    assert_eq!(rows, [("-X1", "1"), ("-X1", "2")], "strip -X1, by number");
+    // X1.1's lower side is wired to K1:A2.
+    assert!(plan.rows[0][3].contains("A2"), "{:?}", plan.rows[0]);
+}
+
+#[test]
+fn a_wire_end_on_a_repeated_pin_name_is_found_on_the_right_pin() {
+    let c = sample();
+    // A strip terminal whose two points are both called `1`: the lower one becomes `1#2`.
+    // The line reaches only the lower one, and the wire record names that one.
+    c.execute_batch(
+        "INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '1', '-X1-1', 4, 200, 1);
+         INSERT INTO tew_symbol VALUES (20, 10, 201, 'Terminal', 150, 200, 0, 1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5);
+         INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0);
+         INSERT INTO tew_componentterminal VALUES (60, 0, '1'), (60, 1, '1');
+         INSERT INTO tew_line VALUES (10, 10, 150, 195, 100, 195, NULL);
+         INSERT INTO tew_wire VALUES (80, NULL, -1, 'N1', 60, 1, 50, 1);",
+    )
+    .unwrap();
+    let (_, warnings, report) = build(&read(&c).unwrap(), None);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert_eq!((ends.source, ends.imported), (1, 1), "{} {warnings:?}", ends.note);
+}
+
+#[test]
+fn terminal_numbers_that_sort_alike_count_the_strip_as_out_of_order() {
+    let c = sample();
+    c.execute_batch(
+        "INSERT INTO tew_component VALUES (200, 'X1', '-X1', 3, NULL, 0), (201, '01', '-X1-01', 4, 200, 1),
+           (202, '1', '-X1-1', 4, 200, 2), (210, 'X2', '-X2', 3, NULL, 0), (211, '1', '-X2-1', 4, 210, 1),
+           (212, '2', '-X2-2', 4, 210, 2), (213, '10', '-X2-10', 4, 210, 3);",
+    )
+    .unwrap();
+    let (_, warnings, report) = build(&read(&c).unwrap(), None);
+    let strips = report.iter().find(|c| c.what == "terminal strips").unwrap();
+    assert!(
+        strips.note.starts_with("1 whose source order differs"),
+        "{}",
+        strips.note
+    );
+    assert!(
+        warnings.iter().any(|w| w.starts_with("terminal strip(s) -X1 have")),
+        "only -X1 (1, 2, 10 rise naturally): {warnings:?}"
+    );
+}
+
+#[test]
+fn a_line_diagram_does_not_join_what_the_schematics_keep_apart() {
+    let c = sample_with_strip();
+    // Wire N2's ends are apart in the schematic: X1.2's upper end (given potential JOIN here) and
+    // K1:A1 (potential 101). A line diagram joins the two potentials at one pin; the check must
+    // not let that count as a connection.
+    c.execute_batch(
+        "INSERT INTO tew_file (fil_id, fil_orderno, fil_filetype, fil_title, fil_fol_id) VALUES (12, 3, 1, '02', 7);
+         INSERT INTO tew_equipotential VALUES (901, 'JOIN');
+         INSERT INTO tew_symbol VALUES (30, 12, 202, 'Terminal', 50, 50, 0, 1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (30, 0, 0, 0, 5);
+         INSERT INTO tew_line VALUES (20, 12, 50, 55, 50, 70, 901), (22, 12, 50, 55, 30, 55, 900),
+           (21, 10, 170, 205, 170, 230, 901);",
+    )
+    .unwrap();
+    let (built, _, report) = build(&read(&c).unwrap(), None);
+    assert!(built.pages.iter().any(|p| p.overview), "the line diagram is imported");
+    // The line diagram draws X1.2 again; the terminal plan lists it once.
+    let mut project = wc_core::Project::new("t");
+    project.pages = built.pages.clone();
+    let symbols: BTreeMap<String, Symbol> = built.symbols.iter().map(|s| (s.id.clone(), s.clone())).collect();
+    let parts = BTreeMap::new();
+    let plan = wc_report::terminal_plan(&wc_report::Inputs {
+        project: &project,
+        symbols: &symbols,
+        parts: &parts,
+    });
+    assert_eq!(plan.rows.len(), 2, "{:?}", plan.rows);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(
+        ends.note.contains("1 join terminals that are not connected"),
+        "{}",
+        ends.note
+    );
+}
+
+/// An archive project list (`Database/tew_app_project.sqlite`) with two projects.
+fn project_list() -> Vec<u8> {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0 TEXT);
+         INSERT INTO tew_project VALUES
+           (1, 'Pump station', '3', 'Example Water Ltd', 'Harbour Road 1', '', 'Sample Town', 'Drawing Office A',
+            NULL, NULL, NULL, 'P-1042', 'designer', 'checker', '20240131 08:15:00 ', '20250203 10:00:00 '),
+           (2, 'Other', '12', '', '', '', '', '', '', '', '', '', '', '', '', '');
+         INSERT INTO tew_translatedtext VALUES (1, -1, 'de', 'Pumpwerk'), (1, -1, 'en', 'Pump station control');",
+    )
+    .unwrap();
+    c.serialize(rusqlite::MAIN_DB).unwrap().to_vec()
+}
+
+#[test]
+fn the_project_list_gives_the_title_block_fields() {
+    let list = project_list();
+    let info = project_info(&open(&list).unwrap(), "3").unwrap().unwrap();
+    assert_eq!(info.name, "Pump station");
+    assert_eq!(
+        info.customer_address,
+        ["Harbour Road 1", "Sample Town"],
+        "blank lines dropped"
+    );
+    assert_eq!(
+        (info.created.as_str(), info.modified.as_str()),
+        ("2024-01-31", "2025-02-03")
+    );
+    let tb = info.title_block();
+    assert_eq!(tb["customer"], "Example Water Ltd");
+    assert_eq!(tb["customer_address"], "Harbour Road 1, Sample Town");
+    assert_eq!(tb["project_number"], "P-1042");
+    assert_eq!(tb["drawn_by"], "designer");
+    assert_eq!(tb["date"], "2024-01-31");
+    assert_eq!(tb["description"], "Pump station control", "English wins");
+    assert!(!tb.contains_key("drawing_office_address"), "empty fields are left out");
+    let other = project_info(&open(&list).unwrap(), "12").unwrap().unwrap();
+    assert!(other.title_block().is_empty());
+    assert!(project_info(&open(&list).unwrap(), "99").unwrap().is_none());
+}
+
+#[test]
+fn an_archive_import_carries_the_project_fields_into_the_title_block() {
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    let list = project_list();
+    let buf = archive(&[
+        ("Projects/3/Database/tew_project_data.sqlite", &db),
+        ("Database/tew_app_project.sqlite", &list),
+    ]);
+    let got = database_from_archive(buf, 1).unwrap();
+    assert!(got.info_warning.is_none());
+    let mut p = read(&open(&got.bytes).unwrap()).unwrap();
+    p.info = got.info;
+    let (built, _, _) = build(&p, None);
+    assert_eq!(built.title_block["customer"], "Example Water Ltd");
+    assert_eq!(built.title_block["project_number"], "P-1042");
+    // Without the project list (a bare database, or an older archive) nothing is guessed.
+    let bare = archive(&[("Projects/3/Database/tew_project_data.sqlite", &db)]);
+    let got = database_from_archive(bare, 1).unwrap();
+    assert!(got.info.is_none() && got.info_warning.is_none());
+}
+
+#[test]
+fn the_project_fields_come_across_without_a_description_table_and_with_numbers() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb INTEGER,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         INSERT INTO tew_project VALUES (1, 'P', '1', 'Customer', '', '', '', '', '', '', '', 1042,
+           'designer', '', '', '');",
+    )
+    .unwrap();
+    let info = project_info(&c, "1").unwrap().unwrap();
+    assert_eq!(
+        info.contract_number, "1042",
+        "a number stored as an integer is read as text"
+    );
+    assert_eq!(info.customer, "Customer");
+    assert!(info.description.is_empty());
+    assert!(
+        info.warnings
+            .iter()
+            .any(|w| w.starts_with("the project description was not read")),
+        "{:?}",
+        info.warnings
+    );
+}
+
+#[test]
+fn an_unreadable_description_row_is_reported_with_its_reason() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         INSERT INTO tew_project VALUES (1, 'P', '1', 'Customer', '', '', '', '', '', '', '', '7',
+           '', '', '20240102 10:00:00', 'not a date');
+         CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0);
+         INSERT INTO tew_translatedtext VALUES (1, -1, 'en', 42.5);",
+    )
+    .unwrap();
+    let info = project_info(&c, "1").unwrap().unwrap();
+    assert_eq!(info.customer, "Customer", "the other fields still come across");
+    assert!(info.description.is_empty());
+    assert!(
+        info.warnings
+            .iter()
+            .any(|w| w.contains("text row(s) could not be read")),
+        "{:?}",
+        info.warnings
+    );
+    assert_eq!(info.created, "2024-01-02");
+    assert_eq!(info.modified, "not a date", "a date in another form is kept as written");
+}
+
+#[test]
+fn a_project_list_that_cannot_be_opened_is_a_warning_not_silence() {
+    use std::io::Write;
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        let opt = zip::write::SimpleFileOptions::default();
+        z.start_file("Projects/1/Database/tew_project_data.sqlite", opt)
+            .unwrap();
+        z.write_all(&db).unwrap();
+        use zip::unstable::write::FileOptionsExt;
+        let locked = opt.with_deprecated_encryption(b"secret");
+        z.start_file("Database/tew_app_project.sqlite", locked).unwrap();
+        z.write_all(&db).unwrap();
+        z.finish().unwrap();
+    }
+    buf.set_position(0);
+    let got = database_from_archive(buf, 1).unwrap();
+    assert!(got.info.is_none());
+    let w = got.info_warning.unwrap();
+    assert!(w.contains("tew_app_project.sqlite"), "{w}");
+
+    // Without a project list there are simply no fields, and no warning.
+    let got = database_from_archive(archive(&[("Projects/1/Database/tew_project_data.sqlite", &db)]), 1).unwrap();
+    assert!(got.info.is_none() && got.info_warning.is_none());
+}
+
+#[test]
+fn a_blank_english_translation_does_not_hide_another_language() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         INSERT INTO tew_project VALUES (1, 'P', '1', '', '', '', '', '', '', '', '', '', '', '', '', '');
+         CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0 TEXT);
+         INSERT INTO tew_translatedtext VALUES (1, -1, 'de', ' Beschreibung '), (1, -1, 'en', char(9) || char(10));",
+    )
+    .unwrap();
+    let info = project_info(&c, "1").unwrap().unwrap();
+    assert_eq!(info.description, "Beschreibung");
+    assert!(info.warnings.is_empty(), "{:?}", info.warnings);
 }
 
 #[test]

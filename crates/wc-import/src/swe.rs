@@ -6,7 +6,10 @@
 //! and their connection points (`tew_symbolpt`), components (`tew_component`) with their
 //! terminals, wire lines (`tew_line`) with their potentials (`tew_equipotential`), the wires they
 //! carry (`tew_linewirepair`, `tew_wire`), cables and their cores (`tew_cable`, `tew_cablewire`),
-//! parts (`tew_buildofmaterial`) and translated texts (`tew_translatedtext`). Page drawings and
+//! parts (`tew_buildofmaterial`) and translated texts (`tew_translatedtext`). A terminal strip is
+//! a component of type 3; its terminals are components of type 4 whose `com_com_id` is the strip,
+//! numbered by `com_tag` in `com_tagorderno` order. Each wire record names the component terminal
+//! at both of its ends (`wir_cel_idfrom` + `wir_cte_nofrom`, and the same for `to`). Page drawings and
 //! symbol graphics are DWG files and are not read: each placed symbol becomes a box with its
 //! connection points where the database puts them.
 //!
@@ -22,7 +25,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+use wc_core::connectivity::{PinRef, nets_linked};
 use wc_core::geom::{Point, Shape};
 use wc_core::symbol::{Pin, PinDir, SymbolRole};
 use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Symbol, Wire};
@@ -44,6 +48,10 @@ pub const DRAWN_KINDS: [i64; 5] = [KIND_FOLIO, KIND_LINE_DIAGRAM, KIND_MIXED, KI
 /// `tew_component.com_type` of origin-destination arrows (`EwComponentType`): the two arrows
 /// that carry a wire from one page to another. Imported as interruption points.
 pub const COMPONENT_ARROW: i64 = 5;
+/// `tew_component.com_type` of a terminal strip. Its terminals are [`COMPONENT_TERMINAL`]s.
+pub const COMPONENT_TERMINAL_STRIP: i64 = 3;
+/// `tew_component.com_type` of one terminal; `com_com_id` is its strip.
+pub const COMPONENT_TERMINAL: i64 = 4;
 
 /// The largest project database read out of an archive.
 pub const MAX_DATABASE_BYTES: u64 = 1 << 30;
@@ -76,6 +84,9 @@ pub struct SwePin {
     pub name: String,
     /// Page position in millimetres, y up.
     pub at: Point,
+    /// The component terminal this point stands for: (`cel_id`, `cte_no`), as wire records name
+    /// their ends.
+    pub terminal: Option<(i64, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +123,9 @@ pub struct SweWire {
     /// The core's number in its cable.
     pub core: i64,
     pub tag: String,
+    /// The component terminal at each end, (`cel_id`, `cte_no`), when the source names it.
+    pub from: Option<(i64, i64)>,
+    pub to: Option<(i64, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -134,6 +148,12 @@ pub struct SweComponent {
     pub description: String,
     pub part_number: String,
     pub manufacturer: String,
+    /// The component this one belongs to (`com_com_id`): a terminal's strip.
+    pub parent: Option<i64>,
+    /// Place among its parent's children (`com_tagorderno`): a terminal's place on its strip.
+    pub order: i64,
+    /// Its own tag without the path (`com_tag`): a terminal's number.
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -147,7 +167,123 @@ pub struct SweProject {
     pub cables: BTreeMap<i64, SweCable>,
     pub components: BTreeMap<i64, SweComponent>,
     pub locations: Vec<SweLocation>,
+    /// The project's own fields (name, customer, ...), from the archive's project list. Not in
+    /// the project database itself, so a bare database import has none.
+    pub info: Option<SweProjectInfo>,
     pub warnings: Vec<String>,
+}
+
+/// A project's own fields, from `tew_project` in the archive's `Database/tew_app_project.sqlite`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SweProjectInfo {
+    pub name: String,
+    /// The project description (translated text, English first).
+    pub description: String,
+    pub customer: String,
+    /// The customer's address lines that are filled.
+    pub customer_address: Vec<String>,
+    pub drawing_office: String,
+    pub drawing_office_address: Vec<String>,
+    pub contract_number: String,
+    pub created_by: String,
+    pub modified_by: String,
+    /// `YYYY-MM-DD`, from the source's `YYYYMMDD hh:mm:ss`.
+    pub created: String,
+    pub modified: String,
+    /// What could not be read, with the reason (the other fields still came across).
+    pub warnings: Vec<String>,
+}
+
+impl SweProjectInfo {
+    /// The WiringCraft title-block fields these fill. Empty values are left out.
+    pub fn title_block(&self) -> BTreeMap<String, String> {
+        let fields = [
+            ("description", self.description.clone()),
+            ("customer", self.customer.clone()),
+            ("customer_address", self.customer_address.join(", ")),
+            ("drawing_office", self.drawing_office.clone()),
+            ("drawing_office_address", self.drawing_office_address.join(", ")),
+            ("project_number", self.contract_number.clone()),
+            ("drawn_by", self.created_by.clone()),
+            ("modified_by", self.modified_by.clone()),
+            ("date", self.created.clone()),
+            ("modified", self.modified.clone()),
+        ];
+        fields
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
+            .filter(|(_, v)| !v.is_empty())
+            .collect()
+    }
+}
+
+/// `YYYYMMDD hh:mm:ss` as `YYYY-MM-DD`; anything else is kept as written.
+fn source_date(s: &str) -> String {
+    let d = s.trim();
+    let day: String = d.chars().take(8).collect();
+    if !day.chars().all(|c| c.is_ascii_digit()) {
+        return d.to_owned();
+    }
+    match (day.get(..4), day.get(4..6), day.get(6..8)) {
+        (Some(y), Some(m), Some(dd)) => format!("{y}-{m}-{dd}"),
+        _ => d.to_owned(),
+    }
+}
+
+/// The fields of the project in archive folder `Projects/<directory>`, read from the archive's
+/// project list database. `Ok(None)` when the list has no row for it.
+pub fn project_info(conn: &Connection, directory: &str) -> Result<Option<SweProjectInfo>> {
+    let mut st = conn
+        .prepare(
+            "SELECT pro_id, COALESCE(CAST(pro_name AS TEXT), ''), COALESCE(CAST(pro_customername AS TEXT), ''), COALESCE(CAST(pro_custaddress1 AS TEXT), ''), \
+             COALESCE(CAST(pro_custaddress2 AS TEXT), ''), COALESCE(CAST(pro_custaddress3 AS TEXT), ''), COALESCE(CAST(pro_drawingofficename AS TEXT), ''), \
+             COALESCE(CAST(pro_doaddress1 AS TEXT), ''), COALESCE(CAST(pro_doaddress2 AS TEXT), ''), COALESCE(CAST(pro_doaddress3 AS TEXT), ''), \
+             COALESCE(CAST(pro_contractnb AS TEXT), ''), COALESCE(CAST(pro_createdby AS TEXT), ''), COALESCE(CAST(pro_modifiedby AS TEXT), ''), \
+             COALESCE(CAST(pro_creationdate AS TEXT), ''), COALESCE(CAST(pro_modificationdate AS TEXT), '') \
+             FROM tew_project WHERE TRIM(pro_directory) = ?1",
+        )
+        .map_err(sql)?;
+    // Address lines that are filled, trimmed.
+    let lines = |a: [String; 3]| -> Vec<String> {
+        a.into_iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let row = st
+        .query_row([directory.trim()], |r| {
+            let text = |i: usize| r.get::<_, String>(i).map(|s| s.trim().to_owned());
+            Ok((
+                r.get::<_, i64>(0)?,
+                SweProjectInfo {
+                    name: text(1)?,
+                    description: String::new(),
+                    customer: text(2)?,
+                    customer_address: lines([text(3)?, text(4)?, text(5)?]),
+                    drawing_office: text(6)?,
+                    drawing_office_address: lines([text(7)?, text(8)?, text(9)?]),
+                    contract_number: text(10)?,
+                    created_by: text(11)?,
+                    modified_by: text(12)?,
+                    created: source_date(&text(13)?),
+                    modified: source_date(&text(14)?),
+                    warnings: Vec::new(),
+                },
+            ))
+        })
+        .optional()
+        .map_err(sql)?;
+    let Some((id, mut info)) = row else {
+        return Ok(None);
+    };
+    // The description is a nice-to-have: without it the other fields still come across, and
+    // why it is missing is kept.
+    // Text rows that cannot be read are reported too (`texts` counts them with the reason).
+    match texts(conn, &mut info.warnings) {
+        Ok(mut t) => info.description = t.remove(&id).unwrap_or_default().trim().to_owned(),
+        Err(e) => info.warnings.push(format!("the project description was not read: {e}")),
+    }
+    Ok(Some(info))
 }
 
 /// A location (`tew_location`): a cabinet, room or panel.
@@ -215,6 +351,10 @@ pub struct ArchiveDatabase {
     /// How many projects the archive holds.
     pub count: usize,
     pub bytes: Vec<u8>,
+    /// The project's own fields from the archive's project list, when it has them.
+    pub info: Option<SweProjectInfo>,
+    /// Why the project's own fields could not be read, when they could not.
+    pub info_warning: Option<String>,
 }
 
 /// Take project number `pick` (counted from 1, in project folder order) out of an archive. Only
@@ -248,7 +388,43 @@ pub fn database_from_archive<R: Read + std::io::Seek>(reader: R, pick: usize) ->
         )));
     }
     let folder = name.rsplitn(3, '/').nth(2).unwrap_or_default().to_owned();
-    Ok(ArchiveDatabase { folder, count, bytes })
+    // The project's own fields live in the archive's project list, keyed by folder number.
+    let directory = folder.rsplit('/').next().unwrap_or_default().to_owned();
+    let (info, info_warning) = match read_project_list(&mut zip, &directory) {
+        Ok(info) => (info, None),
+        Err(e) => (
+            None,
+            Some(format!("the project's name, customer and dates were not read: {e}")),
+        ),
+    };
+    Ok(ArchiveDatabase {
+        folder,
+        count,
+        bytes,
+        info,
+        info_warning,
+    })
+}
+
+/// The archive's project list (`Database/tew_app_project.sqlite`), row for `directory`.
+fn read_project_list<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    directory: &str,
+) -> Result<Option<SweProjectInfo>> {
+    const LIST: &str = "Database/tew_app_project.sqlite";
+    let f = match zip.by_name(LIST) {
+        Ok(f) => f,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(Error::Format(format!("{LIST}: {e}"))),
+    };
+    let mut bytes = Vec::new();
+    f.take(MAX_DATABASE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::Format(format!("{LIST}: {e}")))?;
+    if bytes.len() as u64 > MAX_DATABASE_BYTES {
+        return Err(Error::Format(format!("{LIST} is too large")));
+    }
+    project_info(&open(&bytes)?, directory)
 }
 
 /// The project database paths in an archive, in project folder order.
@@ -295,10 +471,11 @@ fn texts(conn: &Connection, warnings: &mut Vec<String>) -> Result<BTreeMap<i64, 
     let rows = st
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
         .map_err(sql)?;
-    // English sorts last, so it wins.
+    // English sorts last, so it wins. A blank translation (only tabs or line breaks, which SQL
+    // TRIM keeps) never replaces a real one.
     for (id, text) in readable(rows, "text", warnings) {
-        if let Some(t) = text {
-            out.insert(id, t);
+        if let Some(t) = text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            out.insert(id, t.to_owned());
         }
     }
     Ok(out)
@@ -370,25 +547,26 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     // Components with their tag, description and first part.
     let mut st = conn
         .prepare(
-            "SELECT com_id, COALESCE(NULLIF(com_tagpath, ''), com_tag, ''), COALESCE(com_type, -1) FROM tew_component",
+            "SELECT com_id, COALESCE(NULLIF(com_tagpath, ''), com_tag, ''), COALESCE(com_type, -1), com_com_id, \
+             COALESCE(com_tagorderno, 0), COALESCE(CAST(com_tag AS TEXT), '') FROM tew_component",
         )
         .map_err(sql)?;
     let rows = st
         .query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            Ok(SweComponent {
+                id: r.get(0)?,
+                tag: r.get(1)?,
+                kind: r.get(2)?,
+                parent: r.get::<_, Option<i64>>(3)?.filter(|c| *c > 0),
+                order: r.get(4)?,
+                name: r.get(5)?,
+                ..Default::default()
+            })
         })
         .map_err(sql)?;
-    for (id, tag, kind) in readable(rows, "component", &mut warnings) {
-        p.components.insert(
-            id,
-            SweComponent {
-                id,
-                tag,
-                kind,
-                description: text.get(&id).cloned().unwrap_or_default(),
-                ..Default::default()
-            },
-        );
+    for mut c in readable(rows, "component", &mut warnings) {
+        c.description = text.get(&c.id).cloned().unwrap_or_default();
+        p.components.insert(c.id, c);
     }
     let mut st = conn
         .prepare(
@@ -450,8 +628,13 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         }
     }
     let mut st = conn
-        .prepare("SELECT wir_id, wir_cab_id, COALESCE(wir_caw_no, -1), COALESCE(wir_tag, '') FROM tew_wire")
+        .prepare(
+            "SELECT wir_id, wir_cab_id, COALESCE(wir_caw_no, -1), COALESCE(wir_tag, ''), \
+             wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto FROM tew_wire",
+        )
         .map_err(sql)?;
+    // An end is named by its element and terminal number; an element of 0 or less is none.
+    let end = |el: Option<i64>, no: Option<i64>| el.filter(|e| *e > 0).zip(no);
     let rows = st
         .query_map([], |r| {
             Ok(SweWire {
@@ -459,6 +642,8 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
                 cable: r.get::<_, Option<i64>>(1)?.filter(|c| *c > 0),
                 core: r.get(2)?,
                 tag: r.get(3)?,
+                from: end(r.get(4)?, r.get(5)?),
+                to: end(r.get(6)?, r.get(7)?),
             })
         })
         .map_err(sql)?;
@@ -485,13 +670,15 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         /// The element's order in its component, when the component is drawn as several
         /// symbols (terminal strips, connectors drawn pin by pin).
         element: Option<i64>,
+        /// (`cel_id`, `cte_no`) of the component terminal, when there is one.
+        stands_for: Option<(i64, i64)>,
     }
     let mut pins: BTreeMap<i64, Vec<RawPin>> = BTreeMap::new();
     let mut st = conn
         .prepare(
             "SELECT p.spt_sym_id, COALESCE(p.spt_sct_no, 0), COALESCE(p.spt_no, 0), p.spt_dx, p.spt_dy, t.cte_txt, \
              CASE WHEN (SELECT COUNT(*) FROM tew_componentelement x WHERE x.cel_com_id = e.cel_com_id AND x.cel_sym_id > 0) > 1 \
-             THEN e.cel_orderno END \
+             THEN e.cel_orderno END, e.cel_id, t.cte_no \
              FROM tew_symbolpt p \
              LEFT JOIN tew_componentelement e ON e.cel_sym_id = p.spt_sym_id AND e.cel_sct_no = p.spt_sct_no \
              LEFT JOIN tew_componentterminal t ON t.cte_cel_id = e.cel_id AND t.cte_no = p.spt_no \
@@ -508,6 +695,7 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
                     offset: Point::new(r.get(3)?, r.get(4)?),
                     terminal: r.get(5)?,
                     element: r.get(6)?,
+                    stands_for: r.get::<_, Option<i64>>(7)?.zip(r.get::<_, Option<i64>>(8)?),
                 },
             ))
         })
@@ -576,7 +764,11 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
                     None if raw.circuit > 0 => format!("{}.{n}", raw.circuit),
                     None => n.to_string(),
                 });
-            out_pins.push(SwePin { name, at: placed });
+            out_pins.push(SwePin {
+                name,
+                at: placed,
+                terminal: raw.stands_for,
+            });
         }
         // `sym_posend*` is a box size (width, minus height) in the symbol's frame; 0, 0 is none.
         let corner = match (ex, ey) {
@@ -674,6 +866,18 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
     }
     p.warnings = warnings;
     Ok(p)
+}
+
+/// A terminal number as one product level: letters, digits and `_` kept, everything else
+/// (`.`, `+`, `-`, `=`, spaces) becomes `_`, so `1.2` is `1_2` and `1+2` is `1_2`. `None` when
+/// nothing is left.
+fn terminal_level(name: &str) -> Option<String> {
+    let level: String = name
+        .trim()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    (!level.is_empty()).then_some(level)
 }
 
 /// A tag WiringCraft accepts, from a SolidWorks tag path (`=F1+L1+L3-K3`, or a bare `K3`):
@@ -959,6 +1163,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         pages: Vec::new(),
         devices: BTreeMap::new(),
         locations: Vec::new(),
+        title_block: p.info.as_ref().map(SweProjectInfo::title_block).unwrap_or_default(),
     };
     // Locations, with their descriptions. One without a usable tag path cannot be named.
     let mut locations_untagged = 0;
@@ -1007,11 +1212,19 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut untagged = 0;
     let mut renamed = 0;
     let mut arrows = 0;
-    for c in p.components.values() {
-        let tag = if c.kind == COMPONENT_ARROW {
-            arrows += 1;
-            DeviceTag::parse(&format!("-OD{arrows}")).ok()
-        } else {
+    let strip_of = |c: &SweComponent| {
+        c.parent
+            .filter(|_| c.kind == COMPONENT_TERMINAL)
+            .and_then(|s| p.components.get(&s))
+            .filter(|s| s.kind == COMPONENT_TERMINAL_STRIP)
+    };
+    // Terminals come after everything else, so their strip's final tag is known.
+    let (terminals, others_first): (Vec<&SweComponent>, Vec<&SweComponent>) =
+        p.components.values().partition(|c| strip_of(c).is_some());
+    let mut loose_terminals = 0usize;
+    let mut strip_terminals = 0usize;
+    for c in others_first.into_iter().chain(terminals) {
+        let own = || {
             device_tag(&c.tag).map(|mut t| {
                 if shared_function.is_some() {
                     t.function.clear();
@@ -1019,12 +1232,74 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 t
             })
         };
+        let tag = if c.kind == COMPONENT_ARROW {
+            arrows += 1;
+            DeviceTag::parse(&format!("-OD{arrows}")).ok()
+        } else if let Some(strip) = strip_of(c) {
+            // `-X1` and terminal 3 make `-X1.3`, whatever separator the source's tag path uses.
+            // One level, whatever the number contains: `1.2` must not become a strip `-X1.1`.
+            // Cleaned as text, not parsed as a tag: `1+2` would otherwise lose `+2` as a location.
+            let number = terminal_level(&c.name);
+            match (tags.get(&strip.id), number) {
+                (Some(strip_tag), Some(number)) => {
+                    let mut t = strip_tag.clone();
+                    t.product.push(number);
+                    strip_terminals += 1;
+                    Some(t)
+                }
+                _ => {
+                    loose_terminals += 1;
+                    own()
+                }
+            }
+        } else {
+            if c.kind == COMPONENT_TERMINAL {
+                loose_terminals += 1;
+            }
+            own()
+        };
         match tag {
             Some(t) => {
                 tags.insert(c.id, unique(t, &mut taken, &mut renamed));
             }
             None => untagged += 1,
         }
+    }
+    // Terminal order: WiringCraft lists a strip's terminals by number. A strip whose source order
+    // is not the number order is counted.
+    let mut on_strip: BTreeMap<i64, Vec<&SweComponent>> = BTreeMap::new();
+    for c in p.components.values() {
+        if let Some(s) = strip_of(c) {
+            on_strip.entry(s.id).or_default().push(c);
+        }
+    }
+    // The terminal plan sorts by the tag's last level with the same natural sort.
+    let number_of = |c: &SweComponent| {
+        tags.get(&c.id)
+            .and_then(|t| t.product.last().cloned())
+            .unwrap_or_default()
+    };
+    let out_of_order: Vec<String> = on_strip
+        .iter()
+        .filter(|(_, list)| {
+            // In source order the numbers must rise strictly. Two numbers that sort alike (`1`
+            // and `01`) leave the plan's order to the drawing, so that strip is counted too.
+            let mut by_order: Vec<&SweComponent> = list.to_vec();
+            by_order.sort_by_key(|c| (c.order, c.id));
+            let keys: Vec<_> = by_order
+                .iter()
+                .map(|c| wc_core::project::natural_key(&number_of(c)))
+                .collect();
+            keys.windows(2).any(|w| matches!(w, [a, b] if a >= b))
+        })
+        .filter_map(|(strip, _)| tags.get(strip).map(ToString::to_string))
+        .collect();
+    let strips_out_of_order = out_of_order.len();
+    if !out_of_order.is_empty() {
+        warnings.push(format!(
+            "terminal strip(s) {} have their terminals in another order in the source than by number; WiringCraft lists them by number",
+            out_of_order.join(", ")
+        ));
     }
     let mut cable_tags: BTreeMap<i64, DeviceTag> = BTreeMap::new();
     let mut cables_untagged = 0;
@@ -1079,6 +1354,8 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
     let mut multi_number_lines = 0usize;
     let mut numbers_not_shown = 0usize;
     let mut wires_on_zero_length: BTreeSet<i64> = BTreeSet::new();
+    // Component terminal (`cel_id`, `cte_no`) -> the pin drawn for it, and a label for messages.
+    let mut drawn_at: BTreeMap<(i64, i64), (PinRef, String)> = BTreeMap::new();
 
     for (i, pg) in drawn.iter().enumerate() {
         let syms: Vec<&SweSymbol> = syms_of.remove(&pg.id).unwrap_or_default();
@@ -1142,10 +1419,10 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             if s.component.is_some() && component.is_none() {
                 unknown_component += 1;
             }
-            let role = if component.is_some_and(|c| c.kind == COMPONENT_ARROW) {
-                SymbolRole::Interruption
-            } else {
-                SymbolRole::Standalone
+            let role = match component.map(|c| c.kind) {
+                Some(COMPONENT_ARROW) => SymbolRole::Interruption,
+                Some(COMPONENT_TERMINAL) => SymbolRole::Terminal,
+                _ => SymbolRole::Standalone,
             };
             let key = format!("{}|{:?}|{:?}|{:?}", s.block, role, graphics, out_pins);
             let sym_id = match symbol_ids.get(&key) {
@@ -1177,6 +1454,25 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 }
             };
             let item = format!("s{}", s.id);
+            if !page.overview {
+                let label = s.component.and_then(|c| tags.get(&c)).map(ToString::to_string);
+                // `box_symbol` gives one pin per point, in order; a repeated name became `A#2`,
+                // so the pin is taken by position, not by name.
+                for (q, o) in s.pins.iter().zip(&out_pins) {
+                    let Some(t) = q.terminal else { continue };
+                    drawn_at.entry(t).or_insert_with(|| {
+                        (
+                            (page.id.clone(), item.clone(), o.name.clone()),
+                            format!(
+                                "{}:{} (page {})",
+                                label.clone().unwrap_or_else(|| "?".to_owned()),
+                                o.name,
+                                page.number
+                            ),
+                        )
+                    });
+                }
+            }
             for pin in &out_pins {
                 pin_at.push((
                     Point::new(origin.x + pin.at.x, origin.y + pin.at.y),
@@ -1379,6 +1675,69 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
         built.pages.push(page);
     }
 
+    // Each wire record names its two terminals; they must be connected on the drawing too.
+    let interruptions: BTreeSet<&str> = built
+        .symbols
+        .iter()
+        .filter(|s| s.role == SymbolRole::Interruption)
+        .map(|s| s.id.as_str())
+        .collect();
+    let mut probe = wc_core::Project::new("");
+    // Schematic pages only: a line diagram's potential names could join nets no schematic joins.
+    probe.pages = built.pages.iter().filter(|pg| !pg.overview).cloned().collect();
+    let mut net_of: BTreeMap<PinRef, usize> = BTreeMap::new();
+    for (n, net) in nets_linked(&probe, |id| interruptions.contains(id))
+        .into_iter()
+        .enumerate()
+    {
+        for pin in net.pins {
+            net_of.insert(pin, n);
+        }
+    }
+    let mut wire_ends = 0usize;
+    let mut one_end_named = 0usize;
+    let mut ends_agree = 0usize;
+    let mut ends_not_drawn = 0usize;
+    let mut ends_apart: Vec<String> = Vec::new();
+    for w in p.wires.values() {
+        let (Some(a), Some(b)) = (w.from, w.to) else {
+            if w.from.is_some() || w.to.is_some() {
+                one_end_named += 1;
+            }
+            continue;
+        };
+        wire_ends += 1;
+        let (Some((pa, la)), Some((pb, lb))) = (drawn_at.get(&a), drawn_at.get(&b)) else {
+            ends_not_drawn += 1;
+            continue;
+        };
+        match (net_of.get(pa), net_of.get(pb)) {
+            (Some(x), Some(y)) if x == y => ends_agree += 1,
+            _ => {
+                let name = if w.tag.trim().is_empty() {
+                    format!("wire {}", w.id)
+                } else {
+                    format!("wire {}", w.tag.trim())
+                };
+                ends_apart.push(format!("{name}: {la} and {lb}"));
+            }
+        }
+    }
+    if !ends_apart.is_empty() {
+        let shown: Vec<&str> = ends_apart.iter().take(5).map(String::as_str).collect();
+        let more = ends_apart.len().saturating_sub(shown.len());
+        warnings.push(format!(
+            "{} wire(s) join two terminals that are not connected on the imported drawing: {}{}",
+            ends_apart.len(),
+            shown.join("; "),
+            if more > 0 {
+                format!("; and {more} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+
     // Devices: every tagged component that is not an arrow, and every cable.
     let mut devices_out = 0usize;
     for c in p.components.values() {
@@ -1469,7 +1828,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                 (covers, "cover page(s)"),
                 (
                     others.saturating_sub(covers),
-                    "report, layout or other non-schematic page(s)",
+                    "report, layout or other non-schematic page(s) (WiringCraft makes its own reports)",
                 ),
             ]),
         },
@@ -1545,6 +1904,45 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             ]),
         },
         Count {
+            what: "terminal strips",
+            source: p
+                .components
+                .values()
+                .filter(|c| c.kind == COMPONENT_TERMINAL_STRIP)
+                .count(),
+            imported: p
+                .components
+                .values()
+                .filter(|c| c.kind == COMPONENT_TERMINAL_STRIP && tags.contains_key(&c.id))
+                .count(),
+            note: note(vec![(
+                strips_out_of_order,
+                "whose source order differs from the terminal numbers (listed by number)",
+            )]),
+        },
+        Count {
+            what: "terminals",
+            source: p.components.values().filter(|c| c.kind == COMPONENT_TERMINAL).count(),
+            imported: strip_terminals,
+            note: note(vec![(
+                loose_terminals,
+                "not on a strip or without a number (tagged from their own tag path, when it has one)",
+            )]),
+        },
+        Count {
+            what: "wire ends (from/to terminals)",
+            source: wire_ends,
+            imported: ends_agree,
+            note: note(vec![
+                (
+                    ends_apart.len(),
+                    "join terminals that are not connected on the drawing (see the warnings)",
+                ),
+                (ends_not_drawn, "with a terminal that is not drawn on a schematic page"),
+                (one_end_named, "more name only one terminal (not checked)"),
+            ]),
+        },
+        Count {
             what: "locations",
             source: p.locations.len(),
             imported: built.locations.len(),
@@ -1554,6 +1952,30 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             ]),
         },
     ];
+    // The project's own fields: which ones print, and which are only kept in the project.
+    let mut report = report;
+    if let Some(info) = &p.info {
+        let fields = info.title_block();
+        let printed = ["customer", "project_number", "drawn_by", "date"];
+        let kept: Vec<&str> = fields
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !printed.contains(k))
+            .collect();
+        report.push(Count {
+            what: "project fields",
+            source: fields.len(),
+            imported: fields.len(),
+            note: if kept.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{} kept in Project Properties but not printed on any page yet (the title block prints customer, project number, drawn by and date)",
+                    kept.join(", ")
+                )
+            },
+        });
+    }
     (built, warnings, report)
 }
 
