@@ -391,6 +391,28 @@ mod tests {
     }
 
     #[test]
+    fn the_first_close_reason_is_kept() {
+        // The writer's failure comes first; the reader's end of stream after it must not hide it.
+        let slot = CloseSlot::default();
+        let (tx, _keep) = std::sync::mpsc::channel::<String>();
+        let (_, rx) = std::sync::mpsc::channel::<String>();
+        let link: Link<String, String> = Link::from_channels(tx, rx, slot.clone());
+        slot.set(CloseReason::WriteFailed("broken pipe".into()));
+        slot.set(CloseReason::Ended);
+        let reason = link.close_reason();
+        assert_eq!(reason, Some(CloseReason::WriteFailed("broken pipe".into())));
+        assert!(!reason.is_some_and(|r| r.is_orderly()));
+
+        let slot = CloseSlot::default();
+        let (tx, _keep) = std::sync::mpsc::channel::<String>();
+        let (_, rx) = std::sync::mpsc::channel::<String>();
+        let link: Link<String, String> = Link::from_channels(tx, rx, slot.clone());
+        slot.set(CloseReason::WriteTimedOut);
+        slot.set(CloseReason::ReadFailed("reset".into()));
+        assert_eq!(link.close_reason(), Some(CloseReason::WriteTimedOut));
+    }
+
+    #[test]
     fn a_reason_names_the_cause_in_words() {
         let text = CloseReason::LineTooLong { max: 8 }.to_string();
         assert!(text.contains("longer than 8 bytes"), "{text}");
