@@ -127,9 +127,15 @@ impl ProjectMeta {
     /// typed is found too. When nothing goes, the reason: not a location, or not in the list.
     pub fn remove_location(&mut self, path: &str) -> Result<(), String> {
         let parsed = location_path(path);
-        let key = parsed.clone().unwrap_or_else(|_| path.trim().to_owned());
+        let raw = path.trim();
         let before = self.locations.len();
-        self.locations.retain(|l| l.path != key);
+        // The normal form first, then the path as typed (an entry stored as `+L1`).
+        if let Ok(key) = &parsed {
+            self.locations.retain(|l| l.path != *key);
+        }
+        if self.locations.len() == before {
+            self.locations.retain(|l| l.path != raw);
+        }
         if self.locations.len() != before {
             return Ok(());
         }
@@ -684,6 +690,13 @@ mod tests {
         assert!(m.set_location("", "x").is_err());
         assert_eq!(m.remove_location("+L1"), Ok(()));
         assert_eq!(m.remove_location("L1"), Err("no location +L1".into()));
+        // An entry stored with its sign, as an older or hand-edited file may have it.
+        m.locations.push(Location {
+            path: "+L5".into(),
+            description: String::new(),
+        });
+        assert_eq!(m.remove_location("+L5"), Ok(()));
+        assert!(!m.locations.iter().any(|l| l.path == "+L5"));
         let why = m.remove_location("+L1-K1");
         assert!(why.as_ref().is_err_and(|e| e.contains("not a location")), "{why:?}");
         assert_eq!(m.locations.len(), 1);
