@@ -862,6 +862,49 @@ impl Project {
             .collect()
     }
 
+    /// Rename device `from` to `to` everywhere it appears: its device entry, the symbols that
+    /// carry its tag, the cable cores of a cable, panel items and terminal-strip jumpers.
+    /// Returns how many symbols were retagged. It does not check that `to` is free: callers do.
+    pub fn rename_device(&mut self, from: &DeviceTag, to: &DeviceTag) -> usize {
+        if from == to {
+            return 0;
+        }
+        let mut n = 0;
+        if let Some(d) = self.devices.remove(from) {
+            self.devices.insert(to.clone(), d);
+        }
+        for p in &mut self.pages {
+            for s in &mut p.symbols {
+                if s.tag.as_ref() == Some(from) {
+                    s.tag = Some(to.clone());
+                    n += 1;
+                }
+            }
+            for w in &mut p.wires {
+                if let Some(c) = &mut w.cable
+                    && &c.cable == from
+                {
+                    c.cable = to.clone();
+                }
+            }
+        }
+        for panel in &mut self.panels {
+            for item in &mut panel.items {
+                if let crate::panel::PanelItem::Device { tag, .. } = item
+                    && tag == from
+                {
+                    *tag = to.clone();
+                }
+            }
+        }
+        for j in &mut self.meta.jumpers {
+            if &j.strip == from {
+                j.strip = to.clone();
+            }
+        }
+        n
+    }
+
     /// Where each tag appears: tag -> [(page id, placed symbol id)].
     pub fn tag_index(&self) -> BTreeMap<DeviceTag, Vec<(String, String)>> {
         let mut idx: BTreeMap<DeviceTag, Vec<(String, String)>> = BTreeMap::new();

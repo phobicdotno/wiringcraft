@@ -48,6 +48,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Copy),
             Some(Action::Paste),
             Some(Action::SelectAll),
+            Some(Action::Find),
             None,
             Some(Action::Rotate),
             Some(Action::Mirror),

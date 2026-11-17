@@ -10,6 +10,7 @@ mod canvas;
 mod chrome;
 mod edit;
 mod feedback;
+mod find_window;
 mod icons;
 mod panel_view;
 mod panels;
@@ -132,6 +133,8 @@ struct App {
     share: share::Share,
     /// The symbol editor window, while it is open.
     symbol_editor: Option<symbol_editor::SymbolEditor>,
+    /// The find and replace window, while it is open.
+    find: Option<find_window::FindState>,
 }
 
 struct StatusView<'a> {
@@ -296,6 +299,7 @@ impl App {
             logged: Default::default(),
             share: Default::default(),
             symbol_editor: None,
+            find: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -353,6 +357,12 @@ impl App {
         match a {
             Action::ShareSession => {
                 self.share.show_share();
+                return;
+            }
+            Action::Find => {
+                if self.open.is_some() {
+                    self.find.get_or_insert_with(Default::default);
+                }
                 return;
             }
             Action::JoinSession => {
@@ -1971,6 +1981,7 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
             (Key::R, Action::Reports),
             (Key::E, Action::Check),
             (Key::A, Action::SelectAll),
+            (Key::F, Action::Find),
             (Key::J, Action::Assistant),
         ] {
             if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
@@ -2245,6 +2256,7 @@ impl eframe::App for App {
         self.share
             .windows(ctx, self.open.as_mut(), self.assistant.command_running());
         self.symbol_editor_window(ctx);
+        self.find_window(ctx);
         self.sync_session(ctx);
 
         let title = match &self.open {
@@ -2288,6 +2300,51 @@ impl App {
                 _ => true,
             })
             .collect()
+    }
+
+    fn find_window(&mut self, ctx: &egui::Context) {
+        let (Some(find), Some(open)) = (self.find.as_mut(), self.open.as_ref()) else {
+            self.find = None;
+            return;
+        };
+        match find.show(ctx, &open.project) {
+            find_window::FindOutcome::None => {}
+            find_window::FindOutcome::Close => self.find = None,
+            find_window::FindOutcome::Go { page, select } => self.show_found(&page, select),
+            find_window::FindOutcome::Replace => self.replace_found(),
+        }
+    }
+
+    /// Show a find hit: open its page and select the item.
+    fn show_found(&mut self, page: &str, select: Option<Selection>) {
+        let Some(o) = self.open.as_ref() else { return };
+        let Some(i) = o.project.pages.iter().position(|p| p.id == page) else {
+            self.ed.message = "That page is gone.".into();
+            return;
+        };
+        self.ed.panel = None;
+        if self.ed.page != i {
+            // A wire started on the other page cannot end on this one.
+            self.ed.wire = None;
+        }
+        self.ed.page = i;
+        self.ed.tool = Tool::Select;
+        self.ed.view.fit = true;
+        self.ed.selection = select.into_iter().collect();
+    }
+
+    /// Replace in the ticked find hits, as one undo step.
+    fn replace_found(&mut self) {
+        let (Some(find), Some(open)) = (self.find.as_mut(), self.open.as_mut()) else {
+            return;
+        };
+        let hits = find.chosen_hits();
+        find.message = match open.replace_found(&hits, &find.query, &find.with, find.options()) {
+            Ok(n) => find_window::replaced_note(n, &hits),
+            Err(e) => e,
+        };
+        // The items replaced may no longer match; what is selected may be gone.
+        self.ed.selection.clear();
     }
 
     fn symbol_editor_window(&mut self, ctx: &egui::Context) {

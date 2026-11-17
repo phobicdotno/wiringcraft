@@ -1055,6 +1055,44 @@ impl Open {
         WireNumbering { done, skipped }
     }
 
+    /// Replace `query` with `with` in the chosen find `hits`, as one undo step
+    /// ([`wc_core::find::replace`]). Nothing changes when a renamed tag clashes or is not a
+    /// tag, or when the change reaches a page someone else in the session has open: the reason
+    /// comes back. Returns how many values changed.
+    pub fn replace_found(
+        &mut self,
+        hits: &[wc_core::find::Hit],
+        query: &str,
+        with: &str,
+        opts: wc_core::find::FindOptions,
+    ) -> Result<usize, String> {
+        self.follow_terminals();
+        let mut project = self.project.clone();
+        let n = wc_core::find::replace(&mut project, hits, query, with, opts)?;
+        let held: Vec<String> = project
+            .pages
+            .iter()
+            .zip(&self.project.pages)
+            .filter(|(new, old)| new != old)
+            .filter_map(|(new, _)| {
+                self.held_by_others
+                    .get(&new.id)
+                    .map(|who| format!("page {} ({who})", new.number))
+            })
+            .collect();
+        if !held.is_empty() {
+            return Err(format!(
+                "Nothing was replaced: it would change {}, which someone else has open.",
+                held.join(", ")
+            ));
+        }
+        if n > 0 {
+            self.checkpoint();
+            self.project = project;
+        }
+        Ok(n)
+    }
+
     pub fn duplicate_page(&mut self, page: usize) -> Option<usize> {
         let mut copy = self.project.pages.get(page)?.clone();
         self.checkpoint();
