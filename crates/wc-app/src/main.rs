@@ -17,6 +17,7 @@ mod state;
 mod theme;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, Pos2, RichText, Stroke, Vec2};
 
@@ -1711,38 +1712,43 @@ fn main() -> eframe::Result {
     }
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let wanted = std::env::var(RENDERER_VAR).ok();
-    let renderer = match wanted.as_deref() {
-        Some("wgpu") => eframe::Renderer::Wgpu,
-        _ => eframe::Renderer::Glow,
-    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([900.0, 560.0])
             .with_title("WiringCraft"),
-        renderer,
+        renderer: renderer_for(wanted.as_deref()),
         ..Default::default()
     };
-    let result = eframe::run_native("WiringCraft", options, Box::new(|cc| Ok(Box::new(App::new(cc, dir)))));
     // No usable OpenGL (a remote desktop session, a virtual machine, a missing graphics driver
     // often offer only OpenGL 1.1): start again on wgpu (Direct3D, Metal or Vulkan, with a
     // software fallback). A window system cannot be started twice in one process, so this is a
-    // new process. Set WIRINGCRAFT_RENDERER=wgpu to skip the first try.
+    // new process. Some OpenGL failures panic inside eframe instead of returning an error, so a
+    // panic before the app has started falls back the same way. Set WIRINGCRAFT_RENDERER=wgpu
+    // to skip the first try.
+    let fallback = falls_back(wanted.as_deref());
+    if fallback {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            if !STARTED.load(Ordering::SeqCst) {
+                restart_with_wgpu(&format!("{info}"));
+            }
+        }));
+    }
+    let result = eframe::run_native(
+        "WiringCraft",
+        options,
+        Box::new(|cc| {
+            STARTED.store(true, Ordering::SeqCst);
+            Ok(Box::new(App::new(cc, dir)))
+        }),
+    );
     if let Err(e) = &result
-        && wanted.is_none()
-        && opengl_failed(e)
+        && fallback
+        && !STARTED.load(Ordering::SeqCst)
     {
-        eprintln!("wiringcraft-app: OpenGL is not usable ({e}); starting again with wgpu");
-        let status = std::env::current_exe().and_then(|exe| {
-            std::process::Command::new(exe)
-                .args(std::env::args_os().skip(1))
-                .env(RENDERER_VAR, "wgpu")
-                .status()
-        });
-        match status {
-            Ok(s) => std::process::exit(s.code().unwrap_or(1)),
-            Err(err) => eprintln!("wiringcraft-app: could not start again with wgpu: {err}"),
-        }
+        restart_with_wgpu(&e.to_string());
     }
     result
 }
@@ -1750,12 +1756,56 @@ fn main() -> eframe::Result {
 /// Environment variable that picks the graphics backend: `glow` (OpenGL, the default) or `wgpu`.
 const RENDERER_VAR: &str = "WIRINGCRAFT_RENDERER";
 
-/// Whether starting the app failed because OpenGL is missing or too old.
-fn opengl_failed(e: &eframe::Error) -> bool {
-    matches!(
-        e,
-        eframe::Error::OpenGL(_) | eframe::Error::Glutin(_) | eframe::Error::NoGlutinConfigs(..)
-    )
+/// Set once the window and its renderer are up; a failure after that is not a renderer problem.
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// The backend to start with: `wgpu` when asked for, OpenGL otherwise.
+fn renderer_for(wanted: Option<&str>) -> eframe::Renderer {
+    match wanted {
+        Some("wgpu") => eframe::Renderer::Wgpu,
+        _ => eframe::Renderer::Glow,
+    }
+}
+
+/// Whether a failure before the app starts should try again on wgpu: only for the default
+/// choice, so a backend picked by hand, and the second try itself, never loop.
+fn falls_back(wanted: Option<&str>) -> bool {
+    wanted.is_none()
+}
+
+/// Run this program again on wgpu with the same arguments and leave with its exit code.
+fn restart_with_wgpu(why: &str) {
+    eprintln!("wiringcraft-app: OpenGL could not start ({why}); starting again with wgpu");
+    let status = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .env(RENDERER_VAR, "wgpu")
+            .status()
+    });
+    match status {
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(err) => eprintln!("wiringcraft-app: could not start again with wgpu: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod renderer_tests {
+    use super::*;
+
+    #[test]
+    fn opengl_is_the_default_and_wgpu_can_be_picked() {
+        assert_eq!(renderer_for(None), eframe::Renderer::Glow);
+        assert_eq!(renderer_for(Some("glow")), eframe::Renderer::Glow);
+        assert_eq!(renderer_for(Some("wgpu")), eframe::Renderer::Wgpu);
+        assert_eq!(renderer_for(Some("other")), eframe::Renderer::Glow);
+    }
+
+    #[test]
+    fn only_the_default_choice_falls_back_so_the_second_try_never_loops() {
+        assert!(falls_back(None));
+        assert!(!falls_back(Some("wgpu")), "the second try runs with wgpu set");
+        assert!(!falls_back(Some("glow")), "OpenGL picked by hand is not overruled");
+    }
 }
 
 #[cfg(test)]
