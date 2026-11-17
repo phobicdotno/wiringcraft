@@ -1343,6 +1343,19 @@ impl Open {
         Ok(self.index_of(&id))
     }
 
+    /// Mark the page at `page` as the project's cover page (`on`), or as a normal page again,
+    /// as one undo step. Any other cover page loses the mark: a project has one.
+    pub fn set_page_cover(&mut self, page: usize, on: bool) -> Result<(), String> {
+        let current = self.project.pages.get(page).ok_or("No such page.")?;
+        let others = self.project.pages.iter().enumerate().any(|(i, p)| i != page && p.cover);
+        if current.cover == on && !(on && others) {
+            return Ok(());
+        }
+        self.checkpoint();
+        self.project.set_cover(page, on);
+        Ok(())
+    }
+
     /// A properties form opens: its live edits will make a fresh undo step. Returns the undo
     /// mark to pass to [`Open::revert_live`].
     pub fn start_live_form(&mut self) -> usize {
