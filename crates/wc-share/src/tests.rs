@@ -1536,3 +1536,36 @@ fn a_change_list_entry_is_kept_in_step_with_the_parts() {
     assert_eq!(back, before);
     assert!(Parts::delta(&before, &before).0.is_empty());
 }
+
+#[test]
+fn only_the_answer_to_a_take_back_ends_the_wait_for_it() {
+    let mut g = Guest::new();
+    let _ = g.undo();
+    // A refusal of an edit sent before the undo arrives first: still waiting.
+    g.handle(HostMsg::Refused {
+        refusal: Refusal::Invalid {
+            reason: "earlier edit".into(),
+        },
+        take_back: false,
+    });
+    assert!(g.taking_back());
+    g.handle(HostMsg::Refused {
+        refusal: Refusal::Invalid {
+            reason: "nothing to undo".into(),
+        },
+        take_back: true,
+    });
+    assert!(!g.taking_back());
+    // Without the flag the message reads as before, as an older host writes it.
+    let line = serde_json::to_string(&HostMsg::Refused {
+        refusal: Refusal::NotApproved,
+        take_back: false,
+    })
+    .unwrap_or_default();
+    assert!(!line.contains("take_back"), "{line}");
+    let back: Option<HostMsg> = serde_json::from_str(&line).ok();
+    assert!(
+        matches!(back, Some(HostMsg::Refused { take_back: false, .. })),
+        "{line}"
+    );
+}

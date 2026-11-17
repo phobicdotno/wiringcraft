@@ -210,11 +210,12 @@ impl Guest {
                 self.locks = locks;
             }
             HostMsg::Peers { peers } => self.peers = peers,
-            HostMsg::Refused { refusal } => {
-                // The host answers in order and the app sends nothing while a take-back is on
-                // its way, so a refusal now is most likely its answer. One for an earlier
-                // message ends the wait early at worst, as before this was tracked.
-                self.taking_back = self.taking_back.saturating_sub(1);
+            HostMsg::Refused { refusal, take_back } => {
+                // Only the refusal of an undo, redo or revert answers one: a refusal of an
+                // earlier edit, arriving first, must not end the wait for the restoration.
+                if take_back {
+                    self.taking_back = self.taking_back.saturating_sub(1);
+                }
                 match &refusal {
                     Refusal::PageLocked { page, .. } if self.switching_to(page) => self.switching = None,
                     Refusal::UnknownPage { page } if self.switching_to(page) => self.switching = None,

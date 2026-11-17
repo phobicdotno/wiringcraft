@@ -258,6 +258,7 @@ impl Host {
         let Some(status) = self.peers.get(&from).map(|p| p.status.clone()) else {
             return Err(Refusal::NotApproved);
         };
+        let take_back = matches!(msg, GuestMsg::Undo | GuestMsg::Redo | GuestMsg::Revert { .. });
         let result = match (status, msg) {
             (Status::Connected, GuestMsg::Join { name, email }) => {
                 if let Some(p) = self.peers.get_mut(&from) {
@@ -304,6 +305,7 @@ impl Host {
                 from,
                 HostMsg::Refused {
                     refusal: refusal.clone(),
+                    take_back,
                 },
             ));
         }

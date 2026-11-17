@@ -202,8 +202,13 @@ pub enum HostMsg {
     Locks { locks: BTreeMap<String, PeerId> },
     /// Who is in the session now.
     Peers { peers: Vec<Peer> },
-    /// A request was not carried out.
-    Refused { refusal: Refusal },
+    /// A request was not carried out. `take_back` is true when it was an undo, redo or revert,
+    /// so the guest knows that request is answered and stops waiting for its result.
+    Refused {
+        refusal: Refusal,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        take_back: bool,
+    },
     /// The host ended the session.
     Closed,
 }
