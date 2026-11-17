@@ -72,6 +72,11 @@ pub struct Open {
     redo: Vec<Project>,
     /// Snapshots dropped from the front of `undo` because it was full, so marks stay valid.
     undo_dropped: usize,
+    /// Counts every change to the undo history (checkpoint, undo, redo, squash).
+    history: u64,
+    /// The `history` count right after a properties form made its own undo step, so later
+    /// typing in the form joins that step only while nothing else has touched the history.
+    form_step: Option<u64>,
     pub branch: String,
     /// Underlay pictures loaded as textures, by file; `None` when the file cannot be shown.
     pub underlays: BTreeMap<String, Option<egui::TextureHandle>>,
@@ -92,6 +97,8 @@ impl Open {
             undo: Vec::new(),
             redo: Vec::new(),
             undo_dropped: 0,
+            history: 0,
+            form_step: None,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
         };
@@ -215,6 +222,7 @@ impl Open {
         }
         self.redo.clear();
         self.dirty = true;
+        self.history += 1;
     }
 
     /// A mark in the undo history, for [`Open::squash_undo`].
@@ -230,6 +238,7 @@ impl Open {
         };
         if self.undo.len() > start + 1 {
             self.undo.truncate(start + 1);
+            self.history += 1;
         }
     }
 
@@ -246,6 +255,7 @@ impl Open {
             Some(prev) => {
                 self.redo.push(std::mem::replace(&mut self.project, prev));
                 self.dirty = true;
+                self.history += 1;
                 true
             }
             None => false,
@@ -257,6 +267,7 @@ impl Open {
             Some(next) => {
                 self.undo.push(std::mem::replace(&mut self.project, next));
                 self.dirty = true;
+                self.history += 1;
                 true
             }
             None => false,
@@ -685,13 +696,14 @@ impl Open {
         if !name_changes && self.project.meta.title_block == block {
             return;
         }
-        // Keep adding to the form's own undo step only while it is the last one; after any
-        // other change (a page added meanwhile) the form starts a new step.
-        if self.undo_mark() > since && self.last_step_changed_only_props() {
-            self.redo.clear();
+        // Keep adding to the form's own undo step only while nothing else has touched the
+        // history since; after any other change (a page added, another properties edit, an
+        // undo) the form starts a new step.
+        if self.undo_mark() > since && self.form_step == Some(self.history) {
             self.dirty = true;
         } else {
             self.checkpoint();
+            self.form_step = Some(self.history);
         }
         if name_changes {
             self.project.meta.name = name.to_owned();
@@ -956,6 +968,14 @@ pub(crate) mod tests {
         assert!(o.undo());
         assert_eq!(o.project.meta.title_block["customer"], "A");
         assert_eq!(o.project.pages[0].title, "Added meanwhile");
+
+        // A properties change made another way in between is its own step too.
+        let since = o.undo_mark();
+        o.set_project_props_live(since, "Test", &fields(&[("customer", "A")]));
+        o.set_project_props("Test", &fields(&[("customer", "X")])).unwrap();
+        o.set_project_props_live(since, "Test", &fields(&[("customer", "B")]));
+        assert!(o.undo());
+        assert_eq!(o.project.meta.title_block["customer"], "X");
     }
 
     #[test]

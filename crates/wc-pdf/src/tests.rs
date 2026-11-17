@@ -569,3 +569,11 @@ fn long_cover_table_labels_and_values_stay_in_their_columns() -> Result<(), Stri
     assert!(value_w <= 180.0 * 0.65 - 3.0 + 1e-6, "value {value_w} mm");
     Ok(())
 }
+
+#[test]
+fn helvetica_w_is_944_units_wide() {
+    let height = 10.0;
+    let expected = 944.0 / 1000.0 * (height / 0.72);
+    let measured = crate::writer::text_width_mm("W", height);
+    assert!((measured - expected).abs() < 1e-9, "W width {measured} mm");
+}
