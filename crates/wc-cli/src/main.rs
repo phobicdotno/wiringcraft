@@ -2764,6 +2764,34 @@ mod tests {
     }
 
     #[test]
+    fn imported_panels_are_sorted_and_a_taken_panel_id_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let panel = |id: &str| wc_core::panel::Panel::new(id, id, 600.0, 800.0);
+        let mut p = load(&dir).unwrap();
+        let built = wc_import::aml::Built {
+            panels: vec![panel("swe-layout-b"), panel("swe-layout-a")],
+            ..Default::default()
+        };
+        add_built(&dir, &mut p, built, "import:a.tewzip").unwrap();
+        save(&dir, &p).unwrap();
+        let ids = |p: &Project| p.panels.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&load(&dir).unwrap()), ["swe-layout-a", "swe-layout-b"]);
+
+        // A second import with a taken id is refused before anything changes.
+        let mut p = load(&dir).unwrap();
+        let before = p.clone();
+        let built = wc_import::aml::Built {
+            panels: vec![panel("swe-layout-c"), panel("swe-layout-a")],
+            ..Default::default()
+        };
+        let err = add_built(&dir, &mut p, built, "import:b.tewzip").unwrap_err();
+        assert!(err.contains("panel swe-layout-a exists"), "{err}");
+        assert_eq!(p, before);
+    }
+
+    #[test]
     fn edz_parts_land_in_the_library_and_macros_are_counted() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("contactor.edz");

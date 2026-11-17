@@ -23,9 +23,14 @@ use super::{SweProject, SweSymbol, round, slug};
 /// `tew_file.fil_filetype` of a 2D cabinet layout page.
 pub const KIND_CABINET: i64 = 9;
 
-const RAIL_WORDS: &[&str] = &["rail", "schiene"];
-const DUCT_WORDS: &[&str] = &["duct", "trunking", "kanal", "channel", "goulotte", "wireway"];
-const PLATE_WORDS: &[&str] = &["plate", "platte", "platine"];
+/// Words that name an item when a token of the name starts with them (`Rail`, `Rail35`, `rails`).
+const RAIL_WORDS: &[&str] = &["rail"];
+const DUCT_WORDS: &[&str] = &["duct", "trunking", "channel", "goulotte", "wireway"];
+const PLATE_WORDS: &[&str] = &["plate", "platine", "backplate"];
+/// German compounds end with the word: `Tragschiene`, `Kabelkanal`, `Montageplatte`.
+const RAIL_ENDINGS: &[&str] = &["schiene", "schienen"];
+const DUCT_ENDINGS: &[&str] = &["kanal", "kanaele", "kanäle"];
+const PLATE_ENDINGS: &[&str] = &["platte"];
 
 /// What the layout pages gave, for the import report.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -42,7 +47,10 @@ pub struct Layouts {
     pub no_size: usize,
     /// Rails that run up and down.
     pub upright: usize,
-    /// Items that are neither plate, rail, duct nor an imported device (texts, frames, graphics).
+    /// Plates whose box gives a panel its size (one per panel at most).
+    pub plates: usize,
+    /// Items that are neither plate, rail, duct nor an imported device (texts, frames, graphics),
+    /// and plates after the first on a page.
     pub other: usize,
     /// Layout pages with no item to place.
     pub empty_pages: usize,
@@ -57,17 +65,34 @@ enum Kind {
     Other,
 }
 
-fn has_word(text: &str, words: &[&str]) -> bool {
+/// Whether a token of `text` (split at anything but letters and digits) is one of `words`, or
+/// one of them followed by digits, `x` or `s` (`Rail35`, `Duct40x60`, `rails`), or ends with one
+/// of `endings`. A word inside another word does not count: `INDUCTOR` is no duct.
+fn has_word(text: &str, (words, endings): (&[&str], &[&str])) -> bool {
     let t = text.to_lowercase();
-    words.iter().any(|w| t.contains(w))
+    t.split(|c: char| !c.is_alphanumeric()).any(|token| {
+        words.iter().any(|w| {
+            token
+                .strip_prefix(w)
+                .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == 'x' || c == 's'))
+        }) || endings.iter().any(|e| token.ends_with(e))
+    })
 }
 
+const RAIL: (&[&str], &[&str]) = (RAIL_WORDS, RAIL_ENDINGS);
+const DUCT: (&[&str], &[&str]) = (DUCT_WORDS, DUCT_ENDINGS);
+const PLATE: (&[&str], &[&str]) = (PLATE_WORDS, PLATE_ENDINGS);
+
 fn kind_of(s: &SweSymbol, p: &SweProject, tag: Option<&DeviceTag>) -> Kind {
-    if has_word(&s.block, RAIL_WORDS) {
+    // The block name decides first: a plate, rail or duct may carry a tag of its own.
+    if has_word(&s.block, RAIL) {
         return Kind::Rail;
     }
-    if has_word(&s.block, DUCT_WORDS) {
+    if has_word(&s.block, DUCT) {
         return Kind::Duct;
+    }
+    if has_word(&s.block, PLATE) {
+        return Kind::Plate;
     }
     if tag.is_some() {
         return Kind::Device;
@@ -77,11 +102,11 @@ fn kind_of(s: &SweSymbol, p: &SweProject, tag: Option<&DeviceTag>) -> Kind {
         .and_then(|c| p.components.get(&c))
         .map(|c| format!("{} {} {}", c.name, c.description, c.part_number))
         .unwrap_or_default();
-    if has_word(&about, RAIL_WORDS) {
+    if has_word(&about, RAIL) {
         Kind::Rail
-    } else if has_word(&about, DUCT_WORDS) {
+    } else if has_word(&about, DUCT) {
         Kind::Duct
-    } else if has_word(&s.block, PLATE_WORDS) || has_word(&about, PLATE_WORDS) {
+    } else if has_word(&about, PLATE) {
         Kind::Plate
     } else {
         Kind::Other
@@ -115,7 +140,10 @@ pub fn layouts(p: &SweProject, tags: &BTreeMap<i64, DeviceTag>, devices: &BTreeM
                 .filter(|t| devices.contains_key(*t));
             let size = s.corner.map(|c| boxed(s.at, c));
             match (kind_of(s, p, tag), size) {
-                (Kind::Plate, Some(b)) if plate.is_none() => plate = Some(b),
+                (Kind::Plate, Some(b)) if plate.is_none() => {
+                    plate = Some(b);
+                    out.plates += 1;
+                }
                 (Kind::Rail, Some((min, max))) if max.x - min.x >= max.y - min.y => rails.push((min, max)),
                 (Kind::Rail, Some(_)) => out.upright += 1,
                 (Kind::Duct, Some(b)) => ducts.push(b),
@@ -135,7 +163,8 @@ pub fn layouts(p: &SweProject, tags: &BTreeMap<i64, DeviceTag>, devices: &BTreeM
                 _ => out.other += 1,
             }
         }
-        if rails.is_empty() && ducts.is_empty() && placed.is_empty() {
+        // A plate alone still makes a panel; a page of graphics only does not.
+        if plate.is_none() && rails.is_empty() && ducts.is_empty() && placed.is_empty() {
             out.empty_pages += 1;
             continue;
         }
