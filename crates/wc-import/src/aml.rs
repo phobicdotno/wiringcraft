@@ -331,6 +331,8 @@ pub struct Built {
     /// Title-block fields for the project (`ProjectMeta.title_block` keys), from importers
     /// that carry project data.
     pub title_block: BTreeMap<String, String>,
+    /// Cabinet panel layouts, from importers that have them.
+    pub panels: Vec<wc_core::panel::Panel>,
 }
 
 const PIN_STEP: f64 = 7.5;

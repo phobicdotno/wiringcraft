@@ -2334,6 +2334,16 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
             ));
         }
     }
+    if let Some(panel) = built
+        .panels
+        .iter()
+        .find(|n| p.panels.iter().any(|have| have.id == n.id))
+    {
+        return Err(format!(
+            "panel {} exists; remove it or import into a fresh project",
+            panel.id
+        ));
+    }
     // A device the project already has under the same tag may come again only unchanged.
     if let Some((tag, _)) = built
         .devices
@@ -2380,6 +2390,8 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
     for loc in built.locations {
         p.meta.merge_location(loc);
     }
+    p.panels.extend(built.panels);
+    p.panels.sort_by(|a, b| a.id.cmp(&b.id));
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
     p.meta.fill_title_block(built.title_block);
     Ok(())
