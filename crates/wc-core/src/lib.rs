@@ -15,6 +15,7 @@ pub mod panel;
 pub mod part;
 pub mod project;
 pub mod review;
+pub mod route;
 pub mod store;
 pub mod symbol;
 pub mod tag;

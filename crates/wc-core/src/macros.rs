@@ -144,6 +144,7 @@ mod tests {
                 number: None,
                 potential: None,
                 cable: None,
+                route: Default::default(),
             }],
             devices: [(tag, Device::default())].into_iter().collect(),
             anchor: Point::new(10.0, 10.0),
