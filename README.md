@@ -75,7 +75,9 @@ claude                                                 # then /login once
 ```
 
 Claude Code only gets WiringCraft's tools in this chat (no shell, file or web tools), and it
-reaches them through a local port only this computer can use, with a fresh token each run.
+reaches them through a local port only this computer can use, with a fresh token each run. It
+starts in WiringCraft's own settings folder, never in the project folder, so settings inside
+a project you were sent cannot run anything when the assistant starts.
 
 To use an Anthropic API key instead, choose **API key** under Settings in the panel, then paste
 the key there or set `ANTHROPIC_API_KEY` (setting the variable alone does not switch). A pasted

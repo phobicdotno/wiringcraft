@@ -175,7 +175,7 @@ fn serve(
             wake();
             rrx.recv_timeout(CALL_TIMEOUT).map_err(|_| {
                 gave_up.store(true, Ordering::SeqCst);
-                "WiringCraft did not answer in time.".to_owned()
+                "WiringCraft did not answer in time. If the call had started it may still finish: check the project with get_state before trying again.".to_owned()
             })?
         });
         if let Some(reply) = reply {

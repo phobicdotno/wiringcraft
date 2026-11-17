@@ -43,12 +43,29 @@ impl Default for Prefs {
     }
 }
 
-fn path() -> Option<PathBuf> {
+fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("wiringcraft").join("prefs.toml"))
+    Some(base.join("wiringcraft"))
+}
+
+fn path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("prefs.toml"))
+}
+
+/// WiringCraft's own folder for Claude Code to start in. Never the project folder: a project
+/// from someone else could carry settings (`.npmrc`, `.claude/`) that run code when the
+/// connector or Claude Code starts there. The assistant reaches the project only through
+/// WiringCraft's tools, so it needs no folder of its own.
+pub fn assistant_dir() -> Result<PathBuf, String> {
+    let dir = config_dir()
+        .map(|d| d.join("assistant"))
+        .ok_or_else(|| "No folder for WiringCraft's settings (HOME is not set).".to_owned())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not make {}: {e}", dir.display()))?;
+    let dir = dir.canonicalize().or_else(|_| std::path::absolute(&dir)).unwrap_or(dir);
+    Ok(dir)
 }
 
 impl Prefs {

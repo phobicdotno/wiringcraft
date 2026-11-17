@@ -72,18 +72,14 @@ impl App {
             let Some(bridge) = a.bridge.as_ref().map(|b| b.server_entry(&program)) else {
                 return false;
             };
-            let cwd = self
-                .open
-                .as_ref()
-                .map(|o| o.dir.clone())
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .or_else(|| std::env::var_os("USERPROFILE"))
-                        .map(Into::into)
-                })
-                .unwrap_or_else(|| ".".into());
-            // Claude Code needs an absolute folder, and it is also the folder it starts in.
-            let cwd = cwd.canonicalize().or_else(|_| std::path::absolute(&cwd)).unwrap_or(cwd);
+            // A folder of WiringCraft's own, never the (possibly untrusted) project folder.
+            let cwd = match crate::prefs::assistant_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    a.login_log.push(Entry::Error(e));
+                    return false;
+                }
+            };
             match acp::Acp::start(&argv, &cwd, bridge, SYSTEM, &self.prefs.assistant.login_model, wake) {
                 Ok(c) => a.acp = Some(c),
                 Err(e) => {
