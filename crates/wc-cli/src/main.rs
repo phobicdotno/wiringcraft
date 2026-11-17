@@ -83,6 +83,15 @@ enum Cmd {
         /// The core's name in the cable, e.g. `1` or `BN`.
         #[arg(long)]
         core: Option<String>,
+        /// Cross-section with its unit, e.g. `"1.5 mm²"` or `"18 AWG"`.
+        #[arg(long)]
+        section: Option<String>,
+        /// Colour code, e.g. `BU`.
+        #[arg(long)]
+        colour: Option<String>,
+        /// Wire type, e.g. `H07V-K`.
+        #[arg(long = "type")]
+        kind: Option<String>,
     },
     /// Set a device's part and description.
     Device {
@@ -685,6 +694,9 @@ fn run(cli: Cli) -> Res<()> {
             potential,
             cable,
             core,
+            section,
+            colour,
+            kind,
         } => {
             let mut p = load(dir)?;
             let cable = match cable {
@@ -712,7 +724,11 @@ fn run(cli: Cli) -> Res<()> {
                 potential,
                 cable,
                 route: Default::default(),
-                spec: Default::default(),
+                spec: wc_core::WireSpec {
+                    section: section.as_deref().and_then(wc_core::WireSpec::value),
+                    colour: colour.as_deref().and_then(wc_core::WireSpec::value),
+                    kind: kind.as_deref().and_then(wc_core::WireSpec::value),
+                },
             });
             save(dir, &p)?;
             println!("{id}");

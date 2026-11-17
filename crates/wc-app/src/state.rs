@@ -1120,7 +1120,10 @@ pub(crate) mod tests {
             back.project.pages[page].wires[0].spec,
             o.project.pages[page].wires[0].spec
         );
-        assert!(o.undo() && o.undo());
+        // Clearing a part the wires differ in clears it on all of them.
+        assert_eq!(o.set_wire_spec(page, &ids, SpecPart::Section, None), 1);
+        assert!(o.project.pages[page].wires.iter().all(|w| w.spec.section.is_none()));
+        assert!(o.undo() && o.undo() && o.undo());
         assert!(o.project.pages[page].wires.iter().all(|w| w.spec.is_empty()));
     }
 

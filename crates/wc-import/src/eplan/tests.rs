@@ -515,7 +515,7 @@ fn builds_overview_pages_per_eplan_page() {
         .collect();
     assert_eq!(specced.len(), 2, "both stubs of the connection");
     for w in specced {
-        assert_eq!(w.spec.section.as_deref(), Some("1.5"));
+        assert_eq!(w.spec.section.as_deref(), Some("1.5 mm²"), "a plain number is mm²");
         assert_eq!(w.number, None, "colour and section are not a wire number");
     }
 }
@@ -591,4 +591,61 @@ fn timed_contacts_read_their_pin_numbers() {
     assert!(contact(&["15", "16"]).id.starts_with("eplan.break."));
     assert!(contact(&["17", "18"]).id.starts_with("eplan.make."));
     assert!(contact(&["11", "12"]).id.starts_with("eplan.break."));
+}
+
+#[test]
+fn drawn_wires_get_the_section_and_colour_of_their_connection() {
+    use wc_core::geom::Point;
+    use wc_core::{Endpoint, Page, Wire};
+    let pt = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+    let pin = |item: &str, pin: &str| Endpoint::Pin {
+        item: item.into(),
+        pin: pin.into(),
+    };
+    let wire = |id: &str, from: Endpoint, to: Endpoint| Wire {
+        id: id.into(),
+        from,
+        to,
+        via: vec![],
+        number: None,
+        potential: None,
+        cable: None,
+        route: Default::default(),
+        spec: Default::default(),
+    };
+    let mut page = Page::new("p1", "1", "");
+    // K1:21 to terminal X2.3 through two junctions, and an unrelated wire from K1:22.
+    page.wires = vec![
+        wire("w1", pin("s1", "21"), pt(10.0, 0.0)),
+        wire("w2", pt(10.0, 0.0), pt(20.0, 0.0)),
+        wire("w3", pt(20.0, 0.0), pin("s2", "1")),
+        wire("w4", pin("s1", "22"), pt(50.0, 50.0)),
+    ];
+    let owners = vec![
+        ("s1".to_owned(), "K1".to_owned(), String::new()),
+        ("s2".to_owned(), "X2".to_owned(), "3".to_owned()),
+    ];
+    let conn = |from: &str, to: &str, section: &str, colour: &str| EplanConnection {
+        from: from.into(),
+        to: to.into(),
+        cross_section: section.into(),
+        colour: colour.into(),
+        ..Default::default()
+    };
+    let connections = vec![
+        conn("K1:21", "X2:3:b", "1.5", "BU"),
+        // A second connection over the same wires does not overwrite the first.
+        conn("X2:3", "K1:21", "2.5", "RD"),
+    ];
+    assert_eq!(drawing::spec_from_connections(&mut page, &owners, &connections), 3);
+    for w in &page.wires[..3] {
+        assert_eq!(w.spec.section.as_deref(), Some("1.5 mm²"), "{}", w.id);
+        assert_eq!(w.spec.colour.as_deref(), Some("BU"), "{}", w.id);
+    }
+    assert!(page.wires[3].spec.is_empty(), "w4 is not on the connection");
+    assert_eq!(conn("a:1", "b:1", "0", "").spec(), wc_core::WireSpec::default());
+    assert_eq!(
+        conn("a:1", "b:1", "18 AWG", "").spec().section.as_deref(),
+        Some("18 AWG")
+    );
 }

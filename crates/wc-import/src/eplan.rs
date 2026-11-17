@@ -177,6 +177,24 @@ pub struct EplanConnection {
     pub cable: String,
 }
 
+impl EplanConnection {
+    /// Cross-section and colour as a wire spec. A plain number is in mm², as EPLAN's default
+    /// unit; anything else (`18 AWG`) is kept as written, and 0 is no section.
+    pub fn spec(&self) -> wc_core::WireSpec {
+        let v = self.cross_section.trim();
+        let section = match v.parse::<f64>() {
+            Ok(0.0) => None,
+            Ok(_) => Some(format!("{v} mm²")),
+            Err(_) => wc_core::WireSpec::value(v),
+        };
+        wc_core::WireSpec {
+            section,
+            colour: wc_core::WireSpec::value(&self.colour),
+            kind: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EplanProject {
     /// Project properties from `ProjectInfo.xml`: (id, name, value).
@@ -791,17 +809,12 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
         }
         pins.entry(ia).or_default().insert(pa.to_owned());
         pins.entry(ib).or_default().insert(pb.to_owned());
-        // Colour and cross-section go to the wire's own fields, not into its number. The section
-        // is kept as written: EPLAN stores the value without saying mm² or AWG.
+        // Colour and cross-section go to the wire's own fields, not into its number.
         links.push(AmlLink {
             name: String::new(),
             a: (ia, pa.to_owned()),
             b: (ib, pb.to_owned()),
-            spec: wc_core::WireSpec {
-                section: wc_core::WireSpec::value(&c.cross_section),
-                colour: wc_core::WireSpec::value(&c.colour),
-                kind: None,
-            },
+            spec: c.spec(),
         });
     }
     if skipped > 0 {

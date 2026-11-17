@@ -38,15 +38,18 @@ pub struct PanelState {
     spec: [String; 3],
     spec_loaded: [String; 3],
     spec_mixed: [bool; 3],
-    spec_for: Vec<String>,
+    /// Whether the user typed in the field since it was loaded or committed.
+    spec_dirty: [bool; 3],
+    spec_for: (usize, Vec<String>),
 }
 
 /// Keep the spec buffers in step with the given wires of a page: refilled when the selection
 /// changes, and a field the user is not editing follows changes made elsewhere (undo, the agent).
 fn load_spec(open: &Open, page: usize, ids: &[String], ps: &mut PanelState) {
-    let fresh = ps.spec_for != ids;
+    let fresh = ps.spec_for.0 != page || ps.spec_for.1 != ids;
     if fresh {
-        ps.spec_for = ids.to_vec();
+        ps.spec_for = (page, ids.to_vec());
+        ps.spec_dirty = [false; 3];
     }
     let Some(p) = open.project.pages.get(page) else {
         return;
@@ -61,8 +64,7 @@ fn load_spec(open: &Open, page: usize, ids: &[String], ps: &mut PanelState) {
         } else {
             values.into_iter().next().flatten().cloned().unwrap_or_default()
         };
-        let untouched = ps.spec[k] == ps.spec_loaded[k];
-        if fresh || (untouched && (common != ps.spec_loaded[k] || mixed != ps.spec_mixed[k])) {
+        if fresh || (!ps.spec_dirty[k] && (common != ps.spec_loaded[k] || mixed != ps.spec_mixed[k])) {
             ps.spec[k] = common.clone();
             ps.spec_loaded[k] = common;
             ps.spec_mixed[k] = mixed;
@@ -71,8 +73,8 @@ fn load_spec(open: &Open, page: usize, ids: &[String], ps: &mut PanelState) {
 }
 
 /// Rows for cross-section, colour and type of the given wires, inside a two-column grid. A value
-/// typed in is set on all of them; an empty one clears it. A field left as loaded changes nothing,
-/// so tabbing through a field the wires differ in keeps their own values.
+/// typed in is set on all of them; emptying a field clears it on all of them. A field nobody typed
+/// in changes nothing, so tabbing through a field the wires differ in keeps their own values.
 fn spec_rows(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[String], ps: &mut PanelState) {
     load_spec(open, page, ids, ps);
     for (k, part) in SpecPart::ALL.into_iter().enumerate() {
@@ -83,7 +85,11 @@ fn spec_rows(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[String], ps
             part.hint()
         };
         let r = ui.add(egui::TextEdit::singleline(&mut ps.spec[k]).hint_text(hint));
-        if committed(&r) && ps.spec[k].trim() != ps.spec_loaded[k].trim() {
+        if r.changed() {
+            ps.spec_dirty[k] = true;
+        }
+        if committed(&r) && ps.spec_dirty[k] {
+            ps.spec_dirty[k] = false;
             let value = wc_core::WireSpec::value(&ps.spec[k]);
             open.set_wire_spec(page, ids, part, value.clone());
             ps.spec[k] = value.clone().unwrap_or_default();
