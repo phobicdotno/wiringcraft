@@ -104,12 +104,17 @@ pub fn parse(text: &str) -> Result<AmlImport> {
     // Each finished element with the names of its parents and their designations (the tag
     // attribute when they have one, else the name).
     let mut pending: Vec<(Vec<String>, Vec<String>, Elem)> = Vec::new();
+    // An element's designation for locations: a reference designation that is a location, else
+    // its name when that is one, else whatever it is designated by.
     let designation = |e: &Elem| {
-        TAG_ATTRIBUTES
-            .iter()
-            .find_map(|k| e.attributes.get(*k))
-            .cloned()
-            .unwrap_or_else(|| e.name.clone())
+        let attr = TAG_ATTRIBUTES.iter().find_map(|k| e.attributes.get(*k));
+        let is_loc = |s: &str| s.trim_start().starts_with('+');
+        match attr {
+            Some(a) if is_loc(a) => a.clone(),
+            _ if is_loc(&e.name) => e.name.clone(),
+            Some(a) => a.clone(),
+            None => e.name.clone(),
+        }
     };
     let mut seen_caex = false;
     let mut events = 0usize;
@@ -202,7 +207,14 @@ pub fn parse(text: &str) -> Result<AmlImport> {
             // Structure (function, location), not a device. A location goes to the project.
             let own = designation(&el);
             // Only an element that is itself a location (`+L1`, not `+L1-K1`) names one.
-            if own.trim_start().starts_with('+') && wc_core::project::location_path(&own).is_ok() {
+            let valid = wc_core::project::location_path(&own);
+            if own.trim_start().starts_with('+')
+                && let Err(why) = &valid
+            {
+                out.warnings
+                    .push(format!("{}: {why}; not taken as a location", el.name));
+            }
+            if own.trim_start().starts_with('+') && valid.is_ok() {
                 let levels = location_levels(&outer, &own);
                 if !levels.is_empty() {
                     let description = ["Description", "description", "Beschreibung"]
@@ -758,6 +770,9 @@ mod tests {
       <InternalElement Name="+L9-K2" ID="k2"/>
       <InternalElement Name="+L9" ID="l9b"/>
     </InternalElement>
+    <InternalElement Name="+L7" ID="l7">
+      <Attribute Name="ReferenceDesignation"><Value>F1</Value></Attribute>
+    </InternalElement>
     <InternalElement Name="Cabinet" ID="c2">
       <Attribute Name="RefDes"><Value>+L2</Value></Attribute>
       <InternalElement Name="+L5" ID="l5"/>
@@ -779,10 +794,18 @@ mod tests {
                 ("L1.L4", ""),
                 ("L2", ""),
                 ("L2.L5", ""),
+                ("L7", ""),
                 ("L9", "Engine room")
             ]
         );
         assert_eq!(imp.devices.len(), 1, "locations are not devices");
+        assert!(
+            imp.warnings
+                .iter()
+                .any(|w| w.contains("+L9-K2") && w.contains("not a location")),
+            "{:?}",
+            imp.warnings
+        );
         Ok(())
     }
 }

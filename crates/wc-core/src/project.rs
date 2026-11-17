@@ -123,13 +123,20 @@ impl ProjectMeta {
         }
     }
 
-    /// Remove a location from the list (its devices keep their tags). Returns whether it was
-    /// there.
-    pub fn remove_location(&mut self, path: &str) -> bool {
-        let path = location_path(path).unwrap_or_else(|_| path.trim().to_owned());
+    /// Remove a location from the list (its devices keep their tags). A path stored as it was
+    /// typed is found too. When nothing goes, the reason: not a location, or not in the list.
+    pub fn remove_location(&mut self, path: &str) -> Result<(), String> {
+        let parsed = location_path(path);
+        let key = parsed.clone().unwrap_or_else(|_| path.trim().to_owned());
         let before = self.locations.len();
-        self.locations.retain(|l| l.path != path);
-        self.locations.len() != before
+        self.locations.retain(|l| l.path != key);
+        if self.locations.len() != before {
+            return Ok(());
+        }
+        match parsed {
+            Ok(p) => Err(format!("no location +{p}")),
+            Err(why) => Err(why),
+        }
     }
 
     /// Add a location, or fill in the description of one the project already has. A description
@@ -619,8 +626,10 @@ mod tests {
         assert_eq!(m.locations[1].description, "Cabinet 3");
         assert!(m.set_location("+L1-K1", "x").is_err(), "a device tag is no location");
         assert!(m.set_location("", "x").is_err());
-        assert!(m.remove_location("+L1"));
-        assert!(!m.remove_location("L1"));
+        assert_eq!(m.remove_location("+L1"), Ok(()));
+        assert_eq!(m.remove_location("L1"), Err("no location +L1".into()));
+        let why = m.remove_location("+L1-K1");
+        assert!(why.as_ref().is_err_and(|e| e.contains("not a location")), "{why:?}");
         assert_eq!(m.locations.len(), 1);
     }
 }

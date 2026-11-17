@@ -495,6 +495,19 @@ fn save(dir: &Path, p: &Project) -> Res<()> {
     store::save(dir, p).map(|_| ()).map_err(e)
 }
 
+/// The `location list` output: one location per line, `+path`, then a tab and the description
+/// when it has one.
+fn write_locations(out: &mut impl std::io::Write, locations: &[wc_core::project::Location]) -> std::io::Result<()> {
+    for l in locations {
+        if l.description.is_empty() {
+            writeln!(out, "+{}", l.path)?;
+        } else {
+            writeln!(out, "+{}\t{}", l.path, l.description)?;
+        }
+    }
+    Ok(())
+}
+
 fn page_mut<'a>(p: &'a mut Project, id: &str) -> Res<&'a mut Page> {
     p.page_mut(id).ok_or_else(|| format!("no page {id:?}"))
 }
@@ -738,13 +751,7 @@ fn run(cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             match lc {
                 LocationCmd::List => {
-                    for l in &p.meta.locations {
-                        if l.description.is_empty() {
-                            println!("+{}", l.path);
-                        } else {
-                            println!("+{}\t{}", l.path, l.description);
-                        }
-                    }
+                    write_locations(&mut std::io::stdout(), &p.meta.locations).map_err(e)?;
                 }
                 LocationCmd::Set { path, description } => {
                     let description = description.unwrap_or_else(|| {
@@ -761,9 +768,7 @@ fn run(cli: Cli) -> Res<()> {
                     }
                 }
                 LocationCmd::Remove { path } => {
-                    if !p.meta.remove_location(&path) {
-                        return Err(format!("no location {path}"));
-                    }
+                    p.meta.remove_location(&path)?;
                     save(dir, &p)?;
                 }
             }
@@ -2028,6 +2033,9 @@ mod tests {
             ]
         );
         cli(&dir, &["location", "list"]).unwrap();
+        let mut listed = Vec::new();
+        write_locations(&mut listed, &load(&dir).unwrap().meta.locations).unwrap();
+        assert_eq!(String::from_utf8(listed).unwrap(), "+L1\n+L1.L3\tCabinet 3\n");
         cli(&dir, &["location", "set", "L1.L3", ""]).unwrap();
         assert_eq!(locs(&dir)[1].1, "", "an empty description clears it");
         cli(&dir, &["location", "remove", "+L1"]).unwrap();

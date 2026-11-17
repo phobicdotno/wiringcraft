@@ -55,6 +55,9 @@ enum Dialog {
         fields: Vec<(String, String)>,
         /// The project's locations as (path, description), edited in place.
         locations: Vec<(String, String)>,
+        /// The locations as the dialog opened with them: when they are unchanged, OK leaves the
+        /// project's own (an assistant command may have changed them meanwhile).
+        loaded_locations: Vec<(String, String)>,
     },
     PageProps {
         number: String,
@@ -490,16 +493,18 @@ impl App {
                         fields.push((k.clone(), v.clone()));
                     }
                 }
+                let locations: Vec<(String, String)> = open
+                    .project
+                    .meta
+                    .locations
+                    .iter()
+                    .map(|l| (l.path.clone(), l.description.clone()))
+                    .collect();
                 self.dialog = Some(Dialog::ProjectProps {
                     name: open.project.meta.name.clone(),
                     fields,
-                    locations: open
-                        .project
-                        .meta
-                        .locations
-                        .iter()
-                        .map(|l| (l.path.clone(), l.description.clone()))
-                        .collect(),
+                    loaded_locations: locations.clone(),
+                    locations,
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
@@ -903,7 +908,12 @@ impl App {
                         }
                     });
                 }
-                Dialog::ProjectProps { name, fields, locations } => {
+                Dialog::ProjectProps {
+                    name,
+                    fields,
+                    locations,
+                    loaded_locations,
+                } => {
                     egui::Grid::new("projprops")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
@@ -925,22 +935,29 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(RichText::new("Locations").strong());
                     let mut drop = None;
-                    egui::Grid::new("projlocations")
-                        .num_columns(3)
-                        .spacing([8.0, 6.0])
+                    // A long list scrolls; OK and Cancel stay in view below it.
+                    egui::ScrollArea::vertical()
+                        .id_salt("projlocations-scroll")
+                        .max_height(220.0)
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            for (k, (path, description)) in locations.iter_mut().enumerate() {
-                                ui.add(egui::TextEdit::singleline(path).hint_text("+L1").desired_width(100.0));
-                                ui.add(
-                                    egui::TextEdit::singleline(description)
-                                        .hint_text("What it is")
-                                        .desired_width(250.0),
-                                );
-                                if ui.button("Remove").clicked() {
-                                    drop = Some(k);
-                                }
-                                ui.end_row();
-                            }
+                            egui::Grid::new("projlocations")
+                                .num_columns(3)
+                                .spacing([8.0, 6.0])
+                                .show(ui, |ui| {
+                                    for (k, (path, description)) in locations.iter_mut().enumerate() {
+                                        ui.add(egui::TextEdit::singleline(path).hint_text("+L1").desired_width(100.0));
+                                        ui.add(
+                                            egui::TextEdit::singleline(description)
+                                                .hint_text("What it is")
+                                                .desired_width(250.0),
+                                        );
+                                        if ui.button("Remove").clicked() {
+                                            drop = Some(k);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
                         });
                     if let Some(k) = drop {
                         locations.remove(k);
@@ -959,10 +976,11 @@ impl App {
                         {
                             let n = name.clone();
                             let f = fields.clone();
-                            let l = locations.clone();
+                            // Untouched locations are left as the project has them now.
+                            let l = (locations != loaded_locations).then(|| locations.clone());
                             then = Some(Box::new(move |app: &mut App| {
                                 if let Some(o) = app.open.as_mut()
-                                    && let Err(e) = o.set_project_props(&n, &f, Some(&l))
+                                    && let Err(e) = o.set_project_props(&n, &f, l.as_deref())
                                 {
                                     app.ed.message = e;
                                 }
