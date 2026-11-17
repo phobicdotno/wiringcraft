@@ -393,8 +393,9 @@ impl Project {
     }
 }
 
-/// Split into alternating text and number chunks so `2` sorts before `10`.
-fn natural_key(s: &str) -> Vec<(String, u64)> {
+/// Split into alternating text and number chunks so `2` sorts before `10` and `X2` before `X10`.
+/// Every list ordered by number (pages, terminals) uses this.
+pub fn natural_key(s: &str) -> Vec<(String, u64)> {
     let mut out = Vec::new();
     let mut text = String::new();
     let mut num = String::new();
