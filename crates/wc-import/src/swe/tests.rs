@@ -1560,3 +1560,20 @@ fn a_component_name_with_a_leading_sign_stays_the_product() {
     let p = read(&c).unwrap();
     assert_eq!(p.components[&532].tag, "=F1-_24V");
 }
+
+#[test]
+fn a_spaced_location_path_counts_as_the_space_form() {
+    let c = space_form();
+    c.execute_batch(
+        "INSERT INTO tew_location (loc_id, loc_tagpath) VALUES (940, 'L1 L11');
+         INSERT INTO tew_component VALUES (540, 'K1', 'K1', -1, NULL, 0, NULL, 940, '');",
+    )
+    .unwrap();
+    let p = read(&c).unwrap();
+    assert_eq!(p.components[&540].tag, "+L1+L11-K1");
+    assert!(
+        p.warnings.iter().any(|w| w.contains("stored with spaces")),
+        "{:?}",
+        p.warnings
+    );
+}

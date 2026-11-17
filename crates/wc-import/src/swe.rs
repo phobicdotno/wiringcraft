@@ -660,7 +660,13 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
         // tag with neither stays as written, spaces and all (`K3`, `X 1/2` is one product name).
         let function = fun.and_then(|f| functions.get(&f)).map(String::as_str);
         let location = loc.and_then(|l| location_paths.get(&l)).map(String::as_str);
-        let spaced = c.tag.trim().contains(char::is_whitespace);
+        let has_space = |t: &str| t.trim().contains(char::is_whitespace);
+        // Any part written in the space form counts: the stored path, or a function, location or
+        // product path the tag is rebuilt from.
+        let spaced = has_space(&c.tag)
+            || function.is_some_and(has_space)
+            || location.is_some_and(has_space)
+            || has_space(&product);
         if !has_signs(&c.tag) && (function.is_some() || location.is_some()) {
             // The product path, else the component's own tag as one level (a name, not a path:
             // `X 1/2` is `X_1/2`, `+24V` is `_24V`), else the stored path.
