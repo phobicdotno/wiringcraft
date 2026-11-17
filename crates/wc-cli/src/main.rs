@@ -2150,13 +2150,17 @@ fn swe_symbol_choice(
     let mut sources = std::collections::BTreeMap::new();
     for id in wanted {
         // The project's own copy first, used on a page or not.
-        if p.lock.symbols.contains_key(&id)
-            && let Ok(s) = store::read_vendored_symbol(dir, &id)
-        {
-            let source = p.lock.symbols.get(&id).map(|l| l.source.clone()).unwrap_or_default();
-            sources.insert(id.clone(), source);
-            choice.library.insert(id, s);
-            continue;
+        if p.lock.symbols.contains_key(&id) {
+            match project_copy(dir, &id) {
+                Ok(Some(s)) => {
+                    let source = p.lock.symbols.get(&id).map(|l| l.source.clone()).unwrap_or_default();
+                    sources.insert(id.clone(), source);
+                    choice.library.insert(id, s);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(why) => eprintln!("warning: {why}; trying the libraries"),
+            }
         }
         let found = match lib.as_ref().map(|l| l.symbol(&id)) {
             Some(Ok(found)) => Some(found),
@@ -2174,6 +2178,21 @@ fn swe_symbol_choice(
         }
     }
     Ok((choice, sources))
+}
+
+/// The project's own copy of symbol `id`: `None` when it has none, the reason when the copy is
+/// there but cannot be read.
+fn project_copy(dir: &Path, id: &str) -> Res<Option<wc_core::Symbol>> {
+    let path = dir
+        .join(store::VENDOR_DIR)
+        .join(ItemKind::Symbol.dir())
+        .join(format!("{id}.json"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    store::read_vendored_symbol(dir, id)
+        .map(Some)
+        .map_err(|why| format!("project copy of symbol {id} cannot be read: {why}"))
 }
 
 /// Library symbols an import used stay pinned to the library they came from (`add_built` pins
@@ -2330,6 +2349,21 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_project_copy_that_cannot_be_read_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert_eq!(project_copy(dir, "wc.coil"), Ok(None), "no copy: no error");
+        let folder = dir.join(store::VENDOR_DIR).join(ItemKind::Symbol.dir());
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("wc.coil.json"), "{ not json").unwrap();
+        let why = project_copy(dir, "wc.coil").unwrap_err();
+        assert!(
+            why.starts_with("project copy of symbol wc.coil cannot be read: "),
+            "{why}"
+        );
     }
 
     #[test]
