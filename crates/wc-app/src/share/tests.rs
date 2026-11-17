@@ -665,6 +665,31 @@ fn every_part_changed_on_both_sides_takes_the_sessions_version() -> TestResult {
 }
 
 #[test]
+fn a_page_removed_while_its_renumbering_is_undone_stays() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    base.pages.push(Page::new("p2", "2", "Two"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    // The session (an undo) gave page 1 its old number back; this window removed it.
+    auth.pages[0].number = "7".into();
+    local.pages.retain(|p| p.id != "p1");
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["page 1"]);
+    assert_eq!(local.page("p1").map(|p| p.number.as_str()), Some("7"));
+    assert_eq!(base.page("p1").map(|p| p.number.as_str()), Some("7"));
+    // A renumbering alone does not clash with a content change made here.
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let mut auth = base.clone();
+    let mut local = base.clone();
+    auth.pages[0].number = "7".into();
+    local.pages[0].title = "Mine".into();
+    assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
+    assert_eq!(local.pages[0].title, "Mine");
+}
+
+#[test]
 fn a_page_removed_while_its_undo_is_on_its_way_stays_in_the_session() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;

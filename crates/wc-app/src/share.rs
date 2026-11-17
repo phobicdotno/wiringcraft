@@ -194,7 +194,13 @@ pub fn yield_to_session(local: &mut Project, base: &mut Project, auth: &Project)
         let a = auth.page(&id);
         let l = local.page(&id);
         let differs = |x: Option<&Page>| x.is_none_or(|x| !same_content(x, b));
-        if !differs(a) || !differs(l) {
+        // A renumbering goes out on its own, so a content change here does not clash with
+        // one; a page removed here does, as removing it would take the number back too.
+        let session_changed = match l {
+            Some(_) => differs(a),
+            None => a != Some(b),
+        };
+        if !session_changed || !differs(l) {
             continue;
         }
         dropped.push(format!("page {}", b.number));
