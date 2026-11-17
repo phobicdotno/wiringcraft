@@ -26,6 +26,20 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// One segment of an imported item's id, from a name in the source: ASCII letters and digits
+/// in lower case and `-` are kept, everything else becomes `_` (`Relay Coil` is `relay_coil`).
+pub fn id_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Give a read part its id and add it to `out`, keyed by id. `what` names the source row or
 /// product in warnings ("row 3", "product 2"). Returns false when the part was skipped.
 pub(crate) fn add_part(

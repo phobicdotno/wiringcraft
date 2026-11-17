@@ -439,11 +439,16 @@ enum ImportCmd {
         lib: PathBuf,
     },
     /// The open-format parts of another tool's project archive (PDF pages as trace pages,
-    /// DXF drawings as pages, AutomationML devices and connections).
+    /// DXF drawings as pages, AutomationML devices and connections, KiCad symbol libraries
+    /// into `--lib`).
     Archive {
         file: PathBuf,
         #[arg(long, default_value_t = 300)]
         first_page: usize,
+        /// Library folder for the symbols of `.kicad_sym` entries; without it they are listed,
+        /// not imported.
+        #[arg(long)]
+        lib: Option<PathBuf>,
     },
     /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
     /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
@@ -1335,37 +1340,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             category,
         } => {
             let text = std::fs::read_to_string(&file).map_err(e)?;
-            let prefix = prefix.unwrap_or_else(|| {
-                let stem: String = file
-                    .file_stem()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '-' {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                format!("kicad.{stem}")
-            });
-            let (symbols, warnings) = wc_import::kicad::symbols(&text, &prefix, scale).map_err(e)?;
-            for w in warnings {
-                eprintln!("warning: {w}");
-            }
-            for mut imp in symbols {
-                imp.symbol.category = category.clone();
-                let path = wc_library::write_symbol(&lib, &imp.symbol).map_err(e)?;
-                println!(
-                    "{} -> {} ({} pins, {} shapes)",
-                    imp.kicad_name,
-                    path.display(),
-                    imp.symbol.pins.len(),
-                    imp.symbol.graphics.len()
-                );
-            }
+            let prefix = prefix.unwrap_or_else(|| kicad_prefix(&file.to_string_lossy()));
+            import_kicad(&text, &lib, &prefix, scale, &category)?;
         }
         ImportCmd::SymbolQet {
             files,
@@ -1657,16 +1633,53 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 imp.links.len()
             );
         }
-        ImportCmd::Archive { file, first_page } => {
+        ImportCmd::Archive { file, first_page, lib } => {
             use wc_import::archive::Kind;
             let bytes = std::fs::read(&file).map_err(e)?;
-            let entries =
-                wc_import::archive::open_entries(&bytes, &[Kind::Pdf, Kind::Dxf, Kind::AutomationMl]).map_err(e)?;
+            let entries = wc_import::archive::open_entries(
+                &bytes,
+                &[Kind::Pdf, Kind::Dxf, Kind::AutomationMl, Kind::KicadSymbols],
+            )
+            .map_err(e)?;
             if entries.is_empty() {
                 return Err(
-                    "no importable PDF, DXF or AutomationML inside; run `wiringcraft inspect` to see what is there"
+                    "no importable PDF, DXF, AutomationML or KiCad symbols inside; run `wiringcraft inspect` to see what is there"
                         .into(),
                 );
+            }
+            // Symbol libraries go into a library folder, not the project's pages.
+            let (symbols, entries): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|(_, kind, _)| *kind == Kind::KicadSymbols);
+            // Two entries with the same file name would write the same ids over each other.
+            let mut prefixes = std::collections::BTreeSet::new();
+            for (name, _, data) in symbols {
+                println!("{name}:");
+                let Some(lib) = &lib else {
+                    eprintln!("warning: {name}: KiCad symbols, not imported: pass --lib <folder>");
+                    continue;
+                };
+                let prefix = kicad_prefix(&name);
+                if prefixes.contains(&prefix) {
+                    eprintln!("warning: {name}: skipped, an earlier entry already imports as {prefix}");
+                    continue;
+                }
+                // Read first: an entry that cannot be read writes nothing and keeps its prefix free.
+                let read = match read_kicad(&String::from_utf8_lossy(&data), &prefix, 1.0) {
+                    Ok(symbols) if symbols.is_empty() => continue,
+                    Ok(symbols) => symbols,
+                    Err(err) => {
+                        eprintln!("warning: {name}: {err}");
+                        continue;
+                    }
+                };
+                prefixes.insert(prefix);
+                if let Err(err) = write_kicad(read, lib, "") {
+                    eprintln!("warning: {name}: {err}");
+                }
+            }
+            if entries.is_empty() {
+                return Ok(());
             }
             let tmp = std::env::temp_dir().join(format!("wiringcraft-archive-{}", std::process::id()));
             std::fs::create_dir_all(&tmp).map_err(e)?;
@@ -2119,6 +2132,45 @@ fn import_swe_library(
 
 /// Import QElectroTech elements into a symbol library folder, one symbol per file. A file that
 /// cannot be read is reported and skipped. Returns how many were written and how many failed.
+/// The default id prefix for a KiCad library: `kicad.<file name without extension>`, lower
+/// case, other characters as `_`. `name` may be a path or an archive entry name.
+fn kicad_prefix(name: &str) -> String {
+    let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let stem = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
+    format!("kicad.{}", wc_import::id_segment(stem))
+}
+
+/// Import every symbol (one per unit) of a KiCad library text into `lib`, printing each.
+fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str) -> Res<usize> {
+    write_kicad(read_kicad(text, prefix, scale)?, lib, category)
+}
+
+/// Read a KiCad library's symbols, printing its warnings; nothing is written yet.
+fn read_kicad(text: &str, prefix: &str, scale: f64) -> Res<Vec<wc_import::kicad::Imported>> {
+    let (symbols, warnings) = wc_import::kicad::symbols(text, prefix, scale).map_err(e)?;
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(symbols)
+}
+
+/// Write read KiCad symbols into `lib`, printing each.
+fn write_kicad(symbols: Vec<wc_import::kicad::Imported>, lib: &Path, category: &str) -> Res<usize> {
+    let n = symbols.len();
+    for mut imp in symbols {
+        imp.symbol.category = category.to_owned();
+        let path = wc_library::write_symbol(lib, &imp.symbol).map_err(e)?;
+        println!(
+            "{} -> {} ({} pins, {} shapes)",
+            imp.kicad_name,
+            path.display(),
+            imp.symbol.pins.len(),
+            imp.symbol.graphics.len()
+        );
+    }
+    Ok(n)
+}
+
 fn import_qet(
     files: &[PathBuf],
     lib: &Path,
@@ -2132,19 +2184,12 @@ fn import_qet(
     // Two files whose names give the same id would overwrite each other: the later one fails.
     let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for file in files {
-        let stem: String = file
-            .file_stem()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    c.to_ascii_lowercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let stem = wc_import::id_segment(
+            &file
+                .file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
         let id = format!("{}.{stem}", prefix.trim_end_matches('.'));
         let read = match ids.get(&id) {
             Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
@@ -2942,6 +2987,60 @@ mod tests {
 
         std::fs::write(&file, "not an archive").unwrap();
         assert!(cli(&dir, &["import", "swe-library", file.to_str().unwrap()]).is_err());
+    }
+
+    #[test]
+    fn a_zip_with_a_kicad_library_imports_every_unit_into_the_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        use std::io::Write;
+        let file = tmp.path().join("vendor.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            z.start_file("symbols/My Relays.kicad_sym", opt).unwrap();
+            z.write_all(
+                br#"(kicad_symbol_lib
+  (symbol "K" (property "Reference" "K" (at 0 0 0))
+    (symbol "K_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "A1")))
+    (symbol "K_2_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "11")))))"#,
+            )
+            .unwrap();
+            // A broken library with the same name first: it writes nothing, so it takes nothing.
+            z.start_file("a/My Relays.kicad_sym", opt).unwrap();
+            z.write_all(b"(kicad_symbol_lib (symbol").unwrap();
+            // Same file name elsewhere: it would write kicad.my_relays.k_a over the first one.
+            z.start_file("zz/My Relays.kicad_sym", opt).unwrap();
+            z.write_all(br#"(kicad_symbol_lib (symbol "K" (symbol "K_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "Z")))))"#)
+                .unwrap();
+            z.finish().unwrap();
+        }
+        let lib = tmp.path().join("lib");
+        // Without --lib the library is listed, not imported, and nothing else is in the zip.
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
+        assert!(!lib.exists());
+        cli(
+            &dir,
+            &[
+                "import",
+                "archive",
+                file.to_str().unwrap(),
+                "--lib",
+                lib.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let symbols = lib.join("symbols");
+        assert!(symbols.join("kicad.my_relays.k_a.json").exists());
+        assert!(symbols.join("kicad.my_relays.k_b.json").exists());
+        assert!(
+            !symbols.join("kicad.my_relays.k.json").exists(),
+            "the second entry was skipped"
+        );
+        let a = std::fs::read_to_string(symbols.join("kicad.my_relays.k_a.json")).unwrap();
+        assert!(a.contains("\"A1\""), "{a}");
+        assert_eq!(kicad_prefix("a/b\\Std Relays.v2.kicad_sym"), "kicad.std_relays_v2");
     }
 
     #[test]

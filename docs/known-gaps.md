@@ -38,7 +38,6 @@ These branches can be deleted once their pull requests are merged.
 | Gap | Where it shows | Todo |
 |---|---|---|
 | EDZ exchange files: parts are read, EPLAN macros (`.ema`) only counted | `crates/wc-import/src/edz.rs` | #144 |
-| KiCad: only the first unit of a multi-unit symbol; `.kicad_sym` inside a zip is listed, not imported | `crates/wc-import/src/kicad.rs`, `crates/wc-import/src/archive.rs` | #96 |
 | SolidWorks Electrical: symbol and page graphics from DWG | `crates/wc-import/src/swe.rs` | #59 |
 | SolidWorks Electrical: cover page | `crates/wc-import/src/swe.rs` | #61 |
 | SolidWorks Electrical libraries (`import swe-library`): catalog parts bring their terminals as a text property, not as pins of a symbol; library blocks are box symbols until the DWG reader draws them | `crates/wc-import/src/swe/library.rs` | #59 |
