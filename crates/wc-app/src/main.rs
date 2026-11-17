@@ -53,6 +53,9 @@ enum Dialog {
         fields: Vec<(String, String)>,
         since: usize,
         before: state::PropsSnapshot,
+        /// The project's history count the buffer last matched; when it moves without the
+        /// form (an undo, the assistant), the buffer is reloaded from the project.
+        seen: u64,
     },
     PageProps {
         number: String,
@@ -506,6 +509,7 @@ impl App {
                     fields: form_fields(&open.project.meta.title_block),
                     since: open.start_live_form(),
                     before: open.props_snapshot(),
+                    seen: open.history_count(),
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
@@ -971,7 +975,15 @@ impl App {
                     fields,
                     since,
                     before,
+                    seen,
                 } => {
+                    if let Some(o) = self.open.as_ref()
+                        && o.history_count() != *seen
+                    {
+                        name.clone_from(&o.project.meta.name);
+                        *fields = form_fields(&o.project.meta.title_block);
+                        *seen = o.history_count();
+                    }
                     let mut changed = false;
                     egui::Grid::new("cover")
                         .num_columns(2)
@@ -988,6 +1000,7 @@ impl App {
                         });
                     if changed && let Some(o) = self.open.as_mut() {
                         o.set_project_props_live(name, fields);
+                        *seen = o.history_count();
                     }
                     ui.label(
                         RichText::new(

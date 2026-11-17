@@ -563,7 +563,8 @@ const HELVETICA_ASCII: [u16; 95] = [
 ];
 
 /// The width of `s` drawn in Helvetica at `height_mm` (cap height), from the font's advance
-/// widths. Letters outside ASCII use their Latin-1 widths where known, else a wide default.
+/// widths, for the glyphs `pdf_text` writes. Latin-1 letters use their AFM widths where listed,
+/// else a wide default; characters `pdf_text` cannot encode are measured as the `?` it writes.
 pub fn text_width_mm(s: &str, height_mm: f64) -> f64 {
     let em = height_mm / 0.72;
     let units: f64 = s
@@ -577,14 +578,23 @@ pub fn text_width_mm(s: &str, height_mm: f64) -> f64 {
                     .map_or(556.0, |w| f64::from(*w)),
                 'æ' => 889.0,
                 'Æ' => 1000.0,
-                'ø' | 'ö' | 'ó' | 'ò' | 'ô' | 'õ' | 'é' | 'è' | 'ê' | 'ë' | 'å' | 'ä' | 'á' | 'à' | 'â' | 'ã' | 'ü'
-                | 'ú' | 'ù' | 'û' | 'ñ' => 611.0,
+                'ø' => 611.0,
+                'ö' | 'ó' | 'ò' | 'ô' | 'õ' | 'é' | 'è' | 'ê' | 'ë' | 'å' | 'ä' | 'á' | 'à' | 'â' | 'ã' | 'ü' | 'ú'
+                | 'ù' | 'û' | 'ñ' => 556.0,
                 'Ø' | 'Ö' | 'Ó' | 'Ò' | 'Ô' | 'Õ' => 778.0,
                 'Å' | 'Ä' | 'Á' | 'À' | 'Â' | 'Ã' | 'É' | 'È' | 'Ê' | 'Ë' => 667.0,
                 'Ü' | 'Ú' | 'Ù' | 'Û' | 'Ñ' => 722.0,
                 'ß' => 611.0,
                 '°' => 400.0,
-                _ => 778.0,
+                // What `pdf_text` writes for these: WinAnsi dashes and bullet, `>` for an arrow.
+                '\u{2013}' => 556.0,
+                '\u{2014}' => 1000.0,
+                '\u{2022}' => 350.0,
+                '\u{2192}' => 584.0,
+                // Other Latin-1 letters: a wide estimate, so fitted text never overflows.
+                '\u{a0}'..='\u{ff}' => 778.0,
+                // Anything else is written as `?`.
+                _ => 556.0,
             }
         })
         .sum();

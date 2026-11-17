@@ -567,6 +567,20 @@ fn long_cover_table_labels_and_values_stay_in_their_columns() -> Result<(), Stri
     let (label_w, value_w) = (width_of(&label)?, width_of(&value)?);
     assert!(label_w <= 180.0 * 0.35 - 3.0 + 1e-6, "label {label_w} mm");
     assert!(value_w <= 180.0 * 0.65 - 3.0 + 1e-6, "value {value_w} mm");
+    // Em dashes are 1000 units wide in Helvetica: measured on their own, the fitted row stays
+    // inside the value column too.
+    let dashes = "\u{2014}".repeat(120);
+    project.meta.title_block.insert("Site notes".into(), dashes.clone());
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let height = marks
+        .iter()
+        .find_map(|m| match &m.shape {
+            Shape::Text { text, height, .. } if *text == dashes => Some(*height),
+            _ => None,
+        })
+        .ok_or("the dashes are not on the cover")?;
+    let dash_w = 120.0 * height / 0.72;
+    assert!(dash_w <= 180.0 * 0.65 - 3.0 + 1e-6, "dashes {dash_w} mm");
     Ok(())
 }
 
@@ -574,7 +588,20 @@ fn long_cover_table_labels_and_values_stay_in_their_columns() -> Result<(), Stri
 fn text_widths_are_helvetica_advance_widths() {
     // Adobe Helvetica AFM: W 944, O 778, H 722, e 556, l 222, o 556, i 222, space 278.
     let em_mm = |units: f64| units / 1000.0 * (10.0 / 0.72);
-    for (text, units) in [("W", 944.0), ("O", 778.0), ("Hello", 2278.0), ("i i", 722.0)] {
+    // Accented: aring, eacute 556, oslash 611; emdash 1000, endash 556; `?` 556 for what
+    // `pdf_text` cannot encode.
+    for (text, units) in [
+        ("W", 944.0),
+        ("O", 778.0),
+        ("Hello", 2278.0),
+        ("i i", 722.0),
+        ("å", 556.0),
+        ("é", 556.0),
+        ("ø", 611.0),
+        ("\u{2014}", 1000.0),
+        ("\u{2013}", 556.0),
+        ("\u{4e2d}", 556.0),
+    ] {
         let measured = crate::writer::text_width_mm(text, 10.0);
         assert!(
             (measured - em_mm(units)).abs() < 1e-9,

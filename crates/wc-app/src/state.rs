@@ -693,6 +693,12 @@ impl Open {
         self.undo_mark()
     }
 
+    /// Counts every change to the undo history. A form that shows project values compares it
+    /// with the count it last saw to notice changes it did not make (an undo, the assistant).
+    pub fn history_count(&self) -> u64 {
+        self.history
+    }
+
     /// Set the project name and fields while a form is open, so the page shows each change at
     /// once. The form's changes since [`Open::start_live_form`] stay one undo step while nothing
     /// else changes the history. An empty name is not applied (it is being typed).
@@ -960,6 +966,32 @@ pub(crate) mod tests {
         assert!(!o.can_redo());
         o.revert_live(since, &before);
         assert!(!o.can_undo(), "nothing changed, nothing undone");
+    }
+
+    /// The cover form's flow in `main.rs`: it refreshes its buffer when the history count moved
+    /// without it, and records the count after each of its own edits.
+    #[test]
+    fn the_form_buffer_follows_an_undo_so_a_later_edit_keeps_it() {
+        let (_tmp, mut o) = project();
+        o.start_live_form();
+        let mut buffer = fields(&[("customer", "A")]);
+        o.set_project_props_live("Test", &buffer);
+        let seen = o.history_count();
+        // Undo from the toolbar while the form is open.
+        assert!(o.undo());
+        assert_ne!(o.history_count(), seen, "the form notices the undo");
+        buffer = o
+            .project
+            .meta
+            .title_block
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // Editing another field now does not bring customer A back.
+        buffer.push(("revision".into(), "B".into()));
+        o.set_project_props_live("Test", &buffer);
+        assert!(!o.project.meta.title_block.contains_key("customer"));
+        assert_eq!(o.project.meta.title_block["revision"], "B");
     }
 
     #[test]
