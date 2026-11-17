@@ -2208,6 +2208,7 @@ mod tests {
             open_url: Vec::new(),
             logged: Default::default(),
             share: Default::default(),
+            symbol_editor: None,
         };
         (tmp, app)
     }

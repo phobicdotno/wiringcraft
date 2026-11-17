@@ -100,7 +100,16 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Assistant),
         ],
     ),
-    ("Library", &[Some(Action::LibraryStatus), Some(Action::LibraryUpdate)]),
+    (
+        "Library",
+        &[
+            Some(Action::LibraryStatus),
+            Some(Action::LibraryUpdate),
+            None,
+            Some(Action::NewSymbol),
+            Some(Action::EditSymbol),
+        ],
+    ),
     (
         "Versions",
         &[
