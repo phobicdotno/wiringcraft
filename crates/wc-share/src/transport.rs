@@ -5,38 +5,124 @@
 //! ([`encode`] / [`decode`]), and plugs into [`Hub`] the same way.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::{Error, GuestMsg, Host, HostMsg, PeerId, Result};
 
+/// Why a connection ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The other side ended it in order: it closed the socket or dropped its end.
+    Ended,
+    /// The other side sent a line longer than the limit (bytes).
+    LineTooLong { max: usize },
+    /// The other side sent a line that is not a session message.
+    BadMessage(String),
+    /// Reading from the connection failed.
+    ReadFailed(String),
+    /// A write did not finish in time: the other side stopped reading.
+    WriteTimedOut,
+    /// Writing to the connection failed.
+    WriteFailed(String),
+}
+
+impl CloseReason {
+    /// Whether the connection ended in order rather than failing.
+    pub fn is_orderly(&self) -> bool {
+        matches!(self, Self::Ended)
+    }
+}
+
+impl fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ended => write!(f, "the other side closed the connection"),
+            Self::LineTooLong { max } => write!(f, "the other side sent a line longer than {max} bytes"),
+            Self::BadMessage(why) => write!(f, "the other side sent something that is not a session message ({why})"),
+            Self::ReadFailed(why) => write!(f, "reading from the network failed ({why})"),
+            Self::WriteTimedOut => write!(f, "the other side stopped taking messages (write timed out)"),
+            Self::WriteFailed(why) => write!(f, "writing to the network failed ({why})"),
+        }
+    }
+}
+
+/// Where a link's worker threads leave why the connection ended. The first reason stays: a
+/// failed write closes the socket, and the reader's end of stream that follows is not the cause.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CloseSlot(Arc<Mutex<Option<CloseReason>>>);
+
+impl CloseSlot {
+    /// Keep `reason` unless one is already kept.
+    pub(crate) fn set(&self, reason: CloseReason) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(reason);
+    }
+
+    fn get(&self) -> Option<CloseReason> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
 /// One end of a connection: sends `S`, receives `R`.
 #[derive(Debug)]
 pub struct Link<S, R> {
     tx: Sender<S>,
     rx: Receiver<R>,
+    reason: CloseSlot,
+    /// Set once a receive or send found the connection closed.
+    closed: AtomicBool,
 }
 
 impl<S, R> Link<S, R> {
-    /// A link over existing channels; the network transport feeds them from a socket.
-    pub(crate) fn from_channels(tx: Sender<S>, rx: Receiver<R>) -> Self {
-        Self { tx, rx }
+    fn new(tx: Sender<S>, rx: Receiver<R>, reason: CloseSlot) -> Self {
+        Self {
+            tx,
+            rx,
+            reason,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// A link over existing channels; the network transport feeds them from a socket and
+    /// leaves the reason it closed in `reason`.
+    pub(crate) fn from_channels(tx: Sender<S>, rx: Receiver<R>, reason: CloseSlot) -> Self {
+        Self::new(tx, rx, reason)
     }
 
     pub fn send(&self, msg: S) -> Result<()> {
-        self.tx.send(msg).map_err(|_| Error::Closed)
+        self.tx.send(msg).map_err(|_| {
+            self.closed.store(true, Ordering::Relaxed);
+            Error::Closed
+        })
     }
 
     /// The next message if one has arrived, `Ok(None)` if not, `Err(Closed)` once the other end
-    /// is gone and everything it sent was read.
+    /// is gone and everything it sent was read. [`Self::close_reason`] then says why.
     pub fn try_recv(&self) -> Result<Option<R>> {
         match self.rx.try_recv() {
             Ok(m) => Ok(Some(m)),
             Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(Error::Closed),
+            Err(TryRecvError::Disconnected) => {
+                self.closed.store(true, Ordering::Relaxed);
+                Err(Error::Closed)
+            }
         }
+    }
+
+    /// Why the connection ended: `None` while it is open (or before a receive or send found it
+    /// closed), else whether it ended in order or why it failed.
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        self.reason
+            .get()
+            .or_else(|| self.closed.load(Ordering::Relaxed).then_some(CloseReason::Ended))
     }
 
     /// Every message that has arrived so far.
@@ -55,14 +141,8 @@ pub fn pair() -> (GuestLink, HostLink) {
     let (to_host, from_guest) = channel();
     let (to_guest, from_host) = channel();
     (
-        Link {
-            tx: to_host,
-            rx: from_host,
-        },
-        Link {
-            tx: to_guest,
-            rx: from_guest,
-        },
+        Link::new(to_host, from_host, CloseSlot::default()),
+        Link::new(to_guest, from_guest, CloseSlot::default()),
     )
 }
 
@@ -83,6 +163,8 @@ pub fn decode<T: DeserializeOwned>(line: &str) -> Result<T> {
 #[derive(Debug, Default)]
 pub struct Hub {
     links: BTreeMap<PeerId, HostLink>,
+    /// Connections that ended without the guest leaving, with why, for [`Hub::take_closed`].
+    closed: Vec<(PeerId, CloseReason)>,
 }
 
 impl Hub {
@@ -121,6 +203,8 @@ impl Hub {
                     }
                     Ok(None) => break,
                     Err(_) => {
+                        self.closed
+                            .push((id, link.close_reason().unwrap_or(CloseReason::Ended)));
                         gone.push(id);
                         break;
                     }
@@ -140,11 +224,22 @@ impl Hub {
             let last = matches!(msg, HostMsg::Declined | HostMsg::Closed);
             let failed = self.links.get(&to).is_some_and(|link| link.send(msg).is_err());
             if last || failed {
-                self.links.remove(&to);
+                if let Some(link) = self.links.remove(&to)
+                    && failed
+                {
+                    self.closed
+                        .push((to, link.close_reason().unwrap_or(CloseReason::Ended)));
+                }
                 if failed {
                     host.disconnect(to);
                 }
             }
         }
+    }
+
+    /// Connections that closed since the last call without the guest saying it leaves, with
+    /// why, oldest first: for the log or the session window.
+    pub fn take_closed(&mut self) -> Vec<(PeerId, CloseReason)> {
+        std::mem::take(&mut self.closed)
     }
 }

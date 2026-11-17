@@ -6,7 +6,8 @@
 //! threads per socket, and the window polls the link each frame without blocking.
 //!
 //! A line longer than the limit, or one that is not a valid message, closes that connection
-//! only. A closed connection reads as [`Error::Closed`], so the hub releases the guest's locks.
+//! only. A closed connection reads as [`Error::Closed`], so the hub releases the guest's locks;
+//! [`Link::close_reason`] then says whether it ended in order or why it failed.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -17,7 +18,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::transport::{GuestLink, Hub, Link, decode, encode};
+use crate::transport::{CloseReason, CloseSlot, GuestLink, Hub, Link, decode, encode};
 use crate::{Error, Host, PeerId, Result};
 
 /// The longest line read from a peer by default: 64 MiB, room for the whole project sent on
@@ -139,19 +140,43 @@ where
     let control = stream.try_clone()?;
     let (to_link, from_net) = sync_channel::<R>(cap);
     let (to_net, from_link) = channel::<S>();
+    let reason = CloseSlot::default();
 
+    let read_reason = reason.clone();
     thread::Builder::new().name("wc-share-read".into()).spawn(move || {
         let mut reader = BufReader::new(read_half);
         let mut line = Vec::new();
-        // Ends at the end of the stream, on a read error or on an over-long line.
-        while let Ok(true) = read_line(&mut reader, &mut line, max_line) {
+        loop {
+            match read_line(&mut reader, &mut line, max_line) {
+                Ok(true) => {}
+                Ok(false) => {
+                    read_reason.set(CloseReason::Ended);
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                    read_reason.set(CloseReason::LineTooLong { max: max_line });
+                    break;
+                }
+                Err(e) => {
+                    read_reason.set(CloseReason::ReadFailed(e.to_string()));
+                    break;
+                }
+            }
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let msg = match std::str::from_utf8(&line).map(decode::<R>) {
-                Ok(Ok(msg)) => msg,
-                _ => break,
+            let msg = match std::str::from_utf8(&line) {
+                Ok(text) => decode::<R>(text).map_err(|e| e.to_string()),
+                Err(_) => Err("not UTF-8 text".to_owned()),
             };
+            let msg = match msg {
+                Ok(msg) => msg,
+                Err(why) => {
+                    read_reason.set(CloseReason::BadMessage(why));
+                    break;
+                }
+            };
+            // Fails only when this side dropped its link: nobody is left to tell.
             if to_link.send(msg).is_err() {
                 break;
             }
@@ -162,16 +187,26 @@ where
     })?;
 
     let mut write_half = stream;
+    let write_reason = reason.clone();
     let writer = thread::Builder::new().name("wc-share-write".into()).spawn(move || {
         for msg in from_link.iter() {
-            let ok = encode(&msg)
-                .ok()
-                .is_some_and(|line| write_half.write_all(line.as_bytes()).is_ok());
-            if !ok || write_half.flush().is_err() {
+            let line = match encode(&msg) {
+                Ok(line) => line,
+                Err(e) => {
+                    write_reason.set(CloseReason::WriteFailed(format!("a message could not be encoded: {e}")));
+                    break;
+                }
+            };
+            if let Err(e) = write_half.write_all(line.as_bytes()).and_then(|()| write_half.flush()) {
+                write_reason.set(match e.kind() {
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => CloseReason::WriteTimedOut,
+                    _ => CloseReason::WriteFailed(e.to_string()),
+                });
                 break;
             }
         }
-        // A failed or timed-out write ends here too, which also ends the reader.
+        // A failed or timed-out write ends here too, which also ends the reader; the write's
+        // reason is kept first, so the reader's end of stream does not hide it.
         let _ = write_half.shutdown(Shutdown::Both);
     });
     if let Err(e) = writer {
@@ -180,7 +215,7 @@ where
         return Err(e.into());
     }
 
-    Ok(Link::from_channels(to_net, from_net))
+    Ok(Link::from_channels(to_net, from_net, reason))
 }
 
 /// Read one line, without its `\n`, into `buf`. `Ok(false)` at the end of the stream (a partial
@@ -291,5 +326,74 @@ mod tests {
         io::Read::read_to_end(&mut peer, &mut got)?;
         assert_eq!(got, b"\"hello\"\n");
         Ok(())
+    }
+
+    /// Wait until the link reports closed, then return why.
+    fn reason_after_close(link: &Link<String, String>) -> Option<CloseReason> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            match link.try_recv() {
+                Err(Error::Closed) => return link.close_reason(),
+                _ => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn an_orderly_close_reads_as_ended() -> Result<()> {
+        let (mut peer, ours) = socket_pair()?;
+        let link: Link<String, String> = spawn_link(ours, MAX_LINE)?;
+        assert_eq!(link.close_reason(), None, "open");
+        peer.write_all(b"\"bye\"\n")?;
+        peer.shutdown(Shutdown::Both)?;
+        drop(peer);
+        let reason = reason_after_close(&link);
+        assert_eq!(reason, Some(CloseReason::Ended));
+        assert!(reason.is_some_and(|r| r.is_orderly()));
+        Ok(())
+    }
+
+    #[test]
+    fn an_over_long_line_says_so() -> Result<()> {
+        let (mut peer, ours) = socket_pair()?;
+        let link: Link<String, String> = spawn_link(ours, 8)?;
+        peer.write_all(b"\"far too long for eight\"\n")?;
+        let reason = reason_after_close(&link);
+        assert_eq!(reason, Some(CloseReason::LineTooLong { max: 8 }));
+        assert!(!reason.is_some_and(|r| r.is_orderly()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_message_says_so() -> Result<()> {
+        let (mut peer, ours) = socket_pair()?;
+        let link: Link<String, String> = spawn_link(ours, MAX_LINE)?;
+        peer.write_all(b"{not json\n")?;
+        let reason = reason_after_close(&link);
+        assert!(
+            matches!(&reason, Some(CloseReason::BadMessage(why)) if !why.is_empty()),
+            "{reason:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn text_that_is_not_utf8_is_a_bad_message() -> Result<()> {
+        let (mut peer, ours) = socket_pair()?;
+        let link: Link<String, String> = spawn_link(ours, MAX_LINE)?;
+        peer.write_all(b"\xff\xfe\n")?;
+        assert_eq!(
+            reason_after_close(&link),
+            Some(CloseReason::BadMessage("not UTF-8 text".into()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_reason_names_the_cause_in_words() {
+        let text = CloseReason::LineTooLong { max: 8 }.to_string();
+        assert!(text.contains("longer than 8 bytes"), "{text}");
+        assert!(CloseReason::WriteTimedOut.to_string().contains("timed out"));
     }
 }

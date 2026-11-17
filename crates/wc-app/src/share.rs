@@ -495,7 +495,21 @@ impl Role {
                         crate::applog::warn(&format!("shared session: a connection failed: {e}"));
                     }
                 }
+                // Names before the pump, which forgets who disconnected.
+                let names: std::collections::BTreeMap<_, _> =
+                    h.host.peers().into_iter().map(|p| (p.id, p.name)).collect();
                 h.hub.pump(&mut h.host);
+                for (peer, reason) in h.hub.take_closed() {
+                    let who = names
+                        .get(&peer)
+                        .cloned()
+                        .unwrap_or_else(|| format!("participant {peer}"));
+                    if reason.is_orderly() {
+                        crate::applog::info(&format!("shared session: {who} disconnected: {reason}"));
+                    } else {
+                        crate::applog::warn(&format!("shared session: the connection to {who} failed: {reason}"));
+                    }
+                }
                 for (change, reason) in h.host.take_journal_errors() {
                     notes.push(format!("\"{}\" could not be recorded: {reason}", change.message));
                 }
@@ -510,7 +524,7 @@ impl Role {
                             // A host that declined or ended the session closes the connection
                             // after saying so; only an unexplained close is news.
                             if !matches!(j.guest.status, GuestStatus::Declined | GuestStatus::Closed) {
-                                notes.push("The connection to the host closed.".into());
+                                notes.push(closed_note(&j.link));
                                 j.guest.status = GuestStatus::Closed;
                             }
                             break;
@@ -594,7 +608,22 @@ impl Role {
 
 fn send(link: &GuestLink, msg: GuestMsg, notes: &mut Vec<String>) {
     if link.send(msg).is_err() {
-        notes.push("The connection to the host closed.".into());
+        notes.push(closed_note(link));
+    }
+}
+
+/// The note for a connection to the host that closed without the host saying so: why, when
+/// the link knows, and the same in the log.
+fn closed_note(link: &GuestLink) -> String {
+    match link.close_reason() {
+        Some(reason) if !reason.is_orderly() => {
+            crate::applog::warn(&format!("shared session: the connection to the host failed: {reason}"));
+            format!("The connection to the host failed: {reason}.")
+        }
+        _ => {
+            crate::applog::info("shared session: the host closed the connection");
+            "The connection to the host closed.".into()
+        }
     }
 }
 
