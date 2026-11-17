@@ -32,6 +32,8 @@ pub struct Appearance {
     pub page_id: String,
     pub page_number: String,
     pub column: usize,
+    /// The reference row, 1 for `A`.
+    pub row: usize,
     /// The pins, for contact listings such as `13-14`.
     pub pins: Vec<String>,
     /// The placed symbol's id on its page.
@@ -40,7 +42,12 @@ pub struct Appearance {
 
 impl Appearance {
     pub fn location(&self) -> String {
-        format!("{}.{}", self.page_number, self.column)
+        format!(
+            "{}/{}.{}",
+            self.page_number,
+            self.column,
+            wc_core::project::row_letter(self.row)
+        )
     }
 }
 
@@ -123,11 +130,7 @@ pub fn xref_marks(
                     Some(first) => out.push(XrefMark {
                         at: Point::new(right + 1.5, s.at.y + 0.7 + (below - s.at.y) / 2.0),
                         align: Align::Left,
-                        text: others
-                            .iter()
-                            .map(|a| format!("/{}", a.location()))
-                            .collect::<Vec<_>>()
-                            .join(" "),
+                        text: others.iter().map(|a| a.location()).collect::<Vec<_>>().join(" "),
                         target_page_id: first.page_id.clone(),
                     }),
                     None => warnings.push(format!("page {}: interruption point {tag} has no partner", page.number)),
@@ -151,6 +154,7 @@ impl CrossRefs {
                     page_id: page.id.clone(),
                     page_number: page.number.clone(),
                     column: column_of(page.size, s.at.x),
+                    row: page.size.row_of(s.at.y),
                     pins: sym.pins.iter().map(|p| p.name.clone()).collect(),
                     item: s.id.clone(),
                 };
@@ -281,6 +285,34 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
             2.5,
             Align::Center,
             &(c + 1).to_string(),
+            Ink::Thin,
+            &mut out,
+        );
+    }
+    // Row letters down both sides, in the margin outside the frame, so nothing inside moves.
+    let rows = page.size.frame_rows();
+    let row_h = (y1 - y0) / rows as f64;
+    for r in 0..rows {
+        let ry = y0 + row_h * r as f64;
+        if r > 0 {
+            line((x0 - 3.0, ry), (x0, ry), Ink::Thin, &mut out);
+            line((x1, ry), (x1 + 3.0, ry), Ink::Thin, &mut out);
+        }
+        let letter = wc_core::project::row_letter(r + 1).to_string();
+        let cy = ry + row_h / 2.0 + 0.9;
+        text(
+            (x0 - MARGIN / 2.0, cy),
+            2.5,
+            Align::Center,
+            &letter,
+            Ink::Thin,
+            &mut out,
+        );
+        text(
+            (x1 + MARGIN / 2.0, cy),
+            2.5,
+            Align::Center,
+            &letter,
             Ink::Thin,
             &mut out,
         );
