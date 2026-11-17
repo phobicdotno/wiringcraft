@@ -10,6 +10,7 @@ pub mod dxf;
 pub mod eplan;
 pub mod kicad;
 pub mod pdf;
+pub mod qet;
 pub mod raster;
 pub mod svg;
 pub mod swe;

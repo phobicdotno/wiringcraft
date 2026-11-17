@@ -37,14 +37,12 @@ These branches can be deleted once their pull requests are merged.
 
 | Gap | Where it shows | Todo |
 |---|---|---|
-| QElectroTech `.elmt` elements are not read | `docs/manufacturer-data.md` | #91 |
 | EDZ exchange files (EPLAN macros and parts) are not read | `docs/manufacturer-data.md` | #93 (parts first; macros follow) |
 | DXF: ELLIPSE, SPLINE and HATCH are skipped | `crates/wc-import/src/dxf.rs`, `docs/manufacturer-data.md` | #95 |
 | KiCad: only the first unit of a multi-unit symbol; `.kicad_sym` inside a zip is listed, not imported | `crates/wc-import/src/kicad.rs`, `crates/wc-import/src/archive.rs` | #96 |
 | SolidWorks Electrical: symbol and page graphics from DWG | `crates/wc-import/src/swe.rs` | #59 |
 | SolidWorks Electrical: cabinet layouts, cover page, library parts, own symbols | `crates/wc-import/src/swe.rs` | #60, #61, #62, #71 |
 | SolidWorks Electrical: terminal jumpers made in the terminal strip editor are counted in the import report, not imported (WiringCraft has no jumpers yet) | `crates/wc-import/src/swe.rs` | #108 |
-| SolidWorks Electrical: tag paths stored with spaces instead of `=`/`+`/`-` lose their function and location | `crates/wc-import/src/swe.rs` | #114 |
 | SolidWorks Electrical: a component keeps only its first part ("extra part(s) left out") | `crates/wc-import/src/swe.rs` | #106 (several parts per device) |
 | PDF trace: pictures compressed other than Flate or DCT, or not 1-bit gray, 8-bit gray or 8-bit RGB, are refused ("not supported yet") | `crates/wc-import/src/pdf.rs` | To file next (todo limit per run reached) |
 | Binary DXF | `crates/wc-import/src/dxf.rs` | Not planned: the error tells the user to save as ASCII DXF, which every CAD program can do. |

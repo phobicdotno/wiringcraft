@@ -455,3 +455,160 @@ fn the_frame_shows_row_letters_on_both_sides() {
     assert_eq!(count("H"), 2, "A2 has eight rows");
     assert_eq!(count("I"), 0);
 }
+
+#[test]
+fn the_cover_and_every_title_block_show_the_same_project_fields() {
+    let mut project = wc_core::Project::new("Pump station");
+    let tb = &mut project.meta.title_block;
+    tb.insert("customer".into(), "ACME Water".into());
+    tb.insert("description".into(), "Two duty pumps".into());
+    tb.insert("revision".into(), "B".into());
+    tb.insert("contract".into(), "K-77".into());
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    let schematic = Page::new("p2", "2", "Motors");
+    let texts = |page: &Page, project: &wc_core::Project| -> Vec<String> {
+        layout::frame_marks(project, page, 0, 2, "2026-11-17")
+            .into_iter()
+            .filter_map(|m| match m.shape {
+                Shape::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    };
+    let count = |v: &[String], t: &str| v.iter().filter(|x| *x == t).count();
+    let on_cover = texts(&cover, &project);
+    // Once in the cover's table, once in its title block.
+    assert_eq!(count(&on_cover, "ACME Water"), 2, "{on_cover:?}");
+    assert_eq!(
+        count(&on_cover, "Pump station"),
+        2,
+        "large on the cover and in the title block"
+    );
+    assert_eq!(count(&on_cover, "Two duty pumps"), 1);
+    assert_eq!(count(&on_cover, "K-77"), 1, "other fields are listed too");
+    assert_eq!(
+        count(&on_cover, "Project number"),
+        1,
+        "standard fields show even when empty"
+    );
+    assert_eq!(
+        count(&on_cover, "2026-11-17"),
+        2,
+        "the export date when the project has none"
+    );
+    let on_page = texts(&schematic, &project);
+    assert_eq!(
+        count(&on_page, "ACME Water"),
+        1,
+        "a normal page has only its title block"
+    );
+    assert_eq!(count(&on_page, "Two duty pumps"), 0);
+
+    // Edit the field once: the cover and every title block follow.
+    project
+        .meta
+        .title_block
+        .insert("customer".into(), "Nordic Water".into());
+    assert_eq!(count(&texts(&cover, &project), "Nordic Water"), 2);
+    assert_eq!(count(&texts(&schematic, &project), "Nordic Water"), 1);
+    assert_eq!(count(&texts(&cover, &project), "ACME Water"), 0);
+}
+
+#[test]
+fn a_blank_date_shows_the_export_date_on_the_cover_and_in_the_title_block() -> Result<(), String> {
+    let mut project = wc_core::Project::new("x");
+    project.meta.title_block.insert("date".into(), "  ".into());
+    project
+        .meta
+        .title_block
+        .insert("description".into(), "A very long description ".repeat(30));
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = wc_core::PageSize::A4;
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let dates = marks
+        .iter()
+        .filter(|m| matches!(&m.shape, Shape::Text { text, .. } if text == "2026-11-17"))
+        .count();
+    assert_eq!(dates, 2, "cover table and title block");
+    // The long description is drawn smaller so it fits inside the A4 frame.
+    let desc = marks
+        .iter()
+        .find_map(|m| match &m.shape {
+            Shape::Text { text, height, .. } if text.starts_with("A very long") => Some((text.clone(), *height)),
+            _ => None,
+        })
+        .ok_or("no description on the cover")?;
+    assert!(
+        crate::writer::text_width_mm(&desc.0, desc.1) <= 297.0 - 20.0,
+        "{desc:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn long_cover_table_labels_and_values_stay_in_their_columns() -> Result<(), String> {
+    let mut project = wc_core::Project::new("x");
+    let label = "Contractor reference for the site".repeat(3);
+    let value = "W".repeat(80);
+    project.meta.title_block.insert(label.clone(), value.clone());
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let width_of = |wanted: &str| {
+        marks
+            .iter()
+            .find_map(|m| match &m.shape {
+                Shape::Text { text, height, .. } if text == wanted => Some(crate::writer::text_width_mm(text, *height)),
+                _ => None,
+            })
+            .ok_or(format!("{wanted:?} not on the cover"))
+    };
+    // The table is at most 180 mm wide: 35 % for labels, 65 % for values, less 3 mm padding.
+    let (label_w, value_w) = (width_of(&label)?, width_of(&value)?);
+    assert!(label_w <= 180.0 * 0.35 - 3.0 + 1e-6, "label {label_w} mm");
+    assert!(value_w <= 180.0 * 0.65 - 3.0 + 1e-6, "value {value_w} mm");
+    // Em dashes are 1000 units wide in Helvetica: measured on their own, the fitted row stays
+    // inside the value column too.
+    let dashes = "\u{2014}".repeat(120);
+    project.meta.title_block.insert("Site notes".into(), dashes.clone());
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let height = marks
+        .iter()
+        .find_map(|m| match &m.shape {
+            Shape::Text { text, height, .. } if *text == dashes => Some(*height),
+            _ => None,
+        })
+        .ok_or("the dashes are not on the cover")?;
+    let dash_w = 120.0 * height / 0.72;
+    assert!(dash_w <= 180.0 * 0.65 - 3.0 + 1e-6, "dashes {dash_w} mm");
+    Ok(())
+}
+
+#[test]
+fn text_widths_are_helvetica_advance_widths() {
+    // Adobe Helvetica AFM: W 944, O 778, H 722, e 556, l 222, o 556, i 222, space 278.
+    let em_mm = |units: f64| units / 1000.0 * (10.0 / 0.72);
+    // Accented: aring, eacute 556, oslash 611; emdash 1000, endash 556; `?` 556 for what
+    // `pdf_text` cannot encode.
+    for (text, units) in [
+        ("W", 944.0),
+        ("O", 778.0),
+        ("Hello", 2278.0),
+        ("i i", 722.0),
+        ("å", 556.0),
+        ("é", 556.0),
+        ("ø", 611.0),
+        ("\u{2014}", 1000.0),
+        ("\u{2013}", 556.0),
+        ("\u{4e2d}", 556.0),
+    ] {
+        let measured = crate::writer::text_width_mm(text, 10.0);
+        assert!(
+            (measured - em_mm(units)).abs() < 1e-9,
+            "{text:?}: {measured} mm, want {} mm",
+            em_mm(units)
+        );
+    }
+}
