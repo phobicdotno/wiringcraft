@@ -239,10 +239,19 @@ enum PageCmd {
         title: String,
         #[arg(long, default_value = "A3")]
         size: String,
+        /// An overview (line diagram): its devices do not count as drawings in `check`.
+        #[arg(long)]
+        overview: bool,
     },
     List,
     Remove {
         id: String,
+    },
+    /// Mark a page as an overview (line diagram), or with `--off` as a normal page again.
+    Overview {
+        id: String,
+        #[arg(long)]
+        off: bool,
     },
 }
 
@@ -587,12 +596,14 @@ fn run(cli: Cli) -> Res<()> {
                     number,
                     title,
                     size,
+                    overview,
                 } => {
                     store::check_id(&id).map_err(e)?;
                     if p.page(&id).is_some() {
                         return Err(format!("page {id:?} exists"));
                     }
                     let mut page = Page::new(id, number, title);
+                    page.overview = overview;
                     page.size = match size.to_uppercase().as_str() {
                         "A4" => PageSize::A4,
                         "A3" => PageSize::A3,
@@ -605,12 +616,13 @@ fn run(cli: Cli) -> Res<()> {
                 PageCmd::List => {
                     for pg in &p.pages {
                         println!(
-                            "{:<10} {:<6} {} ({} symbols, {} wires)",
+                            "{:<10} {:<6} {} ({} symbols, {} wires){}",
                             pg.id,
                             pg.number,
                             pg.title,
                             pg.symbols.len(),
-                            pg.wires.len()
+                            pg.wires.len(),
+                            if pg.overview { ", overview" } else { "" }
                         );
                     }
                     return Ok(());
@@ -621,6 +633,14 @@ fn run(cli: Cli) -> Res<()> {
                     if p.pages.len() == before {
                         return Err(format!("no page {id:?}"));
                     }
+                }
+                PageCmd::Overview { id, off } => {
+                    let page = p
+                        .pages
+                        .iter_mut()
+                        .find(|pg| pg.id == id)
+                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    page.overview = !off;
                 }
             }
             save(dir, &p)?;

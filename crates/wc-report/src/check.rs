@@ -89,7 +89,8 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
     }
 
     // Devices drawn twice: one tag on two coils, or on two copies of the same standalone symbol
-    // or terminal. Contacts may repeat (a relay has several).
+    // or terminal. Contacts may repeat (a relay has several). An overview page (line diagram)
+    // shows devices again on purpose, so its symbols do not count here.
     let mut seen: BTreeMap<(DeviceTag, String), Vec<(&Page, &str)>> = BTreeMap::new();
     let mut mains: BTreeSet<DeviceTag> = BTreeSet::new();
     for page in &p.pages {
@@ -98,11 +99,14 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
             match role(&s.symbol) {
                 Some(SymbolRole::Main) => {
                     mains.insert(tag.clone());
+                    if page.overview {
+                        continue;
+                    }
                     seen.entry((tag.clone(), "main".into()))
                         .or_default()
                         .push((page, &s.id));
                 }
-                Some(SymbolRole::Standalone | SymbolRole::Terminal) => {
+                Some(SymbolRole::Standalone | SymbolRole::Terminal) if !page.overview => {
                     seen.entry((tag.clone(), s.symbol.clone()))
                         .or_default()
                         .push((page, &s.id));
