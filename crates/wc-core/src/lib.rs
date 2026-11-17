@@ -3,6 +3,7 @@
 //! A project is a folder of small, deterministic text files (see [`store`]) so it can be
 //! diffed, merged and recovered with ordinary tools.
 
+pub mod autowire;
 pub mod connectivity;
 pub mod error;
 pub mod geom;

@@ -62,6 +62,9 @@ pub struct Editor {
     /// A device being dragged in the panel view: the grab offset and whether the undo
     /// checkpoint was taken.
     pub panel_drag: Option<(Point, bool)>,
+    /// Wire pins that line up when a symbol is placed or moved (the app sets it from the
+    /// preferences). Holding Alt skips it once.
+    pub auto_wire: bool,
 }
 
 impl Default for Editor {
@@ -83,6 +86,7 @@ impl Default for Editor {
             panel: None,
             panel_pick: None,
             panel_drag: None,
+            auto_wire: false,
         }
     }
 }
@@ -835,7 +839,37 @@ fn select_tool(
         _ => {}
     }
     if resp.drag_stopped() {
+        if let Some(Drag::Move { checkpoint: true, .. }) = ed.drag {
+            let moved = ed
+                .selection
+                .iter()
+                .filter_map(|s| match s {
+                    Selection::Symbol(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            let wired = auto_wire(open, ed, &resp.ctx, moved);
+            if wired > 0 {
+                ed.message = wired_note(wired).trim_start().to_owned();
+            }
+        }
         ed.drag = None;
+    }
+}
+
+/// Wire the pins of `items` that now line up, unless auto-wiring is off or Alt is held.
+fn auto_wire(open: &mut Open, ed: &Editor, ctx: &egui::Context, items: std::collections::BTreeSet<String>) -> usize {
+    if !ed.auto_wire || items.is_empty() || ctx.input(|i| i.modifiers.alt) {
+        return 0;
+    }
+    open.auto_wire(ed.page, &items)
+}
+
+fn wired_note(n: usize) -> String {
+    match n {
+        0 => String::new(),
+        1 => " Connected 1 wire to pins that line up (hold Alt to skip).".into(),
+        n => format!(" Connected {n} wires to pins that line up (hold Alt to skip)."),
     }
 }
 
@@ -917,8 +951,9 @@ fn place_tool(
         }
         match open.place(ed.page, &id, at) {
             Ok(sid) => {
+                let wired = auto_wire(open, ed, &resp.ctx, std::iter::once(sid.clone()).collect());
                 ed.select_only(Selection::Symbol(sid));
-                ed.message = format!("Placed {id}.");
+                ed.message = format!("Placed {id}.{}", wired_note(wired));
             }
             Err(e) => ed.message = format!("Could not place {id}: {e}"),
         }

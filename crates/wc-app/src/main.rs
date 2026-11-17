@@ -120,6 +120,7 @@ impl chrome::Status for StatusView<'_> {
             Action::LineTool => self.ed.tool == Tool::Line,
             Action::RectTool => self.ed.tool == Tool::Rect,
             Action::ToggleGrid => self.prefs.show_grid,
+            Action::ToggleAutoWire => self.prefs.auto_wire,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
             Action::ToggleTheme => self.prefs.theme == theme::Mode::Dark,
             Action::Assistant => self.prefs.show_assistant,
@@ -135,6 +136,7 @@ impl chrome::Status for StatusView<'_> {
             | Action::ToggleChrome
             | Action::ToggleTheme
             | Action::ToggleGrid
+            | Action::ToggleAutoWire
             | Action::Assistant
             | Action::ReportProblem
             | Action::RequestFunction
@@ -248,6 +250,15 @@ impl App {
             Action::ToggleGrid => {
                 self.prefs.show_grid = !self.prefs.show_grid;
                 self.prefs.save();
+            }
+            Action::ToggleAutoWire => {
+                self.prefs.auto_wire = !self.prefs.auto_wire;
+                self.prefs.save();
+                self.ed.message = if self.prefs.auto_wire {
+                    "Auto-wiring is on: pins that line up get a wire (hold Alt to skip once).".into()
+                } else {
+                    "Auto-wiring is off.".into()
+                };
             }
             Action::Assistant => {
                 self.prefs.show_assistant = !self.prefs.show_assistant;
@@ -1579,6 +1590,7 @@ impl eframe::App for App {
                     });
                 });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
+                self.ed.auto_wire = self.prefs.auto_wire;
                 canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
             });
         } else {

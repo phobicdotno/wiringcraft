@@ -39,6 +39,7 @@ pub enum Action {
     ZoomOut,
     ZoomFit,
     ToggleGrid,
+    ToggleAutoWire,
     LibraryStatus,
     LibraryUpdate,
     ExportPdf,
@@ -104,6 +105,7 @@ impl Action {
         Action::ZoomOut,
         Action::ZoomFit,
         Action::ToggleGrid,
+        Action::ToggleAutoWire,
         Action::LibraryStatus,
         Action::LibraryUpdate,
         Action::ExportPdf,
@@ -277,6 +279,12 @@ impl Action {
             Action::ZoomOut => i("Zoom out", "Zoom out", Icon::ZoomOut, "-"),
             Action::ZoomFit => i("Fit page", "Show the whole page", Icon::ZoomFit, "F"),
             Action::ToggleGrid => i("Grid", "Show or hide the grid", Icon::Grid, "G"),
+            Action::ToggleAutoWire => i(
+                "Auto-wire",
+                "Draw wires between pins that line up when a symbol is placed or moved (hold Alt to skip once)",
+                Icon::Wire,
+                "",
+            ),
             Action::LibraryStatus => i(
                 "Library",
                 "Compare the project's library items with the library",
