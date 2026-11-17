@@ -56,6 +56,13 @@ pub enum ProjectEdit {
     Renumber { numbers: Vec<(String, String)> },
     /// Replace the project's properties (name, title block, locations, jumpers, settings).
     SetMeta { meta: Box<ProjectMeta> },
+    /// Replace the content of several existing pages at once, for a tool that changes pages
+    /// other than the one the author has open (wire numbering, a device tag renamed on every
+    /// page). Display numbers are kept: only `Renumber` changes them. `before` holds each page
+    /// as the author last had it, in the same order: when one of them has changed on the host
+    /// since, the edit is refused, so a copy that had not yet seen someone else's change cannot
+    /// undo it. Also refused as a whole when someone else has one of the pages open.
+    SetPages { pages: Vec<Page>, before: Vec<Page> },
 }
 
 impl ProjectEdit {
@@ -71,6 +78,10 @@ impl ProjectEdit {
             Self::RemovePage { id } => format!("Remove page {id}"),
             Self::Renumber { numbers } => format!("Renumber {} pages", numbers.len()),
             Self::SetMeta { .. } => "Change project properties".to_owned(),
+            Self::SetPages { pages, .. } => match pages.as_slice() {
+                [p] => format!("Edit page {} {}", p.number, p.title),
+                _ => format!("Edit {} pages", pages.len()),
+            },
         }
     }
 
@@ -80,6 +91,10 @@ impl ProjectEdit {
             Self::SetComments { page, .. } => Some(page),
             Self::AddPage { page } => Some(&page.id),
             Self::RemovePage { id } => Some(id),
+            Self::SetPages { pages, .. } => match pages.as_slice() {
+                [p] => Some(&p.id),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -222,7 +237,32 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
             project.sort_pages();
         }
         ProjectEdit::SetMeta { meta } => project.meta = (**meta).clone(),
+        ProjectEdit::SetPages { pages, .. } => {
+            for page in pages {
+                if let Some(p) = project.page_mut(&page.id) {
+                    let number = std::mem::take(&mut p.number);
+                    *p = page.clone();
+                    p.number = number;
+                }
+            }
+        }
     }
+}
+
+/// Two versions of a page, ignoring the display number (only `Renumber` changes that). The
+/// app uses the same rule to see what changed, so change detection and the host's stale check
+/// agree.
+pub fn same_but_number(a: &Page, b: &Page) -> bool {
+    if a.number == b.number {
+        return a == b;
+    }
+    let mut b = b.clone();
+    b.number = a.number.clone();
+    *a == b
+}
+
+fn now_number(project: &Project, id: &str) -> String {
+    project.page(id).map_or_else(|| id.to_owned(), |p| p.number.clone())
 }
 
 /// Whether `edit` can be applied by `by`, given who holds which page.
@@ -284,5 +324,33 @@ pub(crate) fn check_edit(
             Ok(())
         }
         ProjectEdit::SetMeta { .. } => Ok(()),
+        ProjectEdit::SetPages { pages, before } => {
+            if pages.len() != before.len() || pages.iter().zip(before).any(|(p, b)| p.id != b.id) {
+                return invalid("the pages and what they were before do not match".into());
+            }
+            let mut ids = std::collections::BTreeSet::new();
+            for (page, was) in pages.iter().zip(before) {
+                known(&page.id)?;
+                if !ids.insert(page.id.as_str()) {
+                    return invalid(format!("page {} is listed twice", page.id));
+                }
+                if project.page(&page.id).is_some_and(|now| !same_but_number(now, was)) {
+                    return invalid(format!(
+                        "page {} was changed by someone else meanwhile; do it again on the new page",
+                        now_number(project, &page.id)
+                    ));
+                }
+                match locks.get(&page.id) {
+                    Some(&holder) if holder != by => {
+                        return Err(Refusal::PageLocked {
+                            page: page.id.clone(),
+                            by: holder,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
     }
 }

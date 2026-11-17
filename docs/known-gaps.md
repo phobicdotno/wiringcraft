@@ -65,8 +65,9 @@ These branches can be deleted once their pull requests are merged.
 The core (#79), the network transport (#74), discovery (#75) and the app's Share session and
 Join session (#76) are in. In a session the app sends every change to the open page as one page
 edit and project-level changes (devices, comments, panels, pages, project properties) as project
-edits; Undo is off. Still open: page tools that change pages other people hold, such as wire
-numbering (#77), and undo per change (#78). #43 tracks them.
+edits; Undo is off. Tools that change pages nobody else has open (wire numbering, a tag renamed
+on every page) send those pages together as one change (#77); wire numbering leaves pages other
+people hold as they are and says which. Still open: undo per change (#78). #43 tracks it.
 
 ## Planning and integrations
 

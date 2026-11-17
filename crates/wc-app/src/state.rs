@@ -100,6 +100,31 @@ pub struct MacroEntry {
     pub error: Option<String>,
 }
 
+/// What [`Open::number_wires`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WireNumbering {
+    pub done: wc_core::numbering::Numbered,
+    /// Numbers of the pages left alone because someone else has them open.
+    pub skipped: Vec<String>,
+}
+
+impl WireNumbering {
+    /// One line for the person who asked.
+    pub fn report(&self) -> String {
+        let mut s = format!(
+            "Numbered {} connection(s); {} wire(s) changed. Existing numbers were kept.",
+            self.done.connections, self.done.wires
+        );
+        if !self.skipped.is_empty() {
+            s.push_str(&format!(
+                " Page(s) {} were left as they are: someone else has them open. Number again once they are free.",
+                self.skipped.join(", ")
+            ));
+        }
+        s
+    }
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
@@ -127,6 +152,9 @@ pub struct Open {
     /// The terminal numbering before the change in progress (taken at its checkpoint), so
     /// jumpers can follow their terminals once it is done.
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+    /// In a shared session, the pages someone else has open (page id to their name). Tools that
+    /// work on every page leave these alone; the session would refuse the change otherwise.
+    pub held_by_others: BTreeMap<String, String>,
 }
 
 impl Open {
@@ -149,6 +177,7 @@ impl Open {
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
             terminals_before: None,
+            held_by_others: BTreeMap::new(),
         };
         me.refresh_library();
         Ok(me)
@@ -623,8 +652,10 @@ impl Open {
     }
 
     /// Number the wires by `rule`, keeping numbers already given. One undo step; nothing is
-    /// recorded when no number changes.
-    pub fn number_wires(&mut self, rule: wc_core::numbering::Rule) -> wc_core::numbering::Numbered {
+    /// recorded when no number changes. In a shared session the pages someone else has open
+    /// keep their wires as they are; their numbers are listed in `skipped`, and a later run
+    /// gives their wires the numbers their connections got elsewhere.
+    pub fn number_wires(&mut self, rule: wc_core::numbering::Rule) -> WireNumbering {
         self.follow_terminals();
         let mut project = self.project.clone();
         let symbols = &self.symbols;
@@ -641,11 +672,35 @@ impl Open {
                 }
             },
         );
+        let mut done = done;
+        let mut skipped = Vec::new();
+        if !self.held_by_others.is_empty() {
+            for (new, old) in project.pages.iter_mut().zip(&self.project.pages) {
+                if self.held_by_others.contains_key(&new.id) && new != old {
+                    skipped.push(old.number.clone());
+                    *new = old.clone();
+                }
+            }
+            if !skipped.is_empty() {
+                // Count again what is left: only the pages that were really changed.
+                let mut numbers = std::collections::BTreeSet::new();
+                done.wires = 0;
+                for (new, old) in project.pages.iter().zip(&self.project.pages) {
+                    for (w, was) in new.wires.iter().zip(&old.wires) {
+                        if w.number != was.number {
+                            done.wires += 1;
+                            numbers.insert(w.number.clone());
+                        }
+                    }
+                }
+                done.connections = numbers.len();
+            }
+        }
         if done.wires > 0 {
             self.checkpoint();
             self.project = project;
         }
-        done
+        WireNumbering { done, skipped }
     }
 
     pub fn duplicate_page(&mut self, page: usize) -> Option<usize> {
@@ -1763,7 +1818,7 @@ pub(crate) mod tests {
         o.add_wire(page, pin(&k1, "A2"), pin(&k2, "A1"), Vec::new());
         o.checkpoint();
         o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(5.0, 20.0);
-        assert!(o.number_wires(wc_core::numbering::Rule::Sequential).wires > 0);
+        assert!(o.number_wires(wc_core::numbering::Rule::Sequential).done.wires > 0);
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
         o.set_device_property(&x2, "note", "x");
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);

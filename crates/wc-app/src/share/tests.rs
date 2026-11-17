@@ -26,9 +26,18 @@ impl Log {
     }
 }
 
-/// A project folder with a cover and two pages, opened as the app opens it.
+/// A project folder with a cover and two pages and the starter library, opened as the app
+/// opens it.
 fn project(dir: &Path) -> std::result::Result<Open, Box<dyn std::error::Error>> {
     let mut p = store::create(dir, "Pump station")?;
+    // The starter symbols, so tests can place symbols.
+    let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    p.meta.libraries.push(wc_core::project::LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: lib.display().to_string(),
+        reference: None,
+    });
     p.pages.push(Page::new("p0002", "2", "Motor"));
     p.pages.push(Page::new("p0003", "3", "Valves"));
     store::save(dir, &p)?;
@@ -112,7 +121,17 @@ type Session = (Share, Log, Open, Share, Open);
 
 /// Host and guest, joined, each in its own folder.
 fn session(tmp: &Path) -> std::result::Result<Session, Box<dyn std::error::Error>> {
+    session_with(tmp, |_| Ok(()))
+}
+
+/// Like [`session`], with `setup` run on the host's project before it is shared.
+fn session_with(
+    tmp: &Path,
+    setup: impl FnOnce(&mut Open) -> std::result::Result<(), Box<dyn std::error::Error>>,
+) -> std::result::Result<Session, Box<dyn std::error::Error>> {
     let mut host_open = project(&tmp.join("host"))?;
+    setup(&mut host_open)?;
+    host_open.save()?;
     let (mut h, log) = host(&host_open);
     let mut g = guest(&mut h, "Ola", &tmp.join("guest"));
     h.frame(Some(&mut host_open), Some("p0002".into()), false);
@@ -489,5 +508,101 @@ fn a_joined_copy_waits_while_the_window_is_busy() -> TestResult {
     assert!(g.active());
     let joined = g.frame(None, None, false).ok_or("the copy never opened")?;
     assert_eq!(joined.project.pages, host_open.project.pages);
+    Ok(())
+}
+
+#[test]
+fn pages_nobody_has_open_go_out_together_as_one_change() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.project.pages.push(Page::new("p0004", "4", "Terminals"));
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let before = log.messages().len();
+
+    // The guest renames -K1 on its own page, on the cover and on page 4, which nobody has open.
+    let k1 = DeviceTag::parse("-K1")?;
+    guest_open.project.devices.insert(k1.clone(), Device::default());
+    guest_open.project.page_mut("p0001").ok_or("no page")?.title = "Cover -K1".into();
+    guest_open.project.page_mut("p0004").ok_or("no page")?.title = "Terminals -K1".into();
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves -K1".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    // The two pages nobody holds are one change; the guest's own page is its page edit.
+    assert_eq!(
+        log.messages()[before..],
+        ["Change device -K1", "Edit 2 pages", "Edit page 3 Valves -K1"]
+    );
+    assert!(host_open.project.devices.contains_key(&k1));
+    assert_eq!(host_open.project.pages, guest_open.project.pages);
+    assert_eq!(
+        host_open.project.page("p0004").map(|p| p.title.as_str()),
+        Some("Terminals -K1")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_change_to_a_free_page_made_before_someone_elses_change_arrived_is_not_kept() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let before = log.messages().len();
+
+    // The host retitles the cover; in the same moment, before that reaches the guest, the
+    // guest changes the cover too, from the old version.
+    host_open.project.page_mut("p0001").ok_or("no page")?.title = "Revised".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    guest_open.project.page_mut("p0001").ok_or("no page")?.cover = false;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    assert_eq!(log.messages()[before..], ["Edit page 1 Revised"]);
+    assert!(g.take_notes().iter().any(|n| n.contains("changed by someone else")));
+    for (who, o) in [("host", &host_open), ("guest", &guest_open)] {
+        let cover = o.project.page("p0001").ok_or("no page")?;
+        assert_eq!(cover.title, "Revised", "{who}: the earlier change is kept");
+        assert!(cover.cover, "the stale change is not");
+    }
+    Ok(())
+}
+
+#[test]
+fn wire_numbering_in_a_session_leaves_pages_others_hold_and_says_so() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let pin = |item: &str, pin: &str| wc_core::Endpoint::Pin {
+        item: item.into(),
+        pin: pin.into(),
+    };
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        // Two coils joined by a wire on every page.
+        for page in 0..o.project.pages.len() {
+            let a = o.place(page, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+            let b = o.place(page, "wc.coil", wc_core::Point::new(60.0, 160.0))?;
+            o.add_wire(page, pin(&a, "A2"), pin(&b, "A1"), Vec::new());
+        }
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let before = log.messages().len();
+
+    // The host numbers the wires while the guest has page 3 open.
+    host_open.held_by_others = h.held_by_others();
+    let done = host_open.number_wires(wc_core::numbering::Rule::Sequential);
+    assert_eq!(done.skipped, ["3"]);
+    assert_eq!(done.done.wires, 2, "the cover and the host's own page");
+    assert!(done.report().contains("Page(s) 3 were left as they are"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    let numbered = |o: &Open, page: &str| {
+        o.project
+            .page(page)
+            .is_some_and(|p| p.wires.iter().all(|w| w.number.is_some()))
+    };
+    assert!(numbered(&guest_open, "p0001"), "the cover's numbers reached the guest");
+    assert!(numbered(&guest_open, "p0002"));
+    assert!(!numbered(&host_open, "p0003"), "the guest's page was not touched");
+    assert_eq!(host_open.project.pages, guest_open.project.pages);
+    assert_eq!(log.messages()[before..], ["Edit page 1 Cover", "Edit page 2 Motor"]);
     Ok(())
 }
