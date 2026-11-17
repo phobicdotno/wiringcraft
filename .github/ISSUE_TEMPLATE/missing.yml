@@ -1,0 +1,16 @@
+name: Something is missing
+description: A symbol, part, report, import, setting or piece of a workflow that you expected to find. It goes on the todo list.
+labels: [todo]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What is missing
+      description: What you looked for and where you expected it.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: How anyone can check it is there.

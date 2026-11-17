@@ -52,6 +52,9 @@ pub enum Action {
     History,
     CommentTool,
     PageHistory,
+    ReportProblem,
+    RequestFunction,
+    ReportMissing,
     ToggleChrome,
     ToggleTheme,
     Assistant,
@@ -117,6 +120,9 @@ impl Action {
         Action::ToggleChrome,
         Action::ToggleTheme,
         Action::Assistant,
+        Action::ReportProblem,
+        Action::RequestFunction,
+        Action::ReportMissing,
     ];
 
     /// The action's name as the assistant uses it, e.g. `AddPage`.
@@ -184,6 +190,24 @@ impl Action {
                 "Pin a review comment on the sheet: click where it goes",
                 Icon::Comment,
                 "C",
+            ),
+            Action::ReportProblem => i(
+                "Report a problem…",
+                "Something broke or gave a wrong result: write it up on GitHub, where it goes on the todo list",
+                Icon::Check,
+                "",
+            ),
+            Action::RequestFunction => i(
+                "Request a function…",
+                "Ask for something WiringCraft should do: it goes on the todo list on GitHub",
+                Icon::Comment,
+                "",
+            ),
+            Action::ReportMissing => i(
+                "Something is missing…",
+                "A symbol, part, report or setting you expected: it goes on the todo list on GitHub",
+                Icon::Library,
+                "",
             ),
             Action::PageHistory => i(
                 "Page history",

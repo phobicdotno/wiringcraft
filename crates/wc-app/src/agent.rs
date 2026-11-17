@@ -56,6 +56,12 @@ and fix what you broke.
 - Do not save, commit, delete pages, or overwrite files unless the user asked for it or it is plainly part of \
 what they asked. Never invent part numbers; use find_parts.
 - Work only through the WiringCraft tools: do not use shell, file or web tools.
+- Requests make WiringCraft better. When the user reports an error, asks for something WiringCraft cannot do yet, \
+or misses something (a symbol, part, report, setting), and when you hit a tool error that looks like a bug or a \
+capability that is not there, put it on the todo list with the todo tool: search first so you do not file a \
+duplicate, then file it with a title, what and done-when. Show the user the text and ask before filing with \
+confirmed: true; without it the form opens in their browser for them to submit. Keep customer names, project \
+contents and paths out of it. Then carry on with what you can do now.
 - Answer briefly in plain language: what you did, and anything the user should look at. The user cannot see your \
 tool calls in detail.";
 
@@ -431,6 +437,21 @@ pub fn specs() -> Vec<Value> {
             json!({"args": {"type": "array", "items": {"type": "string"}, "description": "Arguments, e.g. [\"plc-vars\", \"export/io.st\"]. The project folder is passed for you."}}),
             &["args"],
         ),
+        tool(
+            "todo",
+            "WiringCraft's todo list (GitHub issues labelled todo, built in order by the project's agents and shipped in later versions). action \"search\": look for an existing todo before filing (needs the GitHub command line). action \"file\": put a problem, a requested function or a missing item on the list. Without confirmed, or without the GitHub command line, it opens the filled-in form in the user's browser for them to read and submit; with confirmed: true and the GitHub command line signed in, it files the issue directly and returns its link. The text is public: describe the problem in general terms, never customer names, project contents or file paths.",
+            json!({
+                "action": {"type": "string", "enum": ["search", "file"]},
+                "query": {"type": "string", "description": "search: words to look for."},
+                "kind": {"type": "string", "enum": ["problem", "function", "missing"], "description": "file: problem (error, crash, wrong result), function (something WiringCraft should do), missing (a symbol, part, report, setting or step that is not there)."},
+                "title": {"type": "string", "description": "file: one line that makes sense on its own, e.g. \"PDF export: wire numbers overlap at 90 degree bends\"."},
+                "what": {"type": "string", "description": "file: what happened or what is wanted, and why it matters."},
+                "detail": {"type": "string", "description": "file: for a problem, how to make it happen again; for a function, an example of using it."},
+                "done": {"type": "string", "description": "file: how anyone can check it is finished."},
+                "confirmed": {"type": "boolean", "description": "file: true only when the user read this text and agreed to file it."}
+            }),
+            &["action"],
+        ),
     ]
 }
 
@@ -762,6 +783,10 @@ impl wc_agent::Tools for AppTools<'_> {
                 format!("{name}: {}", s(input, "action").unwrap_or_default())
             }
             "export" => format!("Exported {}", s(input, "format").unwrap_or_default()),
+            "todo" => match s(input, "action") {
+                Some("file") => format!("Put on the todo list: {}", s(input, "title").unwrap_or_default()),
+                _ => format!("Searched the todo list for {:?}", s(input, "query").unwrap_or_default()),
+            },
             "get_report" => format!("Read the {} report", s(input, "kind").unwrap_or_default()),
             "get_page" => format!("Looked at page {}", s(input, "page").unwrap_or("shown")),
             "find_symbols" | "find_parts" => format!("Searched {:?}", s(input, "query").unwrap_or_default()),
@@ -1252,6 +1277,7 @@ impl App {
                 })
             }
             "run_command" => self.tool_command(v),
+            "todo" => self.tool_todo(v),
             other => Err(format!("Unknown tool {other}.")),
         }
     }
@@ -1827,6 +1853,39 @@ impl App {
         }
     }
 
+    /// Search the todo list, or put a request on it.
+    fn tool_todo(&mut self, v: &Value) -> Result<String, String> {
+        use crate::feedback::{self, Kind, Request};
+        match need_s(v, "action")? {
+            "search" => feedback::search(need_s(v, "query")?),
+            "file" => {
+                let kind = Kind::parse(need_s(v, "kind")?).ok_or("`kind` is problem, function or missing.")?;
+                let r = Request {
+                    title: need_s(v, "title")?.trim().to_owned(),
+                    what: need_s(v, "what")?.trim().to_owned(),
+                    detail: s(v, "detail").unwrap_or_default().trim().to_owned(),
+                    done: s(v, "done").unwrap_or_default().trim().to_owned(),
+                };
+                if r.title.is_empty() || r.what.is_empty() {
+                    return Err("`title` and `what` must not be empty.".into());
+                }
+                let confirmed = v["confirmed"].as_bool().unwrap_or(false);
+                if confirmed && feedback::gh_ready() {
+                    let url = feedback::file(kind, &r)?;
+                    self.ed.message = format!("Filed {url}");
+                    return Ok(format!("Filed on the todo list: {url}"));
+                }
+                self.open_url.push(feedback::form_url(kind, &r));
+                self.ed.message = "Opened a filled-in request on GitHub in your browser.".into();
+                Ok(
+                    "Opened the filled-in form in the user's browser; it is on the todo list once they press Submit."
+                        .into(),
+                )
+            }
+            other => Err(format!("Unknown action {other:?} (search, file).")),
+        }
+    }
+
     fn tool_command(&mut self, v: &Value) -> Result<String, String> {
         let args = strings(v, "args");
         if args.is_empty() {
@@ -1932,6 +1991,7 @@ mod tests {
             copied_text: None,
             applied_theme: crate::theme::Mode::Light,
             assistant: Assistant::with_transport(Arc::new(Script(Mutex::new(answers)))),
+            open_url: Vec::new(),
         };
         (tmp, app)
     }
@@ -2119,6 +2179,49 @@ mod tests {
     }
 
     /// Runs when `WIRINGCRAFT_CLI` points at a built `wiringcraft` program.
+    #[test]
+    fn todo_requests_open_the_filled_in_form_without_the_go_ahead() {
+        let (_tmp, mut a) = app(vec![]);
+        let out = call(
+            &mut a,
+            "todo",
+            json!({"action": "file", "kind": "missing", "title": "4-pole breaker symbol", "what": "No 4-pole breaker in the library"}),
+        )
+        .unwrap();
+        assert!(out.contains("browser"), "{out}");
+        // A second request in the same reply opens its own form too.
+        call(
+            &mut a,
+            "todo",
+            json!({"action": "file", "kind": "function", "title": "Cable plan per cabinet", "what": "Group the cable plan by cabinet"}),
+        )
+        .unwrap();
+        assert_eq!(a.open_url.len(), 2);
+        assert!(
+            a.open_url[0].contains("template=missing.yml&title=4-pole%20breaker%20symbol"),
+            "{:?}",
+            a.open_url
+        );
+        assert!(a.open_url[1].contains("template=feature.yml"), "{:?}", a.open_url);
+        assert!(
+            call(
+                &mut a,
+                "todo",
+                json!({"action": "file", "kind": "nope", "title": "x", "what": "y"})
+            )
+            .is_err()
+        );
+        assert!(
+            call(
+                &mut a,
+                "todo",
+                json!({"action": "file", "kind": "problem", "title": " ", "what": "y"})
+            )
+            .is_err()
+        );
+        assert!(call(&mut a, "todo", json!({"action": "other"})).is_err());
+    }
+
     #[test]
     fn run_command_saves_runs_and_reloads() {
         if std::env::var_os("WIRINGCRAFT_CLI").is_none() {

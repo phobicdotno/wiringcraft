@@ -109,6 +109,14 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::PageHistory),
         ],
     ),
+    (
+        "Help",
+        &[
+            Some(Action::ReportProblem),
+            Some(Action::RequestFunction),
+            Some(Action::ReportMissing),
+        ],
+    ),
 ];
 
 /// WiringCraft's mark: a sheet corner with a wire running through two nodes.
