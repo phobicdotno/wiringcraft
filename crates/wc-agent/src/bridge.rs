@@ -145,19 +145,11 @@ fn serve(
 ) {
     let (specs, instructions, token) = shared;
     let Ok(mut writer) = stream.try_clone() else { return };
-    // The token must come quickly; after that the agent may stay quiet as long as it likes.
-    if stream.set_read_timeout(Some(TOKEN_TIMEOUT)).is_err() {
+    let mut stream = stream;
+    if !token_ok(&mut stream, token) {
         return;
     }
-    let Ok(reading) = stream.try_clone() else { return };
-    let mut lines = BufReader::new(stream).lines();
-    match lines.next() {
-        Some(Ok(first)) if first.trim() == token => {}
-        _ => return,
-    }
-    if reading.set_read_timeout(None).is_err() {
-        return;
-    }
+    let lines = BufReader::new(stream).lines();
     for line in lines.map_while(Result::ok) {
         let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
@@ -190,6 +182,31 @@ fn serve(
             }
         }
     }
+}
+
+/// Read the first line and check it is the token. The whole line must arrive within
+/// [`TOKEN_TIMEOUT`] and be no longer than the token (plus a line ending); after that the agent
+/// may stay quiet as long as it likes. Reads byte by byte so nothing after the line is lost.
+fn token_ok(stream: &mut TcpStream, token: &str) -> bool {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + TOKEN_TIMEOUT;
+    let mut line = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return false;
+        }
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(1) if byte[0] == b'\n' => break,
+            Ok(1) if line.len() <= token.len() => line.push(byte[0]),
+            _ => return false,
+        }
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    line == token.as_bytes() && stream.set_read_timeout(None).is_ok()
 }
 
 /// Answer one MCP message (`None` for a notification). `call` runs a tool.
@@ -409,6 +426,35 @@ mod tests {
         let mut line = String::new();
         let n = BufReader::new(s).read_line(&mut line).unwrap_or(1);
         assert_eq!(n, 0, "closed after the token wait");
+    }
+
+    #[test]
+    fn a_slow_or_long_token_line_is_dropped() {
+        let Ok(bridge) = Bridge::start(Vec::new(), String::new(), Arc::new(|| {})) else {
+            return;
+        };
+        // Far too long: closed as soon as the line passes the token's length.
+        let Ok(mut s) = TcpStream::connect(("127.0.0.1", bridge.port)) else {
+            return;
+        };
+        let _ = s.write_all(&vec![b'a'; 4096]);
+        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut line = String::new();
+        assert_eq!(BufReader::new(s).read_line(&mut line).unwrap_or(0), 0);
+        // A byte now and then never gets past the deadline.
+        let Ok(mut s) = TcpStream::connect(("127.0.0.1", bridge.port)) else {
+            return;
+        };
+        let start = std::time::Instant::now();
+        let mut closed = false;
+        while start.elapsed() < TOKEN_TIMEOUT + Duration::from_secs(5) {
+            if s.write_all(b"0").is_err() {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert!(closed, "a trickling sender is cut off at the deadline");
     }
 
     #[test]
