@@ -816,6 +816,18 @@ fn one_strips_markers_are_only_that_strips_terminals() {
         parts: &parts,
     };
     assert_eq!(terminal_strips(&i), ["-X1", "-X2"]);
+    // Strips that sort alike are each listed once.
+    let mut q = p.clone();
+    for (id, tag) in [("z1", "-X01.1"), ("z2", "-X01.3"), ("z3", "-X1.2")] {
+        q.pages[0].symbols.push(place(id, "term", 160.0, Some(tag)));
+    }
+    let strips = terminal_strips(&Inputs {
+        project: &q,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(strips.iter().filter(|s| *s == "-X1").count(), 1, "{strips:?}");
+    assert_eq!(strips.iter().filter(|s| *s == "-X01").count(), 1, "{strips:?}");
     let o = MarkingOptions {
         strip: Some("-X1".into()),
         ..MarkingOptions::default()

@@ -203,6 +203,8 @@ pub fn marking_list(i: &Inputs<'_>, kinds: &[MarkerKind]) -> Table {
 /// [`MarkingOptions::strip`] can name.
 pub fn terminal_strips(i: &Inputs<'_>) -> Vec<String> {
     let mut strips: Vec<String> = terminal_rows(i).into_iter().map(|(s, _)| s).collect();
+    // `-X1` and `-X01` sort alike, so their rows can interleave: order them exactly first.
+    strips.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
     strips.dedup();
     strips
 }

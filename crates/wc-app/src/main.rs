@@ -1608,18 +1608,27 @@ impl App {
                                     }
                                 });
                             ui.end_row();
+                            // A line is offered only after a chosen one, so the columns stay
+                            // in order; clearing a line clears the ones after it.
+                            let mut open_line = true;
                             for (n, line) in lines.iter_mut().enumerate() {
+                                if !open_line {
+                                    *line = None;
+                                }
                                 ui.label(format!("Line {}", n + 1));
-                                egui::ComboBox::from_id_salt(("wago-line", n))
-                                    .selected_text(line.map_or("(none)", field_label))
-                                    .show_ui(ui, |ui| {
-                                        if n > 0 {
-                                            ui.selectable_value(line, None, "(none)");
-                                        }
-                                        for f in LineField::ALL {
-                                            ui.selectable_value(line, Some(f), field_label(f));
-                                        }
-                                    });
+                                ui.add_enabled_ui(open_line, |ui| {
+                                    egui::ComboBox::from_id_salt(("wago-line", n))
+                                        .selected_text(line.map_or("(none)", field_label))
+                                        .show_ui(ui, |ui| {
+                                            if n > 0 {
+                                                ui.selectable_value(line, None, "(none)");
+                                            }
+                                            for f in LineField::ALL {
+                                                ui.selectable_value(line, Some(f), field_label(f));
+                                            }
+                                        });
+                                });
+                                open_line = line.is_some();
                                 ui.end_row();
                             }
                             ui.label("Language");
@@ -1649,7 +1658,7 @@ impl App {
                                     .filter(|(_, on)| **on)
                                     .map(|(k, _)| k)
                                     .collect(),
-                                lines: lines.iter().flatten().copied().collect(),
+                                lines: chosen_lines(lines),
                                 language: *language,
                                 strip: strip.clone(),
                             };
@@ -2236,6 +2245,12 @@ fn export_aml(open: &Open) -> String {
         }
         Err(e) => format!("Export failed: {e}"),
     }
+}
+
+/// The marker lines chosen in the dialog, up to the first one left at (none): a later line never
+/// moves up into an empty one's column.
+fn chosen_lines(lines: &[Option<wc_report::LineField>]) -> Vec<wc_report::LineField> {
+    lines.iter().map_while(|l| *l).collect()
 }
 
 /// The WAGO marking dialog: every kind (only terminals when a strip is given), one marker line.
@@ -3158,6 +3173,12 @@ mod marking_tests {
             "\u{feff}Typ;Gruppe;Zeile 1;Zeile 2;Anzahl\r\nKlemme;-X1;1;Field terminals;1\r\n"
         );
         assert_eq!(file_stem("=A+C1/X1"), "=A+C1_X1");
+        use wc_report::LineField::{Description, Marker};
+        assert_eq!(chosen_lines(&[Some(Marker), None, Some(Description)]), [Marker]);
+        assert_eq!(
+            chosen_lines(&[Some(Description), Some(Marker), None]),
+            [Description, Marker]
+        );
 
         // A strip drawn only on an overview page has nothing to export: no file is written.
         o.project.pages[1].overview = true;
