@@ -13,6 +13,7 @@ use wc_core::{DeviceTag, Endpoint, Part, Project, Symbol};
 
 pub mod aml;
 pub mod check;
+pub mod marking;
 pub mod plc;
 pub mod step;
 #[cfg(test)]
@@ -20,6 +21,7 @@ mod tests;
 
 pub use aml::{AmlCounts, automationml};
 pub use check::{Finding, Severity, check, check_table};
+pub use marking::{MarkerKind, marking_list, parse_kinds, to_smartscript_csv};
 pub use plc::{PlcVariables, plc_variables};
 
 /// A finished report: a title, column headings and rows of text.
@@ -46,14 +48,26 @@ impl Table {
 
     /// RFC 4180 CSV with a header row; fields are quoted when they need it.
     pub fn to_csv(&self) -> String {
+        self.to_csv_with(',')
+    }
+
+    /// CSV separated by `sep` (`,` or `;`), with a header row and CRLF line ends; fields are
+    /// quoted when they contain the separator, a quote or a line end.
+    pub fn to_csv_with(&self, sep: char) -> String {
         let field = |s: &str| {
-            if s.contains([',', '"', '\n', '\r']) {
+            if s.contains([sep, '"', '\n', '\r']) {
                 format!("\"{}\"", s.replace('"', "\"\""))
             } else {
                 s.to_owned()
             }
         };
-        let line = |cells: &[String]| cells.iter().map(|c| field(c)).collect::<Vec<_>>().join(",");
+        let line = |cells: &[String]| {
+            cells
+                .iter()
+                .map(|c| field(c))
+                .collect::<Vec<_>>()
+                .join(&sep.to_string())
+        };
         let mut out = line(&self.columns);
         out.push_str("\r\n");
         for r in &self.rows {

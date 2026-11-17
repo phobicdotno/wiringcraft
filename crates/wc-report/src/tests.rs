@@ -454,3 +454,112 @@ fn plc_io_list_and_contents() {
     assert!(lines[5].starts_with("    u1 AT %I* : BOOL;"));
     assert_eq!(lines[6], "END_VAR");
 }
+
+#[test]
+fn marking_list_has_every_marker_in_natural_order() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w3") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+    }
+    // A cable device without cores yet, and a strip numbered past 9.
+    p.devices.insert(DeviceTag::parse("-W10").unwrap(), Device::default());
+    p.pages[0].symbols.push(place("s7", "term", 140.0, Some("-X1.10")));
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s6", "X2"), pin("s7", "1"), Some("10"), None));
+    p.pages[0]
+        .wires
+        .push(wire("w6", pin("s7", "2"), pin("s5", "2"), Some("2"), None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[]);
+    let rows: Vec<String> = t.rows.iter().map(|r| r.join("|")).collect();
+    assert_eq!(
+        rows,
+        [
+            "Terminal|-X1|1|1",
+            "Terminal|-X1|2|1",
+            "Terminal|-X1|10|1",
+            "Terminal|-X2|1|1",
+            "Wire||1|2",
+            "Wire||2|4",
+            "Wire||3|2",
+            "Wire||10|2",
+            "Device||-P1|1",
+            "Device|+C1|=A+C1-K1|1",
+            "Cable||-W1|2",
+            "Cable||-W10|2",
+        ]
+    );
+
+    let only = marking_list(&i, &[MarkerKind::Cables, MarkerKind::Terminals]);
+    assert!(only.rows.iter().all(|r| r[0] == "Cable" || r[0] == "Terminal"));
+    assert_eq!(only.rows.len(), 6);
+    assert_eq!(MarkerKind::parse("Wire"), Some(MarkerKind::Wires));
+    assert_eq!(MarkerKind::parse("cables"), Some(MarkerKind::Cables));
+    assert_eq!(MarkerKind::parse("rails"), None);
+}
+
+#[test]
+fn smartscript_csv_is_semicolon_separated_utf8_with_bom() {
+    let t = Table {
+        title: "Marking list".into(),
+        columns: vec!["Type".into(), "Group".into(), "Marker".into(), "Count".into()],
+        rows: vec![
+            vec!["Device".into(), "+Kjøkken".into(), "-K1;A".into(), "1".into()],
+            vec!["Wire".into(), String::new(), "2,5".into(), "2".into()],
+        ],
+        ..Default::default()
+    };
+    let csv = to_smartscript_csv(&t);
+    assert_eq!(
+        csv,
+        "\u{feff}Type;Group;Marker;Count\r\nDevice;+Kjøkken;\"-K1;A\";1\r\nWire;;2,5;2\r\n"
+    );
+}
+
+#[test]
+fn a_cable_drawn_only_as_a_symbol_gets_its_markers() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s9", "lamp", 200.0, Some("-W2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[]);
+    let cables: Vec<String> = t.rows.iter().filter(|r| r[0] == "Cable").map(|r| r.join("|")).collect();
+    assert_eq!(cables, ["Cable||-W2|2"]);
+    assert!(!t.rows.iter().any(|r| r[0] == "Device" && r[2] == "-W2"));
+    assert_eq!(
+        parse_kinds(&["wire".into(), "Cables".into()]),
+        Ok(vec![MarkerKind::Wires, MarkerKind::Cables])
+    );
+    assert!(parse_kinds(&["rails".into()]).is_err());
+}
+
+#[test]
+fn marking_list_drops_repeated_terminals_even_between_equal_sorting_numbers() {
+    let (mut p, s, parts) = fixture();
+    // `-X1.1`, `-X1.01`, `-X1.1`: `1` and `01` sort alike, but only the exact repeat goes.
+    for (id, tag) in [("t1", "-X1.1"), ("t2", "-X1.01"), ("t3", "-X1.1")] {
+        p.pages[0].symbols.push(place(id, "term", 150.0, Some(tag)));
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[MarkerKind::Terminals]);
+    let x1: Vec<&str> = t.rows.iter().filter(|r| r[1] == "-X1").map(|r| r[2].as_str()).collect();
+    let ones = x1.iter().filter(|n| **n == "1").count();
+    assert_eq!(ones, 1, "{x1:?}");
+    assert_eq!(x1.iter().filter(|n| **n == "01").count(), 1, "{x1:?}");
+}
