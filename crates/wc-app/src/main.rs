@@ -211,6 +211,7 @@ impl App {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
         });
+        let mut shown = page.clone();
         if let Some(joined) = self.share.frame(self.open.as_mut(), page, busy) {
             // The joined copy replaces the open project: keep its unsaved work first.
             if let Some(o) = self.open.as_mut()
@@ -229,6 +230,14 @@ impl App {
             self.prefs.remember(joined.dir.clone());
             self.prefs.save();
             self.open = Some(joined);
+            // The id belonged to the project left behind.
+            shown = None;
+        }
+        // Others may have added or removed pages before this one: keep showing the same page.
+        if let (Some(id), Some(o)) = (&shown, &self.open)
+            && let Some(i) = o.project.pages.iter().position(|p| &p.id == id)
+        {
+            self.ed.page = i;
         }
         // A page shown in the navigator may have been removed by someone else.
         if let Some(o) = &self.open
@@ -1436,7 +1445,13 @@ impl App {
                             )
                         })
                         .unwrap_or_default();
-                    ui.label(format!("Delete {what}? Undo brings it back."));
+                    // Undo is off in a shared session, so it is not promised there.
+                    let undo = if self.share.active() {
+                        " It cannot be undone in a shared session."
+                    } else {
+                        " Undo brings it back."
+                    };
+                    ui.label(format!("Delete {what}?{undo}"));
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
                             if let Some(o) = self.open.as_mut() {
