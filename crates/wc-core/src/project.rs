@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::geom::{Point, Rotation, Shape};
+use crate::route::Route;
 use crate::tag::DeviceTag;
 
 /// A library source as listed in `project.toml`. Earlier entries win when ids collide.
@@ -126,6 +127,9 @@ pub struct Wire {
     /// The cable this wire runs in, when it is a cable core.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cable: Option<CableCore>,
+    /// The route style its bend points were made with; older files have none (square).
+    #[serde(default, skip_serializing_if = "Route::is_square")]
+    pub route: Route,
 }
 
 /// A wire's place in a cable: the cable device (for example `-W1`) and the core's name

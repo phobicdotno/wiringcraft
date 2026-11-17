@@ -481,6 +481,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                     number,
                     potential: None,
                     cable: None,
+                    route: Default::default(),
                 });
             }
         } else {
@@ -500,6 +501,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                         number: number.clone(),
                         potential: potential.clone(),
                         cable: None,
+                        route: Default::default(),
                     });
                 }
             }
@@ -622,6 +624,7 @@ mod tests {
             number: None,
             potential: Some("L+".into()),
             cable: None,
+            route: Default::default(),
         });
         project.pages.push(page);
         let part = wc_core::Part {

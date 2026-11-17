@@ -5,6 +5,7 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape as EShape, Stroke, Vec2};
 use wc_core::geom::{Align, Point};
+use wc_core::route::Route;
 use wc_core::{Endpoint, Page, Shape};
 
 use crate::state::{Open, Selection, Tool};
@@ -774,6 +775,18 @@ fn select_tool(
             (None, false) => ed.selection.clear(),
         }
     }
+    // Right-click on a wire: select it (keeping a selection it is part of) and offer the route
+    // styles for every selected wire.
+    if resp.secondary_clicked()
+        && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
+        && let Some(h @ Selection::Wire(_)) = open.hit(page, at, tol)
+        && !ed.is_selected(&h)
+    {
+        ed.select_only(h);
+    }
+    if !selected_wires(ed).is_empty() {
+        resp.context_menu(|ui| route_menu(ui, open, ed));
+    }
     if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
@@ -836,6 +849,53 @@ fn select_tool(
     }
     if resp.drag_stopped() {
         ed.drag = None;
+    }
+}
+
+/// The ids of the selected wires.
+fn selected_wires(ed: &Editor) -> Vec<String> {
+    ed.selection
+        .iter()
+        .filter_map(|s| match s {
+            Selection::Wire(id) => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The route style shared by all of `wires`, or `None` when they differ.
+fn shared_route(page: &Page, wires: &[String]) -> Option<Route> {
+    let mut styles = page.wires.iter().filter(|w| wires.contains(&w.id)).map(|w| w.route);
+    let first = styles.next()?;
+    styles.all(|r| r == first).then_some(first)
+}
+
+/// The wire right-click menu: the route styles, the current one marked.
+fn route_menu(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor) {
+    let wires = selected_wires(ed);
+    let Some(page) = open.project.pages.get(ed.page) else {
+        return;
+    };
+    let current = shared_route(page, &wires);
+    ui.label(if wires.len() == 1 {
+        "Route".to_owned()
+    } else {
+        format!("Route of {} wires", wires.len())
+    });
+    for style in Route::ALL {
+        if ui.radio(current == Some(style), style.label()).clicked() {
+            ed.message = route_note(open.set_route(ed.page, &wires, style), style);
+            ui.close_menu();
+        }
+    }
+}
+
+fn route_note(changed: usize, style: Route) -> String {
+    let what = style.label().to_lowercase();
+    match changed {
+        0 => format!("Route already {what}."),
+        1 => format!("Route changed to {what} on 1 wire."),
+        n => format!("Route changed to {what} on {n} wires."),
     }
 }
 

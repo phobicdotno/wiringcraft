@@ -61,6 +61,7 @@ fn exports_pages_bookmarks_and_links() {
         number: Some("101".into()),
         potential: Some("24V".into()),
         cable: None,
+        route: Default::default(),
     });
     let mut p2 = Page::new("p2", "2", "Motor");
     p2.symbols.push(place("s1", "no", 200.0, "-K1"));
@@ -241,6 +242,7 @@ fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
         number: Some("101".into()),
         potential: None,
         cable: None,
+        route: Default::default(),
     });
     p1.graphics.push(Shape::Line {
         a: Point::new(200.0, 20.0),

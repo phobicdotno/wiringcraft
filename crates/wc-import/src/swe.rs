@@ -1297,6 +1297,7 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
                     number: number.clone(),
                     potential: potential.clone(),
                     cable: cable.clone(),
+                    route: Default::default(),
                 });
             }
         }
