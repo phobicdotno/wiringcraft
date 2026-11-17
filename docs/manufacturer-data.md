@@ -14,8 +14,8 @@ From `crates/wc-import`:
 
 | Format | Module | Notes |
 |---|---|---|
-| ASCII DXF | `dxf` | Symbols and whole drawings. Binary DXF and DWG are **not** read. |
-| KiCad symbol libraries (`.kicad_sym`, KiCad 6+) | `kicad` | Graphics and pins of the common unit and the first unit (body style 1) become a WiringCraft symbol; later units and alternate body styles are skipped with a warning. |
+| ASCII DXF | `dxf` | Symbols and whole drawings, from the entities LINE, CIRCLE, ARC, LWPOLYLINE, POLYLINE, TEXT, MTEXT, POINT and INSERT. Other entities (for example ELLIPSE, SPLINE, HATCH) are skipped, so some graphics can be lost. Binary DXF and DWG are **not** read. |
+| KiCad symbol libraries (`.kicad_sym`, KiCad 6+) | `kicad` | Graphics and visible pins of the common unit and the first unit (body style 1) become a WiringCraft symbol. Later units are skipped with a warning; alternate body styles and hidden pins are left out without one. |
 | SVG | `svg` | Graphics. |
 | PDF (vector) | `pdf` | Traced drawings. |
 | CSV | `csv` | Parts lists and PLC address lists. |
@@ -63,7 +63,7 @@ Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **
 ## What this means for WiringCraft
 
 1. **Readable now:** KiCad libraries (open licence with clear terms, read directly), and any
-   maker's 2D **ASCII DXF** drawings for symbol graphics. Being able to read a file is not
+   maker's 2D **ASCII DXF** drawings for symbol graphics (within the entities listed above). Being able to read a file is not
    permission to use it: most makers' terms are not stated on the pages checked, and some limit
    use (Mitsubishi's CAD data is "for design consideration" only), so check each maker's terms
    before building a library from their files. DXF from Siemens and similar sites has no
