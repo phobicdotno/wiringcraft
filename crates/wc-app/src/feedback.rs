@@ -190,15 +190,13 @@ fn gh(args: &[&str]) -> Result<String, String> {
         h.join()
             .unwrap_or_else(|_| Err("reading gh's output stopped unexpectedly".into()))
     };
-    let out = join(out_reader);
-    let err = join(err_reader);
+    // Both streams must read cleanly before the exit status picks one.
+    let out = join(out_reader)?;
+    let err = join(err_reader)?;
     if status.success() {
-        out
+        Ok(out)
     } else {
-        Err(match err {
-            Ok(text) => text.trim().to_owned(),
-            Err(e) => e,
-        })
+        Err(err.trim().to_owned())
     }
 }
 
