@@ -1890,12 +1890,7 @@ fn add_built(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: 
         p.meta.merge_location(loc);
     }
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
-    for (k, v) in built.title_block {
-        let have = p.meta.title_block.entry(k).or_default();
-        if have.trim().is_empty() {
-            *have = v;
-        }
-    }
+    p.meta.fill_title_block(built.title_block);
     Ok(())
 }
 

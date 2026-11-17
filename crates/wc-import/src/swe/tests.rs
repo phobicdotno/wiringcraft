@@ -971,3 +971,59 @@ fn the_project_fields_come_across_without_a_description_table_and_with_numbers()
         info.warnings
     );
 }
+
+#[test]
+fn an_unreadable_description_row_is_reported_with_its_reason() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE tew_project (pro_id INTEGER, pro_name TEXT, pro_directory TEXT, pro_customername TEXT,
+           pro_custaddress1 TEXT, pro_custaddress2 TEXT, pro_custaddress3 TEXT, pro_drawingofficename TEXT,
+           pro_doaddress1 TEXT, pro_doaddress2 TEXT, pro_doaddress3 TEXT, pro_contractnb TEXT,
+           pro_createdby TEXT, pro_modifiedby TEXT, pro_creationdate TEXT, pro_modificationdate TEXT);
+         INSERT INTO tew_project VALUES (1, 'P', '1', 'Customer', '', '', '', '', '', '', '', '7',
+           '', '', '20240102 10:00:00', 'not a date');
+         CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0);
+         INSERT INTO tew_translatedtext VALUES (1, -1, 'en', 42.5);",
+    )
+    .unwrap();
+    let info = project_info(&c, "1").unwrap().unwrap();
+    assert_eq!(info.customer, "Customer", "the other fields still come across");
+    assert!(info.description.is_empty());
+    assert!(
+        info.warnings
+            .iter()
+            .any(|w| w.contains("text row(s) could not be read")),
+        "{:?}",
+        info.warnings
+    );
+    assert_eq!(info.created, "2024-01-02");
+    assert_eq!(info.modified, "not a date", "a date in another form is kept as written");
+}
+
+#[test]
+fn a_project_list_that_cannot_be_opened_is_a_warning_not_silence() {
+    use std::io::Write;
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        let opt = zip::write::SimpleFileOptions::default();
+        z.start_file("Projects/1/Database/tew_project_data.sqlite", opt)
+            .unwrap();
+        z.write_all(&db).unwrap();
+        use zip::unstable::write::FileOptionsExt;
+        let locked = opt.with_deprecated_encryption(b"secret");
+        z.start_file("Database/tew_app_project.sqlite", locked).unwrap();
+        z.write_all(&db).unwrap();
+        z.finish().unwrap();
+    }
+    buf.set_position(0);
+    let got = database_from_archive(buf, 1).unwrap();
+    assert!(got.info.is_none());
+    let w = got.info_warning.unwrap();
+    assert!(w.contains("tew_app_project.sqlite"), "{w}");
+
+    // Without a project list there are simply no fields, and no warning.
+    let got = database_from_archive(archive(&[("Projects/1/Database/tew_project_data.sqlite", &db)]), 1).unwrap();
+    assert!(got.info.is_none() && got.info_warning.is_none());
+}

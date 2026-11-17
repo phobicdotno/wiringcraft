@@ -199,10 +199,12 @@ impl SweProjectInfo {
 fn source_date(s: &str) -> String {
     let d = s.trim();
     let day: String = d.chars().take(8).collect();
-    if day.len() == 8 && day.chars().all(|c| c.is_ascii_digit()) {
-        format!("{}-{}-{}", &day[..4], &day[4..6], &day[6..])
-    } else {
-        d.to_owned()
+    if !day.chars().all(|c| c.is_ascii_digit()) {
+        return d.to_owned();
+    }
+    match (day.get(..4), day.get(4..6), day.get(6..8)) {
+        (Some(y), Some(m), Some(dd)) => format!("{y}-{m}-{dd}"),
+        _ => d.to_owned(),
     }
 }
 
@@ -219,49 +221,47 @@ pub fn project_info(conn: &Connection, directory: &str) -> Result<Option<SweProj
              FROM tew_project WHERE TRIM(pro_directory) = ?1",
         )
         .map_err(sql)?;
-    let row = st
-        .query_row([directory.trim()], |r| {
-            let mut v: Vec<String> = Vec::new();
-            for i in 1..15 {
-                v.push(r.get::<_, String>(i)?);
-            }
-            Ok((r.get::<_, i64>(0)?, v))
-        })
-        .optional()
-        .map_err(sql)?;
-    let Some((id, v)) = row else {
-        return Ok(None);
-    };
-    let lines = |a: &[String]| -> Vec<String> {
-        a.iter()
+    // Address lines that are filled, trimmed.
+    let lines = |a: [String; 3]| -> Vec<String> {
+        a.into_iter()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .collect()
     };
+    let row = st
+        .query_row([directory.trim()], |r| {
+            let text = |i: usize| r.get::<_, String>(i).map(|s| s.trim().to_owned());
+            Ok((
+                r.get::<_, i64>(0)?,
+                SweProjectInfo {
+                    name: text(1)?,
+                    description: String::new(),
+                    customer: text(2)?,
+                    customer_address: lines([text(3)?, text(4)?, text(5)?]),
+                    drawing_office: text(6)?,
+                    drawing_office_address: lines([text(7)?, text(8)?, text(9)?]),
+                    contract_number: text(10)?,
+                    created_by: text(11)?,
+                    modified_by: text(12)?,
+                    created: source_date(&text(13)?),
+                    modified: source_date(&text(14)?),
+                    warnings: Vec::new(),
+                },
+            ))
+        })
+        .optional()
+        .map_err(sql)?;
+    let Some((id, mut info)) = row else {
+        return Ok(None);
+    };
     // The description is a nice-to-have: without it the other fields still come across, and
     // why it is missing is kept.
-    let mut warnings = Vec::new();
-    let description = match texts(conn, &mut warnings) {
-        Ok(mut t) => t.remove(&id).unwrap_or_default(),
-        Err(e) => {
-            warnings.push(format!("the project description was not read: {e}"));
-            String::new()
-        }
-    };
-    Ok(Some(SweProjectInfo {
-        name: v[0].trim().to_owned(),
-        description: description.trim().to_owned(),
-        customer: v[1].trim().to_owned(),
-        customer_address: lines(&v[2..5]),
-        drawing_office: v[5].trim().to_owned(),
-        drawing_office_address: lines(&v[6..9]),
-        contract_number: v[9].trim().to_owned(),
-        created_by: v[10].trim().to_owned(),
-        modified_by: v[11].trim().to_owned(),
-        created: source_date(&v[12]),
-        modified: source_date(&v[13]),
-        warnings,
-    }))
+    // Text rows that cannot be read are reported too (`texts` counts them with the reason).
+    match texts(conn, &mut info.warnings) {
+        Ok(mut t) => info.description = t.remove(&id).unwrap_or_default().trim().to_owned(),
+        Err(e) => info.warnings.push(format!("the project description was not read: {e}")),
+    }
+    Ok(Some(info))
 }
 
 /// A location (`tew_location`): a cabinet, room or panel.
@@ -390,8 +390,10 @@ fn read_project_list<R: Read + std::io::Seek>(
     directory: &str,
 ) -> Result<Option<SweProjectInfo>> {
     const LIST: &str = "Database/tew_app_project.sqlite";
-    let Ok(f) = zip.by_name(LIST) else {
-        return Ok(None);
+    let f = match zip.by_name(LIST) {
+        Ok(f) => f,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(Error::Format(format!("{LIST}: {e}"))),
     };
     let mut bytes = Vec::new();
     f.take(MAX_DATABASE_BYTES + 1)
@@ -1704,6 +1706,30 @@ pub fn build(p: &SweProject, first_page_number: Option<usize>) -> (Built, Vec<St
             ]),
         },
     ];
+    // The project's own fields: which ones print, and which are only kept in the project.
+    let mut report = report;
+    if let Some(info) = &p.info {
+        let fields = info.title_block();
+        let printed = ["customer", "project_number", "drawn_by", "date"];
+        let kept: Vec<&str> = fields
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !printed.contains(k))
+            .collect();
+        report.push(Count {
+            what: "project fields",
+            source: fields.len(),
+            imported: fields.len(),
+            note: if kept.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{} kept in Project Properties but not printed on any page yet (the title block prints customer, project number, drawn by and date)",
+                    kept.join(", ")
+                )
+            },
+        });
+    }
     (built, warnings, report)
 }
 
