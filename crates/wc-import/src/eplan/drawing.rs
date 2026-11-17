@@ -524,6 +524,7 @@ pub fn pages(p: &EplanProject, first_page_number: usize) -> Drawing {
                 number: None,
                 potential: None,
                 cable: None,
+                route: Default::default(),
             });
         }
         if page.symbols.is_empty() && page.graphics.is_empty() {

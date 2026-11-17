@@ -5,6 +5,7 @@
 mod actions;
 mod agent;
 mod agent_panel;
+mod applog;
 mod canvas;
 mod chrome;
 mod edit;
@@ -18,6 +19,7 @@ mod state;
 mod theme;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, Pos2, RichText, Stroke, Vec2};
 
@@ -75,6 +77,11 @@ enum Dialog {
     History(Vec<wc_vcs::subway::Row>),
     Library(Vec<wc_library::ItemStatus>),
     Message(String),
+    /// Help, Report a problem: the masked log to look at before anything is sent.
+    Report {
+        log: String,
+        include: bool,
+    },
     /// Name and description for a macro made from the copied selection.
     SaveMacro {
         clip: edit::Clipboard,
@@ -106,6 +113,8 @@ struct App {
     assistant: agent::Assistant,
     /// Web pages to open in the browser on the next frame.
     open_url: Vec<String>,
+    /// The last status message and message box written to the log, so each is logged once.
+    logged: (String, String),
 }
 
 struct StatusView<'a> {
@@ -126,6 +135,7 @@ impl chrome::Status for StatusView<'_> {
             Action::LineTool => self.ed.tool == Tool::Line,
             Action::RectTool => self.ed.tool == Tool::Rect,
             Action::ToggleGrid => self.prefs.show_grid,
+            Action::ToggleAutoWire => self.prefs.auto_wire,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
             Action::ToggleTheme => self.prefs.theme == theme::Mode::Dark,
             Action::Assistant => self.prefs.show_assistant,
@@ -141,6 +151,7 @@ impl chrome::Status for StatusView<'_> {
             | Action::ToggleChrome
             | Action::ToggleTheme
             | Action::ToggleGrid
+            | Action::ToggleAutoWire
             | Action::Assistant
             | Action::ReportProblem
             | Action::RequestFunction
@@ -180,6 +191,7 @@ impl App {
             applied_theme: prefs.theme,
             assistant: agent::Assistant::default(),
             open_url: Vec::new(),
+            logged: Default::default(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -205,14 +217,24 @@ impl App {
                 prefs.remember(dir.to_path_buf());
                 prefs.save();
             }
-            Err(e) => self.dialog = Some(Dialog::Message(format!("Could not open {}:\n{e}", dir.display()))),
+            Err(e) => {
+                applog::warn(&format!("could not open {}: {e}", dir.display()));
+                self.dialog = Some(Dialog::Message(format!("Could not open {}:\n{e}", dir.display())));
+            }
         }
     }
 
     fn run(&mut self, a: Action) {
         let page = self.ed.page;
+        applog::info(&format!("command {a:?}"));
+        if a == Action::ReportProblem {
+            self.dialog = Some(Dialog::Report {
+                log: applog::tail(REPORT_LOG_BYTES),
+                include: false,
+            });
+            return;
+        }
         let kind = match a {
-            Action::ReportProblem => Some(feedback::Kind::Problem),
             Action::RequestFunction => Some(feedback::Kind::Function),
             Action::ReportMissing => Some(feedback::Kind::Missing),
             _ => None,
@@ -239,14 +261,14 @@ impl App {
                     .and_then(|o| o.dir.parent())
                     .map(Path::to_path_buf)
                     .unwrap_or_else(prefs::projects_dir);
+                // A default location that cannot be shown as text is not guessed at: the field
+                // starts empty (Create stays off) and says why.
                 let mut field = prefs::FolderField::default();
-                if field.pick(location.clone()).is_err() {
-                    field = prefs::FolderField::typed(location.to_string_lossy());
-                }
+                let error = field.pick(location).err();
                 self.dialog = Some(Dialog::NewProject {
                     location: field,
                     name: String::new(),
-                    error: None,
+                    error,
                 });
             }
             Action::ToggleChrome => {
@@ -266,6 +288,15 @@ impl App {
             Action::ToggleGrid => {
                 self.prefs.show_grid = !self.prefs.show_grid;
                 self.prefs.save();
+            }
+            Action::ToggleAutoWire => {
+                self.prefs.auto_wire = !self.prefs.auto_wire;
+                self.prefs.save();
+                self.ed.message = if self.prefs.auto_wire {
+                    "Auto-wiring is on: pins that line up get a wire (hold Alt to skip once).".into()
+                } else {
+                    "Auto-wiring is off.".into()
+                };
             }
             Action::Assistant => {
                 self.prefs.show_assistant = !self.prefs.show_assistant;
@@ -623,6 +654,7 @@ impl App {
             Dialog::Message(_) => "WiringCraft",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
+            Dialog::Report { .. } => "Report a problem",
         };
         let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_));
         let screen = ctx.screen_rect();
@@ -715,6 +747,56 @@ impl App {
                     if ui.button("Close").clicked() {
                         keep = false;
                     }
+                }
+                Dialog::Report { log, include } => {
+                    ui.label(
+                        "This is WiringCraft's log of what happened recently. Home folders, keys, tokens, \
+                         email addresses and device tags are already hidden, and no drawing is in it. Messages \
+                         WiringCraft showed are in it and can name a page, so look it over first. Nothing is \
+                         sent unless you choose to.",
+                    );
+                    if let Some(e) = applog::error() {
+                        ui.colored_label(
+                            theme::Theme::of(ui.ctx()).error,
+                            format!("The log could not be written: {e}"),
+                        );
+                    }
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        let shown = if log.is_empty() {
+                            "(The log is empty.)"
+                        } else {
+                            log.as_str()
+                        };
+                        ui.add(egui::Label::new(RichText::new(shown).monospace().small()).wrap());
+                    });
+                    ui.checkbox(include, "Include this log in my report");
+                    ui.horizontal(|ui| {
+                        if ui.button("Open the report form").clicked() {
+                            let (request, copy) = report_request(log, *include);
+                            if let Some(copy) = copy {
+                                self.copied_text = Some(copy);
+                                self.ed.message = "The log is on the clipboard: paste it into the report if the \
+                                                   form shows only its end."
+                                    .into();
+                            }
+                            self.open_url
+                                .push(feedback::form_url(feedback::Kind::Problem, &request));
+                            applog::info(if *include {
+                                "report form opened with the log"
+                            } else {
+                                "report form opened without the log"
+                            });
+                            keep = false;
+                        }
+                        if let Some(dir) = applog::dir()
+                            && ui.button("Show the log folder").clicked()
+                        {
+                            self.open_url.push(format!("file://{}", dir.display()));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
                 }
                 Dialog::Message(m) => {
                     ui.label(m.as_str());
@@ -1391,9 +1473,19 @@ fn main_viewport() -> egui::ViewportBuilder {
 /// The starter symbol library: `library/` beside the executable or in the source tree.
 fn starter_library() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    find_library(exe.as_deref().and_then(Path::parent), &source)
+}
+
+/// The first `library/` with a `symbols` folder: next to the program (Windows install, download
+/// folder), the Linux package layout (/usr/bin -> /usr/share/wiringcraft), the macOS app bundle
+/// (Contents/MacOS -> Contents/Resources), then the source checkout this was built from.
+fn find_library(exe_dir: Option<&Path>, source: &Path) -> Option<PathBuf> {
     let candidates = [
-        exe.as_ref().and_then(|e| e.parent()).map(|d| d.join("library")),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../library")),
+        exe_dir.map(|d| d.join("library")),
+        exe_dir.map(|d| d.join("../share/wiringcraft/library")),
+        exe_dir.map(|d| d.join("../Resources/library")),
+        Some(source.to_path_buf()),
     ];
     candidates
         .into_iter()
@@ -1647,6 +1739,7 @@ impl eframe::App for App {
         for a in actions {
             self.run(a);
         }
+        self.log_messages();
         self.assistant_poll(ctx);
         if self.applied_theme != self.prefs.theme {
             theme::apply(ctx, self.prefs.theme);
@@ -1690,6 +1783,7 @@ impl eframe::App for App {
                     });
                 });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
+                self.ed.auto_wire = self.prefs.auto_wire;
                 canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
             });
         } else {
@@ -1795,6 +1889,65 @@ fn welcome(
     });
 }
 
+/// How much of the log a problem report shows and copies (GitHub takes about 65 000 characters).
+const REPORT_LOG_BYTES: usize = 60_000;
+/// How much of the log's end goes into the report form itself (the link has a size limit).
+const REPORT_FORM_BYTES: usize = 1_500;
+
+/// The report form's fields and the text for the clipboard: the log goes in only when the person
+/// chose to include it and there is one.
+fn report_request(log: &str, include: bool) -> (feedback::Request, Option<String>) {
+    let mut request = feedback::Request::default();
+    if include && !log.is_empty() {
+        request.detail = report_detail(log);
+        return (request, Some(log.to_owned()));
+    }
+    (request, None)
+}
+
+/// The "how to make it happen again" field of a report: the end of the log.
+fn report_detail(log: &str) -> String {
+    let mut start = log.len().saturating_sub(REPORT_FORM_BYTES);
+    while !log.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &log[start..];
+    let tail = if start > 0 {
+        tail.split_once('\n').map_or(tail, |(_, rest)| rest)
+    } else {
+        tail
+    };
+    format!("End of the WiringCraft log (paste the whole log from the clipboard if it helps):\n```\n{tail}```\n")
+}
+
+impl App {
+    /// Write new status messages and message boxes to the log, once each.
+    fn log_messages(&mut self) {
+        for (level, text) in self.new_messages() {
+            applog::log(level, &text);
+        }
+    }
+
+    /// Status messages and message boxes not logged yet. A message box is logged once while it
+    /// is open; after it closes, the same text is logged again the next time it shows.
+    fn new_messages(&mut self) -> Vec<(applog::Level, String)> {
+        let mut new = Vec::new();
+        if !self.ed.message.is_empty() && self.ed.message != self.logged.0 {
+            self.logged.0 = self.ed.message.clone();
+            new.push((applog::Level::Info, self.logged.0.clone()));
+        }
+        match &self.dialog {
+            Some(Dialog::Message(m)) if *m != self.logged.1 => {
+                self.logged.1 = m.clone();
+                new.push((applog::Level::Warn, m.clone()));
+            }
+            Some(Dialog::Message(_)) => {}
+            _ => self.logged.1.clear(),
+        }
+        new
+    }
+}
+
 fn main() -> eframe::Result {
     // Started by Claude Code as the assistant's MCP server: pass messages to the running app.
     let mut args = std::env::args_os();
@@ -1810,12 +1963,146 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    applog::init();
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
+    let wanted = std::env::var(RENDERER_VAR).ok();
     let options = eframe::NativeOptions {
         viewport: main_viewport(),
+        renderer: renderer_for(wanted.as_deref()),
         ..Default::default()
     };
-    eframe::run_native("WiringCraft", options, Box::new(|cc| Ok(Box::new(App::new(cc, dir)))))
+    // No usable OpenGL (a remote desktop session, a virtual machine, a missing graphics driver
+    // often offer only OpenGL 1.1): start again on wgpu (Direct3D, Metal or Vulkan, with a
+    // software fallback). A window system cannot be started twice in one process, so this is a
+    // new process. Some OpenGL failures panic inside eframe instead of returning an error, so a
+    // panic before the app has started falls back the same way. Set WIRINGCRAFT_RENDERER=wgpu
+    // to skip the first try.
+    let fallback = falls_back(wanted.as_deref());
+    if fallback {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            if !STARTED.load(Ordering::SeqCst) {
+                // Leave at once: waiting here would keep this process's half-made window on
+                // screen while the new one runs.
+                restart_with_wgpu(&format!("{info}"), false);
+            }
+        }));
+    }
+    let result = eframe::run_native(
+        "WiringCraft",
+        options,
+        Box::new(|cc| {
+            STARTED.store(true, Ordering::SeqCst);
+            Ok(Box::new(App::new(cc, dir)))
+        }),
+    );
+    if let Err(e) = &result
+        && fallback
+        && !STARTED.load(Ordering::SeqCst)
+    {
+        restart_with_wgpu(&e.to_string(), true);
+    }
+    result
+}
+
+/// Environment variable that picks the graphics backend: `glow` (OpenGL, the default) or `wgpu`.
+const RENDERER_VAR: &str = "WIRINGCRAFT_RENDERER";
+
+/// Set once the window and its renderer are up; a failure after that is not a renderer problem.
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// The backend to start with: `wgpu` when asked for, OpenGL otherwise.
+fn renderer_for(wanted: Option<&str>) -> eframe::Renderer {
+    match wanted {
+        Some("wgpu") => eframe::Renderer::Wgpu,
+        _ => eframe::Renderer::Glow,
+    }
+}
+
+/// Whether a failure before the app starts should try again on wgpu: only for the default
+/// choice, so a backend picked by hand, and the second try itself, never loop.
+fn falls_back(wanted: Option<&str>) -> bool {
+    wanted.is_none()
+}
+
+/// Run this program again on wgpu with the same arguments, then leave: with the new process's
+/// exit code when `wait`, at once otherwise.
+fn restart_with_wgpu(why: &str, wait: bool) {
+    eprintln!("wiringcraft-app: OpenGL could not start ({why}); starting again with wgpu");
+    let child = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .env(RENDERER_VAR, "wgpu")
+            .spawn()
+    });
+    match child {
+        Ok(mut c) if wait => std::process::exit(c.wait().ok().and_then(|s| s.code()).unwrap_or(1)),
+        Ok(_) => std::process::exit(0),
+        Err(err) => eprintln!("wiringcraft-app: could not start again with wgpu: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod renderer_tests {
+    use super::*;
+
+    #[test]
+    fn opengl_is_the_default_and_wgpu_can_be_picked() {
+        assert_eq!(renderer_for(None), eframe::Renderer::Glow);
+        assert_eq!(renderer_for(Some("glow")), eframe::Renderer::Glow);
+        assert_eq!(renderer_for(Some("wgpu")), eframe::Renderer::Wgpu);
+        assert_eq!(renderer_for(Some("other")), eframe::Renderer::Glow);
+    }
+
+    #[test]
+    fn only_the_default_choice_falls_back_so_the_second_try_never_loops() {
+        assert!(falls_back(None));
+        assert!(!falls_back(Some("wgpu")), "the second try runs with wgpu set");
+        assert!(!falls_back(Some("glow")), "OpenGL picked by hand is not overruled");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod library_tests {
+    use super::*;
+
+    /// Makes `<root>/<rel>/symbols` and returns `<root>/<rel>` canonicalized.
+    fn lib(root: &Path, rel: &str) -> PathBuf {
+        std::fs::create_dir_all(root.join(rel).join("symbols")).unwrap();
+        root.join(rel).canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_library_is_found_in_each_install_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let none = t.path().join("no-source");
+        // Linux package: /usr/bin/wiringcraft-app with /usr/share/wiringcraft/library.
+        let linux = t.path().join("usr");
+        let want = lib(&linux, "share/wiringcraft/library");
+        std::fs::create_dir_all(linux.join("bin")).unwrap();
+        assert_eq!(find_library(Some(&linux.join("bin")), &none), Some(want));
+        // macOS bundle: Contents/MacOS with Contents/Resources/library.
+        let mac = t.path().join("WiringCraft.app/Contents");
+        let want = lib(&mac, "Resources/library");
+        std::fs::create_dir_all(mac.join("MacOS")).unwrap();
+        assert_eq!(find_library(Some(&mac.join("MacOS")), &none), Some(want));
+        // Nothing installed and no source checkout: no library.
+        let empty = t.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(find_library(Some(&empty), &none), None);
+    }
+
+    #[test]
+    fn a_library_next_to_the_program_wins() {
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("app");
+        let beside = lib(&app, "library");
+        let source = lib(t.path(), "source/library");
+        assert_eq!(find_library(Some(&app), &source), Some(beside));
+        assert_eq!(find_library(None, &source), Some(source));
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ wc-pdf = { path = "crates/wc-pdf" }
 wc-vcs = { path = "crates/wc-vcs" }
 wc-report = { path = "crates/wc-report" }
 wc-agent = { path = "crates/wc-agent" }
+wc-share = { path = "crates/wc-share" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

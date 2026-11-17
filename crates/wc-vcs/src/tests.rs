@@ -101,3 +101,133 @@ fn symbol_level_changes() -> std::result::Result<(), wc_core::Error> {
     assert!(ch.iter().any(|c| c.ends_with("added")), "{ch:?}");
     Ok(())
 }
+
+#[test]
+fn revert_refuses_while_another_operation_is_in_progress() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let head = git.head().unwrap_or_default();
+    std::fs::write(dir.join(".git").join("CHERRY_PICK_HEAD"), &head).map_err(|e| wc_core::Error::io("write", e))?;
+    let err = git.revert(&head).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("in progress"), "{err}");
+    assert!(
+        dir.join(".git").join("CHERRY_PICK_HEAD").exists(),
+        "the other operation is left alone"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_failed_revert_in_a_linked_worktree_is_undone() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path().join("main");
+    std::fs::create_dir(&dir).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    store::create(&dir, "Demo")?;
+    let git = Git::new(&dir);
+    git.init()?;
+    let write = |d: &std::path::Path, v: &str| {
+        std::fs::write(d.join("note.txt"), v).map_err(|e| wc_core::Error::io("write", e))
+    };
+    write(&dir, "one\n")?;
+    git.commit("one")?;
+    write(&dir, "two\n")?;
+    let two = git.commit("two")?.unwrap_or_default();
+    write(&dir, "three\n")?;
+    git.commit("three")?;
+    let wt = tmp.path().join("wt");
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["worktree", "add", "-q", "-b", "side"])
+        .arg(&wt)
+        .status()
+        .map_err(|e| wc_core::Error::io("git", e))?
+        .success();
+    assert!(ok, "worktree add");
+    let side = Git::new(&wt);
+    // Reverting "two" conflicts with "three": nothing may be left half done.
+    assert!(side.revert(&two).is_err());
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| wc_core::Error::io("git", e))?;
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    let text = std::fs::read_to_string(wt.join("note.txt")).map_err(|e| wc_core::Error::io("read", e))?;
+    // Windows checkouts may turn the line end into CRLF.
+    assert_eq!(text.trim_end(), "three");
+    Ok(())
+}
+
+#[test]
+fn a_resolved_merge_conflict_can_be_committed() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let write = |text: &str| std::fs::write(dir.join("notes.txt"), text).map_err(|e| wc_core::Error::io("notes", e));
+    write("base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    assert_eq!(git.merge("other")?, MergeOutcome::Conflicts(vec!["notes.txt".into()]));
+    // The index is unmerged here, so no copy of it can be taken; the commit must still work.
+    assert!(git.run(&["write-tree"]).is_err());
+    write("both\n")?;
+    assert!(git.commit("Merge other")?.is_some());
+    assert!(!dir.join(".git").join("MERGE_HEAD").exists());
+    assert_eq!(
+        git.run(&["show", "-s", "--format=%P", "HEAD"])?
+            .split_whitespace()
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_commit_without_an_index_copy_says_so() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let io = |e| wc_core::Error::io("test", e);
+    let write = |text: &str| std::fs::write(dir.join("notes.txt"), text).map_err(io);
+    write("base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    assert!(matches!(git.merge("other")?, MergeOutcome::Conflicts(_)));
+    write("both\n")?;
+    // The unmerged index has no tree to copy, and a hook refuses the commit.
+    let hook = dir.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(dir.join(".git/hooks")).map_err(io)?;
+    std::fs::write(&hook, "#!/bin/sh\necho refused by hook >&2\nexit 1\n").map_err(io)?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).map_err(io)?;
+    let e = git
+        .commit("Merge other")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(e.contains("refused by hook"), "the commit's reason: {e}");
+    assert!(
+        e.contains("could not be put back"),
+        "says the index was not restored: {e}"
+    );
+    assert!(e.contains("no copy of the staged files was taken"), "and why: {e}");
+    Ok(())
+}

@@ -91,30 +91,125 @@ impl Git {
 
     /// Record every change in the folder. Returns the new commit, or `None` when nothing changed.
     pub fn commit(&self, message: &str) -> Result<Option<String>> {
+        self.commit_inner(message, None)
+    }
+
+    /// Like [`Git::commit`], but recorded as written by `author` (`Name <email>`), for example
+    /// another participant of a shared session. The committer stays the local user.
+    pub fn commit_as(&self, message: &str, author: &str) -> Result<Option<String>> {
+        self.commit_inner(message, Some(author))
+    }
+
+    fn commit_inner(&self, message: &str, author: Option<&str>) -> Result<Option<String>> {
+        // What was staged before, so a failed commit can put the index back as it was. This can
+        // fail (an unmerged index while resolving a merge has no tree); the commit still goes on,
+        // and the reason is kept for the error if the commit then fails.
+        let index_before = self.run(&["write-tree"]).map(|t| t.trim().to_owned());
         self.run(&["add", "-A"])?;
         let staged = self.run(&["status", "--porcelain"])?;
-        let merging = self.dir.join(".git").join("MERGE_HEAD").exists();
+        let merging = self.git_path("MERGE_HEAD")?.exists();
         if staged.trim().is_empty() && !merging && self.head().is_some() {
             return Ok(None);
         }
-        let mut args = vec!["commit", "-q", "--allow-empty", "-m", message];
+        let author_arg = author.map(|a| format!("--author={a}"));
+        let mut args: Vec<&str> = Vec::new();
         // Commit as the configured user; fall back to a neutral identity so a fresh machine works.
-        let has_identity = self.run(&["config", "user.email"]).is_ok();
-        if !has_identity {
-            args = vec![
-                "-c",
-                "user.name=WiringCraft",
-                "-c",
-                "user.email=wiringcraft@localhost",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                message,
-            ];
+        if self.run(&["config", "user.email"]).is_err() {
+            args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"]);
         }
-        self.run(&args)?;
+        args.extend(["commit", "-q", "--allow-empty", "-m", message]);
+        if let Some(a) = &author_arg {
+            args.push(a);
+        }
+        if let Err(e) = self.run(&args) {
+            let undo = match &index_before {
+                Ok(tree) => self.run(&["read-tree", tree]).err(),
+                Err(snapshot) => Some(Error::Git {
+                    args: "write-tree".into(),
+                    message: format!("no copy of the staged files was taken: {snapshot}"),
+                }),
+            };
+            return Err(match undo {
+                None => e,
+                Some(undo) => Error::Git {
+                    args: "commit".into(),
+                    message: format!("{e}; the staged files could not be put back: {undo}"),
+                },
+            });
+        }
         Ok(self.head())
+    }
+
+    /// Undo one earlier commit with a new commit that reverses it (the history keeps both).
+    /// Returns the new commit. Fails, leaving nothing half done, when later commits changed the
+    /// same lines.
+    pub fn revert(&self, commit: &str) -> Result<Option<String>> {
+        let mut args: Vec<&str> = Vec::new();
+        if self.run(&["config", "user.email"]).is_err() {
+            args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"]);
+        }
+        let mut busy = None;
+        for f in ["REVERT_HEAD", "CHERRY_PICK_HEAD", "MERGE_HEAD", "sequencer"] {
+            if self.git_path(f)?.exists() {
+                busy = Some(f);
+                break;
+            }
+        }
+        if let Some(f) = busy {
+            return Err(Error::Git {
+                args: format!("revert {commit}"),
+                message: format!("another revert, cherry-pick or merge is in progress ({f}); finish or abort it first"),
+            });
+        }
+        args.extend(["revert", "--no-edit", commit]);
+        if let Err(e) = self.run(&args) {
+            // Only this call's revert can be in progress here (checked above), so aborting it
+            // cannot throw away earlier work.
+            // When the lookup itself fails, try the abort anyway (no other operation was running)
+            // and keep the lookup's reason with the error.
+            let (mid_revert, lookup) = match self.git_path("REVERT_HEAD") {
+                Ok(p) => (p.exists(), None),
+                Err(l) => (true, Some(l)),
+            };
+            let abort = if mid_revert {
+                self.run(&["revert", "--abort"]).err()
+            } else {
+                None
+            };
+            if abort.is_none() && lookup.is_none() {
+                return Err(e);
+            }
+            let mut message = e.to_string();
+            if let Some(l) = lookup {
+                message.push_str(&format!("; could not tell whether the revert was left half done: {l}"));
+            }
+            if let Some(a) = abort {
+                message.push_str(&format!(
+                    "; undoing the failed revert also failed, so the folder is mid-revert: {a}"
+                ));
+            }
+            return Err(Error::Git {
+                args: format!("revert {commit}"),
+                message,
+            });
+        }
+        Ok(self.head())
+    }
+
+    /// Where git keeps an operation file such as `REVERT_HEAD`. In a linked worktree `.git` is a
+    /// file pointing elsewhere, so git is asked.
+    fn git_path(&self, name: &str) -> Result<PathBuf> {
+        let out = self.run(&["rev-parse", "--git-path", name])?;
+        Ok(self.dir.join(out.trim()))
+    }
+
+    /// The author (`Name <email>`) and subject of a commit.
+    pub fn author_and_subject(&self, rev: &str) -> Result<(String, String)> {
+        let out = self.run(&["log", "-1", "--format=%an <%ae>%n%s", rev])?;
+        let mut lines = out.lines();
+        let author = lines.next().unwrap_or_default().to_owned();
+        let subject = lines.next().unwrap_or_default().to_owned();
+        Ok((author, subject))
     }
 
     pub fn current_branch(&self) -> Option<String> {

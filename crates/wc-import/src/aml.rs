@@ -251,6 +251,8 @@ pub struct Built {
     pub parts: Vec<wc_core::Part>,
     pub pages: Vec<Page>,
     pub devices: BTreeMap<DeviceTag, Device>,
+    /// Locations with their descriptions, for the project file (importers that have them).
+    pub locations: Vec<wc_core::Location>,
 }
 
 const PIN_STEP: f64 = 7.5;
@@ -481,6 +483,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                     number,
                     potential: None,
                     cable: None,
+                    route: Default::default(),
                 });
             }
         } else {
@@ -500,6 +503,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                         number: number.clone(),
                         potential: potential.clone(),
                         cable: None,
+                        route: Default::default(),
                     });
                 }
             }
@@ -622,6 +626,7 @@ mod tests {
             number: None,
             potential: Some("L+".into()),
             cable: None,
+            route: Default::default(),
         });
         project.pages.push(page);
         let part = wc_core::Part {

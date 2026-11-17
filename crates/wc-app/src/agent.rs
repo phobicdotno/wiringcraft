@@ -923,8 +923,14 @@ impl App {
 
     /// Take the message a command left in a dialog, so the model gets it as a result.
     fn take_message(&mut self) -> Option<String> {
+        // Log it first: once taken, the frame's own logging never sees it.
+        self.log_messages();
         match self.dialog.take() {
-            Some(Dialog::Message(m)) => Some(m),
+            Some(Dialog::Message(m)) => {
+                // Closed now, so the same message is logged again the next time it shows.
+                self.logged.1.clear();
+                Some(m)
+            }
             other => {
                 self.dialog = other;
                 None
@@ -2042,6 +2048,7 @@ mod tests {
             applied_theme: crate::theme::Mode::Light,
             assistant: Assistant::with_transport(Arc::new(Script(Mutex::new(answers)))),
             open_url: Vec::new(),
+            logged: Default::default(),
         };
         (tmp, app)
     }
@@ -2052,6 +2059,63 @@ mod tests {
 
     fn page2(app: &App) -> &Page {
         app.open.as_ref().unwrap().project.page("p0002").unwrap()
+    }
+
+    #[test]
+    fn a_message_box_is_logged_again_after_it_closed() {
+        let (_tmp, mut a) = app(vec![]);
+        let fail = || Some(Dialog::Message("Saving failed:\ndisk full".into()));
+        let boxes = |a: &mut App| {
+            a.new_messages()
+                .into_iter()
+                .filter(|(l, _)| *l == crate::applog::Level::Warn)
+                .count()
+        };
+        a.dialog = fail();
+        assert_eq!(boxes(&mut a), 1);
+        assert_eq!(boxes(&mut a), 0, "once while it is open");
+        a.dialog = None;
+        assert_eq!(boxes(&mut a), 0);
+        // A save that worked, then the same failure again.
+        a.ed.message = "Saved".into();
+        a.new_messages();
+        a.dialog = fail();
+        assert_eq!(boxes(&mut a), 1, "the second failure is logged too");
+    }
+
+    #[test]
+    fn the_report_gets_the_log_only_when_chosen() {
+        let (request, copy) = crate::report_request("line one\nline two\n", false);
+        assert!(request.detail.is_empty() && copy.is_none());
+        let (request, copy) = crate::report_request("", true);
+        assert!(request.detail.is_empty() && copy.is_none(), "no empty log");
+        let (request, copy) = crate::report_request("line one\nline two\n", true);
+        assert!(request.detail.contains("line two"));
+        assert_eq!(copy.as_deref(), Some("line one\nline two\n"));
+    }
+
+    #[test]
+    fn a_taken_message_was_logged_first() {
+        let (_tmp, mut a) = app(vec![]);
+        crate::applog::take_captured();
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        // `take_message` logs before taking, and forgets the text once taken: the cache that
+        // stops a message from being logged twice must not hold it, or the same message taken
+        // again right after (no frame in between) would not be logged.
+        assert_eq!(a.take_message().as_deref(), Some("Export failed"));
+        assert!(a.logged.1.is_empty(), "the taken message no longer blocks the next one");
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        assert_eq!(a.take_message().as_deref(), Some("Export failed"));
+        assert!(a.logged.1.is_empty());
+        let warned = (crate::applog::Level::Warn, "Export failed".to_owned());
+        assert_eq!(
+            crate::applog::take_captured(),
+            [warned.clone(), warned],
+            "both reached the log"
+        );
+        // And the frame's own logging sees a third one as new.
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        assert_eq!(a.new_messages().len(), 1);
     }
 
     #[test]
