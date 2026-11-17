@@ -155,6 +155,25 @@ pub struct Open {
     /// In a shared session, the pages someone else has open (page id to their name). Tools that
     /// work on every page leave these alone; the session would refuse the change otherwise.
     pub held_by_others: BTreeMap<String, String>,
+    /// Every version of a vendored symbol this window has loaded, by content hash, so Undo
+    /// and Redo can put back the version the restored lock names.
+    symbol_versions: BTreeMap<String, Symbol>,
+    /// Symbols whose vendored file may hold another version than the one loaded, after a
+    /// failed Undo or Redo (or a command's result) could not be put back. The next Undo, Redo
+    /// or save writes them again.
+    stale_symbol_files: std::collections::BTreeSet<String>,
+    /// Tests: whether each coming symbol file write fails, in order.
+    #[cfg(test)]
+    pub(crate) fail_symbol_writes: std::collections::VecDeque<bool>,
+    /// Tests: a file that turns into a folder once the update's backups are taken, so the
+    /// update's write of it fails after other items were already written.
+    #[cfg(test)]
+    block_after_snapshot: Option<PathBuf>,
+    /// Tests: a file whose backup read fails, though the file is a plain readable one.
+    #[cfg(test)]
+    unreadable: Option<PathBuf>,
+    /// Why the last Undo or Redo was not done, when it failed.
+    undo_error: Option<String>,
 }
 
 impl Open {
@@ -178,7 +197,19 @@ impl Open {
             underlays: BTreeMap::new(),
             terminals_before: None,
             held_by_others: BTreeMap::new(),
+            symbol_versions: BTreeMap::new(),
+            stale_symbol_files: Default::default(),
+            #[cfg(test)]
+            fail_symbol_writes: Default::default(),
+            #[cfg(test)]
+            block_after_snapshot: None,
+            #[cfg(test)]
+            unreadable: None,
+            undo_error: None,
         };
+        // Locked symbols no page uses are loaded too, so Undo can put back the version a
+        // library update replaces.
+        me.reload_symbols();
         me.refresh_library();
         Ok(me)
     }
@@ -396,6 +427,14 @@ impl Open {
             Some(prev) => {
                 self.forget_terminal_change();
                 self.redo.push(std::mem::replace(&mut self.project, prev));
+                if let Err(e) = self.sync_symbols() {
+                    // The symbol files could not follow: keep the project as it was.
+                    if let Some(cur) = self.redo.pop() {
+                        self.undo.push(std::mem::replace(&mut self.project, cur));
+                    }
+                    self.undo_error = Some(e);
+                    return false;
+                }
                 self.dirty = true;
                 self.history += 1;
                 true
@@ -410,6 +449,13 @@ impl Open {
             Some(next) => {
                 self.forget_terminal_change();
                 self.undo.push(std::mem::replace(&mut self.project, next));
+                if let Err(e) = self.sync_symbols() {
+                    if let Some(cur) = self.undo.pop() {
+                        self.redo.push(std::mem::replace(&mut self.project, cur));
+                    }
+                    self.undo_error = Some(e);
+                    return false;
+                }
                 self.dirty = true;
                 self.history += 1;
                 true
@@ -418,8 +464,284 @@ impl Open {
         }
     }
 
+    /// Load the vendored symbols again after the library changed them, keeping the versions
+    /// they replace so Undo can bring those back.
+    pub fn reload_symbols(&mut self) {
+        for sym in self.symbols.values() {
+            self.symbol_versions.insert(sym.hash(), sym.clone());
+        }
+        let (mut syms, _) = store::vendored_symbols(&self.dir, &self.project);
+        // Locked symbols no page uses yet are kept too, so the version the lock names is
+        // known for Redo and for the next placement.
+        for id in self.project.lock.symbols.keys() {
+            if !syms.contains_key(id)
+                && let Ok(sym) = store::read_vendored_symbol(&self.dir, id)
+            {
+                syms.insert(id.clone(), sym);
+            }
+        }
+        // A file that could not be put back still holds another version: the loaded one stays
+        // while the lock still names it, so the next save writes it. A lock that now names
+        // the file's version (the symbol was taken again) makes the file right.
+        for id in self.stale_symbol_files.clone() {
+            let wanted = self.project.lock.symbols.get(&id).map(|e| e.hash.clone());
+            match self.symbols.get(&id) {
+                Some(loaded) if wanted.as_ref().is_none_or(|h| *h == loaded.hash()) => {
+                    syms.insert(id.clone(), loaded.clone());
+                }
+                _ => {
+                    self.stale_symbol_files.remove(&id);
+                }
+            }
+        }
+        self.symbols = syms;
+    }
+
+    /// After Undo or Redo: put back the vendored symbol versions the restored lock names, both
+    /// in memory and in the project folder, so the pages draw what the lock says. When a file
+    /// cannot be written, the files already written are put back and nothing changes.
+    fn sync_symbols(&mut self) -> Result<(), String> {
+        let mut wanted: Vec<(String, Symbol)> = Vec::new();
+        for (id, entry) in &self.project.lock.symbols {
+            if let Some(loaded) = self.symbols.get(id).filter(|s| s.hash() == entry.hash) {
+                // Loaded already; its file is written again only when it could not be put back.
+                if self.stale_symbol_files.contains(id) {
+                    wanted.push((id.clone(), loaded.clone()));
+                }
+                continue;
+            }
+            // The version the lock names: kept from earlier, or still in the project folder.
+            if let Some(sym) = self.symbol_versions.get(&entry.hash) {
+                wanted.push((id.clone(), sym.clone()));
+                continue;
+            }
+            match store::read_vendored_symbol(&self.dir, id) {
+                Ok(sym) if sym.hash() == entry.hash => wanted.push((id.clone(), sym)),
+                Ok(_) => {
+                    return Err(format!(
+                        "the version of symbol {id} this step names is not known any more"
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "the version of symbol {id} this step names is not known any more, and its file cannot be read: {e}"
+                    ));
+                }
+            }
+        }
+        for (n, (id, want)) in wanted.iter().enumerate() {
+            if let Err(e) = self.write_symbol_file(want) {
+                // Put back the files already written; say which could not be, and remember
+                // them so the next Undo or Redo writes them again.
+                let mut unrestored = Vec::new();
+                for (done, _) in wanted.iter().take(n) {
+                    let Some(old) = self.symbols.get(done).cloned() else {
+                        continue;
+                    };
+                    if let Err(e) = self.write_symbol_file(&old) {
+                        unrestored.push(format!("{done} ({e})"));
+                        self.stale_symbol_files.insert(done.clone());
+                    }
+                }
+                let mut msg = format!("symbol {id} could not be put back: {e}");
+                if !unrestored.is_empty() {
+                    msg.push_str(&format!(
+                        "; these symbol files now hold the other version and could not be restored: {}. The next Undo or Redo writes them again.",
+                        unrestored.join(", ")
+                    ));
+                }
+                return Err(msg);
+            }
+        }
+        for (id, _) in &wanted {
+            self.stale_symbol_files.remove(id);
+        }
+        for (id, want) in wanted {
+            if let Some(old) = self.symbols.insert(id, want) {
+                self.symbol_versions.insert(old.hash(), old);
+            }
+        }
+        // A symbol the restored step neither locks nor uses is let go, kept as a version for
+        // Redo: still loaded, it would let the next placement skip pinning it in the lock.
+        let used = self.project.used_symbols();
+        let gone: Vec<String> = self
+            .symbols
+            .keys()
+            .filter(|id| !self.project.lock.symbols.contains_key(*id) && !used.contains(*id))
+            .cloned()
+            .collect();
+        for id in gone {
+            if let Some(old) = self.symbols.remove(&id) {
+                self.symbol_versions.insert(old.hash(), old);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_symbol_file(&mut self, sym: &Symbol) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_symbol_writes.pop_front() == Some(true) {
+            return Err("test write failure".into());
+        }
+        store::write_vendored_symbol(&self.dir, sym)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remember that a symbol's vendored file may hold another version than the loaded one;
+    /// the next save, Undo or Redo writes the loaded version again.
+    pub(crate) fn mark_symbol_file_stale(&mut self, id: &str) {
+        self.stale_symbol_files.insert(id.to_owned());
+    }
+
+    /// Write the loaded version of every symbol whose file may hold another one. A save does
+    /// not go ahead while one of them cannot be written, since the saved lock would not match.
+    fn rewrite_stale_symbol_files(&mut self) -> Result<(), String> {
+        for id in self.stale_symbol_files.clone() {
+            let Some(sym) = self.symbols.get(&id).cloned() else {
+                self.stale_symbol_files.remove(&id);
+                continue;
+            };
+            self.write_symbol_file(&sym).map_err(|e| {
+                format!("not saved: the file of symbol {id} still holds another version and cannot be written: {e}")
+            })?;
+            self.stale_symbol_files.remove(&id);
+        }
+        Ok(())
+    }
+
+    /// Keep the loaded symbol versions, so a step that replaces them can be undone.
+    pub fn archive_symbols(&mut self) {
+        for sym in self.symbols.values() {
+            self.symbol_versions.insert(sym.hash(), sym.clone());
+        }
+    }
+
+    /// Take the newer library versions of the project's items (only `only`, when given), as
+    /// one undo step. An update that would leave wires on pins a new symbol version no longer
+    /// has is taken back, and the wires are named.
+    pub fn update_library(
+        &mut self,
+        lib: &wc_library::Library,
+        only: Option<&[String]>,
+    ) -> Result<Vec<(ItemKind, String)>, String> {
+        let todo: Vec<(ItemKind, String)> = wc_library::status(&self.dir, &self.project, lib)
+            .into_iter()
+            .filter(|s| s.state == wc_library::State::Changed)
+            .filter(|s| only.is_none_or(|ids| ids.contains(&s.id)))
+            .map(|s| (s.kind, s.id))
+            .collect();
+        // Checked before anything is written: a new version that drops a wired pin stops the
+        // whole update.
+        let mut dangling: Vec<String> = todo
+            .iter()
+            .filter(|(kind, _)| *kind == ItemKind::Symbol)
+            .filter_map(|(_, id)| Some(dangling_pins(&self.project, id, &lib.symbol(id).ok()?.0)))
+            .flatten()
+            .collect();
+        if !dangling.is_empty() {
+            dangling.sort();
+            return Err(format!(
+                "nothing was updated: wires end on pins the new versions no longer have ({}). Move those wires first.",
+                dangling.join(", ")
+            ));
+        }
+        // Undo puts back the lock and the symbol files; part files are kept here, so a write
+        // that fails halfway leaves none of them changed either.
+        let parts: Vec<(PathBuf, Option<Vec<u8>>)> = todo
+            .iter()
+            .filter(|(kind, _)| *kind == ItemKind::Part)
+            .filter_map(|(kind, id)| store::vendor_path(&self.dir, *kind, id).ok())
+            .map(|path| {
+                #[cfg(test)]
+                if self.unreadable.as_ref() == Some(&path) {
+                    return Err(format!("{} cannot be read: test read failure", path.display()));
+                }
+                Ok((path.clone(), snapshot_file(&path)?))
+            })
+            .collect::<Result<_, String>>()
+            .map_err(|e| format!("nothing was updated: {e}"))?;
+        #[cfg(test)]
+        if let Some(path) = self.block_after_snapshot.take() {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::create_dir(&path);
+        }
+        self.archive_symbols();
+        self.checkpoint();
+        let done = match wc_library::update(&self.dir, &mut self.project, lib, only) {
+            Ok(done) => done,
+            Err(e) => {
+                // Some items may have been taken already: take them back too.
+                let mut unrestored: Vec<String> = parts
+                    .iter()
+                    .filter_map(|(path, was)| {
+                        restore_file(path, was.as_deref())
+                            .err()
+                            .map(|err| format!("{} ({err})", path.display()))
+                    })
+                    .collect();
+                self.reload_symbols();
+                let undone = self.undo();
+                self.redo.clear();
+                if let (false, Some(why)) = (undone, self.take_undo_error()) {
+                    unrestored.push(why);
+                }
+                return Err(if unrestored.is_empty() {
+                    e.to_string()
+                } else {
+                    format!(
+                        "{e}; what was already updated could not be taken back: {}",
+                        unrestored.join("; ")
+                    )
+                });
+            }
+        };
+        self.reload_symbols();
+        let mut dangling: Vec<String> = done
+            .iter()
+            .filter(|(kind, _)| *kind == ItemKind::Symbol)
+            .filter_map(|(_, id)| Some(dangling_pins(&self.project, id, self.symbols.get(id)?)))
+            .flatten()
+            .collect();
+        if dangling.is_empty() {
+            return Ok(done);
+        }
+        dangling.sort();
+        let wires = dangling.join(", ");
+        if !self.undo() {
+            let why = self.take_undo_error().unwrap_or_default();
+            return Err(format!(
+                "wires end on pins the new versions no longer have ({wires}), and the update could not be taken back: {why}"
+            ));
+        }
+        self.redo.clear();
+        Err(format!(
+            "nothing was updated: wires end on pins the new versions no longer have ({wires}). Move those wires first."
+        ))
+    }
+
+    /// Why the last Undo or Redo failed, once.
+    pub fn take_undo_error(&mut self) -> Option<String> {
+        self.undo_error.take()
+    }
+
+    /// After the symbol editor saved symbol `id` into the library: take that symbol (only the
+    /// symbol, never a part with the same id) into the project, as one undo step.
+    pub fn take_saved_symbol(&mut self, lib: &wc_library::Library, id: &str) -> Result<(), String> {
+        // Taken into a copy first: a failure leaves the project and its history as they were
+        // (take writes the file only once the library symbol is read, and nothing after).
+        self.archive_symbols();
+        let mut next = self.project.clone();
+        let entry = wc_library::take(&self.dir, &mut next, lib, ItemKind::Symbol, id).map_err(|e| e.to_string())?;
+        self.checkpoint();
+        self.project.lock.symbols.insert(id.to_owned(), entry);
+        self.reload_symbols();
+        Ok(())
+    }
+
     pub fn save(&mut self) -> Result<usize, String> {
         self.follow_terminals();
+        self.rewrite_stale_symbol_files()?;
         let n = store::save(&self.dir, &self.project).map_err(|e| e.to_string())?.len();
         self.dirty = false;
         Ok(n)
@@ -1156,6 +1478,61 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Wire ends on pins of symbol `id` that `symbol` does not have: `page 3 -K1:13` each.
+pub fn dangling_pins(project: &wc_core::Project, id: &str, symbol: &wc_core::Symbol) -> Vec<String> {
+    let mut out = Vec::new();
+    for page in &project.pages {
+        for w in &page.wires {
+            for end in [&w.from, &w.to] {
+                let wc_core::Endpoint::Pin { item, pin } = end else {
+                    continue;
+                };
+                let Some(placed) = page.symbol(item) else { continue };
+                if placed.symbol == id && symbol.pin(pin).is_none() {
+                    let name = placed.tag.as_ref().map_or_else(|| item.clone(), ToString::to_string);
+                    out.push(format!("page {} {name}:{pin}", page.number));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A file's bytes before it is changed, or `None` when there is no such file. Any other
+/// read error is returned: a file that is there but cannot be read must not be taken for absent
+/// (and then removed when putting things back).
+fn snapshot_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{} cannot be read: {e}", path.display())),
+    }
+}
+
+/// Put a file back as [`snapshot_file`] found it: untouched when it already holds those bytes,
+/// otherwise replaced whole (written next to it, then renamed over it), so a failed write
+/// leaves the file as it was rather than cut short.
+fn restore_file(path: &Path, was: Option<&[u8]>) -> std::io::Result<()> {
+    match was {
+        Some(bytes) => {
+            if std::fs::read(path).is_ok_and(|now| now == bytes) {
+                return Ok(());
+            }
+            let mut tmp = path.as_os_str().to_owned();
+            tmp.push(".tmp");
+            let tmp = PathBuf::from(tmp);
+            std::fs::write(&tmp, bytes)?;
+            std::fs::rename(&tmp, path)
+        }
+        None => match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        },
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
@@ -1177,6 +1554,422 @@ pub(crate) mod tests {
         store::save(&dir, &p).unwrap();
         let open = Open::load(&dir).unwrap();
         (tmp, open)
+    }
+
+    #[test]
+    fn a_part_file_that_cannot_be_read_is_not_taken_for_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing.json");
+        assert_eq!(super::snapshot_file(&missing).unwrap(), None);
+        // A directory where the file should be: there, but not readable as a file.
+        let unreadable = tmp.path().join("part.json");
+        std::fs::create_dir(&unreadable).unwrap();
+        let err = super::snapshot_file(&unreadable).unwrap_err();
+        assert!(err.contains("cannot be read"), "{err}");
+    }
+
+    #[test]
+    fn a_part_file_is_put_back_whole_or_not_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("part.json");
+        std::fs::write(&path, b"new").unwrap();
+        // The replacement cannot be written next to the file: the file keeps what it had.
+        std::fs::create_dir(tmp.path().join("part.json.tmp")).unwrap();
+        assert!(super::restore_file(&path, Some(b"old")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        // A file that already holds the bytes is not written at all.
+        assert!(super::restore_file(&path, Some(b"new")).is_ok());
+        std::fs::remove_dir(tmp.path().join("part.json.tmp")).unwrap();
+        super::restore_file(&path, Some(b"old")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        super::restore_file(&path, None).unwrap();
+        assert!(!path.exists());
+        super::restore_file(&path, None).unwrap();
+    }
+
+    #[test]
+    fn undo_puts_back_the_symbol_version_a_library_update_replaced() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        assert_eq!(o.symbols["wc.coil"], new);
+
+        assert!(o.undo());
+        assert_eq!(o.symbols["wc.coil"], old, "the cache follows the lock");
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "and the file"
+        );
+        assert!(o.redo());
+        assert_eq!(o.symbols["wc.coil"], new);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
+    }
+
+    #[test]
+    fn redo_puts_back_a_new_version_of_a_symbol_no_page_uses() {
+        let (_tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        assert_eq!(o.symbols["wc.coil"], new, "kept though no page uses it");
+        assert!(o.undo());
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert!(o.redo());
+        assert_eq!(o.symbols["wc.coil"], new);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
+        assert_eq!(o.project.lock.symbols["wc.coil"].hash, new.hash());
+    }
+
+    /// A library folder named "mine", put ahead of the others, holding `sym`.
+    fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
+        let mine = root.join("mine");
+        std::fs::create_dir_all(mine.join("symbols")).unwrap();
+        std::fs::write(
+            mine.join(format!("symbols/{}.json", sym.id)),
+            serde_json::to_string(sym).unwrap(),
+        )
+        .unwrap();
+        o.project.meta.libraries.insert(
+            0,
+            LibrarySource {
+                name: "mine".into(),
+                kind: "folder".into(),
+                location: mine.display().to_string(),
+                reference: None,
+            },
+        );
+        wc_library::Library::open(&o.dir, &o.project).unwrap()
+    }
+
+    /// Put a changed copy of a vendored part into the "mine" library folder.
+    fn changed_part_in_mine(o: &Open, root: &Path, pid: &str) -> wc_core::Part {
+        let mut part = store::read_vendored_part(&o.dir, pid).unwrap();
+        part.description = "Changed in the library".into();
+        std::fs::create_dir_all(root.join("mine/parts")).unwrap();
+        std::fs::write(
+            root.join(format!("mine/parts/{pid}.json")),
+            serde_json::to_string(&part).unwrap(),
+        )
+        .unwrap();
+        part
+    }
+
+    #[test]
+    fn an_update_refused_for_a_dropped_pin_writes_no_part_either() {
+        let (tmp, mut o) = project();
+        let s1 = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let s2 = o.place(1, "wc.coil", Point::new(60.0, 20.0)).unwrap();
+        let pin = |item: &str| Endpoint::Pin {
+            item: item.to_owned(),
+            pin: "A2".into(),
+        };
+        o.project.pages[1].wires.push(Wire {
+            id: "w1".into(),
+            from: pin(&s1),
+            to: pin(&s2),
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let part_before = std::fs::read(&part_file).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let mut new = o.symbols["wc.coil"].clone();
+        new.pins.retain(|p| p.name != "A2");
+        let lib = library_first(&mut o, tmp.path(), &new);
+        let lock = o.project.lock.clone();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(err.starts_with("nothing was updated") && err.contains(":A2"), "{err}");
+        assert_eq!(
+            std::fs::read(&part_file).unwrap(),
+            part_before,
+            "the part file is untouched"
+        );
+        assert_eq!(o.project.lock, lock);
+    }
+
+    #[test]
+    fn an_update_whose_later_write_fails_takes_back_the_symbol_written_before_it() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        // Once the backups are taken, a folder where the part file goes: symbols are taken
+        // first, then this write fails.
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        o.block_after_snapshot = Some(part_file.clone());
+        let lock = o.project.lock.clone();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(
+            !err.starts_with("nothing was updated"),
+            "the update itself failed: {err}"
+        );
+        assert_eq!(o.project.lock, lock, "the lock is as before");
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "and the symbol file"
+        );
+        assert!(!o.can_redo());
+    }
+
+    #[test]
+    fn an_update_whose_part_file_cannot_be_read_changes_nothing_and_keeps_the_file() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        // The part file is a plain, removable file whose read fails.
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let bytes = std::fs::read(&part_file).unwrap();
+        o.unreadable = Some(part_file.clone());
+        let lock = o.project.lock.clone();
+        let mark = o.undo_mark();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(
+            err.starts_with("nothing was updated") && err.contains("cannot be read"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&part_file).unwrap(), bytes, "the file is kept as it was");
+        assert_eq!(o.project.lock, lock);
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "no symbol written"
+        );
+        assert_eq!(o.undo_mark(), mark, "no undo step");
+    }
+
+    #[test]
+    fn undo_after_reopening_puts_back_a_locked_symbol_no_page_uses() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        o.save().unwrap();
+        let old = store::read_vendored_symbol(&o.dir, "wc.coil").unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        let done = o.update_library(&lib, None).unwrap();
+        assert!(done.contains(&(ItemKind::Symbol, "wc.coil".to_owned())));
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
+        assert!(o.undo());
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    #[test]
+    fn a_library_update_that_drops_a_wired_pin_is_taken_back() {
+        let (tmp, mut o) = project();
+        let s1 = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let s2 = o.place(1, "wc.coil", Point::new(60.0, 20.0)).unwrap();
+        let pin = |item: &str| Endpoint::Pin {
+            item: item.to_owned(),
+            pin: "A2".into(),
+        };
+        o.project.pages[1].wires.push(Wire {
+            id: "w1".into(),
+            from: pin(&s1),
+            to: pin(&s2),
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.pins.retain(|p| p.name != "A2");
+        let lib = library_first(&mut o, tmp.path(), &new);
+        let before = o.project.clone();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(err.contains(":A2"), "{err}");
+        assert_eq!(o.project, before, "nothing was updated");
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+        assert!(!o.can_redo(), "no step is left to redo into the broken version");
+    }
+
+    #[test]
+    fn a_symbol_taken_back_by_undo_is_pinned_again_when_it_is_placed() {
+        let (_tmp, mut o) = project();
+        let lib = wc_library::Library::open(&o.dir, &o.project).unwrap();
+        o.take_saved_symbol(&lib, "wc.lamp").unwrap();
+        assert!(o.symbols.contains_key("wc.lamp"));
+        assert!(o.undo());
+        assert!(!o.project.lock.symbols.contains_key("wc.lamp"));
+        assert!(!o.symbols.contains_key("wc.lamp"), "not locked and not used: let go");
+        assert!(o.redo(), "the version is kept for Redo");
+        assert!(o.symbols.contains_key("wc.lamp") && o.project.lock.symbols.contains_key("wc.lamp"));
+        assert!(o.undo());
+        o.place(1, "wc.lamp", Point::new(20.0, 20.0)).unwrap();
+        assert!(
+            o.project.lock.symbols.contains_key("wc.lamp"),
+            "every placed symbol is pinned"
+        );
+    }
+
+    #[test]
+    fn an_undo_whose_symbol_version_is_gone_says_why_the_file_could_not_be_read() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut new = o.symbols["wc.coil"].clone();
+        new.name = "Coil, changed".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        o.symbol_versions.clear();
+        let file = store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap();
+        std::fs::write(&file, "not a symbol").unwrap();
+        assert!(!o.undo());
+        let err = o.take_undo_error().unwrap_or_default();
+        let reason = err.split("cannot be read: ").nth(1).unwrap_or_default();
+        assert!(!reason.trim().is_empty(), "the parse error follows: {err}");
+        let parse = store::read_vendored_symbol(&o.dir, "wc.coil").unwrap_err().to_string();
+        assert!(err.ends_with(&parse), "{err} / {parse}");
+    }
+
+    #[test]
+    fn a_rollback_that_fails_is_written_again_by_the_next_undo() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        o.place(1, "wc.lamp", Point::new(60.0, 20.0)).unwrap();
+        let (coil, lamp) = (o.symbols["wc.coil"].clone(), o.symbols["wc.lamp"].clone());
+        o.checkpoint();
+        let mut coil2 = coil.clone();
+        coil2.name = "Coil, changed".into();
+        let mut lamp2 = lamp.clone();
+        lamp2.name = "Lamp, changed".into();
+        for s in [&coil2, &lamp2] {
+            store::write_vendored_symbol(&o.dir, s).unwrap();
+            o.project.lock.symbols.get_mut(&s.id).unwrap().hash = s.hash();
+        }
+        o.reload_symbols();
+        // Undo: the coil file is written, the lamp write fails, and putting the coil back fails.
+        o.fail_symbol_writes = [false, true, true].into();
+        assert!(!o.undo());
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(err.contains("could not be restored: wc.coil"), "{err}");
+        assert_eq!(o.symbols["wc.coil"], coil2, "memory follows the lock");
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            coil,
+            "the file does not"
+        );
+        // A step whose lock names what memory already holds still writes the coil file again.
+        o.checkpoint();
+        assert!(o.undo());
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), coil2);
+        // And the step that failed now goes through.
+        assert!(o.undo());
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), coil);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.lamp").unwrap(), lamp);
+    }
+
+    #[test]
+    fn an_undo_whose_symbol_file_cannot_be_written_changes_nothing() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut new = o.symbols["wc.coil"].clone();
+        new.name = "Coil, changed".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        let after = o.project.clone();
+        // A folder where the symbol file goes: the write fails, even for root.
+        let file = store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some_and(|e| e.contains("wc.coil")));
+        assert_eq!(o.project, after, "the project stays as it was");
+        assert_eq!(o.symbols["wc.coil"], new);
+        assert!(o.can_undo() && !o.can_redo(), "the step is still there to undo");
+    }
+
+    #[test]
+    fn saving_a_symbol_leaves_a_part_with_the_same_id_alone() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        let part = store::read_vendored_part(&o.dir, pid).unwrap();
+        let locked = o.project.lock.parts[pid].clone();
+        // A library folder ahead of the starter one with a changed part and a symbol, same id.
+        let mine = tmp.path().join("mine");
+        std::fs::create_dir_all(mine.join("symbols")).unwrap();
+        std::fs::create_dir_all(mine.join("parts")).unwrap();
+        let mut changed = part.clone();
+        changed.description = "Changed in the library".into();
+        std::fs::write(
+            mine.join(format!("parts/{pid}.json")),
+            serde_json::to_string(&changed).unwrap(),
+        )
+        .unwrap();
+        let mut sym = o.symbols["wc.coil"].clone();
+        sym.id = pid.into();
+        std::fs::write(
+            mine.join(format!("symbols/{pid}.json")),
+            serde_json::to_string(&sym).unwrap(),
+        )
+        .unwrap();
+        o.project.meta.libraries.insert(
+            0,
+            LibrarySource {
+                name: "mine".into(),
+                kind: "folder".into(),
+                location: mine.display().to_string(),
+                reference: None,
+            },
+        );
+        let lib = wc_library::Library::open(&o.dir, &o.project).unwrap();
+        o.take_saved_symbol(&lib, pid).unwrap();
+        assert!(o.project.lock.symbols.contains_key(pid));
+        assert_eq!(o.project.lock.parts[pid], locked, "the part's lock entry is unchanged");
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), part, "and its copy");
+    }
+
+    #[test]
+    fn a_symbol_save_that_fails_leaves_the_history_alone() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let before = o.project.clone();
+        let steps = o.undo.len();
+        let lib = wc_library::Library::open(&o.dir, &o.project).unwrap();
+        assert!(o.take_saved_symbol(&lib, "no.such-symbol").is_err());
+        assert_eq!(o.project, before, "the project stays as it was");
+        assert_eq!(o.undo.len(), steps, "and no empty undo step was added");
     }
 
     fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

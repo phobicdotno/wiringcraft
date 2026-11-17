@@ -1259,11 +1259,7 @@ impl App {
                 if need_s(v, "action")? == "update" {
                     let ids = strings(v, "ids");
                     let only = (!ids.is_empty()).then_some(ids.as_slice());
-                    open.checkpoint();
-                    let done =
-                        wc_library::update(&open.dir, &mut open.project, &lib, only).map_err(|e| e.to_string())?;
-                    let (syms, _) = wc_core::store::vendored_symbols(&open.dir, &open.project);
-                    open.symbols = syms;
+                    let done = open.update_library(&lib, only)?;
                     open.refresh_library();
                     let ids: Vec<String> = done.iter().map(|(_, id)| id.clone()).collect();
                     return Ok(format!("Updated {} item(s): {}", ids.len(), ids.join(", ")));
@@ -1326,6 +1322,9 @@ impl App {
                 }
                 let open = need_open(self.open.as_mut())?;
                 let done = if redo { open.redo() } else { open.undo() };
+                if let Some(e) = open.take_undo_error() {
+                    return Err(format!("Not done: {e}"));
+                }
                 self.ed.selection.clear();
                 Ok(if done { "Done." } else { "Nothing to undo or redo." }.into())
             }
@@ -2117,21 +2116,48 @@ impl App {
             return r;
         }
         let fresh = Open::load(&open.dir)?;
-        // Symbols the command added or changed come in; symbols the window vendored meanwhile
-        // (not saved yet, so not on disk) stay.
         // Pending window changes follow their terminals under the roles they were made with.
         open.follow_terminals();
-        open.symbols.extend(fresh.symbols);
+        // The versions the command replaced are kept, so its undo step can put them back.
+        open.archive_symbols();
         open.branch = fresh.branch;
         let by_command = fresh.project != base;
         let by_window = open.project != base;
         let mut note = None;
         if by_command && by_window {
-            note = Some(
+            // The window's project, and so its symbol lock, is kept: its symbol files go back
+            // over the ones the command wrote, so the lock and the files still match.
+            // A symbol the pages use counts too: a project from before the lock can use one
+            // without a lock entry, and it is loaded from its file all the same.
+            let used = open.project.used_symbols();
+            let mut unrestored = Vec::new();
+            for (id, sym) in open.symbols.clone() {
+                if fresh.symbols.get(&id) != Some(&sym)
+                    && (open.project.lock.symbols.contains_key(&id) || used.contains(&id))
+                    && let Err(e) = open.write_symbol_file(&sym)
+                {
+                    // Saving writes it again, and does not go ahead until it can.
+                    open.mark_symbol_file_stale(&id);
+                    unrestored.push(format!("{id} ({e})"));
+                }
+            }
+            note = Some(if unrestored.is_empty() {
                 "The project was edited in the window while the command ran, so the command's changes were \
-                 not loaded: the window's edits are kept, and saving writes them over the command's result.",
-            );
+                 not loaded: the window's edits are kept, and saving writes them over the command's result."
+                    .to_owned()
+            } else {
+                format!(
+                    "The project was edited in the window while the command ran, so the command's changes were \
+                     not loaded: the window's edits are kept, and saving writes them over the command's result. \
+                     The command's version of these symbols is still in the project folder, and saving \
+                     writes the window's version over it first: {}.",
+                    unrestored.join(", ")
+                )
+            });
         } else if by_command {
+            // Symbols the command added or changed come in; symbols the window vendored before
+            // it ran stay.
+            open.symbols.extend(fresh.symbols);
             // The roles may have changed with the command: nothing is left to follow for the
             // undo snapshot, which keeps the drawing and its jumpers as they were.
             open.forget_terminal_change();
@@ -2144,7 +2170,7 @@ impl App {
         self.prune_selection();
         match note {
             Some(n) => {
-                self.ed.message = n.into();
+                self.ed.message = n.clone();
                 Err(match r {
                     Ok(t) | Err(t) => format!("{t}\n\n{n} Ask the user before running it again."),
                 })
@@ -2230,6 +2256,7 @@ mod tests {
             open_url: Vec::new(),
             logged: Default::default(),
             share: Default::default(),
+            symbol_editor: None,
         };
         (tmp, app)
     }
@@ -2240,6 +2267,337 @@ mod tests {
 
     fn page2(app: &App) -> &Page {
         app.open.as_ref().unwrap().project.page("p0002").unwrap()
+    }
+
+    #[test]
+    fn the_symbol_editor_says_why_a_symbol_or_the_library_could_not_be_opened() {
+        let (tmp, mut a) = app(vec![]);
+        let lib = tmp.path().join("mine");
+        std::fs::create_dir_all(lib.join("symbols")).unwrap();
+        std::fs::write(lib.join("symbols/bad.json"), "{ not json").unwrap();
+        let id = call(
+            &mut a,
+            "place_symbol",
+            json!({"symbol": "wc.coil", "x": 50, "y": 50, "page": "2"}),
+        )
+        .unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "mine".into(),
+            kind: "folder".into(),
+            location: lib.display().to_string(),
+            reference: None,
+        });
+        let page = open.project.pages.iter().position(|p| p.number == "2").unwrap();
+        let placed = open.project.pages[page]
+            .symbols
+            .iter_mut()
+            .find(|p| id.contains(&p.id))
+            .unwrap();
+        placed.symbol = "bad".into();
+        let item = placed.id.clone();
+        a.ed.page = page;
+        a.ed.selection = vec![Selection::Symbol(item)];
+        a.run(Action::EditSymbol);
+        let msg = &a.symbol_editor.as_ref().unwrap().message;
+        assert!(
+            msg.starts_with("Symbol bad could not be opened from the library: "),
+            "{msg}"
+        );
+        let open = a.open.as_ref().unwrap();
+        let read_error = wc_library::Library::open(&open.dir, &open.project)
+            .unwrap()
+            .symbol("bad")
+            .unwrap_err()
+            .to_string();
+        assert!(!read_error.is_empty());
+        assert!(msg.ends_with(&read_error), "the read error is kept: {msg}");
+
+        a.symbol_editor = None;
+        a.open.as_mut().unwrap().project.meta.libraries[0].kind = "bogus".into();
+        a.run(Action::NewSymbol);
+        let msg = &a.symbol_editor.as_ref().unwrap().message;
+        assert!(msg.starts_with("The project's library could not be opened: "), "{msg}");
+        assert!(msg.contains("bogus"), "{msg}");
+    }
+
+    #[test]
+    fn editing_keys_go_to_the_symbol_editor_while_it_is_open() {
+        let (_tmp, mut a) = app(vec![]);
+        let keys = vec![Action::Undo, Action::Delete, Action::Redo, Action::ZoomIn];
+        assert_eq!(
+            a.route_to_symbol_editor(keys.clone()),
+            keys,
+            "closed: the project gets them"
+        );
+
+        let mut ed = crate::symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(crate::symbol_editor::Tool::Line);
+        ed.click(wc_core::geom::Point::new(0.0, 0.0));
+        ed.click(wc_core::geom::Point::new(10.0, 0.0));
+        ed.set_tool(crate::symbol_editor::Tool::Select);
+        ed.click(wc_core::geom::Point::new(5.0, 0.0));
+        assert!(ed.selected.is_some());
+        a.symbol_editor = Some(ed);
+        let before = a.open.as_ref().unwrap().project.clone();
+        assert_eq!(
+            a.route_to_symbol_editor(vec![Action::Delete, Action::ZoomIn]),
+            vec![Action::ZoomIn]
+        );
+        assert!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.is_empty(),
+            "the editor deleted"
+        );
+        assert_eq!(
+            a.route_to_symbol_editor(vec![Action::Undo, Action::Redo]),
+            Vec::<Action>::new()
+        );
+        assert_eq!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.len(),
+            1,
+            "the editor undid"
+        );
+        assert_eq!(a.open.as_ref().unwrap().project, before, "the project was not touched");
+    }
+
+    #[test]
+    fn the_symbol_editor_closes_when_another_project_is_opened() {
+        let (_tmp, mut a) = app(vec![]);
+        a.run(Action::NewSymbol);
+        assert!(a.symbol_editor.is_some());
+        let (_other_tmp, other) = crate::state::tests::project();
+        let other_before = other.project.clone();
+        a.open = Some(other);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| a.symbol_editor_window(ctx));
+        assert!(a.symbol_editor.is_none(), "it belonged to the first project");
+        assert_eq!(a.open.as_ref().unwrap().project, other_before);
+    }
+
+    #[test]
+    fn undo_puts_back_a_symbol_a_command_replaced() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        open.save().unwrap();
+        let old = open.symbols["wc.coil"].clone();
+        let old_lock = open.project.lock.symbols["wc.coil"].clone();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        // What a command does on disk: a new version of the symbol, and the lock naming it.
+        let mut new = old.clone();
+        new.name = "Coil, from the command".into();
+        wc_core::store::write_vendored_symbol(&open.dir, &new).unwrap();
+        let mut on_disk = open.project.clone();
+        on_disk.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        wc_core::store::save(&open.dir, &on_disk).unwrap();
+        a.command_finish(Ok("Done.".into())).unwrap();
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.symbols["wc.coil"], new);
+        assert!(open.undo());
+        assert_eq!(open.project.lock.symbols["wc.coil"], old_lock);
+        assert_eq!(
+            open.symbols["wc.coil"], old,
+            "the version from before the command is back"
+        );
+        assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), old);
+        assert!(open.redo());
+        assert_eq!(open.project.lock.symbols["wc.coil"].hash, new.hash());
+        assert_eq!(open.symbols["wc.coil"], new);
+        assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), new);
+    }
+
+    #[test]
+    fn a_command_symbol_update_is_not_loaded_when_the_window_changed_the_project_too() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        open.save().unwrap();
+        let old = open.symbols["wc.coil"].clone();
+        let old_lock = open.project.lock.symbols["wc.coil"].clone();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        // The command writes a new version of the symbol and the lock naming it.
+        let mut new = old.clone();
+        new.name = "Coil, from the command".into();
+        wc_core::store::write_vendored_symbol(&open.dir, &new).unwrap();
+        let mut on_disk = open.project.clone();
+        on_disk.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        wc_core::store::save(&open.dir, &on_disk).unwrap();
+        // Meanwhile the window changes a page.
+        open.project.pages[0].title = "Edited in the window".into();
+        assert!(a.command_finish(Ok("Done.".into())).is_err());
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.project.lock.symbols["wc.coil"], old_lock);
+        assert_eq!(open.symbols["wc.coil"], old, "the window's definition stays");
+        assert_eq!(
+            wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(),
+            old,
+            "the file matches the window's lock again"
+        );
+        open.save().unwrap();
+        let saved = Open::load(&open.dir).unwrap();
+        assert_eq!(saved.project.lock.symbols["wc.coil"].hash, old.hash());
+        assert_eq!(saved.symbols["wc.coil"], old);
+    }
+
+    #[test]
+    fn a_used_symbol_without_a_lock_entry_is_put_back_when_the_window_changed_the_project_too() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        // A project from before the lock: the coil is used and loaded, but not pinned.
+        open.project.lock.symbols.remove("wc.coil");
+        open.save().unwrap();
+        let old = open.symbols["wc.coil"].clone();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut new = old.clone();
+        new.name = "Coil, from the command".into();
+        wc_core::store::write_vendored_symbol(&open.dir, &new).unwrap();
+        open.project.pages[0].title = "Edited in the window".into();
+        let on_disk = {
+            let mut p = a.assistant.command_base.as_ref().unwrap().1.clone();
+            p.pages[0].title = "Changed by the command".into();
+            p
+        };
+        wc_core::store::save(&a.open.as_ref().unwrap().dir, &on_disk).unwrap();
+        assert!(a.command_finish(Ok("Done.".into())).is_err());
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.symbols["wc.coil"], old);
+        assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), old);
+        open.save().unwrap();
+        assert_eq!(Open::load(&open.dir).unwrap().symbols["wc.coil"], old);
+    }
+
+    #[test]
+    fn a_symbol_file_that_could_not_be_put_back_is_written_before_the_next_save() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        open.save().unwrap();
+        let old = open.symbols["wc.coil"].clone();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut new = old.clone();
+        new.name = "Coil, from the command".into();
+        wc_core::store::write_vendored_symbol(&open.dir, &new).unwrap();
+        let mut on_disk = open.project.clone();
+        on_disk.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        wc_core::store::save(&open.dir, &on_disk).unwrap();
+        open.project.pages[0].title = "Edited in the window".into();
+        // Putting the window's version back fails, and so does the first save's retry.
+        open.fail_symbol_writes = [true, true].into();
+        let Err(answer) = a.command_finish(Ok("Done.".into())) else {
+            unreachable!("both sides changed the project")
+        };
+        assert!(answer.contains("wc.coil"), "{answer}");
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(wc_core::store::read_vendored_symbol(&open.dir, "wc.coil").unwrap(), new);
+        assert!(open.save().is_err(), "a save waits until the file is right again");
+        assert_eq!(
+            Open::load(&open.dir).unwrap().project.lock.symbols["wc.coil"].hash,
+            new.hash(),
+            "nothing was saved"
+        );
+        open.save().unwrap();
+        let saved = Open::load(&open.dir).unwrap();
+        assert_eq!(saved.project.lock.symbols["wc.coil"].hash, old.hash());
+        assert_eq!(saved.symbols["wc.coil"], old);
+        assert_eq!(saved.project.pages[0].title, "Edited in the window");
+    }
+
+    #[test]
+    fn a_symbol_waiting_to_be_put_back_survives_taking_another_symbol() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        open.save().unwrap();
+        let old = open.symbols["wc.coil"].clone();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut new = old.clone();
+        new.name = "Coil, from the command".into();
+        wc_core::store::write_vendored_symbol(&open.dir, &new).unwrap();
+        let mut on_disk = open.project.clone();
+        on_disk.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        wc_core::store::save(&open.dir, &on_disk).unwrap();
+        open.project.pages[0].title = "Edited in the window".into();
+        open.fail_symbol_writes = [true].into();
+        assert!(a.command_finish(Ok("Done.".into())).is_err());
+        let open = a.open.as_mut().unwrap();
+        // Another symbol is taken from the library, which reloads the vendored symbols.
+        let lib = wc_library::Library::open(&open.dir, &open.project).unwrap();
+        let other = lib
+            .index(wc_core::lock::ItemKind::Symbol)
+            .into_keys()
+            .find(|id| id != "wc.coil")
+            .unwrap();
+        open.take_saved_symbol(&lib, &other).unwrap();
+        assert_eq!(open.symbols["wc.coil"], old, "the window's version stays loaded");
+        open.save().unwrap();
+        let saved = Open::load(&open.dir).unwrap();
+        assert_eq!(saved.project.lock.symbols["wc.coil"].hash, old.hash());
+        assert_eq!(saved.symbols["wc.coil"], old);
+    }
+
+    /// A second library folder after the starter one, holding its own `wc.coil`.
+    fn later_library_with_a_coil(a: &mut App, root: &std::path::Path) -> crate::symbol_editor::Saved {
+        let open = a.open.as_mut().unwrap();
+        let lib = wc_library::Library::open(&open.dir, &open.project).unwrap();
+        let (mut symbol, _) = lib.symbol("wc.coil").unwrap();
+        symbol.name = "Coil, mine".into();
+        let folder = root.join("mine");
+        std::fs::create_dir_all(folder.join("symbols")).unwrap();
+        let path = folder.join("symbols/wc.coil.json");
+        std::fs::write(&path, serde_json::to_string(&symbol).unwrap()).unwrap();
+        open.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "mine".into(),
+            kind: "folder".into(),
+            location: folder.display().to_string(),
+            reference: None,
+        });
+        crate::symbol_editor::Saved {
+            id: "wc.coil".into(),
+            path,
+            source: "mine".into(),
+            symbol,
+        }
+    }
+
+    #[test]
+    fn a_symbol_saved_behind_an_earlier_library_says_so_whether_or_not_it_is_used() {
+        // Not used yet: the place list would give the starter library's coil.
+        let root = tempfile::tempdir().unwrap();
+        let (_tmp, mut a) = app(vec![]);
+        let saved = later_library_with_a_coil(&mut a, root.path());
+        a.symbol_saved(saved);
+        assert!(a.ed.message.contains("comes first"), "{}", a.ed.message);
+        assert!(
+            a.ed.message.contains("placing it takes the one from"),
+            "{}",
+            a.ed.message
+        );
+        // Used: the project keeps its copy.
+        let (_tmp2, mut a) = app(vec![]);
+        a.open
+            .as_mut()
+            .unwrap()
+            .place(1, "wc.coil", Point::new(20.0, 20.0))
+            .unwrap();
+        let before = a.open.as_ref().unwrap().symbols["wc.coil"].clone();
+        let saved = later_library_with_a_coil(&mut a, root.path());
+        a.symbol_saved(saved);
+        assert!(a.ed.message.contains("comes first"), "{}", a.ed.message);
+        assert!(a.ed.message.contains("keeps the copy it has"), "{}", a.ed.message);
+        assert_eq!(a.open.as_ref().unwrap().symbols["wc.coil"], before);
+        // Used, with a copy that matches neither library (an older version): the message
+        // still names the project's own copy, not the first library's.
+        let (_tmp3, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        open.symbols.get_mut("wc.coil").unwrap().name = "Coil, older".into();
+        let before = open.symbols["wc.coil"].clone();
+        let saved = later_library_with_a_coil(&mut a, root.path());
+        a.symbol_saved(saved);
+        assert!(a.ed.message.contains("keeps the copy it has"), "{}", a.ed.message);
+        assert!(!a.ed.message.contains("takes the one from"), "{}", a.ed.message);
+        assert_eq!(a.open.as_ref().unwrap().symbols["wc.coil"], before);
     }
 
     #[test]

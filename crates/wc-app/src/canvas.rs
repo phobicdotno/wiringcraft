@@ -123,20 +123,20 @@ impl Editor {
     }
 }
 
-struct Xf {
-    origin: Pos2,
-    zoom: f32,
+pub(crate) struct Xf {
+    pub(crate) origin: Pos2,
+    pub(crate) zoom: f32,
 }
 
 impl Xf {
-    fn s(&self, p: Point) -> Pos2 {
+    pub(crate) fn s(&self, p: Point) -> Pos2 {
         self.origin + Vec2::new(p.x as f32, p.y as f32) * self.zoom
     }
-    fn mm(&self, p: Pos2) -> Point {
+    pub(crate) fn mm(&self, p: Pos2) -> Point {
         let v = (p - self.origin) / self.zoom;
         Point::new(f64::from(v.x), f64::from(v.y))
     }
-    fn len(&self, mm: f64) -> f32 {
+    pub(crate) fn len(&self, mm: f64) -> f32 {
         mm as f32 * self.zoom
     }
 }
@@ -232,7 +232,7 @@ fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
     out
 }
 
-fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
+pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
     match s {
         Shape::Line { a, b } => {
             p.line_segment([xf.s(*a), xf.s(*b)], stroke);

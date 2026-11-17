@@ -17,6 +17,7 @@ mod prefs;
 mod screenshot;
 mod share;
 mod state;
+mod symbol_editor;
 mod theme;
 
 use std::path::{Path, PathBuf};
@@ -129,6 +130,8 @@ struct App {
     logged: (String, String),
     /// The shared work session, when one is running, and its windows.
     share: share::Share,
+    /// The symbol editor window, while it is open.
+    symbol_editor: Option<symbol_editor::SymbolEditor>,
 }
 
 struct StatusView<'a> {
@@ -292,6 +295,7 @@ impl App {
             open_url: Vec::new(),
             logged: Default::default(),
             share: Default::default(),
+            symbol_editor: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -478,14 +482,12 @@ impl App {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
                 Err(e) => self.dialog = Some(Dialog::Message(format!("Saving failed:\n{e}"))),
             },
-            Action::Undo => {
-                if open.undo() {
+            Action::Undo | Action::Redo => {
+                let done = if a == Action::Undo { open.undo() } else { open.redo() };
+                if done {
                     self.ed.selection.clear();
-                }
-            }
-            Action::Redo => {
-                if open.redo() {
-                    self.ed.selection.clear();
+                } else if let Some(e) = open.take_undo_error() {
+                    self.dialog = Some(Dialog::Message(format!("Undo or redo was not done:\n{e}")));
                 }
             }
             Action::Delete if self.ed.panel.is_some() => {
@@ -686,17 +688,58 @@ impl App {
                 self.ed.message = format!("Project check: {errors} errors, {} findings in all.", found.len());
                 self.dialog = Some(Dialog::Check(found));
             }
+            Action::NewSymbol | Action::EditSymbol => {
+                let (lib, lib_error) = match wc_library::Library::open(&open.dir, &open.project) {
+                    Ok(l) => (Some(l), None),
+                    Err(e) => (None, Some(format!("The project's library could not be opened: {e}"))),
+                };
+                // Only folders: a git source is a cache that the next sync overwrites. Each
+                // source is paired with its declaration by position (`Library::open` keeps the
+                // order), so a git source sharing a folder's name is never offered.
+                let targets: Vec<symbol_editor::Target> = lib
+                    .iter()
+                    .flat_map(|l| l.sources.iter().zip(&open.project.meta.libraries))
+                    .filter(|(_, decl)| decl.kind == "folder")
+                    .map(|(s, _)| (s.name.clone(), s.root.clone()))
+                    .collect();
+                let selected = self.ed.selection.iter().find_map(|s| match s {
+                    Selection::Symbol(item) => open
+                        .project
+                        .pages
+                        .get(self.ed.page)
+                        .and_then(|pg| pg.symbols.iter().find(|p| &p.id == item))
+                        .map(|p| p.symbol.clone()),
+                    _ => None,
+                });
+                let mut ed = match (a, selected, lib.as_ref()) {
+                    (Action::EditSymbol, Some(id), Some(lib)) => match lib.symbol(&id) {
+                        Ok((s, source)) => symbol_editor::SymbolEditor::edit(s, &source, targets),
+                        Err(err) => {
+                            let mut e = symbol_editor::SymbolEditor::new(targets);
+                            e.message = format!("Symbol {id} could not be opened from the library: {err}");
+                            e
+                        }
+                    },
+                    _ => symbol_editor::SymbolEditor::new(targets),
+                };
+                ed.owner = Some(open.dir.clone());
+                if let Some(e) = lib_error {
+                    ed.message = e;
+                }
+                if a == Action::EditSymbol {
+                    ed.choices = open.library.clone();
+                    if ed.opened_as.is_none() && ed.message.is_empty() {
+                        ed.message = "Pick the symbol to change under \"Open a library symbol\".".into();
+                    }
+                }
+                self.symbol_editor = Some(ed);
+            }
             Action::LibraryStatus | Action::LibraryUpdate => {
                 match wc_library::Library::open(&open.dir, &open.project) {
                     Ok(lib) => {
                         if a == Action::LibraryUpdate {
-                            open.checkpoint();
-                            match wc_library::update(&open.dir, &mut open.project, &lib, None) {
-                                Ok(done) => {
-                                    let (syms, _) = wc_core::store::vendored_symbols(&open.dir, &open.project);
-                                    open.symbols = syms;
-                                    self.ed.message = format!("Updated {} library items.", done.len());
-                                }
+                            match open.update_library(&lib, None) {
+                                Ok(done) => self.ed.message = format!("Updated {} library items.", done.len()),
                                 Err(e) => self.ed.message = format!("Update failed: {e}"),
                             }
                         }
@@ -2110,7 +2153,8 @@ impl eframe::App for App {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
-        actions.extend(self.shortcuts(ctx));
+        let keys = self.shortcuts(ctx);
+        actions.extend(self.route_to_symbol_editor(keys));
         for a in actions {
             self.run(a);
         }
@@ -2200,6 +2244,7 @@ impl eframe::App for App {
         self.dialogs(ctx);
         self.share
             .windows(ctx, self.open.as_mut(), self.assistant.command_running());
+        self.symbol_editor_window(ctx);
         self.sync_session(ctx);
 
         let title = match &self.open {
@@ -2211,6 +2256,120 @@ impl eframe::App for App {
             None => "WiringCraft".into(),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+    }
+}
+
+impl App {
+    /// The symbol editor, while open. A saved symbol shows up in the place list at once; when
+    /// the project already uses it, its copy in the project is updated too (one undo step).
+    /// While the symbol editor is open, Undo and Delete work on the symbol being drawn, and
+    /// the shortcuts that change the schematic are held back.
+    fn route_to_symbol_editor(&mut self, keys: Vec<Action>) -> Vec<Action> {
+        let Some(ed) = self.symbol_editor.as_mut() else {
+            return keys;
+        };
+        keys.into_iter()
+            .filter(|a| match a {
+                Action::Undo => {
+                    ed.undo();
+                    false
+                }
+                Action::Delete => {
+                    ed.delete_selected();
+                    false
+                }
+                Action::Redo
+                | Action::Cut
+                | Action::Copy
+                | Action::Paste
+                | Action::Rotate
+                | Action::Mirror
+                | Action::SelectAll => false,
+                _ => true,
+            })
+            .collect()
+    }
+
+    fn symbol_editor_window(&mut self, ctx: &egui::Context) {
+        let Some(ed) = self.symbol_editor.as_mut() else { return };
+        // The editor belongs to the project it was opened in: its library folders are that
+        // project's. Another project opened since closes it.
+        if ed.owner.as_deref() != self.open.as_ref().map(|o| o.dir.as_path()) {
+            self.symbol_editor = None;
+            return;
+        }
+        let lib = self
+            .open
+            .as_ref()
+            .map(|o| wc_library::Library::open(&o.dir, &o.project).map_err(|e| e.to_string()));
+        let mut read = |id: &str| match &lib {
+            Some(Ok(l)) => l.symbol(id).map_err(|e| e.to_string()),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("no project is open".to_owned()),
+        };
+        let (saved, keep) = ed.show(ctx, &mut read);
+        if !keep {
+            self.symbol_editor = None;
+        }
+        if let Some(saved) = saved {
+            self.symbol_saved(saved);
+        }
+    }
+
+    /// After the symbol editor saved: tell what the project gets, and update its copy when the
+    /// pages use the symbol.
+    fn symbol_saved(&mut self, saved: crate::symbol_editor::Saved) {
+        let Some(open) = self.open.as_mut() else { return };
+        open.refresh_library();
+        let lib = match wc_library::Library::open(&open.dir, &open.project) {
+            Ok(l) => l,
+            Err(e) => {
+                self.ed.message = format!("Symbol {} saved, but the project's copy was not updated: {e}", saved.id);
+                return;
+            }
+        };
+        // The project takes a symbol from the first library that has it: when that is another
+        // folder, the saved file is not what the project gets, now or when it is placed.
+        if let Some(first) = lib.locate(wc_core::lock::ItemKind::Symbol, &saved.id)
+            && first.source != saved.source
+        {
+            // A used symbol stays as the project has it, which may be an older version or a
+            // copy from yet another library; an unused one would come from the first library.
+            let keeps = if open.symbols.contains_key(&saved.id) {
+                "the project keeps the copy it has".to_owned()
+            } else {
+                format!("placing it takes the one from {}", first.source)
+            };
+            self.ed.message = format!(
+                "Symbol {} saved into {}, but library {} comes first and has a symbol with the same id; {keeps}.",
+                saved.id, saved.source, first.source
+            );
+            return;
+        }
+        if !open.symbols.contains_key(&saved.id) {
+            self.ed.message = format!("Symbol {} saved; it is in the place list.", saved.id);
+            return;
+        }
+        // Wires on a pin the new version no longer has would point at nothing: say which, and
+        // leave the project's copy as it is.
+        let dangling = state::dangling_pins(&open.project, &saved.id, &saved.symbol);
+        if !dangling.is_empty() {
+            self.ed.message = format!(
+                "Symbol {} saved, but the project keeps its old version: wires end on pins it no longer has ({}). Rename those pins back, or move the wires, then update the library.",
+                saved.id,
+                dangling.join(", ")
+            );
+            return;
+        }
+        match open.take_saved_symbol(&lib, &saved.id) {
+            Ok(()) => {
+                open.refresh_library();
+                self.ed.message = format!("Symbol {} saved and updated on the pages that use it.", saved.id);
+            }
+            Err(e) => {
+                self.ed.message = format!("Symbol {} saved, but the project's copy was not updated: {e}", saved.id)
+            }
+        }
     }
 }
 
@@ -2496,6 +2655,43 @@ mod renderer_tests {
 #[allow(clippy::unwrap_used)]
 mod library_tests {
     use super::*;
+
+    #[test]
+    fn wires_on_pins_a_new_symbol_version_drops_are_listed() {
+        use wc_core::{Endpoint, Page, PlacedSymbol, Project, Wire};
+        let mut p = Project::new("x");
+        let mut page = Page::new("p1", "3", "Motor");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "my.coil".into(),
+            at: wc_core::geom::Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(wc_core::DeviceTag::parse("-K1").unwrap()),
+        });
+        let pin = |p: &str| Endpoint::Pin {
+            item: "s1".into(),
+            pin: p.into(),
+        };
+        page.wires.push(Wire {
+            id: "w1".into(),
+            from: pin("A1"),
+            to: pin("A2"),
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        p.pages.push(page);
+        let mut ed = symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(symbol_editor::Tool::Pin);
+        ed.pin_name = "A1".into();
+        ed.click(wc_core::geom::Point::new(0.0, -5.0));
+        assert_eq!(state::dangling_pins(&p, "my.coil", &ed.symbol), ["page 3 -K1:A2"]);
+        assert!(state::dangling_pins(&p, "other", &ed.symbol).is_empty());
+    }
 
     /// Makes `<root>/<rel>/symbols` and returns `<root>/<rel>` canonicalized.
     fn lib(root: &Path, rel: &str) -> PathBuf {

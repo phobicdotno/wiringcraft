@@ -43,6 +43,8 @@ pub enum Action {
     ToggleAutoWire,
     LibraryStatus,
     LibraryUpdate,
+    NewSymbol,
+    EditSymbol,
     ExportPdf,
     ExportDrawings,
     ExportAml,
@@ -113,6 +115,8 @@ impl Action {
         Action::ToggleAutoWire,
         Action::LibraryStatus,
         Action::LibraryUpdate,
+        Action::NewSymbol,
+        Action::EditSymbol,
         Action::ExportPdf,
         Action::ExportDrawings,
         Action::ExportAml,
@@ -306,6 +310,18 @@ impl Action {
                 "",
             ),
             Action::LibraryUpdate => i("Update", "Take the newer library versions", Icon::Update, ""),
+            Action::NewSymbol => i(
+                "New symbol",
+                "Draw a new symbol and save it into a library folder",
+                Icon::Symbol,
+                "",
+            ),
+            Action::EditSymbol => i(
+                "Edit symbol",
+                "Change a library symbol (the selected one, or pick one)",
+                Icon::Symbol,
+                "",
+            ),
             Action::ExportPdf => i("PDF", "Export all pages and the reports to PDF", Icon::Pdf, "Ctrl+P"),
             Action::ExportAml => i(
                 "AutomationML",
@@ -402,7 +418,12 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::DeletePage,
     ],
     &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
-    &[Action::LibraryStatus, Action::LibraryUpdate],
+    &[
+        Action::LibraryStatus,
+        Action::LibraryUpdate,
+        Action::NewSymbol,
+        Action::EditSymbol,
+    ],
     &[Action::Commit, Action::NewBranch, Action::History],
     &[Action::ShareSession, Action::JoinSession],
     &[Action::CommentTool, Action::PageHistory],
@@ -480,7 +501,10 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
     ),
     (
         "Library",
-        &[("Library", &[Action::LibraryStatus, Action::LibraryUpdate])],
+        &[
+            ("Library", &[Action::LibraryStatus, Action::LibraryUpdate]),
+            ("Symbols", &[Action::NewSymbol, Action::EditSymbol]),
+        ],
     ),
     (
         "Versions",
