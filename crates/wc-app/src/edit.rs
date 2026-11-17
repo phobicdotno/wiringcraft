@@ -525,6 +525,27 @@ mod tests {
     use super::*;
     use crate::state::tests::project;
 
+    #[test]
+    fn a_click_inside_a_filled_outline_hits_it() {
+        let sq = |filled| Shape::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(20.0, 0.0),
+                Point::new(20.0, 20.0),
+                Point::new(0.0, 20.0),
+            ],
+            closed: true,
+            filled,
+        };
+        assert!(graphic_hit(&sq(true), Point::new(10.0, 10.0), 1.0), "inside a fill");
+        assert!(
+            !graphic_hit(&sq(false), Point::new(10.0, 10.0), 1.0),
+            "inside an outline only"
+        );
+        assert!(!graphic_hit(&sq(true), Point::new(30.0, 10.0), 1.0), "outside");
+        assert!(graphic_hit(&sq(true), Point::new(20.5, 10.0), 1.0), "near the edge");
+    }
+
     fn setup() -> (tempfile::TempDir, Open, usize, String, String) {
         let (tmp, mut o) = project();
         let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();

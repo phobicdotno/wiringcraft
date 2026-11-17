@@ -185,7 +185,7 @@ fn tuple(p: Point) -> (f64, f64) {
     (p.x, p.y)
 }
 
-fn draw_shape(pen: &mut Pen, s: &Shape) {
+pub(crate) fn draw_shape(pen: &mut Pen, s: &Shape) {
     match s {
         Shape::Line { a, b } => pen.line(tuple(*a), tuple(*b)),
         Shape::Polyline { points, closed, filled } => {

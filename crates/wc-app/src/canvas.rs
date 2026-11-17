@@ -236,9 +236,10 @@ fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
         }
         Shape::Polyline { points, closed, filled } => {
             let pts: Vec<Pos2> = points.iter().map(|q| xf.s(*q)).collect();
+            // A filled shape is drawn without its outline: the cut that carries a hole would
+            // show as a line.
             if *filled && convex(&pts) {
-                p.add(EShape::convex_polygon(pts.clone(), stroke.color, Stroke::NONE));
-                p.add(EShape::closed_line(pts, stroke));
+                p.add(EShape::convex_polygon(pts, stroke.color, Stroke::NONE));
             } else if *filled {
                 // egui fills only convex paths itself, so cut the outline into triangles.
                 let mut mesh = egui::Mesh::default();
@@ -249,7 +250,6 @@ fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
                     mesh.add_triangle(a, b, c);
                 }
                 p.add(EShape::mesh(mesh));
-                p.add(EShape::closed_line(pts, stroke));
             } else if *closed {
                 p.add(EShape::closed_line(pts, stroke));
             } else {
@@ -1236,6 +1236,44 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
 mod tests {
     use super::*;
     use crate::state::tests::project;
+
+    #[test]
+    fn a_notched_outline_leaves_the_notch_empty() {
+        let pts: Vec<Pos2> = [
+            (0.0, 0.0),
+            (60.0, 0.0),
+            (60.0, 60.0),
+            (40.0, 60.0),
+            (40.0, 20.0),
+            (20.0, 20.0),
+            (20.0, 60.0),
+            (0.0, 60.0),
+        ]
+        .iter()
+        .map(|(x, y)| Pos2::new(*x, *y))
+        .collect();
+        assert!(!convex(&pts));
+        let inside = |q: Pos2, [a, b, c]: [u32; 3]| {
+            let (a, b, c) = (pts[a as usize], pts[b as usize], pts[c as usize]);
+            let s = |p: Pos2, r: Pos2| (r.x - p.x) * (q.y - p.y) - (r.y - p.y) * (q.x - p.x);
+            let (d1, d2, d3) = (s(a, b), s(b, c), s(c, a));
+            (d1 > 0.0 && d2 > 0.0 && d3 > 0.0) || (d1 < 0.0 && d2 < 0.0 && d3 < 0.0)
+        };
+        let tris = triangulate(&pts);
+        assert!(
+            !tris.iter().any(|t| inside(Pos2::new(30.0, 40.0), *t)),
+            "the notch is not filled"
+        );
+        assert!(tris.iter().any(|t| inside(Pos2::new(7.0, 13.0), *t)));
+        let area: f32 = tris
+            .iter()
+            .map(|[a, b, c]| {
+                let (a, b, c) = (pts[*a as usize], pts[*b as usize], pts[*c as usize]);
+                ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() / 2.0
+            })
+            .sum();
+        assert!((area - 2800.0).abs() < 1e-2, "{area}");
+    }
 
     #[test]
     fn a_square_with_a_hole_cut_in_fills_only_the_ring() {

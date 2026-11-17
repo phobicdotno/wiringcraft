@@ -455,3 +455,30 @@ fn the_frame_shows_row_letters_on_both_sides() {
     assert_eq!(count("H"), 2, "A2 has eight rows");
     assert_eq!(count("I"), 0);
 }
+
+#[test]
+fn a_filled_polyline_is_filled_not_stroked() {
+    let mut pen = crate::writer::Pen::new(100.0);
+    crate::layout::draw_shape(
+        &mut pen,
+        &wc_core::geom::Shape::Polyline {
+            points: vec![
+                wc_core::geom::Point::new(0.0, 0.0),
+                wc_core::geom::Point::new(10.0, 0.0),
+                wc_core::geom::Point::new(5.0, 5.0),
+            ],
+            closed: true,
+            filled: true,
+        },
+    );
+    assert!(pen.ops.contains("h f\n"), "{}", pen.ops);
+    assert!(!pen.ops.contains("s\n"), "not stroked: {}", pen.ops);
+    assert!(matches!(
+        pen.prims.as_slice(),
+        [crate::writer::Prim::Path {
+            filled: true,
+            closed: true,
+            ..
+        }]
+    ));
+}

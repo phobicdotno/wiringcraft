@@ -240,7 +240,12 @@ fn shapes(
             "LWPOLYLINE" => {
                 let xs = e.all(10);
                 let ys = e.all(20);
-                let pts: Vec<Point> = xs.iter().zip(&ys).map(|(x, y)| q(*x, *y)).collect();
+                let pts: Vec<Point> = xs
+                    .iter()
+                    .zip(&ys)
+                    .filter(|(x, y)| x.is_finite() && y.is_finite())
+                    .map(|(x, y)| q(*x, *y))
+                    .collect();
                 (pts.len() >= 2).then(|| Shape::Polyline {
                     points: pts,
                     closed: (e.f(70) as i64) & 1 == 1,
@@ -268,7 +273,10 @@ fn shapes(
                 let solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
                 let loops = hatch_loops(e);
                 // Islands inside a solid fill stay open: each is cut into the loop around it.
-                let outlines = if solid { with_holes(loops) } else { loops };
+                // Style (75): 0 fills every other level, 1 only the outermost area, 2 ignores
+                // islands.
+                let style = hatch_style(e);
+                let outlines = if solid { with_holes(loops, style) } else { loops };
                 for lp in outlines {
                     if let Some(s) = polyline(lp.into_iter().map(|(x, y)| q(x, y)).collect(), true, solid) {
                         out.push((layer.clone(), s));
@@ -336,15 +344,25 @@ fn polyline(points: Vec<Point>, closed: bool, filled: bool) -> Option<Shape> {
 /// Segments per full turn when an ellipse or arc is sampled.
 const TURN_STEPS: f64 = 72.0;
 
+/// A sweep brought into (0, `full`]: a whole number of turns is one full turn. `None` when it is
+/// not a number.
+fn turn(sweep: f64, full: f64) -> Option<f64> {
+    if !sweep.is_finite() {
+        return None;
+    }
+    let r = sweep.rem_euclid(full);
+    Some(if r <= 1e-12 * full { full } else { r })
+}
+
 /// Points along an ellipse (DXF coordinates): centre, end of the major axis relative to the
 /// centre, minor/major ratio and the start and end parameters in radians. A full ellipse comes
 /// back closed, without repeating its first point.
 fn ellipse_points(c: (f64, f64), major: (f64, f64), ratio: f64, t0: f64, t1: f64) -> (Vec<(f64, f64)>, bool) {
     let minor = (-major.1 * ratio, major.0 * ratio);
-    let mut sweep = t1 - t0;
-    if sweep <= 0.0 {
-        sweep += std::f64::consts::TAU;
-    }
+    // File angles can be anything: bring the sweep into (0, one turn].
+    let Some(sweep) = turn(t1 - t0, std::f64::consts::TAU) else {
+        return (Vec::new(), false);
+    };
     let full = sweep >= std::f64::consts::TAU - 1e-9;
     let n = ((TURN_STEPS * sweep / std::f64::consts::TAU).ceil() as usize).max(4);
     let at = |t: f64| {
@@ -359,10 +377,9 @@ fn ellipse_points(c: (f64, f64), major: (f64, f64), ratio: f64, t0: f64, t1: f64
 /// Points along a circular arc (DXF coordinates, degrees), counter-clockwise from `a0` to `a1`,
 /// or clockwise when `ccw` is false (then `a1` is reached going down from `a0`).
 fn arc_points(c: (f64, f64), r: f64, a0: f64, a1: f64, ccw: bool) -> Vec<(f64, f64)> {
-    let mut sweep = if ccw { a1 - a0 } else { a0 - a1 };
-    if sweep <= 0.0 {
-        sweep += 360.0;
-    }
+    let Some(sweep) = turn(if ccw { a1 - a0 } else { a0 - a1 }, 360.0) else {
+        return Vec::new();
+    };
     let n = ((TURN_STEPS * sweep / 360.0).ceil() as usize).max(2);
     let dir = if ccw { 1.0 } else { -1.0 };
     (0..=n)
@@ -438,7 +455,7 @@ fn bspline_points(ctrl: &[(f64, f64)], knots: &[f64], weights: &[f64], degree: u
             u0 + (u1 - u0) * i as f64 / steps as f64
         };
         let u = if i == steps { u - (u1 - u0) * 1e-12 } else { u };
-        out.push(de_boor(&h, knots, degree, u)?);
+        out.push(de_boor(&h, knots, degree, u).filter(|p| p.0.is_finite() && p.1.is_finite())?);
     }
     if let (Some(last), Some(end)) = (out.last_mut(), ctrl.last()) {
         // A clamped spline ends on its last control point; snap the rounding away.
@@ -453,8 +470,10 @@ fn bspline_points(ctrl: &[(f64, f64)], knots: &[f64], weights: &[f64], degree: u
 /// points; and whether it is closed.
 fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool) {
     let closed = (e.f(70) as i64) & 1 == 1;
-    let ctrl: Vec<(f64, f64)> = e.all(10).into_iter().zip(e.all(20)).collect();
-    let fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).collect();
+    // Whole pairs only, both coordinates finite: a NaN would make the project file unreadable.
+    let finite = |(x, y): &(f64, f64)| x.is_finite() && y.is_finite();
+    let ctrl: Vec<(f64, f64)> = e.all(10).into_iter().zip(e.all(20)).filter(finite).collect();
+    let fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).filter(finite).collect();
     let degree = e.f_or(71, 3.0).max(0.0) as usize;
     if let Some(pts) = bspline_points(&ctrl, &e.all(40), &e.all(41), degree) {
         return (pts, closed);
@@ -609,8 +628,11 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                         // Older files have no count; a 97 there is the loop's own. Before
                         // another edge a 97 can only be the count (often 0, with nothing after).
                         let next_is_count = matches!(cur.codes.get(cur.i), Some((97, _)));
+                        // A zero count is read here too: if it was the loop's own, the loop
+                        // has no source objects either, so nothing is lost.
+                        let zero = matches!(cur.codes.get(cur.i), Some((97, v)) if v.trim() == "0");
                         let fit_follows = matches!(cur.codes.get(cur.i + 1), Some((11 | 12, _)))
-                            || (next_is_count && edge + 1 < edges);
+                            || (next_is_count && (zero || edge + 1 < edges));
                         let nf = if fit_follows { cur.count(97) } else { 0 };
                         let fit: Vec<(f64, f64)> = (0..nf).filter_map(|_| cur.point(11, 21)).collect();
                         let _ = (cur.point(12, 22), cur.point(13, 23));
@@ -677,6 +699,15 @@ fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
     odd
 }
 
+/// The hatch style (code 75): 0 normal, 1 outer, 2 ignore. Read after the boundary loops, where
+/// the code stands; a 75 elsewhere does not occur in a HATCH.
+fn hatch_style(e: &Entity) -> i64 {
+    e.get(75)
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|s| (0..=2).contains(s))
+        .unwrap_or(0)
+}
+
 /// Whether segments p-q and c-d cross at a point inside both (touching at an end does not count).
 fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
     let side = |a: (f64, f64), b: (f64, f64), x: (f64, f64)| (b.0 - a.0) * (x.1 - a.1) - (b.1 - a.1) * (x.0 - a.0);
@@ -689,7 +720,7 @@ fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
 /// The loops of a solid fill as outlines that fill right with the non-zero and even-odd rules
 /// alike: every loop inside an odd number of others is a hole, cut into the loop just around it
 /// along the shortest bridge, so one outline goes round the solid part and back round the hole.
-fn with_holes(loops: Vec<Vec<(f64, f64)>>) -> Vec<Vec<(f64, f64)>> {
+fn with_holes(loops: Vec<Vec<(f64, f64)>>, style: i64) -> Vec<Vec<(f64, f64)>> {
     let mut loops: Vec<Vec<(f64, f64)>> = loops.into_iter().filter(|l| l.len() >= 3).collect();
     loops.sort_by(|a, b| area2(b).abs().total_cmp(&area2(a).abs()));
     // For each loop, the loops around it (they are all bigger, so earlier).
@@ -698,6 +729,11 @@ fn with_holes(loops: Vec<Vec<(f64, f64)>>) -> Vec<Vec<(f64, f64)>> {
         .collect();
     let mut outer: Vec<Option<Vec<(f64, f64)>>> = vec![None; loops.len()];
     for i in 0..loops.len() {
+        // Outer style keeps the outermost level and its holes; Ignore only the outermost.
+        let depth = around[i].len();
+        if (style == 1 && depth >= 2) || (style == 2 && depth >= 1) {
+            continue;
+        }
         let mut lp = loops[i].clone();
         if around[i].len().is_multiple_of(2) {
             // A solid part: counter-clockwise.
@@ -1282,11 +1318,10 @@ mod tests {
     fn a_bridge_never_crosses_another_hole_or_the_outline() {
         let sq = |x0: f64, y0: f64, x1: f64, y1: f64| vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
         // A small hole sits between the big hole's corner and the outline's corner.
-        let out = with_holes(vec![
-            sq(0.0, 0.0, 10.0, 10.0),
-            sq(3.0, 3.0, 9.0, 9.0),
-            sq(9.3, 9.3, 9.6, 9.6),
-        ]);
+        let out = with_holes(
+            vec![sq(0.0, 0.0, 10.0, 10.0), sq(3.0, 3.0, 9.0, 9.0), sq(9.3, 9.3, 9.6, 9.6)],
+            0,
+        );
         assert_eq!(out.len(), 1);
         let want = 100.0 - 36.0 - 0.09;
         assert!((filled_area(&out[0]) - want).abs() < 1e-9, "{}", filled_area(&out[0]));
@@ -1316,7 +1351,7 @@ mod tests {
             (4.9, 10.0),
             (0.0, 10.0),
         ];
-        let out = with_holes(vec![slotted.clone(), sq(4.6, 5.9, 4.8, 6.1)]);
+        let out = with_holes(vec![slotted.clone(), sq(4.6, 5.9, 4.8, 6.1)], 0);
         let want = filled_area(&slotted) - 0.04;
         assert!((filled_area(&out[0]) - want).abs() < 1e-9);
         let lp = &out[0];
@@ -1349,5 +1384,71 @@ mod tests {
             "the line edges came in: {pts:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn huge_or_odd_angles_give_a_bounded_curve() -> Result<()> {
+        let ents = "0\nELLIPSE\n10\n0\n20\n0\n11\n5\n21\n0\n40\n0.5\n41\n0\n42\n1e300\n\
+            0\nELLIPSE\n10\n0\n20\n0\n11\n5\n21\n0\n40\n0.5\n41\n0\n42\n-20\n\
+            0\nHATCH\n2\nSOLID\n70\n1\n91\n1\n92\n1\n93\n2\n\
+            72\n2\n10\n0\n20\n0\n40\n5\n50\n0\n51\n1e12\n73\n1\n72\n1\n10\n5\n20\n0\n11\n5\n21\n0\n97\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        for s in &g {
+            let (pts, _, _) = poly(s);
+            assert!(!pts.is_empty() && pts.len() <= 80, "{}", pts.len());
+            assert!(pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
+        }
+        // -20 radians is the same as -20 + 4 turns: about 5.13 rad of sweep, not 4 points.
+        let (p, _, _) = poly(&g[1]);
+        assert!(p.len() > 50);
+        assert_eq!(turn(f64::NAN, 360.0), None);
+        assert_eq!(turn(720.0, 360.0), Some(360.0));
+        Ok(())
+    }
+
+    #[test]
+    fn spline_points_that_are_not_numbers_are_left_out() -> Result<()> {
+        let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nNaN\n21\n1\n11\n5\n21\n1e999\n11\n10\n21\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert_eq!(s, [Point::new(0.0, 0.0), Point::new(10.0, 0.0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_clockwise_arc_edge_and_a_counter_clockwise_ellipse_edge() -> Result<()> {
+        // Square 0..10 whose top is a clockwise arc edge round (5, 10) radius 5 (stored mirrored:
+        // 0 and 180 stand for 0 and -180), and a second loop with a counter-clockwise ellipse
+        // edge (half ellipse above the x axis) closed by a line.
+        let ents = "0\nHATCH\n2\nSOLID\n70\n1\n91\n2\n\
+            92\n1\n93\n4\n72\n1\n10\n0\n20\n0\n11\n10\n21\n0\n72\n1\n10\n10\n20\n0\n11\n10\n21\n10\n\
+            72\n2\n10\n5\n20\n10\n40\n5\n50\n0\n51\n180\n73\n0\n72\n1\n10\n0\n20\n10\n11\n0\n21\n0\n97\n0\n\
+            92\n1\n93\n2\n72\n3\n10\n30\n20\n0\n11\n5\n21\n0\n40\n0.5\n50\n0\n51\n180\n73\n1\n72\n1\n10\n25\n20\n0\n11\n35\n21\n0\n97\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        assert_eq!(g.len(), 2);
+        let (a, _, _) = poly(&g[0]);
+        assert!(
+            a.iter().any(|q| near(*q, Point::new(5.0, -5.0))),
+            "the clockwise arc dips into the square"
+        );
+        let (b, _, _) = poly(&g[1]);
+        assert!(
+            b.iter().any(|q| near(*q, Point::new(30.0, -2.5))),
+            "the top of the half ellipse"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hatch_styles_decide_which_islands_are_filled() {
+        let sq = |a: f64, b: f64| vec![(a, a), (b, a), (b, b), (a, b)];
+        let loops = || vec![sq(0.0, 10.0), sq(2.0, 8.0), sq(4.0, 6.0)];
+        let area = |v: &[Vec<(f64, f64)>]| v.iter().map(|l| area2(l).abs() / 2.0).sum::<f64>();
+        // Normal: ring, hole, island again.
+        assert!((area(&with_holes(loops(), 0)) - (100.0 - 36.0 + 4.0)).abs() < 1e-9);
+        // Outer: the outermost ring only.
+        assert!((area(&with_holes(loops(), 1)) - 64.0).abs() < 1e-9);
+        // Ignore: the whole outer loop.
+        assert!((area(&with_holes(loops(), 2)) - 100.0).abs() < 1e-9);
     }
 }
