@@ -573,8 +573,10 @@ impl Share {
             return None;
         }
 
-        // A guest that was just let in writes its copy and opens it.
+        // A guest that was just let in writes its copy and opens it, once the window is free:
+        // never in the middle of an action or while an assistant command owns the files.
         if let Role::Guest(j) = role
+            && !busy
             && j.dir.is_none()
             && j.guest.status == GuestStatus::Joined
             && let Some(project) = j.guest.project.as_ref()

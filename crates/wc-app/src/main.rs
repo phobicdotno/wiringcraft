@@ -202,7 +202,11 @@ impl App {
             self.ed.held_by.clear();
             return;
         }
-        let busy = ctx.input(|i| i.pointer.any_down()) || matches!(self.dialog, Some(Dialog::Cover { .. }));
+        // While an assistant command runs, its files are its own: nothing is sent, and a joined
+        // copy waits, so the dirty project is not saved over the command's changes.
+        let busy = ctx.input(|i| i.pointer.any_down())
+            || matches!(self.dialog, Some(Dialog::Cover { .. }))
+            || self.assistant.command_running();
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),

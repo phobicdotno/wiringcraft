@@ -473,3 +473,21 @@ fn a_change_from_someone_else_marks_the_copy_unsaved() -> TestResult {
     assert!(guest_open.dirty);
     Ok(())
 }
+
+#[test]
+fn a_joined_copy_waits_while_the_window_is_busy() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    let (mut h, _) = host(&host_open);
+    let mut g = guest(&mut h, "Ola", &tmp.path().join("guest"));
+    h.frame(Some(&mut host_open), None, false);
+    let ids = pending(&h);
+    approve(&mut h, ids[0], true);
+    // An assistant command is running (or a button is held): the copy is not opened yet.
+    assert!(g.frame(None, None, true).is_none());
+    assert!(!tmp.path().join("guest").join("Pump station").exists());
+    assert!(g.active());
+    let joined = g.frame(None, None, false).ok_or("the copy never opened")?;
+    assert_eq!(joined.project.pages, host_open.project.pages);
+    Ok(())
+}
