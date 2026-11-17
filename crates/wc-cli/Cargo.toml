@@ -23,6 +23,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Tests write an EDZ archive.
+sevenz-rust2 = { workspace = true, features = ["compress"] }
 
 [lints]
 workspace = true

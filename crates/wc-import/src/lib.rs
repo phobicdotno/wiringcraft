@@ -7,6 +7,7 @@ pub mod archive;
 pub mod bmecat;
 pub mod csv;
 pub mod dxf;
+pub mod edz;
 pub mod eplan;
 pub mod kicad;
 pub mod pdf;

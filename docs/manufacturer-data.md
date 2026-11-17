@@ -21,13 +21,14 @@ From `crates/wc-import`:
 | PDF (vector) | `pdf` | Traced drawings. |
 | CSV | `csv` | Parts lists and PLC address lists. |
 | BMEcat catalogues (XML, 1.2 and 2005) | `bmecat` | `wiringcraft import parts-bmecat <file> --lib <folder>`: one part per product/article with order number, maker (or the catalogue's supplier), description in the catalogue's language, and as properties the maker's part number, GTIN, ECLASS (or other) class and every feature with its unit. Products marked for deletion are skipped; prices, pictures and other media are not read. |
+| EDZ (EPLAN Data Exchange archives, 7-Zip or zip) | `edz` | `wiringcraft import parts-edz <file> --lib <folder>`: the part data (EPLAN part XML, `partsmanagement` root) becomes one part per `part`: order number (or type number, or the EPLAN part number without the maker), maker, description (English when given), and every other EPLAN part property; a `variant` fills what the part leaves empty. Macros (`.ema`), pictures and other files are counted in the report, not imported (#144). Built from public format knowledge and synthetic archives; not yet checked against a real portal download. |
 | AutomationML (IEC 62714, CAEX XML) | `aml` | Devices, properties, connection points, links. |
-| EPLAN P8 projects (`.elk` + `.edb`) | `eplan` | Projects, not the EDZ macro/part exchange files. |
+| EPLAN P8 projects (`.elk` + `.edb`) | `eplan` | Projects. Parts from EDZ files: see `edz` above. |
 | SolidWorks Electrical archives (`.tewzip`) | `swe` | Projects. Content Portal parts also arrive as `.tewzip`; library import is #62. |
 | Plain zip | `archive` | Opens the container and imports PDF, DXF, AutomationML and CSV entries inside. Other entries (including `.kicad_sym`) are listed, not imported. |
 
-Not read today: **EDZ** (EPLAN Data Exchange archives with macros and parts), **DWG**, **STEP**
-(3D), ECLASS data outside a BMEcat catalogue.
+Not read today: EPLAN macros inside EDZ files (#144), **DWG**, **STEP** (3D), ECLASS data
+outside a BMEcat catalogue.
 
 ## Portals that serve many manufacturers
 

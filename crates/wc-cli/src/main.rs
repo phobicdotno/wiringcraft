@@ -405,6 +405,14 @@ enum ImportCmd {
         #[arg(long)]
         lib: PathBuf,
     },
+    /// Parts from an EDZ file (EPLAN Data Exchange archive, 7-Zip or zip): part number, maker,
+    /// description and the EPLAN part properties. Macros and pictures in it are counted, not
+    /// imported.
+    PartsEdz {
+        file: PathBuf,
+        #[arg(long)]
+        lib: PathBuf,
+    },
     /// QElectroTech elements (`.elmt`), one symbol per file. Ids are `<prefix>.<file name>`;
     /// the first terminal becomes the origin.
     SymbolQet {
@@ -1393,6 +1401,16 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             println!("imported {n} part(s) into {}", lib.display());
         }
+        ImportCmd::PartsEdz { file, lib } => {
+            let (n, report, warnings) = import_edz(&file, &lib)?;
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+            for line in report.lines() {
+                println!("{line}");
+            }
+            println!("imported {n} part(s) into {}", lib.display());
+        }
         ImportCmd::PartsCsv { file, lib } => {
             let bytes = std::fs::read(&file).map_err(e)?;
             let (parts, warnings) = wc_import::csv::parts(&wc_import::csv::decode(&bytes)).map_err(e)?;
@@ -2002,6 +2020,17 @@ fn import_bmecat(file: &Path, lib: &Path) -> Res<(usize, Vec<String>)> {
         wc_library::write_part(lib, p).map_err(e)?;
     }
     Ok((parts.len(), warnings))
+}
+
+/// Import an EDZ archive's parts into a library folder. Returns the count, what the archive
+/// held and warnings.
+fn import_edz(file: &Path, lib: &Path) -> Res<(usize, wc_import::edz::Report, Vec<String>)> {
+    let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
+    let (parts, report, warnings) = wc_import::edz::read(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    for p in &parts {
+        wc_library::write_part(lib, p).map_err(e)?;
+    }
+    Ok((parts.len(), report, warnings))
 }
 
 /// Import QElectroTech elements into a symbol library folder, one symbol per file. A file that
@@ -2720,6 +2749,54 @@ mod tests {
 
         std::fs::write(&file, "<catalog/>").unwrap();
         assert!(import_bmecat(&file, &lib).is_err());
+    }
+
+    #[test]
+    fn edz_parts_land_in_the_library_and_macros_are_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("contactor.edz");
+        let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="SIE.3RT2015" P_ARTICLE_MANUFACTURER="SIE" P_ARTICLE_DESCR1="de_DE@Schütz;en_US@Contactor;"/></partsmanagement>"#;
+        let mut w = sevenz_rust2::ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("parts.xml"), Some(xml.as_bytes()))
+            .unwrap();
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("SIE_3RT2015.ema"), Some(&b"m"[..]))
+            .unwrap();
+        std::fs::write(&file, w.finish().unwrap().into_inner()).unwrap();
+        let lib = tmp.path().join("lib");
+        cli(
+            tmp.path(),
+            &[
+                "import",
+                "parts-edz",
+                file.to_str().unwrap(),
+                "--lib",
+                lib.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(lib.join("parts").join("sie.3rt2015.json").exists());
+        std::fs::remove_dir_all(&lib).unwrap();
+        let (n, report, warnings) = import_edz(&file, &lib).unwrap();
+        assert_eq!(n, 1, "{warnings:?}");
+        assert_eq!(report.macros, 1);
+        let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+        let p: wc_core::Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(p.description, "Contactor");
+
+        std::fs::write(&file, "not an archive").unwrap();
+        assert!(import_edz(&file, &lib).is_err());
+        let err = cli(
+            tmp.path(),
+            &[
+                "import",
+                "parts-edz",
+                file.to_str().unwrap(),
+                "--lib",
+                lib.to_str().unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("not an EDZ archive"), "{err}");
     }
 
     #[test]
