@@ -7,8 +7,8 @@
 //   /unclaim force            release whoever holds it (for a human)
 //
 // A pull request that names an issue (`(#N)` in the title, or `Fixes #N` / `Claim #N` in the body)
-// claims it for the agent in its `Agent: <name>` body line, or for its branch name, and every push
-// to that pull request extends the lock. A lock past its time is free for anyone; an hourly sweep
+// claims it for the agent in its `Agent: <name>` body line, or for its branch name, until 4 h after
+// the pull request's last push or edit. A lock past its time is free for anyone; an hourly sweep
 // also posts the release and removes the `claimed` label.
 //
 // The state lives in the bot's own comments: the newest bot comment carrying the marker below.
@@ -191,22 +191,33 @@ async function answer({ github, owner, repo, issue, comment, now }) {
 async function backlog({ github, context, now = Date.now() }) {
   const { owner, repo } = context.repo;
   const since = new Date(now - BACKLOG_HOURS * HOUR).toISOString();
+  // `since` filters on the last edit; a command counts only when it was also created in the window,
+  // so editing an old command never runs it again. Its reply is newer than the command, so it is
+  // in the window too.
   const all = await github.paginate(github.rest.issues.listCommentsForRepo, { owner, repo, since, sort: 'created', direction: 'asc', per_page: 100 });
   const answered = new Set();
   for (const c of all) {
     const data = isBot(c) ? readMarker(c.body) : null;
     if (data && data.reply_to) answered.add(data.reply_to);
   }
-  const pending = all
-    .filter((c) => !isBot(c) && !/\/pull\/\d+/.test(c.html_url || '') && !answered.has(c.id) && parseCommand(c.body))
+  const commands = all
+    .filter((c) => !isBot(c) && !/\/pull\/\d+/.test(c.html_url || '') && Date.parse(c.created_at || 0) >= Date.parse(since) && parseCommand(c.body))
     .sort((a, b) => a.id - b.id);
   const out = [];
-  for (const comment of pending) {
+  const touched = new Set();
+  for (const comment of commands) {
     const m = /\/issues\/(\d+)$/.exec(comment.issue_url || '');
     if (!m) continue;
+    touched.add(Number(m[1]));
+    if (answered.has(comment.id)) continue;
     const issue = (await github.rest.issues.get({ owner, repo, issue_number: Number(m[1]) })).data;
     if (issue.pull_request) continue;
     out.push(await answer({ github, owner, repo, issue, comment, now }));
+  }
+  // The label follows the claim state, also when setting it failed in an earlier run.
+  for (const n of touched) {
+    const state = readState(await comments(github, owner, repo, n));
+    await setLabel(github, owner, repo, n, isActive(state, now));
   }
   return out;
 }
@@ -215,21 +226,29 @@ async function handleComment({ github, context, now = Date.now() }) {
   return backlog({ github, context, now });
 }
 
-async function handlePull({ github, context, now = Date.now() }) {
-  const pr = context.payload.pull_request;
-  if (!pr || pr.state !== 'open') return [];
-  const { owner, repo } = context.repo;
+/** Post a note on a pull request once: skipped when a bot note with the same key is there. */
+async function noteOnce(github, owner, repo, number, key, text) {
+  const tag = `<!-- ${MARK}-note ${key} -->`;
+  if ((await comments(github, owner, repo, number)).some((c) => isBot(c) && String(c.body).includes(tag))) return;
+  await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `${text}\n\n${tag}` });
+}
+
+/**
+ * The claims of one open pull request. A pull request's claim lasts until 4 h after its last
+ * activity (`updated_at`: pushes, edits), so the result does not depend on which event or run
+ * computes it, and an event GitHub dropped from the queue loses nothing.
+ */
+async function claimForPull({ github, owner, repo, pr, now }) {
   const refs = parseRefs(pr.title, pr.body);
+  if (!refs.length) return [];
   const agent = parseAgent(pr.body) || (AGENT.test(pr.head.ref) ? pr.head.ref : null);
   if (!agent) {
-    if (refs.length) {
-      await github.rest.issues.createComment({
-        owner, repo, issue_number: pr.number,
-        body: `The branch name \`${pr.head.ref}\` cannot be an agent name; add a line \`Agent: <name>\` to the description to claim ${refs.map((n) => `#${n}`).join(', ')}.`,
-      });
-    }
+    await noteOnce(github, owner, repo, pr.number, 'no-agent',
+      `The branch name \`${pr.head.ref}\` cannot be an agent name; add a line \`Agent: <name>\` to the description to claim ${refs.map((n) => `#${n}`).join(', ')}.`);
     return refs.map((n) => `#${n} no agent`);
   }
+  const until = (Date.parse(pr.updated_at || '') || now) + DEFAULT_HOURS * HOUR;
+  if (until <= now) return refs.map((n) => `#${n} pull request idle`);
   const out = [];
   for (const n of refs) {
     let issue;
@@ -242,19 +261,22 @@ async function handlePull({ github, context, now = Date.now() }) {
     if (issue.pull_request || issue.state !== 'open') continue;
     const state = readState(await comments(github, owner, repo, n));
     if (isActive(state, now) && state.agent !== agent) {
-      await github.rest.issues.createComment({
-        owner, repo, issue_number: pr.number,
-        body: `#${n} is locked by \`${state.agent}\` until ${stamp(Date.parse(state.until))}; this pull request does not hold it.`,
-      });
+      await noteOnce(github, owner, repo, pr.number, `held-${n}-${state.agent}`,
+        `#${n} is locked by \`${state.agent}\` until ${stamp(Date.parse(state.until))}; this pull request does not hold it.`);
       out.push(`#${n} held by ${state.agent}`);
       continue;
     }
-    const until = now + DEFAULT_HOURS * HOUR;
+    const mine = state.kind === 'pr' && state.agent === agent && state.pr === pr.number && state.commentId;
+    if (mine && Date.parse(state.until) >= until) {
+      await setLabel(github, owner, repo, n, true);
+      out.push(`#${n} held`);
+      continue;
+    }
     const next = { agent, until: new Date(until).toISOString(), pr: pr.number, kind: 'pr' };
-    const body = `Claimed by \`${agent}\` through #${pr.number} until ${stamp(until)}. Each push to #${pr.number} extends it by ${DEFAULT_HOURS} h.\n\n${marker(next)}`;
+    const body = `Claimed by \`${agent}\` through #${pr.number} until ${stamp(until)}. Each push to #${pr.number} extends it to ${DEFAULT_HOURS} h after the push.\n\n${marker(next)}`;
     // Extend by editing our own pull-request claim comment, never a reply to a command (the
     // command line waits for that reply).
-    if (state.kind === 'pr' && state.agent === agent && state.pr === pr.number && state.commentId) {
+    if (mine) {
       await github.rest.issues.updateComment({ owner, repo, comment_id: state.commentId, body });
       out.push(`#${n} extended`);
     } else {
@@ -264,6 +286,23 @@ async function handlePull({ github, context, now = Date.now() }) {
     await setLabel(github, owner, repo, n, true);
   }
   return out;
+}
+
+/** Reconcile the claims of every open pull request (each run does this). */
+async function pulls({ github, context, now = Date.now() }) {
+  const { owner, repo } = context.repo;
+  const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+  const out = [];
+  for (const pr of open) out.push(...(await claimForPull({ github, owner, repo, pr, now })).map((s) => `PR #${pr.number}: ${s}`));
+  return out;
+}
+
+/** One pull request, from its event payload (kept for direct use and tests). */
+async function handlePull({ github, context, now = Date.now() }) {
+  const pr = context.payload.pull_request;
+  if (!pr || pr.state !== 'open') return [];
+  const { owner, repo } = context.repo;
+  return claimForPull({ github, owner, repo, pr, now });
 }
 
 async function sweep({ github, context, now = Date.now() }) {
@@ -289,5 +328,5 @@ async function sweep({ github, context, now = Date.now() }) {
 module.exports = {
   DEFAULT_HOURS, MAX_HOURS, LABEL,
   parseCommand, readState, isActive, decide, parseRefs, parseAgent, marker, readMarker,
-  handleComment, handlePull, sweep, backlog,
+  handleComment, handlePull, sweep, backlog, pulls,
 };

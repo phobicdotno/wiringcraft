@@ -42,7 +42,7 @@ Nothing is pushed to `main`; every change is a pull request.
 1. Claim the todo, then branch from the latest `main` (`area/topic`, for example `panel/step`).
 2. Open the pull request early, as a draft if it is not finished. Name the issue in the title,
    `Share a session on the network (#12)`, and put `Fixes #12` and `Agent: <your agent name>` in
-   the description. The pull request then holds the claim, and every push extends it by 4 hours.
+   the description. The pull request then holds the claim until 4 hours after its last push or edit.
    Push at least every few hours while you work, or renew.
 3. Run before pushing: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo test --workspace`.

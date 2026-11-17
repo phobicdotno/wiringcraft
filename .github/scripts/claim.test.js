@@ -7,7 +7,7 @@ const c = require('./claim.js');
 const T0 = Date.parse('2026-11-17T10:00:00Z');
 const H = 3600 * 1000;
 const bot = (id, data) => ({ id, user: { type: 'Bot' }, body: `text\n\n${c.marker(data)}` });
-const human = (id, body) => ({ id, user: { type: 'User' }, body });
+const human = (id, body, created = T0 - 60000) => ({ id, user: { type: 'User' }, body, created_at: new Date(created).toISOString() });
 
 test('parseCommand reads verbs, agents and hours', () => {
   assert.deepEqual(c.parseCommand('/claim agent-1'), { verb: 'claim', agent: 'agent-1', hours: 4 });
@@ -116,6 +116,7 @@ function fakeGithub(issues) {
       removeLabel: async (p) => { calls.push(['label-', p.issue_number]); const l = issues[p.issue_number].labels; l.splice(l.indexOf(c.LABEL), 1); },
     },
   };
+  rest.pulls = { list: () => Object.values(issues).filter((i) => i.prData).map((i) => i.prData) };
   return { calls, github: { rest, paginate: async (fn, p) => fn(p) } };
 }
 const repo = { owner: 'o', repo: 'r' };
@@ -202,4 +203,46 @@ test('sweep releases expired locks only', async () => {
   assert.equal(c.readState(issues[1].comments).agent, null);
   assert.ok(!issues[1].labels.includes('claimed'));
   assert.ok(issues[2].labels.includes('claimed'));
+});
+
+test('an old command edited later is not run again', async () => {
+  const issues = { 3: { comments: [human(1, '/claim a', T0 - 10 * H)], labels: [], state: 'open' } };
+  const { github, calls } = fakeGithub(issues);
+  assert.deepEqual(await c.backlog({ github, context: { repo }, now: T0 }), []);
+  assert.equal(calls.filter((x) => x[0] === 'comment').length, 0);
+});
+
+test('backlog sets a missing label from the claim state without answering again', async () => {
+  const issues = { 3: { comments: [human(1, '/claim a')], labels: [], state: 'open' } };
+  const { github, calls } = fakeGithub(issues);
+  await c.backlog({ github, context: { repo }, now: T0 });
+  issues[3].labels.length = 0; // the label call failed in that run
+  assert.deepEqual(await c.backlog({ github, context: { repo }, now: T0 + 60000 }), []);
+  assert.ok(issues[3].labels.includes('claimed'));
+  assert.equal(calls.filter((x) => x[0] === 'comment').length, 1);
+});
+
+test('pulls reconciles every open pull request from its last activity, idempotently', async () => {
+  const prData = { number: 9, state: 'open', title: 'Thing (#5)', body: 'Agent: a', head: { ref: 'x' }, updated_at: new Date(T0 - H).toISOString() };
+  const idle = { number: 10, state: 'open', title: 'Old (#6)', body: 'Agent: b', head: { ref: 'y' }, updated_at: new Date(T0 - 5 * H).toISOString() };
+  const issues = {
+    5: { comments: [], labels: [], state: 'open' }, 6: { comments: [], labels: [], state: 'open' },
+    9: { comments: [], labels: [], state: 'open', pr: true, prData }, 10: { comments: [], labels: [], state: 'open', pr: true, prData: idle },
+  };
+  const { github, calls } = fakeGithub(issues);
+  assert.deepEqual(await c.pulls({ github, context: { repo }, now: T0 }), ['PR #9: #5 claimed', 'PR #10: #6 pull request idle']);
+  assert.equal(Date.parse(c.readState(issues[5].comments).until), T0 + 3 * H);
+  assert.deepEqual(await c.pulls({ github, context: { repo }, now: T0 + 60000 }), ['PR #9: #5 held', 'PR #10: #6 pull request idle']);
+  prData.updated_at = new Date(T0 + H).toISOString();
+  assert.deepEqual(await c.pulls({ github, context: { repo }, now: T0 + H }), ['PR #9: #5 extended', 'PR #10: #6 pull request idle']);
+  assert.equal(calls.filter((x) => x[0] === 'comment').length, 1);
+});
+
+test('a note on a pull request is posted once', async () => {
+  const prData = { number: 9, state: 'open', title: 'Thing (#5)', body: '', head: { ref: '_bad' }, updated_at: new Date(T0).toISOString() };
+  const issues = { 5: { comments: [], labels: [], state: 'open' }, 9: { comments: [], labels: [], state: 'open', pr: true, prData } };
+  const { github } = fakeGithub(issues);
+  await c.pulls({ github, context: { repo }, now: T0 });
+  await c.pulls({ github, context: { repo }, now: T0 + 60000 });
+  assert.equal(issues[9].comments.length, 1);
 });

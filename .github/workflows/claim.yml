@@ -17,6 +17,7 @@ on:
 permissions:
   contents: read
   issues: write
+  pull-requests: read # to list open pull requests
 
 # One queue for every run in the repository: commands, pull requests and the sweep can all change
 # the same issue, so they never run at the same time. GitHub keeps only one waiting run and cancels
@@ -43,9 +44,10 @@ jobs:
         with:
           script: |
             const claim = require('./.github/scripts/claim.js');
+            // Every run answers waiting commands and reconciles all open pull requests, whatever
+            // event started it, so a run GitHub cancelled in the queue leaves nothing undone.
             core.info(`Answered: ${(await claim.backlog({ github, context })).join(' | ') || 'none'}`);
-            if (context.eventName === 'pull_request_target') {
-              core.info((await claim.handlePull({ github, context })).join(', ') || 'no issue named');
-            } else if (context.eventName !== 'issue_comment') {
+            core.info(`Pull requests: ${(await claim.pulls({ github, context })).join(', ') || 'none name an issue'}`);
+            if (context.eventName === 'schedule' || context.eventName === 'workflow_dispatch') {
               core.info(`Released: ${(await claim.sweep({ github, context })).join(', ') || 'none'}`);
             }
