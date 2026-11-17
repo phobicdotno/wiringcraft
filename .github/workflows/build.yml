@@ -2,7 +2,7 @@
 # (`wiringcraft`) for Windows, Linux and macOS, one download per system on the run's page under
 # "Artifacts". Linux and macOS hold a .tar.gz inside, because the artifact zip drops the
 # executable bit and the programs would not start without `chmod +x`. Runs on every push to main, on pull requests, and on demand (Actions > Build > Run
-# workflow). Installers are the next step (#47).
+# workflow). Install packages come from release.yml (#47).
 name: Build
 
 on:

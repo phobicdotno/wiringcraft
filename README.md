@@ -88,6 +88,20 @@ Settings also pick the model and the effort. The connections are in `crates/wc-a
 
 ![assistant](docs/screenshots/assistant.png)
 
+## Install
+
+Install packages are attached to each [GitHub release](https://github.com/phobicdotno/wiringcraft/releases):
+
+- **Windows:** `wiringcraft-<version>-windows-x64-setup.exe`. It installs for the current user and
+  adds a Start menu entry and the `wiringcraft` command.
+- **Linux:** `wiringcraft-<version>-linux-amd64.deb`. Install it with `sudo apt install ./<file>.deb`.
+- **macOS:** `wiringcraft-<version>-macos-universal.dmg`. Drag WiringCraft to Applications. The
+  command line program is `WiringCraft.app/Contents/MacOS/wiringcraft`.
+
+The packages are not signed yet. Windows SmartScreen and macOS Gatekeeper warn on the first start,
+and the release notes say how to get past that. Builds of every change on main are under
+Actions > Build > Artifacts.
+
 ## Build
 
 ```sh
