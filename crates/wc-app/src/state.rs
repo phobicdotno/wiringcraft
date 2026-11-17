@@ -1754,6 +1754,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn jumper_edits_after_a_move_start_from_the_followed_jumper() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        let (a, _b, _c, _d) = (put(10.0), put(20.0), put(30.0), put(50.0));
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        // Move a past b and c (b 1, c 2, a 3, d 4), then jumper a (now 3) to d: one jumper of
+        // a, b and d.
+        o.checkpoint();
+        o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(40.0, 20.0);
+        o.add_jumper(&x1, &["3".into(), "4".into()]).unwrap();
+        assert_eq!(o.project.meta.jumpers.len(), 1);
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "3", "4"]);
+        // Move a back to the left (a 1, b 2, c 3, d 4), then take d out: a and b remain.
+        o.checkpoint();
+        o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(5.0, 20.0);
+        assert!(o.remove_from_jumper(&x1, "4"));
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
     fn redo_brings_back_a_followed_move_and_an_overview_page_keeps_its_jumpers() {
         let (_tmp, mut o) = project();
         let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
