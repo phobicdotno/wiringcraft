@@ -13,8 +13,11 @@ zip.workspace = true
 image.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
+sevenz-rust2.workspace = true
 
 [dev-dependencies]
+# Tests write 7-Zip archives.
+sevenz-rust2 = { workspace = true, features = ["compress"] }
 wc-report.workspace = true
 
 [lints]

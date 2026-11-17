@@ -26,6 +26,7 @@ quick-xml = "0.37"
 tempfile = "3"
 miniz_oxide = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+sevenz-rust2 = { version = "0.25", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 base64 = "0.22"
