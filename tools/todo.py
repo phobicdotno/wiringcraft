@@ -22,7 +22,8 @@ import time
 from datetime import datetime, timezone
 
 MARK = re.compile(r"<!-- wc-claim (\{.*?\}) -->")
-WAIT_S = 240
+WAIT_S = 900
+BOT = "github-actions[bot]"
 
 
 def gh(*args, data=None):
@@ -44,7 +45,7 @@ def comments(r, n):
 def state(cs):
     """The newest claim state from the bot's comments: (agent, until)."""
     for c in reversed(cs):
-        if c["user"]["type"] != "Bot":
+        if c["user"]["login"] != BOT:
             continue
         m = MARK.search(c["body"] or "")
         if m:
@@ -72,7 +73,7 @@ def command(r, n, text):
     while time.time() < deadline:
         time.sleep(5)
         for c in comments(r, n):
-            m = MARK.search(c["body"] or "") if c["user"]["type"] == "Bot" else None
+            m = MARK.search(c["body"] or "") if c["user"]["login"] == BOT else None
             if m and json.loads(m.group(1)).get("reply_to") == posted["id"]:
                 return json.loads(m.group(1)).get("ok", False), MARK.sub("", c["body"]).strip()
     return None, f"no answer from the claim bot within {WAIT_S} s (see the Claim workflow runs)"
