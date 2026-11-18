@@ -528,6 +528,9 @@ impl App {
                 let done = if a == Action::Undo { open.undo() } else { open.redo() };
                 if done {
                     self.ed.selection.clear();
+                    if let Some(w) = open.take_step_warning() {
+                        self.ed.message = format!("Done, but {w}.");
+                    }
                 } else if let Some(e) = open.take_undo_error() {
                     self.dialog = Some(Dialog::Message(format!("Undo or redo was not done:\n{e}")));
                 }

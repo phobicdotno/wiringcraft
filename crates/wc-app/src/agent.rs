@@ -1324,6 +1324,9 @@ impl App {
                     return Err(format!("Not done: {e}"));
                 }
                 self.ed.selection.clear();
+                if let Some(w) = open.take_step_warning() {
+                    return Ok(format!("Done, but {w}."));
+                }
                 Ok(if done { "Done." } else { "Nothing to undo or redo." }.into())
             }
             "open_project" => {

@@ -178,6 +178,8 @@ pub struct Open {
     unreadable: Option<PathBuf>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
+    /// Parts the last Undo or Redo could not load, with the reason, though the step was done.
+    step_warning: Option<String>,
 }
 
 impl Open {
@@ -211,6 +213,7 @@ impl Open {
             #[cfg(test)]
             unreadable: None,
             undo_error: None,
+            step_warning: None,
         };
         // Locked symbols no page uses are loaded too, so Undo can put back the version a
         // library update replaces.
@@ -600,11 +603,17 @@ impl Open {
             .filter(|id| !self.parts.contains_key(*id))
             .map(str::to_owned)
             .collect();
+        let mut failed = Vec::new();
         for id in missing {
-            if let Ok(p) = store::read_vendored_part(&self.dir, &id) {
-                self.parts.insert(id, p);
+            match store::read_vendored_part(&self.dir, &id) {
+                Ok(p) => {
+                    self.parts.insert(id, p);
+                }
+                Err(e) => failed.push(format!("{id} ({e})")),
             }
         }
+        self.step_warning =
+            (!failed.is_empty()).then(|| format!("these parts could not be loaded: {}", failed.join("; ")));
     }
 
     /// Load the vendored symbols again after the library changed them, keeping the versions
@@ -866,6 +875,11 @@ impl Open {
     /// Why the last Undo or Redo failed, once.
     pub fn take_undo_error(&mut self) -> Option<String> {
         self.undo_error.take()
+    }
+
+    /// Parts the last Undo or Redo could not load, though the step was done; once.
+    pub fn take_step_warning(&mut self) -> Option<String> {
+        self.step_warning.take()
     }
 
     /// After the symbol editor saved symbol `id` into the library: take that symbol (only the
@@ -3227,5 +3241,14 @@ pub(crate) mod tests {
             Some(&part),
             "the device's part is loaded again"
         );
+        assert_eq!(o.take_step_warning(), None);
+
+        // A part file that is gone: the step is done, and the warning names the part and why.
+        assert!(o.undo());
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Part, "acme.relay").unwrap()).unwrap();
+        o.parts.remove("acme.relay");
+        assert!(o.redo());
+        let warning = o.take_step_warning().unwrap_or_default();
+        assert!(warning.contains("acme.relay"), "{warning}");
     }
 }
