@@ -84,14 +84,21 @@ fn part(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Option<S
             MAX_PART / 1024 / 1024
         )));
     }
-    Ok(Some(decode(&data)))
+    decode(&data)
+        .map(Some)
+        .map_err(|e| Error::Format(format!("xlsx: {name:?}: {e}")))
 }
 
 /// An XML part as text: UTF-16 when it starts with a byte order mark (or with `<` as UTF-16),
-/// otherwise UTF-8 with any byte order mark left out.
-fn decode(data: &[u8]) -> String {
+/// otherwise UTF-8 with any byte order mark left out. Bytes that are not valid in that encoding
+/// are an error, never replaced, so no cell text changes silently.
+fn decode(data: &[u8]) -> std::result::Result<String, String> {
     let utf16 = |bytes: &[u8], big: bool| {
-        let units = bytes.as_chunks::<2>().0.iter().map(|&p| {
+        let (units, rest) = bytes.as_chunks::<2>();
+        if !rest.is_empty() {
+            return Err("UTF-16 text ends in half a code unit".to_owned());
+        }
+        let units = units.iter().map(|&p| {
             if big {
                 u16::from_be_bytes(p)
             } else {
@@ -99,16 +106,21 @@ fn decode(data: &[u8]) -> String {
             }
         });
         char::decode_utf16(units)
-            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-            .collect::<String>()
+            .collect::<std::result::Result<String, _>>()
+            .map_err(|e| format!("invalid UTF-16: {e}"))
+    };
+    let utf8 = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|e| format!("invalid UTF-8: {e}"))
     };
     match data {
         [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
         [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
         [b'<', 0, ..] => utf16(data, false),
         [0, b'<', ..] => utf16(data, true),
-        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
-        _ => String::from_utf8_lossy(data).into_owned(),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => utf8(rest),
+        _ => utf8(data),
     }
 }
 
@@ -192,27 +204,32 @@ fn sheets(xml: &str) -> Result<Vec<(String, bool)>> {
 }
 
 /// The relationship of the first worksheet that is not hidden (or of the first worksheet when
-/// all are hidden). Chartsheets and dialog sheets hold no cells and are passed over; `None`
-/// when the workbook lists no sheets.
+/// all are hidden). Chartsheets and dialog sheets hold no cells and are passed over; a sheet
+/// whose relationship is missing is an error. `None` when the workbook lists no sheets.
 fn first_worksheet<'a>(sheets: &[(String, bool)], rels: &'a [Relationship]) -> Result<Option<&'a Relationship>> {
-    let Some((first_id, _)) = sheets.first() else {
+    if sheets.is_empty() {
         return Ok(None);
-    };
-    let worksheet = |id: &str| rels.iter().find(|r| r.id == id && r.kind.ends_with("/worksheet"));
-    let found = sheets
+    }
+    // Indexed once: a workbook can list very many sheets.
+    let by_id: std::collections::HashMap<&str, &Relationship> = rels.iter().map(|r| (r.id.as_str(), r)).collect();
+    let in_order = sheets
         .iter()
         .filter(|(_, hidden)| !hidden)
-        .chain(sheets.iter().filter(|(_, hidden)| *hidden))
-        .find_map(|(id, _)| worksheet(id));
-    match found {
-        Some(r) => Ok(Some(r)),
-        None if rels.iter().any(|r| &r.id == first_id) => Err(Error::Format(
-            "xlsx: the workbook has no worksheet, only chart or dialog sheets".into(),
-        )),
-        None => Err(Error::Format(format!(
-            "xlsx: the first sheet's relationship {first_id:?} is missing"
-        ))),
+        .chain(sheets.iter().filter(|(_, hidden)| *hidden));
+    for (id, _) in in_order {
+        let r = by_id.get(id.as_str()).ok_or_else(|| {
+            Error::Format(format!(
+                "xlsx: the sheet relationship {:?} is missing",
+                crate::printable(id)
+            ))
+        })?;
+        if r.kind.ends_with("/worksheet") {
+            return Ok(Some(r));
+        }
     }
+    Err(Error::Format(
+        "xlsx: the workbook has no worksheet, only chart or dialog sheets".into(),
+    ))
 }
 
 /// The text of each `<si>` in order: plain or rich text runs joined, phonetic hints left out.
@@ -485,10 +502,15 @@ mod tests {
     /// A workbook built by hand the way spreadsheet programs write one: shared strings, a
     /// hidden first sheet, a rich text run and every cell type.
     fn workbook(parts: &[(&str, &str)]) -> Vec<u8> {
+        let parts: Vec<(&str, Vec<u8>)> = parts.iter().map(|(n, b)| (*n, b.as_bytes().to_vec())).collect();
+        workbook_bytes(&parts)
+    }
+
+    fn workbook_bytes(parts: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, body) in parts {
             let _ = z.start_file(*name, zip::write::SimpleFileOptions::default());
-            let _ = z.write_all(body.as_bytes());
+            let _ = z.write_all(body);
         }
         z.finish().map(Cursor::into_inner).unwrap_or_default()
     }
@@ -771,7 +793,7 @@ mod tests {
     #[test]
     fn utf16_parts_read_like_utf8() -> Result<()> {
         let xml = r#"<?xml version="1.0" encoding="UTF-16"?><worksheet><sheetData><row><c t="inlineStr"><is><t>Ø x</t></is></c></row></sheetData></worksheet>"#;
-        let utf8 = sheet_rows(&decode(xml.as_bytes()), &[])?;
+        let utf8 = sheet_rows(&decode(xml.as_bytes()).map_err(Error::Format)?, &[])?;
         let mut le = vec![0xFF, 0xFE];
         le.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
         let mut be = vec![0xFE, 0xFF];
@@ -781,9 +803,62 @@ mod tests {
         bom8.extend(xml.as_bytes());
         assert_eq!(utf8, vec![vec!["Ø x".to_owned()]]);
         for bytes in [le, be, no_bom, bom8] {
-            assert_eq!(sheet_rows(&decode(&bytes), &[])?, utf8);
+            assert_eq!(sheet_rows(&decode(&bytes).map_err(Error::Format)?, &[])?, utf8);
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_utf16_workbook_imports_like_the_same_workbook_in_utf8() -> Result<()> {
+        let parts = [
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-16"?><workbook><sheets><sheet name="Parts" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-16"?><Relationships>
+                    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+                    <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+                </Relationships>"#,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                r#"<?xml version="1.0" encoding="UTF-16"?><sst><si><t>Order number</t></si><si><t>Kontaktør Ø</t></si></sst>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-16"?><worksheet><sheetData><row><c t="s"><v>0</v></c></row><row><c t="s"><v>1</v></c><c t="inlineStr"><is><t>µ</t></is></c></row></sheetData></worksheet>"#,
+            ),
+        ];
+        let utf8 = workbook(&parts);
+        let utf16: Vec<(&str, Vec<u8>)> = parts
+            .iter()
+            .map(|(n, b)| {
+                let mut bytes = vec![0xFF, 0xFE];
+                bytes.extend(b.encode_utf16().flat_map(u16::to_le_bytes));
+                (*n, bytes)
+            })
+            .collect();
+        let expected = vec![
+            vec!["Order number".to_owned()],
+            vec!["Kontaktør Ø".to_owned(), "µ".into()],
+        ];
+        assert_eq!(rows(&utf8)?, expected);
+        assert_eq!(rows(&workbook_bytes(&utf16))?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_text_encodings_are_errors() {
+        // An unpaired surrogate, half a code unit and a broken UTF-8 sequence.
+        let mut lone = vec![0xFF, 0xFE, b'<', 0];
+        lone.extend(0xD800u16.to_le_bytes());
+        let half = vec![0xFF, 0xFE, b'<', 0, b'a'];
+        let bad8 = b"<a>\xC3</a>".to_vec();
+        for bytes in [lone, half, bad8] {
+            assert!(decode(&bytes).is_err(), "{bytes:?}");
+        }
     }
 
     #[test]
@@ -818,6 +893,23 @@ mod tests {
         ]);
         assert_eq!(rows(&bytes)?, vec![vec!["x".to_owned()]]);
         Ok(())
+    }
+
+    #[test]
+    fn a_sheet_with_a_missing_relationship_is_an_error() {
+        let bytes = workbook(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="A" r:id="rId9"/><sheet name="B" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            ("xl/worksheets/sheet1.xml", ONE_CELL),
+        ]);
+        let err = rows(&bytes).map(|_| ()).map_err(|e| e.to_string());
+        assert!(err.as_ref().is_err_and(|e| e.contains("rId9")), "{err:?}");
     }
 
     #[test]
