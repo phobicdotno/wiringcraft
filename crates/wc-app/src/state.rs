@@ -345,13 +345,16 @@ impl Open {
     }
 
     /// Write the articles of a list that came back from the WAGO configurator onto the terminal
-    /// and strip devices, as one undo step (see [`wc_import::wago`]). Articles are looked up
+    /// and strip devices and the jumpers, as one undo step (see [`wc_import::wago`]). Articles are looked up
     /// among the project's own parts, then the libraries'; a library part that is used is taken
     /// into the project. Returns the report: what changed and every row not matched, with why.
     pub fn import_wago_configured(&mut self, bytes: &[u8]) -> Result<String, String> {
         let (rows, mut warnings) = wc_import::wago::read_configured(bytes).map_err(|e| e.to_string())?;
         let (candidates, more) = wc_import::wago::Candidates::load(&self.dir, &self.project);
         warnings.extend(more);
+        // Jumpers follow a terminal change still in progress first, so the rows are matched to
+        // the jumpers as they will be.
+        self.follow_terminals();
         let plan = wc_import::wago::plan(
             &wc_report::Inputs {
                 project: &self.project,
@@ -384,7 +387,7 @@ impl Open {
             wc_import::wago::apply(&mut self.project, &taken)
         };
         let mut msg = format!(
-            "WAGO configurator: {changed} device(s) changed, {} row(s) already up to date, {} not matched.",
+            "WAGO configurator: {changed} device(s) or jumper(s) changed, {} row(s) already up to date, {} not matched.",
             plan.unchanged,
             unmatched.len()
         );

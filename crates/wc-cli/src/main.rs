@@ -1667,7 +1667,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 eprintln!("warning: {w}");
             }
             println!(
-                "WAGO configurator: {} device(s) changed, {} row(s) already up to date, {} not matched",
+                "WAGO configurator: {} device(s) or jumper(s) changed, {} row(s) already up to date, {} not matched",
                 done.changed,
                 done.unchanged,
                 done.unmatched.len()
