@@ -1240,3 +1240,26 @@ fn a_session_version_that_cannot_be_written_is_not_drawn_with_the_old_one() -> T
     assert_eq!(guest_open.symbols.get("wc.coil"), Some(&session_coil));
     Ok(())
 }
+
+#[test]
+fn whole_record_edits_say_what_the_record_was_at_the_last_sync() -> TestResult {
+    let mut base = Project::new("Demo");
+    base.pages.push(Page::new("p0001", "1", "One"));
+    let tag = wc_core::DeviceTag::parse("-K1")?;
+    base.devices.insert(tag.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.devices.get_mut(&tag).ok_or("no device")?.description = "Relay".into();
+    local.meta.name = "Renamed".into();
+    let out = outgoing(&local, &base, None, &BTreeMap::new(), HOST);
+    assert_eq!(out.edits.len(), 2, "{:?}", out.edits);
+    for edit in &out.edits {
+        let stamp = match edit {
+            ProjectEdit::SetDevice { before, .. } | ProjectEdit::SetMeta { before, .. } => before.clone(),
+            other => return Err(format!("unexpected {other:?}").into()),
+        };
+        assert!(stamp.is_some(), "{edit:?} carries what it was");
+        assert_eq!(stamp, edit.record(&base), "made from the last sync, not from this copy");
+        assert_ne!(stamp, edit.record(&local));
+    }
+    Ok(())
+}

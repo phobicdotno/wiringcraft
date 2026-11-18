@@ -260,10 +260,12 @@ fn project_changes_go_through_the_host_in_order() -> TestResult {
     a_link.send(a.edit_project(ProjectEdit::SetDevice {
         tag: tag.clone(),
         device: Some(device("Ola's")),
+        before: None,
     }))?;
     b_link.send(b.edit_project(ProjectEdit::SetDevice {
         tag: tag.clone(),
         device: Some(device("Kari's")),
+        before: None,
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     assert_eq!(
@@ -558,6 +560,7 @@ fn a_change_that_cannot_be_recorded_is_undone() -> TestResult {
     a_link.send(a.edit_project(ProjectEdit::SetDevice {
         tag: tag.clone(),
         device: Some(Device::default()),
+        before: None,
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     assert_eq!(s.host.project(), &demo());
@@ -608,6 +611,7 @@ fn a_refused_project_edit_is_taken_back_from_the_guests_copy() -> TestResult {
     a_link.send(a.edit_project(ProjectEdit::SetDevice {
         tag: tag.clone(),
         device: Some(Device::default()),
+        before: None,
     }))?;
     assert!(a.project.as_ref().is_some_and(|p| p.devices.contains_key(&tag)));
     // Refused by the host's checks: a page someone else has open, a page that is not there.
@@ -635,6 +639,7 @@ fn a_refused_project_edit_is_taken_back_from_the_guests_copy() -> TestResult {
     a_link.send(a.edit_project(ProjectEdit::SetDevice {
         tag: tag.clone(),
         device: Some(Device::default()),
+        before: None,
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     assert!(s.host.project().devices.contains_key(&tag));
@@ -838,6 +843,7 @@ fn every_project_edit_of_a_guest_gets_exactly_one_answer() -> TestResult {
     let device = ProjectEdit::SetDevice {
         tag: wc_core::DeviceTag::parse("-K1")?,
         device: Some(Device::default()),
+        before: None,
     };
     // Applied, no change (the same again), refused, and a whole-page edit applied.
     a_link.send(a.edit_project(device.clone()))?;
@@ -906,27 +912,34 @@ fn comments_and_panels_go_through_the_host() -> TestResult {
     a_link.send(a.edit_project(ProjectEdit::SetComments {
         page: "p0002".into(),
         comments: vec![comment("c1", "p0003")],
+        before: None,
     }))?;
     // A comment id used on another page, and one used twice, are refused.
     b_link.send(b.edit_project(ProjectEdit::SetComments {
         page: "p0003".into(),
         comments: vec![comment("c1", "p0003")],
+        before: None,
     }))?;
     b_link.send(b.edit_project(ProjectEdit::SetComments {
         page: "p0001".into(),
         comments: vec![comment("c7", "p0001"), comment("c7", "p0001")],
+        before: None,
     }))?;
     a_link.send(a.edit_project(ProjectEdit::SetPanel {
         panel: panel("cab1", "Cabinet"),
+        before: None,
     }))?;
     a_link.send(a.edit_project(ProjectEdit::SetPanel {
         panel: panel("cab1", "Main cabinet"),
+        before: None,
     }))?;
     a_link.send(a.edit_project(ProjectEdit::SetPanel {
         panel: panel("cab2", "Field box"),
+        before: None,
     }))?;
     a_link.send(a.edit_project(ProjectEdit::SetPanel {
         panel: panel("../evil", "Bad"),
+        before: None,
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     b_link.send(b.edit_project(ProjectEdit::RemovePanel { id: "cab2".into() }))?;
@@ -1518,6 +1531,7 @@ fn project_properties_go_through_the_host() -> TestResult {
     meta.title_block.insert("customer".into(), "Kommune".into());
     a_link.send(a.edit_project(ProjectEdit::SetMeta {
         meta: Box::new(meta.clone()),
+        before: None,
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     assert_eq!(s.host.project().meta, meta);
@@ -1726,6 +1740,7 @@ fn anyones_change_can_be_taken_back_from_the_list() -> TestResult {
     a_link.send(a.edit_project(ProjectEdit::SetDevice {
         tag: tag.clone(),
         device: Some(device("Ola's")),
+        before: None,
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     let first = b.history.last().map(|c| c.id).ok_or("not in the list")?;
@@ -1747,12 +1762,14 @@ fn anyones_change_can_be_taken_back_from_the_list() -> TestResult {
     a_link.send(a.edit_project(ProjectEdit::SetDevice {
         tag: tag.clone(),
         device: Some(device("v1")),
+        before: None,
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     let v1 = a.history.last().map(|c| c.id).ok_or("not in the list")?;
     b_link.send(b.edit_project(ProjectEdit::SetDevice {
         tag: tag.clone(),
         device: Some(device("v2")),
+        before: None,
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     a_link.send(a.revert(v1))?;
@@ -1783,6 +1800,7 @@ fn undoing_a_removed_page_brings_it_back_with_its_comments_unless_someone_holds_
     a_link.send(a.edit_project(ProjectEdit::SetComments {
         page: "p0003".into(),
         comments: vec![comment],
+        before: None,
     }))?;
     a_link.send(a.edit_project(ProjectEdit::RemovePage { id: "p0003".into() }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
@@ -1847,6 +1865,7 @@ fn undoing_a_removed_page_brings_it_back_with_its_comments_unless_someone_holds_
     b_link.send(b.edit_project(ProjectEdit::SetComments {
         page: "p0010".into(),
         comments: vec![note],
+        before: None,
     }))?;
     s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
     assert!(s.host.undo().is_err());
@@ -2060,5 +2079,189 @@ fn added_symbols_are_committed_with_their_files() -> TestResult {
     let rel = path.strip_prefix(dir)?.to_string_lossy().replace('\\', "/");
     assert!(git.show("HEAD", &rel).is_some(), "the file is in the change's commit");
     assert_eq!(git.author_and_subject("HEAD")?.1, "Add lamp to the project");
+    Ok(())
+}
+
+#[test]
+fn a_whole_record_edit_from_a_copy_that_missed_a_change_is_refused() -> TestResult {
+    use wc_core::panel::Panel;
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    let tag = wc_core::DeviceTag::parse("-K1")?;
+    let device = |text: &str| Device {
+        description: text.into(),
+        ..Device::default()
+    };
+    let comment = |text: &str| Comment {
+        id: "c1".into(),
+        page: "p0002".into(),
+        at: None,
+        author: "Ola".into(),
+        time: 0,
+        text: text.into(),
+        resolved: false,
+        replies: Vec::new(),
+    };
+    let panel = |name: &str| Panel {
+        id: "cab1".into(),
+        name: name.into(),
+        width: 600.0,
+        height: 800.0,
+        items: Vec::new(),
+    };
+    let meta = |title: &str| {
+        let mut m = s.host.project().meta.clone();
+        m.title_block.insert("title".into(), title.into());
+        Box::new(m)
+    };
+    // The same moment: both copies are as the host's project is now.
+    let seen = s.host.project().clone();
+    let kinds = [
+        (
+            ProjectEdit::SetDevice {
+                tag: tag.clone(),
+                device: Some(device("Ola's relay")),
+                before: None,
+            },
+            ProjectEdit::SetDevice {
+                tag: tag.clone(),
+                device: Some(device("Kari's relay")),
+                before: None,
+            },
+            "device -K1",
+        ),
+        (
+            ProjectEdit::SetComments {
+                page: "p0002".into(),
+                comments: vec![comment("Ola's note")],
+                before: None,
+            },
+            ProjectEdit::SetComments {
+                page: "p0002".into(),
+                comments: vec![comment("Kari's note")],
+                before: None,
+            },
+            "the comments on page 2",
+        ),
+        (
+            ProjectEdit::SetPanel {
+                panel: panel("Ola's cabinet"),
+                before: None,
+            },
+            ProjectEdit::SetPanel {
+                panel: panel("Kari's cabinet"),
+                before: None,
+            },
+            "panel cab1",
+        ),
+        (
+            ProjectEdit::SetMeta {
+                meta: meta("Ola's title"),
+                before: None,
+            },
+            ProjectEdit::SetMeta {
+                meta: meta("Kari's title"),
+                before: None,
+            },
+            "the project properties",
+        ),
+    ];
+    for (first, second, what) in kinds {
+        // Both are sent before either hears of the other's.
+        a_link.send(a.edit_project(first.clone().stamped(&seen)))?;
+        b_link.send(b.edit_project(second.clone().stamped(&seen)))?;
+        s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+        assert!(
+            matches!(b.refusals.last(), Some(Refusal::Invalid { reason }) if reason.contains(what) && reason.contains("changed by someone else")),
+            "{what}: {:?}",
+            b.refusals.last()
+        );
+        let mut kept = seen.clone();
+        apply_edit(&mut kept, &first);
+        assert_eq!(
+            first.record(s.host.project()),
+            first.record(&kept),
+            "{what}: the first change is kept"
+        );
+        assert_eq!(
+            b.project.as_ref(),
+            Some(s.host.project()),
+            "{what}: Kari's copy is put right"
+        );
+        assert_eq!(a.project.as_ref(), Some(s.host.project()));
+        assert!(a.refusals.is_empty(), "{what}: Ola's change went in");
+    }
+    let refused = b.refusals.len();
+
+    // Made from the copy as it is now, Kari's change goes in.
+    let now = b.project.clone().ok_or("no copy")?;
+    b_link.send(
+        b.edit_project(
+            ProjectEdit::SetDevice {
+                tag: tag.clone(),
+                device: Some(device("Kari's relay")),
+                before: None,
+            }
+            .stamped(&now),
+        ),
+    )?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(b.refusals.len(), refused);
+    assert_eq!(
+        s.host.project().devices.get(&tag).map(|d| d.description.as_str()),
+        Some("Kari's relay")
+    );
+    // An edit that does not say what it was made from is not checked.
+    a_link.send(a.edit_project(ProjectEdit::SetDevice {
+        tag: tag.clone(),
+        device: Some(device("Ola again")),
+        before: None,
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(a.refusals.is_empty());
+    assert_eq!(b.project.as_ref(), Some(s.host.project()));
+    Ok(())
+}
+
+#[test]
+fn what_a_record_was_survives_the_wire_and_old_messages_still_read() -> TestResult {
+    let mut p = demo();
+    let edit = ProjectEdit::SetMeta {
+        meta: Box::new(p.meta.clone()),
+        before: None,
+    }
+    .stamped(&p);
+    let line = serde_json::to_string(&edit)?;
+    assert!(line.contains("\"before\""));
+    assert_eq!(serde_json::from_str::<ProjectEdit>(&line)?, edit);
+    // Without it (an older copy of the app): read as not checked.
+    let old = r#"{"type":"set_panel","panel":{"id":"cab1","name":"A","width":1.0,"height":1.0,"items":[]}}"#;
+    assert!(matches!(
+        serde_json::from_str::<ProjectEdit>(old)?,
+        ProjectEdit::SetPanel { before: None, .. }
+    ));
+    // The order comments are kept in does not count; their content does.
+    let c = |id: &str| Comment {
+        id: id.into(),
+        page: "p0001".into(),
+        at: None,
+        author: "A".into(),
+        time: 0,
+        text: id.into(),
+        resolved: false,
+        replies: Vec::new(),
+    };
+    p.comments = vec![c("c1"), c("c2")];
+    let edit = ProjectEdit::SetComments {
+        page: "p0001".into(),
+        comments: Vec::new(),
+        before: None,
+    };
+    let was = edit.record(&p);
+    p.comments.reverse();
+    assert_eq!(edit.record(&p), was);
+    p.comments[0].text = "changed".into();
+    assert_ne!(edit.record(&p), was);
     Ok(())
 }
