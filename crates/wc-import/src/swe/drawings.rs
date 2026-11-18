@@ -284,6 +284,15 @@ fn kind_of(name: &str, folder: &str) -> Option<Kind> {
     if stem.is_empty() {
         return None;
     }
+    // `./Projects/4` and `Projects//4` are `Projects/4`: other zip tools write such names.
+    let plain = |path: &str| {
+        path.split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let (dir, folder) = (plain(dir), plain(folder));
+    let (dir, folder) = (dir.as_str(), folder.as_str());
     let own = !folder.is_empty()
         && dir.len() > folder.len()
         && dir.is_char_boundary(folder.len())
@@ -459,6 +468,22 @@ mod tests {
         assert_eq!(kind_of("Block/.dwg", f), None);
         assert_eq!(kind_of("Drawings/Coil.dwg", f), None);
         assert_eq!(kind_of("Projects/4/Database/x.sqlite", f), None);
+        // Names written with `./` or doubled slashes are read the same way.
+        assert_eq!(
+            kind_of("./Projects/4/Block/Coil.dwg", f),
+            Some(Kind::Block("Coil".into(), true))
+        );
+        assert_eq!(kind_of("./Projects/2/Block/Coil.dwg", f), None, "not a library block");
+        assert_eq!(
+            kind_of("./Library/Block/Coil.dwg", f),
+            Some(Kind::Block("Coil".into(), false))
+        );
+        assert_eq!(kind_of("./Projects/4/Drawings/17.ewg", f), Some(Kind::Page(17)));
+        assert_eq!(kind_of("Projects//4/./Drawings/17.ewg", f), Some(Kind::Page(17)));
+        assert_eq!(
+            kind_of("Projects/4/Drawings/17.ewg", "./Projects/4"),
+            Some(Kind::Page(17))
+        );
         // Non-ASCII names next to the folder never split a character.
         assert_eq!(kind_of("Projects/ø/Drawings/1.ewg", f), None);
     }
