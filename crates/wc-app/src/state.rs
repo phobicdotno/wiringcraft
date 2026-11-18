@@ -1201,26 +1201,74 @@ impl Open {
                 target.display()
             ));
         }
-        if target.exists() {
-            let empty = std::fs::read_dir(&target)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(false);
-            if !target.is_dir() || !empty {
+        // A linked git worktree's `.git` is a file pointing into another repository: a copy of
+        // it would record its versions in the original's history.
+        if from.join(".git").is_file() {
+            return Err(format!(
+                "{} is a linked git worktree; its history belongs to another repository, so it \
+                 cannot be copied as the copy's own. Copy the folder by hand and start a new history.",
+                from.display()
+            ));
+        }
+        let existed = target.exists();
+        if existed && !target.is_dir() {
+            return Err(format!(
+                "{} already exists; pick a new name or an empty folder.",
+                target.display()
+            ));
+        }
+        if existed {
+            let mut entries =
+                std::fs::read_dir(&target).map_err(|e| format!("{} cannot be read: {e}", target.display()))?;
+            let empty = match entries.next() {
+                None => true,
+                Some(Ok(_)) => false,
+                Some(Err(e)) => return Err(format!("{} cannot be read: {e}", target.display())),
+            };
+            if !empty {
                 return Err(format!(
                     "{} already exists; pick a new name or an empty folder.",
                     target.display()
                 ));
             }
         }
-        let links = copy_dir(&from, &target).map_err(|e| format!("Copying to {} failed: {e}", target.display()))?;
+        // What a failed copy made is taken away again, so the same place can be tried again;
+        // the folder was new or empty, so all in it is the copy's.
+        let discard = || {
+            let r = if existed {
+                std::fs::read_dir(&target).and_then(|d| {
+                    d.into_iter().try_for_each(|e| {
+                        let e = e?;
+                        if e.file_type()?.is_dir() {
+                            std::fs::remove_dir_all(e.path())
+                        } else {
+                            std::fs::remove_file(e.path())
+                        }
+                    })
+                })
+            } else {
+                std::fs::remove_dir_all(&target)
+            };
+            if let Err(e) = r {
+                crate::applog::warn(&format!("could not clear the failed copy in {}: {e}", target.display()));
+            }
+        };
+        let links = copy_dir(&from, &target).map_err(|e| {
+            discard();
+            format!("Copying to {} failed: {e}", target.display())
+        })?;
         // A relative library folder outside the project is the same folder seen from the copy;
-        // one inside it was copied along.
+        // one inside it was copied along. Where the library is there, the file system resolves
+        // it (a link followed by `..` goes where the file system says, not where the text does).
         let repoint = |libs: &mut Vec<wc_core::project::LibrarySource>| {
             for lib in libs {
                 if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
-                    let at = lexical(&from.join(&lib.location));
-                    if !at.starts_with(lexical(&from)) {
-                        lib.location = relative_to(&at, &target).unwrap_or(at).display().to_string();
+                    let (at, project, base) = match std::fs::canonicalize(from.join(&lib.location)) {
+                        Ok(real) => (real, resolved(&from), resolved(&target)),
+                        Err(_) => (lexical(&from.join(&lib.location)), lexical(&from), target.clone()),
+                    };
+                    if !at.starts_with(&project) {
+                        lib.location = relative_to(&at, &base).unwrap_or(at).display().to_string();
                     }
                 }
             }
@@ -1232,8 +1280,9 @@ impl Open {
             self.dir = from.clone();
             self.project.meta.libraries = old_libraries;
             self.dirty = old_dirty;
+            discard();
             return Err(format!(
-                "{e}\nThe copy in {} is not complete; you are still working in {}.",
+                "{e}\nThe copy in {} was taken away again; you are still working in {}.",
                 target.display(),
                 from.display()
             ));
@@ -2343,7 +2392,7 @@ fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
     for _ in common..b.len() {
         out.push("..");
     }
-    for c in &p[common..] {
+    for c in p.iter().skip(common) {
         out.push(c.as_os_str());
     }
     Some(if out.as_os_str().is_empty() {
@@ -2408,6 +2457,36 @@ pub(crate) mod tests {
         // Not over a folder with something in it, and not inside the project itself.
         assert!(o.save_as(&from).unwrap_err().contains("already exists"));
         assert!(o.save_as(&to.join("inner")).unwrap_err().contains("inside the project"));
+    }
+
+    #[test]
+    fn save_as_refuses_a_linked_git_worktree_and_leaves_nothing_behind() {
+        let (tmp, mut o) = project();
+        std::fs::write(o.dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/p\n").unwrap();
+        let to = tmp.path().join("copy");
+        assert!(o.save_as(&to).unwrap_err().contains("linked git worktree"));
+        assert!(!to.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_follows_a_link_before_the_dots_of_a_library_folder() {
+        let (tmp, mut o) = project();
+        // `link/../library` is where the file system puts it: next to the link's target.
+        let deep = tmp.path().join("srv").join("shared").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(tmp.path().join("srv").join("shared").join("library")).unwrap();
+        std::os::unix::fs::symlink(&deep, tmp.path().join("link")).unwrap();
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "shared".into(),
+            kind: "folder".into(),
+            location: "../link/../library".into(),
+            reference: None,
+        });
+        let to = tmp.path().join("copy");
+        o.save_as(&to).unwrap();
+        let lib = o.project.meta.libraries.iter().find(|l| l.name == "shared").unwrap();
+        assert_eq!(Path::new(&lib.location), Path::new("../srv/shared/library"));
     }
     use wc_core::project::LibrarySource;
 

@@ -177,6 +177,8 @@ struct App {
     find: Option<find_window::FindState>,
     /// A picker an action asked for, shown once the frame's actions have run.
     pending: Option<Pending>,
+    /// The project folder open when the waiting picker was asked for: it is for that project.
+    pending_for: Option<PathBuf>,
 }
 
 /// A file or folder picker an action needs before it can be carried out. It is shown after the
@@ -390,6 +392,7 @@ impl App {
             symbol_editor: None,
             find: None,
             pending: None,
+            pending_for: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -425,6 +428,9 @@ impl App {
 
     /// Save the open project as a copy in `d` and work on in the copy; the error says why not.
     fn save_as_to(&mut self, d: &Path) -> Result<(), String> {
+        if let Some(why) = self.save_as_refused() {
+            return Err(why.into());
+        }
         let Some(open) = self.open.as_mut() else {
             return Err("No project is open.".into());
         };
@@ -439,8 +445,26 @@ impl App {
         Ok(())
     }
 
+    /// Why Save as cannot be done now, checked again when its dialog would open: the assistant
+    /// can start a command or a session can start between the action and its dialog.
+    fn save_as_refused(&self) -> Option<&'static str> {
+        if self.share.active() {
+            Some(
+                "Save as is not available in a shared session: it would end the session. Stop sharing (or leave) first.",
+            )
+        } else if self.assistant.command_running() {
+            Some("Saving waits until the assistant's command has finished.")
+        } else {
+            None
+        }
+    }
+
     /// Show the picker an action asked for, then carry the action out with what was picked.
     fn ask(&mut self, p: Pending) {
+        if let (Pending::SaveAs, Some(why)) = (&p, self.save_as_refused()) {
+            self.ed.message = why.into();
+            return;
+        }
         if let Pending::Open = p {
             let start = self
                 .open
@@ -511,7 +535,10 @@ impl App {
                 let (dir, note) = match pick_folder("Export the pages as drawings into", &default.display().to_string())
                 {
                     Picked::Path(d) => (d, String::new()),
-                    Picked::Failed(e) => (default, format!("{e} So they went to the usual place.\n\n")),
+                    Picked::Failed(e) => {
+                        let note = format!("{e} So they go to the usual place, {}.\n\n", default.display());
+                        (default, note)
+                    }
                     Picked::Cancelled => return,
                 };
                 self.dialog = Some(Dialog::Message(note + &export_drawings_to(open, &dir)));
@@ -530,32 +557,17 @@ impl App {
                 )));
             }
             Pending::Export(kind) => {
-                let (title, default, filter): (&str, PathBuf, (&str, &[&str])) = match kind {
-                    Export::Pdf => ("Export PDF", export_file(open, "pdf"), ("PDF", &["pdf"])),
-                    Export::Aml => (
-                        "Export AutomationML",
-                        export_file(open, "aml"),
-                        ("AutomationML", &["aml"]),
-                    ),
-                    _ => (
-                        "Export for the WAGO configurator",
-                        open.dir.join("export").join("wago-configurator.csv"),
-                        ("CSV list", &["csv"]),
-                    ),
-                };
-                let Some((path, note)) = export_target(title, &default, filter) else {
-                    return;
-                };
-                let msg = match kind {
-                    Export::Pdf => export_pdf_to(open, &path),
-                    Export::Aml => export_aml_to(open, &path),
-                    _ => export_wago_configurator_to(open, &path),
-                };
-                self.dialog = Some(Dialog::Message(note + &msg));
+                if let Some(msg) = export_whole(open, kind, &pick_save) {
+                    self.dialog = Some(Dialog::Message(msg));
+                }
             }
             Pending::Marking(options) => {
                 let default = wago_marking_file(open, &options);
-                let Some((path, note)) = export_target("Export WAGO markers", &default, ("CSV list", &["csv"])) else {
+                let Some((path, note)) =
+                    export_target("Export WAGO markers", &default, ("CSV list", &["csv"]), &pick_save)
+                else {
+                    // Cancelled: the options come back as they were set, to try again.
+                    self.dialog = Some(wago_marking_dialog_with(open, &options));
                     return;
                 };
                 self.dialog = Some(Dialog::Message(note + &export_wago_marking_to(open, &options, &path)));
@@ -583,7 +595,8 @@ impl App {
             }
             Pending::ReportCsv(kind) => {
                 let default = open.dir.join("export").join(format!("{}.csv", kind.name()));
-                let Some((path, note)) = export_target("Save report as CSV", &default, ("CSV", &["csv"])) else {
+                let Some((path, note)) = export_target("Save report as CSV", &default, ("CSV", &["csv"]), &pick_save)
+                else {
                     return;
                 };
                 let inputs = wc_report::Inputs {
@@ -600,7 +613,38 @@ impl App {
         }
     }
 
+    /// Carry out an action. A picker it asks for waits until the frame's actions have run; while
+    /// one waits, another is not taken (the first stays and the action says so).
     fn run(&mut self, a: Action) {
+        let earlier = self.pending.take();
+        self.carry_out(a);
+        match (earlier, self.pending.is_some()) {
+            (Some(e), true) => {
+                self.pending = Some(e);
+                self.ed.message = format!(
+                    "{} was not done: another file dialog is waiting to open; try again after it.",
+                    a.info().label
+                );
+            }
+            (Some(e), false) => self.pending = Some(e),
+            (None, true) => self.pending_for = self.open.as_ref().map(|o| o.dir.clone()),
+            (None, false) => {}
+        }
+    }
+
+    /// Show the picker that waits, if it is still for the project open now.
+    fn ask_pending(&mut self) {
+        let Some(p) = self.pending.take() else { return };
+        let asked_for = self.pending_for.take();
+        let now = self.open.as_ref().map(|o| o.dir.clone());
+        if !matches!(p, Pending::Open) && asked_for != now {
+            self.ed.message = "The file dialog was not shown: another project was opened before it could.".into();
+            return;
+        }
+        self.ask(p);
+    }
+
+    fn carry_out(&mut self, a: Action) {
         let page = self.ed.page;
         applog::info(&format!("command {a:?}"));
         if let Some(name) = self.open.as_ref().and_then(|o| held_for(a, &self.ed, &o.project)) {
@@ -2420,22 +2464,55 @@ fn pick_open(title: &str, dir: &Path, filter: (&str, &[&str])) -> Picked {
     picker_outcome(r, shown.elapsed(), &applog::take_picker_errors())
 }
 
-/// Where an export goes: the file picked in the save dialog, or `default` with a note when the
-/// dialog could not open; `None` when the person cancelled.
-fn export_target(title: &str, default: &Path, filter: (&str, &[&str])) -> Option<(PathBuf, String)> {
+/// A save dialog: [`pick_save`], or a stand-in for it in tests.
+type PickSave<'a> = &'a dyn Fn(&str, &Path, &str, Option<(&str, &[&str])>) -> Picked;
+
+/// Where an export goes: the file picked in the save dialog `pick`, or `default` with a note
+/// when the dialog could not open; `None` when the person cancelled.
+fn export_target(
+    title: &str,
+    default: &Path,
+    filter: (&str, &[&str]),
+    pick: PickSave<'_>,
+) -> Option<(PathBuf, String)> {
     let dir = default.parent().unwrap_or(default);
     let name = default
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    match pick_save(title, dir, &name, Some(filter)) {
+    match pick(title, dir, &name, Some(filter)) {
         Picked::Path(p) => Some((p, String::new())),
         Picked::Failed(e) => Some((
             default.to_path_buf(),
-            format!("{e} So it was saved in the usual place.\n\n"),
+            format!("{e} So it goes to the usual place, {}.\n\n", default.display()),
         )),
         Picked::Cancelled => None,
     }
+}
+
+/// A whole-project export to the file asked for with the save dialog `pick`: what it says, or
+/// `None` when the person cancelled (nothing is written then).
+fn export_whole(open: &Open, kind: Export, pick: PickSave<'_>) -> Option<String> {
+    let (title, default, filter): (&str, PathBuf, (&str, &[&str])) = match kind {
+        Export::Pdf => ("Export PDF", export_file(open, "pdf"), ("PDF", &["pdf"])),
+        Export::Aml => (
+            "Export AutomationML",
+            export_file(open, "aml"),
+            ("AutomationML", &["aml"]),
+        ),
+        _ => (
+            "Export for the WAGO configurator",
+            open.dir.join("export").join("wago-configurator.csv"),
+            ("CSV list", &["csv"]),
+        ),
+    };
+    let (path, note) = export_target(title, &default, filter, pick)?;
+    let msg = match kind {
+        Export::Pdf => export_pdf_to(open, &path),
+        Export::Aml => export_aml_to(open, &path),
+        _ => export_wago_configurator_to(open, &path),
+    };
+    Some(note + &msg)
 }
 
 /// Write a file, making its folder first.
@@ -2818,6 +2895,31 @@ fn chosen_lines(lines: &[Option<wc_report::LineField>]) -> Vec<wc_report::LineFi
     lines.iter().map_while(|l| *l).collect()
 }
 
+/// The WAGO marking dialog set as `options` were, to try again after the save dialog was
+/// cancelled.
+fn wago_marking_dialog_with(open: &Open, options: &wc_report::MarkingOptions) -> Dialog {
+    let mut d = wago_marking_dialog(open, options.strip.clone());
+    if let Dialog::WagoMarking {
+        kinds,
+        lines,
+        language,
+        level_separator,
+        ..
+    } = &mut d
+    {
+        for (on, k) in kinds.iter_mut().zip(wc_report::MarkerKind::ALL) {
+            *on = options.kinds.contains(&k);
+        }
+        let mut chosen = options.lines.iter().copied();
+        for l in lines.iter_mut() {
+            *l = chosen.next();
+        }
+        *language = options.language;
+        level_separator.clone_from(&options.level_separator);
+    }
+    d
+}
+
 /// The WAGO marking dialog: every kind (only terminals when a strip is given), one marker line.
 fn wago_marking_dialog(open: &Open, strip: Option<String>) -> Dialog {
     let inputs = wc_report::Inputs {
@@ -2994,8 +3096,9 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     };
     let (pages, report) = wc_pdf::page_drawings(&open.project, &open.symbols, &options);
     let mut used = std::collections::BTreeSet::new();
-    let written = std::fs::create_dir_all(dir).and_then(|()| {
-        for page in &pages {
+    let files: Vec<(String, &wc_pdf::PageDrawing)> = pages
+        .iter()
+        .map(|page| {
             let base = if page.number.trim().is_empty() {
                 &page.id
             } else {
@@ -3008,8 +3111,43 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
             while !used.insert(stem.clone()) {
                 stem.push('_');
             }
-            std::fs::write(dir.join(format!("{stem}.svg")), wc_pdf::svg(page))?;
-            std::fs::write(dir.join(format!("{stem}.dxf")), wc_pdf::dxf(page))?;
+            (stem, page)
+        })
+        .collect();
+    // The project's own drawings folder is the export's: a new export replaces the last one.
+    // Another folder may hold other files with the same names, which are never replaced.
+    let own = dir == open.dir.join("export").join("drawings");
+    if !own {
+        let taken: Vec<String> = files
+            .iter()
+            .flat_map(|(stem, _)| [format!("{stem}.svg"), format!("{stem}.dxf")])
+            .filter(|name| dir.join(name).exists())
+            .collect();
+        if let Some(first) = taken.first() {
+            return format!(
+                "Nothing exported: {} already has {} of the files this export writes ({first} and \
+                 others), and they are not replaced. Pick an empty folder.",
+                dir.display(),
+                taken.len()
+            );
+        }
+    }
+    let write = |path: PathBuf, bytes: String| {
+        if own {
+            std::fs::write(path, bytes)
+        } else {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .and_then(|mut f| f.write_all(bytes.as_bytes()))
+        }
+    };
+    let written = std::fs::create_dir_all(dir).and_then(|()| {
+        for (stem, page) in &files {
+            write(dir.join(format!("{stem}.svg")), wc_pdf::svg(page))?;
+            write(dir.join(format!("{stem}.dxf")), wc_pdf::dxf(page))?;
         }
         Ok(())
     });
@@ -3057,9 +3195,7 @@ impl eframe::App for App {
         }
         self.log_messages();
         self.assistant_poll(ctx);
-        if let Some(p) = self.pending.take() {
-            self.ask(p);
-        }
+        self.ask_pending();
         if self.applied_theme != self.prefs.theme {
             theme::apply(ctx, self.prefs.theme);
             self.applied_theme = self.prefs.theme;
@@ -3908,6 +4044,89 @@ mod picker_tests {
 #[allow(clippy::unwrap_used)]
 mod marking_tests {
     use super::*;
+
+    #[test]
+    fn an_export_goes_only_where_the_save_dialog_says_and_nowhere_on_cancel() {
+        let (tmp, o) = state::tests::project();
+        let usual = export_file(&o, "aml");
+        let cancel = |_: &str, _: &Path, _: &str, _: Option<(&str, &[&str])>| Picked::Cancelled;
+        assert!(export_whole(&o, Export::Aml, &cancel).is_none());
+        assert!(!usual.exists() && !usual.parent().unwrap().exists());
+
+        let picked = tmp.path().join("elsewhere").join("plant.aml");
+        let to = picked.clone();
+        let pick = move |_: &str, _: &Path, _: &str, _: Option<(&str, &[&str])>| Picked::Path(to.clone());
+        let msg = export_whole(&o, Export::Aml, &pick).unwrap();
+        assert!(msg.contains("Exported"), "{msg}");
+        assert!(picked.is_file());
+        assert!(!usual.exists());
+
+        // Without a dialog it goes to the usual place, and the note names it without claiming
+        // it was saved before the export says so.
+        let failed = |_: &str, _: &Path, _: &str, _: Option<(&str, &[&str])>| Picked::Failed("No dialog.".into());
+        let msg = export_whole(&o, Export::Aml, &failed).unwrap();
+        assert!(msg.contains("So it goes to the usual place"), "{msg}");
+        assert!(usual.is_file());
+    }
+
+    #[test]
+    fn the_marking_options_come_back_after_a_cancelled_save_dialog() {
+        let (_tmp, o) = state::tests::project();
+        let options = wc_report::MarkingOptions {
+            kinds: vec![wc_report::MarkerKind::Terminals],
+            lines: vec![wc_report::LineField::Marker, wc_report::LineField::Description],
+            language: wc_report::Language::De,
+            strip: None,
+            level_separator: "/".into(),
+        };
+        let Dialog::WagoMarking {
+            kinds,
+            lines,
+            language,
+            level_separator,
+            ..
+        } = wago_marking_dialog_with(&o, &options)
+        else {
+            unreachable!("not the marking dialog");
+        };
+        assert_eq!(kinds, [true, false, false, false]);
+        assert_eq!(
+            lines,
+            [
+                Some(wc_report::LineField::Marker),
+                Some(wc_report::LineField::Description),
+                None
+            ]
+        );
+        assert_eq!(language, wc_report::Language::De);
+        assert_eq!(level_separator, "/");
+    }
+
+    #[test]
+    fn drawings_replace_their_own_folder_but_not_other_files_in_a_picked_one() {
+        let (tmp, o) = state::tests::project();
+        let own = o.dir.join("export").join("drawings");
+        assert!(export_drawings_to(&o, &own).starts_with("Exported"));
+        assert!(
+            export_drawings_to(&o, &own).starts_with("Exported"),
+            "a new export replaces the last"
+        );
+
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let name = std::fs::read_dir(&own).unwrap().next().unwrap().unwrap().file_name();
+        std::fs::write(other.join(&name), "someone else's").unwrap();
+        let msg = export_drawings_to(&o, &other);
+        assert!(
+            msg.starts_with("Nothing exported") && msg.contains("not replaced"),
+            "{msg}"
+        );
+        assert_eq!(std::fs::read_to_string(other.join(&name)).unwrap(), "someone else's");
+        assert_eq!(std::fs::read_dir(&other).unwrap().count(), 1, "nothing else written");
+
+        let empty = tmp.path().join("empty");
+        assert!(export_drawings_to(&o, &empty).starts_with("Exported"));
+    }
 
     #[test]
     fn terminal_strips_are_exported_for_the_wago_configurator() {
