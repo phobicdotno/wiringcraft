@@ -1136,6 +1136,21 @@ impl Open {
     /// project already pins (one no page uses is not loaded at open) is placed in the version
     /// it pins: its copy in the project, or that version put back from the library. Only a
     /// symbol with no pin is taken from the library as it is now.
+    /// [`Open::ensure_symbol`] for each of `ids`, all or none: when one can't be loaded, the
+    /// pins and loaded symbols the others added are taken back, and the error names the symbol.
+    pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
+        for id in ids {
+            if let Err(e) = self.ensure_symbol(id) {
+                self.project.lock = lock;
+                self.symbols = symbols;
+                let named = e.starts_with(&format!("symbol {id}:"));
+                return Err(if named { e } else { format!("symbol {id}: {e}") });
+            }
+        }
+        Ok(())
+    }
+
     pub fn ensure_symbol(&mut self, id: &str) -> Result<(), String> {
         if let Some(loaded) = self.symbols.get(id) {
             // Loaded at open from its file, which may hold another version than the pin names.
@@ -1576,7 +1591,7 @@ impl Open {
         let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
         let clip = crate::edit::Clipboard::from(m);
         let at = clip.anchor;
-        Ok(self.paste(page, &clip, at))
+        self.paste(page, &clip, at)
     }
 
     /// Number the wires by `rule`, keeping numbers already given. One undo step; nothing is
@@ -2410,6 +2425,40 @@ pub(crate) mod tests {
                 .unwrap()
                 .exists()
         );
+    }
+
+    #[test]
+    fn a_paste_or_macro_needing_a_pinned_symbol_no_library_has_adds_nothing() {
+        let (tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut clip = o.copy(1, &[Selection::Symbol(id)]);
+        // A lamp ahead of the coil, which the library has and the project doesn't yet.
+        let mut lamp = clip.symbols[0].clone();
+        lamp.symbol = "wc.lamp".into();
+        lamp.tag = None;
+        clip.symbols.insert(0, lamp);
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().source = "mine".into();
+        o.project.meta.libraries.retain(|l| l.name == "mine");
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.lamp.json");
+        std::fs::copy(starter, tmp.path().join("mine/symbols/wc.lamp.json")).unwrap();
+        let before = o.project.clone();
+        let undo = o.can_undo();
+        let err = o.paste(1, &clip, Point::new(80.0, 80.0)).unwrap_err();
+        assert!(err.contains("wc.coil"), "the symbol is named: {err}");
+        assert_eq!(o.project, before, "nothing is added, not even the lamp's pin");
+        assert!(!o.symbols.contains_key("wc.lamp"));
+        assert_eq!(o.can_undo(), undo, "no undo step");
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let err = o.insert_macro(1, &path).unwrap_err();
+        assert!(err.contains("another version"), "{err}");
+        assert_eq!(o.project.pages, before.pages, "the macro adds nothing either");
     }
 
     /// A library folder named "mine", put ahead of the others, holding `sym`.
@@ -3557,7 +3606,11 @@ pub(crate) mod tests {
             graphics: vec![text.clone()],
             ..Default::default()
         };
-        assert!(o.paste(1, &clip, wc_core::geom::Point::new(0.0, 0.0)).is_empty());
+        assert!(
+            o.paste(1, &clip, wc_core::geom::Point::new(0.0, 0.0))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(o.project, before);
         assert!(!o.can_undo(), "nothing was recorded");
         // The other page is not held.
