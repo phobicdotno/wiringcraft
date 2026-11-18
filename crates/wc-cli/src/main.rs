@@ -2942,13 +2942,15 @@ mod tests {
             "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n10\n0\nENDSEC\n0\nEOF\n",
         )
         .unwrap();
-        // A stand-in converter that notes where it was told to write, then copies or fails.
-        let record = tmp.path().join("out.txt");
+        // A stand-in converter that notes where it was told to write, then copies or fails. The
+        // template is split on spaces, so it lives under /tmp, not a TMPDIR that may have them.
+        let bin = tempfile::tempdir_in("/tmp").unwrap();
+        let record = bin.path().join("out.txt");
         let converter = |name: &str, last: &str| {
-            let path = tmp.path().join(name);
+            let path = bin.path().join(name);
             std::fs::write(
                 &path,
-                format!("#!/bin/sh\necho \"$2\" > {}\n{last}\n", record.display()),
+                format!("#!/bin/sh\necho \"$2\" > '{}'\n{last}\n", record.display()),
             )
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
