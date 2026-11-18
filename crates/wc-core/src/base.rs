@@ -54,7 +54,7 @@ pub fn create_from(base: &Path, dir: &Path, name: &str, date: &str) -> Result<Pr
     }
     let mut project = store::load(base)?;
     fill(&mut project, name, date);
-    keep_libraries(&mut project, &base_full);
+    keep_libraries(&mut project, &base_full)?;
 
     let parent = target
         .parent()
@@ -123,7 +123,7 @@ pub fn fill(project: &mut Project, name: &str, date: &str) {
 
 /// Relative folder sources that lead out of the base project become the absolute folder they
 /// named from it; everything else already points at the same library from the new project.
-fn keep_libraries(project: &mut Project, base: &Path) {
+fn keep_libraries(project: &mut Project, base: &Path) -> Result<()> {
     for lib in &mut project.meta.libraries {
         if lib.kind != "folder" || Path::new(&lib.location).is_absolute() {
             continue;
@@ -131,7 +131,12 @@ fn keep_libraries(project: &mut Project, base: &Path) {
         // Where the folder really is, with links followed before `..` as the library loader
         // does when it opens the path.
         let full = base.join(&lib.location);
-        let named = resolved(&full).unwrap_or_else(|_| lexical(&full));
+        let named = resolved(&full).map_err(|e| {
+            Error::Invalid(format!(
+                "the library \"{}\" points at {}, which cannot be reached: {e}",
+                lib.name, lib.location
+            ))
+        })?;
         match named.strip_prefix(base) {
             Err(_) => lib.location = named.to_string_lossy().into_owned(),
             // Inside the base, but reached through a link: links are not copied, so point
@@ -143,6 +148,7 @@ fn keep_libraries(project: &mut Project, base: &Path) {
             Ok(_) => {}
         }
     }
+    Ok(())
 }
 
 /// The relative folder sources of a project that lead out of its folder (such as
@@ -522,6 +528,29 @@ mod tests {
         let made = create_from(&b, &new, "New", "2026-11-18").unwrap();
         assert_eq!(made.meta.libraries[0].location, "own-library/parts");
         assert!(new.join(&made.meta.libraries[0].location).is_dir());
+    }
+
+    #[test]
+    fn a_library_path_through_a_file_is_refused() {
+        use crate::project::LibrarySource;
+        let tmp = tempfile::tempdir().unwrap();
+        let company = tmp.path().join("company");
+        let b = company.join("base");
+        base(&b);
+        fs::write(company.join("file"), "not a folder").unwrap();
+        fs::create_dir_all(company.join("library")).unwrap();
+        let mut p = store::load(&b).unwrap();
+        p.meta.libraries = vec![LibrarySource {
+            name: "broken".into(),
+            kind: "folder".into(),
+            location: "../file/../library".into(),
+            reference: None,
+        }];
+        store::save(&b, &p).unwrap();
+        let new = tmp.path().join("new");
+        let err = create_from(&b, &new, "New", "2026-11-18").unwrap_err();
+        assert!(err.to_string().contains("broken"), "{err}");
+        assert!(!new.exists());
     }
 
     #[cfg(unix)]
