@@ -1920,7 +1920,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             );
-            let n_sym = add_swe_built(dir, &mut p, built, &source, &choice.1)?;
+            let (n_sym, joined) = add_swe_built(dir, &mut p, built, &source, &choice.1)?;
             save_imported(dir, &p)?;
             println!(
                 "{:<18} {:>8} {:>9}  why the rest is not imported",
@@ -1928,6 +1928,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             );
             for r in &report {
                 println!("{:<18} {:>8} {:>9}  {}", r.what, r.source, r.imported, r.note);
+            }
+            if joined > 0 {
+                println!("{joined} imported jumper group(s) joined a jumper the project already had");
             }
             if let Some(n) = linked {
                 println!("{n} device(s) and cable(s) linked to a part from the archive's catalog");
@@ -3047,7 +3050,7 @@ fn add_swe_built(
     built: wc_import::aml::Built,
     source: &str,
     sources: &std::collections::BTreeMap<String, String>,
-) -> Res<usize> {
+) -> Res<(usize, usize)> {
     let n_sym = built.symbols.iter().filter(|s| !sources.contains_key(&s.id)).count();
     let from_library: Vec<String> = built
         .symbols
@@ -3056,9 +3059,9 @@ fn add_swe_built(
         .map(|s| s.id.clone())
         .collect();
     // Not replacing: a generated symbol may still be placed on pages the project keeps.
-    add_built(dir, p, built, source, Replace::No)?;
+    let (_, joined) = add_built_joining(dir, p, built, source, Replace::No)?;
     keep_library_sources(p, &from_library, sources);
-    Ok(n_sym)
+    Ok((n_sym, joined))
 }
 
 /// Library symbols an import used stay pinned to the library they came from (`add_built` pins
@@ -3263,10 +3266,23 @@ fn put_files_back(files: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
 fn add_built(
     dir: &Path,
     p: &mut Project,
-    mut built: wc_import::aml::Built,
+    built: wc_import::aml::Built,
     source: &str,
     replace: Replace,
 ) -> Result<Written, String> {
+    add_built_joining(dir, p, built, source, replace).map(|(written, _)| written)
+}
+
+/// [`add_built`], also giving how many imported jumper groups joined a jumper the project
+/// already had (directly, or through another imported group that did): the saved project
+/// holds those as part of that jumper, not as jumpers of their own.
+fn add_built_joining(
+    dir: &Path,
+    p: &mut Project,
+    mut built: wc_import::aml::Built,
+    source: &str,
+    replace: Replace,
+) -> Result<(Written, usize), String> {
     let cover_fields = keep_one_cover(p, &mut built.pages);
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of
     // an earlier one and then fail half way.
@@ -3455,7 +3471,23 @@ fn add_built(
         let (symbols, _) = store::vendored_symbols(dir, p);
         wc_core::project::follow_terminals_in(p, &before, |id| symbols.get(id).map(|s| s.role));
     }
+    // Terminals held by the project's own jumpers (with their numbers after following), and by
+    // the imported groups that joined one of them.
+    let mut joined_terminals: std::collections::BTreeSet<(DeviceTag, String)> = p
+        .meta
+        .jumpers
+        .iter()
+        .flat_map(|j| j.terminals.iter().map(|t| (j.strip.clone(), t.clone())))
+        .collect();
+    let mut joined = 0;
     for j in &built.jumpers {
+        if j.terminals
+            .iter()
+            .any(|t| joined_terminals.contains(&(j.strip.clone(), t.clone())))
+        {
+            joined += 1;
+            joined_terminals.extend(j.terminals.iter().map(|t| (j.strip.clone(), t.clone())));
+        }
         p.meta
             .add_jumper(&j.strip, &j.terminals)
             .map_err(|why| format!("jumper on {}: {why}", j.strip))?;
@@ -3464,7 +3496,7 @@ fn add_built(
     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
     p.meta.fill_title_block(built.title_block);
-    Ok(changed)
+    Ok((changed, joined))
 }
 
 /// The path and bytes of a vendored copy, kept before an import replaces it.
@@ -4692,13 +4724,15 @@ mod tests {
             part: None,
         };
         let built = wc_import::aml::Built {
-            jumpers: vec![jumper(&["4", "5"]), jumper(&["7", "8"])],
+            jumpers: vec![jumper(&["4", "5"]), jumper(&["5", "6"]), jumper(&["7", "8"])],
             ..Default::default()
         };
-        add_built(&dir, &mut p, built, "import:a.tewzip", Replace::No).unwrap();
+        let (_, joined) = add_built_joining(&dir, &mut p, built, "import:a.tewzip", Replace::No).unwrap();
         let mut sets: Vec<Vec<String>> = p.meta.jumpers.iter().map(|j| j.terminals.clone()).collect();
         sets.sort();
-        assert_eq!(sets, [vec!["3", "4", "5"], vec!["7", "8"]]);
+        assert_eq!(sets, [vec!["3", "4", "5", "6"], vec!["7", "8"]]);
+        // 4-5 joined the project's 3-4, and 5-6 joined it through 4-5; 7-8 is a jumper of its own.
+        assert_eq!(joined, 2, "the report tells merged groups apart from new jumpers");
     }
 
     #[test]
