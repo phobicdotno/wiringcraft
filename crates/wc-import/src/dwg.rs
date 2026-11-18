@@ -219,10 +219,12 @@ fn parse_page_map(map: &[u8], file_len: usize) -> Result<BTreeMap<u32, u64>> {
         if pages.len() > MAX_PAGES {
             return Err(bad("the page map lists too many pages"));
         }
-        at += size as u64;
-        if at > file_len as u64 {
+        // Each page starts in the file. The last one's padding may be cut short (a real file
+        // ends one byte before it); reading a page checks what it holds.
+        if at >= file_len as u64 {
             return Err(bad("the page map reaches past the end of the file"));
         }
+        at += size as u64;
     }
     Ok(pages)
 }
@@ -246,6 +248,7 @@ fn read_section_map(
     for _ in 0..count {
         let size = r.u64(pos)?;
         let page_count = r.u32(pos + 0x08)? as usize;
+        let max_page = r.u32(pos + 0x0C)?;
         let compressed = r.u32(pos + 0x14)?;
         let id = r.u32(pos + 0x18)?;
         let encrypted = r.u32(pos + 0x1C)?;
@@ -279,7 +282,7 @@ fn read_section_map(
                 .ok()
                 .filter(|s| *s <= size)
                 .ok_or_else(|| bad(format!("section {name}, page {number} starts past its end")))?;
-            let page = data_page(bytes, address, compressed, &mut budget)
+            let page = data_page(bytes, address, compressed, max_page, &mut budget)
                 .map_err(|e| bad(format!("section {name}, page {number}: {e}")))?;
             let end = start.saturating_add(page.len()).min(size);
             if data.len() < end {
@@ -300,9 +303,13 @@ fn read_section_map(
     })
 }
 
-/// Read one data page at `address`: unscramble its header, check it, and decompress it.
-/// Each page's decompressed size is taken from `budget` before it is decompressed.
-fn data_page(bytes: &[u8], address: u64, compressed: u32, budget: &mut usize) -> Result<Vec<u8>> {
+/// Read one data page at `address`: unscramble its header, check it, and decompress it to at
+/// most `max_page` bytes (the section's page size). What a page may give is taken from `budget`
+/// before it is decompressed.
+///
+/// The header's word at 0x0C is the page's size in the file (header and data, rounded up to 32
+/// bytes), not what it decompresses to; it is not needed.
+fn data_page(bytes: &[u8], address: u64, compressed: u32, max_page: u32, budget: &mut usize) -> Result<Vec<u8>> {
     let start = offset(address, bytes.len(), "data page")?;
     let raw = bytes
         .get(start..start.saturating_add(DATA_PAGE_HEADER))
@@ -311,21 +318,21 @@ fn data_page(bytes: &[u8], address: u64, compressed: u32, budget: &mut usize) ->
     if head.u32(0)? != DATA_PAGE {
         return Err(bad("the page is damaged (wrong page type)"));
     }
-    let data_size = head.u32(0x08)? as usize;
-    let page_size = to_usize(head.u32(0x0C)?, MAX_PAGE, "page")?;
-    *budget = budget
-        .checked_sub(page_size)
-        .ok_or_else(|| bad("the file's pages decompress to too much"))?;
+    let data_size = to_usize(head.u32(0x08)?, MAX_PAGE, "page")?;
     let data_at = start + DATA_PAGE_HEADER;
     let data = bytes
         .get(data_at..data_at.saturating_add(data_size))
         .ok_or_else(|| bad("the page's data is cut off"))?;
+    let gives = match compressed {
+        2 => to_usize(max_page, MAX_PAGE, "page")?,
+        _ => data_size,
+    };
+    *budget = budget
+        .checked_sub(gives)
+        .ok_or_else(|| bad("the file's pages decompress to too much"))?;
     match compressed {
-        2 => decompress(data, page_size),
-        1 => data
-            .get(..page_size)
-            .map(<[u8]>::to_vec)
-            .ok_or_else(|| bad("the page holds fewer bytes than its header says")),
+        2 => decompress_at_most(data, gives),
+        1 => Ok(data.to_vec()),
         c => Err(bad(format!("unknown compression {c}"))),
     }
 }
@@ -367,6 +374,19 @@ fn to_usize(n: u32, max: usize, what: &str) -> Result<usize> {
 /// copying bytes from earlier in the output and then a few new literal bytes, and ends with
 /// `0x11`.
 pub fn decompress(src: &[u8], size: usize) -> Result<Vec<u8>> {
+    let out = decompress_at_most(src, size)?;
+    if out.len() != size {
+        return Err(bad(format!(
+            "compressed data gives {} bytes, the page holds {size}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// [`decompress`] where the data may give fewer bytes than `size`, but not more: a data page,
+/// whose header does not say what it decompresses to.
+pub fn decompress_at_most(src: &[u8], size: usize) -> Result<Vec<u8>> {
     let mut r = Stream { src, pos: 0 };
     let mut out = Vec::new();
     let mut op = r.byte()?;
@@ -430,12 +450,6 @@ pub fn decompress(src: &[u8], size: usize) -> Result<Vec<u8>> {
             literal(&mut r, &mut out, lits, size)?;
             op = r.byte()?;
         }
-    }
-    if out.len() != size {
-        return Err(bad(format!(
-            "compressed data gives {} bytes, the page holds {size}",
-            out.len()
-        )));
     }
     Ok(out)
 }
