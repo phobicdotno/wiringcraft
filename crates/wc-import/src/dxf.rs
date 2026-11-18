@@ -2415,12 +2415,12 @@ mod tests {
     #[test]
     fn a_hatch_spline_edge_follows_its_start_tangent() -> Result<()> {
         // A spline edge by fit points (0, 0), (5, 5), (10, 0) with start and end tangents (1, 0)
-        // (the fit chords rise and fall at 45 degrees), then a line back: the edge leaves and
-        // arrives flat, the line is still there.
-        let ents = "0\nHATCH\n2\nANSI31\n70\n0\n91\n1\n92\n1\n93\n2\n\
+        // (the fit chords rise and fall at 45 degrees), then two lines back through (5, -5): the
+        // edge leaves and arrives flat, and the lines after it are kept.
+        let ents = "0\nHATCH\n2\nANSI31\n70\n0\n91\n1\n92\n1\n93\n3\n\
                     72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n\
                     12\n1\n22\n0\n13\n1\n23\n0\n\
-                    72\n1\n10\n10\n20\n0\n11\n0\n21\n0\n97\n0\n";
+                    72\n1\n10\n10\n20\n0\n11\n5\n21\n-5\n72\n1\n10\n5\n20\n-5\n11\n0\n21\n0\n97\n0\n";
         let (g, _) = drawn(ents, "")?;
         let (s, _, _) = poly(&g[0]);
         assert!(s.len() > 10, "{s:?}");
@@ -2436,10 +2436,11 @@ mod tests {
             end > 0 && ((b.y - a.y) / (b.x - a.x)).abs() < 0.15 && b.x > a.x,
             "{a:?} {b:?}"
         );
-        // The closing line back to (0, 0): the last point is (0, 0) or next to it.
+        // The two line edges back through (5, -5) (page (5, 5)), below the spline: that vertex
+        // is in the outline, so no edge after the spline was skipped.
         assert!(
-            s.iter().filter(|q| q.y.abs() < 1e-9).count() >= 2,
-            "the line is kept: {s:?}"
+            s.iter().any(|q| (q.x - 5.0).abs() < 1e-6 && (q.y - 5.0).abs() < 1e-6),
+            "the line edges are kept: {s:?}"
         );
         Ok(())
     }
