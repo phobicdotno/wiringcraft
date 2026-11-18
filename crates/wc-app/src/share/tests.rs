@@ -1279,6 +1279,16 @@ fn free_graphics_merge_item_by_item() {
     assert_eq!(m(&[&a, &b, &a], &[&a, &b, &a, &text], &[&a, &b]), None);
     // Moved to different places on the two sides, with a text added here: still a clash.
     assert_eq!(m(&[&a], &[&c], &[&d, &text]), None);
+    // Every copy around another line removed here: only one list results, so no clash.
+    assert_eq!(
+        m(&[&a, &b, &a], &[&a, &b, &a, &text], &[&b]),
+        Some(vec![b.clone(), text.clone()])
+    );
+    // Some copies of one unbroken run removed here: which ones does not matter.
+    assert_eq!(
+        m(&[&b, &a, &a, &a], &[&b, &a, &a, &a, &text], &[&b, &a]),
+        Some(vec![b.clone(), a.clone(), text.clone()])
+    );
 }
 
 #[test]

@@ -298,7 +298,8 @@ fn merge_unordered<T: PartialEq + Clone>(
         None => true,
     });
     let mut removed_there = minus(base, auth);
-    let mut out = auth.to_vec();
+    // Removed only here, grouped by value with a count.
+    let mut only_here: Vec<(&T, usize)> = Vec::new();
     for r in &removed_here {
         match removed_there.iter().position(|x| x == r) {
             // Gone from the session too (that copy, not another one it still has): a clash if
@@ -310,24 +311,41 @@ fn merge_unordered<T: PartialEq + Clone>(
                     return None;
                 }
             }
-            // Removed only here. With several equal copies left in the session, which one went
-            // matters when they sit at different places among the others; if taking out any
-            // one of them does not give the same list, it is not known which copy went.
-            None => {
-                let copies: Vec<usize> = (0..out.len()).filter(|&i| out[i] == *r).collect();
-                let without = |i: usize| {
-                    let mut v = out.clone();
-                    v.remove(i);
-                    v
-                };
-                let Some(&first) = copies.first() else { continue };
-                let after = without(first);
-                if copies[1..].iter().any(|&i| without(i) != after) {
-                    return None;
+            None => match only_here.iter_mut().find(|(v, _)| *v == r) {
+                Some((_, n)) => *n += 1,
+                None => only_here.push((r, 1)),
+            },
+        }
+    }
+    let mut out = auth.to_vec();
+    for (r, n) in only_here {
+        // With several equal copies left in the session, which ones went matters when they sit
+        // at different places among the others: removing every copy, or some copies of one
+        // unbroken run, gives one list; otherwise it is not known which copies went.
+        let copies = out.iter().filter(|x| *x == r).count();
+        if n < copies {
+            let mut runs = 0;
+            let mut in_run = false;
+            for x in &out {
+                let is_copy = x == r;
+                if is_copy && !in_run {
+                    runs += 1;
                 }
-                out = after;
+                in_run = is_copy;
+            }
+            if runs > 1 {
+                return None;
             }
         }
+        let mut left = n;
+        out.retain(|x| {
+            if left > 0 && x == r {
+                left -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
     out.extend(added_here);
     Some(out)
