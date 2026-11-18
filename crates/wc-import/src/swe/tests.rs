@@ -2500,3 +2500,30 @@ fn jumpers_from_the_terminal_strip_editor_become_the_strips_jumper() {
         .unwrap();
     assert!(!ends.note.contains("WiringCraft has no jumpers"), "{}", ends.note);
 }
+
+#[test]
+fn archive_names_with_dot_slash_are_read_like_plain_ones() {
+    let library = model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]);
+    let other = model_space_dwg(&[E::Line((0.0, 0.0), (9.0, 9.0))]);
+    let page = model_space_dwg(&[E::Line((0.0, 0.0), (5.0, 0.0))]);
+    // Another project's block comes after the library's: it must not replace it.
+    let buf = archive(&[
+        ("Block/Coil.dwg", &library),
+        ("./Projects/2/Block/Coil.dwg", &other),
+        ("./Projects/4/Drawings/17.ewg", &page),
+    ]);
+    let lim = drawings::Limits {
+        file: 1 << 20,
+        total: 1 << 24,
+    };
+    let drawings = drawings::drawings_within(buf, "Projects/4", lim).unwrap();
+    assert!(drawings.warnings.is_empty(), "{:?}", drawings.warnings);
+    let (mut budget, mut skipped) = (usize::MAX, BTreeMap::new());
+    let coil = drawings.block_graphics("Coil", &mut budget, &mut skipped).unwrap();
+    assert!(
+        matches!(coil[..], [Shape::Line { b, .. }] if (b.x - 1.0).abs() < 1e-9 && b.y.abs() < 1e-9),
+        "{coil:?}"
+    );
+    assert_eq!(drawings.page_count(), 1);
+    assert!(!drawings.page_graphics(17, &[], &mut budget, &mut skipped).is_empty());
+}

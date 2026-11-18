@@ -68,6 +68,16 @@ devices and jumpers:
   without an index that is a Jumper, or has no Type but names terminals in Connects, is not taken:
   it may be a jumper that lost its index.
 - In the app it is one undo step.
+- A copy the project has of a part without its pin (left by an undone import) is matched as it
+  is and pinned again, never replaced by a newer library version. A pin names a library, so one
+  of the project's libraries must still have the part: otherwise the copy stays unpinned (and,
+  when no device uses it, it is not matched at all).
+- The command line import also pins every part the project already uses without a pin (left
+  by an earlier import whose lock could not be written), even one no row names: then only
+  `library.lock` is written (and the part's copy, when the project has none and a library has
+  the part). A used part no library has and the project has no copy of stays unpinned; `lib
+  lock` reports it, once every configured library can be opened (`import wago` itself goes on
+  past a library it cannot open). With every used part pinned and nothing to change, nothing is written.
 
 Every row with an article that is not taken is listed with the reason: an index the project no
 longer has, or whose type, terminal number or (for an accessory) terminal in Connects changed

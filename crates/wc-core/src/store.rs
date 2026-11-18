@@ -216,6 +216,14 @@ pub fn load(dir: &Path) -> Result<Project> {
     Ok(project)
 }
 
+/// Write only the project's `library.lock`; true when it changed. For a change that pins new
+/// items: written before the files that use them, a failed save leaves a pin nothing uses yet
+/// (harmless, and the next try finds it), never a use without its pin.
+pub fn save_lock(dir: &Path, project: &Project) -> Result<bool> {
+    let path = dir.join(LOCK_FILE);
+    write_if_changed(&path, &to_toml(&project.lock, &path)?)
+}
+
 /// Save a project folder. Page files of deleted pages are removed. Returns the files written.
 pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();

@@ -201,8 +201,9 @@ pub fn outgoing(
 
 /// Page `base` as both this window (`local`) and the session (`auth`) changed it: the session's
 /// page with the local changes on top, or `None` when the two touched the same thing. Symbols
-/// and wires are matched by id, title-block fields by name; the title, size, underlay, the
-/// overview and cover marks, and the free graphics (which carry no id) each count as one thing.
+/// and wires are matched by id, title-block fields by name, the free graphics and texts (which
+/// carry no id) item by item ([`merge_unordered`]); the title, size, underlay, and the overview
+/// and cover marks each count as one thing.
 /// A wire that ends at a symbol the other side took away is a clash too. The page number is
 /// left as the session's.
 fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
@@ -212,7 +213,9 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
     page.underlay = pick(&base.underlay, &auth.underlay, &local.underlay)?;
     page.overview = pick(&base.overview, &auth.overview, &local.overview)?;
     page.cover = pick(&base.cover, &auth.cover, &local.cover)?;
-    page.graphics = pick(&base.graphics, &auth.graphics, &local.graphics)?;
+    page.graphics = merge_unordered(&base.graphics, &auth.graphics, &local.graphics, |a, b| {
+        std::mem::discriminant(a) == std::mem::discriminant(b)
+    })?;
     let names: std::collections::BTreeSet<&String> =
         [base, auth, local].iter().flat_map(|p| p.title_block.keys()).collect();
     let mut title_block = BTreeMap::new();
@@ -244,6 +247,108 @@ fn pick<T: PartialEq + Clone>(base: &T, auth: &T, local: &T) -> Option<T> {
     } else {
         None
     }
+}
+
+/// A three-way merge of items without ids (a page's free graphics and texts), as multisets.
+/// When only one side changed the list, or both made it the same, that list is taken as it is
+/// (its order kept). Otherwise: the session's items in its order, less those removed here that
+/// the session still has, then the items added here (one the session added the same way is not
+/// added twice). A change to an item is its removal and the new version's addition, so `None` (a
+/// clash) when an item removed here is gone from the session too and this window added an item
+/// that may be its new version (`same_kind`, such as another line for a line): it was most
+/// likely changed here and removed or changed by the session. Likewise when the session added
+/// such an item: it most likely changed the item this window deleted. Removed on both sides
+/// with nothing of its kind added on either side is no clash.
+fn merge_unordered<T: PartialEq + Clone>(
+    base: &[T],
+    auth: &[T],
+    local: &[T],
+    same_kind: impl Fn(&T, &T) -> bool,
+) -> Option<Vec<T>> {
+    if local == base || local == auth {
+        return Some(auth.to_vec());
+    }
+    if auth == base {
+        return Some(local.to_vec());
+    }
+    // `a` less `b`, counting repeats.
+    let minus = |a: &[T], b: &[T]| -> Vec<T> {
+        let mut left: Vec<&T> = b.iter().collect();
+        a.iter()
+            .filter(|x| match left.iter().position(|y| y == x) {
+                Some(i) => {
+                    left.swap_remove(i);
+                    false
+                }
+                None => true,
+            })
+            .cloned()
+            .collect()
+    };
+    let removed_here = minus(base, local);
+    let mut added_here = minus(local, base);
+    let mut added_there = minus(auth, base);
+    // Additions made on both sides (the same move made here and there) are one change, agreed:
+    // already in the session's list, and no sign of a clash.
+    added_here.retain(|x| match added_there.iter().position(|y| y == x) {
+        Some(i) => {
+            added_there.swap_remove(i);
+            false
+        }
+        None => true,
+    });
+    let mut removed_there = minus(base, auth);
+    // Removed only here, grouped by value with a count.
+    let mut only_here: Vec<(&T, usize)> = Vec::new();
+    for r in &removed_here {
+        match removed_there.iter().position(|x| x == r) {
+            // Gone from the session too (that copy, not another one it still has): a clash if
+            // it may have been changed here, or if the session may have changed it (deleted
+            // here, moved there).
+            Some(i) => {
+                removed_there.swap_remove(i);
+                if added_here.iter().chain(&added_there).any(|a| same_kind(a, r)) {
+                    return None;
+                }
+            }
+            None => match only_here.iter_mut().find(|(v, _)| *v == r) {
+                Some((_, n)) => *n += 1,
+                None => only_here.push((r, 1)),
+            },
+        }
+    }
+    let mut out = auth.to_vec();
+    for (r, n) in only_here {
+        // With several equal copies left in the session, which ones went matters when they sit
+        // at different places among the others: removing every copy, or some copies of one
+        // unbroken run, gives one list; otherwise it is not known which copies went.
+        let copies = out.iter().filter(|x| *x == r).count();
+        if n < copies {
+            let mut runs = 0;
+            let mut in_run = false;
+            for x in &out {
+                let is_copy = x == r;
+                if is_copy && !in_run {
+                    runs += 1;
+                }
+                in_run = is_copy;
+            }
+            if runs > 1 {
+                return None;
+            }
+        }
+        let mut left = n;
+        out.retain(|x| {
+            if left > 0 && x == r {
+                left -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    out.extend(added_here);
+    Some(out)
 }
 
 /// A three-way merge of items with ids: the session's items in its order, each with this
@@ -453,8 +558,8 @@ fn number_of(p: &Project, page: &str) -> String {
 /// Make `local` the session's project `auth`, changing only what differs. The symbol lock stays
 /// local, except for items the session has: this copy takes their entries, so an item it lacks
 /// is added and one it has in another version (someone else used it first) takes the session's
-/// version. Their files come with the session, see [`take_files`]. Returns whether anything
-/// changed.
+/// version. Their files come with the session, see [`take_files`]; items the session took back
+/// are dropped by [`taken_back`] first. Returns whether anything changed.
 pub fn incoming(local: &mut Project, auth: &Project) -> bool {
     let mut changed = false;
     for kind in [ItemKind::Symbol, ItemKind::Part] {
@@ -494,6 +599,203 @@ pub fn incoming(local: &mut Project, auth: &Project) -> bool {
         local.comments = auth.comments.clone();
     }
     changed
+}
+
+/// The symbols and parts `local` uses in what it changed since `base` (the last sync): a
+/// placement the base's page does not have, a part a device names that the base's device does
+/// not, a jumper the base does not have. A use the last sync brought in is not one, even on a
+/// page or device changed otherwise since: the session may have taken it back.
+fn fresh_uses(
+    local: &Project,
+    base: &Project,
+) -> (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>) {
+    let symbols = local
+        .pages
+        .iter()
+        .flat_map(|p| {
+            let had: std::collections::BTreeSet<(&str, &str)> = base
+                .page(&p.id)
+                .map(|b| b.symbols.iter().map(|o| (o.id.as_str(), o.symbol.as_str())).collect())
+                .unwrap_or_default();
+            p.symbols
+                .iter()
+                .filter(move |s| !had.contains(&(s.id.as_str(), s.symbol.as_str())))
+                .map(|s| s.symbol.clone())
+        })
+        .collect();
+    let parts = local
+        .devices
+        .iter()
+        .flat_map(|(tag, d)| {
+            let had: std::collections::BTreeSet<String> = base
+                .devices
+                .get(tag)
+                .map(|b| b.all_parts().into_iter().map(|(p, _)| p.to_owned()).collect())
+                .unwrap_or_default();
+            d.all_parts()
+                .into_iter()
+                .map(|(p, _)| p.to_owned())
+                .filter(move |p| !had.contains(p))
+        })
+        .chain(
+            local
+                .meta
+                .jumpers
+                .iter()
+                .filter(|j| !base.meta.jumpers.contains(j))
+                .filter_map(|j| j.part.clone()),
+        )
+        .collect();
+    (symbols, parts)
+}
+
+/// Items the session locked at the last sync (`was`) and no longer locks were taken back (an
+/// undo): drop them from `local`'s lock too, so they are not sent again as new items. Kept are
+/// items this copy locks in another version, and items it uses in a change made since the last
+/// sync (`base`) and not sent yet: those go out again with the change that uses them. A use
+/// the last sync brought in does not keep an item: the session took that use back with it.
+/// Returns the items dropped.
+pub fn taken_back(
+    local: &mut Project,
+    base: &Project,
+    was: &wc_core::Lockfile,
+    auth: &Project,
+) -> Vec<(ItemKind, String)> {
+    let candidate = |kind: ItemKind| {
+        was.map(kind).iter().any(|(id, e)| {
+            !auth.lock.map(kind).contains_key(id) && local.lock.map(kind).get(id).is_some_and(|l| l.hash == e.hash)
+        })
+    };
+    if !candidate(ItemKind::Symbol) && !candidate(ItemKind::Part) {
+        return Vec::new();
+    }
+    let (symbols, parts) = fresh_uses(local, base);
+    let mut dropped = Vec::new();
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        let used = match kind {
+            ItemKind::Symbol => &symbols,
+            ItemKind::Part => &parts,
+        };
+        let gone: Vec<String> = was
+            .map(kind)
+            .iter()
+            .filter(|(id, e)| {
+                !auth.lock.map(kind).contains_key(*id)
+                    && !used.contains(*id)
+                    && local.lock.map(kind).get(*id).is_some_and(|l| l.hash == e.hash)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            local.lock.map_mut(kind).remove(&id);
+            dropped.push((kind, id));
+        }
+    }
+    dropped
+}
+
+/// The session's lock to compare the next look with: `auth`'s, except that an item this copy
+/// still locks in the version the session had at the last look (`was`) keeps that version while
+/// the session names another. This copy takes the new version only later ([`incoming`]); if
+/// the session takes that one back first, the old version here is still known as the
+/// session's and goes with it.
+fn next_seen(was: &wc_core::Lockfile, local: &Project, auth: &Project) -> wc_core::Lockfile {
+    let mut next = auth.lock.clone();
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        for (id, e) in was.map(kind) {
+            let here = local.lock.map(kind).get(id).is_some_and(|l| l.hash == e.hash);
+            let moved = auth.lock.map(kind).get(id).is_some_and(|a| a.hash != e.hash);
+            if here && moved {
+                next.map_mut(kind).insert(id.clone(), e.clone());
+            }
+        }
+    }
+    next
+}
+
+/// Drop from `open` what the session took back since the last look (`seen`, the session's lock
+/// then, updated by [`next_seen`]): the lock entries ([`taken_back`]) and the loaded copies, so
+/// placing the item again takes it afresh and locks it, instead of drawing a loaded copy
+/// without a pin. A copy a page or device here still uses stays loaded until the session's
+/// change replaces it (`unload`, emptied by [`unload_taken_back`]). The entries in the symbol
+/// and part lists wait in `delist` for [`delist_taken_back`], which looks at the libraries the
+/// session's change names.
+fn follow_take_backs(
+    seen: &mut Option<wc_core::Lockfile>,
+    unload: &mut std::collections::BTreeSet<(ItemKind, String)>,
+    delist: &mut std::collections::BTreeSet<(ItemKind, String)>,
+    open: &mut Open,
+    base: &Project,
+    auth: &Project,
+) {
+    let was = seen.take().unwrap_or_else(|| auth.lock.clone());
+    let dropped = taken_back(&mut open.project, base, &was, auth);
+    *seen = Some(next_seen(&was, &open.project, auth));
+    if dropped.is_empty() {
+        return;
+    }
+    // The lock changed, not yet in this copy's files.
+    open.dirty = true;
+    delist.extend(dropped.iter().cloned());
+    unload.extend(dropped);
+    unload_taken_back(unload, open);
+}
+
+/// Take the items the session took back (`delist`) out of the symbol and part lists unless a
+/// library here offers them or this copy locks them again. Returns why the libraries could not
+/// be opened, if they could not; the items then stay listed and waiting for the next try.
+fn delist_taken_back(delist: &mut std::collections::BTreeSet<(ItemKind, String)>, open: &mut Open) -> Option<String> {
+    if delist.is_empty() {
+        return None;
+    }
+    let lib = match wc_library::Library::open(&open.dir, &open.project) {
+        Ok(lib) => lib,
+        Err(e) => {
+            return Some(format!(
+                "The library could not be opened to check the items the session took back ({e}); they stay in the lists."
+            ));
+        }
+    };
+    for (kind, id) in std::mem::take(delist) {
+        if open.project.lock.map(kind).contains_key(&id) || lib.locate(kind, &id).is_some() {
+            continue;
+        }
+        match kind {
+            ItemKind::Symbol => open.library.retain(|(i, _)| *i != id),
+            ItemKind::Part => open.part_library.retain(|(i, _)| *i != id),
+        }
+    }
+    None
+}
+
+/// Unload the copies of items the session took back (`unload`) that this copy neither locks
+/// again nor uses any more; the others wait for the session's change that removes their use.
+fn unload_taken_back(unload: &mut std::collections::BTreeSet<(ItemKind, String)>, open: &mut Open) {
+    if unload.is_empty() {
+        return;
+    }
+    let (symbols, parts) = (open.project.used_symbols(), open.project.used_parts());
+    unload.retain(|(kind, id)| {
+        let (locked, used) = match kind {
+            ItemKind::Symbol => (open.project.lock.symbols.contains_key(id), symbols.contains(id)),
+            ItemKind::Part => (open.project.lock.parts.contains_key(id), parts.contains(id)),
+        };
+        if locked {
+            return false;
+        }
+        if used {
+            return true;
+        }
+        match kind {
+            ItemKind::Symbol => {
+                open.symbols.remove(id);
+            }
+            ItemKind::Part => {
+                open.parts.remove(id);
+            }
+        }
+        false
+    });
 }
 
 /// The items `local` locks in another version than the session `auth`: someone else used them
@@ -619,6 +921,13 @@ pub fn take_files(
         }
         match store::write_vendored_symbol(&open.dir, s) {
             Ok(_) => {
+                match open.library.iter_mut().find(|(i, _)| *i == id) {
+                    Some(row) => row.1 = s.name.clone(),
+                    None => {
+                        open.library.push((id.clone(), s.name.clone()));
+                        open.library.sort();
+                    }
+                }
                 open.symbols.insert(id, s.clone());
             }
             Err(e) => {
@@ -646,6 +955,13 @@ pub fn take_files(
         }
         match store::write_vendored_part(&open.dir, p) {
             Ok(_) => {
+                match open.part_library.iter_mut().find(|(i, _)| *i == id) {
+                    Some(row) => row.1 = crate::state::part_label(p),
+                    None => {
+                        open.part_library.push((id.clone(), crate::state::part_label(p)));
+                        open.part_library.sort();
+                    }
+                }
                 open.parts.insert(id, p.clone());
             }
             Err(e) => {
@@ -1184,6 +1500,14 @@ pub struct Share {
     pub role: Option<Role>,
     /// The open project as of the last sync.
     base: Option<Project>,
+    /// The session's symbol lock as of the last sync: an item it no longer locks was taken back.
+    session_lock: Option<wc_core::Lockfile>,
+    /// Items the session took back whose copies wait to be unloaded until nothing here uses
+    /// them ([`unload_taken_back`]).
+    unload: std::collections::BTreeSet<(ItemKind, String)>,
+    /// Items the session took back whose entries in the symbol and part lists wait for the
+    /// session's change to be in ([`delist_taken_back`]).
+    delist: std::collections::BTreeSet<(ItemKind, String)>,
     /// The page last opened in the session, and when it was asked for.
     opened: Option<Option<String>>,
     asked_at: Option<std::time::Instant>,
@@ -1438,6 +1762,9 @@ impl Share {
     /// Items sent to a session, and problems reported about them, belong to that session.
     fn forget_items(&mut self) {
         self.items_out.clear();
+        self.session_lock = None;
+        self.unload.clear();
+        self.delist.clear();
         self.unreadable.clear();
         self.pictures_out.clear();
         self.pictures_taken.clear();
@@ -1506,6 +1833,7 @@ impl Share {
                     self.notes
                         .push(format!("Joined the session. Your copy is in {}.", o.dir.display()));
                     self.base = Some(o.project.clone());
+                    self.session_lock = Some(project.lock.clone());
                     self.opened = None;
                     Some(o)
                 }
@@ -1560,6 +1888,15 @@ impl Share {
         // the changes that may draw them wait in the window: a page must not reach the session
         // without its symbols, and an item the session refused is sent again a few times.
         let auth = role.project()?;
+        // Items the session took back are dropped here first, or they would look new below.
+        follow_take_backs(
+            &mut self.session_lock,
+            &mut self.unload,
+            &mut self.delist,
+            open,
+            base,
+            auth,
+        );
         // An item the session took is done; one this copy no longer locks (an undo, or an
         // assistant command that rewrote the project) is not sent again, so nothing waits for it.
         self.items_out
@@ -1613,6 +1950,16 @@ impl Share {
             role.pump(&mut self.notes);
             let auth = role.project()?;
             self.items_out.retain(|name, _| !session_has(auth, name));
+            // What the session took in is the baseline now, so a take-back before the last
+            // look of this frame is still seen.
+            follow_take_backs(
+                &mut self.session_lock,
+                &mut self.unload,
+                &mut self.delist,
+                open,
+                base,
+                auth,
+            );
         }
         // Pictures used for the first time go out before the change that names them. Changes do
         // not wait for them: without its picture a page still works, it just shows a gap.
@@ -1669,7 +2016,26 @@ impl Share {
                 conflicting.join(", ")
             ));
         }
+        let base = self.base.get_or_insert_with(|| open.project.clone());
+        follow_take_backs(
+            &mut self.session_lock,
+            &mut self.unload,
+            &mut self.delist,
+            open,
+            base,
+            auth,
+        );
         let changed = incoming(&mut open.project, auth);
+        // This copy now holds the session's versions: a take-back of those is what is followed.
+        if let Some(seen) = self.session_lock.as_mut() {
+            *seen = next_seen(seen, &open.project, auth);
+        }
+        unload_taken_back(&mut self.unload, open);
+        if let Some(why) = delist_taken_back(&mut self.delist, open)
+            && self.unreadable.insert("library".into())
+        {
+            self.notes.push(why);
+        }
         let (symbols, parts) = role.files();
         let failed: Vec<String> = take_files(open, symbols, parts)
             .into_iter()

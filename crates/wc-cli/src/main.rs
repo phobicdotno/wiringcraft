@@ -2051,18 +2051,53 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     Kind::Dxf => {
                         let mut p = load(dir)?;
                         let id = format!("dxf-{next}");
-                        p.pages.push(Page::new(id.clone(), next.to_string(), name.clone()));
-                        p.sort_pages();
-                        save(dir, &p)?;
                         next += 1;
-                        import_cmd(
-                            dir,
-                            ImportCmd::PageDxf {
-                                file: path.clone(),
-                                page: id,
-                                scale: 1.0,
-                            },
-                        )
+                        // Page files are named by id, and some folders do not tell `DXF-300`
+                        // from `dxf-300`.
+                        if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
+                            // Never added over an earlier page: removing it again on failure
+                            // would delete that page.
+                            Err(format!(
+                                "page {id} exists; remove it or import with --first-page to number the pages from a free number"
+                            ))
+                        } else {
+                            p.pages
+                                .push(Page::new(id.clone(), (next - 1).to_string(), name.clone()));
+                            p.sort_pages();
+                            // A save that fails part way is cleaned up like a failed import.
+                            let r = save(dir, &p).and_then(|()| {
+                                import_cmd(
+                                    dir,
+                                    ImportCmd::PageDxf {
+                                        file: path.clone(),
+                                        page: id.clone(),
+                                        scale: 1.0,
+                                    },
+                                )
+                            });
+                            // A drawing that could not be imported leaves no blank page behind.
+                            // When that fails too, the entry's own error still counts and the
+                            // other entries still come in.
+                            if r.is_err() {
+                                let remove = || -> Res<()> {
+                                    let mut p = load(dir)?;
+                                    p.pages.retain(|pg| pg.id != id);
+                                    save(dir, &p)
+                                };
+                                if let Err(why) = remove() {
+                                    // The save may fail after the page file is gone already.
+                                    let left = load(dir).map_or(true, |p| p.pages.iter().any(|pg| pg.id == id));
+                                    if left {
+                                        eprintln!("warning: {name}: the empty page {id} could not be removed: {why}");
+                                    } else {
+                                        eprintln!(
+                                            "warning: {name}: the empty page {id} was removed, but the project could not be saved in full: {why}"
+                                        );
+                                    }
+                                }
+                            }
+                            r
+                        }
                     }
                     _ => {
                         let r = import_cmd(
@@ -2137,8 +2172,48 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     return Err(format!("{source}: the symbol file for {id:?} declares id {:?}", s.id));
                 }
             }
+            // What is in the vendor folder now, so a write that fails part way leaves no copy
+            // without its pin (a retry would skip a readable one).
+            let before: Vec<(PathBuf, Option<String>)> = needed
+                .iter()
+                .map(|id| {
+                    let path = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
+                    let was = match std::fs::read_to_string(&path) {
+                        Ok(text) => Some(text),
+                        Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(x) => return Err(format!("{}: {x}", path.display())),
+                    };
+                    Ok((path, was))
+                })
+                .collect::<Res<_>>()?;
+            let put_back = |why: String| -> String {
+                let failed: Vec<String> = before
+                    .iter()
+                    .filter_map(|(path, was)| {
+                        // Written only when it differs, and whole or not at all.
+                        let r = match was {
+                            Some(text) => store::write_if_changed(path, text)
+                                .map(|_| ())
+                                .map_err(|x| x.to_string()),
+                            None => std::fs::remove_file(path).or_else(|x| {
+                                if x.kind() == std::io::ErrorKind::NotFound {
+                                    Ok(())
+                                } else {
+                                    Err(format!("{}: {x}", path.display()))
+                                }
+                            }),
+                        };
+                        r.err()
+                    })
+                    .collect();
+                if failed.is_empty() {
+                    why
+                } else {
+                    format!("{why}; symbol copies could not be put back: {}", failed.join("; "))
+                }
+            };
             for id in needed {
-                wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(e)?;
+                wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(|x| put_back(x.to_string()))?;
             }
             let pg = page_mut(&mut p, &page)?;
             let n_g = imported.graphics.len();
@@ -2557,8 +2632,10 @@ struct WagoImported {
 
 /// Write the articles of a configured WAGO configurator list onto the project in `dir` (see
 /// [`wc_import::wago`]). Articles are looked up among the project's own parts first, then its
-/// libraries; a library part that is used is taken into the project. Nothing is saved when
-/// nothing changes.
+/// libraries; a library part that is used is taken into the project. A part the project uses
+/// without a pin, named by a row or not, is pinned too: the lock is written for that, and a
+/// missing copy is written from the library when one has the part; the assignment files are
+/// left alone. Nothing else is saved when no row changes.
 fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
     let (rows, mut warnings) = wc_import::wago::read_configured(&bytes).map_err(e)?;
@@ -2581,12 +2658,8 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     let mut unmatched = plan.unmatched.clone();
     let mut taken = plan.clone();
     for id in plan.parts() {
-        // A locked part is only ever planned when its copy was read.
-        if candidates.project.contains_key(id) {
-            continue;
-        }
-        // Taken from the library it was read from: another library that cannot be opened
-        // does not stop it.
+        // Pinned as it is when the project has a copy; else taken from the library it was read
+        // from: another library that cannot be opened does not stop it.
         if let Err(why) = candidates.take(dir, &mut p, id) {
             // Its rows are listed, not written with a part the project cannot hold.
             for a in plan.assignments.iter().filter(|a| a.part == id) {
@@ -2599,6 +2672,29 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
         }
     }
     let changed = wc_import::wago::apply(&mut p, &taken);
+    // A part a device or jumper already uses without a pin (left by an import whose lock write
+    // failed before the lock went first) is pinned now: its copy as it is, or the library's
+    // when the project has none. One no library has and the project has no copy of is left to
+    // `lib lock` to report.
+    let mut repaired = 0;
+    for id in p.used_parts() {
+        let known = candidates.project.contains_key(&id)
+            || candidates.unreadable.contains_key(&id)
+            || candidates.library.contains_key(&id);
+        if p.lock.parts.contains_key(&id) || !known {
+            continue;
+        }
+        match candidates.take(dir, &mut p, &id) {
+            Ok(()) => repaired += 1,
+            Err(why) => warnings.push(format!("part {id} is used without a pin and cannot be pinned: {why}")),
+        }
+    }
+    // The pins first: if a later write fails, a repeat import still finds the part unassigned
+    // and saves again, instead of leaving it assigned without a pin. Only pins changed: the
+    // other files are left alone.
+    if changed > 0 || repaired > 0 {
+        store::save_lock(dir, &p).map_err(e)?;
+    }
     if changed > 0 {
         save(dir, &p)?;
     }
@@ -3540,6 +3636,20 @@ mod tests {
         assert!(err.contains("no-such-page"), "{err}");
         assert!(store::read_vendored_symbol(&dir, "aa.good").is_err());
 
+        // A copy that cannot be written after `aa.good` was copied takes that copy away again.
+        let blocked = store::vendor_path(&dir, ItemKind::Symbol, "zz.bad").unwrap();
+        let mut tmp_path = blocked.as_os_str().to_owned();
+        tmp_path.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_path);
+        std::fs::create_dir_all(&tmp_path).unwrap();
+        cli(&dir, &args).unwrap_err();
+        assert!(
+            store::read_vendored_symbol(&dir, "aa.good").is_err(),
+            "the copy written first is gone again"
+        );
+        assert!(!load(&dir).unwrap().lock.symbols.contains_key("aa.good"));
+        std::fs::remove_dir(&tmp_path).unwrap();
+
         // And the retry pins both.
         cli(&dir, &args).unwrap();
         let p = load(&dir).unwrap();
@@ -4143,6 +4253,107 @@ mod tests {
     }
 
     #[test]
+    fn a_dxf_in_an_archive_that_cannot_be_imported_leaves_no_blank_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let pages = load(&dir).unwrap().pages.len();
+        use std::io::Write;
+        let file = tmp.path().join("drawings.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            z.start_file("broken.dxf", opt).unwrap();
+            z.write_all(b"this is not a drawing").unwrap();
+            z.finish().unwrap();
+        }
+        // The drawing itself does not import, so the archive entry reaches that failure; the
+        // archive import still succeeds and only warns about it.
+        let broken = tmp.path().join("broken.dxf");
+        std::fs::write(&broken, b"this is not a drawing").unwrap();
+        let mut q = load(&dir).unwrap();
+        q.pages.push(Page::new("probe", "999", "Probe"));
+        save(&dir, &q).unwrap();
+        assert!(
+            cli(
+                &dir,
+                &["import", "page-dxf", broken.to_str().unwrap(), "--page", "probe"]
+            )
+            .is_err()
+        );
+        q.pages.retain(|pg| pg.id != "probe");
+        save(&dir, &q).unwrap();
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(
+            p.pages.len(),
+            pages,
+            "{:?}",
+            p.pages.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        assert!(p.pages.iter().all(|p| !p.id.starts_with("dxf-")));
+
+        // A page an earlier import left under the id this one would use is never touched.
+        let mut p = load(&dir).unwrap();
+        let mut earlier = Page::new("dxf-300", "300", "Earlier drawing");
+        earlier.title_block.insert("revision".into(), "B".into());
+        p.pages.push(earlier.clone());
+        save(&dir, &p).unwrap();
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.page("dxf-300"), Some(&earlier));
+        assert_eq!(p.pages.len(), pages + 1);
+
+        // Nor one whose id differs only in case: its file may be the same file.
+        let mut p = load(&dir).unwrap();
+        p.pages.retain(|pg| pg.id != "dxf-300");
+        // Saved apart: on a folder that ignores case, one save that drops `dxf-300` and adds
+        // `DXF-300` would delete the file it just wrote.
+        save(&dir, &p).unwrap();
+        let mut upper = Page::new("DXF-300", "299", "Earlier drawing");
+        upper.title_block.insert("revision".into(), "C".into());
+        p.pages.push(upper.clone());
+        save(&dir, &p).unwrap();
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
+        let mut p = load(&dir).unwrap();
+        assert_eq!(p.page("DXF-300"), Some(&upper));
+        assert!(p.page("dxf-300").is_none());
+        p.pages.retain(|pg| pg.id != "DXF-300");
+        save(&dir, &p).unwrap();
+
+        // Every save fails after the page files are written (a panel file that has to be
+        // rewritten cannot be): each drawing's page is still removed again, and every entry
+        // is tried.
+        p.panels
+            .push(wc_core::panel::Panel::new("cab", "Cabinet", 600.0, 800.0));
+        save(&dir, &p).unwrap();
+        let panel = dir.join("panels").join("cab.panel.json");
+        let text = std::fs::read_to_string(&panel).unwrap();
+        std::fs::write(&panel, format!("{text}\n\n")).unwrap();
+        std::fs::create_dir(dir.join("panels").join("cab.panel.json.tmp")).unwrap();
+        let two = tmp.path().join("two.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&two).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            for name in ["a.dxf", "b.dxf"] {
+                z.start_file(name, opt).unwrap();
+                z.write_all(b"this is not a drawing").unwrap();
+            }
+            z.finish().unwrap();
+        }
+        cli(&dir, &["import", "archive", two.to_str().unwrap()]).unwrap();
+        let p = load(&dir).unwrap();
+        assert!(p.pages.iter().all(|p| !p.id.starts_with("dxf-")));
+        let left: Vec<_> = std::fs::read_dir(dir.join("pages"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("dxf-"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
     fn a_zip_with_a_kicad_library_imports_every_unit_into_the_library() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -4533,6 +4744,84 @@ mod tests {
     }
 
     #[test]
+    fn a_wago_import_whose_lock_write_fails_pins_the_part_on_the_next_try() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = wago_project(tmp.path(), &[part("wago.2002-1201", "WAGO", "2002-1201")]);
+        fill_wago_list(&out, "2002-1201", "");
+        let names = [store::PROJECT_FILE, store::DEVICES_FILE, store::LOCK_FILE];
+        let files = |d: &Path| names.map(|f| std::fs::read(d.join(f)).ok());
+        let times = |d: &Path| names.map(|f| std::fs::metadata(d.join(f)).and_then(|m| m.modified()).ok());
+        let before = files(&dir);
+        // The lock's write goes through library.lock.tmp: a folder there makes it fail.
+        let blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&blocker).unwrap();
+        let err = import_wago(&dir, &out).err().unwrap_or_default();
+        assert!(err.contains("library.lock"), "{err}");
+        assert_eq!(files(&dir), before, "the assignment is not written before its pin");
+        std::fs::remove_dir(&blocker).unwrap();
+        let done = run_import_wago(&dir, &out);
+        assert_eq!(done.changed, 1, "{:?}", done.unmatched);
+        let p = load(&dir).unwrap();
+        let x11 = wc_core::DeviceTag::parse("-X1.1").unwrap();
+        assert_eq!(
+            p.devices.get(&x11).and_then(|d| d.part.as_deref()),
+            Some("wago.2002-1201")
+        );
+        assert!(p.lock.parts.contains_key("wago.2002-1201"), "pinned");
+        // A repeat import of the pinned part writes nothing.
+        let saved = times(&dir);
+        let again = run_import_wago(&dir, &out);
+        assert_eq!((again.changed, again.unchanged), (0, 1));
+        assert_eq!(times(&dir), saved, "no file written again");
+
+        // A project left by the old order (assigned, pin missing) is repaired by a re-import,
+        // pinning its own copy as it is although the library has another version by now, and
+        // writing nothing but the lock.
+        let mut p = load(&dir).unwrap();
+        p.lock.parts.remove("wago.2002-1201");
+        save(&dir, &p).unwrap();
+        let mut newer = part("wago.2002-1201", "WAGO", "2002-1201");
+        newer.description = "Changed in the library".into();
+        wc_library::write_part(&tmp.path().join("lib"), &newer).unwrap();
+        let copy_file = store::vendor_path(&dir, ItemKind::Part, "wago.2002-1201").unwrap();
+        let copy = std::fs::read(&copy_file).unwrap();
+        // A full save would rewrite devices.json written by hand like this, and its write fails.
+        let devices_file = dir.join(store::DEVICES_FILE);
+        let by_hand = format!("{}\n\n", std::fs::read_to_string(&devices_file).unwrap().trim_end());
+        std::fs::write(&devices_file, &by_hand).unwrap();
+        let devices_tmp = dir.join(format!("{}.tmp", store::DEVICES_FILE));
+        std::fs::create_dir(&devices_tmp).unwrap();
+        let devices = std::fs::metadata(&devices_file).unwrap().modified().unwrap();
+        let again = run_import_wago(&dir, &out);
+        assert_eq!(std::fs::read_to_string(&devices_file).unwrap(), by_hand);
+        std::fs::remove_dir(&devices_tmp).unwrap();
+        assert_eq!(again.changed, 0, "{:?}", again.unmatched);
+        assert_eq!(std::fs::read(&copy_file).unwrap(), copy, "the copy is kept");
+        assert_eq!(
+            load(&dir)
+                .unwrap()
+                .lock
+                .parts
+                .get("wago.2002-1201")
+                .map(|e| e.hash.clone()),
+            Some(store::read_vendored_part(&dir, "wago.2002-1201").unwrap().hash()),
+            "pinned again, to its own copy"
+        );
+        assert_ne!(
+            store::read_vendored_part(&dir, "wago.2002-1201").unwrap().hash(),
+            newer.hash()
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join(store::DEVICES_FILE))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            devices,
+            "only the lock is written"
+        );
+    }
+
+    #[test]
     fn a_wago_article_several_parts_have_stays_unmatched_after_one_of_them_is_taken() {
         let tmp = tempfile::tempdir().unwrap();
         let (dir, out) = wago_project(tmp.path(), &[part("dup.a", "", "DUP-1"), part("dup.b", "", "DUP-1")]);
@@ -4546,6 +4835,63 @@ mod tests {
         let again = run_import_wago(&dir, &out);
         assert_eq!((again.changed, again.unchanged), (0, 1), "{:?}", again.unmatched);
         assert_eq!(again.unmatched, first.unmatched);
+    }
+
+    #[test]
+    fn a_used_part_whose_copy_cannot_be_read_is_not_pinned_or_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = wago_project(tmp.path(), &[part("wago.2002-1201", "WAGO", "2002-1201")]);
+        fill_wago_list(&out, "2002-1201", "");
+        assert_eq!(run_import_wago(&dir, &out).changed, 1);
+        let mut p = load(&dir).unwrap();
+        p.lock.parts.remove("wago.2002-1201");
+        save(&dir, &p).unwrap();
+        let copy_file = store::vendor_path(&dir, ItemKind::Part, "wago.2002-1201").unwrap();
+        std::fs::write(&copy_file, "{ not json").unwrap();
+        let done = run_import_wago(&dir, &out);
+        assert_eq!(
+            std::fs::read_to_string(&copy_file).unwrap(),
+            "{ not json",
+            "the file stays"
+        );
+        assert!(!load(&dir).unwrap().lock.parts.contains_key("wago.2002-1201"), "no pin");
+        assert!(
+            done.warnings
+                .iter()
+                .any(|w| w.contains("wago.2002-1201") && w.contains("cannot be read") && w.contains("line 1")),
+            "{:?}",
+            done.warnings
+        );
+
+        // A link to nothing is there, not absent: the library part does not replace it.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&copy_file).unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("gone.json"), &copy_file).unwrap();
+            let done = run_import_wago(&dir, &out);
+            assert!(std::fs::symlink_metadata(&copy_file).unwrap().file_type().is_symlink());
+            assert!(!load(&dir).unwrap().lock.parts.contains_key("wago.2002-1201"));
+            assert!(
+                done.warnings
+                    .iter()
+                    .any(|w| w.contains("wago.2002-1201") && w.contains("cannot be read")),
+                "{:?}",
+                done.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_no_library_has_and_nothing_uses_does_not_hide_a_library_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = wago_project(tmp.path(), &[part("current.b", "WAGO", "2002-1201")]);
+        store::write_vendored_part(&dir, &part("old.a", "WAGO", "2002-1201")).unwrap();
+        fill_wago_list(&out, "2002-1201", "");
+        let done = run_import_wago(&dir, &out);
+        assert_eq!(done.changed, 1, "{:?}", done.unmatched);
+        let p = load(&dir).unwrap();
+        let x11 = wc_core::DeviceTag::parse("-X1.1").unwrap();
+        assert_eq!(p.devices.get(&x11).and_then(|d| d.part.as_deref()), Some("current.b"));
     }
 
     fn run_import_wago(dir: &Path, file: &Path) -> WagoImported {

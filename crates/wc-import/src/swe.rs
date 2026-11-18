@@ -2708,6 +2708,10 @@ pub fn build_with(
                     "device(s) placed with an estimated 18 x 90 mm footprint: no box size in the source and no part size",
                 ),
                 (
+                    layouts.from_drawing,
+                    "device(s) placed with the size of their block's drawing: no box size in the source",
+                ),
+                (
                     layouts.from_part,
                     "device(s) placed with their catalog part's width and height: no box size in the source",
                 ),

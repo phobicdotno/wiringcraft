@@ -122,9 +122,13 @@ impl W {
         self
     }
     fn t8(&mut self, s: &str) -> &mut Self {
-        self.bs(s.len() as u16);
-        for b in s.bytes() {
-            self.rc(b);
+        self.t8_bytes(s.as_bytes())
+    }
+    /// A TV of these bytes (2004): its length, then the bytes.
+    fn t8_bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        self.bs(bytes.len() as u16);
+        for b in bytes {
+            self.rc(*b);
         }
         self
     }
@@ -525,7 +529,7 @@ fn sample(v: Version) -> Vec<Obj> {
     tr.data.be((0.0, 0.0, 1.0));
     objs.push(tr);
     // Model space: RELAY with a visible and a hidden attribute, a 2D polyline of three
-    // vertices, an MTEXT, a point, an invisible line, an ellipse and a custom object.
+    // vertices, an MTEXT, a point, an invisible line, a ray (not read) and a custom object.
     // The RELAY insert has a true colour without a colour book (no colour handle).
     let mut i = entity(v, 7, 0x50, Head { extras: true, ..model });
     i.data
@@ -594,7 +598,7 @@ fn sample(v: Version) -> Vec<Obj> {
         (0.0, 0.0),
         (1.0, 1.0),
     ));
-    objs.push(entity(v, 35, 0x5B, model));
+    objs.push(entity(v, 40, 0x5B, model));
     objs.push(Obj::new(v, 0x1F3, 0x5C));
     objs
 }
@@ -658,6 +662,7 @@ fn sections(v: Version, objs: &[Obj], extra: &[(u64, usize)]) -> Sections {
             },
         ],
         skipped: Vec::new(),
+        codepage: 30,
     }
 }
 
@@ -754,7 +759,7 @@ fn check_sample(d: &Drawing) {
         "an invisible line is left out"
     );
 
-    assert_eq!(d.skipped.get("ELLIPSE"), Some(&1));
+    assert_eq!(d.skipped.get("RAY"), Some(&1));
     assert_eq!(d.skipped.len(), 1, "{:?}", d.skipped);
 }
 
@@ -1126,7 +1131,12 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
 
 /// A BLOCK_HEADER with every field up to its base point; an xref has no owned-object count.
 fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: bool) -> Obj {
-    let mut o = named(v, BLOCK_HEADER, handle, name);
+    block_fields(named(v, BLOCK_HEADER, handle, name), base, xref)
+}
+
+/// The fields a BLOCK_HEADER has after its name, written onto `o`.
+fn block_fields(mut o: Obj, base: (f64, f64), xref: bool) -> Obj {
+    let v = o.version;
     match v {
         Version::R2004 => o.data.b(true).bs(0).b(false),
         Version::R2010 => o.data.bs(0),
@@ -1248,5 +1258,758 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
             d.skipped
         );
     }
+    Ok(())
+}
+
+/// A HATCH in model space: no gradient, pattern `name`, the paths written by `paths`.
+fn hatch_obj(v: Version, handle: u64, name: &str, solid: bool, count: u32, paths: impl Fn(&mut W)) -> Obj {
+    hatch_with(v, handle, name, solid, count, 1.0, 0, paths)
+}
+
+/// [`hatch_obj`] with an extrusion of (0, 0, `z`), a gradient of two colours (the second with a
+/// colour name and a book name) and `boundary` boundary object handles. Written whole: after
+/// the style and pattern type, a pattern's angle, scale and (no) lines, then (no) seed points.
+#[allow(clippy::too_many_arguments)]
+fn hatch_with(
+    v: Version,
+    handle: u64,
+    name: &str,
+    solid: bool,
+    count: u32,
+    z: f64,
+    boundary: u64,
+    paths: impl Fn(&mut W),
+) -> Obj {
+    let mut o = entity(v, 78, handle, head(None));
+    o.data.bl(1).bl(0).bd(0.0).bd(0.0).bl(0).bd(0.0).bl(2);
+    o.data.bd(0.0).bs(5).bl(0xC300_0005).rc(0);
+    o.data.bd(1.0).bs(7).bl(0xC200_FF00).rc(3);
+    o.text("Green");
+    o.text("Book");
+    o.text("LINEAR");
+    o.data.bd(0.0).bd3((0.0, 0.0, z));
+    o.text(name);
+    o.data.b(solid).b(false).bl(count);
+    paths(&mut o.data);
+    o.data.bs(0).bs(1);
+    if !solid {
+        o.data.bd(0.0).bd(1.0).b(false).bs(0);
+    }
+    o.data.bl(0);
+    for b in 0..boundary {
+        o.handles.h(4, 0x700 + b);
+    }
+    o
+}
+
+#[test]
+fn hatches_become_filled_and_unfilled_outlines() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        // A solid square: a polyline path without bulges, filled by its solid flag (its name
+        // is not SOLID).
+        let solid = hatch_obj(v, 0x300, "_USER", true, 1, |d| {
+            d.bl(2).b(false).b(true).bl(4);
+            for p in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)] {
+                d.rd(p.0).rd(p.1);
+            }
+            d.bl(0);
+        });
+        // A pattern: an edge path of a line and a half circle over it.
+        let pattern = hatch_obj(v, 0x301, "ANSI31", false, 1, |d| {
+            d.bl(1).bl(2);
+            d.rc(1).rd(20.0).rd(0.0).rd(30.0).rd(0.0);
+            d.rc(2)
+                .rd(25.0)
+                .rd(0.0)
+                .bd(5.0)
+                .bd(0.0)
+                .bd(std::f64::consts::PI)
+                .b(true);
+            d.bl(0);
+        });
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            solid,
+            pattern,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(!d.skipped.contains_key("HATCH"), "{v:?}: {:?}", d.skipped);
+        let polylines: Vec<(usize, bool)> = d
+            .model
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline { points, filled, .. } => Some((points.len(), *filled)),
+                _ => None,
+            })
+            .collect();
+        assert!(polylines.contains(&(4, true)), "{v:?}: {polylines:?}");
+        // The half circle's points plus the line's start: well over 3, and not filled.
+        assert!(polylines.iter().any(|(n, f)| *n > 5 && !f), "{v:?}: {polylines:?}");
+        assert_eq!(polylines.len(), 2, "{:?}", d.model);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_hatch_listing_too_much_is_a_damaged_object() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        hatch_obj(v, 0x300, "SOLID", true, 50_000, |_| {}),
+        hatch_obj(v, 0x301, "SOLID", true, 1, |d| {
+            // An edge of unknown type.
+            d.bl(1).bl(1).rc(9);
+        }),
+        hatch_obj(v, 0x302, "SOLID", true, 1, |d| {
+            // A point that is not a number.
+            d.bl(2)
+                .b(false)
+                .b(true)
+                .bl(3)
+                .rd(f64::NAN)
+                .rd(0.0)
+                .rd(1.0)
+                .rd(0.0)
+                .rd(0.0)
+                .rd(1.0)
+                .bl(0);
+        }),
+        hatch_obj(v, 0x303, "SOLID", true, 1, |d| {
+            // One boundary object declared, its handle missing.
+            d.bl(2)
+                .b(false)
+                .b(true)
+                .bl(3)
+                .rd(0.0)
+                .rd(0.0)
+                .rd(1.0)
+                .rd(0.0)
+                .rd(0.0)
+                .rd(1.0)
+                .bl(1);
+        }),
+    ];
+    let mut objs = objs;
+    // A radius that is not a number, and an arc angle too large to be degrees.
+    objs.push(hatch_obj(v, 0x304, "SOLID", true, 1, |d| {
+        d.bl(1)
+            .bl(1)
+            .rc(2)
+            .rd(0.0)
+            .rd(0.0)
+            .bd(f64::NAN)
+            .bd(0.0)
+            .bd(1.0)
+            .b(true)
+            .bl(0);
+    }));
+    objs.push(hatch_obj(v, 0x305, "SOLID", true, 1, |d| {
+        d.bl(1)
+            .bl(1)
+            .rc(2)
+            .rd(0.0)
+            .rd(0.0)
+            .bd(1.0)
+            .bd(f64::MAX)
+            .bd(0.0)
+            .b(true)
+            .bl(0);
+    }));
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&6), "{:?}", d.skipped);
+    assert!(
+        d.damaged.iter().any(|r| r.contains("boundary value is not a number")),
+        "{:?}",
+        d.damaged
+    );
+    assert!(
+        d.damaged.iter().any(|r| r.contains("edge angle is too large")),
+        "{:?}",
+        d.damaged
+    );
+    assert!(
+        d.damaged.iter().any(|r| r.contains("boundary point is not a number")),
+        "{:?}",
+        d.damaged
+    );
+    assert!(
+        d.damaged.iter().any(|r| r.contains("50000 boundary paths")),
+        "{:?}",
+        d.damaged
+    );
+    Ok(())
+}
+
+#[test]
+fn hatch_edges_of_every_kind_and_a_mirrored_hatch_are_read() -> TestResult {
+    use std::f64::consts::PI;
+    for v in [Version::R2004, Version::R2010] {
+        // A solid slot: a polyline path with bulges (two half circles joined by lines).
+        let slot = hatch_obj(v, 0x300, "SOLID", true, 1, |d| {
+            d.bl(2).b(true).b(true).bl(4);
+            for (p, bulge) in [
+                ((0.0, 0.0), 0.0),
+                ((10.0, 0.0), 1.0),
+                ((10.0, 4.0), 0.0),
+                ((0.0, 4.0), 1.0),
+            ] {
+                d.rd(p.0).rd(p.1).bd(bulge);
+            }
+            d.bl(0);
+        });
+        // An edge path: half an ellipse over (40, 0)..(60, 0), closed by a spline below it,
+        // with fit points (and tangents) in 2010.
+        let edges = hatch_with(v, 0x301, "ANSI31", false, 1, 1.0, 2, |d| {
+            d.bl(1).bl(2);
+            d.rc(3).rd(50.0).rd(0.0).rd(10.0).rd(0.0).bd(0.5).bd(0.0).bd(PI).b(true);
+            d.rc(4).bl(2).b(false).b(false).bl(6).bl(3);
+            for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+                d.bd(k);
+            }
+            for p in [(40.0, 0.0), (50.0, -10.0), (60.0, 0.0)] {
+                d.rd(p.0).rd(p.1);
+            }
+            if v == Version::R2010 {
+                d.bl(2)
+                    .rd(40.0)
+                    .rd(0.0)
+                    .rd(60.0)
+                    .rd(0.0)
+                    .rd(1.0)
+                    .rd(0.0)
+                    .rd(1.0)
+                    .rd(0.0);
+            }
+            // Two boundary objects (their handles are in the handle stream).
+            d.bl(2);
+        });
+        // A solid triangle with a downward extrusion: mirrored in x.
+        let mirrored = hatch_with(v, 0x302, "SOLID", true, 1, -1.0, 0, |d| {
+            d.bl(2).b(false).b(true).bl(3);
+            for p in [(100.0, 0.0), (110.0, 0.0), (100.0, 10.0)] {
+                d.rd(p.0).rd(p.1);
+            }
+            d.bl(0);
+        });
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            slot,
+            edges,
+            mirrored,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(d.skipped.is_empty(), "{v:?}: {:?}", d.skipped);
+        let polys: Vec<(&Vec<Point>, bool)> = d
+            .model
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline { points, filled, .. } => Some((points, *filled)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polys.len(), 3, "{v:?}: {:?}", d.model);
+        let near = |p: &Point, x: f64, y: f64| p.distance(Point::new(x, y)) < 1e-6;
+        // The slot's bulges reach 2 past its ends.
+        let (slot, filled) = polys[0];
+        assert!(
+            filled && slot.iter().any(|p| p.x > 11.9) && slot.iter().any(|p| p.x < -1.9),
+            "{slot:?}"
+        );
+        // The ellipse's top (y 5 up) and the spline's bottom (y 5 down), not filled.
+        let (edge, filled) = polys[1];
+        assert!(!filled, "{v:?}");
+        assert!(edge.iter().any(|p| near(p, 50.0, -5.0)), "{edge:?}");
+        assert!(edge.iter().any(|p| near(p, 50.0, 5.0)), "{edge:?}");
+        // The mirrored triangle lies at negative x.
+        let (tri, _) = polys[2];
+        assert!(tri.iter().all(|p| p.x <= -100.0 + 1e-9), "{tri:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_hatch_loop_that_overflows_is_left_out_and_counted() -> TestResult {
+    // An arc of a finite but huge radius: its points overflow to infinity when sampled.
+    let v = Version::R2010;
+    let huge = hatch_obj(v, 0x300, "SOLID", true, 1, |d| {
+        d.bl(1)
+            .bl(1)
+            .rc(2)
+            .rd(f64::MAX)
+            .rd(0.0)
+            .bd(f64::MAX)
+            .bd(0.0)
+            .bd(1.0)
+            .b(true)
+            .bl(0);
+    });
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        huge,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert!(d.model.is_empty(), "{:?}", d.model);
+    assert!(d.skipped.keys().any(|k| k.contains("not numbers")), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn far_apart_arc_angles_still_make_an_arc_and_a_lost_hole_unfills() -> TestResult {
+    let v = Version::R2010;
+    // A half circle whose angles are 2e306 apart in radians (both finite in degrees), closed by
+    // a line: the arc is still drawn.
+    let far = hatch_obj(v, 0x300, "ANSI31", false, 1, |d| {
+        d.bl(1).bl(2);
+        d.rc(1).rd(20.0).rd(0.0).rd(30.0).rd(0.0);
+        d.rc(2).rd(25.0).rd(0.0).bd(5.0).bd(-2e306).bd(2e306).b(true);
+        d.bl(0);
+    });
+    // A solid square with a hole whose arc overflows: drawn as outlines, not filled over.
+    let lost = hatch_obj(v, 0x301, "SOLID", true, 2, |d| {
+        d.bl(2).b(false).b(true).bl(4);
+        for p in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)] {
+            d.rd(p.0).rd(p.1);
+        }
+        d.bl(0);
+        d.bl(1)
+            .bl(1)
+            .rc(2)
+            .rd(f64::MAX)
+            .rd(0.0)
+            .bd(f64::MAX)
+            .bd(0.0)
+            .bd(1.0)
+            .b(true)
+            .bl(0);
+    });
+    // Each end is a number of degrees, their difference is not.
+    let (d0, d1) = ((-2e306f64).to_degrees(), 2e306f64.to_degrees());
+    assert!(d0.is_finite() && d1.is_finite() && !(d1 - d0).is_finite());
+    // A solid triangle whose bulged side overflows: left out and counted, not filled straight.
+    let bulge = hatch_obj(v, 0x302, "SOLID", true, 1, |d| {
+        d.bl(2).b(true).b(true).bl(3);
+        d.rd(-1e308)
+            .rd(0.0)
+            .bd(1.0)
+            .rd(1e308)
+            .rd(0.0)
+            .bd(0.0)
+            .rd(0.0)
+            .rd(1.0)
+            .bd(0.0);
+        d.bl(0);
+    });
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        far,
+        lost,
+        bulge,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    let polys: Vec<(usize, bool)> = d
+        .model
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Polyline { points, filled, .. } => Some((points.len(), *filled)),
+            _ => None,
+        })
+        .collect();
+    assert!(polys.iter().any(|(n, _)| *n > 5), "the arc is drawn: {polys:?}");
+    assert!(polys.contains(&(4, false)), "the square is not filled: {polys:?}");
+    assert!(
+        !polys.contains(&(3, true)),
+        "the bulged triangle is not filled straight: {polys:?}"
+    );
+    assert_eq!(
+        d.skipped.get("HATCH with a boundary that is not numbers"),
+        Some(&2),
+        "{:?}",
+        d.skipped
+    );
+    Ok(())
+}
+
+#[test]
+fn ellipses_and_splines_are_drawn() -> TestResult {
+    use std::f64::consts::PI;
+    for v in [Version::R2004, Version::R2010] {
+        let model = head(None);
+        // Half an ellipse 20 wide and 10 high round (50, 0): from (60, 0) over the top to (40, 0).
+        let mut el = entity(v, 35, 0x300, model);
+        el.data
+            .bd3((50.0, 0.0, 0.0))
+            .bd3((10.0, 0.0, 0.0))
+            .bd3((0.0, 0.0, 1.0))
+            .bd(0.5)
+            .bd(0.0)
+            .bd(PI);
+        // A quadratic spline by control points: (0, 0), (5, 10), (10, 0).
+        let mut sp = entity(v, 36, 0x301, model);
+        sp.data
+            .bl(1)
+            .bl(2)
+            .b(false)
+            .b(false)
+            .b(false)
+            .bd(1e-7)
+            .bd(1e-7)
+            .bl(6)
+            .bl(3)
+            .b(false);
+        for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+            sp.data.bd(k);
+        }
+        for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
+            sp.data.bd3(p);
+        }
+        // A spline by fit points only.
+        let mut fit = entity(v, 36, 0x302, model);
+        fit.data
+            .bl(2)
+            .bl(3)
+            .bd(1e-7)
+            .bd3((1.0, 0.0, 0.0))
+            .bd3((1.0, 0.0, 0.0))
+            .bl(3);
+        for p in [(0.0, 20.0, 0.0), (5.0, 25.0, 0.0), (10.0, 20.0, 0.0)] {
+            fit.data.bd3(p);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            el,
+            sp,
+            fit,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(d.skipped.is_empty(), "{v:?}: {:?}", d.skipped);
+        let lines: Vec<&Vec<Point>> = d
+            .model
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline { points, .. } => Some(points),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 3, "{:?}", d.model);
+        let near = |a: &Point, x: f64, y: f64| a.distance(Point::new(x, y)) < 1e-6;
+        // The ellipse: ends on the axis, its top 5 above (y flipped on a page).
+        let el = lines[0];
+        assert!(
+            near(&el[0], 60.0, 0.0) && el.last().is_some_and(|p| near(p, 40.0, 0.0)),
+            "{el:?}"
+        );
+        assert!(el.iter().any(|p| near(p, 50.0, -5.0)), "{el:?}");
+        // The spline: from (0, 0) to (10, 0), its middle at height 5.
+        let sp = lines[1];
+        assert!(
+            near(&sp[0], 0.0, 0.0) && sp.last().is_some_and(|p| near(p, 10.0, 0.0)),
+            "{sp:?}"
+        );
+        assert!(sp.iter().any(|p| near(p, 5.0, -5.0)), "{sp:?}");
+        // The fit-point spline goes through its fit points.
+        assert!(lines[2].iter().any(|p| near(p, 5.0, -25.0)), "{:?}", lines[2]);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_spline_listing_too_much_is_a_damaged_object() -> TestResult {
+    let v = Version::R2010;
+    let mut sp = entity(v, 36, 0x301, head(None));
+    sp.data
+        .bl(1)
+        .bl(3)
+        .b(false)
+        .b(false)
+        .b(false)
+        .bd(0.0)
+        .bd(0.0)
+        .bl(50_000)
+        .bl(4)
+        .b(false);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        sp,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    assert!(d.damaged.iter().any(|r| r.contains("50000 knots")), "{:?}", d.damaged);
+    Ok(())
+}
+
+#[test]
+fn a_weighted_closed_spline_a_flipped_ellipse_and_an_unknown_scenario() -> TestResult {
+    use std::f64::consts::PI;
+    for v in [Version::R2004, Version::R2010] {
+        let model = head(None);
+        // A quarter ellipse round (0, 0) with a downward extrusion: its axis is in world
+        // coordinates, so it runs the other way, from (10, 0) down to (0, -10).
+        let mut el = entity(v, 35, 0x300, model);
+        el.data
+            .bd3((0.0, 0.0, 0.0))
+            .bd3((10.0, 0.0, 0.0))
+            .bd3((0.0, 0.0, -1.0))
+            .bd(1.0)
+            .bd(0.0)
+            .bd(PI / 2.0);
+        // A rational quadratic: the middle weight pulls the curve towards (5, 10); closed.
+        let weighted = |h: u64, w: f64| {
+            let mut sp = entity(v, 36, h, model);
+            sp.data
+                .bl(1)
+                .bl(2)
+                .b(true)
+                .b(true)
+                .b(false)
+                .bd(1e-7)
+                .bd(1e-7)
+                .bl(6)
+                .bl(3)
+                .b(true);
+            for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+                sp.data.bd(k);
+            }
+            for (p, wt) in [((0.0, 0.0, 0.0), 1.0), ((5.0, 10.0, 0.0), w), ((10.0, 0.0, 0.0), 1.0)] {
+                sp.data.bd3(p).bd(wt);
+            }
+            sp
+        };
+        // A spline with scenario 3: damaged.
+        let mut odd = entity(v, 36, 0x303, model);
+        odd.data.bl(3).bl(2);
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            el,
+            weighted(0x301, 1.0),
+            weighted(0x302, 4.0),
+            odd,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{v:?}: {:?}", d.skipped);
+        assert!(
+            d.damaged.iter().any(|r| r.contains("unknown scenario 3")),
+            "{:?}",
+            d.damaged
+        );
+        let polys: Vec<(&Vec<Point>, bool)> = d
+            .model
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline { points, closed, .. } => Some((points, *closed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polys.len(), 3, "{:?}", d.model);
+        let (el, _) = polys[0];
+        assert!(
+            el.iter().all(|p| p.y >= -1e-9) && el.iter().any(|p| p.y > 9.9),
+            "{el:?}"
+        );
+        // Closed, and the heavier middle weight lifts the middle (page y is down).
+        let top = |pts: &Vec<Point>| pts.iter().map(|p| -p.y).fold(f64::MIN, f64::max);
+        let ((plain, closed), (heavy, _)) = (polys[1], polys[2]);
+        assert!(closed, "{v:?}");
+        assert!(top(heavy) > top(plain) + 1.0, "{} vs {}", top(heavy), top(plain));
+    }
+    Ok(())
+}
+
+#[test]
+fn an_ellipse_not_a_number_and_a_spline_short_of_knots_are_damaged() -> TestResult {
+    let v = Version::R2010;
+    let model = head(None);
+    let mut el = entity(v, 35, 0x300, model);
+    el.data
+        .bd3((0.0, 0.0, 0.0))
+        .bd3((10.0, 0.0, 0.0))
+        .bd3((0.0, 0.0, 1.0))
+        .bd(f64::NAN)
+        .bd(0.0)
+        .bd(1.0);
+    let mut sp = entity(v, 36, 0x301, model);
+    sp.data
+        .bl(1)
+        .bl(2)
+        .b(false)
+        .b(false)
+        .b(false)
+        .bd(0.0)
+        .bd(0.0)
+        .bl(3)
+        .bl(3)
+        .b(false);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        el,
+        sp,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&2), "{:?}", d.skipped);
+    assert!(d.damaged.iter().any(|r| r.contains("not a number")), "{:?}", d.damaged);
+    assert!(
+        d.damaged.iter().any(|r| r.contains("3 knots for 3 control points")),
+        "{:?}",
+        d.damaged
+    );
+    // A z that is not a number, 4 knots for a non-periodic quadratic over 3 points, and
+    // decreasing knots: each damaged.
+    let mut el = entity(v, 35, 0x302, model);
+    el.data
+        .bd3((0.0, 0.0, f64::NAN))
+        .bd3((10.0, 0.0, 0.0))
+        .bd3((0.0, 0.0, 1.0))
+        .bd(0.5)
+        .bd(0.0)
+        .bd(1.0);
+    let spline = |h: u64, knots: &[f64]| control_spline(v, h, 2, knots);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        el,
+        spline(0x303, &[0.0, 0.0, 1.0, 1.0]),
+        spline(0x304, &[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]),
+        spline(0x305, &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+        spline(0x306, &[0.0, 0.0, 0.0, f64::NAN, 1.0, 1.0]),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&4), "{:?}", d.skipped);
+    assert!(
+        d.damaged.iter().any(|r| r.starts_with("object 306")),
+        "the NaN knot: {:?}",
+        d.damaged
+    );
+    assert!(d.damaged.iter().any(|r| r.contains("4 knots for 3")), "{:?}", d.damaged);
+    assert!(
+        d.damaged.iter().any(|r| r.contains("not numbers in order")),
+        "{:?}",
+        d.damaged
+    );
+    assert_eq!(d.model.len(), 1, "the good quadratic is drawn: {:?}", d.model);
+    Ok(())
+}
+
+#[test]
+fn a_spline_whose_knots_make_no_curve_is_drawn_through_its_points_and_said() -> TestResult {
+    let v = Version::R2010;
+    // A cubic over three control points (degree too high), and a quadratic whose knots leave
+    // no interval: both pass the count and order checks.
+    let spline = |h: u64, degree: u32, knots: &[f64]| control_spline(v, h, degree, knots);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        spline(0x300, 3, &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+        spline(0x301, 2, &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0]),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.model.len(), 2, "{:?}", d.model);
+    assert_eq!(
+        d.skipped.get("SPLINE whose knots make no curve"),
+        Some(&2),
+        "{:?}",
+        d.skipped
+    );
+    Ok(())
+}
+
+/// A scenario-1 SPLINE in model space of `degree` with `knots`, over the control points
+/// (0, 0), (5, 10), (10, 0), unweighted.
+fn control_spline(v: Version, handle: u64, degree: u32, knots: &[f64]) -> Obj {
+    let mut sp = entity(v, 36, handle, head(None));
+    sp.data
+        .bl(1)
+        .bl(degree)
+        .b(false)
+        .b(false)
+        .b(false)
+        .bd(0.0)
+        .bd(0.0)
+        .bl(knots.len() as u32)
+        .bl(3)
+        .b(false);
+    for k in knots {
+        sp.data.bd(*k);
+    }
+    for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
+        sp.data.bd3(p);
+    }
+    sp
+}
+
+#[test]
+fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestResult {
+    let v = Version::R2010;
+    let mut one = entity(v, 36, 0x300, head(None));
+    one.data
+        .bl(2)
+        .bl(3)
+        .bd(0.0)
+        .bd3((1.0, 0.0, 0.0))
+        .bd3((1.0, 0.0, 0.0))
+        .bl(1)
+        .bd3((5.0, 5.0, 0.0));
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        one,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert!(d.model.is_empty(), "{:?}", d.model);
+    assert_eq!(d.skipped.get("SPLINE with too few points"), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+/// A 2004 drawing with a block named "Реле" holding the text "Пуск", both in Windows-1251.
+fn cyrillic_2004(codepage: u16) -> Sections {
+    let v = Version::R2004;
+    let mut block = Obj::new(v, BLOCK_HEADER, 0x100);
+    block.data.bs(0).bl(0).b(true).t8_bytes(&[0xD0, 0xE5, 0xEB, 0xE5]);
+    let block = block_fields(block, (0.0, 0.0), false);
+    let mut text = entity(v, 1, 0x200, head(Some(0x100)));
+    text.data
+        .rc(0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80)
+        .rd(0.0)
+        .rd(0.0)
+        .be((0.0, 0.0, 1.0))
+        .bt(0.0)
+        .rd(2.5);
+    text.data.t8_bytes(&[0xCF, 0xF3, 0xF1, 0xEA]);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        block,
+        text,
+    ];
+    let mut s = sections(v, &objs, &[]);
+    s.codepage = codepage;
+    s
+}
+
+#[test]
+fn a_2004_drawing_in_windows_1251_reads_cyrillic() -> TestResult {
+    let d = drawing(&cyrillic_2004(29))?;
+    assert!(d.blocks.contains_key("Реле"), "{:?}", d.blocks.keys());
+    assert_eq!(texts(&d.blocks["Реле"]), ["Пуск"]);
+    assert!(d.skipped.is_empty(), "{:?}", d.skipped);
+    // An unknown code page still reads, as Windows-1252, and is named in a warning.
+    let d = drawing(&cyrillic_2004(31))?;
+    assert_eq!(d.blocks.len(), 1);
+    // Its text is kept, decoded the legacy way (not UTF-8, so Windows-1252).
+    assert_eq!(texts(&d.blocks["Ðåëå"]), ["Ïóñê"]);
+    assert!(d.skipped.is_empty(), "not an entity count: {:?}", d.skipped);
+    assert_eq!(
+        d.warnings.iter().filter(|w| w.contains("code page 31")).count(),
+        1,
+        "one warning per drawing: {:?}",
+        d.warnings
+    );
     Ok(())
 }
