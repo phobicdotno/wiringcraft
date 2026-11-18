@@ -1832,7 +1832,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 return Ok(());
             }
             // Removed when it goes out of scope, also on an early return.
-            let staging = staging_dir().map_err(e)?;
+            let staging = staging_dir("wiringcraft-archive-").map_err(e)?;
             let tmp = staging.path();
             let mut next = first_page;
             for (i, (name, kind, data)) in entries.into_iter().enumerate() {
@@ -1919,17 +1919,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
         }
         ImportCmd::PageDwg { file, page, scale } => {
-            let dxf = dwg_to_dxf(&file)?;
-            let r = import_cmd(
-                dir,
-                ImportCmd::PageDxf {
-                    file: dxf.clone(),
-                    page,
-                    scale,
-                },
-            );
-            let _ = std::fs::remove_file(&dxf);
-            r?;
+            import_page_dwg(dir, &file, page, scale, std::env::var("WIRINGCRAFT_DWG2DXF").ok())?;
         }
         ImportCmd::PageDxf { file, page, scale } => {
             let mut p = load(dir)?;
@@ -1960,12 +1950,21 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
     Ok(())
 }
 
-/// Convert DWG to a temporary DXF with whatever converter is installed. DWG is a closed format;
-/// WiringCraft does not read it itself.
-fn dwg_to_dxf(file: &Path) -> Res<PathBuf> {
+/// `import page-dwg`: convert `file` with the converter (`template`, see [`dwg_to_dxf`]) and
+/// import the DXF onto `page`. The converter writes into a private folder of its own, removed
+/// with everything in it when this ends, also on failure.
+fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: Option<String>) -> Res<()> {
+    let tmp = staging_dir("wiringcraft-dwg-").map_err(e)?;
+    let dxf = dwg_to_dxf(file, tmp.path(), template)?;
+    import_cmd(dir, ImportCmd::PageDxf { file: dxf, page, scale })
+}
+
+/// Convert DWG to a DXF in `tmp` (a private folder, see [`staging_dir`]) with whatever
+/// converter is installed: the command `template` (the WIRINGCRAFT_DWG2DXF setting, with `{in}`
+/// and `{out}`) when given, otherwise `dwg2dxf` or the ODA File Converter. DWG is a closed
+/// format; WiringCraft does not read it itself.
+fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<PathBuf> {
     use std::process::Command;
-    let tmp = std::env::temp_dir().join(format!("wiringcraft-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).map_err(e)?;
     let stem = file
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1974,7 +1973,7 @@ fn dwg_to_dxf(file: &Path) -> Res<PathBuf> {
     let input = file.to_string_lossy().into_owned();
     let output = out.to_string_lossy().into_owned();
     let ran = |mut c: Command| c.output().map(|o| o.status.success()).unwrap_or(false);
-    if let Ok(template) = std::env::var("WIRINGCRAFT_DWG2DXF") {
+    if let Some(template) = template {
         let parts: Vec<String> = template
             .split_whitespace()
             .map(|p| p.replace("{in}", &input).replace("{out}", &output))
@@ -2880,12 +2879,13 @@ fn file_stem(number: &str, id: &str) -> String {
     if stem.is_empty() { "page".into() } else { stem }
 }
 
-/// A fresh folder for files taken out of an archive: unique, and on Unix readable only by
-/// this user (mode 0700, set as it is created), so nobody can plant a file or link there.
-/// Removed when the returned value is dropped.
-fn staging_dir() -> std::io::Result<tempfile::TempDir> {
+/// A fresh folder for files taken out of an archive or written by a converter, its name
+/// starting with `prefix`: unique, and on Unix readable only by this user (mode 0700, set as it
+/// is created), so nobody can plant a file or link there. Removed when the returned value is
+/// dropped.
+fn staging_dir(prefix: &str) -> std::io::Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix("wiringcraft-archive-");
+    builder.prefix(prefix);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2903,9 +2903,82 @@ mod tests {
     #[test]
     fn the_archive_staging_folder_is_readable_only_by_its_owner() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = staging_dir().unwrap();
+        let dir = staging_dir("wiringcraft-archive-").unwrap();
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dwg_is_converted_inside_a_private_folder_that_goes_away() {
+        let src = tempfile::tempdir().unwrap();
+        let dwg = src.path().join("Motor plan.dwg");
+        std::fs::write(&dwg, "0\nEOF\n").unwrap();
+        let tmp = staging_dir("wiringcraft-dwg-").unwrap();
+        let folder = tmp.path().to_owned();
+        // A stand-in converter, as WIRINGCRAFT_DWG2DXF names one; a path with a space stays
+        // one argument.
+        let out = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
+        assert_eq!(out, folder.join("Motor plan.dxf"));
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "0\nEOF\n");
+        let err = dwg_to_dxf(&dwg, &folder, Some("false {in} {out}".into()))
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("did not produce a DXF"), "{err}");
+        drop(tmp);
+        assert!(!folder.exists(), "removed with everything in it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_page_dwg_leaves_no_folder_behind_when_it_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        store::create(&dir, "Test").unwrap();
+        let dwg = tmp.path().join("plan.dwg");
+        std::fs::write(
+            &dwg,
+            "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n10\n0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+        // A stand-in converter that notes where it was told to write, then copies or fails. The
+        // template is split on spaces, so it lives under /tmp, not a TMPDIR that may have them.
+        let bin = tempfile::tempdir_in("/tmp").unwrap();
+        let record = bin.path().join("out.txt");
+        let converter = |name: &str, last: &str| {
+            let path = bin.path().join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho \"$2\" > '{}'\n{last}\n", record.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            format!("{} {{in}} {{out}}", path.display())
+        };
+        let folder = || {
+            PathBuf::from(std::fs::read_to_string(&record).unwrap().trim())
+                .parent()
+                .unwrap()
+                .to_owned()
+        };
+
+        // The conversion fails.
+        let err = import_page_dwg(&dir, &dwg, "1".into(), 1.0, Some(converter("fail.sh", "exit 1")));
+        assert!(err.is_err());
+        assert!(folder().starts_with(std::env::temp_dir()), "{:?}", folder());
+        assert!(!folder().exists(), "removed after a failed conversion");
+
+        // The conversion works, the DXF import fails (no such page).
+        let copy = converter("copy.sh", "cp \"$1\" \"$2\"");
+        let err = import_page_dwg(&dir, &dwg, "no-such-page".into(), 1.0, Some(copy.clone()));
+        assert!(err.as_ref().is_err_and(|e| e.contains("no-such-page")), "{err:?}");
+        assert!(!folder().exists(), "removed after a failed import");
+
+        // And when it works.
+        let pages = load(&dir).unwrap().pages;
+        import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(copy)).unwrap();
+        assert!(!folder().exists(), "removed after the import");
     }
 
     fn cli(dir: &Path, args: &[&str]) -> Res<()> {
