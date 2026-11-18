@@ -119,7 +119,7 @@ impl Contacts {
 /// The contact elements a contact symbol with these pin names draws, by IEC 60947 terminal
 /// numbers: single-digit pairs 1-2, 3-4, 5-6, 7-8 are main contacts; two-digit numbers group by
 /// their first digit, where x1-x2 and x5-x6 are NC, x3-x4 and x7-x8 are NO, and x1-x2-x4 or
-/// x5-x6-x8 are changeovers. Pins that fit none of these are left out.
+/// x5-x6-x8 are changeovers when x3 or x7 is not there. Pins that fit none of these are left out.
 pub fn contact_kinds<'a>(pins: impl IntoIterator<Item = &'a str>) -> Vec<ContactKind> {
     let mut singles = std::collections::BTreeSet::new();
     let mut groups: BTreeMap<u32, std::collections::BTreeSet<u32>> = BTreeMap::new();
@@ -147,21 +147,24 @@ pub fn contact_kinds<'a>(pins: impl IntoIterator<Item = &'a str>) -> Vec<Contact
     }
     for units in groups.values() {
         let has = |d: &[u32]| d.iter().all(|u| units.contains(u));
-        // A changeover's pins also hold an NC pair, so it is looked for first.
-        if has(&[1, 2, 4]) {
+        // x1-x2-x4 is a changeover only when x3 is not there: with it, x1-x2 and x3-x4 are a
+        // separate NC and NO (as on an overload relay's 95-96 and 97-98).
+        let co_low = has(&[1, 2, 4]) && !units.contains(&3);
+        let co_high = has(&[5, 6, 8]) && !units.contains(&7);
+        if co_low {
             out.push(ContactKind::Co);
         } else if has(&[1, 2]) {
-            out.push(ContactKind::Nc);
-        }
-        if has(&[5, 6, 8]) {
-            out.push(ContactKind::Co);
-        } else if has(&[5, 6]) {
             out.push(ContactKind::Nc);
         }
         if has(&[3, 4]) {
             out.push(ContactKind::No);
         }
-        if has(&[7, 8]) && !has(&[5, 6, 8]) {
+        if co_high {
+            out.push(ContactKind::Co);
+        } else if has(&[5, 6]) {
+            out.push(ContactKind::Nc);
+        }
+        if has(&[7, 8]) {
             out.push(ContactKind::No);
         }
     }
@@ -205,6 +208,12 @@ mod tests {
         assert_eq!(contact_kinds(["95", "96"]), [Nc]);
         assert_eq!(contact_kinds(["97", "98"]), [No]);
         assert_eq!(contact_kinds(["95", "96", "98"]), [Co]);
+        assert_eq!(
+            contact_kinds(["95", "96", "97", "98"]),
+            [No, Nc],
+            "an NC and an NO, no changeover"
+        );
+        assert_eq!(contact_kinds(["11", "12", "13", "14"]), [No, Nc]);
         assert_eq!(contact_kinds(["1", "2", "3", "4", "5", "6"]), [Main, Main, Main]);
         assert_eq!(contact_kinds(["13", "14", "21", "22"]), [No, Nc]);
         assert!(contact_kinds(["A1", "A2"]).is_empty());
