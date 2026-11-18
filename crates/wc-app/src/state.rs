@@ -408,6 +408,9 @@ impl Open {
         if changed > 0 {
             self.checkpoint_with_lock(lock);
             wc_import::wago::apply(&mut self.project, &taken);
+        } else {
+            // Nothing applies: no pin either, so the lock stays as saved and undoable.
+            self.project.lock = lock;
         }
         let mut msg = format!(
             "WAGO configurator: {changed} device(s) or jumper(s) changed, {} row(s) already up to date, {} not matched.",
@@ -436,18 +439,24 @@ impl Open {
         }
         let vendored = store::vendor_path(&self.dir, ItemKind::Part, id).map_err(|e| e.to_string())?;
         let lib = || wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string());
-        match (&pin, vendored.exists()) {
-            // No copy: taken from the library, a pinned part only in the version it pins.
-            (_, false) => {
-                let lib = lib()?;
-                if let Some(pin) = &pin {
-                    let (p, _) = lib.part(id).map_err(|e| e.to_string())?;
-                    if p.hash() != pin.hash {
-                        return Err(format!(
-                            "part {id}: its copy in the project is missing and the library has another version than the project pins; put the copy back or update the part from the library"
-                        ));
-                    }
+        let exists = vendored
+            .try_exists()
+            .map_err(|e| format!("part {id}: {} cannot be checked: {e}", vendored.display()))?;
+        match (&pin, exists) {
+            // No copy of a pinned part: put back from the library only in the version it pins,
+            // the very part checked, and the pin kept as it is.
+            (Some(pin), false) => {
+                let (p, _) = lib()?.part(id).map_err(|e| e.to_string())?;
+                if p.hash() != pin.hash || p.id != id {
+                    return Err(format!(
+                        "part {id}: its copy in the project is missing and the library has another version than the project pins; put the copy back or update the part from the library"
+                    ));
                 }
+                store::write_vendored_part(&self.dir, &p).map_err(|e| e.to_string())?;
+            }
+            // No copy and no pin: a new part, taken from the library and pinned.
+            (None, false) => {
+                let lib = lib()?;
                 wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
             }
             // A pinned copy: used as it is (a broken one is reported below).
@@ -456,8 +465,11 @@ impl Open {
             // is, never replaced by a newer library version, to the library that has the part.
             (None, true) => {
                 let copy = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
-                let (_, source) = lib()?.part(id).map_err(|_| {
-                    format!("part {id} has a copy in the project but no pin, and no library has it to pin it to")
+                let (_, source) = lib()?.part(id).map_err(|e| match e {
+                    wc_library::Error::NotFound { .. } => {
+                        format!("part {id} has a copy in the project but no pin, and no library has it to pin it to")
+                    }
+                    e => format!("part {id} has a copy in the project but no pin, and its library file cannot be read to pin it: {e}"),
                 })?;
                 self.project.lock.parts.insert(
                     id.to_owned(),
@@ -2094,6 +2106,20 @@ pub(crate) mod tests {
         let err = o.set_device_part(&third, Some(pid)).unwrap_err();
         assert!(err.contains("another version than the project pins"), "{err}");
         assert!(o.project.devices.get(&third).is_none_or(|d| d.part.is_none()));
+        // With the pinned version back in the library, the copy is put back and the pin kept.
+        let pin = o.project.lock.parts[pid].clone();
+        wc_library::write_part(&tmp.path().join("mine"), &copy).unwrap();
+        o.set_device_part(&third, Some(pid)).unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), copy);
+        assert_eq!(o.project.lock.parts[pid], pin);
+
+        // A copy without its pin whose library file cannot be read says why.
+        o.project.lock.parts.remove(pid);
+        o.parts.remove(pid);
+        std::fs::write(tmp.path().join(format!("mine/parts/{pid}.json")), "{ not json").unwrap();
+        let fourth = DeviceTag::parse("-K4").unwrap();
+        let err = o.set_device_part(&fourth, Some(pid)).unwrap_err();
+        assert!(err.contains("cannot be read"), "{err}");
     }
 
     #[test]

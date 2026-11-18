@@ -184,38 +184,90 @@ impl Candidates {
                 }
             }
         }
-        for id in project.lock.parts.keys() {
-            match store::read_vendored_part(dir, id) {
+        // The project's copies: every pinned one, and one left without its pin (an undone change
+        // took the pin back) or used without one, which is matched and pinned as it is, never
+        // replaced by a newer library version.
+        let mut ids: std::collections::BTreeSet<String> = project.lock.parts.keys().cloned().collect();
+        ids.extend(project.used_parts());
+        if let Ok(entries) = std::fs::read_dir(dir.join(store::VENDOR_DIR).join(ItemKind::Part.dir())) {
+            ids.extend(entries.filter_map(|e| {
+                let name = e.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".json").map(str::to_owned)
+            }));
+        }
+        for id in ids {
+            let pinned = project.lock.parts.contains_key(&id);
+            let path = match store::vendor_path(dir, ItemKind::Part, &id) {
+                Ok(path) => path,
+                Err(_) if !pinned => continue,
+                Err(why) => {
+                    out.unreadable.insert(id, why.to_string());
+                    continue;
+                }
+            };
+            match std::fs::symlink_metadata(&path) {
+                Err(why) if why.kind() == std::io::ErrorKind::NotFound && !pinned => continue,
+                _ => {}
+            }
+            match store::read_vendored_part(dir, &id) {
+                Ok(part) if part.id == id => {
+                    out.project.insert(id, part);
+                }
                 Ok(part) => {
-                    out.project.insert(id.clone(), part);
+                    let why = format!("the file declares id {:?}", part.id);
+                    warnings.push(format!("the project's copy of part {id} cannot be used: {why}"));
+                    out.unreadable.insert(id, why);
                 }
                 Err(why) => {
                     warnings.push(format!("the project's copy of part {id} cannot be read: {why}"));
-                    out.unreadable.insert(id.clone(), why.to_string());
+                    out.unreadable.insert(id, why.to_string());
                 }
             }
         }
         (out, warnings)
     }
 
-    /// Make sure the project in `dir` holds part `id`: a library part is copied into the
-    /// project and locked as it was read here, the copy its article was matched on (not a
-    /// fresh read, which may have changed since).
+    /// Make sure the project in `dir` holds part `id`, pinned: a copy the project has without
+    /// its pin is pinned as it is, to the library that has the part; a library part is copied
+    /// into the project and pinned as it was read here, the copy its article was matched on
+    /// (not a fresh read, which may have changed since). A copy that cannot be read is never
+    /// replaced.
     pub fn take(&self, dir: &Path, project: &mut Project, id: &str) -> std::result::Result<(), String> {
-        if self.project.contains_key(id) || project.lock.parts.contains_key(id) {
+        if project.lock.parts.contains_key(id) {
             return Ok(());
         }
-        let (Some(part), Some(source)) = (
-            self.library.get(id),
-            self.sources.get(id).and_then(|&n| project.meta.libraries.get(n)),
-        ) else {
+        if let Some(why) = self.unreadable.get(id) {
+            return Err(format!("the project's copy of part {id} cannot be read: {why}"));
+        }
+        let source = self
+            .sources
+            .get(id)
+            .and_then(|&n| project.meta.libraries.get(n))
+            .map(|l| l.name.clone());
+        if let Some(copy) = self.project.get(id) {
+            let source = source.ok_or_else(|| {
+                format!("part {id} has a copy in the project but no pin, and no library has it to pin it to")
+            })?;
+            project.lock.parts.insert(
+                id.to_owned(),
+                wc_core::lock::LockEntry {
+                    source,
+                    hash: copy.hash(),
+                },
+            );
+            return Ok(());
+        }
+        let (Some(part), Some(source)) = (self.library.get(id), source) else {
             return Err(format!("no library has part {id}"));
         };
+        if part.id != id {
+            return Err(format!("the library's file for part {id} declares id {:?}", part.id));
+        }
         store::write_vendored_part(dir, part).map_err(|e| e.to_string())?;
         project.lock.parts.insert(
             id.to_owned(),
             wc_core::lock::LockEntry {
-                source: source.name.clone(),
+                source,
                 hash: part.hash(),
             },
         );
@@ -1243,6 +1295,47 @@ mod tests {
             ("wago", matched.hash().as_str())
         );
         assert!(c.take(&dir, &mut p, "no.such").is_err());
+    }
+
+    #[test]
+    fn a_copy_left_without_its_pin_is_matched_and_pinned_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        let mut p = store::create(&dir, "Test").unwrap();
+        let lib = tmp.path().join("lib");
+        p.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "wago".into(),
+            kind: "folder".into(),
+            location: lib.to_string_lossy().into_owned(),
+            reference: None,
+        });
+        // The project keeps v1 without its pin (an undone import); the library has v2 now.
+        let (_, v1) = part("wago.2002-1201", "WAGO", "2002-1201");
+        store::write_vendored_part(&dir, &v1).unwrap();
+        let mut v2 = v1.clone();
+        v2.description = "Changed".into();
+        wc_library::write_part(&lib, &v2).unwrap();
+        // And a library file named after one part that declares another.
+        let (_, other) = part("wago.other", "WAGO", "2002-9999");
+        let path = wc_library::write_part(&lib, &other).unwrap();
+        std::fs::rename(&path, lib.join("parts").join("wago.renamed.json")).unwrap();
+        let (c, warnings) = Candidates::load(&dir, &p);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            c.project.get("wago.2002-1201"),
+            Some(&v1),
+            "the project's copy is a candidate"
+        );
+        c.take(&dir, &mut p, "wago.2002-1201").unwrap();
+        assert_eq!(store::read_vendored_part(&dir, "wago.2002-1201").unwrap(), v1, "kept");
+        assert_eq!(p.lock.parts["wago.2002-1201"].hash, v1.hash());
+        let err = c.take(&dir, &mut p, "wago.renamed").unwrap_err();
+        assert!(err.contains("declares id"), "{err}");
+        assert!(
+            store::read_vendored_part(&dir, "wago.other").is_err(),
+            "nothing written"
+        );
+        assert!(!p.lock.parts.contains_key("wago.renamed"));
     }
 
     #[test]
