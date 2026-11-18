@@ -1866,31 +1866,40 @@ impl Share {
                     .clicked();
             });
         if join {
-            let (addr, name, email) = (form.addr.clone(), form.name.clone(), form.email.clone());
-            let joined = crate::prefs::project_path(&form.folder)
-                .map_err(|e| (ErrorAbout::Folder, e))
-                .and_then(|folder| {
-                    self.join(&addr, &name, &email, folder)
-                        .map_err(|e| (ErrorAbout::Address, e))
-                });
-            match joined {
-                Ok(()) => {
-                    if let Some(f) = self.form.as_mut() {
-                        f.browser = None;
-                    }
-                    self.view = View::Status;
-                }
-                Err((about, e)) => {
-                    if let Some(f) = self.form.as_mut() {
-                        f.fail(about, e);
-                    }
-                }
-            }
+            self.ask_to_join(crate::prefs::project_path);
         } else if !keep {
             if let Some(f) = self.form.as_mut() {
                 f.browser = None;
             }
             self.view = View::Closed;
+        }
+    }
+
+    /// "Ask to join" with what the join form holds. `folder` resolves the typed folder (see
+    /// [`crate::prefs::project_path`]); an error is shown on the field it is about.
+    fn ask_to_join(&mut self, folder: impl FnOnce(&str) -> Result<PathBuf, String>) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        let (addr, name, email) = (form.addr.clone(), form.name.clone(), form.email.clone());
+        let joined = folder(&form.folder)
+            .map_err(|e| (ErrorAbout::Folder, e))
+            .and_then(|folder| {
+                self.join(&addr, &name, &email, folder)
+                    .map_err(|e| (ErrorAbout::Address, e))
+            });
+        match joined {
+            Ok(()) => {
+                if let Some(f) = self.form.as_mut() {
+                    f.browser = None;
+                }
+                self.view = View::Status;
+            }
+            Err((about, e)) => {
+                if let Some(f) = self.form.as_mut() {
+                    f.fail(about, e);
+                }
+            }
         }
     }
 

@@ -1897,24 +1897,39 @@ fn a_refusal_is_forgotten_once_another_address_is_chosen() {
     let folder = form.folder.clone();
     form.forget_error_unless("192.168.1.20:47812", &folder);
     assert!(form.error.is_some(), "same address: still shown");
+    // Another folder does not make the host take the request.
+    form.forget_error_unless("192.168.1.20:47812", "/somewhere/else");
+    assert!(form.error.is_some(), "only the folder changed: still shown");
     form.addr = "192.168.1.21:47812".into();
     form.forget_error_unless("192.168.1.20:47812", &folder);
     assert!(form.error.is_none());
 }
 
 #[test]
-fn a_folder_error_stays_until_the_folder_changes() {
-    let mut form = Form {
-        addr: "192.168.1.20:47812".into(),
-        folder: "~x".into(),
-        ..Form::default()
+fn a_folder_error_stays_until_the_folder_changes() -> TestResult {
+    let mut s = Share {
+        form: Some(Form {
+            addr: "192.168.1.20:47812".into(),
+            folder: "C:shared".into(),
+            ..Form::default()
+        }),
+        view: View::Join,
+        ..Default::default()
     };
-    form.fail(ErrorAbout::Folder, "That folder cannot be used.".into());
+    // The folder is refused (as `C:shared` is on Windows) before the host is tried.
+    s.ask_to_join(|typed| Err(format!("{typed} is relative to the current folder")));
+    assert!(s.role.is_none(), "not joined");
+    let form = s.form.as_mut().ok_or("no form")?;
+    assert_eq!(
+        form.error.as_deref(),
+        Some("C:shared is relative to the current folder")
+    );
     // Another address does not make the folder usable.
     form.addr = "192.168.1.21:47812".into();
-    form.forget_error_unless("192.168.1.20:47812", "~x");
+    form.forget_error_unless("192.168.1.20:47812", "C:shared");
     assert!(form.error.is_some(), "the folder is still the same");
-    form.folder = "/tmp/shared".into();
-    form.forget_error_unless("192.168.1.21:47812", "~x");
+    form.folder = "C:\\shared".into();
+    form.forget_error_unless("192.168.1.21:47812", "C:shared");
     assert!(form.error.is_none());
+    Ok(())
 }
