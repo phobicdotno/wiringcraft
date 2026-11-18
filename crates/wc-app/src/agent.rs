@@ -3535,16 +3535,19 @@ mod tests {
         let mut find = crate::find_window::FindState::default();
         find.query = "Pump 7".into();
         find.refresh(&open.project);
-        let Some(crate::find_window::FindOutcome::Go { page: hit_page, select }) =
-            find.hits.first().and_then(crate::find_window::go_to)
-        else {
-            panic!("no hit on the free text: {:?}", find.hits);
-        };
-        assert_eq!(hit_page, page);
-        assert_eq!(select, Some(Selection::Graphic(0)));
+        let hit = Selection::Graphic(0);
+        assert_eq!(
+            find.hits.first().and_then(crate::find_window::go_to),
+            Some(crate::find_window::FindOutcome::Go {
+                page: page.clone(),
+                select: Some(hit.clone()),
+            }),
+            "{:?}",
+            find.hits
+        );
         a.find = Some(find);
         a.prefs.layers.set_shown(crate::layers::Layer::Drawings, false);
-        a.show_found(&hit_page, select);
+        a.show_found(&page, Some(hit));
         assert!(a.ed.selection.is_empty());
         assert!(
             a.ed.message.contains("hidden layer Drawings and notes"),
