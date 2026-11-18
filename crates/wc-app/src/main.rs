@@ -437,8 +437,9 @@ impl App {
                 return;
             }
             Action::TerminalStrips => {
-                if self.open.is_some() {
-                    self.strip_editor.get_or_insert_with(Default::default);
+                if let Some(o) = self.open.as_ref() {
+                    self.strip_editor
+                        .get_or_insert_with(|| strip_editor::StripEditor::for_project(o));
                 }
                 return;
             }
@@ -2901,12 +2902,18 @@ impl App {
         }
     }
 
-    /// The terminal strip editor, while open and a project is.
+    /// The terminal strip editor, while open and its project is.
     fn strip_editor_window(&mut self, ctx: &egui::Context) {
         let (Some(ed), Some(open)) = (self.strip_editor.as_mut(), self.open.as_mut()) else {
             self.strip_editor = None;
             return;
         };
+        // The window belongs to the project it was opened in: another project opened since
+        // (or a shared session joined) closes it, so nothing typed in it lands there.
+        if ed.owner.as_deref() != Some(open.dir.as_path()) {
+            self.strip_editor = None;
+            return;
+        }
         if !ed.show(ctx, open) {
             self.strip_editor = None;
         }

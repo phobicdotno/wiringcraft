@@ -393,7 +393,8 @@ enum StripCmd {
     /// `strip unspare -- -X1 S1`.
     Unspare { strip: String, terminal: String },
     /// Set a terminal's level on a multi-level terminal (1 is the bottom), e.g.
-    /// `strip level -- -X1 4 2`; leave the level out to make it single-level again.
+    /// `strip level -- -X1 4 2`; leave the level out to clear the terminal's own `Level`
+    /// property (a terminal right below one with level 2 or more is still level 1).
     Level {
         strip: String,
         terminal: String,
@@ -1259,7 +1260,10 @@ fn run(cli: Cli) -> Res<()> {
                         }
                         let terms: Vec<String> = list
                             .iter()
-                            .map(|(t, spare)| if *spare { format!("{t} (spare)") } else { t.clone() })
+                            .map(|(t, spare)| {
+                                let t = escape_field(t);
+                                if *spare { format!("{t} (spare)") } else { t }
+                            })
                             .collect();
                         println!("{strip} {}", terms.join(" "));
                     }
@@ -1289,7 +1293,8 @@ fn run(cli: Cli) -> Res<()> {
                 }
                 StripCmd::Unspare { strip, terminal } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
-                    if !p.meta.remove_spare(&strip, terminal.trim()) {
+                    let current = rail(&p, &strip);
+                    if !p.meta.remove_spare(&strip, terminal.trim(), &current) {
                         return Err(format!("{strip} has no spare terminal {}", terminal.trim()));
                     }
                     save(dir, &p)?;

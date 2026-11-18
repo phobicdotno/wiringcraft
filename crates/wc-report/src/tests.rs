@@ -1447,5 +1447,52 @@ fn the_terminal_strip_editors_order_and_spares_show_in_the_plan_and_the_configur
         out.targets.get("-X1/T2"),
         Some(configurator::Target::Part(t)) if t.to_string() == "-X1.S1"
     ));
-    assert!(out.table.rows.iter().any(|r| r[1] == "Terminal" && r[2] == "-X9"));
+    // A spare without a device entry still names its own device for the import back.
+    assert!(matches!(
+        out.targets.get("-X9/T1"),
+        Some(configurator::Target::Part(t)) if t.to_string() == "-X9.1"
+    ));
+}
+
+#[test]
+fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_the_potential() {
+    let (mut p, s, parts) = fixture();
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    // -X1.1 and -X1.2 are one two-level terminal (the level above says so).
+    p.devices
+        .entry(DeviceTag::parse("-X1.2").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "2".into());
+    // On the rail 2 comes first, and a spare 1a (between 1 and 2 by number) is added.
+    let current = vec![("1".to_owned(), false), ("2".to_owned(), false)];
+    p.meta.move_terminal(&x1, "2", 0, &current).unwrap();
+    let current = vec![("2".to_owned(), false), ("1".to_owned(), false)];
+    p.meta.add_spare(&x1, "1a", None, &current).unwrap();
+    // -X2.1 is on 0V; a spare jumpered to it is too.
+    let x2 = DeviceTag::parse("-X2").unwrap();
+    p.meta.add_spare(&x2, "S1", None, &[("1".to_owned(), false)]).unwrap();
+    p.meta.add_jumper(&x2, &["1".to_owned(), "S1".to_owned()]).unwrap();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let plan = terminal_plan(&i);
+    let levels: Vec<(&str, &str)> = plan
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| (r[1].as_str(), r[7].as_str()))
+        .collect();
+    assert_eq!(levels, [("2", "2"), ("1", "1"), ("1a", "")]);
+    let o = MarkingOptions {
+        strip: Some("-X1".into()),
+        level_separator: LEVEL_SEPARATOR.into(),
+        ..MarkingOptions::default()
+    };
+    let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
+    assert_eq!(marked, ["1 / 2", "1a"]);
+    let spare = plan.rows.iter().find(|r| r[0] == "-X2" && r[1] == "S1").unwrap();
+    assert_eq!((spare[2].as_str(), spare[4].as_str()), ("", "0V"));
 }

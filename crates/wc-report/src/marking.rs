@@ -219,13 +219,17 @@ pub fn terminal_strips(i: &Inputs<'_>) -> Vec<String> {
 /// (strip, number, level) of every numbered terminal, sorted and without repeats. The level is
 /// the terminal plan's: set on the levels of a multi-level terminal.
 fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
-    // The terminal plan already numbers terminals and sorts strips and numbers.
-    let mut rows: Vec<(String, String, Option<u32>)> = terminal_plan(i)
+    // The terminal plan already numbers terminals and sorts strips and numbers. A spare
+    // without a level of its own (terminal strip editor) is in no multi-level block, so it
+    // goes after its strip's other terminals and never splits a block's marker.
+    let mut rows: Vec<(String, bool, String, Option<u32>)> = terminal_plan(i)
         .rows
         .into_iter()
         .filter_map(|r| match (r.first(), r.get(1)) {
             (Some(strip), Some(number)) if strip != "(untagged)" => {
-                Some((strip.clone(), number.clone(), r.get(7).and_then(|l| l.parse().ok())))
+                let level = r.get(7).and_then(|l| l.parse().ok());
+                let loose = level.is_none() && r.get(5).is_some_and(|p| p == crate::SPARE_PAGE);
+                Some((strip.clone(), loose, number.clone(), level))
             }
             _ => None,
         })
@@ -236,13 +240,14 @@ fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
         natural_key(&a.0)
             .cmp(&natural_key(&b.0))
             .then_with(|| a.0.cmp(&b.0))
-            .then(natural_key(&a.1).cmp(&natural_key(&b.1)))
+            .then(a.1.cmp(&b.1))
+            .then(natural_key(&a.2).cmp(&natural_key(&b.2)))
             // `1` and `01` have equal keys: order them exactly too, so `dedup` sees
             // repeats side by side.
-            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
     });
-    rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-    rows
+    rows.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
+    rows.into_iter().map(|(s, _, n, l)| (s, n, l)).collect()
 }
 
 /// The terminal markers of `rows` (from [`terminal_rows`]) as (strip, marker text): one per

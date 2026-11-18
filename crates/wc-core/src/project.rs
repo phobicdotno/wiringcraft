@@ -186,6 +186,7 @@ pub struct Jumper {
 /// terminals it has beyond those drawn on the schematic. Written by the terminal strip editor;
 /// the terminal plan and the WAGO configurator export follow it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredStripLayout")]
 pub struct StripLayout {
     /// The strip, e.g. `-X1`.
     pub strip: DeviceTag,
@@ -198,6 +199,33 @@ pub struct StripLayout {
     /// later is that drawn terminal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spares: Vec<String>,
+}
+
+/// A [`StripLayout`] as read from `project.toml`, before its terminal numbers are checked.
+#[derive(Deserialize)]
+struct StoredStripLayout {
+    strip: DeviceTag,
+    #[serde(default)]
+    order: Vec<String>,
+    #[serde(default)]
+    spares: Vec<String>,
+}
+
+impl TryFrom<StoredStripLayout> for StripLayout {
+    type Error = String;
+
+    /// Refuses a layout naming a number that cannot be a terminal of its strip (a hand edit
+    /// or another tool), so it never becomes a device tag the project cannot read back.
+    fn try_from(s: StoredStripLayout) -> Result<Self, String> {
+        for n in s.order.iter().chain(&s.spares) {
+            check_terminal_number(&s.strip, n)?;
+        }
+        Ok(StripLayout {
+            strip: s.strip,
+            order: s.order,
+            spares: s.spares,
+        })
+    }
 }
 
 impl StripLayout {
@@ -604,13 +632,7 @@ impl ProjectMeta {
     ) -> Result<(), String> {
         let mut set: Vec<String> = Vec::new();
         for t in terminals.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
-            let mut tag = strip.clone();
-            tag.product.push(t.to_owned());
-            if DeviceTag::parse(&tag.to_string()).ok().as_ref() != Some(&tag) {
-                return Err(format!(
-                    "{t:?} cannot be a terminal of {strip}: a terminal is one tag level"
-                ));
-            }
+            check_terminal_number(strip, t)?;
             if !set.iter().any(|s| s == t) {
                 set.push(t.to_owned());
             }
@@ -764,26 +786,25 @@ impl ProjectMeta {
         self.strips.iter().find(|l| &l.strip == strip)
     }
 
-    /// The layout of `strip`, made when it has none; layouts stay in strip order.
-    fn strip_layout_mut(&mut self, strip: &DeviceTag) -> &mut StripLayout {
-        let k = match self.strips.iter().position(|l| &l.strip == strip) {
-            Some(k) => k,
-            None => {
-                self.strips.push(StripLayout {
-                    strip: strip.clone(),
-                    order: Vec::new(),
-                    spares: Vec::new(),
-                });
-                self.strips.sort_by(|a, b| {
-                    let key = |l: &StripLayout| l.strip.to_string();
-                    natural_key(&key(a))
-                        .cmp(&natural_key(&key(b)))
-                        .then_with(|| key(a).cmp(&key(b)))
-                });
-                self.strips.iter().position(|l| &l.strip == strip).unwrap_or_default()
-            }
+    /// Run `f` on the layout of `strip`, made when it has none; layouts stay in strip order.
+    fn with_layout<R>(&mut self, strip: &DeviceTag, f: impl FnOnce(&mut StripLayout) -> R) -> R {
+        let mut layout = match self.strips.iter().position(|l| &l.strip == strip) {
+            Some(k) => self.strips.remove(k),
+            None => StripLayout {
+                strip: strip.clone(),
+                order: Vec::new(),
+                spares: Vec::new(),
+            },
         };
-        &mut self.strips[k]
+        let r = f(&mut layout);
+        // Kept in strip order: the layout goes back where its strip sorts.
+        let key = |l: &StripLayout| {
+            let t = l.strip.to_string();
+            (natural_key(&t), t)
+        };
+        let at = self.strips.partition_point(|l| key(l) < key(&layout));
+        self.strips.insert(at, layout);
+        r
     }
 
     /// Drop layouts that say nothing any more.
@@ -804,7 +825,7 @@ impl ProjectMeta {
             list.push(n.to_owned());
         }
         let before = self.strips.clone();
-        self.strip_layout_mut(strip).order = list;
+        self.with_layout(strip, |l| l.order = list);
         self.drop_empty_layouts();
         Ok(self.strips != before)
     }
@@ -838,15 +859,19 @@ impl ProjectMeta {
             None => order.len(),
         };
         order.insert(at, number.to_owned());
-        let layout = self.strip_layout_mut(strip);
-        layout.spares.push(number.to_owned());
-        layout.order = order;
+        self.with_layout(strip, |l| {
+            l.spares.push(number.to_owned());
+            l.order = order;
+        });
         Ok(())
     }
 
-    /// Take spare terminal `number` off `strip`, and out of its jumper. Returns whether it was
+    /// Take spare terminal `number` off `strip`, and out of its jumper; `current` is the strip's
+    /// rail order (see [`strip_terminals`]). A spare that has been drawn since is that drawn
+    /// terminal: only its spare entry goes, its place and jumper stay. Returns whether it was
     /// a spare.
-    pub fn remove_spare(&mut self, strip: &DeviceTag, number: &str) -> bool {
+    pub fn remove_spare(&mut self, strip: &DeviceTag, number: &str, current: &[(String, bool)]) -> bool {
+        let drawn = current.iter().any(|(t, spare)| t == number && !spare);
         let Some(l) = self.strips.iter_mut().find(|l| &l.strip == strip) else {
             return false;
         };
@@ -855,9 +880,13 @@ impl ProjectMeta {
         if l.spares.len() == before {
             return false;
         }
-        l.order.retain(|t| t != number);
+        if !drawn {
+            l.order.retain(|t| t != number);
+        }
         self.drop_empty_layouts();
-        self.remove_from_jumper(strip, number);
+        if !drawn {
+            self.remove_from_jumper(strip, number);
+        }
         true
     }
 
@@ -2205,13 +2234,32 @@ mod tests {
         // A jumpered spare taken off leaves its jumper; the last spare and the order gone, the
         // layout goes.
         m.add_jumper(&x1, &s(&["S1", "2"]))?;
-        assert!(m.remove_spare(&x1, "S1"));
-        assert!(!m.remove_spare(&x1, "S1"));
+        let rail = m.strip_layout(&x1).ok_or("no layout")?.arrange(&drawn);
+        // Once S1 is drawn, unsparing it keeps its place and its jumper.
+        let mut drawn_later = m.clone();
+        let with_s1 = s(&["1", "2", "3", "S1"]);
+        let now = drawn_later.strip_layout(&x1).ok_or("no layout")?.arrange(&with_s1);
+        assert!(drawn_later.remove_spare(&x1, "S1", &now));
+        assert_eq!(drawn_later.jumpers.len(), 1);
+        assert_eq!(
+            drawn_later.strip_layout(&x1).ok_or("no layout")?.arrange(&with_s1),
+            plain(&["3", "1", "S1", "2"])
+                .into_iter()
+                .chain([("S2".to_owned(), true)])
+                .collect::<Vec<_>>()
+        );
+        assert!(m.remove_spare(&x1, "S1", &rail));
+        assert!(!m.remove_spare(&x1, "S1", &rail));
         assert!(m.jumpers.is_empty());
-        assert!(m.remove_spare(&x1, "S2"));
+        assert!(m.remove_spare(&x1, "S2", &rail));
         assert!(m.set_terminal_order(&x1, &[])?);
         assert!(m.strips.is_empty());
         assert!(m.set_terminal_order(&x1, &s(&["1", "1"])).is_err());
+
+        // A hand-edited layout naming something that cannot be a terminal is refused on load.
+        let bad = "name = \"t\"\n[[strip]]\nstrip = \"-X1\"\nspares = [\"=HYPERLINK(1)\"]\n";
+        let err = toml::from_str::<ProjectMeta>(bad).err().ok_or("loaded")?.to_string();
+        assert!(err.contains("cannot be a terminal of -X1"), "{err}");
         Ok(())
     }
 

@@ -2051,8 +2051,8 @@ impl Open {
 
     /// Take spare terminal `number` off `strip` (and out of its jumper).
     pub fn remove_spare(&mut self, strip: &DeviceTag, number: &str) {
-        let _ = self.edit_strip(strip, |m, _| {
-            m.remove_spare(strip, number);
+        let _ = self.edit_strip(strip, |m, current| {
+            m.remove_spare(strip, number, current);
             Ok(())
         });
     }

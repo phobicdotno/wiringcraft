@@ -695,6 +695,19 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
         // The rail order and spares the terminal strip editor set: a terminal drawn twice
         // stays together, a spare gets a row of its own with nothing connected.
         let layout = i.project.meta.strips.iter().find(|l| l.strip.to_string() == strip);
+        // Levels are inferred in the usual order (by number), so moving terminals on the rail
+        // never changes a terminal's level or which block it is in. Spares only count when they
+        // have a level of their own, so adding one never splits a block.
+        let mut usual: Vec<String> = numbered.iter().map(|(_, n)| n.clone()).collect();
+        usual.dedup();
+        for spare in layout.iter().flat_map(|l| &l.spares) {
+            if usual.contains(spare) || level_value(i.project, &strip, spare).is_none() {
+                continue;
+            }
+            let key = (natural_key(spare), spare.clone());
+            let at = usual.partition_point(|n| (natural_key(n), n.clone()) < key);
+            usual.insert(at, spare.clone());
+        }
         let numbered: Vec<(Option<Term>, String)> = match layout {
             None => numbered.into_iter().map(|(t, n)| (Some(t), n)).collect(),
             Some(layout) => {
@@ -719,8 +732,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             }
         };
         // Levels are inferred over distinct terminals: a terminal drawn twice has one level.
-        let mut distinct: Vec<&str> = numbered.iter().map(|(_, n)| n.as_str()).collect();
-        distinct.dedup();
+        let distinct: Vec<&str> = usual.iter().map(String::as_str).collect();
         let mut by_number: BTreeMap<&str, u32> = BTreeMap::new();
         for (k, n) in distinct.iter().enumerate() {
             let own = terminal_level(i.project, &strip, n);
@@ -795,6 +807,32 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 term.jumpered.clone(),
                 level,
             ]);
+        }
+    }
+    // A spare has no wiring of its own, but a jumper to a drawn terminal puts it on that
+    // terminal's potential.
+    for k in 0..t.rows.len() {
+        let Some(row) = t.rows.get(k) else { continue };
+        if row[5] != SPARE_PAGE || !row[4].is_empty() {
+            continue;
+        }
+        let (strip, number) = (row[0].clone(), row[1].clone());
+        let Some(jumper) = DeviceTag::parse(&strip).ok().and_then(|st| {
+            i.project
+                .meta
+                .jumpers
+                .iter()
+                .find(|j| j.strip == st && j.terminals.contains(&number))
+        }) else {
+            continue;
+        };
+        let potential = t
+            .rows
+            .iter()
+            .find(|r| r[0] == strip && r[5] != SPARE_PAGE && jumper.terminals.contains(&r[1]) && !r[4].is_empty())
+            .map(|r| r[4].clone());
+        if let (Some(p), Some(row)) = (potential, t.rows.get_mut(k)) {
+            row[4] = p;
         }
     }
     t
