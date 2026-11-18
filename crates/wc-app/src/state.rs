@@ -1178,12 +1178,17 @@ impl Open {
     /// Terminal tracking goes back with them: a copy put back restarted it from that copy.
     pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
         let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
-        let (jumpers, terminals) = (self.project.meta.jumpers.clone(), self.terminals_before.clone());
+        // Putting a terminal copy back follows terminals: jumpers, rail orders and the device
+        // data and panel places of spares a strip took along all go back too.
+        let (meta, terminals) = (self.project.meta.clone(), self.terminals_before.clone());
+        let (devices, panels) = (self.project.devices.clone(), self.project.panels.clone());
         for id in ids {
             if let Err(e) = self.ensure_symbol(id) {
                 self.project.lock = lock;
                 self.symbols = symbols;
-                self.project.meta.jumpers = jumpers;
+                self.project.meta = meta;
+                self.project.devices = devices;
+                self.project.panels = panels;
                 self.terminals_before = terminals;
                 let named = e.starts_with(&format!("symbol {id}:"));
                 return Err(if named { e } else { format!("symbol {id}: {e}") });
@@ -2616,18 +2621,37 @@ pub(crate) mod tests {
         }
         let x1 = DeviceTag::parse("-X1").unwrap();
         o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        o.project.meta.strips.push(wc_core::project::StripLayout {
+            strip: x1.clone(),
+            order: vec!["2".into(), "1".into()],
+            spares: vec![],
+        });
         o.save().unwrap();
         // Opened with a copy in which A is no terminal: B and C are 1 and 2 here.
         store::write_vendored_symbol(&o.dir, &terminal("test.term", wc_core::symbol::SymbolRole::Main)).unwrap();
         let mut o = Open::load(&o.dir).unwrap();
         o.checkpoint();
         let jumpers = o.project.meta.jumpers.clone();
+        // A change in progress: B and C swap places, so they swap numbers (C 1, B 2). The rail
+        // order (C, B) follows it once.
+        let page = &mut o.project.pages[1].symbols;
+        let (b, c) = (
+            page.iter().position(|s| s.id == "b").unwrap(),
+            page.iter().position(|s| s.id == "c").unwrap(),
+        );
+        let (at_b, at_c) = (page[b].at, page[c].at);
+        page[b].at = at_c;
+        page[c].at = at_b;
         // A paste puts the pinned copy back, then fails on a symbol no library has.
         store::write_vendored_symbol(&o.dir, &pinned).unwrap();
         assert!(o.ensure_symbols(["test.term", "no.such.symbol"]).is_err());
         // Nothing was added, and the next step does not read the rollback as terminals moved.
         o.checkpoint();
         assert_eq!(o.project.meta.jumpers, jumpers);
+        assert_eq!(
+            o.project.meta.strip_layout(&x1).map(|l| l.order.clone()),
+            Some(vec!["1".into(), "2".into()])
+        );
     }
 
     #[test]
