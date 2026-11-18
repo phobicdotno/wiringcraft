@@ -458,8 +458,11 @@ fn spline_count(o: &mut Object, what: &str) -> Result<u32> {
 /// points, 2 fit points.
 fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
     let scenario = o.data.bl()?;
+    if scenario != 1 && scenario != 2 {
+        return Err(bad(format!("a spline has unknown scenario {scenario}")));
+    }
     let degree = o.data.bl()?;
-    if scenario & 1 != 0 {
+    if scenario == 1 {
         let d = &mut o.data;
         let _rational = d.b()?;
         let closed = d.b()?;

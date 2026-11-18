@@ -1360,3 +1360,81 @@ fn a_spline_listing_too_much_is_a_damaged_object() -> TestResult {
     assert!(d.damaged.iter().any(|r| r.contains("50000 knots")), "{:?}", d.damaged);
     Ok(())
 }
+
+#[test]
+fn a_weighted_closed_spline_a_flipped_ellipse_and_an_unknown_scenario() -> TestResult {
+    use std::f64::consts::PI;
+    for v in [Version::R2004, Version::R2010] {
+        let model = head(None);
+        // A quarter ellipse round (0, 0) with a downward extrusion: its axis is in world
+        // coordinates, so it runs the other way, from (10, 0) down to (0, -10).
+        let mut el = entity(v, 35, 0x300, model);
+        el.data
+            .bd3((0.0, 0.0, 0.0))
+            .bd3((10.0, 0.0, 0.0))
+            .bd3((0.0, 0.0, -1.0))
+            .bd(1.0)
+            .bd(0.0)
+            .bd(PI / 2.0);
+        // A rational quadratic: the middle weight pulls the curve towards (5, 10); closed.
+        let weighted = |h: u64, w: f64| {
+            let mut sp = entity(v, 36, h, model);
+            sp.data
+                .bl(1)
+                .bl(2)
+                .b(true)
+                .b(true)
+                .b(false)
+                .bd(1e-7)
+                .bd(1e-7)
+                .bl(6)
+                .bl(3)
+                .b(true);
+            for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+                sp.data.bd(k);
+            }
+            for (p, wt) in [((0.0, 0.0, 0.0), 1.0), ((5.0, 10.0, 0.0), w), ((10.0, 0.0, 0.0), 1.0)] {
+                sp.data.bd3(p).bd(wt);
+            }
+            sp
+        };
+        // A spline with scenario 3: damaged.
+        let mut odd = entity(v, 36, 0x303, model);
+        odd.data.bl(3).bl(2);
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            el,
+            weighted(0x301, 1.0),
+            weighted(0x302, 4.0),
+            odd,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{v:?}: {:?}", d.skipped);
+        assert!(
+            d.damaged.iter().any(|r| r.contains("unknown scenario 3")),
+            "{:?}",
+            d.damaged
+        );
+        let polys: Vec<(&Vec<Point>, bool)> = d
+            .model
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline { points, closed, .. } => Some((points, *closed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polys.len(), 3, "{:?}", d.model);
+        let (el, _) = polys[0];
+        assert!(
+            el.iter().all(|p| p.y >= -1e-9) && el.iter().any(|p| p.y > 9.9),
+            "{el:?}"
+        );
+        // Closed, and the heavier middle weight lifts the middle (page y is down).
+        let top = |pts: &Vec<Point>| pts.iter().map(|p| -p.y).fold(f64::MIN, f64::max);
+        let ((plain, closed), (heavy, _)) = (polys[1], polys[2]);
+        assert!(closed, "{v:?}");
+        assert!(top(heavy) > top(plain) + 1.0, "{} vs {}", top(heavy), top(plain));
+    }
+    Ok(())
+}
