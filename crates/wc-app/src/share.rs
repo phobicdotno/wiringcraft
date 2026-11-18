@@ -1286,21 +1286,82 @@ pub struct NewPictures {
     pub tried: Vec<String>,
     /// Pictures that exist here but cannot be sent, with the reason.
     pub unreadable: Vec<(String, String)>,
+    /// Pictures the session has that were replaced here by another file of the same name:
+    /// sent (in `edits`) so the session refuses the name and this copy gives its file a name of
+    /// its own, as for any picture clash.
+    pub replaced: Vec<String>,
+    /// Pictures whose file here was touched but still is the session's, with their version
+    /// now ([`picture_version`]): looked at again only when they change again.
+    pub same: Vec<(String, PictureVersion)>,
+}
+
+/// What tells one version of a picture file here from another without reading it: its size and
+/// when it was last written.
+pub type PictureVersion = (u64, Option<std::time::SystemTime>);
+
+/// The version of picture `file` in `dir` ([`PictureVersion`]); `None` when it is not there.
+pub fn picture_version(dir: &Path, file: &str) -> Option<PictureVersion> {
+    let m = std::fs::metadata(dir.join(file)).ok()?;
+    Some((m.len(), m.modified().ok()))
+}
+
+/// Whether a picture file here is still the one taken in at `was`, judged without reading it.
+/// Only a version with a known write time can say so: without one (the file system gives
+/// none), a same-size replacement would look unchanged, so the file is read again instead.
+fn still_taken(now: Option<&PictureVersion>, was: &PictureVersion) -> bool {
+    was.1.is_some() && now == Some(was)
 }
 
 /// The pictures `local` uses that the session (`session`, by project path) does not have, read
 /// from `dir`, each as its own edit so each message stays small. Pictures named in `skip` were
 /// tried a moment ago and are left out. A picture missing here is left out silently: nobody
-/// can show it, and the window already says so.
+/// can show it, and the window already says so. A picture the session has goes again when the
+/// file here was replaced since this copy took the session's (`taken`, by its version then).
 pub fn new_pictures(
     dir: &Path,
     local: &Project,
     session: &BTreeMap<String, Vec<u8>>,
+    taken: &BTreeMap<String, PictureVersion>,
     skip: &std::collections::BTreeSet<String>,
 ) -> NewPictures {
     let mut out = NewPictures::default();
     for file in used_pictures(local) {
-        if session.contains_key(&file) || skip.contains(&file) {
+        if skip.contains(&file) {
+            continue;
+        }
+        if let Some(theirs) = session.get(&file) {
+            // Taken in here: unchanged since, it is the session's (no read needed).
+            let Some(was) = taken.get(&file) else { continue };
+            let now = picture_version(dir, &file);
+            if still_taken(now.as_ref(), was) {
+                continue;
+            }
+            match wc_pdf::read_picture(dir, &file) {
+                Ok(Some(data)) if data == *theirs => {
+                    if let Some(now) = now {
+                        out.same.push((file, now));
+                    }
+                }
+                // Gone here: the session's stays, and the window says it is missing.
+                Ok(None) => {}
+                // Another file: sent, or (empty, too big) the reason is told. Either way it is
+                // looked at again only after a while.
+                Ok(Some(data)) => {
+                    out.tried.push(file.clone());
+                    out.replaced.push(file.clone());
+                    let picture = Picture { file, data };
+                    match picture.problem() {
+                        Some(why) => out.unreadable.push((picture.file, why)),
+                        None => out.edits.push(ProjectEdit::AddPicture { picture }),
+                    }
+                }
+                // Unreadable here: the session's stays, and the reason is told.
+                Err(why) => {
+                    out.tried.push(file.clone());
+                    out.replaced.push(file.clone());
+                    out.unreadable.push((file, why));
+                }
+            }
             continue;
         }
         out.tried.push(file.clone());
@@ -1460,12 +1521,13 @@ pub struct TakenPictures {
 pub fn take_pictures(
     open: &mut Open,
     session: &BTreeMap<String, Vec<u8>>,
-    taken: &mut std::collections::BTreeSet<String>,
+    taken: &mut BTreeMap<String, PictureVersion>,
     skip: &std::collections::BTreeSet<String>,
 ) -> TakenPictures {
     let mut out = TakenPictures::default();
     for file in used_pictures(&open.project) {
-        if taken.contains(&file) || skip.contains(&file) {
+        // Once taken, a file changed here since is this copy's to send ([`new_pictures`]).
+        if taken.contains_key(&file) || skip.contains(&file) {
             continue;
         }
         let Some(data) = session.get(&file) else { continue };
@@ -1477,7 +1539,8 @@ pub fn take_pictures(
             Ok(()) => {
                 open.underlays.remove(&file);
                 open.picture_problems.remove(&file);
-                taken.insert(file);
+                let version = picture_version(&open.dir, &file).unwrap_or((0, None));
+                taken.insert(file, version);
             }
             Err(wc_share::Error::PictureNameTaken(_)) => out.clashes.push(file),
             Err(e) => out.failed.push((file, e.to_string())),
@@ -1536,6 +1599,9 @@ pub struct Hosting {
     dir: PathBuf,
     /// Items of the host's own updates the session took, as [`Guest::took_updates`].
     took_updates: Vec<(ItemKind, String, String)>,
+    /// Pictures the host sent whose name the session has for another file (a picture replaced
+    /// in its folder), since the last look: given a name of their own, as a guest's are.
+    names_taken: Vec<String>,
 }
 
 /// A guest's side: its view of the session and the connection to the host.
@@ -1620,11 +1686,11 @@ impl Role {
         }
     }
 
-    /// Pictures this guest sent whose name the session has for another file
+    /// Pictures this person sent whose name the session has for another file
     /// ([`wc_share::Refusal::PictureNameTaken`]), since the last call.
     fn picture_names_taken(&mut self) -> Vec<String> {
         match self {
-            Role::Host(_) => Vec::new(),
+            Role::Host(h) => std::mem::take(&mut h.names_taken),
             Role::Guest(j) => std::mem::take(&mut j.guest.refusals)
                 .into_iter()
                 .filter_map(|r| match r {
@@ -1695,6 +1761,8 @@ impl Role {
                 let updated = edit.updated_items();
                 match h.host.edit_project(edit) {
                     Ok(()) => h.took_updates.extend(updated),
+                    // Given a name of its own on the next look, as a guest's picture is.
+                    Err(wc_share::Refusal::PictureNameTaken { file }) => h.names_taken.push(file),
                     Err(e) => notes.push(format!("Your change was not kept: {e}")),
                 }
             }
@@ -2007,8 +2075,12 @@ pub struct Share {
     /// these makes this copy give a picture a name of its own. Kept while the session lasts,
     /// as a refusal can arrive after the session's own picture of that name.
     pictures_sent: std::collections::BTreeSet<String>,
-    /// The session's pictures written into this copy (or found there already), by project path.
-    pictures_taken: std::collections::BTreeSet<String>,
+    /// The session's pictures written into this copy (or found there already), by project path,
+    /// with the file's version then: one replaced here since goes out again.
+    pictures_taken: BTreeMap<String, PictureVersion>,
+    /// Pictures sent as a replacement of the session's file of that name: waited for until the
+    /// session refuses the name (and this copy renames its file), not taken as arrived.
+    pictures_replaced: std::collections::BTreeSet<String>,
     /// Session pictures that could not be written into this copy, with when: each is tried
     /// again only after [`ITEM_RETRY_LATER`].
     pictures_failed: BTreeMap<String, std::time::Instant>,
@@ -2597,6 +2669,7 @@ impl Share {
             port,
             dir: open.dir.clone(),
             took_updates: Vec::new(),
+            names_taken: Vec::new(),
         })));
         self.base = Some(open.project.clone());
         self.forget_items();
@@ -2640,6 +2713,7 @@ impl Share {
         self.pictures_out.clear();
         self.pictures_sent.clear();
         self.pictures_taken.clear();
+        self.pictures_replaced.clear();
         self.pictures_failed.clear();
         self.holding.clear();
         self.drop_held = false;
@@ -2938,13 +3012,17 @@ impl Share {
         // Pictures used for the first time go out before the change that names them. Changes do
         // not wait for them: without its picture a page still works, it just shows a gap.
         let session_pictures = role.pictures();
-        self.pictures_out
-            .retain(|file, at| !session_pictures.contains_key(file) && at.elapsed() < ITEM_RETRY_LATER);
+        let replaced = &self.pictures_replaced;
+        self.pictures_out.retain(|file, at| {
+            (!session_pictures.contains_key(file) || replaced.contains(file)) && at.elapsed() < ITEM_RETRY_LATER
+        });
         let skip = self.pictures_out.keys().cloned().collect();
-        let pictures = new_pictures(&open.dir, &open.project, session_pictures, &skip);
+        let pictures = new_pictures(&open.dir, &open.project, session_pictures, &self.pictures_taken, &skip);
         for file in pictures.tried {
             self.pictures_out.insert(file, now);
         }
+        self.pictures_replaced.extend(pictures.replaced);
+        self.pictures_taken.extend(pictures.same);
         for (file, why) in pictures.unreadable {
             if self.unreadable.insert(format!("picture {file}")) {
                 self.notes.push(format!(
