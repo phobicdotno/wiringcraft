@@ -3804,20 +3804,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wago_configurator_list_comes_back_onto_the_devices() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("p");
+    /// A project in `tmp` with terminals -X1.1 and -X1.2, a folder library holding `parts` and a
+    /// second library that cannot be opened, and its configurator list exported: (project, list).
+    fn wago_project(tmp: &Path, parts: &[wc_core::Part]) -> (PathBuf, PathBuf) {
+        let dir = tmp.join("p");
         let mut p = store::create(&dir, "Test").unwrap();
         // A folder library with the terminal the configurator will choose.
-        let lib = tmp.path().join("lib");
-        let term_part = wc_core::Part {
-            id: "wago.2002-1201".into(),
-            manufacturer: "WAGO".into(),
-            order_number: "2002-1201".into(),
-            ..Default::default()
-        };
-        wc_library::write_part(&lib, &term_part).unwrap();
+        let lib = tmp.join("lib");
+        for part in parts {
+            wc_library::write_part(&lib, part).unwrap();
+        }
         p.meta.libraries.push(LibrarySource {
             name: "wago".into(),
             kind: "folder".into(),
@@ -3862,14 +3858,41 @@ mod tests {
             });
         }
         store::save(&dir, &p).unwrap();
-        let out = tmp.path().join("c.csv");
+        let out = tmp.join("c.csv");
         export_wago_configurator(&dir, &out).unwrap();
-        // The configurator fills in the articles: one it knows, one no library has.
-        let csv = std::fs::read_to_string(&out)
+        (dir, out)
+    }
+
+    fn part(id: &str, maker: &str, number: &str) -> wc_core::Part {
+        wc_core::Part {
+            id: id.into(),
+            manufacturer: maker.into(),
+            order_number: number.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Fill in the articles of terminals -X1.1 and -X1.2 in the list at `out`.
+    fn fill_wago_list(out: &Path, first: &str, second: &str) {
+        let csv = std::fs::read_to_string(out)
             .unwrap()
-            .replace("-X1/T1;Terminal;-X1;1;1;;;", "-X1/T1;Terminal;-X1;1;1;;2002-1201;")
-            .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;2002-9999;");
-        std::fs::write(&out, csv).unwrap();
+            .replace(
+                "-X1/T1;Terminal;-X1;1;1;;;",
+                &format!("-X1/T1;Terminal;-X1;1;1;;{first};"),
+            )
+            .replace(
+                "-X1/T2;Terminal;-X1;2;2;;;",
+                &format!("-X1/T2;Terminal;-X1;2;2;;{second};"),
+            );
+        std::fs::write(out, csv).unwrap();
+    }
+
+    #[test]
+    fn wago_configurator_list_comes_back_onto_the_devices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = wago_project(tmp.path(), &[part("wago.2002-1201", "WAGO", "2002-1201")]);
+        // The configurator fills in the articles: one it knows, one no library has.
+        fill_wago_list(&out, "2002-1201", "2002-9999");
         let done = run_import_wago(&dir, &out);
         assert_eq!((done.changed, done.unchanged), (1, 0), "{:?}", done.unmatched);
         assert_eq!(done.unmatched.len(), 1);
@@ -3886,6 +3909,22 @@ mod tests {
         let again = run_import_wago(&dir, &out);
         assert_eq!((again.changed, again.unchanged), (0, 1));
         assert!(import_wago(&dir, &tmp.path().join("missing.csv")).is_err());
+    }
+
+    #[test]
+    fn a_wago_article_several_parts_have_stays_unmatched_after_one_of_them_is_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = wago_project(tmp.path(), &[part("dup.a", "", "DUP-1"), part("dup.b", "", "DUP-1")]);
+        fill_wago_list(&out, "dup.a", "DUP-1");
+        let first = run_import_wago(&dir, &out);
+        assert_eq!(first.changed, 1, "{:?}", first.unmatched);
+        assert!(load(&dir).unwrap().lock.parts.contains_key("dup.a"), "taken");
+        assert_eq!(first.unmatched.len(), 1);
+        assert!(first.unmatched[0].contains("several parts"), "{:?}", first.unmatched);
+        // Read again with dup.a in the project: the same answer.
+        let again = run_import_wago(&dir, &out);
+        assert_eq!((again.changed, again.unchanged), (0, 1), "{:?}", again.unmatched);
+        assert_eq!(again.unmatched, first.unmatched);
     }
 
     fn run_import_wago(dir: &Path, file: &Path) -> WagoImported {

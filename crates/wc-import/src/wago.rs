@@ -382,7 +382,7 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
         };
         if slot != Slot::NewAccessory {
             let key = (tag.clone(), slot.clone());
-            if let Some(first) = taken.get(&key) {
+            if let Some(first) = taken.get_mut(&key) {
                 let (why, choose) = if first.part != part {
                     (format!("line {} gives {tag} part {}", first.line, first.part), "one")
                 } else if first.qty != qty {
@@ -390,19 +390,28 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
                         format!("line {} gives {tag} {} {} times", first.line, first.part, first.qty),
                         "one quantity",
                     )
+                } else if conflicted.contains(&key) {
+                    (format!("other rows give {tag} something else here"), "one")
                 } else {
+                    // The same again: taken with the first row, unless a later row disagrees.
+                    first.same.push(format!("{at}: {}", row.article));
                     continue;
                 };
                 miss(format!("{why}; neither is taken, choose {choose} in the configurator"));
-                // The first row is not taken either: listed once, with the row it clashes with.
+                // The rows before are not taken either: each listed once, with the row it
+                // clashes with.
                 if conflicted.insert(key) {
                     if first.unchanged {
                         out.unchanged -= 1;
                     }
-                    out.unmatched.push(format!(
-                        "{}: {} — line {} disagrees; neither is taken, choose {choose} in the configurator",
-                        first.at, first.article, row.line
-                    ));
+                    let earlier =
+                        std::iter::once(format!("{}: {}", first.at, first.article)).chain(first.same.drain(..));
+                    for e in earlier {
+                        out.unmatched.push(format!(
+                            "{e} — line {} disagrees; neither is taken, choose {choose} in the configurator",
+                            row.line
+                        ));
+                    }
                 }
                 continue;
             }
@@ -416,6 +425,7 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
                     at: at.clone(),
                     article: row.article.clone(),
                     unchanged,
+                    same: Vec::new(),
                 },
             );
         }
@@ -447,6 +457,8 @@ struct Taken {
     article: String,
     /// It already was the device's part.
     unchanged: bool,
+    /// Later rows that give the same, as the reasons name them.
+    same: Vec<String>,
 }
 
 /// The part `article` names among `candidates`: by id, or by order number (ignoring case and
@@ -479,8 +491,8 @@ fn find_part(candidates: &Candidates, article: &str, manufacturer: &str) -> std:
     if hits.is_empty() {
         hits = candidates
             .library
-            .keys()
-            .map(|id| candidates.project.get(id).unwrap_or(&candidates.library[id]))
+            .iter()
+            .map(|(id, part)| candidates.project.get(id).unwrap_or(part))
             .filter(matches)
             .collect();
     }
@@ -865,6 +877,23 @@ mod tests {
             );
             assert!(plan.unmatched.iter().any(|u| u.starts_with("line 2 ")), "{plan:#?}");
             assert!(plan.unmatched.iter().any(|u| u.starts_with("line 3 ")), "{plan:#?}");
+        }
+        // Every row of a slot rows disagree on is listed once, whatever the order.
+        for text in [
+            "Index;Article;Quantity\n-X1/A1;2002-1291;3\n-X1/A1;2002-1291;4\n-X1/A1;2002-1291;3\n",
+            "Index;Article;Quantity\n-X1/A1;2002-1291;3\n-X1/A1;2002-1291;3\n-X1/A1;2002-1291;4\n",
+        ] {
+            let rows = read_configured(text.as_bytes()).unwrap().0;
+            let plan = plan(&inputs, &library(&parts), &rows);
+            assert!(plan.assignments.is_empty(), "{text}: {plan:#?}");
+            for line in ["line 2 ", "line 3 ", "line 4 "] {
+                assert_eq!(
+                    plan.unmatched.iter().filter(|u| u.starts_with(line)).count(),
+                    1,
+                    "{line} in {text}: {plan:#?}"
+                );
+            }
+            assert_eq!(plan.unmatched.len(), 3, "{plan:#?}");
         }
         // A third row that disagrees too is listed, and the first is still listed only once.
         let text = "Index;Article;Quantity\n-X1/A1;2002-1291;3\n-X1/A1;2002-1291;4\n-X1/A1;2002-1291;5\n";
