@@ -347,6 +347,21 @@ impl Open {
     /// that is changed is kept between 0 and 360 degrees (one left as it was is kept as stored);
     /// an opened polyline is no longer filled (only a closed one can be).
     pub fn set_shape(&mut self, page: usize, index: usize, new: Shape) -> Result<bool, &'static str> {
+        let new = self.shape_checked(page, index, new)?;
+        if self.project.pages.get(page).and_then(|p| p.graphics.get(index)) == Some(&new) {
+            return Ok(false);
+        }
+        self.checkpoint();
+        if let Some(g) = self.project.pages.get_mut(page).and_then(|p| p.graphics.get_mut(index)) {
+            *g = new;
+        }
+        Ok(true)
+    }
+
+    /// `new` as [`Self::set_shape`] would store it in place of free drawing `index` on `page`
+    /// (arc angles that changed kept within a turn, an opened polyline unfilled), or the reason
+    /// it would refuse it. Nothing is changed.
+    pub fn shape_checked(&self, page: usize, index: usize, new: Shape) -> Result<Shape, &'static str> {
         let Some(old) = self.project.pages.get(page).and_then(|p| p.graphics.get(index)) else {
             return Err("The drawing is no longer there.");
         };
@@ -419,14 +434,7 @@ impl Open {
             }
             _ => {}
         }
-        if *old == new {
-            return Ok(false);
-        }
-        self.checkpoint();
-        if let Some(g) = self.project.pages.get_mut(page).and_then(|p| p.graphics.get_mut(index)) {
-            *g = new;
-        }
-        Ok(true)
+        Ok(new)
     }
 
     /// Move the selection by `d`. The caller takes the undo checkpoint (once per drag).
