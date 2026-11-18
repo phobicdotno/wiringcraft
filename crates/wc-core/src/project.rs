@@ -357,7 +357,7 @@ pub fn follow_terminals_in(
     before: &TerminalNumbers,
     role: impl Fn(&str) -> Option<SymbolRole>,
 ) -> bool {
-    if project.meta.jumpers.is_empty() {
+    if !project.meta.follows_terminals() {
         return false;
     }
     let mut after = terminal_numbers(project, role);
@@ -380,7 +380,9 @@ pub fn follow_terminals_in(
             after.insert(key.clone(), was.clone());
         }
     }
-    project.meta.follow_terminals(before, &after)
+    let jumpers = project.meta.follow_terminals(before, &after);
+    let layouts = project.meta.follow_layouts(before, &after);
+    jumpers || layouts
 }
 
 /// Whether a placed symbol with `tag` and symbol `role` counts as a terminal: a terminal symbol,
@@ -825,6 +827,82 @@ impl ProjectMeta {
         }
         j.part = part;
         Ok(true)
+    }
+
+    /// Whether anything names terminals by number (jumpers, or a strip's rail order and spares),
+    /// so a change that renames, renumbers or deletes terminals must be followed.
+    pub fn follows_terminals(&self) -> bool {
+        !self.jumpers.is_empty() || self.strips.iter().any(|l| !l.is_empty())
+    }
+
+    /// Keep each strip's rail order on the terminals it named, after a change (`before` to
+    /// `after`, as [`ProjectMeta::follow_terminals`]): a renamed or renumbered terminal keeps
+    /// its place under its new number, a deleted one leaves the order, and a strip whose drawn
+    /// terminals all went to one other strip (the strip renamed) takes its layout along. Spares
+    /// and numbers that were not drawn stay. Returns whether a layout changed.
+    pub fn follow_layouts(&mut self, before: &TerminalNumbers, after: &TerminalNumbers) -> bool {
+        let old = self.strips.clone();
+        for layout in std::mem::take(&mut self.strips) {
+            let strip = &layout.strip;
+            // What became of each drawn terminal of the strip: kept, another number or strip,
+            // or deleted (None).
+            let went = |n: &str| -> Option<Option<(DeviceTag, String)>> {
+                let keys: Vec<&(String, String)> = before
+                    .iter()
+                    .filter(|(_, (s, m))| s == strip && m == n)
+                    .map(|(k, _)| k)
+                    .collect();
+                if keys.is_empty() {
+                    return None;
+                }
+                let same = (strip.clone(), n.to_owned());
+                if keys.iter().any(|k| after.get(*k) == Some(&same)) {
+                    return Some(Some(same));
+                }
+                Some(keys.iter().find_map(|k| after.get(*k).cloned()))
+            };
+            // The strip renamed: every drawn terminal of it went to one other strip, which has
+            // no layout of its own.
+            let drawn: Vec<Option<(DeviceTag, String)>> = before
+                .iter()
+                .filter(|(_, (s, _))| s == strip)
+                .map(|(k, _)| after.get(k).cloned())
+                .collect();
+            let mut targets: Vec<&DeviceTag> = drawn.iter().flatten().map(|(s, _)| s).collect();
+            targets.sort();
+            targets.dedup();
+            let moved_to = match (drawn.iter().all(Option::is_some), targets.as_slice()) {
+                (true, [only]) if *only != strip && !old.iter().any(|l| &l.strip == *only) => Some((*only).clone()),
+                _ => None,
+            };
+            let home = moved_to.clone().unwrap_or_else(|| strip.clone());
+            let mut order: Vec<String> = Vec::new();
+            for n in &layout.order {
+                let number = if layout.spares.contains(n) {
+                    Some(n.clone())
+                } else {
+                    match went(n) {
+                        None => Some(n.clone()),
+                        Some(Some((s, m))) if s == home => Some(m),
+                        // Deleted, or gone to another strip.
+                        Some(_) => None,
+                    }
+                };
+                if let Some(m) = number
+                    && !order.contains(&m)
+                {
+                    order.push(m);
+                }
+            }
+            let layout = StripLayout {
+                strip: home.clone(),
+                order,
+                spares: layout.spares,
+            };
+            self.with_layout(&home, |l| *l = layout);
+        }
+        self.drop_empty_layouts();
+        self.strips != old
     }
 
     /// How `strip` is arranged in the terminal strip editor, if it was.
@@ -2389,6 +2467,69 @@ mod tests {
         let err = toml::from_str::<ProjectMeta>(twice).err().ok_or("loaded")?.to_string();
         assert!(err.contains("-X1 is arranged twice"), "{err}");
         assert!(toml::from_str::<ProjectMeta>("name = \"t\"\n")?.strips.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_strips_rail_order_follows_renamed_renumbered_and_deleted_terminals() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (x1, x2) = (DeviceTag::parse("-X1")?, DeviceTag::parse("-X2")?);
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        for (id, tag) in [("t1", "-X1.1"), ("t2", "-X1.2"), ("t3", "-X1.3")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "term".into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        p.pages.push(page);
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        p.meta.set_terminal_order(&x1, &s(&["3", "1", "2"]))?;
+        p.meta.add_spare(
+            &x1,
+            "S1",
+            Some("1"),
+            &[("3".into(), false), ("1".into(), false), ("2".into(), false)],
+        )?;
+        assert_eq!(
+            p.meta.strip_layout(&x1).ok_or("layout")?.order,
+            s(&["3", "1", "S1", "2"])
+        );
+        let role = |_: &str| None;
+        let tag = |p: &mut Project, id: &str, t: &str| -> Result<(), Box<dyn std::error::Error>> {
+            let sym = p.pages[0].symbols.iter_mut().find(|s| s.id == id).ok_or("symbol")?;
+            sym.tag = Some(DeviceTag::parse(t)?);
+            Ok(())
+        };
+
+        // -X1.3 renamed to -X1.7: it keeps its place at the front of the rail.
+        let before = terminal_numbers(&p, role);
+        tag(&mut p, "t3", "-X1.7")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        assert_eq!(
+            p.meta.strip_layout(&x1).ok_or("layout")?.order,
+            s(&["7", "1", "S1", "2"])
+        );
+
+        // -X1.1 deleted: it leaves the order; the spare stays.
+        let before = terminal_numbers(&p, role);
+        p.pages[0].symbols.retain(|s| s.id != "t1");
+        assert!(follow_terminals_in(&mut p, &before, role));
+        assert_eq!(p.meta.strip_layout(&x1).ok_or("layout")?.order, s(&["7", "S1", "2"]));
+
+        // The whole strip renamed to -X2: the layout goes with it, spares included.
+        let before = terminal_numbers(&p, role);
+        tag(&mut p, "t3", "-X2.7")?;
+        tag(&mut p, "t2", "-X2.2")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        assert!(p.meta.strip_layout(&x1).is_none());
+        let moved = p.meta.strip_layout(&x2).ok_or("layout moved")?;
+        assert_eq!(moved.order, s(&["7", "S1", "2"]));
+        assert_eq!(moved.spares, s(&["S1"]));
         Ok(())
     }
 

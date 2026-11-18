@@ -756,13 +756,13 @@ fn load(dir: &Path) -> Res<Project> {
     store::load(dir).map_err(e)
 }
 
-/// Save the project. Jumpers first follow their terminals: what the command renamed, moved or
-/// deleted is found by comparing with the project as it is on disk.
+/// Save the project. Jumpers and strip layouts first follow their terminals: what the command
+/// renamed, moved or deleted is found by comparing with the project as it is on disk.
 fn save(dir: &Path, p: &Project) -> Res<()> {
     let mut p = p.clone();
     // A new project has nothing on disk to compare with; any other load failure is reported.
     let on_disk = dir.join(store::PROJECT_FILE).exists();
-    if !p.meta.jumpers.is_empty() && on_disk {
+    if p.meta.follows_terminals() && on_disk {
         let old = store::load(dir).map_err(|err| format!("jumpers not updated: {}", e(err)))?;
         let (old_symbols, _) = store::vendored_symbols(dir, &old);
         let before = wc_core::project::terminal_numbers(&old, |id| old_symbols.get(id).map(|s| s.role));
@@ -3622,7 +3622,7 @@ fn add_built(
     }
     // The imported pages can renumber the project's terminals tagged with only their strip, so
     // the project's own jumpers follow first; the imported ones already have the final numbers.
-    let before = if p.meta.jumpers.is_empty() {
+    let before = if !p.meta.follows_terminals() {
         None
     } else {
         // A symbol the project has no readable copy of, which the import brings, changes which
@@ -4463,6 +4463,34 @@ mod tests {
         p.pages[0].symbols[0].tag = DeviceTag::parse("-X1.7").ok();
         save(&dir, &p).unwrap();
         assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["4", "7"]);
+    }
+
+    #[test]
+    fn saving_from_the_command_line_keeps_a_renamed_terminal_in_its_rail_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let page = &mut p.pages[0];
+        for (id, tag) in [("t3", "-X1.3"), ("t4", "-X1.4")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0, 10.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: DeviceTag::parse(tag).ok(),
+            });
+        }
+        // No jumper: the rail order alone is followed.
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.set_terminal_order(&x1, &["4".into(), "3".into()]).unwrap();
+        save(&dir, &p).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.pages[0].symbols[0].tag = DeviceTag::parse("-X1.7").ok();
+        save(&dir, &p).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.meta.strip_layout(&x1).unwrap().order, ["4", "7"]);
     }
 
     #[test]

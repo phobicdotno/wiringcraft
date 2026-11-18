@@ -720,8 +720,8 @@ impl Open {
         let changed =
             wc_core::project::follow_terminals_in(&mut self.project, &before, |id| symbols.get(id).map(|s| s.role));
         // Keep tracking: the next change before a checkpoint (the next frame of one drag) is
-        // measured from here. Without jumpers there is nothing to follow until the next one.
-        if !self.project.meta.jumpers.is_empty() {
+        // measured from here. Without jumpers or a strip layout there is nothing to follow.
+        if self.project.meta.follows_terminals() {
             self.terminals_before = Some(self.terminal_numbers());
         }
         changed
@@ -3922,6 +3922,35 @@ pub(crate) mod tests {
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
         o.set_device_property(&x2, "note", "x");
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
+    fn a_renamed_terminal_keeps_its_place_on_the_rail() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64, tag: &str| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(DeviceTag::parse(tag).unwrap());
+            id
+        };
+        let (three, _four) = (put(10.0, "-X1.3"), put(20.0, "-X1.4"));
+        o.checkpoint();
+        o.project
+            .meta
+            .set_terminal_order(&x1, &["4".into(), "3".into()])
+            .unwrap();
+        // -X1.3 renamed to -X1.7 (no jumper on the strip): it stays after 4.
+        o.checkpoint();
+        o.project.pages[page]
+            .symbols
+            .iter_mut()
+            .find(|s| s.id == three)
+            .unwrap()
+            .tag = Some(DeviceTag::parse("-X1.7").unwrap());
+        o.checkpoint();
+        assert_eq!(o.project.meta.strip_layout(&x1).unwrap().order, ["4", "7"]);
     }
 
     #[test]
