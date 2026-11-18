@@ -1796,56 +1796,80 @@ impl Held {
         }
         let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
         // Only a device gone since `base` whose placements or cables now name a new tag instead
-        // is the old side of a rename; other devices removed here go out as usual.
-        let renamed_from = |old: &wc_core::DeviceTag| {
+        // is the old side of a rename; other devices removed here go out as usual. The new tags
+        // it hands over to are its partners: only those, and the targets naming them, wait
+        // together with it, so a new device that merely waits for a part stays on its own.
+        let partners = |old: &wc_core::DeviceTag| {
             let was = |t: &wc_core::DeviceTag| t == old;
-            base.pages.iter().any(|b| {
-                let Some(l) = local.page(&b.id) else { return false };
-                b.symbols.iter().any(|s| {
-                    s.tag.as_ref().is_some_and(was)
-                        && l.symbols
-                            .iter()
-                            .any(|n| n.id == s.id && n.tag.as_ref().is_some_and(named))
-                }) || b.wires.iter().any(|w| {
-                    w.cable.as_ref().is_some_and(|c| was(&c.cable))
-                        && l.wires
-                            .iter()
-                            .any(|n| n.id == w.id && n.cable.as_ref().is_some_and(|c| named(&c.cable)))
-                })
-            }) || base.panels.iter().any(|b| {
-                panel_mentions(b, &was)
-                    && local
-                        .panels
+            let mut to = BTreeSet::new();
+            for b in &base.pages {
+                let Some(l) = local.page(&b.id) else { continue };
+                for s in b.symbols.iter().filter(|s| s.tag.as_ref().is_some_and(was)) {
+                    if let Some(t) = l.symbols.iter().find(|n| n.id == s.id).and_then(|n| n.tag.as_ref())
+                        && named(t)
+                    {
+                        to.insert(t.clone());
+                    }
+                }
+                for w in b
+                    .wires
+                    .iter()
+                    .filter(|w| w.cable.as_ref().is_some_and(|c| was(&c.cable)))
+                {
+                    if let Some(c) = l.wires.iter().find(|n| n.id == w.id).and_then(|n| n.cable.as_ref())
+                        && named(&c.cable)
+                    {
+                        to.insert(c.cable.clone());
+                    }
+                }
+            }
+            for b in base.panels.iter().filter(|b| panel_mentions(b, &was)) {
+                if let Some(l) = local.panels.iter().find(|l| l.id == b.id) {
+                    to.extend(new_tags.iter().filter(|t| panel_mentions(l, &|x| x == *t)).cloned());
+                }
+            }
+            if base.meta.jumpers.iter().any(|j| was(&j.strip)) {
+                to.extend(
+                    local
+                        .meta
+                        .jumpers
                         .iter()
-                        .find(|l| l.id == b.id)
-                        .is_some_and(|l| panel_mentions(l, &named))
-            }) || (base.meta.jumpers.iter().any(|j| was(&j.strip))
-                && local.meta.jumpers.iter().any(|j| named(&j.strip)))
+                        .filter(|j| named(&j.strip))
+                        .map(|j| j.strip.clone()),
+                );
+            }
+            to
         };
-        for tag in base
-            .devices
-            .keys()
-            .filter(|t| !local.devices.contains_key(*t) && renamed_from(t))
-        {
-            self.now.devices.insert(tag.clone(), None);
-            self.rename.devices.insert(tag.clone());
+        let mut paired = BTreeSet::new();
+        for tag in base.devices.keys().filter(|t| !local.devices.contains_key(*t)) {
+            let to = partners(tag);
+            if !to.is_empty() {
+                self.now.devices.insert(tag.clone(), None);
+                self.rename.devices.insert(tag.clone());
+                paired.extend(to);
+            }
         }
-        self.rename.devices.extend(new_tags.iter().cloned());
+        self.rename.devices.extend(paired.iter().cloned());
+        let in_rename = |t: &wc_core::DeviceTag| paired.contains(t);
         for p in &local.pages {
             if page_mentions(p, &named) && base.page(&p.id) != Some(p) {
                 self.now.pages.insert(p.id.clone(), Some(p.clone()));
-                self.rename.pages.insert(p.id.clone());
+                if page_mentions(p, &in_rename) {
+                    self.rename.pages.insert(p.id.clone());
+                }
             }
         }
         for panel in &local.panels {
             if panel_mentions(panel, &named) && base.panels.iter().find(|b| b.id == panel.id) != Some(panel) {
                 self.now.panels.insert(panel.id.clone(), Some(panel.clone()));
-                self.rename.panels.insert(panel.id.clone());
+                if panel_mentions(panel, &in_rename) {
+                    self.rename.panels.insert(panel.id.clone());
+                }
             }
         }
         if local.meta != base.meta && local.meta.jumpers.iter().any(|j| named(&j.strip)) {
             self.now.meta = Some(Box::new(local.meta.clone()));
-            self.rename.meta = true;
+            self.rename.meta |= local.meta.jumpers.iter().any(|j| in_rename(&j.strip));
         }
     }
 

@@ -2740,6 +2740,57 @@ fn a_waiting_rename_is_dropped_whole_when_the_session_changed_one_of_its_pages()
 }
 
 #[test]
+fn a_new_device_waiting_beside_a_lost_rename_is_kept() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let k5 = wc_core::DeviceTag::parse("-K5")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.pages.push(Page::new("p2", "2", "Two"));
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    // An unrelated new device on another page, waiting for a part of its own.
+    local.pages[1].symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k5.clone()),
+        ..symbol("s5", 10.0)
+    });
+    local.devices.insert(
+        k5.clone(),
+        wc_core::Device {
+            part: Some("acme.timer".into()),
+            ..Default::default()
+        },
+    );
+    let held = Held::find(
+        &local,
+        &base,
+        &waiting(&[
+            item_name(ItemKind::Part, "acme.relay"),
+            item_name(ItemKind::Part, "acme.timer"),
+        ]),
+    );
+    let mut session = base.clone();
+    session.pages[0].title = "Theirs".into();
+    assert_eq!(
+        held.put_back(&mut session),
+        ["page 1", "the device rename that waited with it"]
+    );
+    assert_eq!(session.pages[0].title, "Theirs");
+    assert!(session.devices.contains_key(&k1));
+    assert!(!session.devices.contains_key(&k2));
+    assert_eq!(session.devices.get(&k5), local.devices.get(&k5));
+    assert_eq!(session.pages[1], local.pages[1]);
+    Ok(())
+}
+
+#[test]
 fn a_waiting_page_the_session_left_alone_is_kept_when_another_one_is_lost() -> TestResult {
     let mut base = Project::new("Test");
     base.pages.push(Page::new("pa", "1", "A"));
