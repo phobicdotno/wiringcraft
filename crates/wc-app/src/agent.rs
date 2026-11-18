@@ -841,6 +841,9 @@ struct HeldGuard {
     mark: crate::state::Mark,
     page: usize,
     selection: Vec<Selection>,
+    panel: Option<usize>,
+    /// Whether a cover or template form was open before: one the change opened goes with it.
+    had_form: bool,
 }
 
 impl AppTools<'_> {
@@ -858,7 +861,8 @@ impl AppTools<'_> {
             }),
             _ => false,
         };
-        let (page, selection) = (self.0.ed.page, self.0.ed.selection.clone());
+        let (page, selection, panel) = (self.0.ed.page, self.0.ed.selection.clone(), self.0.ed.panel);
+        let had_form = matches!(self.0.dialog, Some(Dialog::Cover { .. } | Dialog::Template { .. }));
         let open = self.0.open.as_mut()?;
         let held = open.held_pages();
         (!held.is_empty() && !undoes).then(|| HeldGuard {
@@ -867,6 +871,8 @@ impl AppTools<'_> {
             mark: open.mark(),
             page,
             selection,
+            panel,
+            had_form,
         })
     }
 
@@ -890,7 +896,12 @@ impl AppTools<'_> {
             return r;
         };
         open.back_to(g.mark);
-        (self.0.ed.page, self.0.ed.selection) = (g.page, g.selection);
+        (self.0.ed.page, self.0.ed.selection, self.0.ed.panel) = (g.page, g.selection, g.panel);
+        // A form the refused change opened (the cover page made from a held page) edits what
+        // was taken back: it closes, and the panel shown before stays shown.
+        if !g.had_form && matches!(self.0.dialog, Some(Dialog::Cover { .. } | Dialog::Template { .. })) {
+            self.0.dialog = None;
+        }
         Err(match r {
             Ok(_) => format!("Not done: {why}"),
             Err(e) => format!("Not done: {why} The tool also said: {e}"),
@@ -4106,6 +4117,45 @@ mod tests {
             a.agent_start("todo", &json!({"action": "file"})),
             Started::Done(Err(_))
         ));
+    }
+
+    #[test]
+    fn a_refused_cover_page_opens_no_form_and_keeps_the_panel_shown() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let panel = wc_core::panel::Panel::with_rails("panel1", "Panel 1", 600.0, 800.0);
+        open.project.panels.push(panel);
+        for p in &mut open.project.pages {
+            p.cover = false;
+        }
+        let first = &mut open.project.pages[0];
+        (first.title, first.symbols, first.wires, first.graphics) = ("Cover".into(), vec![], vec![], vec![]);
+        let id = first.id.clone();
+        open.held_by_others.insert(id, "Ola".into());
+        let project = open.project.clone();
+        a.ed.panel = Some(0);
+        let r = call(&mut a, "run_action", json!({"action": Action::CoverPage.name()}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola")), "{r:?}");
+        assert!(a.dialog.is_none(), "no cover form for a refused change");
+        assert_eq!(a.ed.panel, Some(0), "the panel stays shown");
+        assert_eq!(a.open.as_ref().unwrap().project, project);
+    }
+
+    #[test]
+    fn a_form_opened_while_a_page_is_held_cancels_only_its_own_step() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({})).unwrap();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        call(&mut a, "run_action", json!({"action": Action::PageTemplate.name()})).unwrap();
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        assert!(
+            matches!(a.dialog, Some(Dialog::Template { since, .. }) if since == mark),
+            "the form's undo mark is the window's"
+        );
     }
 
     #[test]

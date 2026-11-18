@@ -136,6 +136,7 @@ pub(crate) struct Mark {
     parts: std::collections::BTreeSet<String>,
     undo: Vec<Project>,
     redo: Vec<Project>,
+    undo_dropped: usize,
     history: u64,
     form_step: Option<u64>,
     dirty: bool,
@@ -1158,13 +1159,19 @@ impl Open {
     /// loaded now are kept, and the undo history is set aside, so the change's own undo steps
     /// collect apart from it. [`Open::keep`] or [`Open::back_to`] ends it. Undo and redo
     /// must not run in between.
+    /// The steps set aside still count in [`Open::undo_mark`], so a mark taken in between
+    /// (a form opened by the change) stays valid after [`Open::keep`].
     pub(crate) fn mark(&mut self) -> Mark {
+        let undo = std::mem::take(&mut self.undo);
+        let undo_dropped = self.undo_dropped;
+        self.undo_dropped += undo.len();
         Mark {
             project: self.project.clone(),
             symbols: self.symbols.keys().cloned().collect(),
             parts: self.parts.keys().cloned().collect(),
-            undo: std::mem::take(&mut self.undo),
+            undo,
             redo: std::mem::take(&mut self.redo),
+            undo_dropped,
             history: self.history,
             form_step: self.form_step,
             dirty: self.dirty,
@@ -1176,6 +1183,8 @@ impl Open {
     /// dropped beyond the usual limit), and redo is kept only when it made no undo step.
     pub(crate) fn keep(&mut self, mark: Mark) {
         let mut undo = mark.undo;
+        // The set-aside steps counted as dropped while the change ran; they are back now.
+        self.undo_dropped -= undo.len();
         undo.append(&mut self.undo);
         let over = undo.len().saturating_sub(UNDO_LIMIT);
         undo.drain(..over);
@@ -1191,9 +1200,19 @@ impl Open {
     pub(crate) fn back_to(&mut self, mark: Mark) {
         self.project = mark.project;
         self.symbols.retain(|id, _| mark.symbols.contains(id));
+        // A part file the change took from the library goes too: left behind without its lock
+        // entry, a later use would load it unpinned and the session would never send it.
+        for id in self.parts.keys().filter(|id| !mark.parts.contains(*id)) {
+            if !self.project.lock.parts.contains_key(id)
+                && let Ok(path) = store::vendor_path(&self.dir, ItemKind::Part, id)
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         self.parts.retain(|id, _| mark.parts.contains(id));
         self.undo = mark.undo;
         self.redo = mark.redo;
+        self.undo_dropped = mark.undo_dropped;
         (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
         self.terminals_before = mark.terminals_before;
     }
@@ -2098,6 +2117,33 @@ pub(crate) mod tests {
             "the part file is untouched"
         );
         assert_eq!(o.project.lock, lock);
+    }
+
+    #[test]
+    fn a_change_taken_back_leaves_no_part_file_and_keeps_undo_marks_in_step() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let (undo_mark, can_undo) = (o.undo_mark(), o.can_undo());
+        let pid = "example.ex-ct-9-24dc";
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        // A refused change that took a part from the library: its file goes with it.
+        let mark = o.mark();
+        assert_eq!(o.undo_mark(), undo_mark, "the set-aside steps still count");
+        o.ensure_part(pid).unwrap();
+        o.checkpoint();
+        assert!(part_file.exists());
+        o.back_to(mark);
+        assert!(!part_file.exists(), "no unpinned part file is left");
+        assert!(!o.project.lock.parts.contains_key(pid));
+        assert_eq!((o.undo_mark(), o.can_undo()), (undo_mark, can_undo));
+        // Taken again later, it is pinned (and so sent to the session).
+        o.ensure_part(pid).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid));
+        // A mark taken inside a kept change (a form it opened) means the same step afterwards.
+        let mark = o.mark();
+        let inside = o.start_live_form();
+        o.keep(mark);
+        assert_eq!(inside, o.undo_mark());
     }
 
     #[test]
