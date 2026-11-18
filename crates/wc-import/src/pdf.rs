@@ -333,13 +333,13 @@ const MAX_INFLATE: usize = 64 * 1024 * 1024;
 
 /// Undo PDF's LZW compression (`LZWDecode`): codes of 9 to 12 bits, most significant bit
 /// first, 256 clears the table and 257 ends the data. With `early_change` (the default) the
-/// code length grows one code early. `None` for a code that is not in the table, or output over
-/// [`MAX_INFLATE`].
-fn lzw_decode(data: &[u8], early_change: bool) -> Option<Vec<u8>> {
+/// code length grows one code early. Fails with the reason for a code that is not in the table,
+/// or for output over [`MAX_INFLATE`].
+fn lzw_decode(data: &[u8], early_change: bool) -> std::result::Result<Vec<u8>, String> {
     const CLEAR: usize = 256;
     const END: usize = 257;
-    let fresh = || -> Vec<Vec<u8>> { (0..=255u8).map(|b| vec![b]).chain([vec![], vec![]]).collect() };
-    let mut table = fresh();
+    // The 256 single bytes, then the places of the clear and end codes.
+    let mut table: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).chain([vec![], vec![]]).collect();
     let mut out = Vec::new();
     let mut prev: Option<Vec<u8>> = None;
     let mut width = 9;
@@ -348,7 +348,7 @@ fn lzw_decode(data: &[u8], early_change: bool) -> Option<Vec<u8>> {
     loop {
         while held < width {
             let Some(&b) = input.next() else {
-                return Some(out);
+                return Ok(out);
             };
             acc = (acc << 8) | u32::from(b);
             held += 8;
@@ -357,31 +357,35 @@ fn lzw_decode(data: &[u8], early_change: bool) -> Option<Vec<u8>> {
         let code = ((acc >> held) & ((1 << width) - 1)) as usize;
         acc &= (1 << held) - 1;
         if code == CLEAR {
-            table = fresh();
+            table.truncate(END + 1);
             prev = None;
             width = 9;
             continue;
         }
         if code == END {
-            return Some(out);
+            return Ok(out);
         }
+        let damaged = || format!("the LZW data is damaged (code {code} is not in the table)");
         let entry = match (table.get(code), &prev) {
             (Some(e), _) => e.clone(),
             (None, Some(p)) if code == table.len() => {
                 let mut e = p.clone();
-                e.push(*p.first()?);
+                e.push(*p.first().ok_or_else(damaged)?);
                 e
             }
-            _ => return None,
+            _ => return Err(damaged()),
         };
         if out.len() + entry.len() > MAX_INFLATE {
-            return None;
+            return Err(format!(
+                "the LZW data unpacks to more than {} MiB",
+                MAX_INFLATE / (1024 * 1024)
+            ));
         }
         out.extend_from_slice(&entry);
         if let Some(mut p) = prev.take()
             && table.len() < 4096
         {
-            p.push(*entry.first()?);
+            p.push(*entry.first().ok_or_else(damaged)?);
             table.push(p);
         }
         prev = Some(entry);
@@ -670,6 +674,47 @@ pub struct Scan {
 const SCAN_SHARE: f64 = 0.3;
 
 /// Undo PNG predictors (PDF `/Predictor` 10 to 15) on decoded rows.
+/// Undo the predictor a filter's parameters name: PNG predictors (10 and up) and the TIFF
+/// predictor (2) for 8-bit samples; 1 or none leaves the data as it is.
+fn unpredict(data: Vec<u8>, parms: Option<&BTreeMap<String, Obj>>) -> std::result::Result<Vec<u8>, String> {
+    let Some(p) = parms else {
+        return Ok(data);
+    };
+    let predictor = p.get("Predictor").and_then(Obj::num).unwrap_or(1.0);
+    if predictor < 2.0 {
+        return Ok(data);
+    }
+    let colors = p.get("Colors").and_then(Obj::num).unwrap_or(1.0) as usize;
+    let bpc = p.get("BitsPerComponent").and_then(Obj::num).unwrap_or(8.0) as usize;
+    let columns = p.get("Columns").and_then(Obj::num).unwrap_or(1.0) as usize;
+    if colors == 0 || colors > 4 || bpc == 0 || bpc > 16 || columns == 0 || columns > 1_000_000 {
+        return Err("the picture has impossible predictor settings".into());
+    }
+    if predictor >= 10.0 {
+        return png_unpredict(&data, colors, bpc, columns).ok_or_else(|| "the picture data is damaged".into());
+    }
+    if predictor == 2.0 && bpc == 8 {
+        return Ok(tiff_unpredict(data, colors, columns));
+    }
+    Err(format!(
+        "pictures with predictor {predictor} at {bpc} bit(s) are not supported yet"
+    ))
+}
+
+/// Undo the TIFF predictor for 8-bit samples: each sample was stored as its difference from the
+/// same channel of the pixel to its left.
+fn tiff_unpredict(mut data: Vec<u8>, colors: usize, columns: usize) -> Vec<u8> {
+    for line in data.chunks_mut(colors * columns) {
+        for i in colors..line.len() {
+            let left = line.get(i - colors).copied().unwrap_or(0);
+            if let Some(v) = line.get_mut(i) {
+                *v = v.wrapping_add(left);
+            }
+        }
+    }
+    data
+}
+
 fn png_unpredict(data: &[u8], colors: usize, bits: usize, columns: usize) -> Option<Vec<u8>> {
     let bpp = (colors * bits).div_ceil(8).max(1);
     let row = (colors.checked_mul(bits)?.checked_mul(columns)?).div_ceil(8);
@@ -822,23 +867,30 @@ impl Interp<'_> {
                 .collect(),
             Some(_) => return Err("the picture has a damaged filter list".into()),
         };
-        let parms = match get("DecodeParms") {
-            Some(Obj::Dict(p)) => Some(p.clone()),
-            Some(Obj::Array(a)) => a.first().map(|o| self.doc.get(o)).and_then(Obj::dict).cloned(),
-            _ => None,
+        // The parameters of filter `i`: one dictionary for a single filter, or the entry at the
+        // same place in an array (`null` for none).
+        let parms_for = |i: usize| -> Option<&BTreeMap<String, Obj>> {
+            match get("DecodeParms") {
+                Some(Obj::Dict(p)) if i == 0 => Some(p),
+                Some(Obj::Array(a)) => a.get(i).map(|o| self.doc.get(o)).and_then(Obj::dict),
+                _ => None,
+            }
         };
         let mut bytes = data.to_vec();
         for (i, f) in filters.iter().enumerate() {
+            let parms = parms_for(i);
             match f.as_str() {
-                "FlateDecode" | "Fl" => bytes = inflate(&bytes).ok_or("the picture data is damaged")?,
+                "FlateDecode" | "Fl" => {
+                    bytes = inflate(&bytes).ok_or("the picture data is damaged")?;
+                    bytes = unpredict(bytes, parms)?;
+                }
                 "LZWDecode" | "LZW" => {
                     let early = parms
-                        .as_ref()
                         .and_then(|p| p.get("EarlyChange"))
                         .and_then(Obj::num)
                         .unwrap_or(1.0)
                         != 0.0;
-                    bytes = lzw_decode(&bytes, early).ok_or("the picture data is damaged")?;
+                    bytes = unpredict(lzw_decode(&bytes, early)?, parms)?;
                 }
                 "DCTDecode" | "DCT" if i + 1 == filters.len() => {
                     return Ok(Raster {
@@ -886,20 +938,20 @@ impl Interp<'_> {
                 "pictures with {channels} colour channel(s) at {bits} bit(s) are not supported yet"
             ));
         }
-        // Decode [1 0] swaps black and white; an image mask paints its 0 samples by default.
-        let decode_inverted = matches!(get("Decode"), Some(Obj::Array(a))
-            if a.first().and_then(Obj::num) == Some(1.0));
-        if let Some(p) = &parms
-            && p.get("Predictor").and_then(Obj::num).unwrap_or(1.0) >= 10.0
-        {
-            let colors = p.get("Colors").and_then(Obj::num).unwrap_or(1.0) as usize;
-            let bpc = p.get("BitsPerComponent").and_then(Obj::num).unwrap_or(8.0) as usize;
-            let columns = p.get("Columns").and_then(Obj::num).unwrap_or(1.0) as usize;
-            if colors > 4 || bpc > 16 || columns > 1_000_000 {
-                return Err("the picture has impossible predictor settings".into());
+        // Decode [1 0] swaps black and white; an image mask paints its 0 samples by default. With
+        // several colour channels, every channel must be swapped or none.
+        let decode_inverted = match get("Decode") {
+            Some(Obj::Array(a)) => {
+                let starts: Vec<Option<f64>> = a.iter().step_by(2).map(Obj::num).collect();
+                if channels > 1 && starts.windows(2).any(|w| w.first() != w.get(1)) {
+                    return Err(
+                        "pictures that map their colour channels differently (Decode) are not supported yet".into(),
+                    );
+                }
+                starts.first().copied().flatten() == Some(1.0)
             }
-            bytes = png_unpredict(&bytes, colors, bpc, columns).ok_or("the picture data is damaged")?;
-        }
+            _ => false,
+        };
         samples_to_png(width, height, channels, bits, decode_inverted, &bytes)
             .ok_or_else(|| "the picture data is too short or too large".to_owned())
     }
@@ -1616,19 +1668,24 @@ mod tests {
     fn lzw_data_is_read() {
         // The example in the PDF reference: "-----A---B".
         let packed = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
-        assert_eq!(lzw_decode(&packed, true).as_deref(), Some(&b"-----A---B"[..]));
+        assert_eq!(lzw_decode(&packed, true).as_deref(), Ok(&b"-----A---B"[..]));
         // Long enough for 12-bit codes and a cleared table, with and without early change.
         let mut long: Vec<u8> = (0..40_000u32).map(|i| (i * 7 % 251) as u8 ^ (i / 300) as u8).collect();
         long.extend([b'x'; 3000]);
         for early in [true, false] {
             assert_eq!(
                 lzw_decode(&lzw_encode(&long, early), early),
-                Some(long.clone()),
+                Ok(long.clone()),
                 "early {early}"
             );
         }
         // A code that is not in the table yet.
-        assert_eq!(lzw_decode(&[0x80, 0x4B, 0x00], true), None);
+        assert!(lzw_decode(&[0x80, 0x4B, 0x00], true).is_err_and(|e| e.contains("code 300")));
+        // Many clear codes in a row: each is cheap, and they give no bytes.
+        let clears: Vec<u8> = std::iter::repeat_n([0x80u8, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, 0x00], 1000)
+            .flatten()
+            .collect();
+        assert_eq!(lzw_decode(&clears, true), Ok(vec![]));
     }
 
     #[test]
@@ -1665,6 +1722,39 @@ mod tests {
             want
         );
 
+        // Two filters, the predictor in the second one's parameters (a null placeholder first).
+        let flate_of_lzw = miniz_oxide::deflate::compress_to_vec_zlib(&lzw_encode(&predicted, true), 6);
+        assert_eq!(
+            scan(
+                &format!("{gray} /Filter [/FlateDecode /LZWDecode] /DecodeParms [null << /Predictor 15 /Columns 3 >>]"),
+                &flate_of_lzw
+            )?,
+            want
+        );
+        // A predictor on the first of two filters is undone before the second one runs: the LZW
+        // stage gives one predicted row (type 0) holding the Flate data.
+        let inner = miniz_oxide::deflate::compress_to_vec_zlib(&grey, 6);
+        let mut row = vec![0u8];
+        row.extend(&inner);
+        assert_eq!(
+            scan(
+                &format!(
+                    "{gray} /Filter [/LZWDecode /FlateDecode] /DecodeParms [<< /Predictor 10 /Columns {} >> null]",
+                    inner.len()
+                ),
+                &lzw_encode(&row, true)
+            )?,
+            want
+        );
+        // TIFF predictor: differences 10 10 10 are the samples 10 20 30.
+        assert_eq!(
+            scan(
+                &format!("{gray} /Filter /LZWDecode /DecodeParms << /Predictor 2 /Columns 3 >>"),
+                &lzw_encode(&[10, 10, 10, 40, 10, 10], true)
+            )?,
+            want
+        );
+
         // 16-bit grey: the high byte of each sample.
         let wide: Vec<u8> = grey.iter().flat_map(|v| [*v, 0xAB]).collect();
         assert_eq!(
@@ -1692,6 +1782,14 @@ mod tests {
             .and_then(|s| crate::raster::decode(&s.raster))
             .map(|img| img.to_rgb8().into_raw());
         assert_eq!(rgb, Some(vec![255, 255, 255, 0, 0, 0, 0, 255, 255]));
+        // A Decode array that swaps only cyan is refused, not drawn wrong.
+        let p = pages(&picture_pdf(
+            0,
+            "/Width 3 /Height 1 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Decode [1 0 0 1 0 1 0 1]",
+            &cmyk,
+            full,
+        ))?;
+        assert!(p[0].scan_problem.as_deref().is_some_and(|m| m.contains("Decode")));
         Ok(())
     }
 
