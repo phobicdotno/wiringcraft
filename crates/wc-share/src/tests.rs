@@ -3698,3 +3698,31 @@ fn a_page_edit_or_undo_adding_a_second_end_on_a_missing_pin_is_refused() -> Test
     assert_eq!(host.project().page("p0002"), Some(&one));
     Ok(())
 }
+
+#[test]
+fn a_shared_file_holding_another_symbol_is_the_file_of_neither() {
+    use wc_core::lock::{ItemKind, LockEntry};
+    let b = symbol("b", "B");
+    let mut project = demo();
+    for id in ["a", "b"] {
+        project.lock.symbols.insert(
+            id.into(),
+            LockEntry {
+                source: "starter".into(),
+                hash: b.hash(),
+            },
+        );
+    }
+    let mut host = Host::new(
+        project,
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    // a's file holds b, in the version both pins name.
+    host.share_files([("a".to_owned(), b)].into(), Default::default());
+    let missing = host.files_missing();
+    assert!(missing.contains(&(ItemKind::Symbol, "a".into())), "{missing:?}");
+    assert!(missing.contains(&(ItemKind::Symbol, "b".into())), "{missing:?}");
+    assert!(host.files().0.is_empty());
+}

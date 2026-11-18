@@ -688,10 +688,13 @@ impl App {
                     .ed
                     .cursor
                     .unwrap_or(self.clipboard.anchor + wc_core::geom::Point::new(10.0, 10.0));
-                let pasted = open.paste(page, &self.clipboard, at);
-                if !pasted.is_empty() {
-                    self.ed.tool = Tool::Select;
-                    self.ed.selection = pasted;
+                match open.paste(page, &self.clipboard, at) {
+                    Ok(pasted) if !pasted.is_empty() => {
+                        self.ed.tool = Tool::Select;
+                        self.ed.selection = pasted;
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.ed.message = format!("Nothing was pasted: {e}"),
                 }
             }
             Action::AddPage => {

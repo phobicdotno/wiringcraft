@@ -92,13 +92,60 @@ impl Library {
 
     /// Part `id` as source `source` has it (not necessarily the source that wins for it).
     pub fn part_in(&self, source: &str, id: &str) -> Result<Part> {
+        self.item_in(ItemKind::Part, source, id)
+    }
+
+    /// Symbol `id` as source `source` has it (not necessarily the source that wins for it).
+    pub fn symbol_in(&self, source: &str, id: &str) -> Result<Symbol> {
+        self.item_in(ItemKind::Symbol, source, id)
+    }
+
+    /// Item `id` of `kind` in a version `fits` accepts (or says why not): the source named
+    /// `first` is tried first, then every other source in order. The reason it is not found
+    /// names what each source had (why `fits` refused it, or why it could not be read).
+    pub fn find_version<T: serde::de::DeserializeOwned>(
+        &self,
+        kind: ItemKind,
+        id: &str,
+        first: &str,
+        fits: impl Fn(&T) -> std::result::Result<(), String>,
+    ) -> std::result::Result<T, String> {
+        let order = self
+            .sources
+            .iter()
+            .filter(|s| s.name == first)
+            .chain(self.sources.iter().filter(|s| s.name != first));
+        let mut seen = Vec::new();
+        for s in order {
+            // Each source read from its own folder: two may share a name.
+            match Self::item_at::<T>(kind, s, id) {
+                Ok(item) => match fits(&item) {
+                    Ok(()) => return Ok(item),
+                    Err(why) => seen.push(format!("{}: {why}", s.name)),
+                },
+                Err(Error::NotFound { .. }) => {}
+                Err(e) => seen.push(format!("{}: {e}", s.name)),
+            }
+        }
+        Err(if seen.is_empty() {
+            "no library has it".to_owned()
+        } else {
+            seen.join("; ")
+        })
+    }
+
+    fn item_in<T: serde::de::DeserializeOwned>(&self, kind: ItemKind, source: &str, id: &str) -> Result<T> {
         store::check_id(id)?;
-        let not_found = || Error::NotFound {
-            kind: ItemKind::Part,
-            id: id.into(),
-        };
+        let not_found = || Error::NotFound { kind, id: id.into() };
         let s = self.sources.iter().find(|s| s.name == source).ok_or_else(not_found)?;
-        let path = s.root.join(ItemKind::Part.dir()).join(format!("{id}.json"));
+        Self::item_at(kind, s, id)
+    }
+
+    /// Item `id` read from source `s`'s folder.
+    fn item_at<T: serde::de::DeserializeOwned>(kind: ItemKind, s: &Source, id: &str) -> Result<T> {
+        store::check_id(id)?;
+        let not_found = || Error::NotFound { kind, id: id.into() };
+        let path = s.root.join(kind.dir()).join(format!("{id}.json"));
         // An entry that is there but cannot be followed (a link to nothing) says so.
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
