@@ -3751,6 +3751,7 @@ dependencies = [
  "toml 0.8.23",
  "wc-agent",
  "wc-core",
+ "wc-import",
  "wc-library",
  "wc-pdf",
  "wc-report",

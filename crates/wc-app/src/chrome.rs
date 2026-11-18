@@ -110,6 +110,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             None,
             Some(Action::NewSymbol),
             Some(Action::EditSymbol),
+            Some(Action::ImportSymbols),
         ],
     ),
     (
