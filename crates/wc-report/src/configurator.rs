@@ -71,6 +71,18 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
         targets: BTreeMap::new(),
     };
     let info = terminal_info(i);
+    // A terminal whose symbol the project has no copy of is still on the rail (as in the
+    // terminal plan), but nothing tells its sides apart.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
+        for s in page.symbols.iter().filter(|s| !i.symbols.contains_key(&s.symbol)) {
+            if let Some(tag) = s.tag.as_ref().filter(|t| wc_core::project::is_terminal(t, None)) {
+                out.warnings.push(format!(
+                    "terminal {tag} on page {}: its symbol {} is missing from the project, so its wiring is not known",
+                    page.number, s.symbol
+                ));
+            }
+        }
+    }
     // (number, level) of each terminal in strip order, each terminal once, by strip.
     let mut strips: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for r in terminal_plan(i).rows {

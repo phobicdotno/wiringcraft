@@ -651,6 +651,8 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
         x: f64,
         /// The other terminals of its jumper, e.g. `3, 5`.
         jumpered: String,
+        /// Its symbol, when the project has no copy of it: what it connects is not known.
+        missing: Option<String>,
     }
     let mut terms: Vec<Term> = Vec::new();
     // The numbers jumpers refer to: a terminal tagged with only its strip gets the next one.
@@ -658,8 +660,15 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
     // An overview (line diagram) draws terminals again; the plan lists each one once.
     for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for s in &page.symbols {
-            let Some(sym) = i.symbols.get(&s.symbol) else { continue };
-            if sym.role != SymbolRole::Terminal {
+            // One rule with the strip editor and jumpers (terminal_numbers): a symbol the project
+            // has no copy of is a terminal when its tag has a terminal level (`-X1.3`). It is
+            // listed, marked, so the plan and the exports have the same terminals.
+            let sym = i.symbols.get(&s.symbol);
+            let terminal = match sym {
+                Some(sym) => sym.role == SymbolRole::Terminal,
+                None => s.tag.as_ref().is_some_and(|t| wc_core::project::is_terminal(t, None)),
+            };
+            if !terminal {
                 continue;
             }
             let (strip, number) = match &s.tag {
@@ -696,8 +705,11 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
                 page: page.number.clone(),
                 page_id: page.id.clone(),
                 item: s.id.clone(),
-                pins: sym.pins.iter().map(|p| p.name.clone()).collect(),
+                pins: sym
+                    .map(|sym| sym.pins.iter().map(|p| p.name.clone()).collect())
+                    .unwrap_or_default(),
                 x: s.at.x,
+                missing: sym.is_none().then(|| s.symbol.clone()),
             });
         }
     }
@@ -825,8 +837,11 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
                 let r: PinRef = (term.page_id.clone(), term.item.clone(), pin.clone());
                 (others(&r).join(", "), net_of.get(&r).cloned())
             };
-            let (upper, pa) = side(0);
+            let (mut upper, pa) = side(0);
             let (lower, pb) = side(1);
+            if let Some(symbol) = &term.missing {
+                upper = format!("(symbol {symbol} missing)");
+            }
             t.rows.push(vec![
                 strip.clone(),
                 number,

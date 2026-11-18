@@ -6318,8 +6318,16 @@ mod tests {
         store::save(&dir, &p).unwrap();
         let out = tmp.path().join("c.csv");
         let done = export_wago_configurator(&dir, &out).unwrap();
-        // -X1.3 has no vendored symbol: it is not known as a terminal and is left out.
-        assert_eq!(done.markers, 3, "{:?}", std::fs::read_to_string(&out));
+        // -X1.3 has no vendored symbol: its terminal level makes it a terminal, as in the strip
+        // editor and jumpers, so it is on the rail (with a warning that its wiring is not known).
+        assert_eq!(done.markers, 4, "{:?}", std::fs::read_to_string(&out));
+        assert!(
+            std::fs::read_to_string(&out)
+                .unwrap()
+                .contains("\r\n-X1/T3;Terminal;-X1;3;3;"),
+            "{:?}",
+            std::fs::read_to_string(&out)
+        );
         let csv = std::fs::read_to_string(&out).unwrap();
         assert!(csv.starts_with("\u{feff}Index;Type;Strip;Position;Terminal;"), "{csv}");
         assert!(csv.contains("\r\n-X1/T2;Terminal;-X1;2;2;"), "{csv}");
