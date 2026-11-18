@@ -79,6 +79,8 @@ fn parts_come_with_number_maker_description_and_properties() -> TestResult {
             pictures: 1,
             other: 1,
             too_large: 0,
+            macro_files: vec!["items/macros/SIE_3RT2015.ema".into()],
+            part_macros: Vec::new(),
         }
     );
     assert_eq!(
@@ -87,7 +89,8 @@ fn parts_come_with_number_maker_description_and_properties() -> TestResult {
             "2 part(s) from 1 part file(s)",
             "1 macro(s) (.ema): not imported",
             "1 picture(s): not imported",
-            "1 other file(s): not imported"
+            "1 other file(s): not imported",
+            "macro file: items/macros/SIE_3RT2015.ema",
         ]
     );
     Ok(())
@@ -266,5 +269,123 @@ fn the_largest_limits_do_not_overflow() -> TestResult {
     };
     let (parts, _, _) = read_with(&edz, all)?;
     assert_eq!(parts.len(), 2);
+    Ok(())
+}
+
+const PARTS_WITH_MACROS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<partsmanagement>
+  <part P_ARTICLE_PARTNR="SIE.3RT2015-1BB41" P_ARTICLE_MANUFACTURER="SIE"
+        P_ARTICLE_ORDERNR="3RT2015-1BB41" P_ARTICLE_MACRO="$(MD_MACROS)\SIE\SIE_3RT2015.ema"/>
+  <part P_ARTICLE_PARTNR="SIE.3SU1100" P_ARTICLE_MANUFACTURER="SIE"
+        P_ARTICLE_ORDERNR="3SU1100" P_ARTICLE_GROUPSYMBOLMACRO="SIE\SIE_3SU1.ema"/>
+  <part P_ARTICLE_PARTNR="RIT.8601.000" P_ARTICLE_MANUFACTURER="RIT" P_ARTICLE_ORDERNR="8601.000"/>
+</partsmanagement>
+"#;
+
+#[test]
+fn the_report_lists_each_parts_macro_and_whether_the_archive_has_it() -> TestResult {
+    let edz = seven_zip(&[
+        ("items/parts.xml", PARTS_WITH_MACROS.as_bytes()),
+        ("items/macros/sie_3rt2015.EMA", b"binary macro"),
+        ("items/macros/OTHER.ema", b"binary macro"),
+    ])?;
+    let (parts, report, _) = read(&edz)?;
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        report.macro_files,
+        ["items/macros/OTHER.ema", "items/macros/sie_3rt2015.EMA"],
+        "sorted"
+    );
+    let contactor = Part::make_id("SIE", "3RT2015-1BB41");
+    let button = Part::make_id("SIE", "3SU1100");
+    assert_eq!(
+        report.part_macros,
+        [
+            PartMacro {
+                part: contactor.clone(),
+                name: "$(MD_MACROS)\\SIE\\SIE_3RT2015.ema".into(),
+                in_archive: true,
+                symbol: None,
+            },
+            PartMacro {
+                part: button.clone(),
+                name: "SIE\\SIE_3SU1.ema".into(),
+                in_archive: false,
+                symbol: None,
+            },
+        ]
+    );
+    let lines = report.lines();
+    assert!(
+        lines.contains(&"macro file: items/macros/OTHER.ema".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&format!(
+            "part {contactor}: macro $(MD_MACROS)\\SIE\\SIE_3RT2015.ema (in the archive), pick a symbol by hand"
+        )),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(&button) && l.contains("not in the archive")),
+        "{lines:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_symbol_map_gives_parts_with_a_mapped_macro_their_symbol() -> TestResult {
+    let edz = zip(&[("parts.xml", PARTS_WITH_MACROS.as_bytes())])?;
+    let (mut parts, mut report, _) = read(&edz)?;
+    // By file name without `.ema`, any case; the other macro is not in the map.
+    let map = crate::swe::parse_symbol_map("# EPLAN macros\nsie_3rt2015 = wc.coil\nNOPE.ema = wc.lamp\n")?;
+    assert_eq!(apply_symbol_map(&mut parts, &map, &mut report), 1);
+    let symbol = |id: &str| parts.iter().find(|p| p.id == id).and_then(|p| p.symbol.clone());
+    assert_eq!(
+        symbol(&Part::make_id("SIE", "3RT2015-1BB41")).as_deref(),
+        Some("wc.coil")
+    );
+    assert_eq!(symbol(&Part::make_id("SIE", "3SU1100")), None);
+    assert_eq!(symbol(&Part::make_id("RIT", "8601.000")), None, "no macro");
+    assert!(
+        report.lines().iter().any(|l| l.ends_with("drawn with symbol wc.coil")),
+        "{:?}",
+        report.lines()
+    );
+    // The full name and the file name match too.
+    for key in ["$(MD_MACROS)\\SIE\\SIE_3SU1.ema", "SIE_3SU1.EMA", "SIE\\SIE_3SU1.ema"] {
+        let (mut parts, mut report, _) = read(&edz)?;
+        let map = BTreeMap::from([(key.to_owned(), "wc.lamp".to_owned())]);
+        let n = apply_symbol_map(&mut parts, &map, &mut report);
+        assert_eq!(n, usize::from(key != "$(MD_MACROS)\\SIE\\SIE_3SU1.ema"), "{key}");
+    }
+    Ok(())
+}
+
+#[test]
+fn control_characters_in_macro_names_print_as_plain_text() -> TestResult {
+    let edz = zip(&[
+        ("parts.xml", PARTS_WITH_MACROS.as_bytes()),
+        ("macros/evil\u{1b}[2J.ema", b"m"),
+        ("macros/two\nlines.ema", b"m"),
+    ])?;
+    let (_, report, _) = read(&edz)?;
+    let lines = report.lines();
+    assert!(lines.iter().all(|l| !l.chars().any(char::is_control)), "{lines:?}");
+    assert!(
+        lines.contains(&"macro file: macros/evil\\u{1b}[2J.ema".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"macro file: macros/two\\u{a}lines.ema".to_owned()),
+        "{lines:?}"
+    );
+    // EPLAN's backslash paths are left as they are.
+    assert!(
+        lines.iter().any(|l| l.contains("macro SIE\\SIE_3SU1.ema (")),
+        "{lines:?}"
+    );
     Ok(())
 }

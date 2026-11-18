@@ -6,7 +6,9 @@
 //! properties (`P_ARTICLE_PARTNR`, `P_ARTICLE_MANUFACTURER`, `P_ARTICLE_ORDERNR`,
 //! `P_ARTICLE_DESCR1`, ...). A `variant` inside a part fills in what the part leaves empty.
 //! Texts in several languages are written `de_DE@Schütz;en_US@Contactor;`; English is taken
-//! when there is one. Macros (`.ema`), pictures and other entries are counted, not imported.
+//! when there is one. Macros (`.ema`) are a closed binary format and are not read: the report lists them, and
+//! which macro each part names (`P_ARTICLE_MACRO`), so a symbol can be picked for it by hand or
+//! with a symbol map ([`apply_symbol_map`]). Pictures and other entries are counted, not imported.
 //!
 //! Written from public descriptions of the format and checked with synthetic archives only.
 
@@ -75,6 +77,88 @@ pub struct Report {
     pub other: usize,
     /// Part XML entries over the size limits, skipped.
     pub too_large: usize,
+    /// The macro files' paths in the archive, sorted.
+    pub macro_files: Vec<String>,
+    /// Each macro a part names, and whether the archive holds it, by part id.
+    pub part_macros: Vec<PartMacro>,
+}
+
+/// A macro a part names ([`MACRO_PROPERTIES`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartMacro {
+    /// The part's id.
+    pub part: String,
+    /// The macro as the part names it, e.g. `SIE\3RT2015.ema`.
+    pub name: String,
+    /// Whether the archive holds a macro file of that name.
+    pub in_archive: bool,
+    /// The library symbol a symbol map gave the part for it ([`apply_symbol_map`]).
+    pub symbol: Option<String>,
+}
+
+/// The EPLAN part properties naming the macro a part is drawn with: its own macro and its
+/// group symbol macro.
+pub const MACRO_PROPERTIES: [&str; 2] = ["P_ARTICLE_MACRO", "P_ARTICLE_GROUPSYMBOLMACRO"];
+
+/// The file name of a macro path as EPLAN writes it (`$(MD_MACROS)\SIE\3RT2015.ema`), in
+/// lower case, for matching: `3rt2015.ema`.
+fn macro_file_name(path: &str) -> String {
+    path.trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+/// The keys a symbol map may name a macro by: its full name, its file name and its file name
+/// without `.ema`, all in lower case.
+fn macro_keys(name: &str) -> [String; 3] {
+    let file = macro_file_name(name);
+    let stem = file.strip_suffix(".ema").unwrap_or(&file).to_owned();
+    [name.trim().to_lowercase(), file, stem]
+}
+
+/// Give every part whose macro `map` names (`macro = symbol.id`, as
+/// [`crate::swe::parse_symbol_map`] reads it) that library symbol. A macro is matched by its
+/// full name, its file name or its file name without `.ema`, ignoring case; the part's own
+/// macro is tried before its group symbol macro. Updates `report.part_macros` and returns how
+/// many parts got a symbol.
+pub fn apply_symbol_map(parts: &mut [Part], map: &BTreeMap<String, String>, report: &mut Report) -> usize {
+    let map: BTreeMap<String, &String> = map.iter().map(|(k, v)| (k.trim().to_lowercase(), v)).collect();
+    // (part id, macro name) to the symbol it got, so the report is updated in one pass.
+    let mut chosen: BTreeMap<(String, String), String> = BTreeMap::new();
+    for part in parts.iter_mut() {
+        let hit = MACRO_PROPERTIES
+            .iter()
+            .filter_map(|k| part.properties.get(*k))
+            .find_map(|name| {
+                let symbol = macro_keys(name).iter().find_map(|k| map.get(k))?;
+                Some((name.clone(), (*symbol).clone()))
+            });
+        let Some((name, symbol)) = hit else { continue };
+        part.symbol = Some(symbol.clone());
+        chosen.insert((part.id.clone(), name), symbol);
+    }
+    for m in &mut report.part_macros {
+        if let Some(symbol) = chosen.get(&(m.part.clone(), m.name.clone())) {
+            m.symbol = Some(symbol.clone());
+        }
+    }
+    chosen.len()
+}
+
+/// `s` with control characters (escape, line breaks, ...) written as `\u{1b}`, so a name from an
+/// archive prints as one line of plain text. Backslashes in EPLAN paths are kept as they are.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 impl Report {
@@ -92,6 +176,24 @@ impl Report {
         }
         if self.too_large > 0 {
             out.push(format!("{} XML file(s) over the size limit: skipped", self.too_large));
+        }
+        for f in &self.macro_files {
+            out.push(format!("macro file: {}", printable(f)));
+        }
+        for m in &self.part_macros {
+            let (part, name) = (printable(&m.part), printable(&m.name));
+            let place = if m.in_archive {
+                "in the archive"
+            } else {
+                "not in the archive"
+            };
+            out.push(match &m.symbol {
+                Some(s) => format!(
+                    "part {part}: macro {name} ({place}), drawn with symbol {}",
+                    printable(s)
+                ),
+                None => format!("part {part}: macro {name} ({place}), pick a symbol by hand"),
+            });
         }
         out
     }
@@ -129,7 +231,10 @@ pub fn read_with(bytes: &[u8], limits: Limits) -> Result<(Vec<Part>, Report, Vec
     let mut total = 0u64;
     let mut take = |name: &str, size: u64, data: &mut dyn Read, report: &mut Report| -> Result<bool> {
         match entry_kind(name) {
-            Entry::Macro => report.macros += 1,
+            Entry::Macro => {
+                report.macros += 1;
+                report.macro_files.push(name.to_owned());
+            }
             Entry::Picture => report.pictures += 1,
             Entry::Other => report.other += 1,
             Entry::Xml if size > limits.entry || total.saturating_add(size) > limits.total => report.too_large += 1,
@@ -230,6 +335,21 @@ pub fn read_with(bytes: &[u8], limits: Limits) -> Result<(Vec<Part>, Report, Vec
         }
     }
     report.parts = parts.len();
+    report.macro_files.sort();
+    let in_archive: std::collections::BTreeSet<String> =
+        report.macro_files.iter().map(|f| macro_file_name(f)).collect();
+    for p in parts.values() {
+        for k in MACRO_PROPERTIES {
+            if let Some(name) = p.properties.get(k) {
+                report.part_macros.push(PartMacro {
+                    part: p.id.clone(),
+                    name: name.clone(),
+                    in_archive: in_archive.contains(&macro_file_name(name)),
+                    symbol: None,
+                });
+            }
+        }
+    }
     if report.parts == 0 {
         warnings.push("the archive holds no part data".into());
     }

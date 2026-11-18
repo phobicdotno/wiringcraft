@@ -37,7 +37,7 @@ These branches can be deleted once their pull requests are merged.
 
 | Gap | Where it shows | Todo |
 |---|---|---|
-| EDZ exchange files: parts are read, EPLAN macros (`.ema`) only counted | `crates/wc-import/src/edz.rs` | #144 |
+| EDZ exchange files: EPLAN macros (`.ema`) are listed and matched to parts, never drawn (closed binary format); pick a symbol by hand or with `--symbol-map` | `crates/wc-import/src/edz.rs` | done (#144) |
 | SolidWorks Electrical: symbol and page graphics from DWG | `crates/wc-import/src/swe.rs` | #59 |
 | SolidWorks Electrical: page revisions are read from `tew_revision` by column name (the layout is not published), checked on synthetic databases only; the project's own revision and checked-by are not read | `crates/wc-import/src/swe.rs` | #170 |
 | SolidWorks Electrical libraries (`import swe-library`): catalog parts bring their terminals as a text property, not as pins of a symbol; library blocks are box symbols until the DWG reader draws them | `crates/wc-import/src/swe/library.rs` | #59 |
