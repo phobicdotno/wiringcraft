@@ -1574,6 +1574,26 @@ mod tests {
     }
 
     #[test]
+    fn a_value_in_the_added_band_area_shows_as_a_bar_only_for_a_taller_band() {
+        let page = wc_core::Page::new("p1", "1", "Main");
+        let size = page.size.mm();
+        let y1 = size.1 - wc_core::project::FRAME_MARGIN;
+        // A small value 30 mm above the frame's foot: inside a 36 mm band, above a 24 mm one.
+        let m = wc_pdf::FrameMark {
+            shape: Shape::Text {
+                at: Point::new(100.0, y1 - 30.0),
+                text: "Notes".into(),
+                height: 1.0,
+                align: Align::Left,
+                angle: 0.0,
+            },
+            ink: wc_pdf::Ink::Thin,
+        };
+        assert!(value_placeholder(&m, size, 36.0, 0.5).is_some());
+        assert_eq!(value_placeholder(&m, size, 24.0, 0.5), None);
+    }
+
+    #[test]
     fn the_cover_logo_moves_and_sizes_by_whole_millimetres_and_stays_usable() {
         let start = (Point::new(10.0, 10.0), Point::new(40.0, 30.0));
         assert_eq!(

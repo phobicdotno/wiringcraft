@@ -405,8 +405,9 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
             k => page.title_field(&project.meta, k).to_owned(),
         }
     };
-    for (b, (l, t, r, _)) in &boxes {
+    for (b, (l, t, r, bottom)) in &boxes {
         let top = ty + t;
+        let bottom = ty + bottom;
         // Labels and values never reach past their box: they shrink to fit, and a box too narrow
         // for any text shows none.
         let label_room = r - l - 2.0 * PAD;
@@ -427,26 +428,40 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
             if room <= 0.0 {
                 continue;
             }
-            let h = fit_height(&shown, bt.size, room);
-            text((x, top + bt.y), h, bt.align, &shown, Ink::Thin, &mut out);
+            let Some((y, h)) = fit_in_box(top, bottom, top + bt.y, fit_height(&shown, bt.size, room)) else {
+                continue;
+            };
+            text((x, y), h, bt.align, &shown, Ink::Thin, &mut out);
         }
         // The project's logo takes a logo box when it has one (see `title_logo_box`).
-        if b.logo && project.meta.logo.is_none() {
-            let h = fit_height("WiringCraft", 2.0, r - l - 2.0 * PAD);
-            text(
-                ((l + r) / 2.0, top + 9.5),
-                h,
-                Align::Center,
-                "WiringCraft",
-                Ink::Thin,
-                &mut out,
-            );
+        if b.logo
+            && project.meta.logo.is_none()
+            && let Some((y, h)) = fit_in_box(
+                top,
+                bottom,
+                top + 9.5,
+                fit_height("WiringCraft", 2.0, r - l - 2.0 * PAD),
+            )
+        {
+            text(((l + r) / 2.0, y), h, Align::Center, "WiringCraft", Ink::Thin, &mut out);
         }
     }
     if page.cover {
         cover_marks(project, (x0, y0 + HEADER, x1, ty), date, &mut out);
     }
     out
+}
+
+/// Room kept between a title-block text's baseline and the bottom of its box, for descenders.
+const BELOW_BASELINE: f64 = 0.8;
+
+/// Where text of height `h` with its baseline at `y` goes in a title-block box from `top` to
+/// `bottom`: moved up to stay inside it, and shrunk when the box is too short for it.
+/// `None` when no text fits.
+fn fit_in_box(top: f64, bottom: f64, y: f64, h: f64) -> Option<(f64, f64)> {
+    let y = y.min(bottom - BELOW_BASELINE);
+    let h = h.min(y - top);
+    (h > 0.5).then_some((y, h))
 }
 
 /// The title block's logo box on `page` (top-left and bottom-right, in millimetres): the
@@ -1442,6 +1457,40 @@ mod template_tests {
         // Report pages fit fewer rows, and the cover logo stays above the band.
         assert!(rows_per_page(page.size, p.meta.template.band_height()) < before);
         assert!(cover_logo_default(&p, &page).1.y < ty);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_shorter_title_block_keeps_its_texts_inside_the_frame() {
+        let (mut p, page) = demo(PageSize::A3, true);
+        let (w, h) = page.size.mm();
+        let (x0, x1, y1) = (MARGIN, w - MARGIN, h - MARGIN);
+        // The default layout already fits its boxes, so the 24 mm band is drawn as before.
+        let default = PageTemplate::default();
+        for b in &default.boxes {
+            let (_, t, _, bottom) = b.resolve(x0, x1, default.band_height()).unwrap();
+            for bt in &b.texts {
+                assert!(t + bt.y <= bottom - BELOW_BASELINE, "{} {:?}", b.label, bt.values);
+                assert!(bt.size <= bt.y, "{} {:?}", b.label, bt.values);
+            }
+        }
+        p.meta.template = PageTemplate {
+            height: 20.0,
+            ..Default::default()
+        };
+        let ty = y1 - 20.0;
+        let marks = frame_marks(&p, &page, 0, 1, "");
+        let mut seen = 0;
+        for m in &marks {
+            if let Shape::Text { at, height, text, .. } = &m.shape
+                && at.y > ty
+            {
+                seen += 1;
+                assert!(at.y <= y1 - BELOW_BASELINE + 1e-9, "{text} below the frame: {at:?}");
+                assert!(at.y - height >= ty - 1e-9, "{text} above the band: {at:?} {height}");
+            }
+        }
+        assert!(seen > 0, "the title block shows its texts");
     }
 
     fn texts(marks: &[FrameMark]) -> Vec<(String, f64)> {
