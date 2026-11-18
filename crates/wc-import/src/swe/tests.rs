@@ -2445,6 +2445,28 @@ fn a_drawing_read_in_part_keeps_its_graphics_and_says_why() {
 }
 
 #[test]
+fn a_damaged_class_section_and_object_are_each_warned_with_their_own_cause() {
+    let mut d = SweDrawings::default();
+    let classes = Some(vec![0u8; 40]);
+    let dwg = crate::dwg::objects::tests::model_space_dwg_with_classes(
+        &[E::Line((0.0, 0.0), (0.0, 6.0)), E::Damaged],
+        classes,
+    );
+    d.add_block("Coil", &dwg).unwrap();
+    assert_eq!(d.warnings.len(), 2, "{:?}", d.warnings);
+    let classes = d.warnings.iter().find(|w| w.contains("custom entities")).unwrap();
+    assert!(
+        classes.starts_with("block Coil: DWG: the class section (AcDb:Classes) is damaged"),
+        "{classes}"
+    );
+    assert!(classes.contains("sentinel"), "{classes}");
+    let object = d.warnings.iter().find(|w| w.contains("object(s)")).unwrap();
+    assert!(object.contains("the first because of: object 101 at"), "{object}");
+    assert!(object.contains("past the end"), "{object}");
+    assert!(!object.contains("AcDb:Classes"), "{object}");
+}
+
+#[test]
 fn a_symbol_at_the_join_boundary_is_drawn_and_sized_alike_by_both_checks() {
     let mut sw = read(&sample()).unwrap();
     // A2 sits 5.5002 below the origin: 5.500 when the difference is rounded (a library fit,
