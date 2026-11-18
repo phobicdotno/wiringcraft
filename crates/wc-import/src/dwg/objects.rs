@@ -210,7 +210,7 @@ impl Object<'_> {
     fn text(&mut self) -> Result<String> {
         match self.version {
             Version::R2004 => self.data.t8(),
-            Version::R2007 | Version::R2010 => self
+            _ => self
                 .strings
                 .as_mut()
                 .ok_or_else(|| bad("an object's text is missing"))?
@@ -242,7 +242,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     let mut start = at + n;
     let handle_bits = match version {
         Version::R2004 | Version::R2007 => 0,
-        Version::R2010 => {
+        _ => {
             let (h, m) = modular_char(objects.get(start..).unwrap_or_default(), false)?;
             start += m;
             usize::try_from(h).map_err(|_| bad("an object's handle stream is out of range"))?
@@ -257,7 +257,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     // A bit short up to 2007, a bit pair and one or two bytes from 2010 on.
     let kind = match version {
         Version::R2004 | Version::R2007 => head.bs()?,
-        Version::R2010 => match head.bb()? {
+        _ => match head.bb()? {
             0 => u16::from(head.rc()?),
             1 => u16::from(head.rc()?) + 0x1F0,
             _ => head.rs()?,
@@ -267,7 +267,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     // the handle stream's size before the type.
     let end = match version {
         Version::R2004 | Version::R2007 => head.rl()? as usize,
-        Version::R2010 => total
+        _ => total
             .checked_sub(handle_bits)
             .ok_or_else(|| bad("an object's handle stream is larger than the object"))?,
     };
@@ -278,7 +278,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     let handle = data.h()?.1;
     let strings = match version {
         Version::R2004 => None,
-        Version::R2007 | Version::R2010 => string_stream(bytes, end)?,
+        _ => string_stream(bytes, end)?,
     };
     Ok(Object {
         version,
@@ -616,7 +616,7 @@ struct Common {
 
 /// Read the data every entity has, from both the data and the handle streams.
 fn entity_common(o: &mut Object) -> Result<Common> {
-    let r2010 = o.version == Version::R2010;
+    let r2010 = o.version >= Version::R2010;
     // Material and shadow flags are there from 2007 on, visual styles from 2010 on.
     let r2007 = o.version != Version::R2004;
     o.skip_eed()?;
@@ -731,7 +731,7 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
     }
     // ATTRIB and ATTDEF: the tag and flags, and for ATTDEF the prompt. A version byte from
     // 2010 on, a lock position flag from 2007 on.
-    if o.version == Version::R2010 {
+    if o.version >= Version::R2010 {
         o.data.rc()?;
     }
     let tag = o.text()?;
@@ -742,7 +742,7 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
     }
     e.s(1, value).s(2, tag).i(70, i64::from(attr_flags));
     if o.kind == 3 {
-        if o.version == Version::R2010 {
+        if o.version >= Version::R2010 {
             o.data.rc()?;
         }
         let prompt = o.text()?;
@@ -837,7 +837,7 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
     if flags & 16 != 0 {
         d.bl()?;
     }
-    if o.version == Version::R2010 && flags & 1024 != 0 {
+    if o.version >= Version::R2010 && flags & 1024 != 0 {
         d.bl()?;
     }
     if flags & 32 != 0 {

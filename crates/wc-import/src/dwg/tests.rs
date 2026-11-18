@@ -407,6 +407,58 @@ fn a_2004_drawing_is_read_too() -> TestResult {
 }
 
 #[test]
+fn the_sections_of_2013_and_2018_drawings_are_read() -> TestResult {
+    // The 2004 container, with the data store section 2013 added.
+    let mut sections = sample_sections();
+    sections.push(TestSection {
+        name: "AcDb:AcDsPrototype_1b",
+        data: noise(500, 13),
+        ..TestSection::default()
+    });
+    for (tag, version) in [(b"AC1027", Version::R2013), (b"AC1032", Version::R2018)] {
+        let read = read_sections(&write_dwg(tag, &sections))?;
+        assert_eq!(read.version, version);
+        for section in sections.iter().filter(|s| !s.encrypted) {
+            assert_eq!(
+                read.get(section.name),
+                Some(section.data.as_slice()),
+                "{tag:?} {}",
+                section.name
+            );
+        }
+        assert_eq!(read.skipped, ["AcDb:SummaryInfo"]);
+    }
+    assert!(Version::R2004 < Version::R2007 && Version::R2010 < Version::R2013);
+    assert!(Version::R2013 < Version::R2018);
+    Ok(())
+}
+
+#[test]
+fn cut_or_flipped_2013_and_2018_files_give_errors_not_panics() -> TestResult {
+    for tag in [b"AC1027", b"AC1032"] {
+        let file = write_dwg(tag, &sample_sections());
+        assert!(read_sections(&file).is_ok());
+        for len in (0..file.len()).step_by(11) {
+            let _ = read_sections(&file[..len]);
+        }
+        assert!(read_sections(&file[..page_map_data_end(&file)? - 1]).is_err());
+        let mut seed = 5u32;
+        for i in 0..500 {
+            let mut damaged = file.clone();
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let at = (seed as usize >> 4) % damaged.len();
+            damaged[at] ^= 1 << (i % 8);
+            let _ = read_sections(&damaged);
+        }
+        // The header is checked as in 2004 and 2010.
+        let mut damaged = file.clone();
+        damaged[ENCRYPTED_HEADER_AT + 3] ^= 0x40;
+        assert!(error_of(&damaged).contains("header is damaged"));
+    }
+    Ok(())
+}
+
+#[test]
 fn other_versions_are_refused_with_a_reason() {
     let message = |bytes: &[u8]| match read_sections(bytes) {
         Err(e) => e.to_string(),
@@ -422,7 +474,12 @@ fn other_versions_are_refused_with_a_reason() {
         message(&r2007)
     );
     let old = message(b"AC1015 and more");
-    assert!(old.contains("AC1015") && old.contains("2010, 2007 or 2004"), "{old}");
+    assert!(
+        old.contains("AC1015") && old.contains("2018, 2013, 2010, 2007 or 2004"),
+        "{old}"
+    );
+    let newer = message(b"AC1033 and more");
+    assert!(newer.contains("AC1033") && newer.contains("not supported"), "{newer}");
     assert!(message(b"PK\x03\x04 a zip file").contains("not a DWG"));
     assert!(message(b"AC").contains("too short"));
 }

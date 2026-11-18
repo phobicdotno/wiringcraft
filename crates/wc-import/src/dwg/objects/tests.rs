@@ -216,7 +216,7 @@ impl Obj {
             Version::R2004 => {
                 self.data.t8(s);
             }
-            Version::R2007 | Version::R2010 => {
+            _ => {
                 self.strings.tu(s);
             }
         }
@@ -273,7 +273,7 @@ impl Obj {
                 out.extend(bytes);
                 out
             }
-            Version::R2010 => {
+            _ => {
                 match self.kind {
                     0..=255 => w.bb(0).rc(self.kind as u8),
                     k if (0x1F0..0x1F0 + 256).contains(&k) => w.bb(1).rc((k - 0x1F0) as u8),
@@ -342,7 +342,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
         d.b(true);
         match v {
             Version::R2004 | Version::R2007 => d.rl(2),
-            Version::R2010 => d.bll(2),
+            _ => d.bll(2),
         };
         d.rc(0xAB).rc(0xCD);
     } else {
@@ -363,7 +363,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
     if v != Version::R2004 {
         d.bb(if h.extras { 3 } else { 0 }).rc(0);
     }
-    if v == Version::R2010 {
+    if v >= Version::R2010 {
         d.b(false).b(h.extras).b(false);
     }
     d.bs(u16::from(h.invisible)).rc(0);
@@ -385,7 +385,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
             hs.h(5, 0x17);
         }
         hs.h(5, 0x15);
-        if v == Version::R2010 {
+        if v >= Version::R2010 {
             hs.h(5, 0x16);
         }
     } else {
@@ -443,7 +443,7 @@ fn attrib(v: Version, kind: u16, handle: u64, h: Head, at: (f64, f64), value: &s
     let mut o = entity(v, kind, handle, h);
     // Attributes carry a vertical alignment, so the field after the text is read too.
     text_data_with(&mut o, at, value, 2.5, 0.0, Some(1));
-    if v == Version::R2010 {
+    if v >= Version::R2010 {
         o.data.rc(0);
     }
     o.text(tag);
@@ -453,7 +453,7 @@ fn attrib(v: Version, kind: u16, handle: u64, h: Head, at: (f64, f64), value: &s
         o.data.b(false);
     }
     if kind == 3 {
-        if v == Version::R2010 {
+        if v >= Version::R2010 {
             o.data.rc(0);
         }
         o.text("Device tag");
@@ -502,7 +502,7 @@ fn sample(v: Version) -> Vec<Obj> {
     // Closed, with vertex ids: their count is there from 2010 on only.
     let mut p = entity(v, 77, 0x42, relay);
     p.data.bs(512 | 1024).bl(3);
-    if v == Version::R2010 {
+    if v >= Version::R2010 {
         p.data.bl(3);
     }
     p.data
@@ -1187,7 +1187,7 @@ fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: boo
     let mut o = named(v, BLOCK_HEADER, handle, name);
     match v {
         Version::R2004 => o.data.b(true).bs(0).b(false),
-        Version::R2007 | Version::R2010 => o.data.bs(0),
+        _ => o.data.bs(0),
     };
     o.data.b(false).b(false).b(xref).b(false).b(false);
     if !xref {

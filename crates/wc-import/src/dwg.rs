@@ -1,5 +1,5 @@
-//! The container of AutoCAD DWG files from AutoCAD 2004, 2007 and 2010 (`AC1018`, `AC1021`,
-//! `AC1024`): the first step of reading DWG drawings, which SolidWorks Electrical stores its
+//! The container of AutoCAD DWG files from AutoCAD 2004 to 2018 (`AC1018`, `AC1021`, `AC1024`,
+//! `AC1027`, `AC1032`): the first step of reading DWG drawings, which SolidWorks Electrical stores its
 //! symbol and page graphics in (#59).
 //!
 //! A DWG file of these versions is a set of pages. A short header at the start holds a second,
@@ -11,6 +11,8 @@
 //!
 //! AutoCAD 2007 files (`AC1021`) use a different container, with Reed-Solomon coded pages and
 //! another compression; [`read_sections`] reads them too and returns the same sections (#215).
+//! AutoCAD 2013 and 2018 files (`AC1027`, `AC1032`) are in the 2004 container again, with one
+//! more section (`AcDb:AcDsPrototype_1b`, the data store), and are read like 2010 ones (#292).
 //! Older and newer versions are refused with a clear message. Sections stored encrypted
 //! (password-protected drawings) are listed in [`Sections::skipped`] and not returned.
 //!
@@ -64,8 +66,9 @@ const DATA_PAGE_HEADER: usize = 0x20;
 /// Length of a section description in the section map, without its page list.
 const SECTION_DESCRIPTION: usize = 0x60;
 
-/// The DWG versions whose container this module reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The DWG versions whose container this module reads, oldest first: a later version compares
+/// greater, so `v >= Version::R2010` means 2010 or later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Version {
     /// AutoCAD 2004 to 2006 (`AC1018`).
     R2004,
@@ -73,6 +76,10 @@ pub enum Version {
     R2007,
     /// AutoCAD 2010 to 2012 (`AC1024`).
     R2010,
+    /// AutoCAD 2013 to 2017 (`AC1027`).
+    R2013,
+    /// AutoCAD 2018 and later (`AC1032`).
+    R2018,
 }
 
 /// One named section of a DWG file.
@@ -116,8 +123,10 @@ pub fn version(bytes: &[u8]) -> Result<Version> {
         b"AC1018" => Ok(Version::R2004),
         b"AC1021" => Ok(Version::R2007),
         b"AC1024" => Ok(Version::R2010),
+        b"AC1027" => Ok(Version::R2013),
+        b"AC1032" => Ok(Version::R2018),
         t if t.starts_with(b"AC") => Err(bad(format!(
-            "drawing version {} is not supported; save it as AutoCAD 2010, 2007 or 2004",
+            "drawing version {} is not supported; save it as AutoCAD 2018, 2013, 2010, 2007 or 2004",
             String::from_utf8_lossy(t)
         ))),
         _ => Err(bad("not a DWG drawing (it does not start with a version)")),
