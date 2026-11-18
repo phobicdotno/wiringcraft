@@ -1575,3 +1575,44 @@ fn a_picture_picked_here_is_not_written_over_by_the_sessions_picture_of_that_nam
     assert!(notes[0].contains("another picture"), "{}", notes[0]);
     Ok(())
 }
+
+#[test]
+fn a_picture_that_could_not_be_written_is_tried_again_only_after_a_while() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        std::fs::create_dir_all(o.dir.join("pictures"))?;
+        std::fs::write(o.dir.join("pictures/brand.png"), PNG)?;
+        o.project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/brand.png".into(),
+            cover: None,
+        });
+        Ok(())
+    })?;
+    // A folder stands where the picture goes, so writing it fails.
+    let target = guest_open.dir.join("pictures/brand.png");
+    assert!(!target.exists(), "not taken before the first frame");
+    std::fs::create_dir_all(&target)?;
+    let started = std::time::Instant::now();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(target.is_dir(), "not written");
+    // The obstacle is gone, but the picture is not tried again right away.
+    std::fs::remove_dir(&target)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    if started.elapsed() < ITEM_RETRY_LATER {
+        assert!(!target.exists(), "skipped while it failed a moment ago");
+    }
+    // After a while it is tried again, and written.
+    std::thread::sleep(ITEM_RETRY_LATER + std::time::Duration::from_millis(50));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, PNG, "written");
+    let notes: Vec<String> = g
+        .take_notes()
+        .into_iter()
+        .filter(|n| n.contains("pictures/brand.png"))
+        .collect();
+    assert_eq!(notes.len(), 1, "named once: {notes:?}");
+    assert!(notes[0].contains("could not be written"), "{}", notes[0]);
+    Ok(())
+}
