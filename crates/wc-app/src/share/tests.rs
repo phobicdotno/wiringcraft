@@ -550,11 +550,28 @@ fn a_part_taken_back_leaves_the_part_list_unless_a_library_offers_it() -> TestRe
             open.part_library.push((p.id.clone(), p.id.clone()));
         }
     }
+    // A device here still names the project's own part from the last sync; the session took
+    // that assignment back with the part.
+    let device = Device {
+        part: Some("own.part".into()),
+        ..Default::default()
+    };
+    open.project.devices.insert(DeviceTag::parse("-K1")?, device);
     let mut seen = Some(open.project.lock.clone());
     let base = open.project.clone();
-    let auth = Project::new("Pump station");
+    let mut auth = open.project.clone();
+    auth.lock = Default::default();
+    auth.devices.clear();
     let mut unload = std::collections::BTreeSet::new();
     assert_eq!(follow_take_backs(&mut seen, &mut unload, &mut open, &base, &auth), None);
+    assert!(
+        open.parts.contains_key("own.part"),
+        "still drawn until the session's change is in"
+    );
+    assert!(incoming(&mut open.project, &auth));
+    unload_taken_back(&mut unload, &mut open);
+    // Reading the lists again does not bring the stale part back either.
+    open.refresh_library();
     assert!(open.project.lock.parts.is_empty());
     assert!(
         open.part_library.iter().any(|(i, _)| i == "example.ex-lamp-24-gn"),

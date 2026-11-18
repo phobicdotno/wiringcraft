@@ -1884,6 +1884,10 @@ impl Share {
             self.notes.push(why);
         }
         let changed = incoming(&mut open.project, auth);
+        // This copy now holds the session's versions: a take-back of those is what is followed.
+        if let Some(seen) = self.session_lock.as_mut() {
+            *seen = next_seen(seen, &open.project, auth);
+        }
         unload_taken_back(&mut self.unload, open);
         let (symbols, parts) = role.files();
         let failed: Vec<String> = take_files(open, symbols, parts)
