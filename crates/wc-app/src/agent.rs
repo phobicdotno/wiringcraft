@@ -390,6 +390,22 @@ pub fn specs() -> Vec<Value> {
             &[],
         ),
         tool(
+            "get_template",
+            "The page template every page is drawn on: columns (reference columns across the frame) and the title block's boxes (label; left and right in mm from the frame side named by left_from/right_from, \"left\" or \"right\"; top and bottom in mm down the 24 mm title block band; texts with values such as project.name, page.title, page.number, page.sheet or title-block field keys, size, y, align and inset; logo for the logo box). is_default tells whether it is the built-in layout.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "set_template",
+            "Change the page template as one undo step: set the column count (1 to 40), replace the title block's boxes (in get_template's format), or reset to the built-in layout.",
+            json!({
+                "columns": {"type": "integer", "minimum": 1, "maximum": 40},
+                "boxes": {"type": "array", "items": {"type": "object"}, "description": "Every box of the title block, as get_template returns them."},
+                "reset": {"type": "boolean", "description": "Go back to the built-in layout; columns and boxes are then applied on top of it."}
+            }),
+            &[],
+        ),
+        tool(
             "comments",
             "Review comments: list (open ones, or all), add (pinned at x, y on a page, or about the whole page), reply, resolve, reopen or delete.",
             json!({
@@ -1269,6 +1285,16 @@ impl App {
                 open.set_project_props(&name, &fields, None)?;
                 Ok(said)
             }
+            "get_template" => {
+                let open = need_open(self.open.as_mut())?;
+                let t = &open.project.meta.template;
+                Ok(pretty(&json!({
+                    "columns": t.columns,
+                    "boxes": t.boxes,
+                    "is_default": t.is_default(),
+                })))
+            }
+            "set_template" => self.tool_set_template(v),
             "comments" => self.tool_comments(v),
             "macros" => self.tool_macros(v),
             "number_wires" => {
@@ -1798,6 +1824,35 @@ impl App {
             done.push("created".into());
         }
         Ok(format!("{t}: {}.", done.join(", ")))
+    }
+
+    fn tool_set_template(&mut self, v: &Value) -> Result<String, String> {
+        let open = need_open(self.open.as_mut())?;
+        let mut t = if v.get("reset").and_then(Value::as_bool) == Some(true) {
+            wc_core::template::PageTemplate::default()
+        } else {
+            open.project.meta.template.clone()
+        };
+        if let Some(c) = v.get("columns").filter(|c| !c.is_null()) {
+            let max = wc_core::template::MAX_COLUMNS;
+            t.columns = c
+                .as_u64()
+                .and_then(|c| usize::try_from(c).ok())
+                .filter(|c| (1..=max).contains(c))
+                .ok_or_else(|| format!("columns must be a whole number from 1 to {max}"))?;
+        }
+        if let Some(b) = v.get("boxes").filter(|b| !b.is_null()) {
+            t.boxes = serde_json::from_value(b.clone()).map_err(|e| format!("boxes: {e}"))?;
+        }
+        if let Some(why) = t.problem() {
+            return Err(format!("The template was not changed: {why}."));
+        }
+        if t == open.project.meta.template {
+            return Ok("The template is already like that.".into());
+        }
+        open.checkpoint();
+        open.project.meta.template = t;
+        Ok("Template set.".into())
     }
 
     fn tool_comments(&mut self, v: &Value) -> Result<String, String> {
@@ -2338,6 +2393,48 @@ mod tests {
 
     fn page2(app: &App) -> &Page {
         app.open.as_ref().unwrap().project.page("p0002").unwrap()
+    }
+
+    #[test]
+    fn the_assistant_reads_and_changes_the_page_template_as_one_undo_step() {
+        let (_tmp, mut a) = app(vec![]);
+        let read =
+            |a: &mut App| -> Value { serde_json::from_str(&call(a, "get_template", json!({})).unwrap()).unwrap() };
+        let t = read(&mut a);
+        assert_eq!(t["is_default"], json!(true));
+        assert_eq!(t["columns"], json!(10));
+        let boxes = t["boxes"].clone();
+        assert!(boxes.as_array().is_some_and(|b| !b.is_empty()));
+
+        // Bad input changes nothing.
+        for bad in [
+            json!({"columns": 0}),
+            json!({"columns": 41}),
+            json!({"columns": "many"}),
+            json!({"boxes": [{"left": 0, "right": 10, "top": 5, "bottom": 2}]}),
+            json!({"boxes": "none"}),
+        ] {
+            assert!(call(&mut a, "set_template", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(read(&mut a)["is_default"], json!(true));
+
+        // Columns and boxes together: one undo step.
+        let one = json!([{"label": "Order", "left": 0, "right": 60, "top": 0, "bottom": 24,
+            "text": [{"values": ["project.name"], "size": 3.5, "y": 10}]}]);
+        call(&mut a, "set_template", json!({"columns": 12, "boxes": one})).unwrap();
+        let t = read(&mut a);
+        assert_eq!(t["columns"], json!(12));
+        assert_eq!(t["boxes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(t["boxes"][0]["label"], json!("Order"));
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(read(&mut a)["is_default"], json!(true));
+        assert!(a.open.as_mut().unwrap().redo());
+        assert_eq!(read(&mut a)["columns"], json!(12));
+
+        call(&mut a, "set_template", json!({"reset": true})).unwrap();
+        let t = read(&mut a);
+        assert_eq!(t["is_default"], json!(true));
+        assert_eq!(t["boxes"], boxes);
     }
 
     #[test]

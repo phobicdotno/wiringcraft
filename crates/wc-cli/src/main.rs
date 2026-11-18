@@ -102,6 +102,9 @@ enum Cmd {
     /// The project logo, shown on the cover page and in every title block.
     #[command(subcommand)]
     Logo(LogoCmd),
+    /// The page template: the frame's reference columns and the title block's boxes.
+    #[command(subcommand)]
+    Template(TemplateCmd),
     /// Set a device's part and description.
     Device {
         tag: String,
@@ -327,6 +330,16 @@ enum LogoCmd {
     Set { file: PathBuf },
     /// Take the logo off the cover page and the title blocks; its file stays in the project.
     Remove,
+}
+
+#[derive(Subcommand)]
+enum TemplateCmd {
+    /// Print the template as TOML (the built-in one when the project has none).
+    Show,
+    /// Set the number of reference columns across the frame (1 to 40).
+    Columns { count: usize },
+    /// Go back to the built-in layout (removes `[template]` from project.toml).
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -1085,6 +1098,31 @@ fn run(cli: Cli) -> Res<()> {
                 }
                 LogoCmd::Remove => {
                     if p.meta.logo.take().is_some() {
+                        save(dir, &p)?;
+                    }
+                }
+            }
+        }
+        Cmd::Template(tc) => {
+            let mut p = load(dir)?;
+            match tc {
+                TemplateCmd::Show => {
+                    let text = toml::to_string_pretty(&p.meta.template).map_err(|e| e.to_string())?;
+                    print!("{text}");
+                }
+                TemplateCmd::Columns { count } => {
+                    let max = wc_core::template::MAX_COLUMNS;
+                    if !(1..=max).contains(&count) {
+                        return Err(format!("the column count must be 1 to {max}"));
+                    }
+                    if p.meta.template.columns != count {
+                        p.meta.template.columns = count;
+                        save(dir, &p)?;
+                    }
+                }
+                TemplateCmd::Reset => {
+                    if !p.meta.template.is_default() {
+                        p.meta.template = Default::default();
                         save(dir, &p)?;
                     }
                 }
@@ -3530,6 +3568,35 @@ mod tests {
         assert_eq!(load(&dir).unwrap().meta.logo, None);
         assert!(dir.join("pictures/Our_logo.png").exists(), "the file stays");
         assert!(!pdf_has_picture(&dir));
+    }
+
+    #[test]
+    fn the_page_template_is_shown_changed_and_reset_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let toml_text = || std::fs::read_to_string(dir.join("project.toml")).unwrap();
+        cli(&dir, &["template", "show"]).unwrap();
+        // The built-in template, printed, reads back as itself.
+        let shown = toml::to_string_pretty(&wc_core::template::PageTemplate::default()).unwrap();
+        assert_eq!(
+            toml::from_str::<wc_core::template::PageTemplate>(&shown).unwrap(),
+            Default::default()
+        );
+
+        for bad in ["0", "41"] {
+            let err = cli(&dir, &["template", "columns", bad]).unwrap_err();
+            assert!(err.contains("1 to 40"), "{err}");
+        }
+        assert!(!toml_text().contains("[template]"));
+
+        cli(&dir, &["template", "columns", "12"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.template.columns, 12);
+        assert!(toml_text().contains("[template]"));
+
+        cli(&dir, &["template", "reset"]).unwrap();
+        assert!(load(&dir).unwrap().meta.template.is_default());
+        assert!(!toml_text().contains("[template]"), "{}", toml_text());
     }
 
     #[test]
