@@ -29,11 +29,16 @@ fn place(page: &mut Page, id: &str, x: f64) {
 
 /// A journal shared with the test so it can look at what was recorded.
 #[derive(Clone, Default)]
-struct Shared(Rc<RefCell<Vec<Change>>>);
+struct Shared(Rc<RefCell<Vec<Change>>>, Rc<RefCell<Vec<String>>>);
 
 impl Journal for Shared {
     fn record(&mut self, _project: &Project, change: &Change) -> Result<()> {
         self.0.borrow_mut().push(change.clone());
+        Ok(())
+    }
+
+    fn picture(&mut self, picture: &Picture) -> Result<()> {
+        self.1.borrow_mut().push(picture.file.clone());
         Ok(())
     }
 }
@@ -2434,4 +2439,230 @@ fn edits_that_can_go_together_are_batched_after_the_others() {
         ]
     );
     assert!(ProjectEdit::batched(Vec::new()).is_empty());
+}
+
+fn picture(file: &str, data: &[u8]) -> Picture {
+    Picture {
+        file: file.into(),
+        data: data.to_vec(),
+    }
+}
+
+#[test]
+fn guests_get_the_pictures_and_pictures_added_during_the_session() -> TestResult {
+    let mut s = Session::new();
+    let png = b"\x89PNG\r\n\x1a\nlogo".to_vec();
+    let scan = b"\xFF\xD8\xFFscan".to_vec();
+    s.host.share_pictures(
+        [
+            ("pictures/logo.png".to_owned(), png.clone()),
+            ("underlays/p0002.jpg".to_owned(), scan.clone()),
+            // Not in a picture folder, so not shared.
+            ("project.toml".to_owned(), b"x".to_vec()),
+        ]
+        .into(),
+    );
+    assert_eq!(s.host.pictures().len(), 2);
+    // A guest that joins gets the host's pictures right after the welcome.
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    assert_eq!(a.pictures.get("pictures/logo.png"), Some(&png));
+    assert_eq!(a.pictures.get("underlays/p0002.jpg"), Some(&scan));
+    let (_b, link_b, mut b) = s.join("Kari")?;
+
+    // Ola picks a new logo: everyone gets the file, and it is no change of its own.
+    let new_logo = picture("pictures/acme.png", b"\x89PNG\r\n\x1a\nacme");
+    let changes = s.log.0.borrow().len();
+    link_a.send(a.edit_project(ProjectEdit::AddPicture {
+        picture: new_logo.clone(),
+    }))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert_eq!(a.unanswered_edits(), 0, "the author gets its answer");
+    assert_eq!(s.log.0.borrow().len(), changes);
+    assert_eq!(s.host.pictures().get("pictures/acme.png"), Some(&new_logo.data));
+    for g in [&a, &b] {
+        assert_eq!(g.pictures.get("pictures/acme.png"), Some(&new_logo.data));
+    }
+
+    // Another picture under a name the session has, one outside the picture folders, one
+    // leading out of the project and an empty one are refused.
+    for p in [
+        picture("pictures/logo.png", b"\x89PNG\r\n\x1a\nother"),
+        picture("vendor/symbols/x.png", b"x"),
+        picture("pictures/../../etc/passwd", b"x"),
+        picture("underlays/empty.png", b""),
+    ] {
+        link_b.send(b.edit_project(ProjectEdit::AddPicture { picture: p }))?;
+    }
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert_eq!(b.refusals.len(), 4, "{:?}", b.refusals);
+    assert!(
+        b.refusals[0].to_string().contains("another picture"),
+        "{}",
+        b.refusals[0]
+    );
+    assert_eq!(a.pictures.get("pictures/logo.png"), Some(&png));
+    assert_eq!(s.host.pictures().len(), 3);
+
+    // Someone who joins later gets them all.
+    let (_c, _link_c, c) = s.join("Per")?;
+    assert_eq!(c.pictures.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn a_picture_survives_a_json_line() -> TestResult {
+    let data: Vec<u8> = (0..=255).collect();
+    let msg = HostMsg::Picture {
+        picture: picture("underlays/p0001.png", &data),
+    };
+    let line = encode(&msg)?;
+    assert!(line.contains("\"data\":\""), "bytes travel as text: {line}");
+    assert_eq!(decode::<HostMsg>(&line)?, msg);
+    Ok(())
+}
+
+#[test]
+fn an_added_picture_is_committed_with_the_change_that_names_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let journal = GitJournal::open(dir)?;
+    let git = journal.git().clone();
+    git.commit("Start")?;
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(journal));
+    let logo = picture("pictures/logo.png", b"\x89PNG\r\n\x1a\nlogo");
+    host.edit_project(ProjectEdit::AddPicture { picture: logo.clone() })?;
+    assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, logo.data);
+    let mut meta = host.project().meta.clone();
+    meta.logo = Some(wc_core::Logo {
+        file: logo.file.clone(),
+        cover: None,
+    });
+    host.edit_project(ProjectEdit::SetMeta {
+        meta: Box::new(meta),
+        before: None,
+    })?;
+    assert!(
+        git.show("HEAD", "pictures/logo.png").is_some(),
+        "the file is in the change's commit"
+    );
+
+    // A file already in the folder under that name with other content is kept: the picture is
+    // refused.
+    std::fs::write(dir.join("pictures/old.png"), b"old")?;
+    let refused = host.edit_project(ProjectEdit::AddPicture {
+        picture: picture("pictures/old.png", b"new"),
+    });
+    assert!(
+        matches!(&refused, Err(Refusal::NotRecorded { reason }) if reason.contains("another picture")),
+        "{refused:?}"
+    );
+    assert_eq!(std::fs::read(dir.join("pictures/old.png"))?, b"old");
+    assert!(!host.pictures().contains_key("pictures/old.png"));
+    Ok(())
+}
+
+#[test]
+fn a_session_takes_only_so_many_new_pictures() -> TestResult {
+    let mut s = Session::new();
+    for n in 0..MAX_ADDED_PICTURES {
+        s.host.edit_project(ProjectEdit::AddPicture {
+            picture: picture(&format!("pictures/p{n}.png"), b"x"),
+        })?;
+    }
+    let refused = s.host.edit_project(ProjectEdit::AddPicture {
+        picture: picture("pictures/one-more.png", b"x"),
+    });
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { reason }) if reason.contains("at most")),
+        "{refused:?}"
+    );
+    assert_eq!(s.host.pictures().len(), MAX_ADDED_PICTURES);
+    // One the session has already is still fine.
+    s.host.edit_project(ProjectEdit::AddPicture {
+        picture: picture("pictures/p0.png", b"x"),
+    })?;
+    Ok(())
+}
+
+#[test]
+fn a_session_takes_only_so_many_bytes_of_new_pictures() -> TestResult {
+    let mut s = Session::new();
+    let mb = vec![7u8; 1024 * 1024];
+    let fit = MAX_ADDED_PICTURE_BYTES / mb.len();
+    assert!(fit < MAX_ADDED_PICTURES, "the byte limit is reached first");
+    for n in 0..fit {
+        s.host.edit_project(ProjectEdit::AddPicture {
+            picture: picture(&format!("pictures/p{n}.png"), &mb),
+        })?;
+    }
+    let (pictures, recorded) = (s.host.pictures().clone(), s.log.1.borrow().clone());
+    let refused = s.host.edit_project(ProjectEdit::AddPicture {
+        picture: picture("pictures/one-more.png", b"x"),
+    });
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { reason }) if reason.contains("at most")),
+        "{refused:?}"
+    );
+    assert_eq!(s.host.pictures(), &pictures, "the session's pictures are unchanged");
+    assert_eq!(*s.log.1.borrow(), recorded, "nothing more was written");
+    assert_eq!(recorded.len(), fit);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_picture_folder_that_links_out_of_the_project_makes_nothing_there() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("project");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(&elsewhere)?;
+    std::os::unix::fs::symlink(&elsewhere, dir.join("underlays"))?;
+    let r = write_picture(&dir, &picture("underlays/deep/p1.png", b"x"));
+    assert!(r.is_err());
+    assert!(!elsewhere.join("deep").exists(), "no folder made outside the project");
+    Ok(())
+}
+
+#[test]
+fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let pictures = dir.join("pictures");
+    std::fs::create_dir_all(&pictures)?;
+    // A file named like a part file that this write did not make is neither in the way nor
+    // touched.
+    let other = pictures.join(format!(".wc-{}-0-0.part", std::process::id()));
+    std::fs::write(&other, b"someone else's")?;
+    let logo = picture("pictures/logo.png", b"\x89PNG\r\n\x1a\nlogo");
+    write_picture(dir, &logo)?;
+    assert_eq!(std::fs::read(pictures.join("logo.png"))?, logo.data);
+    assert_eq!(std::fs::read(&other)?, b"someone else's");
+    let mut names: Vec<_> = std::fs::read_dir(&pictures)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    names.sort();
+    assert_eq!(
+        names,
+        [other.file_name().ok_or("no name")?.to_owned(), "logo.png".into()],
+        "no part file of its own is left"
+    );
+    // The same picture again is fine; another under that name is refused and changes nothing.
+    write_picture(dir, &logo)?;
+    assert!(write_picture(dir, &picture("pictures/logo.png", b"other")).is_err());
+    assert_eq!(std::fs::read(pictures.join("logo.png"))?, logo.data);
+    Ok(())
+}
+
+#[test]
+fn a_picture_with_a_long_name_that_fits_the_folder_is_written() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // 240 bytes: within the 255 most file systems allow, too long for a part file named after it.
+    let file = format!("pictures/{}.png", "a".repeat(236));
+    let logo = picture(&file, b"\x89PNG\r\n\x1a\nlogo");
+    write_picture(tmp.path(), &logo)?;
+    assert_eq!(std::fs::read(tmp.path().join(&file))?, logo.data);
+    Ok(())
 }

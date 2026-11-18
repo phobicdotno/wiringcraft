@@ -135,8 +135,10 @@ pub(super) struct TestSection {
     pub(super) stored: bool,
     /// How many more times the section map lists each page (a hostile file).
     pub(super) listed_again: usize,
-    /// Added to each page's decompressed size in its header (a damaged file).
+    /// Added to each page's stored data size in its header (a damaged file).
     pub(super) claimed_extra: u32,
+    /// The page size the section map gives instead of the real one (a damaged file).
+    pub(super) page_size: Option<u32>,
 }
 
 const MAX_PAGE_DATA: usize = 0x7400;
@@ -179,7 +181,7 @@ pub(super) fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> 
         let chunks: Vec<&[u8]> = section.data.chunks(MAX_PAGE_DATA).collect();
         map.extend((section.data.len() as u64).to_le_bytes());
         map.extend(((chunks.len() * (1 + section.listed_again)) as u32).to_le_bytes());
-        map.extend((MAX_PAGE_DATA as u32).to_le_bytes());
+        map.extend(section.page_size.unwrap_or(MAX_PAGE_DATA as u32).to_le_bytes());
         map.extend(1u32.to_le_bytes());
         map.extend(if section.stored { 1u32 } else { 2 }.to_le_bytes());
         map.extend((index as u32 + 1).to_le_bytes());
@@ -201,8 +203,9 @@ pub(super) fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> 
             let mut words = [
                 DATA_PAGE,
                 index as u32 + 1,
-                packed.len() as u32,
-                chunk.len() as u32 + section.claimed_extra,
+                packed.len() as u32 + section.claimed_extra,
+                // The page's size in the file: header and data, rounded up to 32 bytes.
+                (DATA_PAGE_HEADER + packed.len()).next_multiple_of(0x20) as u32,
                 start as u32,
                 0,
                 0,
@@ -425,13 +428,13 @@ fn a_damaged_header_is_reported() {
 }
 
 #[test]
-fn cut_or_flipped_files_give_errors_not_panics() {
+fn cut_or_flipped_files_give_errors_not_panics() -> TestResult {
     let file = write_dwg(b"AC1024", &sample_sections());
     // Every cut-off length near the structures, and a sample of the rest.
     for len in (0..file.len()).step_by(7) {
         let _ = read_sections(&file[..len]);
     }
-    assert!(read_sections(&file[..file.len() - 1]).is_err());
+    assert!(read_sections(&file[..page_map_data_end(&file)? - 1]).is_err());
     // Flip bits all over, one place at a time.
     let mut seed = 1u32;
     for i in 0..1500 {
@@ -448,10 +451,11 @@ fn cut_or_flipped_files_give_errors_not_panics() {
         damaged[at] = 0xFF;
         let _ = read_sections(&damaged);
     }
+    Ok(())
 }
 
 #[test]
-fn stored_pages_are_read_and_a_short_one_is_refused() -> TestResult {
+fn stored_pages_are_read_and_a_cut_off_one_is_refused() -> TestResult {
     let section = |claimed_extra| TestSection {
         name: "AcDb:Classes",
         data: noise(300, 3),
@@ -461,10 +465,26 @@ fn stored_pages_are_read_and_a_short_one_is_refused() -> TestResult {
     };
     let read = read_sections(&write_dwg(b"AC1024", &[section(0)]))?;
     assert_eq!(read.get("AcDb:Classes"), Some(noise(300, 3).as_slice()));
-    // The header says the page holds 8 bytes more than are stored.
-    let message = read_sections(&write_dwg(b"AC1024", &[section(8)])).map_err(|e| e.to_string());
+    // The header says the page stores more than its page holds.
+    let message = read_sections(&write_dwg(b"AC1024", &[section(0x10_0000)])).map_err(|e| e.to_string());
     assert!(
-        message.as_ref().is_err_and(|m| m.contains("fewer bytes")),
+        message.as_ref().is_err_and(|m| m.contains("past its page")),
+        "{message:?}"
+    );
+    // Also when another page follows, whose bytes it would otherwise take.
+    let mut first = section(0x40);
+    first.data = noise(300, 4);
+    let next = TestSection {
+        name: "AcDb:Header",
+        data: noise(300, 5),
+        stored: true,
+        ..TestSection::default()
+    };
+    let message = read_sections(&write_dwg(b"AC1024", &[first, next])).map_err(|e| e.to_string());
+    assert!(
+        message
+            .as_ref()
+            .is_err_and(|m| m.contains("AcDb:Classes") && m.contains("past its page")),
         "{message:?}"
     );
     Ok(())
@@ -487,10 +507,7 @@ fn a_page_listed_many_times_cannot_make_endless_work() -> TestResult {
     );
     // Listed five times, the fifth decompression is refused before it starts.
     let message = read_sections_with(&write_dwg(b"AC1024", &[section(4)]), budget).map_err(|e| e.to_string());
-    assert!(
-        message.as_ref().is_err_and(|m| m.contains("decompress to too much")),
-        "{message:?}"
-    );
+    assert!(message.as_ref().is_err_and(|m| m.contains("too much")), "{message:?}");
     Ok(())
 }
 
@@ -563,5 +580,129 @@ fn a_changed_byte_that_still_decompresses_is_caught_by_its_checksum() -> TestRes
     map[section_map + SYSTEM_PAGE_HEADER + packed - 3] ^= 0x01;
     let m = error_of(&map);
     assert!(m.contains("section map") && m.contains("checksum"), "{m}");
+    Ok(())
+}
+
+#[test]
+fn a_last_page_shorter_than_the_page_size_is_read() -> TestResult {
+    // One full compressed page and a short one, then a short stored section.
+    let data = noise(MAX_PAGE_DATA + 100, 5);
+    let sections = [
+        TestSection {
+            name: "AcDb:AcDbObjects",
+            data: data.clone(),
+            ..TestSection::default()
+        },
+        TestSection {
+            name: "AcDb:Classes",
+            data: noise(10, 6),
+            stored: true,
+            ..TestSection::default()
+        },
+    ];
+    let read = read_sections(&write_dwg(b"AC1018", &sections))?;
+    assert_eq!(read.get("AcDb:AcDbObjects"), Some(data.as_slice()));
+    assert_eq!(read.get("AcDb:Classes"), Some(noise(10, 6).as_slice()));
+    // At most the page size, never more.
+    assert!(decompress_at_most(&[0x01, b'a', b'b', b'c', b'd', 0x11], 8).is_ok());
+    assert!(decompress_at_most(&[0x01, b'a', b'b', b'c', b'd', 0x11], 3).is_err());
+    Ok(())
+}
+
+/// Where the page map's data ends (the page map is the last page).
+fn page_map_data_end(file: &[u8]) -> std::result::Result<usize, Box<dyn std::error::Error>> {
+    let at = file
+        .windows(4)
+        .rposition(|w| w == PAGE_MAP.to_le_bytes())
+        .ok_or("no page map")?;
+    let packed = u32::from_le_bytes(file[at + 8..at + 12].try_into()?) as usize;
+    Ok(at + SYSTEM_PAGE_HEADER + packed)
+}
+
+#[test]
+fn a_file_short_of_its_last_padding_is_read_and_one_cut_into_its_data_is_not() -> TestResult {
+    let file = write_dwg(b"AC1024", &sample_sections()[..1]);
+    let end = page_map_data_end(&file)?;
+    // The page map is the last page: cut right after its data (no padding), it is read.
+    assert!(read_sections(&file[..end]).is_ok());
+    // Cut into its data, it is refused.
+    assert!(read_sections(&file[..end - 1]).is_err());
+    Ok(())
+}
+
+#[test]
+fn a_stored_page_listed_many_times_is_bounded_too() -> TestResult {
+    // Each listing of a stored page costs its stored bytes.
+    let section = |listed_again| TestSection {
+        name: "AcDb:AcDbObjects",
+        data: noise(4000, 7),
+        stored: true,
+        listed_again,
+        ..TestSection::default()
+    };
+    let budget = 3 * 4000;
+    assert!(read_sections_with(&write_dwg(b"AC1024", &[section(2)]), budget).is_ok());
+    let message = read_sections_with(&write_dwg(b"AC1024", &[section(3)]), budget).map_err(|e| e.to_string());
+    assert!(message.as_ref().is_err_and(|m| m.contains("too much")), "{message:?}");
+    Ok(())
+}
+
+#[test]
+fn a_compressed_page_costs_what_it_gives_not_the_page_size() -> TestResult {
+    // 300 bytes in a section whose pages may hold 0x7400: fits a budget of 1000.
+    let section = TestSection {
+        name: "AcDb:Classes",
+        data: noise(300, 8),
+        ..TestSection::default()
+    };
+    let read = read_sections_with(&write_dwg(b"AC1024", &[section]), 1000)?;
+    assert_eq!(read.get("AcDb:Classes").map(<[u8]>::len), Some(300));
+    Ok(())
+}
+
+#[test]
+fn a_page_short_of_what_its_section_needs_is_refused() -> TestResult {
+    // Two pages of 0x7400, but the section map says pages hold 0x100 more: the first page
+    // would leave a hole of zeros.
+    let section = TestSection {
+        name: "AcDb:AcDbObjects",
+        data: noise(MAX_PAGE_DATA + 100, 9),
+        page_size: Some(MAX_PAGE_DATA as u32 + 0x100),
+        ..TestSection::default()
+    };
+    let m = read_sections(&write_dwg(b"AC1024", &[section])).map_err(|e| e.to_string());
+    assert!(m.as_ref().is_err_and(|m| m.contains("page 1 gives")), "{m:?}");
+    Ok(())
+}
+
+#[test]
+fn a_section_map_reaching_past_its_page_is_refused() -> TestResult {
+    let mut file = write_dwg(b"AC1024", &sample_sections()[..1]);
+    let at = file
+        .windows(4)
+        .rposition(|w| w == SECTION_MAP.to_le_bytes())
+        .ok_or("no section map")?;
+    let packed = u32::from_le_bytes(file[at + 8..at + 12].try_into()?);
+    file[at + 8..at + 12].copy_from_slice(&(packed + 0x1000).to_le_bytes());
+    let m = read_sections(&file).map_err(|e| e.to_string());
+    assert!(
+        m.as_ref()
+            .is_err_and(|m| m.contains("section map") && m.contains("reaches past its page")),
+        "{m:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_section_with_pages_of_size_0_is_refused() -> TestResult {
+    let section = TestSection {
+        name: "AcDb:Classes",
+        data: noise(300, 10),
+        stored: true,
+        page_size: Some(0),
+        ..TestSection::default()
+    };
+    let m = read_sections(&write_dwg(b"AC1024", &[section])).map_err(|e| e.to_string());
+    assert!(m.as_ref().is_err_and(|m| m.contains("pages of size 0")), "{m:?}");
     Ok(())
 }

@@ -273,6 +273,14 @@ impl Obj {
 
 /// A table entry (BLOCK_HEADER, LAYER) with a name.
 fn entry(v: Version, kind: u16, handle: u64, name: &str) -> Obj {
+    if kind == BLOCK_HEADER {
+        return block_header(v, handle, name, (0.0, 0.0), false);
+    }
+    named(v, kind, handle, name)
+}
+
+/// A table entry's common data and name, nothing after it.
+fn named(v: Version, kind: u16, handle: u64, name: &str) -> Obj {
     let mut o = Obj::new(v, kind, handle);
     o.data.bs(0).bl(0).b(true);
     o.text(name);
@@ -1114,4 +1122,131 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
             },
         ],
     )
+}
+
+/// A BLOCK_HEADER with every field up to its base point; an xref has no owned-object count.
+fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: bool) -> Obj {
+    let mut o = named(v, BLOCK_HEADER, handle, name);
+    match v {
+        Version::R2004 => o.data.b(true).bs(0).b(false),
+        Version::R2010 => o.data.bs(0),
+    };
+    o.data.b(false).b(false).b(xref).b(false).b(false);
+    if !xref {
+        o.data.bl(1);
+    }
+    o.data.bd3((base.0, base.1, 0.0));
+    o
+}
+
+#[test]
+fn a_block_is_placed_by_its_base_point() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        let mut objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            block_header(v, 0x100, "B", (5.0, 5.0), false),
+            block_header(v, 0x101, "X", (5.0, 5.0), true),
+            line(v, 0x202, head(Some(0x101)), (5.0, 5.0), (5.0, 10.0)),
+            line(v, 0x200, head(Some(0x100)), (5.0, 5.0), (10.0, 5.0)),
+            {
+                let mut i = entity(v, 7, 0x201, head(None));
+                i.data.bd3((0.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+                i.handles.h(5, 0x100);
+                i
+            },
+        ];
+        let mut x = entity(v, 7, 0x203, head(None));
+        x.data.bd3((0.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+        x.handles.h(5, 0x101);
+        objs.push(x);
+        let d = drawing(&sections(v, &objs, &[]))?;
+        // An xref block, without the owned-object count, is read right too.
+        assert!(
+            has_line(&d.model, Point::new(0.0, 0.0), Point::new(0.0, -5.0)),
+            "{v:?}: {:?}",
+            d.model
+        );
+        assert!(
+            has_line(&d.model, Point::new(0.0, 0.0), Point::new(5.0, 0.0)),
+            "{v:?}: {:?}",
+            d.model
+        );
+        // The block on its own keeps its coordinates.
+        assert!(
+            has_line(&d.blocks["B"], Point::new(5.0, -5.0), Point::new(10.0, -5.0)),
+            "{:?}",
+            d.blocks["B"]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
+    // A 2004 BLOCK_HEADER whose data ends after its name.
+    let v = Version::R2004;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        named(v, BLOCK_HEADER, 0x100, "CUT"),
+        line(v, 0x200, head(Some(0x100)), (5.0, 5.0), (10.0, 5.0)),
+    ];
+    let read = dxf_drawing(&sections(v, &objs, &[]))?;
+    assert!(
+        read.drawing.blocks.contains_key("CUT"),
+        "{:?}",
+        read.drawing.blocks.keys()
+    );
+    assert_eq!(read.skipped.get(BASE_UNREAD), Some(&1), "{:?}", read.skipped);
+    assert!(!read.skipped.contains_key(DAMAGED), "{:?}", read.skipped);
+    assert!(
+        read.damaged.iter().any(|r| r.contains("base point of block CUT")),
+        "{:?}",
+        read.damaged
+    );
+    Ok(())
+}
+
+#[test]
+fn a_dimension_is_drawn_by_its_block() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        let d1 = head(Some(0x100));
+        let mut objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            entry(v, BLOCK_HEADER, 0x100, "*D1"),
+            line(v, 0x200, d1, (0.0, 0.0), (0.0, 5.0)),
+            line(v, 0x201, d1, (20.0, 0.0), (20.0, 5.0)),
+        ];
+        let mut t = entity(v, 1, 0x202, d1);
+        text_data(&mut t, (10.0, 6.0), "20", 2.5, 0.0);
+        objs.push(t);
+        // A linear dimension (type 21) in model space, then one whose block is missing. Its data
+        // is not read: the block comes after the dimension style in the handle stream.
+        for (h, block) in [(0x300, 0x100), (0x301, 0x999)] {
+            let mut dim = entity(v, 21, h, head(None));
+            dim.handles.h(5, 0x50).h(5, block);
+            objs.push(dim);
+        }
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(
+            has_line(&d.model, Point::new(0.0, 0.0), Point::new(0.0, -5.0)),
+            "{v:?}: {:?}",
+            d.model
+        );
+        assert!(
+            has_line(&d.model, Point::new(20.0, 0.0), Point::new(20.0, -5.0)),
+            "{:?}",
+            d.model
+        );
+        assert_eq!(texts(&d.model), ["20"]);
+        assert_eq!(
+            d.skipped.get("DIMENSION"),
+            Some(&1),
+            "only the one without its block: {:?}",
+            d.skipped
+        );
+    }
+    Ok(())
 }

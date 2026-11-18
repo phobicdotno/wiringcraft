@@ -12,6 +12,7 @@ use crate::writer::{Drawn, Layer, Link, Pen, text_width_mm};
 pub use wc_core::project::FRAME_COLUMNS;
 const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
 const HEADER: f64 = 6.0;
+#[cfg(test)]
 const TITLE_H: f64 = wc_core::template::TITLE_HEIGHT;
 
 /// The column (1-based) a point falls into with the built-in column count; a project's own
@@ -363,19 +364,20 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
         );
     }
     // Title block: a full-width band at the bottom, divided into the template's boxes.
-    let ty = y1 - TITLE_H;
+    let band = template.band_height();
+    let ty = y1 - band;
     line((x0, ty), (x1, ty), Ink::Thick, &mut out);
     let boxes: Vec<_> = template
         .boxes
         .iter()
-        .filter_map(|b| b.resolve(x0, x1).map(|r| (b, r)))
+        .filter_map(|b| b.resolve(x0, x1, band).map(|r| (b, r)))
         .collect();
     // Box sides, less those on the band's outline, with overlapping pieces drawn once.
     let mut across: Vec<(f64, f64, f64)> = Vec::new();
     let mut down: Vec<(f64, f64, f64)> = Vec::new();
     for (_, (l, t, r, b)) in &boxes {
         for y in [*t, *b] {
-            if y > 1e-6 && y < TITLE_H - 1e-6 {
+            if y > 1e-6 && y < band - 1e-6 {
                 across.push((ty + y, *l, *r));
             }
         }
@@ -403,14 +405,31 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
             k => page.title_field(&project.meta, k).to_owned(),
         }
     };
-    for (b, (l, t, r, _)) in &boxes {
+    for (b, (l, t, r, bottom)) in &boxes {
         let top = ty + t;
+        let bottom = ty + bottom;
+        // A box shorter than its layout (a low band) has the whole layout squeezed into it:
+        // every baseline and text height scaled alike, so texts keep apart as they are at full
+        // height instead of piling up on the box's foot.
+        let deepest = b
+            .texts
+            .iter()
+            .map(|bt| bt.y)
+            .chain(b.logo.then_some(LOGO_BASELINE))
+            .fold(LABEL_BASELINE, f64::max);
+        let squeeze = ((bottom - top - BELOW_BASELINE) / deepest).clamp(0.0, 1.0);
         // Labels and values never reach past their box: they shrink to fit, and a box too narrow
         // for any text shows none.
         let label_room = r - l - 2.0 * PAD;
-        if label_room > 0.0 {
-            let h = fit_height(&b.label, 1.8, label_room);
-            text((l + PAD, top + 3.0), h, Align::Left, &b.label, Ink::Label, &mut out);
+        if label_room > 0.0
+            && let Some((y, h)) = fit_in_box(
+                top,
+                bottom,
+                top + LABEL_BASELINE * squeeze,
+                fit_height(&b.label, 1.8, label_room) * squeeze,
+            )
+        {
+            text((l + PAD, y), h, Align::Left, &b.label, Ink::Label, &mut out);
         }
         // Each value is shrunk to the width of its box (less padding), so a long one never runs
         // into the next box or over the frame.
@@ -425,26 +444,49 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
             if room <= 0.0 {
                 continue;
             }
-            let h = fit_height(&shown, bt.size, room);
-            text((x, top + bt.y), h, bt.align, &shown, Ink::Thin, &mut out);
+            let Some((y, h)) = fit_in_box(
+                top,
+                bottom,
+                top + bt.y * squeeze,
+                fit_height(&shown, bt.size, room) * squeeze,
+            ) else {
+                continue;
+            };
+            text((x, y), h, bt.align, &shown, Ink::Thin, &mut out);
         }
         // The project's logo takes a logo box when it has one (see `title_logo_box`).
-        if b.logo && project.meta.logo.is_none() {
-            let h = fit_height("WiringCraft", 2.0, r - l - 2.0 * PAD);
-            text(
-                ((l + r) / 2.0, top + 9.5),
-                h,
-                Align::Center,
-                "WiringCraft",
-                Ink::Thin,
-                &mut out,
-            );
+        if b.logo
+            && project.meta.logo.is_none()
+            && let Some((y, h)) = fit_in_box(
+                top,
+                bottom,
+                top + LOGO_BASELINE * squeeze,
+                fit_height("WiringCraft", 2.0, r - l - 2.0 * PAD) * squeeze,
+            )
+        {
+            text(((l + r) / 2.0, y), h, Align::Center, "WiringCraft", Ink::Thin, &mut out);
         }
     }
     if page.cover {
         cover_marks(project, (x0, y0 + HEADER, x1, ty), date, &mut out);
     }
     out
+}
+
+/// Room kept between a title-block text's baseline and the bottom of its box, for descenders.
+const BELOW_BASELINE: f64 = 0.8;
+/// A title-block box's label baseline, below the box's top.
+const LABEL_BASELINE: f64 = 3.0;
+/// The baseline of "WiringCraft" in a logo box of a project without a logo, below its top.
+const LOGO_BASELINE: f64 = 9.5;
+
+/// Where text of height `h` with its baseline at `y` goes in a title-block box from `top` to
+/// `bottom`: moved up to stay inside it, and shrunk when the box is too short for it.
+/// `None` when no text fits.
+fn fit_in_box(top: f64, bottom: f64, y: f64, h: f64) -> Option<(f64, f64)> {
+    let y = y.min(bottom - BELOW_BASELINE);
+    let h = h.min(y - top);
+    (h > 0.5).then_some((y, h))
 }
 
 /// The title block's logo box on `page` (top-left and bottom-right, in millimetres): the
@@ -458,14 +500,15 @@ pub fn title_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> 
 pub fn title_logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
     let (w, h) = page.size.mm();
     let (x0, x1, y1) = (MARGIN, w - MARGIN, h - MARGIN);
-    let ty = y1 - TITLE_H;
+    let band = project.meta.template.band_height();
+    let ty = y1 - band;
     project
         .meta
         .template
         .boxes
         .iter()
         .filter(|b| b.logo)
-        .filter_map(|b| b.resolve(x0, x1))
+        .filter_map(|b| b.resolve(x0, x1, band))
         .map(|(l, t, r, b)| (Point::new(l + 1.0, ty + t + 1.0), Point::new(r - 1.0, ty + b - 1.0)))
         .filter(|(a, b)| a.x < b.x && a.y < b.y)
         .collect()
@@ -473,9 +516,10 @@ pub fn title_logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
 
 /// Where the cover page shows the logo until the user moves it: centred above the project's
 /// name.
-pub fn cover_logo_default(page: &Page) -> (Point, Point) {
+pub fn cover_logo_default(project: &Project, page: &Page) -> (Point, Point) {
     let (w, h) = page.size.mm();
-    let (x0, y0, x1, ty) = (MARGIN, MARGIN + HEADER, w - MARGIN, h - MARGIN - TITLE_H);
+    let band = project.meta.template.band_height();
+    let (x0, y0, x1, ty) = (MARGIN, MARGIN + HEADER, w - MARGIN, h - MARGIN - band);
     let cx = (x0 + x1) / 2.0;
     let name_y = y0 + (ty - y0) * 0.2;
     let top = y0 + 4.0;
@@ -496,7 +540,7 @@ pub fn cover_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> 
             Point::new(a.x.min(b.x), a.y.min(b.y)),
             Point::new(a.x.max(b.x), a.y.max(b.y)),
         ),
-        None => cover_logo_default(page),
+        None => cover_logo_default(project, page),
     })
 }
 
@@ -819,10 +863,11 @@ const TABLE_TEXT: f64 = 2.2;
 const ROW_H: f64 = 4.6;
 const CELL_PAD: f64 = 1.5;
 
-/// How many table rows fit on one report page of this size (below the heading and header row).
-pub fn rows_per_page(size: PageSize) -> usize {
+/// How many table rows fit on one report page of this size (below the heading and header row),
+/// above a title block band `band` mm high.
+pub fn rows_per_page(size: PageSize, band: f64) -> usize {
     let (_, h) = size.mm();
-    let usable = h - 2.0 * MARGIN - HEADER - TITLE_H - 14.0 - ROW_H;
+    let usable = h - 2.0 * MARGIN - HEADER - band - 14.0 - ROW_H;
     ((usable / ROW_H).floor() as usize).max(1)
 }
 
@@ -893,7 +938,11 @@ pub fn draw_table_page(
     pen.text((x0, y), 4.0, 0, &heading);
     y += 4.0;
     let widths = column_widths(table, x1 - x0);
-    let rows = table.rows.iter().skip(first).take(rows_per_page(page.size));
+    let rows = table
+        .rows
+        .iter()
+        .skip(first)
+        .take(rows_per_page(page.size, project.meta.template.band_height()));
     // Header row on a grey band.
     pen.colour(0.88, 0.89, 0.91);
     pen.fill_rect((x0, y), (x1, y + ROW_H));
@@ -974,7 +1023,8 @@ pub fn draw_panel_page(
     frame(&mut pen, project, page, index, total, date);
     // Drawing area inside the frame, above the title block, with room for the caption.
     let (ax0, ay0) = (MARGIN + 10.0, MARGIN + HEADER + 10.0);
-    let (ax1, ay1) = (w - MARGIN - 10.0, h - MARGIN - TITLE_H - 14.0);
+    let band = project.meta.template.band_height();
+    let (ax1, ay1) = (w - MARGIN - 10.0, h - MARGIN - band - 14.0);
     let (pw, ph) = (panel.width.max(1.0), panel.height.max(1.0));
     let fit = ((ax1 - ax0) / pw).min((ay1 - ay0) / ph);
     // A standard reduction (1:2, 1:5, 1:10, ...) that fits.
@@ -1032,7 +1082,7 @@ pub fn draw_panel_page(
     }
     let devices = panel.device_tags().len();
     pen.text(
-        (ax0, h - MARGIN - TITLE_H - 5.0),
+        (ax0, h - MARGIN - band - 5.0),
         2.5,
         0,
         &format!(
@@ -1378,6 +1428,144 @@ mod template_tests {
         let (w, _) = page.size.mm();
         assert_eq!(p.column_of(&page, w - MARGIN - 1.0), 12);
         assert_eq!(p.column_of(&page, MARGIN + (w - 2.0 * MARGIN) / 12.0 + 0.1), 2);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_taller_title_block_moves_its_line_and_keeps_boxes_inside() {
+        let (mut p, page) = demo(PageSize::A3, true);
+        let (w, h) = page.size.mm();
+        let (x0, x1, y1) = (MARGIN, w - MARGIN, h - MARGIN);
+        let before = rows_per_page(page.size, p.meta.template.band_height());
+        let mut t = PageTemplate {
+            height: 36.0,
+            ..Default::default()
+        };
+        // A box filling the lower 12 mm the default layout leaves free.
+        t.boxes.push(TitleBox::new(
+            "Notes",
+            (0.0, Side::Left),
+            (0.0, Side::Right),
+            24.0,
+            36.0,
+        ));
+        p.meta.template = t;
+        let marks = frame_marks(&p, &page, 0, 1, "");
+        let thick: Vec<(Point, Point)> = marks
+            .iter()
+            .filter(|m| m.ink == Ink::Thick)
+            .filter_map(|m| match &m.shape {
+                Shape::Line { a, b } if (a.y - b.y).abs() < 1e-9 => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        let ty = y1 - 36.0;
+        assert!(
+            thick
+                .iter()
+                .any(|(a, b)| (a.y - ty).abs() < 1e-9 && a.x == x0 && b.x == x1),
+            "the band's top line moved up: {thick:?}"
+        );
+        // The Notes box's top side is drawn 24 mm down the band, across the frame.
+        assert!(marks.iter().any(|m| matches!(&m.shape,
+            Shape::Line { a, b } if (a.y - (ty + 24.0)).abs() < 1e-9 && (b.y - a.y).abs() < 1e-9)));
+        // Everything of the title block stays inside it.
+        for m in &marks {
+            if let Shape::Text { at, .. } = &m.shape
+                && at.y > ty
+            {
+                assert!(at.y <= y1, "{at:?}");
+            }
+        }
+        let (a, b) = title_logo_box(&p, &page).unwrap();
+        assert!(a.y > ty && b.y < y1, "the logo stays in its box: {a:?} {b:?}");
+        // Report pages fit fewer rows, and the cover logo stays above the band.
+        assert!(rows_per_page(page.size, p.meta.template.band_height()) < before);
+        assert!(cover_logo_default(&p, &page).1.y < ty);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_shorter_title_block_keeps_its_texts_inside_the_frame() {
+        let (mut p, page) = demo(PageSize::A3, true);
+        let (w, h) = page.size.mm();
+        let (x0, x1, y1) = (MARGIN, w - MARGIN, h - MARGIN);
+        // The default layout already fits its boxes, so the 24 mm band is drawn as before.
+        let default = PageTemplate::default();
+        for b in &default.boxes {
+            let (_, t, _, bottom) = b.resolve(x0, x1, default.band_height()).unwrap();
+            for bt in &b.texts {
+                assert!(t + bt.y <= bottom - BELOW_BASELINE, "{} {:?}", b.label, bt.values);
+                assert!(bt.size <= bt.y, "{} {:?}", b.label, bt.values);
+            }
+        }
+        p.meta.template = PageTemplate {
+            height: 20.0,
+            ..Default::default()
+        };
+        let ty = y1 - 20.0;
+        let marks = frame_marks(&p, &page, 0, 1, "");
+        let mut seen = 0;
+        for m in &marks {
+            if let Shape::Text { at, height, text, .. } = &m.shape
+                && at.y > ty
+            {
+                seen += 1;
+                assert!(at.y <= y1 - BELOW_BASELINE + 1e-9, "{text} below the frame: {at:?}");
+                assert!(at.y - height >= ty - 1e-9, "{text} above the band: {at:?} {height}");
+            }
+        }
+        assert!(seen > 0, "the title block shows its texts");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_lowest_title_block_squeezes_its_texts_without_overprinting() {
+        let (mut p, page) = demo(PageSize::A3, true);
+        p.meta.name = "Pump station".into();
+        let (_, h) = page.size.mm();
+        let y1 = h - MARGIN;
+        let band = wc_core::template::MIN_TITLE_HEIGHT;
+        p.meta.template = PageTemplate {
+            height: band,
+            ..Default::default()
+        };
+        let ty = y1 - band;
+        let marks = frame_marks(&p, &page, 0, 1, "");
+        // Every title-block text as the rectangle it covers.
+        let rects: Vec<(String, f64, f64, f64, f64)> = marks
+            .iter()
+            .filter_map(|m| match &m.shape {
+                Shape::Text {
+                    at,
+                    text,
+                    height,
+                    align,
+                    ..
+                } if at.y > ty => {
+                    let w = crate::text_width_mm(text, *height);
+                    let left = match align {
+                        Align::Left => at.x,
+                        Align::Center => at.x - w / 2.0,
+                        Align::Right => at.x - w,
+                    };
+                    Some((text.clone(), left, left + w, at.y - height, at.y))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(rects.iter().any(|r| r.0 == "Pump station"), "{rects:?}");
+        assert!(rects.iter().any(|r| r.0 == page.title), "{rects:?}");
+        for (i, a) in rects.iter().enumerate() {
+            assert!(
+                a.3 >= ty - 1e-9 && a.4 <= y1 - BELOW_BASELINE + 1e-9,
+                "{a:?} leaves the band"
+            );
+            for b in &rects[i + 1..] {
+                let apart = a.2 <= b.1 + 1e-9 || b.2 <= a.1 + 1e-9 || a.4 <= b.3 + 1e-9 || b.4 <= a.3 + 1e-9;
+                assert!(apart, "{a:?} overprints {b:?}");
+            }
+        }
     }
 
     fn texts(marks: &[FrameMark]) -> Vec<(String, f64)> {

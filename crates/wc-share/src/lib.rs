@@ -24,6 +24,10 @@
 //! The host and guests are plain state machines with no I/O; [`transport`] connects them
 //! in-process and [`net`] over TCP; [`discovery`] finds sessions on the local network.
 //! Tests run whole sessions both ways.
+//!
+//! Picture files (the logo, page underlays) are not project data but travel too: the host sends
+//! each one after the welcome, and a participant that adds one sends it as a
+//! [`ProjectEdit::AddPicture`] before the change that names it.
 
 pub mod discovery;
 mod guest;
@@ -37,8 +41,11 @@ pub mod transport;
 pub use guest::{Guest, GuestStatus};
 pub use history::{ChangeInfo, ChangeKind, MAX_HISTORY, Parts, note, redo_target, undo_target};
 pub use host::{HOST, Host};
-pub use journal::{Change, GitJournal, Journal, MemoryJournal};
-pub use protocol::{GuestMsg, HostMsg, Peer, PeerId, ProjectEdit, Refusal, Snapshot, apply_edit, same_but_number};
+pub use journal::{Change, GitJournal, Journal, MemoryJournal, write_picture};
+pub use protocol::{
+    GuestMsg, HostMsg, MAX_ADDED_PICTURE_BYTES, MAX_ADDED_PICTURES, MAX_PICTURE, Peer, PeerId, Picture, ProjectEdit,
+    Refusal, Snapshot, apply_edit, same_but_number,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

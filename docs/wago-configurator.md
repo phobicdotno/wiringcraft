@@ -18,7 +18,7 @@ Strips come in natural tag order (`-X2` before `-X10`). For each strip:
 | Plate | each panel layout that holds the strip device or one of its terminals | Plate (the layout's name), Description (`Mounting plate 600 x 800 mm`) |
 | Rail | each DIN rail of that layout that the strip's footprints sit on | Plate, Rail (its number on the plate, from 1, in the layout's order), Rail length (mm), Rail rotation |
 | Terminal | each terminal, in strip order | Position, Terminal (its number), Level, Article, Manufacturer, Description, the wires' section and colour on each side |
-| Jumper | each jumper of the strip | Connects (the terminals it joins), Description (`3-way jumper`) |
+| Jumper | each jumper of the strip | Connects (the terminals it joins); Article, Manufacturer and Description from the jumper's part (`wiringcraft jumper part`, or the terminal's properties in the app), else Description `3-way jumper` |
 | Accessory | the strip device's own part and accessories (end plates, end stops), then each terminal device's accessories, once per device | Article, Manufacturer, Description, Quantity, Connects (the terminal, for a terminal's accessory) |
 
 A terminal's article is the part of the device it is drawn as: `-X1.3`, or the strip device
@@ -43,7 +43,8 @@ devices row by row.
 ## Import back
 
 `wiringcraft import wago <file>` (app: File → WAGO articles back; ribbon: Start → Project) reads
-the list after the configurator has filled in the articles, and writes them onto the project:
+the list after the configurator has filled in the articles, and writes them onto the project's
+devices and jumpers:
 
 - The header must have the `Index` and `Article` columns; `Type`, `Strip`, `Terminal`,
   `Connects`, `Manufacturer` and `Quantity` are read when present. The leading `'` the export puts on some
@@ -58,14 +59,20 @@ the list after the configurator has filled in the articles, and writes them onto
 - A Terminal row's article becomes the part of the terminal device (`-X1.3`, or the strip device
   for terminals tagged only with the strip). An accessory row's article and quantity replace that
   accessory; `<strip>/S` is the strip device's own part.
+- A Jumper row's article becomes the part of the strip's jumper with that number
+  (`-X1/J2` is the second jumper of `-X1`, in the order the export writes them), as with
+  `wiringcraft jumper part`. The row's Connects must still name the jumper's terminals (spaces
+  do not matter); otherwise the jumpers changed since the export and the row is not taken.
 - A row the configurator added without an index, with a Strip the project has, becomes a new
-  accessory of the strip device (unless it has that part already), with its quantity.
+  accessory of the strip device (unless it has that part already), with its quantity. A row
+  without an index that is a Jumper, or has no Type but names terminals in Connects, is not taken:
+  it may be a jumper that lost its index.
 - In the app it is one undo step.
 
 Every row with an article that is not taken is listed with the reason: an index the project no
 longer has, or whose type, terminal number or (for an accessory) terminal in Connects changed
-(export again), a terminal's accessory in a file without the Connects column, a jumper (jumpers have no
-part yet), a plate or rail, an article no part has (import the maker's catalogue into a library
+(export again), a jumper whose terminals in Connects changed (export again), a terminal's
+accessory or a jumper in a file without the Connects column, a plate or rail, an article no part has (import the maker's catalogue into a library
 first, e.g. `import parts-bmecat`), an article several parts have, or two rows that give one
 device part different articles or quantities (neither is taken, and both are listed). Importing the same list twice changes nothing the
 second time.
@@ -77,8 +84,6 @@ second time.
   columns in the configurator's article-list (Excel/CSV) import; the other columns say where
   each item goes. This layout has not been checked against a live configurator yet.
 - Rails in WiringCraft's panel layouts are horizontal, so the rotation is always `0`.
-- Jumpers have no part of their own yet: their Article is empty, and an article chosen for a
-  jumper is listed as not matched on import.
 - Strip tags such as `-X1` start with `-`; a spreadsheet that opens the file may take them for
   formulas. The WAGO tools read them as text, as in the marker export, so such tags are written
   as they are. A tag with a function or location aspect (`=A-X1`, `+C1-X1`) gets a leading `'`

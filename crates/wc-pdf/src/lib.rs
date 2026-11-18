@@ -99,7 +99,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     let xref = layout::CrossRefs::build(project, symbols);
     // Report pages use the size of the first schematic page and are counted in the sheet total.
     let size = pages.first().map(|p| p.size).unwrap_or_default();
-    let per_page = layout::rows_per_page(size);
+    let per_page = layout::rows_per_page(size, project.meta.template.band_height());
     // Each report page: (table, first row, part, parts). Front tables (the table of contents)
     // come before the schematic pages, the rest after them.
     let split = |front: bool| -> Vec<(usize, usize, usize, usize)> {
