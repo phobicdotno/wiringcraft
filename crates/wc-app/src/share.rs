@@ -214,12 +214,28 @@ fn take_back_pages(
     // The records it touched as the session has them now: a later change to one may have come
     // in with the refusal.
     let mut parts = wc_share::Parts::read(auth, &records);
+    // Another page it touched (one renumbered with it) takes back only its display number:
+    // its content is not what was refused.
+    let numbers: Vec<(String, String)> = std::mem::take(&mut parts.pages)
+        .into_iter()
+        .filter(|(id, _)| !ids.contains(id))
+        .filter_map(|(id, page)| Some((id, page?.number)))
+        .collect();
+    let renumber = |project: &mut Project| {
+        for (id, number) in &numbers {
+            if let Some(page) = project.page_mut(id) {
+                page.number.clone_from(number);
+            }
+        }
+    };
+    renumber(&mut open.project);
     for id in ids {
         parts.pages.insert(id.clone(), auth.page(id).cloned());
     }
     parts.apply(&mut open.project);
     if let Some(base) = base {
         parts.apply(base);
+        renumber(base);
     }
     open.dirty = true;
     notes.push(format!(
