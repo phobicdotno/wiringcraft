@@ -562,14 +562,16 @@ fn a_part_taken_back_leaves_the_part_list_unless_a_library_offers_it() -> TestRe
     let mut auth = open.project.clone();
     auth.lock = Default::default();
     auth.devices.clear();
-    let mut unload = std::collections::BTreeSet::new();
-    assert_eq!(follow_take_backs(&mut seen, &mut unload, &mut open, &base, &auth), None);
+    let (mut unload, mut delist) = Default::default();
+    follow_take_backs(&mut seen, &mut unload, &mut delist, &mut open, &base, &auth);
     assert!(
         open.parts.contains_key("own.part"),
         "still drawn until the session's change is in"
     );
     assert!(incoming(&mut open.project, &auth));
     unload_taken_back(&mut unload, &mut open);
+    assert_eq!(delist_taken_back(&mut delist, &mut open), None);
+    assert!(delist.is_empty());
     // Reading the lists again does not bring the stale part back either.
     open.refresh_library();
     assert!(open.project.lock.parts.is_empty());
@@ -1523,6 +1525,13 @@ fn a_symbol_taken_from_the_session_is_offered_in_the_symbol_list() -> TestResult
     assert!(take_files(&mut open, &offered, &BTreeMap::new()).is_empty());
     assert!(open.symbols.contains_key("wc.coil"));
     assert!(open.library.iter().any(|(i, _)| i == "wc.coil"));
+    // A newer definition under the same id is listed by its new name.
+    let mut renamed = open.symbols["wc.coil"].clone();
+    renamed.name = "Coil B".into();
+    open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = renamed.hash();
+    let offered = [("wc.coil".to_owned(), renamed)].into_iter().collect();
+    assert!(take_files(&mut open, &offered, &BTreeMap::new()).is_empty());
+    assert!(open.library.iter().any(|(i, n)| i == "wc.coil" && n == "Coil B"));
     Ok(())
 }
 
