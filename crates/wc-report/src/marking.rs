@@ -16,7 +16,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::DeviceTag;
-use wc_core::symbol::SymbolRole;
 
 use crate::{Inputs, Table, natural_key};
 
@@ -385,10 +384,7 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
                 // terminal when its tag has a terminal level (`-X1.3`).
                 let role = i.symbols.get(&s.symbol).map(|y| y.role);
                 if let Some(tag) = &s.tag
-                    && match role {
-                        Some(r) => r == SymbolRole::Terminal,
-                        None => wc_core::project::is_terminal(tag, None),
-                    }
+                    && crate::counts_as_terminal(role, Some(tag))
                 {
                     terminals.insert(tag.clone());
                 }
