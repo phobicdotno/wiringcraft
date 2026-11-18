@@ -2502,6 +2502,40 @@ fn jumpers_from_the_terminal_strip_editor_become_the_strips_jumper() {
 }
 
 #[test]
+fn a_jumper_to_a_terminal_without_a_number_is_refused_with_its_reason() {
+    let c = sample_with_strip();
+    // A terminal on the strip with no name: its tag path `-X1.9` must not stand in for a number.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (204, '', '-X1.9', 4, 200, 4);
+         INSERT INTO tew_symbol VALUES (23, 10, 204, 'Terminal', 210, 200, 0, 1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (23, 0, 0, 0, 5), (23, 0, 1, 0, -5);
+         INSERT INTO tew_componentelement VALUES (63, 23, 0, 204, 0);
+         INSERT INTO tew_componentterminal VALUES (63, 0, NULL), (63, 1, NULL);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (93, NULL, -1, '', 60, 0, 63, 1);",
+    )
+    .unwrap();
+    let (built, warnings, report) = build(&read(&c).unwrap(), None);
+    assert!(built.jumpers.is_empty(), "{:?}", built.jumpers);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("1 jumper record(s)") && w.contains("a terminal has no number of its own")),
+        "{warnings:?}"
+    );
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(
+        ends.note
+            .contains("1 are jumpers between terminals of one strip that no drawn line carries, not imported"),
+        "{}",
+        ends.note
+    );
+}
+
+#[test]
 fn archive_names_with_dot_slash_are_read_like_plain_ones() {
     let library = model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]);
     let other = model_space_dwg(&[E::Line((0.0, 0.0), (9.0, 9.0))]);

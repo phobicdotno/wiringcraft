@@ -1719,6 +1719,8 @@ pub fn build_with(
         p.components.values().partition(|c| strip_of(c).is_some());
     let mut loose_terminals = 0usize;
     let mut strip_terminals = 0usize;
+    // Terminals that kept their strip's tag and their own number: only these can take jumpers.
+    let mut numbered_terminals: BTreeSet<i64> = BTreeSet::new();
     for c in others_first.into_iter().chain(terminals) {
         let own = || {
             device_tag(&c.tag).map(|mut t| {
@@ -1728,6 +1730,7 @@ pub fn build_with(
                 t
             })
         };
+        let mut numbered = false;
         let tag = if c.kind == COMPONENT_ARROW {
             arrows += 1;
             DeviceTag::parse(&format!("-OD{arrows}")).ok()
@@ -1741,6 +1744,7 @@ pub fn build_with(
                     let mut t = strip_tag.clone();
                     t.product.push(number);
                     strip_terminals += 1;
+                    numbered = true;
                     Some(t)
                 }
                 _ => {
@@ -1756,7 +1760,11 @@ pub fn build_with(
         };
         match tag {
             Some(t) => {
-                tags.insert(c.id, unique(t, &mut taken, &mut renamed));
+                let kept = unique(t.clone(), &mut taken, &mut renamed);
+                if numbered && kept == t {
+                    numbered_terminals.insert(c.id);
+                }
+                tags.insert(c.id, kept);
             }
             None => untagged += 1,
         }
@@ -2311,7 +2319,7 @@ pub fn build_with(
     // editor, and become WiringCraft jumpers (chained records merge into one).
     let mut jumper_meta = wc_core::Project::new("").meta;
     let mut jumper_records = 0usize;
-    let mut jumpers_unusable = 0usize;
+    let mut jumpers_unusable: BTreeMap<String, usize> = BTreeMap::new();
     // Judged on the source, not on what was imported: a wire whose line collapsed to zero length
     // or sits on a page left out is still drawn there, and stays a mismatch.
     let carried = &p.wires_on_lines;
@@ -2335,35 +2343,11 @@ pub fn build_with(
             ends_not_drawn += 1;
             continue;
         };
-        match (net_of.get(pa), net_of.get(pb)) {
-            (Some(x), Some(y)) if x == y => ends_agree += 1,
-            _ if !carried.contains(&w.id) => {
-                // Not on any drawn line: a jumper made in the terminal strip editor, or a
-                // connection the source keeps only in its wire list.
-                match (strip_of_element(a.0), strip_of_element(b.0)) {
-                    (Some(x), Some(y)) if x == y => {
-                        // Both terminals tagged as the strip's own, one level below it.
-                        let terminal = |el: i64| {
-                            let t = tags.get(element_component.get(&el)?)?;
-                            let strip = tags.get(&x)?;
-                            let (number, above) = t.product.split_last()?;
-                            (t.function == strip.function && t.location == strip.location && above == strip.product)
-                                .then(|| number.clone())
-                        };
-                        let added = match (terminal(a.0), terminal(b.0), tags.get(&x)) {
-                            (Some(ta), Some(tb), Some(strip)) => jumper_meta.add_jumper(strip, &[ta, tb]).is_ok(),
-                            _ => false,
-                        };
-                        if added {
-                            jumper_records += 1;
-                        } else {
-                            jumpers_unusable += 1;
-                        }
-                    }
-                    _ => records_undrawn += 1,
-                }
-            }
-            _ => {
+        let agree = matches!((net_of.get(pa), net_of.get(pb)), (Some(x), Some(y)) if x == y);
+        if carried.contains(&w.id) {
+            if agree {
+                ends_agree += 1;
+            } else {
                 let name = if w.tag.trim().is_empty() {
                     format!("wire {}", w.id)
                 } else {
@@ -2371,9 +2355,54 @@ pub fn build_with(
                 };
                 ends_apart.push(format!("{name}: {la} and {lb}"));
             }
+            continue;
+        }
+        // Not on any drawn line: a jumper made in the terminal strip editor, or a connection the
+        // source keeps only in its wire list. A jumper counts even where the drawing already
+        // joins the two terminals, so the terminal plan shows it.
+        let same_strip = match (strip_of_element(a.0), strip_of_element(b.0)) {
+            (Some(x), Some(y)) if x == y => Some(x),
+            _ => None,
+        };
+        let Some(x) = same_strip else {
+            if agree {
+                ends_agree += 1;
+            } else {
+                records_undrawn += 1;
+            }
+            continue;
+        };
+        // Both terminals tagged as the strip's own and numbered, one level below it.
+        let terminal = |el: i64| {
+            let c = element_component.get(&el)?;
+            numbered_terminals.contains(c).then_some(())?;
+            let t = tags.get(c)?;
+            let strip = tags.get(&x)?;
+            let (number, above) = t.product.split_last()?;
+            (t.function == strip.function && t.location == strip.location && above == strip.product)
+                .then(|| number.clone())
+        };
+        let refused = match (terminal(a.0), terminal(b.0), tags.get(&x)) {
+            (Some(ta), Some(tb), Some(strip)) => jumper_meta.add_jumper(strip, &[ta, tb]).err().map(|e| e.to_string()),
+            (_, _, None) => Some("the strip has no tag".to_string()),
+            _ => Some("a terminal has no number of its own on the strip".to_string()),
+        };
+        match refused {
+            None => jumper_records += 1,
+            Some(why) => {
+                *jumpers_unusable.entry(why).or_insert(0) += 1;
+            }
         }
     }
     built.jumpers = jumper_meta.jumpers;
+    let jumpers_refused: usize = jumpers_unusable.values().sum();
+    if jumpers_refused > 0 {
+        let why: Vec<String> = jumpers_unusable.iter().map(|(why, n)| format!("{n}: {why}")).collect();
+        warnings.push(format!(
+            "{jumpers_refused} jumper record(s) between terminals of one strip were not imported ({})",
+            why.join("; ")
+        ));
+    }
     if !ends_apart.is_empty() {
         let shown: Vec<&str> = ends_apart.iter().take(5).map(String::as_str).collect();
         let more = ends_apart.len().saturating_sub(shown.len());
@@ -2669,8 +2698,8 @@ pub fn build_with(
                     "are jumpers between terminals of one strip that no drawn line carries, made into the strip's jumpers",
                 ),
                 (
-                    jumpers_unusable,
-                    "are jumpers between terminals of one strip that no drawn line carries, not imported: a terminal has no number on the strip",
+                    jumpers_refused,
+                    "are jumpers between terminals of one strip that no drawn line carries, not imported (see the warnings)",
                 ),
                 (records_undrawn, "are in the source's wire list but on no drawn line"),
                 (one_end_named, "more name only one terminal (not checked)"),

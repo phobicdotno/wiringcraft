@@ -723,6 +723,12 @@ fn save(dir: &Path, p: &Project) -> Res<()> {
     store::save(dir, &p).map(|_| ()).map_err(e)
 }
 
+/// Save a project whose jumpers already follow their terminals: after `add_built`, which
+/// moves the project's own jumpers itself and adds the imported ones with their final numbers.
+fn save_imported(dir: &Path, p: &Project) -> Res<()> {
+    store::save(dir, p).map(|_| ()).map_err(e)
+}
+
 /// The `find` output: one hit per line, the page number (`-` for a device not drawn), the
 /// kind and the value, separated by tabs.
 fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
@@ -1808,7 +1814,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let (n_dev, n_pages) = (built.devices.len(), built.pages.len());
             let n_drawn = built.pages.iter().filter(|pg| pg.id.starts_with("eplan-page-")).count();
             add_built(dir, &mut p, built, &source)?;
-            save(dir, &p)?;
+            save_imported(dir, &p)?;
             println!(
                 "imported {} Eplan pages as {n_pages} page(s), {n_drawn} of them as drawn: {n_dev} devices, {} \
                  connections",
@@ -1914,7 +1920,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .unwrap_or_default()
             );
             let n_sym = add_swe_built(dir, &mut p, built, &source, &choice.1)?;
-            save(dir, &p)?;
+            save_imported(dir, &p)?;
             println!(
                 "{:<18} {:>8} {:>9}  why the rest is not imported",
                 "", "source", "imported"
@@ -1966,7 +1972,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             // Through the shared preflight: conflicts are refused before anything is written.
             let (n_pages, n_dev) = (built.pages.len(), built.devices.len());
             add_built(dir, &mut p, built, &source)?;
-            save(dir, &p)?;
+            save_imported(dir, &p)?;
             println!(
                 "imported {n_dev} devices, {} connections on {n_pages} page(s)",
                 imp.links.len()
@@ -2767,7 +2773,7 @@ fn import_swe_library(
                 ..Default::default()
             };
             add_built(dir, &mut p, built, source)?;
-            save(dir, &p)?;
+            save_imported(dir, &p)?;
         }
     }
     Ok((got.report, got.warnings))
@@ -3195,13 +3201,23 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
         ));
     }
     // Jumpers join the project's own: one that shares a terminal with a jumper of the same
-    // strip becomes one jumper with it.
+    // strip becomes one jumper with it. Checked here, before anything is written.
     let mut jumpers = p.meta.clone();
     for j in &built.jumpers {
         jumpers
             .add_jumper(&j.strip, &j.terminals)
             .map_err(|why| format!("jumper on {}: {why}", j.strip))?;
     }
+    // The imported pages can renumber the project's terminals tagged with only their strip, so
+    // the project's own jumpers follow first; the imported ones already have the final numbers.
+    let before = if p.meta.jumpers.is_empty() {
+        None
+    } else {
+        let (symbols, _) = store::vendored_symbols(dir, p);
+        Some(wc_core::project::terminal_numbers(p, |id| {
+            symbols.get(id).map(|s| s.role)
+        }))
+    };
     fill_cover(p, cover_fields);
     for s in &built.symbols {
         store::write_vendored_symbol(dir, s).map_err(e)?;
@@ -3239,7 +3255,15 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
     for loc in built.locations {
         p.meta.merge_location(loc);
     }
-    p.meta.jumpers = jumpers.jumpers;
+    if let Some(before) = before {
+        let (symbols, _) = store::vendored_symbols(dir, p);
+        wc_core::project::follow_terminals_in(p, &before, |id| symbols.get(id).map(|s| s.role));
+    }
+    for j in &built.jumpers {
+        p.meta
+            .add_jumper(&j.strip, &j.terminals)
+            .map_err(|why| format!("jumper on {}: {why}", j.strip))?;
+    }
     p.panels.extend(built.panels);
     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
@@ -4041,6 +4065,76 @@ mod tests {
         let mut sets: Vec<Vec<String>> = p.meta.jumpers.iter().map(|j| j.terminals.clone()).collect();
         sets.sort();
         assert_eq!(sets, [vec!["3", "4", "5"], vec!["7", "8"]]);
+    }
+
+    #[test]
+    fn imported_jumpers_keep_their_numbers_when_the_import_renumbers_the_projects_terminals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let terminal = |id: &str, x: f64, tag: &str| PlacedSymbol {
+            id: id.into(),
+            symbol: "test.term".into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse(tag).ok(),
+        };
+        let mut p = load(&dir).unwrap();
+        // A terminal symbol in the project, so terminals tagged with only their strip count.
+        let term = wc_core::Symbol {
+            id: "test.term".into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        store::write_vendored_symbol(&dir, &term).unwrap();
+        // -X1.1, then two terminals tagged with only the strip: numbered 2 and 3.
+        p.pages[0].symbols.extend([
+            terminal("a", 10.0, "-X1.1"),
+            terminal("b", 20.0, "-X1"),
+            terminal("c", 30.0, "-X1"),
+        ]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["2".into(), "3".into()]).unwrap();
+        save(&dir, &p).unwrap();
+        // The import brings -X1.2 and -X1.9: the strip-only terminals become 10 and 11.
+        let mut page = p.pages[0].clone();
+        page.id = "imported".into();
+        page.number = "99".into();
+        page.cover = false;
+        page.overview = false;
+        page.symbols = vec![terminal("d", 10.0, "-X1.2"), terminal("e", 20.0, "-X1.9")];
+        let built = wc_import::aml::Built {
+            pages: vec![page],
+            jumpers: vec![wc_core::project::Jumper {
+                strip: x1.clone(),
+                terminals: vec!["1".into(), "2".into()],
+                part: None,
+            }],
+            ..Default::default()
+        };
+        let mut p = load(&dir).unwrap();
+        add_built(&dir, &mut p, built, "import:a.tewzip").unwrap();
+        save_imported(&dir, &p).unwrap();
+        let mut sets: Vec<Vec<String>> = load(&dir)
+            .unwrap()
+            .meta
+            .jumpers
+            .iter()
+            .map(|j| {
+                let mut t = j.terminals.clone();
+                t.sort();
+                t
+            })
+            .collect();
+        sets.sort();
+        assert_eq!(sets, [vec!["1", "2"], vec!["10", "11"]]);
     }
 
     #[test]
