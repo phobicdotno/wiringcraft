@@ -13,6 +13,7 @@ mod feedback;
 mod find_window;
 mod icons;
 mod import_symbols;
+mod layers;
 mod panel_view;
 mod panels;
 mod prefs;
@@ -176,6 +177,8 @@ struct App {
     find: Option<find_window::FindState>,
     /// The terminal strip editor, while open.
     strip_editor: Option<strip_editor::StripEditor>,
+    /// The layer list window is open.
+    show_layers: bool,
 }
 
 struct StatusView<'a> {
@@ -187,6 +190,8 @@ struct StatusView<'a> {
     /// Undo and Redo in a shared session: whether this person has something to take back.
     share_undo: bool,
     share_redo: bool,
+    /// The layer list window is open.
+    show_layers: bool,
 }
 
 impl chrome::Status for StatusView<'_> {
@@ -203,6 +208,7 @@ impl chrome::Status for StatusView<'_> {
             Action::ArcTool => self.ed.tool == Tool::Arc,
             Action::PolylineTool => self.ed.tool == Tool::Polyline,
             Action::ToggleGrid => self.prefs.show_grid,
+            Action::Layers => self.show_layers,
             Action::ToggleAutoWire => self.prefs.auto_wire,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
             Action::ToggleTheme => self.prefs.theme == theme::Mode::Dark,
@@ -222,6 +228,7 @@ impl chrome::Status for StatusView<'_> {
             | Action::ToggleChrome
             | Action::ToggleTheme
             | Action::ToggleGrid
+            | Action::Layers
             | Action::ToggleAutoWire
             | Action::Assistant
             | Action::ReportProblem
@@ -366,6 +373,7 @@ impl App {
             share: Default::default(),
             symbol_editor: None,
             find: None,
+            show_layers: false,
             strip_editor: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
@@ -493,6 +501,7 @@ impl App {
                 self.prefs.show_grid = !self.prefs.show_grid;
                 self.prefs.save();
             }
+            Action::Layers => self.show_layers = !self.show_layers,
             Action::ToggleAutoWire => {
                 self.prefs.auto_wire = !self.prefs.auto_wire;
                 self.prefs.save();
@@ -665,7 +674,7 @@ impl App {
             Action::Mirror => open.mirror_many(page, &self.ed.selection),
             Action::SelectAll => {
                 self.ed.tool = Tool::Select;
-                self.ed.selection = open.select_all(page);
+                self.ed.selection = self.prefs.layers.keep(open.select_all(page));
             }
             Action::Copy | Action::Cut => {
                 let clip = open.copy(page, &self.ed.selection);
@@ -2753,6 +2762,7 @@ impl eframe::App for App {
             sharing: self.share.active(),
             share_undo: self.share.can_undo(),
             share_redo: self.share.can_redo(),
+            show_layers: self.show_layers,
         };
         for url in std::mem::take(&mut self.open_url) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
@@ -2813,6 +2823,7 @@ impl eframe::App for App {
                 });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 self.ed.auto_wire = self.prefs.auto_wire;
+                self.ed.layers = self.prefs.layers.clone();
                 canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
                 let held = open
                     .project
@@ -2856,6 +2867,7 @@ impl eframe::App for App {
             .windows(ctx, self.open.as_mut(), self.assistant.command_running());
         self.symbol_editor_window(ctx);
         self.find_window(ctx);
+        self.layers_window(ctx);
         self.strip_editor_window(ctx);
         self.sync_session(ctx);
 
@@ -2913,6 +2925,24 @@ impl App {
             find_window::FindOutcome::Go { page, select } => self.show_found(&page, select),
             find_window::FindOutcome::Replace => self.replace_found(),
         }
+    }
+
+    /// The layer list: show, hide and lock what the canvas shows. Kept in the preferences.
+    fn layers_window(&mut self, ctx: &egui::Context) {
+        if !self.show_layers {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        egui::Window::new("Layers")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| changed = self.prefs.layers.ui(ui));
+        if changed {
+            self.prefs.save();
+        }
+        self.show_layers = open;
     }
 
     /// The terminal strip editor, while open and its project is.

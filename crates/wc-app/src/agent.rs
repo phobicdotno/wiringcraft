@@ -2614,6 +2614,7 @@ mod tests {
             symbol_editor: None,
             find: None,
             strip_editor: None,
+            show_layers: false,
         };
         (tmp, app)
     }
@@ -2954,6 +2955,7 @@ mod tests {
                 sharing: true,
                 share_undo: false,
                 share_redo: false,
+                show_layers: false,
             }
             .enabled(act)
         };

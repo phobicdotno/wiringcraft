@@ -37,6 +37,7 @@ pub enum Icon {
     ZoomOut,
     ZoomFit,
     Grid,
+    Layers,
     Library,
     Update,
     Pdf,
@@ -362,6 +363,14 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
                     p.circle_filled(at(4.5 + i as f32 * 5.0, 4.5 + j as f32 * 5.0), 1.1 * s, c);
                 }
             }
+        }
+        Icon::Layers => {
+            // Three sheets stacked; the top one picked out.
+            poly(&[(3.0, 15.0), (12.0, 19.5), (21.0, 15.0)], false);
+            poly(&[(3.0, 11.5), (12.0, 16.0), (21.0, 11.5)], false);
+            let top = [(12.0, 3.5), (21.0, 8.0), (12.0, 12.5), (3.0, 8.0)];
+            let v: Vec<Pos2> = top.iter().map(|(x, y)| at(*x, *y)).collect();
+            p.add(Shape::closed_line(v, ast));
         }
         Icon::Library => {
             p.rect_stroke(
