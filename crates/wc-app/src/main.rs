@@ -2886,13 +2886,32 @@ impl App {
             self.ed.live.clear();
             return;
         };
+        // A keystroke, a click or a drag may edit: while the project differs from what was
+        // checked, each one starts the wait again.
+        let editing = ctx.input(|i| {
+            i.pointer.any_down()
+                || i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Cut
+                            | egui::Event::PointerButton { .. }
+                    )
+                })
+        });
         let poll = self
             .live
-            .poll(&o.project, &o.symbols, &o.parts, std::time::Instant::now());
-        // Also after the editor was replaced (a project opened or a session joined) while the
-        // checker kept its findings for the same inputs.
-        if poll.changed || self.ed.live != self.live.findings {
-            self.ed.live = self.live.findings.clone();
+            .poll(&o.project, &o.symbols, &o.parts, editing, std::time::Instant::now());
+        // Show findings only once they are of exactly these inputs: a finished check, or the
+        // checker's findings after the editor was replaced (the same project opened again, a
+        // session joined). While a check is pending they may be of other inputs (another
+        // project), so the editor keeps what it shows.
+        if let Some(found) = self.live.settled()
+            && self.ed.live != found
+        {
+            self.ed.live = found.to_vec();
         }
         if let Some(after) = poll.again {
             ctx.request_repaint_after(after);

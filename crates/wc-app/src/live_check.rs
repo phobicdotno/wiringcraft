@@ -35,9 +35,9 @@ impl Snapshot {
 pub struct LiveCheck {
     /// The inputs of the latest check started.
     started: Option<Arc<Snapshot>>,
-    /// The project as last seen when it differed from `started`, and when it was seen to
-    /// change to that: the check waits until it has stayed so for [`SETTLE`].
-    pending: Option<(Arc<Snapshot>, Instant)>,
+    /// The project differs from `started`; the latest edit to it was at this time. The check
+    /// waits until nothing has been edited for [`SETTLE`].
+    pending: Option<Instant>,
     /// The check running now.
     job: Option<Receiver<Vec<Finding>>>,
     /// The findings of the latest check that finished.
@@ -66,14 +66,20 @@ impl LiveCheck {
         self.job.is_some() || self.pending.is_some()
     }
 
-    /// Take a finished check's findings, and start a new check once the project has stayed
-    /// unchanged for [`SETTLE`] after its latest edit. Only one check runs at a time; an edit
-    /// made while it runs is checked after it.
+    /// Take a finished check's findings, and start a new check once nothing has been edited
+    /// for [`SETTLE`]. `editing` says the user typed, clicked or dragged in this frame: while
+    /// the project differs from what was checked, that starts the wait again. Edits that come
+    /// without input (the assistant, a shared session) wait from when they were first seen.
+    ///
+    /// On the window thread this costs one comparison of the inputs with the copy last
+    /// checked per frame, and one copy of them per check started, never one per edit. Only one
+    /// check runs at a time; an edit made while it runs is checked after it.
     pub fn poll(
         &mut self,
         project: &Project,
         symbols: &BTreeMap<String, Symbol>,
         parts: &BTreeMap<String, Part>,
+        editing: bool,
         now: Instant,
     ) -> Poll {
         let mut changed = false;
@@ -86,49 +92,45 @@ impl LiveCheck {
                     self.job = None;
                 }
                 Err(TryRecvError::Empty) => {
+                    // An edit while the check runs: its wait starts at the latest edit.
+                    if editing {
+                        self.pending = Some(now);
+                    }
                     return Poll {
                         changed,
                         again: Some(POLL),
                     };
                 }
-                // The check panicked: say so, keep the last findings and try again on the
-                // next edit.
+                // The check panicked: say so and try again on the next edit.
                 Err(TryRecvError::Disconnected) => {
                     self.job = None;
+                    self.findings.clear();
                     self.failed = Some("the check stopped before it finished".into());
                     changed = true;
                 }
             }
         }
-        let latest = self.pending.as_ref().map(|(s, _)| s).or(self.started.as_ref());
-        if latest.is_some_and(|s| s.same(project, symbols, parts)) {
-            if self.pending.is_none() {
-                return Poll { changed, again: None };
-            }
-        } else if self.started.as_ref().is_some_and(|s| s.same(project, symbols, parts)) {
-            // Changed back to what was checked last.
+        if self.started.as_ref().is_some_and(|s| s.same(project, symbols, parts)) {
             self.pending = None;
             return Poll { changed, again: None };
-        } else {
-            // A new edit: the wait starts again from now.
-            let snap = Snapshot {
-                project: project.clone(),
-                symbols: symbols.clone(),
-                parts: parts.clone(),
-            };
-            self.pending = Some((Arc::new(snap), now));
         }
-        let Some((snap, since)) = self.pending.take() else {
-            return Poll { changed, again: None };
+        let since = match self.pending {
+            Some(t) if !editing => t,
+            _ => *self.pending.insert(now),
         };
         let waited = now.saturating_duration_since(since);
         if waited < SETTLE {
-            self.pending = Some((snap, since));
             return Poll {
                 changed,
                 again: Some(SETTLE - waited),
             };
         }
+        self.pending = None;
+        let snap = Arc::new(Snapshot {
+            project: project.clone(),
+            symbols: symbols.clone(),
+            parts: parts.clone(),
+        });
         let (tx, rx) = channel();
         let input = Arc::clone(&snap);
         let spawned = std::thread::Builder::new().name("live-check".into()).spawn(move || {
@@ -149,8 +151,10 @@ impl LiveCheck {
                     again: Some(POLL),
                 }
             }
-            // No thread to be had: say why, and try again on the next edit.
+            // No thread to be had: say why (the old findings may be for other inputs), and
+            // try again on the next edit.
             Err(e) => {
+                self.findings.clear();
                 self.failed = Some(format!("the check could not be started: {e}"));
                 Poll {
                     changed: true,
@@ -158,6 +162,13 @@ impl LiveCheck {
                 }
             }
         }
+    }
+
+    /// The findings to show for these inputs: the latest check's when it was of exactly
+    /// them and no newer edit waits; `None` while a check is pending, when the findings may be
+    /// of other inputs (another project, say).
+    pub fn settled(&self) -> Option<&[Finding]> {
+        (!self.busy()).then_some(self.findings.as_slice())
     }
 
     /// The status bar text: errors and warnings, that all is well, or why the check failed.
@@ -202,7 +213,7 @@ mod tests {
     fn settle(live: &mut LiveCheck, o: &Open, now: &mut Instant) -> bool {
         let mut changed = false;
         for _ in 0..1000 {
-            let p = live.poll(&o.project, &o.symbols, &o.parts, *now);
+            let p = live.poll(&o.project, &o.symbols, &o.parts, false, *now);
             changed |= p.changed;
             if p.again.is_none() {
                 return changed;
@@ -251,7 +262,7 @@ mod tests {
 
         // Rename the second coil: nothing is checked until the edit has settled.
         rename_second_coil(&mut o, "-K2");
-        let p = live.poll(&o.project, &o.symbols, &o.parts, now);
+        let p = live.poll(&o.project, &o.symbols, &o.parts, true, now);
         assert!(!p.changed);
         assert!(p.again.is_some_and(|d| d <= SETTLE), "{p:?}");
         assert!(live.busy());
@@ -267,7 +278,7 @@ mod tests {
         assert!(!live.busy());
 
         // Unchanged: no new check is started.
-        let p = live.poll(&o.project, &o.symbols, &o.parts, now);
+        let p = live.poll(&o.project, &o.symbols, &o.parts, true, now);
         assert_eq!(p, Poll::default());
     }
 
@@ -280,18 +291,52 @@ mod tests {
         // Keystrokes 100 ms apart: each one only pushes the check back.
         for tag in ["-K", "-K2", "-K22"] {
             rename_second_coil(&mut o, tag);
-            let p = live.poll(&o.project, &o.symbols, &o.parts, now);
+            let p = live.poll(&o.project, &o.symbols, &o.parts, true, now);
             assert!(p.again.is_some());
             now += Duration::from_millis(100);
         }
         assert!(live.job.is_none(), "no check ran while typing");
         // 300 ms after the first keystroke but only 100 ms after the last: still waiting.
-        let p = live.poll(&o.project, &o.symbols, &o.parts, now);
+        let p = live.poll(&o.project, &o.symbols, &o.parts, false, now);
         assert!(p.again.is_some_and(|d| d > Duration::ZERO), "{p:?}");
         assert!(live.job.is_none(), "the wait starts again at each edit");
+        assert!(live.settled().is_none(), "the findings are not of these inputs yet");
         now += SETTLE;
         settle(&mut live, &o, &mut now);
         assert_eq!(duplicate_tag_errors(&live.findings), 0);
+        assert_eq!(live.settled().map(<[Finding]>::len), Some(live.findings.len()));
+    }
+
+    #[test]
+    fn an_edit_without_input_waits_from_when_it_was_first_seen() {
+        let (_dir, mut o) = coil_twice();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        settle(&mut live, &o, &mut now);
+        // The assistant renames the coil: no keystroke, so later frames do not push it back.
+        rename_second_coil(&mut o, "-K2");
+        for _ in 0..3 {
+            assert!(live.poll(&o.project, &o.symbols, &o.parts, false, now).again.is_some());
+            now += Duration::from_millis(100);
+        }
+        live.poll(&o.project, &o.symbols, &o.parts, false, now);
+        assert!(live.job.is_some(), "the check started 300 ms after the edit was seen");
+    }
+
+    #[test]
+    fn findings_of_another_project_are_not_settled_for_this_one() {
+        let (_a, a) = coil_twice();
+        let (_b, b) = crate::state::tests::project();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        settle(&mut live, &a, &mut now);
+        assert!(duplicate_tag_errors(live.settled().unwrap()) > 0);
+        // Project B is opened: until its own check is done, A's findings are not shown for it.
+        live.poll(&b.project, &b.symbols, &b.parts, false, now);
+        assert!(live.settled().is_none());
+        now += SETTLE;
+        settle(&mut live, &b, &mut now);
+        assert_eq!(duplicate_tag_errors(live.settled().unwrap()), 0);
     }
 
     #[test]
