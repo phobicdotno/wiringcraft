@@ -967,6 +967,12 @@ fn a_page_renumbered_with_a_refused_change_of_your_own_page_gets_its_number_back
     assert_eq!(cover.number, number);
     assert_eq!(cover.title, title);
     assert!(!guest_open.project.devices.contains_key(&k2));
+    // And its place in the page order.
+    let mut sorted = guest_open.project.clone();
+    sorted.sort_pages();
+    let ids = |p: &Project| p.pages.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&guest_open.project), ids(&sorted));
+    assert_eq!(guest_open.project.pages[0].id, "p0001");
     Ok(())
 }
 
@@ -1013,10 +1019,21 @@ fn a_page_the_host_removed_before_ending_goes_with_the_refused_renumbering() -> 
     host_open.project.pages.retain(|p| p.id != "p0001");
     h.frame(Some(&mut host_open), Some("p0002".into()), false);
     h.stop();
+    guest_open.project.comments.push(Comment {
+        id: "c9".into(),
+        page: "p0001".into(),
+        at: None,
+        author: "Ola".into(),
+        time: 0,
+        text: "Cover title?".into(),
+        resolved: false,
+        replies: Vec::new(),
+    });
     g.frame(Some(&mut guest_open), Some("p0003".into()), false);
     assert!(!g.active());
-    // The cover is gone here too, not left with the refused number.
+    // The cover is gone here too, not left with the refused number, and its comments with it.
     assert!(guest_open.project.page("p0001").is_none());
+    assert!(guest_open.project.comments.iter().all(|c| c.page != "p0001"));
     assert!(!guest_open.project.devices.contains_key(&k2));
     Ok(())
 }

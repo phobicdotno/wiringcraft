@@ -239,12 +239,19 @@ fn take_back_pages(
             }
             None => {
                 project.pages.retain(|p| p.id != *id);
+                project.comments.retain(|c| c.page != *id);
             }
         };
         back(&mut open.project);
         if let Some(base) = base.as_deref_mut() {
             back(base);
         }
+    }
+    // In page order by the numbers given back, also when the session has ended and no sync
+    // follows.
+    open.project.sort_pages();
+    if let Some(base) = base {
+        base.sort_pages();
     }
     open.dirty = true;
     notes.push(format!(
