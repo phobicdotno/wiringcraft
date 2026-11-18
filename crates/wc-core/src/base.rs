@@ -195,15 +195,18 @@ fn resolved(dir: &Path) -> Result<PathBuf> {
     walk(abs.components())
 }
 
-/// The parts of a relative path written in a project file, split on `/` and `\\` alike.
+/// The parts of a relative path written in a project file, split where the system splits
+/// a path (`/`, and on Windows `\\` too), so they name what the library loader opens.
 /// Kept apart from the folder they are relative to: joining them onto a Windows `\\?\` path
 /// would work out `..` by name before the disk is asked.
 fn written_parts(rel: &str) -> impl Iterator<Item = Component<'_>> {
-    rel.split(['/', '\\']).filter(|p| !p.is_empty()).map(|p| match p {
-        "." => Component::CurDir,
-        ".." => Component::ParentDir,
-        other => Component::Normal(std::ffi::OsStr::new(other)),
-    })
+    rel.split(std::path::is_separator)
+        .filter(|p| !p.is_empty())
+        .map(|p| match p {
+            "." => Component::CurDir,
+            ".." => Component::ParentDir,
+            other => Component::Normal(std::ffi::OsStr::new(other)),
+        })
 }
 
 /// Follow `parts` from the root as [`resolved`] describes.
@@ -567,6 +570,30 @@ mod tests {
         let err = create_from(&b, &new, "New", "2026-11-18").unwrap_err();
         assert!(err.to_string().contains("broken"), "{err}");
         assert!(!new.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_library_name_is_part_of_the_name_on_unix() {
+        use crate::project::LibrarySource;
+        let tmp = tempfile::tempdir().unwrap();
+        let company = tmp.path().join("company");
+        let b = company.join("base");
+        base(&b);
+        fs::create_dir_all(b.join("..\\library")).unwrap();
+        fs::create_dir_all(company.join("library")).unwrap();
+        let mut p = store::load(&b).unwrap();
+        p.meta.libraries = vec![LibrarySource {
+            name: "odd".into(),
+            kind: "folder".into(),
+            location: "..\\library".into(),
+            reference: None,
+        }];
+        store::save(&b, &p).unwrap();
+        assert!(outside_libraries(&p).is_empty());
+        let made = create_from(&b, &tmp.path().join("new"), "New", "2026-11-18").unwrap();
+        assert_eq!(made.meta.libraries[0].location, "..\\library");
+        assert!(tmp.path().join("new").join("..\\library").is_dir());
     }
 
     #[cfg(unix)]
