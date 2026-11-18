@@ -1752,6 +1752,56 @@ mod tests {
     }
 
     #[test]
+    fn a_quick_repeat_through_egui_pointer_events_ends_a_polyline() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Polyline,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let frame = |open: &mut Open, ed: &mut Editor, time: f64, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, false, 1.0));
+            });
+        };
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // A click: move there, press, release a moment later.
+        let click = |open: &mut Open, ed: &mut Editor, pos: egui::Pos2, t: f64| {
+            frame(open, ed, t, vec![egui::Event::PointerMoved(pos)]);
+            frame(open, ed, t + 0.01, vec![button(pos, true)]);
+            frame(open, ed, t + 0.02, vec![button(pos, false)]);
+        };
+        let (a, b) = (egui::pos2(300.0, 300.0), egui::pos2(400.0, 300.0));
+        click(&mut open, &mut ed, a, 1.0);
+        click(&mut open, &mut ed, b, 2.0);
+        assert_eq!(ed.shape_points.len(), 2, "two points placed");
+        // A slow repeat on the last point does nothing.
+        click(&mut open, &mut ed, b, 3.0);
+        assert_eq!(ed.shape_points.len(), 2);
+        assert!(open.project.pages[0].graphics.is_empty());
+        // A quick repeat on it ends the polyline.
+        click(&mut open, &mut ed, b, 3.1);
+        assert!(ed.shape_points.is_empty());
+        assert!(matches!(
+            &open.project.pages[0].graphics[..],
+            [Shape::Polyline { points, .. }] if points.len() == 2
+        ));
+    }
+
+    #[test]
     fn an_arc_ending_on_its_centre_keeps_its_first_clicks() {
         let (_tmp, mut open) = project();
         let mut ed = Editor {
