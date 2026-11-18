@@ -3580,7 +3580,11 @@ mod marking_tests {
             .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;NO-SUCH;")
             .replace("-X1/J1;Jumper;-X1;;;;;", "-X1/J1;Jumper;-X1;;;;EX-TB-2.5;");
         let before = o.undo_mark();
+        let pid = "example.ex-tb-2-5";
+        assert!(!o.project.lock.parts.contains_key(pid), "not pinned yet");
+        let lock = o.project.lock.clone();
         let msg = o.import_wago_configured(csv.as_bytes()).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid), "taken and pinned");
         assert!(
             msg.starts_with(
                 "WAGO configurator: 2 device(s) or jumper(s) changed, 0 row(s) already up to date, 1 not matched."
@@ -3602,6 +3606,18 @@ mod marking_tests {
             o.project.meta.jumpers[0].part.is_none(),
             "the jumper in the same undo step"
         );
+        assert_eq!(o.project.lock, lock, "and the pin");
+        o.save().unwrap();
+        assert!(!wc_core::store::load(&o.dir).unwrap().lock.parts.contains_key(pid));
+        assert!(o.redo());
+        assert!(o.project.lock.parts.contains_key(pid), "Redo brings the pin back");
+        assert_eq!(o.project.devices.get(&x11).and_then(|d| d.part.as_deref()), Some(pid));
+        // Undone again, then given by hand: the copy left behind is pinned again.
+        assert!(o.undo());
+        o.set_device_part(&x11, Some(pid)).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid));
+        assert!(o.undo());
+        assert_eq!(o.project.lock, lock, "setting a part is one undo step with its pin");
         assert!(o.import_wago_configured(b"Article\n1\n").is_err());
     }
 

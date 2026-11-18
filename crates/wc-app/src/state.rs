@@ -336,10 +336,14 @@ impl Open {
         if current == part {
             return Ok(());
         }
-        if let Some(id) = part {
-            self.ensure_part(id)?;
+        let lock = self.project.lock.clone();
+        if let Some(id) = part
+            && let Err(e) = self.ensure_part(id)
+        {
+            self.project.lock = lock;
+            return Err(e);
         }
-        self.checkpoint();
+        self.checkpoint_with_lock(lock);
         self.project.devices.entry(tag.clone()).or_default().part = part.map(str::to_owned);
         Ok(())
     }
@@ -366,11 +370,22 @@ impl Open {
         );
         let mut unmatched = plan.unmatched.clone();
         let mut taken = plan.clone();
+        // The lock as it was: the undo step goes back to it, and a part that cannot be used
+        // loses the pin it may have got on the way.
+        let lock = self.project.lock.clone();
         for id in plan.parts() {
             let r = candidates
                 .take(&self.dir, &mut self.project, id)
                 .and_then(|()| self.ensure_part(id));
             if let Err(why) = r {
+                match lock.parts.get(id) {
+                    Some(e) => {
+                        self.project.lock.parts.insert(id.to_owned(), e.clone());
+                    }
+                    None => {
+                        self.project.lock.parts.remove(id);
+                    }
+                }
                 for a in plan.assignments.iter().filter(|a| a.part == id) {
                     unmatched.push(format!(
                         "line {}: part {id} cannot be taken into the project: {why}",
@@ -383,7 +398,7 @@ impl Open {
         let changed = if taken.assignments.is_empty() {
             0
         } else {
-            self.checkpoint();
+            self.checkpoint_with_lock(lock);
             wc_import::wago::apply(&mut self.project, &taken)
         };
         let mut msg = format!(
@@ -407,13 +422,21 @@ impl Open {
 
     /// Make sure a part is in the project (taken from the library when needed) and loaded.
     fn ensure_part(&mut self, id: &str) -> Result<(), String> {
-        if self.parts.contains_key(id) {
+        let pinned = self.project.lock.parts.contains_key(id);
+        if pinned && self.parts.contains_key(id) {
             return Ok(());
         }
         // Only go to the library when the project has no copy; a broken copy is reported as is.
         let vendored = store::vendor_path(&self.dir, ItemKind::Part, id).map_err(|e| e.to_string())?;
         if !vendored.exists() {
             let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
+            wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
+        } else if !pinned
+            && let Ok(lib) = wc_library::Library::open(&self.dir, &self.project)
+            && lib.part(id).is_ok()
+        {
+            // A copy left without its pin (an undone change that took it): pinned again from
+            // the library, so the project never uses a part its lock does not name.
             wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
         }
         let p = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
@@ -431,10 +454,15 @@ impl Open {
         if self.project.devices.get(tag).map_or(&[][..], |d| &d.accessories) == accessories.as_slice() {
             return Ok(());
         }
+        let lock = self.project.lock.clone();
         for a in &accessories {
-            self.ensure_part(&a.part)?;
+            if let Err(e) = self.ensure_part(&a.part) {
+                // Parts taken before this one are not pinned without a change that uses them.
+                self.project.lock = lock;
+                return Err(e);
+            }
         }
-        self.checkpoint();
+        self.checkpoint_with_lock(lock);
         self.project.devices.entry(tag.clone()).or_default().accessories = accessories;
         Ok(())
     }
@@ -477,6 +505,14 @@ impl Open {
     }
 
     /// Take a snapshot before a change, so it can be undone.
+    /// [`Open::checkpoint`] for a change that pinned library items before it: the undo step
+    /// keeps the lock as it was (`lock`), so Undo takes those pins back and Redo brings them.
+    fn checkpoint_with_lock(&mut self, lock: wc_core::Lockfile) {
+        let now = std::mem::replace(&mut self.project.lock, lock);
+        self.checkpoint();
+        self.project.lock = now;
+    }
+
     pub fn checkpoint(&mut self) {
         // The change before this one is done: its jumpers follow their terminals first, so the
         // snapshot and this change start from that.

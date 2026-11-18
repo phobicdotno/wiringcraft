@@ -2551,6 +2551,12 @@ struct WagoImported {
     warnings: Vec<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: the next WAGO import's write of `library.lock` fails.
+    static FAIL_LOCK_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Write the articles of a configured WAGO configurator list onto the project in `dir` (see
 /// [`wc_import::wago`]). Articles are looked up among the project's own parts first, then its
 /// libraries; a library part that is used is taken into the project. Nothing is saved when
@@ -2596,6 +2602,13 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     }
     let changed = wc_import::wago::apply(&mut p, &taken);
     if changed > 0 {
+        // The pins first: if a later write fails, a repeat import still finds the part
+        // unassigned and saves again, instead of leaving it assigned without a pin.
+        #[cfg(test)]
+        if FAIL_LOCK_WRITE.with(|f| f.replace(false)) {
+            return Err("test: library.lock cannot be written".into());
+        }
+        store::save_lock(dir, &p).map_err(e)?;
         save(dir, &p)?;
     }
     Ok(WagoImported {
@@ -4494,6 +4507,33 @@ mod tests {
         let again = run_import_wago(&dir, &out);
         assert_eq!((again.changed, again.unchanged), (0, 1));
         assert!(import_wago(&dir, &tmp.path().join("missing.csv")).is_err());
+    }
+
+    #[test]
+    fn a_wago_import_whose_lock_write_fails_pins_the_part_on_the_next_try() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = wago_project(tmp.path(), &[part("wago.2002-1201", "WAGO", "2002-1201")]);
+        fill_wago_list(&out, "2002-1201", "");
+        let files =
+            |d: &Path| [store::PROJECT_FILE, "devices.json", store::LOCK_FILE].map(|f| std::fs::read(d.join(f)).ok());
+        let before = files(&dir);
+        FAIL_LOCK_WRITE.with(|f| f.set(true));
+        assert!(import_wago(&dir, &out).is_err());
+        assert_eq!(files(&dir), before, "nothing written: the lock goes first");
+        let done = run_import_wago(&dir, &out);
+        assert_eq!(done.changed, 1, "{:?}", done.unmatched);
+        let p = load(&dir).unwrap();
+        let x11 = wc_core::DeviceTag::parse("-X1.1").unwrap();
+        assert_eq!(
+            p.devices.get(&x11).and_then(|d| d.part.as_deref()),
+            Some("wago.2002-1201")
+        );
+        assert!(p.lock.parts.contains_key("wago.2002-1201"), "pinned");
+        // A repeat import of the pinned part writes nothing.
+        let saved = files(&dir);
+        let again = run_import_wago(&dir, &out);
+        assert_eq!((again.changed, again.unchanged), (0, 1));
+        assert_eq!(files(&dir), saved);
     }
 
     #[test]
