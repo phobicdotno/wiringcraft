@@ -2602,16 +2602,23 @@ fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
     let dir = tmp.path();
     let pictures = dir.join("pictures");
     std::fs::create_dir_all(&pictures)?;
-    // An earlier attempt stopped half-way and left its part file; it is not in the way.
-    let part = pictures.join(format!(".logo.png.{}.part", std::process::id()));
-    std::fs::write(&part, b"\x89PN")?;
+    // A file named like a part file that this write did not make is neither in the way nor
+    // touched.
+    let other = pictures.join(format!(".logo.png.{}.part", std::process::id()));
+    std::fs::write(&other, b"someone else's")?;
     let logo = picture("pictures/logo.png", b"\x89PNG\r\n\x1a\nlogo");
     write_picture(dir, &logo)?;
     assert_eq!(std::fs::read(pictures.join("logo.png"))?, logo.data);
-    let names: Vec<_> = std::fs::read_dir(&pictures)?
+    assert_eq!(std::fs::read(&other)?, b"someone else's");
+    let mut names: Vec<_> = std::fs::read_dir(&pictures)?
         .map(|e| e.map(|e| e.file_name()))
         .collect::<std::io::Result<_>>()?;
-    assert_eq!(names, ["logo.png"], "nothing but the picture is left");
+    names.sort();
+    assert_eq!(
+        names,
+        [other.file_name().ok_or("no name")?.to_owned(), "logo.png".into()],
+        "no part file of its own is left"
+    );
     // The same picture again is fine; another under that name is refused and changes nothing.
     write_picture(dir, &logo)?;
     assert!(write_picture(dir, &picture("pictures/logo.png", b"other")).is_err());

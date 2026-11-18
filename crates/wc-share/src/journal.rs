@@ -189,20 +189,38 @@ pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
     }
     // The whole file is written beside it first and then put in place without replacing
     // anything, so a failed write never leaves a cut-off picture under the name.
-    let part = folder.join(format!(
-        ".{}.{}.part",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("picture"),
-        std::process::id()
-    ));
-    // A part file left by an earlier attempt that stopped half-way is not wanted any more.
-    let _ = std::fs::remove_file(&part);
-    let published = write_new(&part, &picture.data).and_then(|()| publish(&part, &path));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("picture");
+    let part = stage(folder, name, &picture.data)?;
+    let published = publish(&part, &path);
     let _ = std::fs::remove_file(&part);
     match published {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::AlreadyExists => existing(),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Write `data` to a part file in `folder` that this call makes new, under a name no other
+/// file has (any file already there is left alone), and return its path.
+fn stage(folder: &std::path::Path, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    for _ in 0..16 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let part = folder.join(format!(".{name}.{}-{nanos}-{n}.part", std::process::id()));
+        match write_new(&part, data) {
+            Ok(()) => return Ok(part),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free name for a part file of {name}"),
+    ))
 }
 
 /// Write `data` to a new file at `path`, removing it again when that fails.
