@@ -3218,6 +3218,71 @@ fn the_same_pick_made_again_after_its_refusal_put_the_logo_back_is_kept() -> Tes
 }
 
 #[test]
+fn a_refusal_coming_after_its_pictures_clash_rename_renames_nothing_more() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let file = "pictures/brand.png";
+    // The session has brand.png, under the host's page 2.
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |o| {
+            o.project.page_mut("p0002").ok_or("no page")?.underlay = Some(wc_core::Underlay {
+                file: file.into(),
+                min: wc_core::Point::new(0.0, 0.0),
+                max: wc_core::Point::new(10.0, 10.0),
+            });
+            Ok(())
+        },
+        [(file.to_owned(), PNG.to_vec())].into(),
+    )?;
+    // The guest has a file of its own under that name, and picks it as the logo.
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join(file), &mine)?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: file.into(),
+        cover: None,
+    });
+    // As if its picture had gone out before the session's came in (edit `seq`).
+    let seq = 1;
+    g.pictures_sent.insert(file.into(), Some(seq));
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let logo = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(logo, file, "renamed on the clash: {:?}", g.notes);
+    // The refusal of that picture comes only now: nothing more is renamed.
+    if let Some(Role::Guest(j)) = g.role.as_mut() {
+        j.guest.names_taken.push((file.into(), Some(seq)));
+    }
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let notes = g.take_notes();
+    let renames = notes.iter().filter(|n| n.contains("is renamed")).count();
+    assert_eq!(renames, 1, "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("was not kept")), "{notes:?}");
+    assert_eq!(
+        guest_open.project.meta.logo.as_ref().map(|l| l.file.clone()),
+        Some(logo)
+    );
+    let underlay = |o: &Open| {
+        o.project
+            .page("p0002")
+            .and_then(|p| p.underlay.as_ref())
+            .map(|u| u.file.clone())
+    };
+    assert_eq!(underlay(&guest_open).as_deref(), Some(file));
+    assert_eq!(underlay(&host_open).as_deref(), Some(file));
+    Ok(())
+}
+
+#[test]
 fn a_picture_renamed_for_some_references_leaves_the_others() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut open = project(tmp.path())?;
