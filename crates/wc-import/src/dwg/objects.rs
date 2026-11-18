@@ -8,7 +8,8 @@
 //! texts of an object are in a third stream at the end of its data.
 //!
 //! The entities read are LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE (2D and 3D) with their
-//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, SOLID, TRACE and POINT. Each entity belongs to
+//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), SOLID,
+//! TRACE and POINT. Each entity belongs to
 //! the block whose BLOCK_HEADER owns it, or to model space; vertices belong to their polyline
 //! and attributes to their INSERT. The entities become the same entities the DXF reader works
 //! with, so a DWG drawing is drawn exactly like a DXF one: y flipped, block references expanded.

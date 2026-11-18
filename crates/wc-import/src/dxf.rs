@@ -1,8 +1,8 @@
 //! ASCII DXF reading: symbols and whole drawings.
 //!
 //! Supported entities: LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, SOLID/TRACE, LWPOLYLINE,
-//! POLYLINE/VERTEX, TEXT, MTEXT, POINT and INSERT (block references, exploded or turned into
-//! library symbols). Ellipses and splines become polylines through sampled points; a solid hatch
+//! POLYLINE/VERTEX, TEXT, MTEXT, POINT, INSERT (block references, exploded or turned into
+//! library symbols) and DIMENSION (drawn by its block). Ellipses and splines become polylines through sampled points; a solid hatch
 //! and a SOLID become filled outlines, a patterned hatch its outline. Other entities are counted
 //! in one warning per kind.
 //! DXF has y pointing up; WiringCraft pages have y pointing down, so y is flipped on the way in.
