@@ -1399,8 +1399,8 @@ impl Open {
     /// loaded, its undo steps, and the change marks; the undo and redo history are as before.
     /// A symbol or part file the change added (there was none, and the project as it was does
     /// not pin it) is removed; files that were there are never touched, nor rewritten. One that
-    /// cannot be removed is reported, and is harmless: an unpinned file is taken from the
-    /// library again (and pinned) when it is next used.
+    /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
+    /// when it is next used.
     pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
         self.project = mark.project;
         self.symbols.retain(|id, _| mark.symbols.contains(id));
