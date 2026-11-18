@@ -106,7 +106,9 @@ pub fn samples_to_png(width: u32, height: u32, channels: u8, bits: u8, invert: b
             let need = w.checked_mul(h)?.checked_mul(4)?;
             let px: Vec<u8> = data
                 .get(..need)?
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|cmyk| {
                     let ink = |i: usize| {
                         let v = u16::from(cmyk.get(i).copied().unwrap_or(0));
