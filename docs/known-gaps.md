@@ -44,7 +44,7 @@ These branches can be deleted once their pull requests are merged.
 | PDF trace: pictures compressed other than Flate, LZW or DCT (CCITT fax, JBIG2, JPEG 2000), or in other sample layouts than 1-bit gray, 8- or 16-bit gray and RGB and 8-bit CMYK, are refused ("not supported yet"); LZW, CMYK and 16-bit are read since #171 | `crates/wc-import/src/pdf.rs` | not filed |
 | SolidWorks Electrical cabinet layouts: items are sorted by block name (rail, duct, plate) since the database has no item kind; a footprint without a box size takes the box round its block's DWG drawing, else its catalog part's width and height, else 18 x 90 mm; upright rails are left out (WiringCraft rails run left to right) | `crates/wc-import/src/swe/cabinet.rs` | Known limit: the database has no item kind, so sorting by name stays |
 | Binary DXF | `crates/wc-import/src/dxf.rs` | Not planned: the error tells the user to save as ASCII DXF, which every CAD program can do. |
-| DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004 and 2010 drawings only (2007 is #215); 2004 texts in a code page the reader has no table for (the multi-byte Chinese, Japanese and Korean pages, the DOS pages, ISO 8859 pages other than 8859-1) are read with the legacy decoder, UTF-8 when the bytes are and else byte for byte as Latin-1 (with the euro sign and the two dashes of Windows-1252), with a warning; a DWG page import (`import page-dwg`) still goes through an installed DWG to DXF converter. |
+| DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004, 2007 and 2010 drawings only (2007 checked against one real file, #215; its class section is read as the specification gives it, like 2010 without the second size field, and has only been checked with drawings the tests write); 2004 texts in a code page the reader has no table for (the multi-byte Chinese, Japanese and Korean pages, the DOS pages, ISO 8859 pages other than 8859-1) are read with the legacy decoder, UTF-8 when the bytes are and else byte for byte as Latin-1 (with the euro sign and the two dashes of Windows-1252), with a warning; a DWG page import (`import page-dwg`) still goes through an installed DWG to DXF converter. |
 | STEP (3D) | `docs/manufacturer-data.md` | Later: 3D belongs to the one-way export to SolidCraft (phase 5). |
 
 ## Editing and app
@@ -72,7 +72,15 @@ pin the new version drops; undoing it puts the old version back in every copy (#
 is refused while a wire ends on a pin the version it brings back does not have, for example a
 pin the update added that has been wired since: move or remove that wire, then undo again. A
 joining copy takes a symbol the session did not send from its own libraries only in the version
-the session pinned; otherwise it reports the symbol as missing.
+the session pinned; otherwise it reports the symbol as missing. A page, device or jumper that uses
+a symbol or part the session does not have yet waits in the window until the session takes the
+item, however long that takes, and the session window says what it waits for (#198). Other changes
+go out and others' changes keep coming in meanwhile. When the session changes that same page,
+device or the project properties before it takes the item, the waiting change is dropped and a note
+says so; a change of the page's number alone keeps it. Undo while a change waits takes that change
+back here only. For the first few seconds after an item is sent, while the session answers,
+everything waits, as before. The host refuses a page that places a symbol the project does not lock
+(#286); placements a page already had stay editable.
 
 Host and guests must run builds with the same session protocol version
 (`wc_share::PROTOCOL_VERSION`, raised whenever a message changes). A guest on another version is

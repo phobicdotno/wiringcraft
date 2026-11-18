@@ -1,7 +1,7 @@
 use wc_core::geom::{Align, Point};
 
 use super::super::Section;
-use super::super::tests::{TestSection, write_dwg};
+use super::super::tests::{TestSection, write_dwg, write_dwg_2007};
 use super::*;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -220,20 +220,40 @@ impl Obj {
             Version::R2004 => {
                 self.data.t8(s);
             }
-            Version::R2010 => {
+            Version::R2007 | Version::R2010 => {
                 self.strings.tu(s);
             }
         }
         self
     }
 
+    /// The texts, their size and a flag, at the end of the data (2007 and 2010).
+    fn string_stream(&self, w: &mut W) {
+        if self.strings.0.is_empty() {
+            w.b(false);
+        } else {
+            let n = self.strings.0.len();
+            w.append(&self.strings);
+            if n >= 0x8000 {
+                w.rs((n >> 15) as u16).rs((n & 0x7FFF) as u16 | 0x8000);
+            } else {
+                w.rs(n as u16);
+            }
+            w.b(true);
+        }
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut w = W::default();
         match self.version {
-            Version::R2004 => {
+            Version::R2004 | Version::R2007 => {
                 w.bs(self.kind);
                 let rl_at = w.0.len();
                 w.rl(0).h(0, self.handle).append(&self.data);
+                // 2007 ends the data with the texts, inside the size in bits.
+                if self.version == Version::R2007 {
+                    self.string_stream(&mut w);
+                }
                 let size = w.0.len() as u32;
                 let mut rl = W::default();
                 rl.rl(size);
@@ -251,18 +271,7 @@ impl Obj {
                     k => w.bb(2).rs(k),
                 };
                 w.h(0, self.handle).append(&self.data);
-                if self.strings.0.is_empty() {
-                    w.b(false);
-                } else {
-                    let n = self.strings.0.len();
-                    w.append(&self.strings);
-                    if n >= 0x8000 {
-                        w.rs((n >> 15) as u16).rs((n & 0x7FFF) as u16 | 0x8000);
-                    } else {
-                        w.rs(n as u16);
-                    }
-                    w.b(true);
-                }
+                self.string_stream(&mut w);
                 let end = w.0.len();
                 w.append(&self.handles);
                 let bytes = w.bytes();
@@ -304,6 +313,8 @@ struct Head {
     /// With `extras`, the true colour also names a colour-book colour (0x4000), whose handle
     /// comes before the layer's.
     book: bool,
+    /// The shadow flags (2007 on), which have no handle.
+    shadow: u8,
 }
 
 fn head(owner: Option<u64>) -> Head {
@@ -313,6 +324,7 @@ fn head(owner: Option<u64>) -> Head {
         invisible: false,
         extras: false,
         book: false,
+        shadow: 0,
     }
 }
 
@@ -323,7 +335,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
         d.bs(3).h(5, 0x99).rc(1).rc(2).rc(3).bs(0);
         d.b(true);
         match v {
-            Version::R2004 => d.rl(2),
+            Version::R2004 | Version::R2007 => d.rl(2),
             Version::R2010 => d.bll(2),
         };
         d.rc(0xAB).rc(0xCD);
@@ -341,8 +353,12 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
     d.bd(1.0)
         .bb(if h.extras { 3 } else { 0 })
         .bb(if h.extras { 3 } else { 0 });
+    // Material and shadow flags from 2007 on, visual styles from 2010 on.
+    if v != Version::R2004 {
+        d.bb(if h.extras { 3 } else { 0 }).rc(h.shadow);
+    }
     if v == Version::R2010 {
-        d.bb(0).rc(0).b(false).b(h.extras).b(false);
+        d.b(false).b(h.extras).b(false);
     }
     d.bs(u16::from(h.invisible)).rc(0);
     let hs = &mut o.handles;
@@ -357,7 +373,12 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
         }
         // The layer as an offset back from the entity's own handle.
         hs.h(0xC, handle - h.layer);
-        hs.h(5, 0x14).h(5, 0x15);
+        // Linetype, material (from 2007 on) and plot style, then a visual style (2010).
+        hs.h(5, 0x14);
+        if v != Version::R2004 {
+            hs.h(5, 0x17);
+        }
+        hs.h(5, 0x15);
         if v == Version::R2010 {
             hs.h(5, 0x16);
         }
@@ -421,7 +442,8 @@ fn attrib(v: Version, kind: u16, handle: u64, h: Head, at: (f64, f64), value: &s
     }
     o.text(tag);
     o.data.bs(0).rc(flags);
-    if v == Version::R2010 {
+    // The lock position flag, from 2007 on.
+    if v != Version::R2004 {
         o.data.b(false);
     }
     if kind == 3 {
@@ -471,16 +493,24 @@ fn sample(v: Version) -> Vec<Obj> {
         .bd(0.0)
         .bd(std::f64::consts::FRAC_PI_2);
     objs.push(a);
+    // Closed; from 2010 on with vertex ids too, their count before the points and the ids
+    // after them.
+    let ids = v == Version::R2010;
     let mut p = entity(v, 77, 0x42, relay);
+    p.data.bs(if ids { 512 | 1024 } else { 512 }).bl(3);
+    if ids {
+        p.data.bl(3);
+    }
     p.data
-        .bs(512)
-        .bl(3)
         .rd(0.0)
         .rd(0.0)
         .dd(4.0, 0.0)
         .dd(0.0, 0.0)
         .dd(4.0, 4.0)
         .dd(3.0, 0.0);
+    if ids {
+        p.data.bl(1).bl(2).bl(3);
+    }
     objs.push(p);
     let mut t = entity(v, 1, 0x43, relay);
     text_data(&mut t, (1.0, 2.0), "K1", 3.5, std::f64::consts::FRAC_PI_2);
@@ -579,7 +609,8 @@ fn sample(v: Version) -> Vec<Obj> {
         .bd3((0.0, 0.0, 1.0))
         .bd3((1.0, 0.0, 0.0))
         .bd(50.0);
-    if v == Version::R2010 {
+    // The reference rectangle's height, from 2007 on.
+    if v != Version::R2004 {
         m.data.bd(10.0);
     }
     m.data.bd(2.5).bs(5).bs(1).bd(0.0).bd(0.0);
@@ -662,6 +693,7 @@ fn sections(v: Version, objs: &[Obj], extra: &[(u64, usize)]) -> Sections {
             },
         ],
         skipped: Vec::new(),
+        maint: 0,
         codepage: 30,
     }
 }
@@ -771,6 +803,13 @@ fn a_2010_drawing_gives_its_blocks_and_model_space() -> TestResult {
 }
 
 #[test]
+fn a_2007_drawing_gives_its_blocks_and_model_space() -> TestResult {
+    let v = Version::R2007;
+    check_sample(&drawing(&sections(v, &sample(v), &[]))?);
+    Ok(())
+}
+
+#[test]
 fn a_2004_drawing_gives_its_blocks_and_model_space() -> TestResult {
     let v = Version::R2004;
     check_sample(&drawing(&sections(v, &sample(v), &[]))?);
@@ -798,6 +837,21 @@ fn a_whole_file_is_read() -> TestResult {
         );
         check_sample(&read_drawing(&file)?);
     }
+    // And a 2007 file, in its own container.
+    let (map, objects) = sections_bytes(&sample(Version::R2007), &[]);
+    let file = write_dwg_2007(&[
+        TestSection {
+            name: "AcDb:AcDbObjects",
+            data: objects,
+            ..Default::default()
+        },
+        TestSection {
+            name: "AcDb:Handles",
+            data: map,
+            ..Default::default()
+        },
+    ]);
+    check_sample(&read_drawing(&file)?);
     Ok(())
 }
 
@@ -949,7 +1003,7 @@ fn a_block_inserting_itself_ends() -> TestResult {
 
 #[test]
 fn flipped_and_cut_objects_give_no_panic() {
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2007, Version::R2010] {
         let s = sections(v, &sample(v), &[]);
         let objects = s.sections[1].data.clone();
         let map = s.sections[0].data.clone();
@@ -1056,6 +1110,11 @@ pub(crate) enum TestEntity {
 
 /// An AutoCAD 2010 drawing whose model space holds `items`, for tests elsewhere in the crate.
 pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
+    model_space_dwg_with_classes(items, None)
+}
+
+/// [`model_space_dwg`] with an `AcDb:Classes` section holding `classes` as given.
+pub(crate) fn model_space_dwg_with_classes(items: &[TestEntity], classes: Option<Vec<u8>>) -> Vec<u8> {
     const FRAME_H: u64 = 0x22;
     let v = Version::R2010;
     let model = head(None);
@@ -1112,21 +1171,26 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
     let (_, objects) = sections_bytes(&objs, &[]);
     let past_end: Vec<(u64, usize)> = damaged.iter().map(|&h| (h, objects.len() + 10)).collect();
     let (map, objects) = sections_bytes(&objs, &past_end);
-    write_dwg(
-        b"AC1024",
-        &[
-            TestSection {
-                name: "AcDb:AcDbObjects",
-                data: objects,
-                ..Default::default()
-            },
-            TestSection {
-                name: "AcDb:Handles",
-                data: map,
-                ..Default::default()
-            },
-        ],
-    )
+    let mut sections = vec![
+        TestSection {
+            name: "AcDb:AcDbObjects",
+            data: objects,
+            ..Default::default()
+        },
+        TestSection {
+            name: "AcDb:Handles",
+            data: map,
+            ..Default::default()
+        },
+    ];
+    if let Some(data) = classes {
+        sections.push(TestSection {
+            name: "AcDb:Classes",
+            data,
+            ..Default::default()
+        });
+    }
+    write_dwg(b"AC1024", &sections)
 }
 
 /// A BLOCK_HEADER with every field up to its base point; an xref has no owned-object count.
@@ -1139,7 +1203,7 @@ fn block_fields(mut o: Obj, base: (f64, f64), xref: bool) -> Obj {
     let v = o.version;
     match v {
         Version::R2004 => o.data.b(true).bs(0).b(false),
-        Version::R2010 => o.data.bs(0),
+        Version::R2007 | Version::R2010 => o.data.bs(0),
     };
     o.data.b(false).b(false).b(xref).b(false).b(false);
     if !xref {
@@ -1151,7 +1215,7 @@ fn block_fields(mut o: Obj, base: (f64, f64), xref: bool) -> Obj {
 
 #[test]
 fn a_block_is_placed_by_its_base_point() -> TestResult {
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2007, Version::R2010] {
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -1220,7 +1284,7 @@ fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
 
 #[test]
 fn a_dimension_is_drawn_by_its_block() -> TestResult {
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2007, Version::R2010] {
         let d1 = head(Some(0x100));
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
@@ -1257,6 +1321,38 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
             "only the one without its block: {:?}",
             d.skipped
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn shadow_flags_have_no_handle() -> TestResult {
+    // The specification gives entities shadow flags (an RC, 2007 on) but no shadow handle: with
+    // every flag set, the material and plot style handles and an INSERT's block still line up.
+    for v in [Version::R2007, Version::R2010] {
+        let mut objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            entry(v, BLOCK_HEADER, 0x100, "B"),
+            line(v, 0x200, head(Some(0x100)), (0.0, 0.0), (5.0, 0.0)),
+        ];
+        let shadowed = Head {
+            extras: true,
+            shadow: 3,
+            ..head(None)
+        };
+        let mut i = entity(v, 7, 0x201, shadowed);
+        i.data.bd3((0.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+        i.handles.h(5, 0x100);
+        objs.push(i);
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(
+            has_line(&d.model, Point::new(0.0, 0.0), Point::new(5.0, 0.0)),
+            "{v:?}: {:?} {:?}",
+            d.model,
+            d.damaged
+        );
+        assert!(d.damaged.is_empty(), "{v:?}: {:?}", d.damaged);
     }
     Ok(())
 }
@@ -1347,6 +1443,34 @@ fn hatches_become_filled_and_unfilled_outlines() -> TestResult {
         // The half circle's points plus the line's start: well over 3, and not filled.
         assert!(polylines.iter().any(|(n, f)| *n > 5 && !f), "{v:?}: {polylines:?}");
         assert_eq!(polylines.len(), 2, "{:?}", d.model);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_field_missing_before_the_texts_does_not_read_into_them() -> TestResult {
+    for v in [Version::R2007, Version::R2010] {
+        let mut objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        ];
+        // An ATTRIB without its last field, the lock position flag: the data ends where the
+        // texts start, so the flag is missing rather than taken from the texts.
+        let mut a = entity(v, 2, 0x300, head(None));
+        text_data_with(&mut a, (0.0, 0.0), "value", 2.5, 0.0, Some(1));
+        if v == Version::R2010 {
+            a.data.rc(0);
+        }
+        a.text("TAG");
+        a.data.bs(0).rc(0);
+        objs.push(a);
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{v:?}: {:?}", d.skipped);
+        assert!(
+            d.damaged.iter().any(|m| m.contains("ends too early")),
+            "{v:?}: {:?}",
+            d.damaged
+        );
     }
     Ok(())
 }
@@ -1967,6 +2091,152 @@ fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestRes
     Ok(())
 }
 
+#[test]
+fn a_dwg_spline_by_fit_points_is_a_smooth_curve() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        // Scenario 2: fit tolerance, start and end tangents (none given: zero), three fit points.
+        let mut fit = entity(v, 36, 0x300, head(None));
+        fit.data
+            .bl(2)
+            .bl(3)
+            .bd(1e-7)
+            .bd3((0.0, 0.0, 0.0))
+            .bd3((0.0, 0.0, 0.0))
+            .bl(3);
+        for p in [(0.0, 20.0, 0.0), (5.0, 25.0, 0.0), (10.0, 20.0, 0.0)] {
+            fit.data.bd3(p);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            fit,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        let pts = match d.model.first() {
+            Some(Shape::Polyline { points, .. }) => points.clone(),
+            other => return Err(format!("no polyline: {other:?}").into()),
+        };
+        // A curve, not two segments: many points, and above the straight segment at x = 2.5
+        // (page y is down: above means a smaller y than -22.5).
+        assert!(pts.len() > 10, "{v:?}: {pts:?}");
+        let quarter = pts
+            .iter()
+            .min_by(|a, b| (a.x - 2.5).abs().total_cmp(&(b.x - 2.5).abs()));
+        assert!(quarter.is_some_and(|q| q.y < -22.5 - 0.3), "{v:?}: {quarter:?}");
+        // And it reaches its three fit points (page y down).
+        for (x, y) in [(0.0, -20.0), (5.0, -25.0), (10.0, -20.0)] {
+            let d = pts.iter().map(|q| (q.x - x).hypot(q.y - y)).fold(f64::MAX, f64::min);
+            assert!(d < 0.05, "{v:?}: ({x}, {y}) is {d} away");
+        }
+    }
+    Ok(())
+}
+
+/// An `AcDb:Classes` section listing `classes` (number, DXF name, entity?) as AutoCAD 2004,
+/// 2007 or 2010 (maintenance release 6) writes it.
+fn classes_section(v: Version, classes: &[(u16, &str, bool)]) -> Vec<u8> {
+    // One class per entry, so an entry listed twice is read twice.
+    let max = classes
+        .iter()
+        .map(|c| c.0)
+        .max()
+        .unwrap_or(499)
+        .max(499 + classes.len() as u16);
+    classes_section_max(v, max, classes)
+}
+
+/// [`classes_section`] declaring `max` as the highest class number.
+fn classes_section_max(v: Version, max: u16, classes: &[(u16, &str, bool)]) -> Vec<u8> {
+    let classes: Vec<_> = classes
+        .iter()
+        .map(|&(number, name, entity)| (number, name, if entity { 0x1F2 } else { 0x1F3 }))
+        .collect();
+    classes_section_ids(v, max, &classes)
+}
+
+/// [`classes_section_max`] with each class's item class id given as written.
+fn classes_section_ids(v: Version, max: u16, classes: &[(u16, &str, u16)]) -> Vec<u8> {
+    classes_section_layout(v, true, max, classes)
+}
+
+/// [`classes_section_ids`] with or without the second size field a 2010 drawing of
+/// maintenance release 4 and later has (`second`; ignored for 2004 and 2007, which never have
+/// it).
+fn classes_section_layout(v: Version, second: bool, max: u16, classes: &[(u16, &str, u16)]) -> Vec<u8> {
+    let second = second && v == Version::R2010;
+    classes_section_raw(v, second, max, classes)
+}
+
+/// [`classes_section_layout`] writing the second size field whenever `second` is set, also for
+/// 2007 (not ignored for 2004).
+fn classes_section_raw(v: Version, second: bool, max: u16, classes: &[(u16, &str, u16)]) -> Vec<u8> {
+    const SENTINEL: [u8; 16] = [
+        0x8D, 0xA1, 0xC4, 0xB8, 0xC4, 0xA9, 0xF8, 0xC5, 0xC0, 0xDC, 0xF4, 0x5F, 0xE7, 0xCF, 0xB6, 0x8A,
+    ];
+    let mut data = W::default();
+    let mut strings = W::default();
+    data.bs(max).rc(0).rc(0).b(true);
+    for &(number, name, id) in classes {
+        data.bs(number).bs(0);
+        match v {
+            Version::R2004 => {
+                data.t8("ObjectDBX Classes").t8("AcDbThing").t8(name);
+            }
+            Version::R2007 | Version::R2010 => {
+                strings.tu("ObjectDBX Classes").tu("AcDbThing").tu(name);
+            }
+        }
+        data.b(false).bs(id);
+        data.bl(1).bl(0).bl(0).bl(0).bl(0);
+    }
+    let mut out = W::default();
+    for b in SENTINEL {
+        out.rc(b);
+    }
+    match v {
+        Version::R2004 => {
+            out.rl(data.bytes().len() as u32).append(&data);
+        }
+        Version::R2007 | Version::R2010 => {
+            // Data, texts, their size and the flag; the flag sits `bitsize` after bit 191, or
+            // after bit 159 without the second size.
+            let mut body = W::default();
+            body.append(&data).append(&strings);
+            body.rs(strings.0.len() as u16).b(true);
+            let head = if second { 28 } else { 24 };
+            let flag_at = head * 8 + body.0.len() - 1;
+            // As real files: the size covers the bit size field, the data and the texts.
+            out.rl(body.bytes().len() as u32 + 4);
+            if second {
+                out.rl(0);
+            }
+            out.rl((flag_at - (head * 8 - 33)) as u32).append(&body);
+        }
+    }
+    // A CRC and the closing sentinel after the class data area.
+    let mut bytes = out.bytes();
+    bytes.extend([0, 0]);
+    bytes.extend(SENTINEL.iter().map(|b| !b));
+    bytes
+}
+
+/// `sections` plus a class section, maintenance release 6.
+fn sections_with_classes(v: Version, objs: &[Obj], classes: Vec<u8>) -> Sections {
+    sections_with_classes_maint(v, objs, classes, 6)
+}
+
+/// [`sections_with_classes`] of maintenance release `maint`.
+fn sections_with_classes_maint(v: Version, objs: &[Obj], classes: Vec<u8>, maint: u8) -> Sections {
+    let mut s = sections(v, objs, &[]);
+    s.sections.push(Section {
+        name: "AcDb:Classes".into(),
+        id: 3,
+        data: classes,
+    });
+    s.maint = maint;
+    s
+}
+
 /// A 2004 drawing with a block named "Реле" holding the text "Пуск", both in Windows-1251.
 fn cyrillic_2004(codepage: u16) -> Sections {
     let v = Version::R2004;
@@ -1991,6 +2261,302 @@ fn cyrillic_2004(codepage: u16) -> Sections {
     let mut s = sections(v, &objs, &[]);
     s.codepage = codepage;
     s
+}
+
+#[test]
+fn a_2010_class_section_of_release_3_has_no_second_size() -> TestResult {
+    // Releases 0 to 3: the bit size follows the first size, the flag sits `bitsize` after bit 159.
+    let v = Version::R2010;
+    let ids = [(500, "WIPEOUT", 0x1F2), (501, "ACDBDICTIONARYWDFLT", 0x1F3)];
+    let mut wipeout = entity(v, 500, 0x300, head(None));
+    wipeout.data.bd(0.0);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        wipeout,
+        Obj::new(v, 501, 0x301),
+    ];
+    for maint in [0, 3] {
+        let classes = classes_section_layout(v, false, 501, &ids);
+        let d = drawing(&sections_with_classes_maint(v, &objs, classes, maint))?;
+        assert_eq!(
+            d.skipped.get("WIPEOUT"),
+            Some(&1),
+            "{maint}: {:?} {:?}",
+            d.skipped,
+            d.damaged
+        );
+        assert_eq!(d.skipped.len(), 1, "{maint}: {:?}", d.skipped);
+        assert!(d.damaged.is_empty(), "{maint}: {:?}", d.damaged);
+    }
+    // The same section read as release 4 looks for a second size that is not there.
+    let classes = classes_section_layout(v, false, 501, &ids);
+    let d = drawing(&sections_with_classes_maint(v, &objs, classes, 4))?;
+    assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn a_2007_class_section_never_has_the_second_size() -> TestResult {
+    // 2007 names its classes in a string stream as 2010 does, but whatever its maintenance
+    // release, the bit size follows the first size: a second size is read as damage.
+    let v = Version::R2007;
+    let ids = [(500, "WIPEOUT", 0x1F2), (501, "ACDBDICTIONARYWDFLT", 0x1F3)];
+    let mut wipeout = entity(v, 500, 0x300, head(None));
+    wipeout.data.bd(0.0);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        wipeout,
+        Obj::new(v, 501, 0x301),
+    ];
+    for maint in [0, 3, 4, 6] {
+        let classes = classes_section_raw(v, false, 501, &ids);
+        let d = drawing(&sections_with_classes_maint(v, &objs, classes, maint))?;
+        assert_eq!(
+            d.skipped.get("WIPEOUT"),
+            Some(&1),
+            "{maint}: {:?} {:?}",
+            d.skipped,
+            d.damaged
+        );
+        assert_eq!(d.skipped.len(), 1, "{maint}: {:?}", d.skipped);
+        assert!(d.damaged.is_empty(), "{maint}: {:?}", d.damaged);
+    }
+    let classes = classes_section_raw(v, true, 501, &ids);
+    let d = drawing(&sections_with_classes_maint(v, &objs, classes, 6))?;
+    assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn custom_entities_are_counted_by_their_class_name_and_custom_objects_not() -> TestResult {
+    for v in [Version::R2004, Version::R2007, Version::R2010] {
+        let classes = classes_section(v, &[(500, "WIPEOUT", true), (501, "ACDBDICTIONARYWDFLT", false)]);
+        let mut wipeout = entity(v, 500, 0x300, head(None));
+        wipeout.data.bd(0.0);
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            wipeout,
+            Obj::new(v, 501, 0x301),
+        ];
+        let d = drawing(&sections_with_classes(v, &objs, classes))?;
+        assert_eq!(d.skipped.get("WIPEOUT"), Some(&1), "{v:?}: {:?}", d.skipped);
+        assert_eq!(d.skipped.len(), 1, "nothing for the object: {:?}", d.skipped);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_damaged_class_section_is_named_and_the_rest_read() -> TestResult {
+    for v in [Version::R2004, Version::R2007, Version::R2010] {
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+        ];
+        let whole = classes_section(v, &[(500, "WIPEOUT", true), (501, "IMAGE", true)]);
+        // A wrong sentinel, a section cut in its header, and one cut inside its second class.
+        for bad in [vec![0u8; 40], whole[..22].to_vec(), whole[..whole.len() - 6].to_vec()] {
+            let d = drawing(&sections_with_classes(v, &objs, bad))?;
+            assert_eq!(d.model.len(), 1, "{v:?}: the drawing is still read");
+            assert!(
+                d.damaged.iter().any(|r| r.contains("AcDb:Classes")),
+                "{v:?}: {:?}",
+                d.damaged
+            );
+            assert!(d.damaged.iter().all(|r| !r.contains("DWG: DWG:")), "{:?}", d.damaged);
+            assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{v:?}: {:?}", d.skipped);
+            assert!(
+                !d.skipped.contains_key(DAMAGED),
+                "a section is not an object: {:?}",
+                d.skipped
+            );
+        }
+        // An empty class list (highest class 499) is no damage.
+        let d = drawing(&sections_with_classes(v, &objs, classes_section(v, &[])))?;
+        assert!(d.damaged.is_empty(), "{v:?}: {:?}", d.damaged);
+    }
+    Ok(())
+}
+
+#[test]
+fn twice_listed_classes_and_odd_names_are_handled() -> TestResult {
+    let v = Version::R2010;
+    let objs = |kind: u16| {
+        let mut e = entity(v, kind, 0x300, head(None));
+        e.data.bd(0.0);
+        vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            e,
+        ]
+    };
+    // Class 500 listed twice: the section is damaged.
+    let twice = classes_section(v, &[(500, "WIPEOUT", true), (500, "IMAGE", false)]);
+    let d = drawing(&sections_with_classes(v, &objs(500), twice))?;
+    assert!(d.damaged.iter().any(|r| r.contains("listed twice")), "{:?}", d.damaged);
+    // A name that is no DXF name (it could pass for a counter) is counted by type number.
+    let odd = classes_section(v, &[(500, "damaged objects", true)]);
+    let d = drawing(&sections_with_classes(v, &objs(500), odd))?;
+    assert_eq!(d.skipped.get("custom entity type 500"), Some(&1), "{:?}", d.skipped);
+    assert!(!d.skipped.contains_key(DAMAGED), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn the_maintenance_release_comes_from_the_file_header() -> TestResult {
+    // A whole 2010 file whose header says release 6, so the class section has its second size.
+    let v = Version::R2010;
+    let mut wipeout = entity(v, 500, 0x300, head(None));
+    wipeout.data.bd(0.0);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        wipeout,
+    ];
+    let (map, objects) = sections_bytes(&objs, &[]);
+    let section = |name: &'static str, data: Vec<u8>| TestSection {
+        name,
+        data,
+        ..Default::default()
+    };
+    let mut file = write_dwg(
+        b"AC1024",
+        &[
+            section("AcDb:Handles", map),
+            section("AcDb:AcDbObjects", objects),
+            section("AcDb:Classes", classes_section(v, &[(500, "WIPEOUT", true)])),
+        ],
+    );
+    file[0x0B] = 6;
+    let read = read_sections(&file)?;
+    assert_eq!(read.maint, 6);
+    let d = drawing(&read)?;
+    assert_eq!(d.skipped.get("WIPEOUT"), Some(&1), "{:?} {:?}", d.skipped, d.damaged);
+    Ok(())
+}
+
+#[test]
+fn a_2004_class_section_cut_inside_a_record_or_with_a_wrong_end_is_damaged() -> TestResult {
+    let v = Version::R2004;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+    ];
+    let whole = classes_section(v, &[(500, "WIPEOUT", true), (501, "IMAGE", true)]);
+    // The data area follows the 16-byte sentinel and the 4-byte size; then a CRC and the
+    // closing sentinel.
+    let size = u32::from_le_bytes(whole[16..20].try_into()?) as usize;
+    let trailer = whole[20 + size..].to_vec();
+    // The declared body ends 4 bytes early (inside the second record), the trailer is whole.
+    let mut cut = whole[..16].to_vec();
+    cut.extend(((size - 4) as u32).to_le_bytes());
+    cut.extend(&whole[20..20 + size - 4]);
+    cut.extend(&trailer);
+    // The same length, a closing sentinel with one byte wrong.
+    let mut wrong = whole.clone();
+    let last = wrong.len() - 1;
+    wrong[last] ^= 0xFF;
+    // A class numbered past the declared highest one.
+    let over = classes_section_max(v, 500, &[(501, "WIPEOUT", true)]);
+    for bad in [cut, wrong, over] {
+        let d = drawing(&sections_with_classes(v, &objs, bad))?;
+        assert_eq!(d.model.len(), 1, "the drawing is still read");
+        assert_eq!(
+            d.skipped.get(CLASSES_DAMAGED),
+            Some(&1),
+            "{:?} {:?}",
+            d.skipped,
+            d.damaged
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_2010_class_record_that_cannot_be_read_and_a_cut_trailer_are_damage() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+    ];
+    // Sizes, texts and trailer consistent, but the header declares a second class that is not
+    // there: reading its record fails.
+    let short = classes_section_max(v, 501, &[(500, "WIPEOUT", true)]);
+    // The trailer cut off.
+    let whole = classes_section(v, &[(500, "WIPEOUT", true)]);
+    let cut = whole[..whole.len() - 10].to_vec();
+    for bad in [short, cut] {
+        let d = drawing(&sections_with_classes(v, &objs, bad))?;
+        assert_eq!(d.model.len(), 1, "the drawing is still read");
+        assert_eq!(
+            d.skipped.get(CLASSES_DAMAGED),
+            Some(&1),
+            "{:?} {:?}",
+            d.skipped,
+            d.damaged
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_class_with_an_unknown_item_class_id_is_damage() -> TestResult {
+    for v in [Version::R2004, Version::R2007, Version::R2010] {
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+        ];
+        let zero = classes_section_ids(v, 500, &[(500, "WIPEOUT", 0)]);
+        let d = drawing(&sections_with_classes(v, &objs, zero))?;
+        assert_eq!(d.model.len(), 1, "{v:?}: the drawing is still read");
+        assert!(
+            d.damaged
+                .iter()
+                .any(|r| r.contains("class 500 has item class ID 0x0, not 0x1F2 or 0x1F3")),
+            "{v:?}: {:?}",
+            d.damaged
+        );
+        assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{v:?}: {:?}", d.skipped);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_2010_class_section_with_its_closing_sentinel_4_bytes_early_is_refused() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+    ];
+    // Release 6: the CRC (2 bytes) and the closing sentinel (16) end the section. Move them 4
+    // bytes earlier, over the end of the class data area, once with the section 4 bytes shorter
+    // and once padded back to its length.
+    let whole = classes_section(v, &[(500, "WIPEOUT", true)]);
+    let trailer_at = whole.len() - 18;
+    let mut short = whole[..trailer_at - 4].to_vec();
+    short.extend(&whole[trailer_at..]);
+    let mut padded = short.clone();
+    padded.extend([0; 4]);
+    for bad in [short, padded] {
+        let d = drawing(&sections_with_classes(v, &objs, bad))?;
+        assert_eq!(d.model.len(), 1, "the drawing is still read");
+        assert!(
+            d.damaged
+                .iter()
+                .any(|r| r.contains("AcDb:Classes") && r.contains("closing sentinel")),
+            "{:?}",
+            d.damaged
+        );
+        assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{:?}", d.skipped);
+    }
+    Ok(())
 }
 
 #[test]

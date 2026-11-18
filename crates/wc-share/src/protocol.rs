@@ -17,7 +17,7 @@ pub type PeerId = u32;
 /// before versions were sent counts as 0), since a message one side does not know cannot be
 /// read by the other. Raise it whenever a message, edit or field is added or changed in a way
 /// an older build cannot read.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The session protocol versions of a host and a guest that cannot work together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,8 +353,10 @@ impl ProjectEdit {
 
     /// Which parts of the project this change touches, as keys (the values are those of
     /// `project`): what a participant that applied it at once gets back when the host refuses
-    /// it, to put its copy right. Whole-page changes and added symbols and parts are applied
-    /// only when the host sends them, so they need nothing back.
+    /// it, to put its copy right. Added symbols and parts are applied only when the host sends
+    /// them, so they need nothing back; whole-page changes are too, except a page the sender
+    /// holds, which it writes into its copy at once (see `Guest::edit_project`): their pages
+    /// come back.
     pub fn touches(&self, project: &Project) -> Parts {
         let mut keys = Parts::default();
         match self {
@@ -386,8 +388,11 @@ impl ProjectEdit {
             Self::SetMeta { .. } => keys.meta = Some(Box::new(project.meta.clone())),
             Self::Restore { parts } => keys = (**parts).clone(),
             Self::Batch { edits } => {
-                // What the parts applied at once touch.
-                for e in edits.iter().filter(|e| e.applied_at_once()) {
+                // What the parts applied at once touch, and the pages set.
+                for e in edits
+                    .iter()
+                    .filter(|e| e.applied_at_once() || matches!(e, Self::SetPages { .. }))
+                {
                     let t = e.touches(project);
                     keys.pages.extend(t.pages);
                     keys.devices.extend(t.devices);
@@ -398,7 +403,12 @@ impl ProjectEdit {
                     }
                 }
             }
-            Self::SetPages { .. } | Self::AddItems { .. } | Self::UpdateItems { .. } | Self::AddPicture { .. } => {}
+            Self::SetPages { pages, .. } => {
+                for p in pages {
+                    keys.pages.insert(p.id.clone(), None);
+                }
+            }
+            Self::AddItems { .. } | Self::UpdateItems { .. } | Self::AddPicture { .. } => {}
         }
         Parts::read(project, &keys)
     }
@@ -416,6 +426,20 @@ impl ProjectEdit {
                 | Self::Restore { .. }
                 | Self::Batch { .. }
         )
+    }
+
+    /// The pages this change sets whole ([`ProjectEdit::SetPages`], also inside a batch the host
+    /// can accept; a malformed batch sets none).
+    pub fn set_pages(&self) -> impl Iterator<Item = &Page> {
+        let edits = match self {
+            Self::Batch { edits } if Self::well_formed(edits) => edits.as_slice(),
+            Self::Batch { .. } => &[],
+            e => std::slice::from_ref(e),
+        };
+        edits.iter().flat_map(|e| match e {
+            Self::SetPages { pages, .. } => pages.as_slice(),
+            _ => &[],
+        })
     }
 
     /// Whether any of this change is applied at once (for a batch: any of its edits).
@@ -509,6 +533,11 @@ pub enum Refusal {
     /// The change could not be written to the project's history, so it was undone.
     #[error("the change could not be recorded: {reason}")]
     NotRecorded { reason: String },
+    /// A picture ([`ProjectEdit::AddPicture`]) has a name the session or the host's folder
+    /// already uses for another file. The sender gives its picture a new name and sends it
+    /// again, with the changes that name it.
+    #[error("the session already has another file named {file}")]
+    PictureNameTaken { file: String },
 }
 
 /// The whole project as sent to a guest when they join.

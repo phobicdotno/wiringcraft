@@ -3,7 +3,7 @@
 
 use crate::icons::Icon;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     NewProject,
     Open,

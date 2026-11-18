@@ -59,6 +59,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("the session connection is closed")]
     Closed,
+    /// [`write_picture`] found another file under the picture's name, which it never writes
+    /// over (other storage failures stay [`Error::Io`]).
+    #[error("{0}")]
+    PictureNameTaken(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
