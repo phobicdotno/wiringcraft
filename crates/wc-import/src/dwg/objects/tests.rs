@@ -122,9 +122,13 @@ impl W {
         self
     }
     fn t8(&mut self, s: &str) -> &mut Self {
-        self.bs(s.len() as u16);
-        for b in s.bytes() {
-            self.rc(b);
+        self.t8_bytes(s.as_bytes())
+    }
+    /// A TV of these bytes (2004): its length, then the bytes.
+    fn t8_bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        self.bs(bytes.len() as u16);
+        for b in bytes {
+            self.rc(*b);
         }
         self
     }
@@ -1127,7 +1131,12 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
 
 /// A BLOCK_HEADER with every field up to its base point; an xref has no owned-object count.
 fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: bool) -> Obj {
-    let mut o = named(v, BLOCK_HEADER, handle, name);
+    block_fields(named(v, BLOCK_HEADER, handle, name), base, xref)
+}
+
+/// The fields a BLOCK_HEADER has after its name, written onto `o`.
+fn block_fields(mut o: Obj, base: (f64, f64), xref: bool) -> Obj {
+    let v = o.version;
     match v {
         Version::R2004 => o.data.b(true).bs(0).b(false),
         Version::R2010 => o.data.bs(0),
@@ -1958,30 +1967,12 @@ fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestRes
     Ok(())
 }
 
-/// A TV of raw bytes (2004).
-fn raw_t8(w: &mut W, bytes: &[u8]) {
-    w.bs(bytes.len() as u16);
-    for b in bytes {
-        w.rc(*b);
-    }
-}
-
 /// A 2004 drawing with a block named "Реле" holding the text "Пуск", both in Windows-1251.
 fn cyrillic_2004(codepage: u16) -> Sections {
     let v = Version::R2004;
     let mut block = Obj::new(v, BLOCK_HEADER, 0x100);
-    block.data.bs(0).bl(0).b(true);
-    raw_t8(&mut block.data, &[0xD0, 0xE5, 0xEB, 0xE5]);
-    block.data.b(true).bs(0).b(false);
-    block
-        .data
-        .b(false)
-        .b(false)
-        .b(false)
-        .b(false)
-        .b(false)
-        .bl(0)
-        .bd3((0.0, 0.0, 0.0));
+    block.data.bs(0).bl(0).b(true).t8_bytes(&[0xD0, 0xE5, 0xEB, 0xE5]);
+    let block = block_fields(block, (0.0, 0.0), false);
     let mut text = entity(v, 1, 0x200, head(Some(0x100)));
     text.data
         .rc(0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80)
@@ -1990,7 +1981,7 @@ fn cyrillic_2004(codepage: u16) -> Sections {
         .be((0.0, 0.0, 1.0))
         .bt(0.0)
         .rd(2.5);
-    raw_t8(&mut text.data, &[0xCF, 0xF3, 0xF1, 0xEA]);
+    text.data.t8_bytes(&[0xCF, 0xF3, 0xF1, 0xEA]);
     let objs = vec![
         entry(v, LAYER, LAYER_H, "0"),
         entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -2014,9 +2005,10 @@ fn a_2004_drawing_in_windows_1251_reads_cyrillic() -> TestResult {
     // Its text is kept, decoded the legacy way (not UTF-8, so Windows-1252).
     assert_eq!(texts(&d.blocks["Ðåëå"]), ["Ïóñê"]);
     assert!(d.skipped.is_empty(), "not an entity count: {:?}", d.skipped);
-    assert!(
-        d.warnings.iter().any(|w| w.contains("code page 31")),
-        "{:?}",
+    assert_eq!(
+        d.warnings.iter().filter(|w| w.contains("code page 31")).count(),
+        1,
+        "one warning per drawing: {:?}",
         d.warnings
     );
     Ok(())

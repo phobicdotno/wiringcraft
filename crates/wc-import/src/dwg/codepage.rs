@@ -1,7 +1,7 @@
 //! The single-byte code pages an AutoCAD 2004 drawing may store its texts in, by the code page
 //! number of the file header (byte 0x13), numbered as the DWG format numbers them (30 is
 //! Windows-1252). Bytes below 0x80 are ASCII in all of them; each table gives the characters of
-//! 0x80 to 0xFF (U+FFFD where the code page has none), as the code page definitions give them
+//! 0x80 to 0xFF (0xFFFD marks a byte the code page has no character for), as the code page definitions give them
 //! (the same as Python's codecs, from which they were written out).
 
 /// The characters of bytes 0x80 to 0xFF of a code page.
@@ -170,8 +170,9 @@ fn table(n: u16) -> Option<(&'static Upper, &'static str)> {
 /// How the texts of a drawing with code page number `n` are decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decoding {
-    /// The reader's legacy text decoder: UTF-8 when the bytes are, else Windows-1252. For code
-    /// pages 0 (UTF-8) and 1 (ASCII), and the fallback for a page this reader does not know.
+    /// The reader's legacy text decoder: UTF-8 when the bytes are, else byte for byte as Latin-1
+    /// (with the euro sign and the two dashes of Windows-1252). For code pages 0 (UTF-8) and 1
+    /// (ASCII), and the fallback for a page this reader does not know.
     Legacy,
     /// A single-byte page of [`table`].
     Page(u16),
@@ -198,10 +199,13 @@ impl Decoding {
                         if b < 0x80 {
                             char::from(b)
                         } else {
+                            // A byte the page has no character for keeps its own value (a
+                            // control character), so two names differing only there stay apart.
                             upper
                                 .get(usize::from(b - 0x80))
+                                .filter(|&&u| u != 0xFFFD)
                                 .and_then(|&u| char::from_u32(u32::from(u)))
-                                .unwrap_or(char::REPLACEMENT_CHARACTER)
+                                .unwrap_or(char::from(b))
                         }
                     })
                     .collect(),
@@ -247,8 +251,9 @@ mod tests {
         let d = Decoding::of(29).0;
         // "Реле А" in Windows-1251.
         assert_eq!(d.decode(&[0xD0, 0xE5, 0xEB, 0xE5, b' ', 0xC0]), "Реле А");
-        // A byte a page has no character for.
-        assert_eq!(d.decode(&[0x98]), "\u{FFFD}");
+        // Bytes the page has no character for stay apart.
+        assert_eq!(d.decode(&[0x98]), "\u{98}");
+        assert_ne!(d.decode(&[b'A', 0x98]), Decoding::of(28).0.decode(&[b'A', 0x81]));
         // UTF-8 and ASCII keep the legacy decoder; an unknown page falls back to it, unknown.
         assert_eq!(Decoding::of(0), (Decoding::Legacy, true));
         assert_eq!(Decoding::of(31), (Decoding::Legacy, false));

@@ -139,7 +139,7 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     if sections.version == Version::R2004 && !known {
         warnings.push(format!(
             "its texts are in {}, which is not supported: read with the legacy decoder (UTF-8 \
-             when they are, else Windows-1252)",
+             when they are, else byte for byte as Latin-1)",
             Decoding::name(sections.codepage)
         ));
     }
