@@ -3244,6 +3244,13 @@ impl Share {
         for edit in pictures.edits {
             if let ProjectEdit::AddPicture { picture } = &edit {
                 self.pictures_sent.insert(picture.file.clone());
+                // A replacement of the session's file is an attempt of its own, renamed in every
+                // reference once refused: a pick of that name withdrawn earlier does not hold it
+                // back. (A late refusal of the withdrawn pick's picture now counts for it: the
+                // session has another file of that name either way.)
+                if self.pictures_replaced.contains(&picture.file) {
+                    self.withdrawn_picks.remove(&picture.file);
+                }
             }
             role.edit_project(edit, &mut self.notes);
         }

@@ -2953,6 +2953,61 @@ fn a_picked_picture_whose_change_the_session_refused_is_neither_renamed_nor_shar
 }
 
 #[test]
+fn a_session_picture_replaced_here_after_a_withdrawn_pick_of_its_name_is_renamed_and_shared() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The guest's pick of its own brand.png as the logo is refused, and the host makes the
+    // session's picture of that name its logo: the pick is withdrawn.
+    log.fail_guests(true);
+    let file = "pictures/brand.png";
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join(file), b"\x89PNG\r\n\x1a\nmine")?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: file.into(),
+        cover: None,
+    });
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    host_open.project.meta.logo = Some(wc_core::Logo {
+        file: file.into(),
+        cover: None,
+    });
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    log.fail_guests(false);
+    // The guest puts the session's picture in place, and later replaces it with another file
+    // of that name: the replacement is renamed everywhere and shared under its new name.
+    std::fs::write(guest_open.dir.join(file), PNG)?;
+    std::thread::sleep(ITEM_RETRY_LATER + std::time::Duration::from_millis(50));
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let new = b"\x89PNG\r\n\x1a\nanother logo".to_vec();
+    std::fs::write(guest_open.dir.join(file), &new)?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let renamed = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(renamed, file, "{:?}", g.notes);
+    assert_eq!(file_bytes(&guest_open.dir, &renamed)?, new);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    assert_eq!(file_bytes(&host_open.dir, &renamed)?, new);
+    assert_eq!(file_bytes(&host_open.dir, file)?, PNG);
+    Ok(())
+}
+
+#[test]
 fn a_picture_renamed_for_some_references_leaves_the_others() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut open = project(tmp.path())?;
