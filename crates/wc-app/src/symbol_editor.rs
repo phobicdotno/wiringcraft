@@ -57,7 +57,9 @@ impl Tool {
     /// What to do next, for the status line.
     fn hint(self, clicks: usize) -> &'static str {
         match (self, clicks) {
-            (Tool::Select, _) => "Click a shape or pin to select it; drag it, or nudge it with the arrow keys.",
+            (Tool::Select, _) => {
+                "Click a shape or pin to select it; drag it, nudge it with the arrow keys, or drag a line end or corner."
+            }
             (Tool::Line, 0) => "Click the start of the line.",
             (Tool::Line, _) => "Click the end of the line.",
             (Tool::Rect, 0) => "Click one corner.",
@@ -124,7 +126,48 @@ pub struct SymbolEditor {
 struct Drag {
     from: Point,
     item: Item,
+    /// A line end or rectangle corner being dragged (index into [`handles`]) instead of the
+    /// whole item.
+    handle: Option<usize>,
     before: Symbol,
+}
+
+/// The points of a shape that can be dragged on their own: a line's two ends, a rectangle's
+/// four corners (top-left, top-right, bottom-right, bottom-left).
+pub fn handles(shape: &Shape) -> Vec<Point> {
+    match shape {
+        Shape::Line { a, b } => vec![*a, *b],
+        Shape::Rect { min, max } => vec![*min, Point::new(max.x, min.y), *max, Point::new(min.x, max.y)],
+        _ => Vec::new(),
+    }
+}
+
+/// `shape` with handle `k` moved to `to`. A rectangle keeps the opposite corner; nothing
+/// changes when the result would be a line of no length or a rectangle without area.
+fn with_handle(shape: &Shape, k: usize, to: Point) -> Option<Shape> {
+    let new = match shape {
+        Shape::Line { a, b } => match k {
+            0 => Shape::Line { a: to, b: *b },
+            1 => Shape::Line { a: *a, b: to },
+            _ => return None,
+        },
+        Shape::Rect { .. } => {
+            let corners = handles(shape);
+            let fixed = *corners.get((k + 2) % 4)?;
+            if k > 3 || to.x == fixed.x || to.y == fixed.y {
+                return None;
+            }
+            Shape::Rect {
+                min: Point::new(to.x.min(fixed.x), to.y.min(fixed.y)),
+                max: Point::new(to.x.max(fixed.x), to.y.max(fixed.y)),
+            }
+        }
+        _ => return None,
+    };
+    match new {
+        Shape::Line { a, b } if a == b => None,
+        n => Some(n),
+    }
 }
 
 /// What a save did, for the window around the editor.
@@ -458,6 +501,22 @@ impl SymbolEditor {
             return;
         }
         self.message.clear();
+        // A handle of the selected line or rectangle wins: it reshapes instead of moving.
+        if let Some(Item::Shape(i)) = self.selected
+            && let Some(k) = self.symbol.graphics.get(i).and_then(|g| {
+                handles(g)
+                    .iter()
+                    .position(|h| (h.x - p.x).abs() < 1.0 && (h.y - p.y).abs() < 1.0)
+            })
+        {
+            self.drag = Some(Drag {
+                from: p,
+                item: Item::Shape(i),
+                handle: Some(k),
+                before: self.symbol.clone(),
+            });
+            return;
+        }
         let hit = self.pick(p);
         let item = match self.selected {
             Some(sel) if self.under(sel, p) => sel,
@@ -475,17 +534,30 @@ impl SymbolEditor {
         self.drag = Some(Drag {
             from: p,
             item,
+            handle: None,
             before: self.symbol.clone(),
         });
     }
 
-    /// The mouse moved to `p` during a drag: the item moves by whole grid steps.
+    /// The mouse moved to `p` during a drag: the item moves by whole grid steps; a
+    /// dragged handle lands on the grid point nearest the pointer.
     pub fn drag_to(&mut self, p: Point) {
         let Some(drag) = self.drag.as_ref() else { return };
-        let d = snap(Point::new(p.x - drag.from.x, p.y - drag.from.y));
-        let item = drag.item;
+        let raw = Point::new(p.x - drag.from.x, p.y - drag.from.y);
+        let d = snap(raw);
+        let (item, handle) = (drag.item, drag.handle);
         self.symbol = drag.before.clone();
-        self.shift(item, d);
+        match (item, handle) {
+            (Item::Shape(i), Some(k)) => {
+                if let Some(g) = self.symbol.graphics.get_mut(i)
+                    && let Some(h) = handles(g).get(k).copied()
+                    && let Some(new) = with_handle(g, k, snap(h + raw))
+                {
+                    *g = new;
+                }
+            }
+            _ => self.shift(item, d),
+        }
     }
 
     /// The drag ended: a move is one undo step; a drag that moved nothing leaves none.
@@ -859,6 +931,13 @@ impl SymbolEditor {
                 stroke
             };
             paint_shape(&painter, &xf, g, s);
+            if self.selected == Some(Item::Shape(i)) {
+                for h in handles(g) {
+                    let r = egui::Rect::from_center_size(xf.s(h), Vec2::splat(7.0));
+                    painter.rect_filled(r, 1.0, visuals.extreme_bg_color);
+                    painter.rect_stroke(r, 1.0, Stroke::new(1.5_f32, pick), egui::StrokeKind::Middle);
+                }
+            }
         }
         let pin_col = Color32::from_rgb(200, 60, 60);
         for (i, p) in self.symbol.pins.iter().enumerate() {
@@ -1262,6 +1341,119 @@ mod tests {
         e.start_drag(Point::new(15.0, 15.0));
         assert!(!e.dragging());
         assert_eq!(e.selected, None);
+    }
+
+    #[test]
+    fn a_corner_dragged_onto_the_opposite_side_leaves_the_rectangle_as_it_was() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        e.set_tool(Tool::Select);
+        e.click(Point::new(-5.0, 0.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        let drawn = e.symbol.clone();
+        let steps = e.undo.len();
+        // The bottom-right corner (5,2.5) onto the opposite corner's x, then onto its y.
+        for to in [Point::new(-5.0, 5.0), Point::new(10.0, -2.5)] {
+            e.start_drag(Point::new(5.0, 2.5));
+            e.drag_to(to);
+            e.end_drag();
+            assert_eq!(e.symbol, drawn, "no rectangle of no area at {to:?}");
+            assert_eq!(e.undo.len(), steps, "and no undo step");
+        }
+    }
+
+    #[test]
+    fn an_off_grid_line_end_lands_on_the_grid_point_under_the_pointer() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.symbol.graphics.push(Shape::Line {
+            a: Point::new(20.0, 1.25),
+            b: Point::new(20.0, -10.0),
+        });
+        e.set_tool(Tool::Select);
+        e.click(Point::new(20.0, -5.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        e.start_drag(Point::new(20.0, 1.25));
+        e.drag_to(Point::new(20.0, 5.0));
+        e.end_drag();
+        assert_eq!(
+            e.symbol.graphics[0],
+            Shape::Line {
+                a: Point::new(20.0, 5.0),
+                b: Point::new(20.0, -10.0)
+            }
+        );
+    }
+
+    #[test]
+    fn dragging_a_line_end_or_a_corner_reshapes_it() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        let drawn = e.symbol.clone();
+        e.set_tool(Tool::Select);
+
+        // The upper lead (line 1, from (0,-2.5) to (0,-5)): longer by dragging its outer end.
+        e.click(Point::new(0.0, -3.5));
+        assert_eq!(e.selected, Some(Item::Shape(1)));
+        let steps = e.undo.len();
+        e.start_drag(Point::new(0.3, -5.2));
+        e.drag_to(Point::new(0.4, -9.8));
+        e.end_drag();
+        assert_eq!(
+            e.symbol.graphics[1],
+            Shape::Line {
+                a: Point::new(0.0, -2.5),
+                b: Point::new(0.0, -10.0)
+            },
+            "only that end moved, on the grid"
+        );
+        assert_eq!(e.symbol.pins, drawn.pins, "the pin there stays");
+        assert_eq!(e.undo.len(), steps + 1, "one handle drag is one step");
+        // Onto the other end: a line of no length is not made.
+        e.start_drag(Point::new(0.0, -10.0));
+        e.drag_to(Point::new(0.0, -2.5));
+        e.end_drag();
+        assert_eq!(e.undo.len(), steps + 1);
+
+        // The rectangle (-5,-2.5)-(5,2.5): drag its bottom-right corner, then past the opposite
+        // corner, where it turns over and stays ordered.
+        e.click(Point::new(-5.0, 0.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        e.start_drag(Point::new(5.0, 2.5));
+        e.drag_to(Point::new(10.0, 5.0));
+        e.end_drag();
+        assert_eq!(
+            e.symbol.graphics[0],
+            Shape::Rect {
+                min: Point::new(-5.0, -2.5),
+                max: Point::new(10.0, 5.0)
+            }
+        );
+        e.start_drag(Point::new(10.0, 5.0));
+        e.drag_to(Point::new(-10.0, -10.0));
+        e.end_drag();
+        assert_eq!(
+            e.symbol.graphics[0],
+            Shape::Rect {
+                min: Point::new(-10.0, -10.0),
+                max: Point::new(-5.0, -2.5)
+            }
+        );
+        // Grabbing the side, not a corner, still moves the whole rectangle.
+        e.start_drag(Point::new(-7.5, -2.5));
+        e.drag_to(Point::new(-5.0, -2.5));
+        e.end_drag();
+        assert_eq!(
+            e.symbol.graphics[0],
+            Shape::Rect {
+                min: Point::new(-7.5, -10.0),
+                max: Point::new(-2.5, -2.5)
+            }
+        );
+        e.undo();
+        e.undo();
+        e.undo();
+        e.undo();
+        assert_eq!(e.symbol, drawn, "each drag was one step");
     }
 
     #[test]
