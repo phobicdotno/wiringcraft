@@ -130,8 +130,9 @@ impl WireNumbering {
 }
 
 /// The project and its undo history, set aside by [`Open::set_aside`] and put back whole by
-/// [`Open::put_back`]: a field added to the history belongs here, so every path that takes a
-/// change back restores it.
+/// [`Open::put_back`]: a field added to the history belongs here, so that `without_changes` and
+/// `back_to`, which take a change back through it, restore it. The library-update rollback
+/// (`roll_back_update`) keeps its own copy and needs the field added there too.
 struct Kept {
     project: Project,
     undo: Vec<Project>,

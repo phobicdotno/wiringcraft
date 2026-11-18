@@ -571,8 +571,6 @@ mod tests {
         (rects, out)
     }
 
-    /// One frame of the ribbon in a window `width` points wide, as the app lays it out; returns
-    /// the icon rectangles and adds the commands clicked to `out`.
     /// The Start tab's buttons, in the order the ribbon lays them out.
     fn start_order() -> Vec<Action> {
         RIBBON[0].1.iter().flat_map(|(_, a)| a.iter().copied()).collect()
@@ -585,6 +583,8 @@ mod tests {
         at.unwrap_or_default()
     }
 
+    /// One frame of the ribbon in a window `width` points wide, as the app lays it out; returns
+    /// the icon rectangles and adds the commands clicked to `out`.
     fn ribbon_frame(
         ctx: &egui::Context,
         state: &mut ChromeState,
