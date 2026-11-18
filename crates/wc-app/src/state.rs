@@ -447,16 +447,26 @@ impl Open {
             // the very part checked, and the pin kept as it is.
             (Some(pin), false) => {
                 // The source the pin names first: another one may come first with another version.
+                // The one that wins for the id may still have the pinned version when the
+                // named source has moved on.
                 let lib = lib()?;
-                let p = match lib.part_in(&pin.source, id) {
-                    Ok(p) => p,
-                    Err(_) => lib.part(id).map_err(|e| e.to_string())?.0,
+                let fits = |p: &Part| p.hash() == pin.hash && p.id == id;
+                let named = lib.part_in(&pin.source, id);
+                let p = match named {
+                    Ok(p) if fits(&p) => p,
+                    named => match lib.part(id) {
+                        Ok((p, _)) if fits(&p) => p,
+                        _ => {
+                            let why = match named {
+                                Err(e) => format!(" (source {}: {e})", pin.source),
+                                Ok(_) => String::new(),
+                            };
+                            return Err(format!(
+                                "part {id}: its copy in the project is missing and the library has another version than the project pins{why}; put the copy back or update the part from the library"
+                            ));
+                        }
+                    },
                 };
-                if p.hash() != pin.hash || p.id != id {
-                    return Err(format!(
-                        "part {id}: its copy in the project is missing and the library has another version than the project pins; put the copy back or update the part from the library"
-                    ));
-                }
                 store::write_vendored_part(&self.dir, &p).map_err(|e| e.to_string())?;
             }
             // No copy and no pin: a new part, taken from the library and pinned.
@@ -2124,6 +2134,16 @@ pub(crate) mod tests {
         let err = o.set_device_part(&third, Some(pid)).unwrap_err();
         assert!(err.contains("another version than the project pins"), "{err}");
         assert!(o.project.devices.get(&third).is_none_or(|d| d.part.is_none()));
+        // Pinned to a source that still has the pinned version, though another one comes first
+        // with a newer one: the copy comes from the source the pin names.
+        let pin = o.project.lock.parts[pid].clone();
+        o.project.lock.parts.get_mut(pid).unwrap().source = "starter".into();
+        let sixth = DeviceTag::parse("-K6").unwrap();
+        o.set_device_part(&sixth, Some(pid)).unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), copy);
+        o.parts.remove(pid);
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
+        o.project.lock.parts.insert(pid.into(), pin);
         // With the pinned version back in the library, the copy is put back and the pin kept.
         let pin = o.project.lock.parts[pid].clone();
         wc_library::write_part(&tmp.path().join("mine"), &copy).unwrap();

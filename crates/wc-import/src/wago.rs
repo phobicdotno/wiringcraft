@@ -218,8 +218,14 @@ impl Candidates {
                 folder.display()
             )),
         }
+        let used = project.used_parts();
         for id in ids {
             let pinned = project.lock.parts.contains_key(&id);
+            // A copy left without its pin and used nowhere can be pinned only to a library that
+            // has the part: one none has would stand in for a library part it cannot replace.
+            if !pinned && !used.contains(&id) && !out.library.contains_key(&id) {
+                continue;
+            }
             let path = match store::vendor_path(dir, ItemKind::Part, &id) {
                 Ok(path) => path,
                 Err(_) if !pinned => continue,
@@ -228,16 +234,23 @@ impl Candidates {
                     continue;
                 }
             };
-            // Only a plain file is read: anything else (a folder, a pipe) could block or fail.
-            match std::fs::metadata(&path) {
+            // Only a plain file is read: anything else (a folder, a pipe) could block or fail. An
+            // entry that is there but cannot be followed (a link to nothing) is unreadable, not
+            // absent, so a library part never replaces it.
+            let unreadable = match std::fs::symlink_metadata(&path) {
                 Err(why) if why.kind() == std::io::ErrorKind::NotFound && !pinned => continue,
-                Ok(m) if !m.is_file() => {
-                    let why = "it is not a file".to_owned();
-                    warnings.push(format!("the project's copy of part {id} cannot be read: {why}"));
-                    out.unreadable.insert(id, why);
-                    continue;
-                }
-                _ => {}
+                Err(why) if why.kind() == std::io::ErrorKind::NotFound => None,
+                Err(why) => Some(why.to_string()),
+                Ok(_) => match std::fs::metadata(&path) {
+                    Ok(m) if !m.is_file() => Some("it is not a file".to_owned()),
+                    Ok(_) => None,
+                    Err(why) => Some(why.to_string()),
+                },
+            };
+            if let Some(why) = unreadable {
+                warnings.push(format!("the project's copy of part {id} cannot be read: {why}"));
+                out.unreadable.insert(id, why);
+                continue;
             }
             match store::read_vendored_part(dir, &id) {
                 Ok(part) if part.id == id => {
