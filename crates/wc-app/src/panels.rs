@@ -1448,6 +1448,47 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_on_a_held_page_can_still_be_replied_to() -> Result<(), Box<dyn std::error::Error>> {
+        // Comments are not part of the page: their controls stay enabled while someone else
+        // has the page open. A disabled reply field would not take the typing.
+        let (_tmp, mut o) = crate::state::tests::project();
+        let page = o.project.pages[0].id.clone();
+        let id = o.project.add_comment(&page, None, "Kari", 1, "Check this")?;
+        let mut ed = Editor::default();
+        ed.comment = Some(id);
+        ed.held_by.insert(page, "Ola".into());
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, ps: &mut PanelState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        };
+        let tab = egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        frame(&mut o, &mut ed, &mut ps, Vec::new());
+        for _ in 0..8 {
+            frame(&mut o, &mut ed, &mut ps, vec![tab.clone()]);
+            frame(&mut o, &mut ed, &mut ps, vec![egui::Event::Text("x".into())]);
+            if ps.reply.ends_with('x') {
+                break;
+            }
+        }
+        assert!(ps.reply.ends_with('x'), "the reply field took no typing");
+        Ok(())
+    }
+
+    #[test]
     fn a_wire_colour_draft_is_dropped_when_the_page_becomes_held() {
         use wc_core::geom::Point;
         let (_tmp, mut o) = crate::state::tests::project();
