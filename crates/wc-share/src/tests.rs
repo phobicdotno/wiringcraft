@@ -2557,3 +2557,41 @@ fn an_added_picture_is_committed_with_the_change_that_names_it() -> TestResult {
     assert!(!host.pictures().contains_key("pictures/old.png"));
     Ok(())
 }
+
+#[test]
+fn a_session_takes_only_so_many_new_pictures() -> TestResult {
+    let mut s = Session::new();
+    for n in 0..MAX_ADDED_PICTURES {
+        s.host.edit_project(ProjectEdit::AddPicture {
+            picture: picture(&format!("pictures/p{n}.png"), b"x"),
+        })?;
+    }
+    let refused = s.host.edit_project(ProjectEdit::AddPicture {
+        picture: picture("pictures/one-more.png", b"x"),
+    });
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { reason }) if reason.contains("at most")),
+        "{refused:?}"
+    );
+    assert_eq!(s.host.pictures().len(), MAX_ADDED_PICTURES);
+    // One the session has already is still fine.
+    s.host.edit_project(ProjectEdit::AddPicture {
+        picture: picture("pictures/p0.png", b"x"),
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_picture_folder_that_links_out_of_the_project_makes_nothing_there() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("project");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(&elsewhere)?;
+    std::os::unix::fs::symlink(&elsewhere, dir.join("underlays"))?;
+    let r = write_picture(&dir, &picture("underlays/deep/p1.png", b"x"));
+    assert!(r.is_err());
+    assert!(!elsewhere.join("deep").exists(), "no folder made outside the project");
+    Ok(())
+}

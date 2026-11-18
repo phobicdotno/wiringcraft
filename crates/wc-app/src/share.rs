@@ -722,19 +722,20 @@ pub fn new_pictures(
 }
 
 /// Write the session's pictures that `open` uses and has not taken yet (`taken`, by project
-/// path) into its folder, and forget what the window showed for them. `replace` lets a
-/// session's picture replace another file of the same name (a guest's copy follows the
-/// session); the host's own folder is never written over. Returns the pictures that could not
-/// be written, with the reason; they are tried again next time.
+/// path) into its folder, and forget what the window showed for them. A file of the same name
+/// with other content is never written over: a guest's copy starts in an empty folder, so such
+/// a file is one this person picked here, and it is kept (and named in the result). Pictures
+/// in `skip` (failed a moment ago) are left for later. Returns the pictures that could not be
+/// written, with the reason.
 pub fn take_pictures(
     open: &mut Open,
     session: &BTreeMap<String, Vec<u8>>,
     taken: &mut std::collections::BTreeSet<String>,
-    replace: bool,
+    skip: &std::collections::BTreeSet<String>,
 ) -> Vec<(String, String)> {
     let mut failed = Vec::new();
     for file in used_pictures(&open.project) {
-        if taken.contains(&file) {
+        if taken.contains(&file) || skip.contains(&file) {
             continue;
         }
         let Some(data) = session.get(&file) else { continue };
@@ -742,7 +743,7 @@ pub fn take_pictures(
             file: file.clone(),
             data: data.clone(),
         };
-        match wc_share::write_picture(&open.dir, &picture, replace) {
+        match wc_share::write_picture(&open.dir, &picture) {
             Ok(()) => {
                 open.underlays.remove(&file);
                 open.picture_problems.remove(&file);
@@ -1142,6 +1143,9 @@ pub struct Share {
     pictures_out: BTreeMap<String, std::time::Instant>,
     /// The session's pictures written into this copy (or found there already), by project path.
     pictures_taken: std::collections::BTreeSet<String>,
+    /// Session pictures that could not be written into this copy, with when: each is tried
+    /// again only after [`ITEM_RETRY_LATER`].
+    pictures_failed: BTreeMap<String, std::time::Instant>,
 }
 
 /// One symbol or part sent to the session and not taken yet.
@@ -1371,6 +1375,7 @@ impl Share {
         self.unreadable.clear();
         self.pictures_out.clear();
         self.pictures_taken.clear();
+        self.pictures_failed.clear();
     }
 
     /// Leave or end the session.
@@ -1593,8 +1598,14 @@ impl Share {
                 failed.join(", ")
             ));
         }
-        let replace = matches!(role, Role::Guest(_));
-        let failed: Vec<String> = take_pictures(open, role.pictures(), &mut self.pictures_taken, replace)
+        self.pictures_failed.retain(|_, at| at.elapsed() < ITEM_RETRY_LATER);
+        let skip = self.pictures_failed.keys().cloned().collect();
+        let failed = take_pictures(open, role.pictures(), &mut self.pictures_taken, &skip);
+        let now = std::time::Instant::now();
+        for (file, _) in &failed {
+            self.pictures_failed.insert(file.clone(), now);
+        }
+        let failed: Vec<String> = failed
             .into_iter()
             .filter(|(file, _)| self.unreadable.insert(format!("picture {file}")))
             .map(|(file, why)| format!("{file} ({why})"))

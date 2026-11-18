@@ -60,6 +60,9 @@ pub struct Host {
     /// The picture files guests get (the logo, page underlays), by project path: what the
     /// host's user shared ([`Host::share_pictures`]) and what participants added since.
     pictures: BTreeMap<String, Vec<u8>>,
+    /// How many pictures participants added during the session, and their bytes, kept within
+    /// [`crate::MAX_ADDED_PICTURES`] and [`crate::MAX_ADDED_PICTURE_BYTES`].
+    added_pictures: (usize, usize),
 }
 
 /// A recorded change and the parts of the project it changed, before and after.
@@ -111,6 +114,7 @@ impl Host {
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
             pictures: BTreeMap::new(),
+            added_pictures: (0, 0),
         }
     }
 
@@ -578,9 +582,22 @@ impl Host {
             }
             None => {}
         }
+        let (count, bytes) = self.added_pictures;
+        if count >= crate::MAX_ADDED_PICTURES
+            || bytes.saturating_add(picture.data.len()) > crate::MAX_ADDED_PICTURE_BYTES
+        {
+            return Err(Refusal::Invalid {
+                reason: format!(
+                    "the session takes at most {} new pictures of {} MB together",
+                    crate::MAX_ADDED_PICTURES,
+                    crate::MAX_ADDED_PICTURE_BYTES / (1024 * 1024)
+                ),
+            });
+        }
         self.journal
             .picture(&picture)
             .map_err(|e| Refusal::NotRecorded { reason: e.to_string() })?;
+        self.added_pictures = (count + 1, bytes + picture.data.len());
         self.pictures.insert(picture.file.clone(), picture.data.clone());
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for id in ids {

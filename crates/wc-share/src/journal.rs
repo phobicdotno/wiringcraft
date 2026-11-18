@@ -122,7 +122,7 @@ impl Journal for GitJournal {
     /// Write the picture into the project folder, never outside it and never over a file with
     /// other content.
     fn picture(&mut self, picture: &Picture) -> Result<()> {
-        write_picture(&self.dir, picture, false)
+        write_picture(&self.dir, picture)
     }
 
     /// Save the project as it was before the change, so the folder does not keep a change
@@ -134,39 +134,54 @@ impl Journal for GitJournal {
 }
 
 /// Write `picture` into the project folder `dir`, making its folder. A file there with the same
-/// content is left as it is; one with other content is replaced only when `replace` is true (a
-/// guest's copy taking the session's picture), else it is an error. The file always lands
-/// inside the project, even when its folder is a link.
-pub fn write_picture(dir: &std::path::Path, picture: &Picture, replace: bool) -> Result<()> {
+/// content is left as it is; one with other content is never written over (an undo may still
+/// show it, or the person picked it here) and is an error. The file always lands inside the
+/// project, even when a folder on the way is a link.
+pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
     use std::io::{Error, ErrorKind};
     if let Some(why) = picture.problem() {
         return Err(Error::new(ErrorKind::InvalidInput, why).into());
     }
-    let path = dir.join(&picture.file);
-    let folder = path.parent().unwrap_or(dir);
-    std::fs::create_dir_all(folder)?;
-    if !folder.canonicalize()?.starts_with(dir.canonicalize()?) {
-        return Err(Error::new(
+    let outside = || -> crate::Error {
+        Error::new(
             ErrorKind::InvalidInput,
             format!("{} leads out of the project folder", picture.file),
         )
-        .into());
+        .into()
+    };
+    let path = dir.join(&picture.file);
+    let folder = path.parent().unwrap_or(dir);
+    let root = dir.canonicalize()?;
+    // The nearest folder that exists already must be inside the project before any is made,
+    // so a link on the way cannot make folders elsewhere.
+    let mut anchor = folder;
+    while !anchor.exists() {
+        match anchor.parent() {
+            Some(parent) => anchor = parent,
+            None => break,
+        }
+    }
+    if !anchor.canonicalize()?.starts_with(&root) {
+        return Err(outside());
+    }
+    std::fs::create_dir_all(folder)?;
+    if !folder.canonicalize()?.starts_with(&root) {
+        return Err(outside());
     }
     match std::fs::read(&path) {
         Ok(have) if have == picture.data => return Ok(()),
-        Ok(_) if !replace => {
+        Ok(_) => {
             return Err(Error::new(
                 ErrorKind::AlreadyExists,
                 format!("the project already has another picture named {}", picture.file),
             )
             .into());
         }
-        Ok(_) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-        std::fs::remove_file(&path)?;
+        return Err(outside());
     }
     std::fs::write(&path, &picture.data)?;
     Ok(())

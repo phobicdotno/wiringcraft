@@ -16,6 +16,10 @@ pub type PeerId = u32;
 /// The largest picture file a session carries (a logo or a page underlay), in bytes. It keeps
 /// each message well under the connection's line limit ([`crate::net::MAX_LINE`]).
 pub const MAX_PICTURE: usize = 16 * 1024 * 1024;
+/// The most picture files participants can add to a session, beyond those the host shared.
+pub const MAX_ADDED_PICTURES: usize = 200;
+/// The most bytes all pictures participants add to a session can take together.
+pub const MAX_ADDED_PICTURE_BYTES: usize = 256 * 1024 * 1024;
 
 /// A picture file of the project (the logo in `pictures/`, a page underlay in `underlays/`), so
 /// a participant without it can show it. Its bytes travel as base64.
