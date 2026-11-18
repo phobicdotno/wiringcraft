@@ -2376,45 +2376,27 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     warnings.extend(missing.iter().map(|m| {
         format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals cannot be matched")
     }));
-    // The project's own parts, then the libraries' (a project copy wins over a library's).
-    let mut candidates: std::collections::BTreeMap<String, wc_core::Part> = std::collections::BTreeMap::new();
-    let lib = readable_libraries(dir, &p);
-    if let Some(lib) = &lib {
-        for id in lib.index(ItemKind::Part).into_keys() {
-            match lib.part(&id) {
-                Ok((part, _)) => {
-                    candidates.insert(id, part);
-                }
-                Err(x) => warnings.push(format!("library part {id} cannot be read: {x}")),
-            }
-        }
-    }
-    for id in p.lock.parts.keys() {
-        match store::read_vendored_part(dir, id) {
-            Ok(part) => {
-                candidates.insert(id.clone(), part);
-            }
-            Err(x) => warnings.push(format!("the project's copy of part {id} cannot be read: {x}")),
-        }
-    }
+    // The project's own parts, then the libraries'.
+    let (candidates, more) = wc_import::wago::Candidates::load(dir, &p);
+    warnings.extend(more);
     let plan = {
         let inputs = wc_report::Inputs {
             project: &p,
             symbols: &symbols,
-            parts: &candidates,
+            parts: &candidates.all(),
         };
         wc_import::wago::plan(&inputs, &candidates, &rows)
     };
     let mut unmatched = plan.unmatched.clone();
     let mut taken = plan.clone();
     for id in plan.parts() {
-        if p.lock.parts.contains_key(id) {
+        // A locked part is only ever planned when its copy was read.
+        if candidates.project.contains_key(id) {
             continue;
         }
-        let r = match &lib {
-            Some(lib) => wc_library::take(dir, &mut p, lib, ItemKind::Part, id).map_err(e),
-            None => Err("the libraries cannot be read".to_owned()),
-        };
+        let r = wc_library::Library::open(dir, &p)
+            .and_then(|lib| wc_library::take(dir, &mut p, &lib, ItemKind::Part, id))
+            .map_err(e);
         if let Err(why) = r {
             // Its rows are listed, not written with a part the project cannot hold.
             for a in plan.assignments.iter().filter(|a| a.part == id) {

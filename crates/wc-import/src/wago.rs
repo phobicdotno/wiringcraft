@@ -9,8 +9,10 @@
 //! with the reason, never guessed. See `docs/wago-configurator.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
-use wc_core::{DevicePart, DeviceTag, Part, Project};
+use wc_core::lock::ItemKind;
+use wc_core::{DevicePart, DeviceTag, Part, Project, store};
 use wc_report::{Inputs, Target};
 
 use crate::csv::{decode, records};
@@ -26,6 +28,9 @@ pub struct ConfiguredRow {
     pub kind: String,
     pub strip: String,
     pub terminal: String,
+    /// The Connects column (the terminal an accessory belongs to); `None` when the file has
+    /// no such column.
+    pub connects: Option<String>,
     pub article: String,
     pub manufacturer: String,
     /// `None` when the file has no Quantity column or the cell is empty.
@@ -69,6 +74,7 @@ pub fn read_configured(bytes: &[u8]) -> Result<(Vec<ConfiguredRow>, Vec<String>)
     let kind = find(&["type", "typ"]);
     let strip = find(&["strip", "terminalstrip", "leiste", "klemmenleiste"]);
     let terminal = find(&["terminal", "klemme"]);
+    let connects = find(&["connects"]);
     let manufacturer = find(&["manufacturer", "hersteller"]);
     let quantity = find(&["quantity", "qty", "menge", "anzahl"]);
     let mut out = Vec::new();
@@ -86,9 +92,9 @@ pub fn read_configured(bytes: &[u8]) -> Result<(Vec<ConfiguredRow>, Vec<String>)
         } else {
             match q.parse::<u32>() {
                 Ok(v) => Some(v),
-                Err(_) => {
+                Err(why) => {
                     warnings.push(format!(
-                        "line {line}: quantity {q:?} is not a whole number; the quantity is left as it is"
+                        "line {line}: quantity {q:?} cannot be read ({why}); the quantity is left as it is"
                     ));
                     None
                 }
@@ -100,12 +106,76 @@ pub fn read_configured(bytes: &[u8]) -> Result<(Vec<ConfiguredRow>, Vec<String>)
             kind: cell(kind),
             strip: cell(strip),
             terminal: cell(terminal),
+            connects: connects.map(|c| cell(Some(c))),
             article: cell(Some(article)),
             manufacturer: cell(manufacturer),
             quantity,
         });
     }
     Ok((out, warnings))
+}
+
+/// The parts an article may be, by id: the project's own (read from its copies) before its
+/// libraries'.
+#[derive(Debug, Clone, Default)]
+pub struct Candidates {
+    pub project: BTreeMap<String, Part>,
+    pub library: BTreeMap<String, Part>,
+    /// Parts the project locks whose copy cannot be read, with the reason: never assigned, so
+    /// a device does not get a part the project cannot show.
+    pub unreadable: BTreeMap<String, String>,
+}
+
+impl Candidates {
+    /// The parts of the project in `dir` (its locked copies) and of its libraries, and a warning
+    /// for each library or part that cannot be read, with the reason. A library that cannot be
+    /// opened only means fewer candidates; the others are still read.
+    pub fn load(dir: &Path, project: &Project) -> (Self, Vec<String>) {
+        let mut out = Self::default();
+        let mut warnings = Vec::new();
+        for source in &project.meta.libraries {
+            let mut one = project.clone();
+            one.meta.libraries = vec![source.clone()];
+            let lib = match wc_library::Library::open(dir, &one) {
+                Ok(lib) => lib,
+                Err(why) => {
+                    warnings.push(format!("library {} cannot be read: {why}", source.name));
+                    continue;
+                }
+            };
+            for id in lib.index(ItemKind::Part).into_keys() {
+                // The first library that has a part wins, as everywhere else.
+                if out.library.contains_key(&id) {
+                    continue;
+                }
+                match lib.part(&id) {
+                    Ok((part, _)) => {
+                        out.library.insert(id, part);
+                    }
+                    Err(why) => warnings.push(format!("library part {id} cannot be read: {why}")),
+                }
+            }
+        }
+        for id in project.lock.parts.keys() {
+            match store::read_vendored_part(dir, id) {
+                Ok(part) => {
+                    out.project.insert(id.clone(), part);
+                }
+                Err(why) => {
+                    warnings.push(format!("the project's copy of part {id} cannot be read: {why}"));
+                    out.unreadable.insert(id.clone(), why.to_string());
+                }
+            }
+        }
+        (out, warnings)
+    }
+
+    /// Every part, the project's copy first for an id both have.
+    pub fn all(&self) -> BTreeMap<String, Part> {
+        let mut all = self.library.clone();
+        all.extend(self.project.clone());
+        all
+    }
 }
 
 /// Where an article goes on a device.
@@ -149,22 +219,22 @@ impl Plan {
 }
 
 /// Match the rows of a configured list to the project in `i`. `candidates` are the parts an
-/// article may be (the project's own and its libraries', by id): a part matches when its order
-/// number is the article (ignoring case) or its id is (the export writes a part without a copy
-/// by its id); when several do, the row's manufacturer chooses. Rows without an article are
-/// passed over. A row without an index that names a strip of the project becomes a new
+/// article may be: a part matches when its order number is the article (ignoring case) or its
+/// id is (the export writes a part without a copy by its id), the project's own parts before
+/// the libraries'; when several match, the row's manufacturer chooses. Rows without an article
+/// are passed over. A row without an index that names a strip of the project becomes a new
 /// accessory of the strip device, unless the device has that part already.
-pub fn plan(i: &Inputs<'_>, candidates: &BTreeMap<String, Part>, rows: &[ConfiguredRow]) -> Plan {
+pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> Plan {
     let now = wc_report::configurator_list(i);
-    // Index (unguarded) → (type, terminal) of the list the project gives now.
+    // Index (unguarded) → (type, terminal, connects) of the list the project gives now.
     let unguard = |s: &str| s.strip_prefix('\'').unwrap_or(s).to_owned();
-    let current: BTreeMap<String, (String, String)> = now
+    let current: BTreeMap<String, (String, String, String)> = now
         .table
         .rows
         .iter()
         .map(|r| {
             let cell = |k: usize| r.get(k).cloned().unwrap_or_default();
-            (unguard(&cell(0)), (cell(1), cell(4)))
+            (unguard(&cell(0)), (cell(1), cell(4), cell(14)))
         })
         .collect();
     let strips: BTreeSet<String> = now
@@ -176,8 +246,8 @@ pub fn plan(i: &Inputs<'_>, candidates: &BTreeMap<String, Part>, rows: &[Configu
         .collect();
 
     let mut out = Plan::default();
-    // (tag, slot) → (part, line) already planned, to catch two rows that disagree.
-    let mut taken: BTreeMap<(DeviceTag, Slot), (String, usize)> = BTreeMap::new();
+    // (tag, slot) → (part, quantity, line) already planned, to catch two rows that disagree.
+    let mut taken: BTreeMap<(DeviceTag, Slot), (String, u32, usize)> = BTreeMap::new();
     let mut conflicted: BTreeSet<(DeviceTag, Slot)> = BTreeSet::new();
     for row in rows {
         if row.article.is_empty() {
@@ -205,7 +275,7 @@ pub fn plan(i: &Inputs<'_>, candidates: &BTreeMap<String, Part>, rows: &[Configu
                 }
             }
         } else {
-            let Some((kind, terminal)) = current.get(&row.index) else {
+            let Some((kind, terminal, connects)) = current.get(&row.index) else {
                 miss("the project has no such row now (the strip changed?); export the list again".into());
                 continue;
             };
@@ -220,6 +290,26 @@ pub fn plan(i: &Inputs<'_>, candidates: &BTreeMap<String, Part>, rows: &[Configu
                 miss(format!(
                     "the row is terminal {} in the file but terminal {terminal} in the project now; export the list again",
                     row.terminal
+                ));
+                continue;
+            }
+            // An accessory's index holds its terminal's position, which moves when a terminal
+            // is added before it: the terminal it belongs to must still be the same.
+            if kind == "Accessory"
+                && let Some(file) = &row.connects
+                && file != connects
+            {
+                let name = |c: &str| {
+                    if c.is_empty() {
+                        "the strip".to_owned()
+                    } else {
+                        format!("terminal {c}")
+                    }
+                };
+                miss(format!(
+                    "the accessory belongs to {} in the file but to {} in the project now; export the list again",
+                    name(file),
+                    name(connects)
                 ));
                 continue;
             }
@@ -262,16 +352,21 @@ pub fn plan(i: &Inputs<'_>, candidates: &BTreeMap<String, Part>, rows: &[Configu
             _ => row.quantity.unwrap_or(now_qty).max(1),
         };
         if slot != Slot::NewAccessory {
-            if let Some((other, line)) = taken.get(&(tag.clone(), slot.clone())) {
+            if let Some((other, other_qty, line)) = taken.get(&(tag.clone(), slot.clone())) {
                 if *other != part {
                     miss(format!(
                         "line {line} gives {tag} part {other}; neither is taken, choose one in the configurator"
                     ));
                     conflicted.insert((tag.clone(), slot.clone()));
+                } else if *other_qty != qty {
+                    miss(format!(
+                        "line {line} gives {tag} {other} {other_qty} times; neither is taken, choose one quantity in the configurator"
+                    ));
+                    conflicted.insert((tag.clone(), slot.clone()));
                 }
                 continue;
             }
-            taken.insert((tag.clone(), slot.clone()), (part.clone(), row.line));
+            taken.insert((tag.clone(), slot.clone()), (part.clone(), qty, row.line));
         }
         if now_part.as_deref() == Some(part.as_str()) && qty == now_qty {
             out.unchanged += 1;
@@ -291,21 +386,33 @@ pub fn plan(i: &Inputs<'_>, candidates: &BTreeMap<String, Part>, rows: &[Configu
     out
 }
 
-/// The part `article` names among `candidates`: by order number (ignoring case and spaces at the
-/// ends), or by id; when several match, the one by `manufacturer`. The reason when none or more
-/// than one does.
-fn find_part(
-    candidates: &BTreeMap<String, Part>,
-    article: &str,
-    manufacturer: &str,
-) -> std::result::Result<String, String> {
-    if candidates.contains_key(article) {
+/// The part `article` names among `candidates`: by id, or by order number (ignoring case and
+/// spaces at the ends), the project's own parts first and the libraries' only when none of the
+/// project's match; when several match, the one by `manufacturer`. The reason when none or more
+/// than one does, or when the part is one the project locks but cannot read.
+fn find_part(candidates: &Candidates, article: &str, manufacturer: &str) -> std::result::Result<String, String> {
+    let unreadable = |id: &str| {
+        candidates
+            .unreadable
+            .get(id)
+            .map(|why| format!("the project has part {id}, but its copy cannot be read ({why})"))
+    };
+    if let Some(why) = unreadable(article) {
+        return Err(why);
+    }
+    if candidates.project.contains_key(article) || candidates.library.contains_key(article) {
         return Ok(article.to_owned());
     }
-    let hits: Vec<&Part> = candidates
-        .values()
-        .filter(|p| p.order_number.trim().eq_ignore_ascii_case(article))
-        .collect();
+    let matches = |p: &&Part| p.order_number.trim().eq_ignore_ascii_case(article);
+    let mut hits: Vec<&Part> = candidates.project.values().filter(matches).collect();
+    if hits.is_empty() {
+        hits = candidates
+            .library
+            .values()
+            .filter(|p| !candidates.project.contains_key(&p.id))
+            .filter(matches)
+            .collect();
+    }
     let chosen: Vec<&Part> = if hits.len() > 1 && !manufacturer.is_empty() {
         hits.iter()
             .copied()
@@ -315,16 +422,20 @@ fn find_part(
         hits.clone()
     };
     match chosen.as_slice() {
-        [one] => Ok(one.id.clone()),
+        [one] => match unreadable(&one.id) {
+            Some(why) => Err(why),
+            None => Ok(one.id.clone()),
+        },
         [] if hits.is_empty() => Err(
             "no part of the project or its libraries has this article number; import the maker's catalogue (BMEcat, EDZ or CSV) into a library first"
                 .into(),
         ),
         _ => {
-            let ids: Vec<&str> = if chosen.is_empty() { &hits } else { &chosen }
-                .iter()
-                .map(|p| p.id.as_str())
-                .collect();
+            let ids: Vec<&str> = if chosen.is_empty() {
+                hits.iter().map(|p| p.id.as_str()).collect()
+            } else {
+                chosen.iter().map(|p| p.id.as_str()).collect()
+            };
             Err(format!("several parts have this article number ({})", ids.join(", ")))
         }
     }
@@ -470,6 +581,14 @@ mod tests {
         .collect()
     }
 
+    /// `parts` as the libraries' parts, the project having none of its own.
+    fn library(parts: &BTreeMap<String, Part>) -> Candidates {
+        Candidates {
+            library: parts.clone(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn a_configured_list_puts_its_articles_on_the_devices_and_lists_the_rest() {
         let (mut p, symbols) = project();
@@ -530,7 +649,8 @@ mod tests {
         let (rows, warnings) = read_configured(bytes.as_bytes()).unwrap();
         assert_eq!(rows.len(), 11);
         assert_eq!(warnings.len(), 1, "the quantity x: {warnings:?}");
-        let plan = plan(&inputs, &parts, &rows);
+        assert!(warnings[0].contains("invalid digit"), "the reason: {warnings:?}");
+        let plan = plan(&inputs, &library(&parts), &rows);
         assert_eq!(plan.unchanged, 1, "the marker: {plan:?}");
         assert_eq!(plan.unmatched.len(), 4, "{:#?}", plan.unmatched);
         for (n, why) in [
@@ -564,7 +684,7 @@ mod tests {
             symbols: &symbols,
             parts: &parts,
         };
-        let again = super::plan(&inputs, &parts, &rows);
+        let again = super::plan(&inputs, &library(&parts), &rows);
         assert!(again.assignments.is_empty(), "{again:#?}");
     }
 
@@ -583,7 +703,7 @@ mod tests {
                     -X1/T1;;;DUP-1\n\
                     '-X1/T3;Terminal;3;wago.2002-1301\n";
         let (rows, _) = read_configured(text.as_bytes()).unwrap();
-        let plan = plan(&inputs, &parts, &rows);
+        let plan = plan(&inputs, &library(&parts), &rows);
         assert_eq!(plan.unmatched.len(), 3, "{:#?}", plan.unmatched);
         assert!(plan.unmatched[0].contains("terminal 7 in the file but terminal 2"));
         assert!(plan.unmatched[1].contains("type is Terminal in the file but Accessory"));
@@ -594,5 +714,87 @@ mod tests {
         assert_eq!(plan.assignments[0].part, "wago.2002-1301");
         assert!(read_configured(b"Article;Quantity\n1;2\n").is_err());
         assert!(read_configured(b"").is_err());
+    }
+
+    #[test]
+    fn the_projects_own_part_wins_over_a_library_part_with_the_same_article() {
+        let (p, symbols) = project();
+        let parts = candidates();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let mut c = library(&parts);
+        let (id, mine) = part("own.terminal", "WAGO", "2002-1201");
+        c.project.insert(id, mine);
+        let rows = read_configured(b"Index;Article\n-X1/T3;2002-1201\n").unwrap().0;
+        let plan = plan(&inputs, &c, &rows);
+        assert_eq!(plan.assignments.len(), 1, "{plan:#?}");
+        assert_eq!(plan.assignments[0].part, "own.terminal");
+
+        // A part the project locks but cannot read is not given to a device, also when a
+        // library has it.
+        c.unreadable.insert("wago.2002-1301".into(), "bad json".into());
+        let rows = read_configured(b"Index;Article\n-X1/T3;2002-1301\n-X1/T2;wago.2002-1301\n")
+            .unwrap()
+            .0;
+        let plan = super::plan(&inputs, &c, &rows);
+        assert!(plan.assignments.is_empty(), "{plan:#?}");
+        assert_eq!(plan.unmatched.len(), 2);
+        assert!(plan.unmatched.iter().all(|u| u.contains("cannot be read (bad json)")));
+    }
+
+    #[test]
+    fn two_rows_with_different_quantities_for_one_accessory_take_neither() {
+        let (p, symbols) = project();
+        let parts = candidates();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        for text in [
+            "Index;Article;Quantity\n-X1/A1;2002-1291;3\n-X1/A1;2002-1291;4\n",
+            "Index;Article;Quantity\n-X1/A1;2002-1291;4\n-X1/A1;2002-1291;3\n",
+        ] {
+            let rows = read_configured(text.as_bytes()).unwrap().0;
+            let plan = plan(&inputs, &library(&parts), &rows);
+            assert!(plan.assignments.is_empty(), "{text}: {plan:#?}");
+            assert_eq!(plan.unmatched.len(), 1);
+            assert!(plan.unmatched[0].contains("choose one quantity"), "{plan:#?}");
+        }
+        // A quantity too large for a count is reported with the reason.
+        let (_, warnings) = read_configured(b"Index;Article;Quantity\n-X1/A1;2002-1291;4294967296\n").unwrap();
+        assert!(warnings[0].contains("too large"), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_accessory_row_whose_terminal_moved_is_not_taken() {
+        let (p, symbols) = project();
+        let parts = candidates();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        // Exported when -X1.2 was at position 3 (a terminal before it was removed since): the
+        // index now names another terminal's accessory.
+        let rows = read_configured(
+            b"Index;Type;Article;Quantity;Connects\n-X1/T2/A1;Accessory;793-501;1;3\n-X1/A1;Accessory;2002-1291;1;2\n",
+        )
+        .unwrap()
+        .0;
+        let plan = plan(&inputs, &library(&parts), &rows);
+        assert!(plan.assignments.is_empty(), "{plan:#?}");
+        assert!(plan.unmatched[0].contains("belongs to terminal 3 in the file but to terminal 2"));
+        assert!(plan.unmatched[1].contains("terminal 2 in the file but to the strip"));
+        // The same with the right terminal is taken.
+        let rows = read_configured(b"Index;Article;Quantity;Connects\n-X1/T2/A1;793-501;5;2\n")
+            .unwrap()
+            .0;
+        let plan = super::plan(&inputs, &library(&parts), &rows);
+        assert_eq!(plan.assignments.len(), 1, "{plan:#?}");
+        assert_eq!(plan.assignments[0].qty, 5);
     }
 }

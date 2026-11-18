@@ -14,8 +14,10 @@ image.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 sevenz-rust2.workspace = true
-# The WAGO configurator list back matches its rows to the export's.
+# The WAGO configurator list back matches its rows to the export's, and its articles to the
+# project's and libraries' parts.
 wc-report.workspace = true
+wc-library.workspace = true
 
 [dev-dependencies]
 # Tests write 7-Zip archives.

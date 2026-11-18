@@ -3803,6 +3803,7 @@ dependencies = [
  "sevenz-rust2",
  "thiserror 2.0.21",
  "wc-core",
+ "wc-library",
  "wc-report",
  "zip",
 ]

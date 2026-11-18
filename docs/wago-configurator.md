@@ -46,11 +46,13 @@ devices row by row.
 the list after the configurator has filled in the articles, and writes them onto the project:
 
 - The header must have the `Index` and `Article` columns; `Type`, `Strip`, `Terminal`,
-  `Manufacturer` and `Quantity` are read when present. The leading `'` the export puts on some
+  `Connects`, `Manufacturer` and `Quantity` are read when present. The leading `'` the export puts on some
   cells is dropped. Rows without an article are passed over.
-- Each article is looked up among the project's own parts, then its libraries': by order number
-  (ignoring case), or by part id (as the export writes a part without a copy). When several parts
-  have the order number, the row's Manufacturer chooses. A library part that is used is taken
+- Each article is looked up by part id (as the export writes a part without a copy) or by order
+  number (ignoring case), among the project's own parts first; the libraries' parts count only
+  when none of the project's match. When several parts have the order number, the row's
+  Manufacturer chooses. A part the project locks but whose copy cannot be read is never given to
+  a device. A library part that is used is taken
   into the project and locked, as when a part is chosen by hand.
 - A Terminal row's article becomes the part of the terminal device (`-X1.3`, or the strip device
   for terminals tagged only with the strip). An accessory row's article and quantity replace that
@@ -60,10 +62,11 @@ the list after the configurator has filled in the articles, and writes them onto
 - In the app it is one undo step.
 
 Every row with an article that is not taken is listed with the reason: an index the project no
-longer has, or whose type or terminal number changed (export again), a jumper (jumpers have no
+longer has, or whose type, terminal number or (for an accessory) terminal in Connects changed
+(export again), a jumper (jumpers have no
 part yet), a plate or rail, an article no part has (import the maker's catalogue into a library
 first, e.g. `import parts-bmecat`), an article several parts have, or two rows that give one
-device different parts (neither is taken). Importing the same list twice changes nothing the
+device part different articles or quantities (neither is taken). Importing the same list twice changes nothing the
 second time.
 
 ## Limits

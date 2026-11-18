@@ -421,25 +421,14 @@ impl Open {
     /// among the project's own parts, then the libraries'; a library part that is used is taken
     /// into the project. Returns the report: what changed and every row not matched, with why.
     pub fn import_wago_configured(&mut self, bytes: &[u8]) -> Result<String, String> {
-        let (rows, warnings) = wc_import::wago::read_configured(bytes).map_err(|e| e.to_string())?;
-        let mut candidates: BTreeMap<String, Part> = BTreeMap::new();
-        if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
-            for id in lib.index(ItemKind::Part).into_keys() {
-                if let Ok((p, _)) = lib.part(&id) {
-                    candidates.insert(id, p);
-                }
-            }
-        }
-        for id in self.project.lock.parts.keys() {
-            if let Ok(p) = store::read_vendored_part(&self.dir, id) {
-                candidates.insert(id.clone(), p);
-            }
-        }
+        let (rows, mut warnings) = wc_import::wago::read_configured(bytes).map_err(|e| e.to_string())?;
+        let (candidates, more) = wc_import::wago::Candidates::load(&self.dir, &self.project);
+        warnings.extend(more);
         let plan = wc_import::wago::plan(
             &wc_report::Inputs {
                 project: &self.project,
                 symbols: &self.symbols,
-                parts: &candidates,
+                parts: &candidates.all(),
             },
             &candidates,
             &rows,
