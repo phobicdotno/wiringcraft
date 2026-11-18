@@ -58,7 +58,7 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
     // Revision clouds whose revision the project does not list.
     for page in &p.pages {
         for (n, c) in page.clouds.iter().enumerate() {
-            if p.revision(&c.revision).is_none() {
+            if p.cloud_revision(&c.revision).is_none() {
                 out.push(at(
                     page,
                     &format!("cloud {n}"),

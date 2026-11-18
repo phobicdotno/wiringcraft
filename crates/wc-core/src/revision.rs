@@ -341,6 +341,13 @@ impl Project {
         self.revision_index(letter).and_then(|i| self.meta.revisions.get(i))
     }
 
+    /// The revision a cloud's tag names: the one whose letter the tag shows exactly (trimmed).
+    /// Unlike [`Project::revision`] it does not turn typed input into a kept letter, so a tag
+    /// that reads differently from every listed letter holds no revision and is reported.
+    pub fn cloud_revision(&self, tag: &str) -> Option<&Revision> {
+        self.meta.revisions.iter().find(|r| r.letter == tag.trim())
+    }
+
     /// Where the revision with this letter is in the list: the letter as saved (trimmed) first,
     /// so letters saved by hand stay reachable, else the letter as [`Project::add_revision`]
     /// would store it.
@@ -406,11 +413,12 @@ impl Project {
         let i = self
             .revision_index(letter)
             .ok_or_else(|| Error::Invalid(format!("no revision {}", letter.trim())))?;
-        // A cloud holds the revision its letter resolves to, by the same rule as every lookup.
+        let letter_kept = self.meta.revisions.get(i).map(|r| r.letter.clone()).unwrap_or_default();
+        // A cloud holds the revision its tag names, by the same rule as the checks.
         if let Some(p) = self
             .pages
             .iter()
-            .find(|p| p.clouds.iter().any(|c| self.revision_index(&c.revision) == Some(i)))
+            .find(|p| p.clouds.iter().any(|c| c.revision.trim() == letter_kept))
         {
             return Err(Error::Invalid(format!(
                 "page {} has a cloud of revision {}; remove it first",
@@ -484,7 +492,7 @@ impl Project {
             .flat_map(|p| {
                 p.clouds
                     .iter()
-                    .filter(|c| self.revision(&c.revision).is_none())
+                    .filter(|c| self.cloud_revision(&c.revision).is_none())
                     .map(|c| (p.number.clone(), c.revision.clone()))
             })
             .collect()
@@ -815,6 +823,21 @@ mod tests {
             author: String::new(),
         });
         assert_eq!(p.unprintable_revisions(), ["Ж"]);
+    }
+
+    #[test]
+    fn a_cloud_tag_that_only_resolves_to_a_revision_is_reported() {
+        let mut p = project();
+        p.add_revision("ABCDEFGH", "", "", "").unwrap();
+        // A lookup by typed input would cut ABCDEFGHI to ABCDEFGH, but the tag would print
+        // ABCDEFGHI next to a table listing ABCDEFGH.
+        assert!(p.revision("ABCDEFGHI").is_some());
+        p.add_cloud("p1", Point::new(0.0, 0.0), Point::new(20.0, 20.0), None)
+            .unwrap();
+        p.pages[0].clouds[0].revision = "ABCDEFGHI".into();
+        assert!(p.cloud_revision("ABCDEFGHI").is_none());
+        assert_eq!(p.clouds_without_revision(), [("1".to_owned(), "ABCDEFGHI".to_owned())]);
+        p.remove_revision("ABCDEFGH").unwrap();
     }
 
     #[test]
