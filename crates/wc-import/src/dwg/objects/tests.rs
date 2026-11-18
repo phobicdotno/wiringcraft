@@ -1037,6 +1037,8 @@ pub(crate) enum TestEntity {
     Text((f64, f64), &'static str),
     /// A reference to a block `FRAME` holding a 10 mm line, at this point.
     Insert((f64, f64)),
+    /// An object the handle map places past the end of the objects: it cannot be read.
+    Damaged,
 }
 
 /// An AutoCAD 2010 drawing whose model space holds `items`, for tests elsewhere in the crate.
@@ -1051,9 +1053,14 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
         entry(v, BLOCK_HEADER, FRAME_H, "FRAME"),
         line(v, 0x30, head(Some(FRAME_H)), (0.0, 0.0), (10.0, 0.0)),
     ];
+    let mut damaged = Vec::new();
     for (n, item) in items.iter().enumerate() {
         let handle = 0x100 + n as u64;
         objs.push(match *item {
+            TestEntity::Damaged => {
+                damaged.push(handle);
+                continue;
+            }
             TestEntity::Line(a, b) => line(v, handle, model, a, b),
             TestEntity::Circle(c, r) => {
                 let mut o = entity(v, 18, handle, model);
@@ -1089,7 +1096,9 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
             }
         });
     }
-    let (map, objects) = sections_bytes(&objs, &[]);
+    let (_, objects) = sections_bytes(&objs, &[]);
+    let past_end: Vec<(u64, usize)> = damaged.iter().map(|&h| (h, objects.len() + 10)).collect();
+    let (map, objects) = sections_bytes(&objs, &past_end);
     write_dwg(
         b"AC1024",
         &[

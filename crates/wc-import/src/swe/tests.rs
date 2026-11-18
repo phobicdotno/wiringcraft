@@ -2418,3 +2418,52 @@ fn an_empty_block_drawn_before_the_limit_is_not_counted_as_over_it() {
         "1 drawn as boxes: 1 block(s) without a readable drawing in the archive; 1 drawn as boxes: the drawings' entity limit was reached"
     );
 }
+
+#[test]
+fn a_drawing_read_in_part_keeps_its_graphics_and_says_why() {
+    let mut d = SweDrawings::default();
+    d.add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (0.0, 6.0)), E::Damaged]))
+        .unwrap();
+    assert_eq!(d.warnings.len(), 1, "{:?}", d.warnings);
+    let w = &d.warnings[0];
+    assert!(
+        w.starts_with(
+            "block Coil: 1 object(s) could not be read and are not drawn, the first because of: object 101 at"
+        ),
+        "{w}"
+    );
+    assert!(w.contains("past the end"), "{w}");
+    // What could be read is drawn.
+    let sw = read(&sample()).unwrap();
+    let coil = sw.symbols.iter().find(|s| s.id == 1).unwrap();
+    let g = d
+        .symbol_graphics(coil, &mut { crate::dxf::MAX_DRAWN }, &mut BTreeMap::new())
+        .unwrap();
+    assert!(has_line(&g, Point::new(0.0, 0.0), Point::new(0.0, -6.0)), "{g:?}");
+}
+
+#[test]
+fn a_symbol_at_the_join_boundary_is_drawn_and_sized_alike_by_both_checks() {
+    let mut sw = read(&sample()).unwrap();
+    // A2 sits 5.5002 below the origin: 5.500 when the difference is rounded (a library fit,
+    // exactly JOIN from the library pin), 5.501 when each point is rounded (no fit).
+    let k1 = sw.symbols.iter_mut().find(|s| s.id == 1).unwrap();
+    k1.at = Point::new(100.0, 200.0006);
+    k1.pins[0].at = Point::new(100.0, 205.0006);
+    k1.pins[1].at = Point::new(100.0, 194.5004);
+    // Its block reaches past A3 (420 x 297).
+    sw.drawings
+        .add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (250.0, 150.0))]))
+        .unwrap();
+    let (built, _, _) = build_with(&sw, None, &choice(&[lib_coil("wc.coil", 5.0)], &[]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert_ne!(k1.symbol, "wc.coil", "no library fit at 5.501");
+    let drawn = built.symbols.iter().find(|s| s.id == k1.symbol).unwrap();
+    assert!(
+        !drawn.graphics.iter().any(|s| matches!(s, Shape::Rect { .. })),
+        "drawn from its block: {:?}",
+        drawn.graphics
+    );
+    let (w, h) = page(&built, "01").size.mm();
+    assert!(w >= 350.0 && h >= 350.0, "the sheet has room for the block: {w} x {h}");
+}
