@@ -186,6 +186,9 @@ pub enum State {
     NotLocked,
     /// Pinned, but no source holds it any more. The vendored copy keeps working.
     GoneFromLibrary,
+    /// The library's file for it declares another id, so it cannot be taken (see `changes`).
+    /// The vendored copy, if any, keeps working.
+    WrongId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,16 +205,11 @@ pub struct ItemStatus {
     pub changes: Vec<String>,
 }
 
-fn library_version(lib: &Library, kind: ItemKind, id: &str) -> Option<(String, String, serde_json::Value)> {
+/// The library's version of an item: (hash, source, the id its file declares).
+fn library_version(lib: &Library, kind: ItemKind, id: &str) -> Option<(String, String, String)> {
     match kind {
-        ItemKind::Symbol => lib
-            .symbol(id)
-            .ok()
-            .map(|(s, src)| (s.hash(), src, serde_json::to_value(&s).unwrap_or_default())),
-        ItemKind::Part => lib
-            .part(id)
-            .ok()
-            .map(|(p, src)| (p.hash(), src, serde_json::to_value(&p).unwrap_or_default())),
+        ItemKind::Symbol => lib.symbol(id).ok().map(|(s, src)| (s.hash(), src, s.id)),
+        ItemKind::Part => lib.part(id).ok().map(|(p, src)| (p.hash(), src, p.id)),
     }
 }
 
@@ -228,7 +226,19 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
         for id in ids {
             let locked = project.lock.get(kind, &id).cloned();
             let lib_v = library_version(lib, kind, &id);
+            // A file declaring another id is no version of this item: `take` refuses it, so it
+            // is neither an update nor something to pin.
+            let wrong_id = lib_v
+                .as_ref()
+                .filter(|(_, _, inside)| *inside != id)
+                .map(|(_, src, inside)| {
+                    let what = if kind == ItemKind::Symbol { "symbol" } else { "part" };
+                    format!("the {what} file for {id:?} in {src} declares id {inside:?}; fix the library file")
+                });
+            let library_source = lib_v.as_ref().map(|v| v.1.clone());
+            let lib_v = lib_v.filter(|_| wrong_id.is_none());
             let state = match (&locked, &lib_v) {
+                _ if wrong_id.is_some() => State::WrongId,
                 (None, _) => State::NotLocked,
                 (Some(_), None) => State::GoneFromLibrary,
                 (Some(l), Some((h, _, _))) if &l.hash == h => State::UpToDate,
@@ -267,7 +277,7 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
                     },
                 }
             } else {
-                Vec::new()
+                wrong_id.into_iter().collect()
             };
             out.push(ItemStatus {
                 kind,
@@ -275,7 +285,7 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
                 state,
                 locked,
                 library_hash: lib_v.as_ref().map(|v| v.0.clone()),
-                library_source: lib_v.map(|v| v.1),
+                library_source,
                 used_by,
                 changes,
             });
@@ -344,10 +354,20 @@ pub fn update(
     lib: &Library,
     only: Option<&[String]>,
 ) -> Result<Vec<(ItemKind, String)>> {
-    let todo: Vec<(ItemKind, String)> = status(project_dir, project, lib)
+    let named = |s: &ItemStatus| only.is_none_or(|ids| ids.contains(&s.id));
+    let all = status(project_dir, project, lib);
+    // An item named on purpose whose library file is wrong is an error, before anything is taken.
+    if only.is_some()
+        && let Some(bad) = all.iter().find(|s| s.state == State::WrongId && named(s))
+    {
+        return Err(Error::Source {
+            name: bad.library_source.clone().unwrap_or_default(),
+            message: bad.changes.join("; "),
+        });
+    }
+    let todo: Vec<(ItemKind, String)> = all
         .into_iter()
-        .filter(|s| s.state == State::Changed)
-        .filter(|s| only.is_none_or(|ids| ids.contains(&s.id)))
+        .filter(|s| s.state == State::Changed && named(s))
         .map(|s| (s.kind, s.id))
         .collect();
     for (kind, id) in &todo {

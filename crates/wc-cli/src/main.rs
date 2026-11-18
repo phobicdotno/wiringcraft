@@ -1535,6 +1535,7 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
                     wc_library::State::Changed => "CHANGED in library",
                     wc_library::State::NotLocked => "not pinned",
                     wc_library::State::GoneFromLibrary => "gone from library (using project copy)",
+                    wc_library::State::WrongId => "library file declares another id (not taken)",
                 };
                 let kind = if s.kind == ItemKind::Symbol { "symbol" } else { "part" };
                 println!(

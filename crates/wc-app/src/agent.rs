@@ -568,6 +568,24 @@ fn need_num(v: &Value, key: &str) -> Result<f64, String> {
     num(v, key).ok_or_else(|| format!("`{key}` must be a number."))
 }
 
+/// `terminals` as texts: an entry that is not one is a mistake, so the whole request is refused
+/// rather than run on the rest.
+fn terminal_names(v: &Value) -> Result<Vec<String>, String> {
+    let Some(list) = v.get("terminals") else {
+        return Ok(Vec::new());
+    };
+    let list = list
+        .as_array()
+        .ok_or("`terminals` must be a list of terminal numbers.")?;
+    list.iter()
+        .map(|t| {
+            t.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("`terminals` holds {t}, which is not a terminal number in quotes."))
+        })
+        .collect()
+}
+
 fn strings(v: &Value, key: &str) -> Vec<String> {
     v.get(key)
         .and_then(Value::as_array)
@@ -1952,7 +1970,7 @@ impl App {
         let strip = tag(need_s(v, "strip")?)?;
         match action {
             "add" => {
-                let terminals = strings(v, "terminals");
+                let terminals = terminal_names(v)?;
                 if !open.jumper_offer(&strip, &terminals)? {
                     return Ok(format!(
                         "Terminals {} of {strip} are jumpered together already.",
@@ -1963,7 +1981,7 @@ impl App {
                 Ok(format!("Jumpered {strip} {}.", terminals.join(", ")))
             }
             "remove" => {
-                let terminals = strings(v, "terminals");
+                let terminals = terminal_names(v)?;
                 if terminals.is_empty() {
                     return Err("`terminals` is missing.".into());
                 }
@@ -2599,10 +2617,13 @@ mod tests {
         let with_part = json!([{"strip": "-X1", "terminals": ["1", "2", "4"], "part": "example.ex-tb-2-5"}]);
         assert_eq!(list(&mut a), with_part);
 
-        // A two-level terminal, or a part that is missing or not a text, is refused whole.
+        // A two-level or non-text terminal, or a part that is missing or not a text, is refused whole.
         let mark = undo_mark(&a);
         for bad in [
             json!({"action": "remove", "strip": "-X1", "terminals": ["1", "2.1"]}),
+            json!({"action": "remove", "strip": "-X1", "terminals": ["1", 42]}),
+            json!({"action": "add", "strip": "-X1", "terminals": ["4", "5", 6]}),
+            json!({"action": "remove", "strip": "-X1", "terminals": "1"}),
             json!({"action": "part", "strip": "-X1", "terminal": "4", "part": 42}),
             json!({"action": "part", "strip": "-X1", "terminal": "4", "part": null}),
             json!({"action": "part", "strip": "-X1", "terminal": "4"}),

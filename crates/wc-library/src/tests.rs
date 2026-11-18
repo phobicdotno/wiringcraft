@@ -262,3 +262,50 @@ fn a_library_part_file_declaring_another_id_is_not_taken() -> std::result::Resul
     );
     Ok(())
 }
+
+#[test]
+fn a_library_file_declaring_another_id_is_no_update_and_nothing_to_pin()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut f = fixture()?;
+    let personal = f.proj.parent().ok_or("no parent")?.join("personal");
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let pinned = f.project.lock.symbols.get("coil").cloned().ok_or("not pinned")?;
+    let kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?)?;
+
+    // Both sources' `coil.json` now hold a symbol declaring `other`, with other contents.
+    for root in [&f.company, &personal] {
+        let wrong = write_symbol(root, &sym("other", 42.0))?;
+        std::fs::rename(&wrong, root.join("symbols").join("coil.json"))?;
+    }
+    write_symbol(&f.company, &sym("other", 5.0))?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    let st = status(&f.proj, &f.project, &lib);
+    let coil = st.iter().find(|s| s.id == "coil").ok_or("coil not listed")?;
+    assert_eq!(coil.state, State::WrongId, "{coil:?}");
+    assert!(coil.changes[0].contains("declares id \"other\""), "{:?}", coil.changes);
+    assert!(coil.library_hash.is_none());
+
+    // Updating everything skips it; naming it is an error; neither touches the pin or the copy.
+    assert!(update(&f.proj, &mut f.project, &lib, None)?.is_empty());
+    let err = update(&f.proj, &mut f.project, &lib, Some(&["coil".to_owned()]))
+        .err()
+        .ok_or("updated")?;
+    assert!(err.to_string().contains("declares id \"other\""), "{err}");
+    assert_eq!(f.project.lock.symbols.get("coil"), Some(&pinned));
+    assert_eq!(
+        std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?)?,
+        kept
+    );
+
+    // Not pinned yet: it is not pinned from the wrong file either, and nothing fails.
+    f.project.lock.symbols.remove("coil");
+    let st = status(&f.proj, &f.project, &lib);
+    assert_eq!(
+        st.iter().find(|s| s.id == "coil").map(|s| s.state),
+        Some(State::WrongId)
+    );
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(!f.project.lock.symbols.contains_key("coil"));
+    Ok(())
+}
