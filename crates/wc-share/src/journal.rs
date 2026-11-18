@@ -210,7 +210,9 @@ fn stage(folder: &std::path::Path, name: &str, data: &[u8]) -> std::io::Result<P
         .map_or(0, |d| d.subsec_nanos());
     for _ in 0..16 {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let part = folder.join(format!(".{name}.{}-{nanos}-{n}.part", std::process::id()));
+        // Short and apart from the picture's own name, so a long name that fits the folder
+        // still has a part file name that does.
+        let part = folder.join(format!(".wc-{}-{nanos}-{n}.part", std::process::id()));
         match write_new(&part, data) {
             Ok(()) => return Ok(part),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,

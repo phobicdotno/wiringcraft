@@ -2634,7 +2634,7 @@ fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
     std::fs::create_dir_all(&pictures)?;
     // A file named like a part file that this write did not make is neither in the way nor
     // touched.
-    let other = pictures.join(format!(".logo.png.{}.part", std::process::id()));
+    let other = pictures.join(format!(".wc-{}-0-0.part", std::process::id()));
     std::fs::write(&other, b"someone else's")?;
     let logo = picture("pictures/logo.png", b"\x89PNG\r\n\x1a\nlogo");
     write_picture(dir, &logo)?;
@@ -2653,5 +2653,16 @@ fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
     write_picture(dir, &logo)?;
     assert!(write_picture(dir, &picture("pictures/logo.png", b"other")).is_err());
     assert_eq!(std::fs::read(pictures.join("logo.png"))?, logo.data);
+    Ok(())
+}
+
+#[test]
+fn a_picture_with_a_long_name_that_fits_the_folder_is_written() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // 240 bytes: within the 255 most file systems allow, too long for a part file named after it.
+    let file = format!("pictures/{}.png", "a".repeat(236));
+    let logo = picture(&file, b"\x89PNG\r\n\x1a\nlogo");
+    write_picture(tmp.path(), &logo)?;
+    assert_eq!(std::fs::read(tmp.path().join(&file))?, logo.data);
     Ok(())
 }
