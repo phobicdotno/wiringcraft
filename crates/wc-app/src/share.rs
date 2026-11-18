@@ -2108,6 +2108,12 @@ pub struct Share {
     /// the session's pictures: they get a name of their own at the next sync, before what goes
     /// out is worked out.
     clashes: Vec<String>,
+    /// Files the session lacks ([`repairs_due`]) whose copy here was looked for and could not
+    /// be sent (missing, unreadable, or another version), with when and [`repair_stamp`] then:
+    /// each is read again only after [`ITEM_WAIT`], or at once once this copy pins or loads
+    /// another version (putting the pinned copy back from a library does), so a copy put back
+    /// is still found without reading files every frame.
+    repair_reads: BTreeMap<String, (std::time::Instant, RepairStamp)>,
 }
 
 /// Changes of this copy kept back while the items they use are not in the session yet: the
@@ -2494,6 +2500,18 @@ fn local_hash(local: &Project, name: &str) -> Option<String> {
     named(name).and_then(|(kind, id)| local.lock.map(kind).get(id).map(|e| e.hash.clone()))
 }
 
+/// The version of the item [`item_name`] names that `open` pins, and of the copy it has loaded.
+type RepairStamp = (Option<String>, Option<String>);
+
+/// See [`RepairStamp`].
+fn repair_stamp(open: &Open, name: &str) -> RepairStamp {
+    let loaded = named(name).and_then(|(kind, id)| match kind {
+        ItemKind::Symbol => open.symbols.get(id).map(Symbol::hash),
+        ItemKind::Part => open.parts.get(id).map(Part::hash),
+    });
+    (local_hash(&open.project, name), loaded)
+}
+
 /// How long an item sent to the session may take to be answered before it is sent again.
 const ITEM_WAIT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(100)
@@ -2736,6 +2754,7 @@ impl Share {
         self.drop_held = false;
         self.renames_due.clear();
         self.clashes.clear();
+        self.repair_reads.clear();
     }
 
     /// Leave or end the session.
@@ -2908,7 +2927,9 @@ impl Share {
                 });
             }
         }
-        let skip = self
+        // A file the session no longer lacks is no repair to look for.
+        self.repair_reads.retain(|name, _| repair.contains(name));
+        let skip: BTreeSet<String> = self
             .items_out
             .iter()
             // One given up is still sent now and then, so it gets in once its file can be read
@@ -2919,12 +2940,25 @@ impl Share {
                     && o.hash == local_hash(&open.project, n)
             })
             .map(|(n, _)| n.clone())
+            .chain(
+                self.repair_reads
+                    .iter()
+                    .filter(|(n, (at, stamp))| at.elapsed() < ITEM_WAIT && *stamp == repair_stamp(open, n))
+                    .map(|(n, _)| n.clone()),
+            )
             .collect();
         // An item sent before and not taken goes alone, so one the session cannot store does
         // not keep out the others it was sent with.
         let apart = self.items_out.keys().cloned().collect();
         // The host's session files: one it locks but has no file of goes out again from here.
         let items = new_items(&open.dir, &open.project, base, auth, &skip, &apart, &repair);
+        let now = std::time::Instant::now();
+        // A repair looked for and not sent is looked for again only a while later.
+        for name in repair.iter().filter(|n| !skip.contains(*n)) {
+            if !items.sent.contains(name) && !items.unreadable.iter().any(|(n, _)| n == name) {
+                self.repair_reads.insert(name.clone(), (now, repair_stamp(open, name)));
+            }
+        }
         for (name, why) in &items.unsent_repairs {
             if self.unreadable.insert(format!("repair {name}")) {
                 self.notes.push(format!(
@@ -2932,7 +2966,6 @@ impl Share {
                 ));
             }
         }
-        let now = std::time::Instant::now();
         for (name, why) in &items.unreadable {
             // A file that cannot be read counts as a try: the changes that may draw the item
             // wait for it as for a sent one, and go once the tries are used up.
@@ -3065,6 +3098,9 @@ impl Share {
         // For an Undo, what waited when it was asked waits still, also when its item has come
         // in since: it never reached the session, so it is taken back here, not there.
         let mut waiting: BTreeSet<String> = self.items_out.keys().cloned().collect();
+        // A file the session lacks: a new use of its item waits for it too, or a guest without
+        // the library gets a placement it cannot draw. Uses the session has already are left.
+        waiting.extend(repairs_due(role));
         if undo {
             waiting.extend(self.holding.iter().cloned());
         }

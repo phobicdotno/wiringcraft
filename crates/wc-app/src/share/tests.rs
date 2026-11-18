@@ -1824,6 +1824,64 @@ fn a_pinned_copy_the_host_puts_back_during_a_session_reaches_the_guests() -> Tes
 }
 
 #[test]
+fn a_new_placement_of_a_symbol_whose_file_the_session_lacks_waits_for_the_file() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+        o.save()?;
+        // Shared with the coil pinned and loaded, and its copy gone.
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil")?)?;
+        Ok(())
+    })?;
+    let coil = host_open.symbols.get("wc.coil").cloned().ok_or("loaded")?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // Placed again from the copy in memory: the session still has no file of the coil.
+    let item = host_open.place(1, "wc.coil", wc_core::Point::new(60.0, 120.0))?;
+    let drawn = |o: &Open| {
+        o.project
+            .page("p0002")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(!drawn(&guest_open), "the placement waits for the file");
+    assert_eq!(h.holding, ["symbol wc.coil"]);
+    // The missing copy was looked for once, and is not read again every frame.
+    let tried = h
+        .repair_reads
+        .get("symbol wc.coil")
+        .map(|(at, _)| *at)
+        .ok_or("looked for")?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(h.repair_reads.get("symbol wc.coil").map(|(at, _)| *at), Some(tried));
+    // Put back, it is found at the next look, not before.
+    store::write_vendored_symbol(&host_open.dir, &coil)?;
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    if let Some((at, _)) = h.repair_reads.get_mut("symbol wc.coil") {
+        *at = later;
+    }
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(!log.messages().iter().any(|m| m == "Add wc.coil to the project"));
+    assert!(!drawn(&guest_open));
+    let past = std::time::Instant::now().checked_sub(ITEM_WAIT * 2).ok_or("clock")?;
+    if let Some((at, _)) = h.repair_reads.get_mut("symbol wc.coil") {
+        *at = past;
+    }
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(store::read_vendored_symbol(&guest_open.dir, "wc.coil").ok(), Some(coil));
+    assert!(drawn(&guest_open), "the placement follows the file");
+    assert!(h.holding.is_empty());
+    assert!(
+        h.repair_reads.is_empty(),
+        "the session has the file: nothing to look for"
+    );
+    let messages = log.messages();
+    let add = messages.iter().position(|m| m == "Add wc.coil to the project");
+    let edit = messages.iter().rposition(|m| m.contains("Edit page 2"));
+    assert!(add.is_some() && add < edit, "the file goes in first: {messages:?}");
+    Ok(())
+}
+
+#[test]
 fn a_symbol_used_for_the_first_time_reaches_the_host_with_its_file() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
