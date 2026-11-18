@@ -143,7 +143,12 @@ pub fn read_sections_with(bytes: &[u8], max_total: usize) -> Result<Sections> {
             "the section map (page {section_map_id}) is not in the page map"
         ))
     })?;
-    let section_map = system_page(bytes, section_map_at, SECTION_MAP, "section map")?;
+    let section_map = system_page(
+        bytes,
+        section_map_at,
+        SECTION_MAP,
+        &format!("section map (page {section_map_id})"),
+    )?;
     read_section_map(bytes, &section_map, &pages, version, max_total)
 }
 
@@ -361,10 +366,12 @@ fn data_page(bytes: &[u8], address: u64, compressed: u32, budget: &mut usize) ->
     if head.u32(0)? != DATA_PAGE {
         return Err(bad("the page is damaged (wrong page type)"));
     }
-    let data_size = head.u32(0x08)? as usize;
+    let data_size = to_usize(head.u32(0x08)?, MAX_PAGE, "page")?;
     let page_size = to_usize(head.u32(0x0C)?, MAX_PAGE, "page")?;
+    // Checking and reading the stored bytes costs too, even when they give little (a page
+    // listed many times).
     *budget = budget
-        .checked_sub(page_size)
+        .checked_sub(page_size.max(data_size))
         .ok_or_else(|| bad("the file's pages decompress to too much"))?;
     let data_at = start + DATA_PAGE_HEADER;
     let data = bytes

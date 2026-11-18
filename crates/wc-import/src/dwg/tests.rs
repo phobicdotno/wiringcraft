@@ -537,7 +537,7 @@ fn a_changed_byte_that_still_decompresses_is_caught_by_its_checksum() -> TestRes
     data[0x120 + 5] ^= 0x01;
     let m = error_of(&data);
     assert!(
-        m.contains("AcDb:Classes") && m.contains("page 1") && m.contains("checksum"),
+        m.contains("AcDb:Classes") && m.contains("page 1") && m.contains("page's data is damaged (wrong checksum)"),
         "{m}"
     );
     // Its header: the start offset (not read otherwise) changed.
