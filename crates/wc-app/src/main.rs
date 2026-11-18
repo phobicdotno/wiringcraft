@@ -3719,8 +3719,8 @@ mod marking_tests {
         assert!(msg.contains("Exported 2 terminal strips (3 rows)"), "{msg}");
         let csv = std::fs::read_to_string(&path).unwrap();
         let rows: Vec<&str> = csv.lines().map(|l| l.split(';').next().unwrap()).collect();
-        assert_eq!(rows, ["\u{feff}Index", "-X1/T1", "-X1/T2", "-X2/T1"]);
-        assert!(csv.contains("-X1/T1;Terminal;-X1;1;1;"), "{csv}");
+        assert_eq!(rows, ["\u{feff}Index", "-X1/T:1", "-X1/T:2", "-X2/T:1"]);
+        assert!(csv.contains("-X1/T:1;Terminal;-X1;1;1;"), "{csv}");
     }
 
     #[test]
@@ -3739,8 +3739,8 @@ mod marking_tests {
         export_wago_configurator(&o);
         let csv = std::fs::read_to_string(o.dir.join("export").join("wago-configurator.csv"))
             .unwrap()
-            .replace("-X1/T1;Terminal;-X1;1;1;;;", "-X1/T1;Terminal;-X1;1;1;;EX-TB-2.5;")
-            .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;NO-SUCH;")
+            .replace("-X1/T:1;Terminal;-X1;1;1;;;", "-X1/T:1;Terminal;-X1;1;1;;EX-TB-2.5;")
+            .replace("-X1/T:2;Terminal;-X1;2;2;;;", "-X1/T:2;Terminal;-X1;2;2;;NO-SUCH;")
             .replace("-X1/J1;Jumper;-X1;;;;;", "-X1/J1;Jumper;-X1;;;;EX-TB-2.5;");
         let before = o.undo_mark();
         let pid = "example.ex-tb-2-5";
