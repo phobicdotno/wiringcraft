@@ -725,6 +725,12 @@ fn save(dir: &Path, p: &Project) -> Res<()> {
     store::save(dir, &p).map(|_| ()).map_err(e)
 }
 
+/// Save a project whose jumpers already follow their terminals: after `add_built`, which
+/// moves the project's own jumpers itself and adds the imported ones with their final numbers.
+fn save_imported(dir: &Path, p: &Project) -> Res<()> {
+    store::save(dir, p).map(|_| ()).map_err(e)
+}
+
 /// The `find` output: one hit per line, the page number (`-` for a device not drawn), the
 /// kind and the value, separated by tabs.
 fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
@@ -1914,14 +1920,16 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             );
-            let n_sym = add_swe_built(dir, &mut p, built, &source, &choice.1)?;
-            save(dir, &p)?;
+            let (n_sym, joined) = add_swe_built(dir, &mut p, built, &source, &choice.1)?;
             println!(
                 "{:<18} {:>8} {:>9}  why the rest is not imported",
                 "", "source", "imported"
             );
             for r in &report {
                 println!("{:<18} {:>8} {:>9}  {}", r.what, r.source, r.imported, r.note);
+            }
+            if joined > 0 {
+                println!("{joined} imported jumper group(s) joined a jumper the project already had");
             }
             if let Some(n) = linked {
                 println!("{n} device(s) and cable(s) linked to a part from the archive's catalog");
@@ -3032,16 +3040,17 @@ fn project_copy(dir: &Path, id: &str) -> Res<Option<wc_core::Symbol>> {
         .map_err(|why| format!("project copy of symbol {id} cannot be read: {why}"))
 }
 
-/// Adds a SolidWorks Electrical import to `p`, keeping the library symbols it used (named in
-/// `sources`, new to the project or pinned before) pinned to their libraries. Returns how many
-/// symbol shapes the import made itself.
+/// Adds a SolidWorks Electrical import to `p` and saves it ([`add_and_save`]), keeping the
+/// library symbols it used (named in `sources`, new to the project or pinned before) pinned to
+/// their libraries. Returns how many symbol shapes the import made itself, and how many imported
+/// jumper groups joined the project's own.
 fn add_swe_built(
     dir: &Path,
     p: &mut Project,
     built: wc_import::aml::Built,
     source: &str,
     sources: &std::collections::BTreeMap<String, String>,
-) -> Res<usize> {
+) -> Res<(usize, usize)> {
     let n_sym = built.symbols.iter().filter(|s| !sources.contains_key(&s.id)).count();
     let from_library: Vec<String> = built
         .symbols
@@ -3049,10 +3058,12 @@ fn add_swe_built(
         .filter(|s| sources.contains_key(&s.id))
         .map(|s| s.id.clone())
         .collect();
-    // Not replacing: a generated symbol may still be placed on pages the project keeps.
-    add_built(dir, p, built, source, Replace::No)?;
-    keep_library_sources(p, &from_library, sources);
-    Ok(n_sym)
+    // Not replacing: a generated symbol may still be placed on pages the project keeps. Saved
+    // like every import: a failed save puts every file back, jumpers and pages together.
+    let joined = add_and_save_with(dir, p, built, source, Replace::No, |p| {
+        keep_library_sources(p, &from_library, sources);
+    })?;
+    Ok((n_sym, joined))
 }
 
 /// Library symbols an import used stay pinned to the library they came from (`add_built` pins
@@ -3152,6 +3163,19 @@ enum Replace {
 /// [`add_built`], then save: when the save fails, the vendored files and every project file
 /// the save may have written go back as they were, so the project on disk is the one before.
 fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str, replace: Replace) -> Res<()> {
+    add_and_save_with(dir, p, built, source, replace, |_| {}).map(|_| ())
+}
+
+/// [`add_and_save`], with `finish` changing the project after the import and before the save,
+/// and giving how many imported jumper groups joined the project's own ([`add_built`]).
+fn add_and_save_with(
+    dir: &Path,
+    p: &mut Project,
+    built: wc_import::aml::Built,
+    source: &str,
+    replace: Replace,
+    finish: impl FnOnce(&mut Project),
+) -> Res<usize> {
     // Every file the save may write or remove, read before anything is written: the project's
     // own files, every file in its page, panel and comment folders, and the files the new pages
     // and panels will get.
@@ -3206,8 +3230,9 @@ fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, sourc
         };
         project_files.push((path, before));
     }
-    let written = add_built(dir, p, built, source, replace)?;
-    if let Err(err) = save(dir, p) {
+    let (written, joined) = add_built(dir, p, built, source, replace)?;
+    finish(p);
+    if let Err(err) = save_imported(dir, p) {
         let mut failed = put_files_back(&project_files);
         failed.extend(put_files_back(&written));
         if failed.is_empty() {
@@ -3218,7 +3243,7 @@ fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, sourc
             failed.join("; ")
         ));
     }
-    Ok(())
+    Ok(joined)
 }
 
 /// Wire ends in `p` on pins of the symbol `symbol.id` that `symbol` does not have:
@@ -3254,13 +3279,17 @@ fn put_files_back(files: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
         .collect()
 }
 
+/// Add an import to `p` (not saved yet), giving the vendored files it wrote and how many
+/// imported jumper groups joined a jumper the project already had (directly, or through another
+/// imported group that did): the saved project holds those as part of that jumper, not as
+/// jumpers of their own.
 fn add_built(
     dir: &Path,
     p: &mut Project,
     mut built: wc_import::aml::Built,
     source: &str,
     replace: Replace,
-) -> Result<Written, String> {
+) -> Result<(Written, usize), String> {
     let cover_fields = keep_one_cover(p, &mut built.pages);
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of
     // an earlier one and then fail half way.
@@ -3361,6 +3390,58 @@ fn add_built(
             "device {tag} exists with other data; rename it or import into a fresh project"
         ));
     }
+    // Jumpers join the project's own: one that shares a terminal with a jumper of the same
+    // strip becomes one jumper with it. Checked here, before anything is written.
+    let mut jumpers = p.meta.clone();
+    for j in &built.jumpers {
+        jumpers
+            .add_jumper(&j.strip, &j.terminals)
+            .map_err(|why| format!("jumper on {}: {why}", j.strip))?;
+    }
+    // The imported pages can renumber the project's terminals tagged with only their strip, so
+    // the project's own jumpers follow first; the imported ones already have the final numbers.
+    let before = if p.meta.jumpers.is_empty() {
+        None
+    } else {
+        // A symbol the project has no readable copy of, which the import brings, changes which
+        // placed items are terminals. Whether the jumpers' numbers were given with it or without
+        // it cannot be told, so jumpers on a strip it renumbers are not guessed at.
+        let (own, _) = store::vendored_symbols(dir, p);
+        let mut symbols = own.clone();
+        for s in &built.symbols {
+            symbols.entry(s.id.clone()).or_insert_with(|| s.clone());
+        }
+        let with = wc_core::project::terminal_numbers(p, |id| symbols.get(id).map(|s| s.role));
+        let without = wc_core::project::terminal_numbers(p, |id| own.get(id).map(|s| s.role));
+        let strips: std::collections::BTreeSet<&DeviceTag> = with
+            .iter()
+            .filter(|(k, v)| without.get(*k) != Some(*v))
+            .map(|(_, (strip, _))| strip)
+            .chain(
+                without
+                    .iter()
+                    .filter(|(k, v)| with.get(*k) != Some(*v))
+                    .map(|(_, (strip, _))| strip),
+            )
+            .collect();
+        if let Some(strip) = strips
+            .into_iter()
+            .find(|s| p.meta.jumpers.iter().any(|j| &j.strip == *s))
+        {
+            let missing: Vec<&str> = built
+                .symbols
+                .iter()
+                .filter(|s| !own.contains_key(&s.id))
+                .map(|s| s.id.as_str())
+                .filter(|id| p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == *id)))
+                .collect();
+            return Err(format!(
+                "the jumpers of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
+                missing.join(", ")
+            ));
+        }
+        Some(with)
+    };
     // A write that fails puts back the files written before it (and removes the ones it made),
     // so each copy still matches its pin. Only files this import changed are put back: one it
     // left as it was keeps whatever it holds now.
@@ -3421,11 +3502,49 @@ fn add_built(
     for loc in built.locations {
         p.meta.merge_location(loc);
     }
+    if let Some(before) = before {
+        let (symbols, _) = store::vendored_symbols(dir, p);
+        wc_core::project::follow_terminals_in(p, &before, |id| symbols.get(id).map(|s| s.role));
+    }
+    // Terminals held by the project's own jumpers (with their numbers after following), and by
+    // the imported groups that joined one of them.
+    let mut joined_terminals: std::collections::BTreeSet<(DeviceTag, String)> = p
+        .meta
+        .jumpers
+        .iter()
+        .flat_map(|j| j.terminals.iter().map(|t| (j.strip.clone(), t.clone())))
+        .collect();
+    // Until nothing more joins, so a group that reaches the project's jumper only through one
+    // listed after it counts too.
+    let mut joined_groups = vec![false; built.jumpers.len()];
+    loop {
+        let mut more = false;
+        for (j, done) in built.jumpers.iter().zip(joined_groups.iter_mut()) {
+            if !*done
+                && j.terminals
+                    .iter()
+                    .any(|t| joined_terminals.contains(&(j.strip.clone(), t.clone())))
+            {
+                *done = true;
+                more = true;
+                joined_terminals.extend(j.terminals.iter().map(|t| (j.strip.clone(), t.clone())));
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    let joined = joined_groups.iter().filter(|j| **j).count();
+    for j in &built.jumpers {
+        p.meta
+            .add_jumper(&j.strip, &j.terminals)
+            .map_err(|why| format!("jumper on {}: {why}", j.strip))?;
+    }
     p.panels.extend(built.panels);
     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
     p.meta.fill_title_block(built.title_block);
-    Ok(changed)
+    Ok((changed, joined))
 }
 
 /// The path and bytes of a vendored copy, kept before an import replaces it.
@@ -4637,6 +4756,235 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("cannot be read") && err.contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn imported_jumpers_join_the_projects_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+        let mut p = load(&dir).unwrap();
+        p.meta.add_jumper(&x1, &["3".to_owned(), "4".to_owned()]).unwrap();
+        let jumper = |terminals: &[&str]| wc_core::project::Jumper {
+            strip: x1.clone(),
+            terminals: terminals.iter().map(|t| (*t).to_owned()).collect(),
+            part: None,
+        };
+        let built = wc_import::aml::Built {
+            // 5-6 is listed before the group that links it to the project's jumper.
+            jumpers: vec![jumper(&["5", "6"]), jumper(&["4", "5"]), jumper(&["7", "8"])],
+            ..Default::default()
+        };
+        let (_, joined) = add_built(&dir, &mut p, built, "import:a.tewzip", Replace::No).unwrap();
+        let mut sets: Vec<Vec<String>> = p.meta.jumpers.iter().map(|j| j.terminals.clone()).collect();
+        sets.sort();
+        assert_eq!(sets, [vec!["3", "4", "5", "6"], vec!["7", "8"]]);
+        // 4-5 joined the project's 3-4, and 5-6 joined it through 4-5; 7-8 is a jumper of its own.
+        assert_eq!(joined, 2, "the report tells merged groups apart from new jumpers");
+    }
+
+    #[test]
+    fn imported_jumpers_keep_their_numbers_when_the_import_renumbers_the_projects_terminals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let terminal = |id: &str, x: f64, tag: &str| PlacedSymbol {
+            id: id.into(),
+            symbol: "test.term".into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse(tag).ok(),
+        };
+        let mut p = load(&dir).unwrap();
+        // A terminal symbol in the project, so terminals tagged with only their strip count.
+        let term = wc_core::Symbol {
+            id: "test.term".into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        store::write_vendored_symbol(&dir, &term).unwrap();
+        // -X1.1, then two terminals tagged with only the strip: numbered 2 and 3.
+        p.pages[0].symbols.extend([
+            terminal("a", 10.0, "-X1.1"),
+            terminal("b", 20.0, "-X1"),
+            terminal("c", 30.0, "-X1"),
+        ]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["2".into(), "3".into()]).unwrap();
+        save(&dir, &p).unwrap();
+        // The import brings -X1.2 and -X1.9: the strip-only terminals become 10 and 11.
+        let mut page = p.pages[0].clone();
+        page.id = "imported".into();
+        page.number = "99".into();
+        page.cover = false;
+        page.overview = false;
+        page.symbols = vec![terminal("d", 10.0, "-X1.2"), terminal("e", 20.0, "-X1.9")];
+        let built = wc_import::aml::Built {
+            pages: vec![page],
+            jumpers: vec![wc_core::project::Jumper {
+                strip: x1.clone(),
+                terminals: vec!["1".into(), "2".into()],
+                part: None,
+            }],
+            ..Default::default()
+        };
+        let mut p = load(&dir).unwrap();
+        add_built(&dir, &mut p, built, "import:a.tewzip", Replace::No).unwrap();
+        save_imported(&dir, &p).unwrap();
+        let mut sets: Vec<Vec<String>> = load(&dir)
+            .unwrap()
+            .meta
+            .jumpers
+            .iter()
+            .map(|j| {
+                let mut t = j.terminals.clone();
+                t.sort();
+                t
+            })
+            .collect();
+        sets.sort();
+        assert_eq!(sets, [vec!["1", "2"], vec!["10", "11"]]);
+    }
+
+    #[test]
+    fn an_import_that_brings_a_missing_terminal_symbol_does_not_guess_where_jumpers_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let term = |id: &str| wc_core::Symbol {
+            id: id.into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let placed = |id: &str, symbol: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse("-X1").ok(),
+        };
+        let mut p = load(&dir).unwrap();
+        // Three terminals tagged with only the strip; the first one's symbol has no copy in the
+        // project, and the import brings it. Jumper 1-2 is b-c if it was numbered without that
+        // symbol, a-b if with it.
+        store::write_vendored_symbol(&dir, &term("test.term")).unwrap();
+        p.pages[0].symbols.extend([
+            placed("a", "test.missing", 10.0),
+            placed("b", "test.term", 20.0),
+            placed("c", "test.term", 30.0),
+        ]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        let mut p = load(&dir).unwrap();
+        let built = || wc_import::aml::Built {
+            symbols: vec![term("test.missing")],
+            ..Default::default()
+        };
+        let err = add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap_err();
+        assert!(err.contains("no readable copy of test.missing"), "{err}");
+        assert!(
+            store::read_vendored_symbol(&dir, "test.missing").is_err(),
+            "nothing written"
+        );
+        // With the file back the numbering is known, and the import goes ahead.
+        store::write_vendored_symbol(&dir, &term("test.missing")).unwrap();
+        let mut p = load(&dir).unwrap();
+        add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap();
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
+    fn a_swe_import_whose_save_fails_leaves_jumpers_and_pages_as_they_were() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let term = wc_core::Symbol {
+            id: "test.term".into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let placed = |id: &str, tag: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: "test.term".into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse(tag).ok(),
+        };
+        store::write_vendored_symbol(&dir, &term).unwrap();
+        let mut p = load(&dir).unwrap();
+        // Two terminals tagged with only the strip (1 and 2), jumpered.
+        p.pages[0]
+            .symbols
+            .extend([placed("b", "-X1", 20.0), placed("c", "-X1", 30.0)]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        // The import draws terminals 5 and 6 with their own jumper: the project's become 7 and 8.
+        let built = || {
+            let mut page = Page::new("swe-page-9", "9", "Nine");
+            page.symbols
+                .extend([placed("t5", "-X1.5", 10.0), placed("t6", "-X1.6", 20.0)]);
+            wc_import::aml::Built {
+                pages: vec![page],
+                jumpers: vec![wc_core::project::Jumper {
+                    strip: x1.clone(),
+                    terminals: vec!["5".into(), "6".into()],
+                    part: None,
+                }],
+                ..Default::default()
+            }
+        };
+        let page_file = dir
+            .join(store::PAGES_DIR)
+            .join(format!("swe-page-9{}", store::PAGE_SUFFIX));
+        let mut blocker = page_file.as_os_str().to_owned();
+        blocker.push(".tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        let project_toml = std::fs::read(dir.join(store::PROJECT_FILE)).unwrap();
+        let sources = std::collections::BTreeMap::new();
+        let mut p = load(&dir).unwrap();
+        assert!(add_swe_built(&dir, &mut p, built(), "import:a.tewzip", &sources).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(store::PROJECT_FILE)).unwrap(),
+            project_toml,
+            "the jumpers on disk are the ones before the import"
+        );
+        // The same import again keeps the two jumpers apart.
+        let mut p = load(&dir).unwrap();
+        add_swe_built(&dir, &mut p, built(), "import:a.tewzip", &sources).unwrap();
+        let mut sets: Vec<Vec<String>> = load(&dir)
+            .unwrap()
+            .meta
+            .jumpers
+            .iter()
+            .map(|j| j.terminals.clone())
+            .collect();
+        sets.sort();
+        assert_eq!(sets, [vec!["5", "6"], vec!["7", "8"]]);
     }
 
     #[test]
