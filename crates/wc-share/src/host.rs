@@ -57,6 +57,10 @@ pub struct Host {
     /// user shared ([`Host::share_files`]) and what participants added since.
     symbols: BTreeMap<String, wc_core::Symbol>,
     parts: BTreeMap<String, wc_core::Part>,
+    /// Versions an update ([`ProjectEdit::UpdateItems`]) replaced, by id and hash, so an undo
+    /// can lock and store them again.
+    old_symbols: BTreeMap<(String, String), wc_core::Symbol>,
+    old_parts: BTreeMap<(String, String), wc_core::Part>,
     /// The picture files guests get (the logo, page underlays), by project path: what the
     /// host's user shared ([`Host::share_pictures`]) and what participants added since.
     pictures: BTreeMap<String, Vec<u8>>,
@@ -113,6 +117,8 @@ impl Host {
             take_backs_held: None,
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
+            old_symbols: BTreeMap::new(),
+            old_parts: BTreeMap::new(),
             pictures: BTreeMap::new(),
             added_pictures: (0, 0),
         }
@@ -531,6 +537,10 @@ impl Host {
                 symbols.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>(),
                 parts.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             )),
+            ProjectEdit::UpdateItems { symbols, parts } => Some((
+                symbols.iter().map(|(s, _, _)| s.clone()).collect::<Vec<_>>(),
+                parts.iter().map(|(p, _, _)| p.clone()).collect::<Vec<_>>(),
+            )),
             _ => None,
         };
         // The files go in first, so the change's commit holds them with their lock entries. A
@@ -545,8 +555,8 @@ impl Host {
             return Err(refusal);
         }
         if let Some((symbols, parts)) = added {
-            self.symbols.extend(symbols.into_iter().map(|s| (s.id.clone(), s)));
-            self.parts.extend(parts.into_iter().map(|p| (p.id.clone(), p)));
+            let update = matches!(edit, ProjectEdit::UpdateItems { .. });
+            self.take_versions(symbols, parts, update);
         }
         let (was, now) = Parts::delta(&before, &self.project);
         if let ProjectEdit::RemovePage { id } = &edit
@@ -670,14 +680,14 @@ impl Host {
         let mut missing = Vec::new();
         for (id, e) in &entry.before.lock_symbols {
             if let Some(e) = e
-                && self.symbols.get(id).map(wc_core::Symbol::hash).as_ref() != Some(&e.hash)
+                && self.symbol_version(id, &e.hash).is_none()
             {
                 missing.push(format!("symbol {id}"));
             }
         }
         for (id, e) in &entry.before.lock_parts {
             if let Some(e) = e
-                && self.parts.get(id).map(wc_core::Part::hash).as_ref() != Some(&e.hash)
+                && self.part_version(id, &e.hash).is_none()
             {
                 missing.push(format!("part {id}"));
             }
@@ -714,15 +724,13 @@ impl Host {
             .before
             .lock_symbols
             .iter()
-            .filter(|(_, e)| e.is_some())
-            .filter_map(|(id, _)| self.symbols.get(id).cloned())
+            .filter_map(|(id, e)| self.symbol_version(id, &e.as_ref()?.hash))
             .collect();
         let parts: Vec<wc_core::Part> = entry
             .before
             .lock_parts
             .iter()
-            .filter(|(_, e)| e.is_some())
-            .filter_map(|(id, _)| self.parts.get(id).cloned())
+            .filter_map(|(id, e)| self.part_version(id, &e.as_ref()?.hash))
             .collect();
         let stored = if symbols.is_empty() && parts.is_empty() {
             Ok(())
@@ -752,8 +760,31 @@ impl Host {
             }
             self.broadcast_presence();
         }
+        // Versions the guests may no longer have go out before the change that locks them.
+        let resent: (Vec<_>, Vec<_>) = (
+            symbols
+                .iter()
+                .filter(|s| self.symbols.get(&s.id).is_none_or(|have| have.hash() != s.hash()))
+                .cloned()
+                .collect(),
+            parts
+                .iter()
+                .filter(|p| self.parts.get(&p.id).is_none_or(|have| have.hash() != p.hash()))
+                .cloned()
+                .collect(),
+        );
+        self.take_versions(symbols, parts, true);
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for g in ids {
+            if !resent.0.is_empty() || !resent.1.is_empty() {
+                self.outbox.push((
+                    g,
+                    HostMsg::Items {
+                        symbols: resent.0.clone(),
+                        parts: resent.1.clone(),
+                    },
+                ));
+            }
             self.outbox.push((
                 g,
                 HostMsg::ProjectChanged {
@@ -807,6 +838,43 @@ impl Host {
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for g in ids {
             self.outbox.push((g, HostMsg::Recorded { change: info.clone() }));
+        }
+    }
+
+    /// Symbol `id` in the version `hash`: the one guests get, or one an update replaced.
+    fn symbol_version(&self, id: &str, hash: &str) -> Option<wc_core::Symbol> {
+        match self.symbols.get(id) {
+            Some(s) if s.hash() == hash => Some(s.clone()),
+            _ => self.old_symbols.get(&(id.to_owned(), hash.to_owned())).cloned(),
+        }
+    }
+
+    /// Part `id` in the version `hash`, as [`Self::symbol_version`].
+    fn part_version(&self, id: &str, hash: &str) -> Option<wc_core::Part> {
+        match self.parts.get(id) {
+            Some(p) if p.hash() == hash => Some(p.clone()),
+            _ => self.old_parts.get(&(id.to_owned(), hash.to_owned())).cloned(),
+        }
+    }
+
+    /// Make these the versions guests get. With `keep`, the versions they replace are kept for
+    /// an undo ([`Self::symbol_version`]).
+    fn take_versions(&mut self, symbols: Vec<wc_core::Symbol>, parts: Vec<wc_core::Part>, keep: bool) {
+        for s in symbols {
+            if let Some(old) = self.symbols.insert(s.id.clone(), s)
+                && keep
+                && self.symbols.get(&old.id).is_some_and(|now| now.hash() != old.hash())
+            {
+                self.old_symbols.insert((old.id.clone(), old.hash()), old);
+            }
+        }
+        for p in parts {
+            if let Some(old) = self.parts.insert(p.id.clone(), p)
+                && keep
+                && self.parts.get(&old.id).is_some_and(|now| now.hash() != old.hash())
+            {
+                self.old_parts.insert((old.id.clone(), old.hash()), old);
+            }
         }
     }
 

@@ -1430,6 +1430,10 @@ fn a_symbol_someone_else_used_first_in_another_version_takes_the_sessions_versio
     if let Some(e) = guest_open.project.lock.symbols.get_mut("wc.coil") {
         e.hash = other.hash();
     }
+    // Taken up here before the session's version came in: not an update of it.
+    if let Some(b) = g.base.as_mut() {
+        b.lock.symbols.remove("wc.coil");
+    }
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert_eq!(guest_open.symbols.get("wc.coil"), Some(&session_coil));
     assert_eq!(
@@ -1632,6 +1636,10 @@ fn a_session_version_that_cannot_be_written_is_not_drawn_with_the_old_one() -> T
     guest_open.symbols.insert(other.id.clone(), other.clone());
     if let Some(e) = guest_open.project.lock.symbols.get_mut("wc.coil") {
         e.hash = other.hash();
+    }
+    // Taken up here before the session's version came in: not an update of it.
+    if let Some(b) = g.base.as_mut() {
+        b.lock.symbols.remove("wc.coil");
     }
     // The file cannot be written: a folder stands where it goes.
     let file = store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.coil")?;
@@ -2131,5 +2139,46 @@ fn a_symbol_whose_adding_was_undone_is_not_sent_again_and_is_locked_when_placed_
             .page("p0003")
             .is_some_and(|p| p.symbols.iter().any(|s| s.symbol == id))
     );
+    Ok(())
+}
+
+#[test]
+fn a_symbol_updated_in_a_session_reaches_the_host_and_an_undo_brings_the_old_one_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    guest_open.place(2, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let v1 = guest_open.symbols.get("wc.coil").cloned().ok_or("coil")?;
+    assert_eq!(
+        host_open.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone()),
+        Some(v1.hash())
+    );
+
+    // The guest updates the coil from the library.
+    let mut v2 = v1.clone();
+    v2.name = "Coil, newer".into();
+    store::write_vendored_symbol(&guest_open.dir, &v2)?;
+    guest_open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = v2.hash();
+    guest_open.symbols.insert("wc.coil".into(), v2.clone());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let hash = |o: &Open| o.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone());
+    assert_eq!(hash(&host_open), Some(v2.hash()), "{:?}", h.notes);
+    assert_eq!(host_open.symbols.get("wc.coil"), Some(&v2));
+    assert_eq!(store::read_vendored_symbol(&host_open.dir, "wc.coil")?, v2);
+    assert_eq!(hash(&guest_open), Some(v2.hash()), "the guest keeps its update");
+    assert!(
+        !g.notes.iter().any(|n| n.contains("first in another version")),
+        "{:?}",
+        g.notes
+    );
+
+    // Undone: both copies draw the old version again.
+    g.undo()?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(hash(&host_open), Some(v1.hash()), "{:?} {:?}", g.notes, h.notes);
+    assert_eq!(host_open.symbols.get("wc.coil"), Some(&v1));
+    assert_eq!(hash(&guest_open), Some(v1.hash()), "{:?}", g.notes);
+    assert_eq!(guest_open.symbols.get("wc.coil"), Some(&v1));
+    assert_eq!(store::read_vendored_symbol(&guest_open.dir, "wc.coil")?, v1);
     Ok(())
 }

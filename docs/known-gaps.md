@@ -66,6 +66,9 @@ edit and project-level changes (devices, comments, panels, pages, project proper
 edits; Undo is off. Tools that change pages nobody else has open (wire numbering, a tag renamed
 on every page) send those pages together as one change (#77); wire numbering leaves pages other
 people hold as they are and says which. Still open: undo per change (#78). #43 tracks it.
+Updating a symbol or part from the library during a session sends the new version to everyone
+as one change, refused when someone else updated it first; undoing it puts the old version back
+in every copy (#197).
 
 Host and guests must run builds with the same session protocol version
 (`wc_share::PROTOCOL_VERSION`, raised whenever a message changes). A guest on another version is

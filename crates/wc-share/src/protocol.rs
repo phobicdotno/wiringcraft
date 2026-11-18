@@ -17,7 +17,7 @@ pub type PeerId = u32;
 /// before versions were sent counts as 0), since a message one side does not know cannot be
 /// read by the other. Raise it whenever a message, edit or field is added or changed in a way
 /// an older build cannot read.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The session protocol versions of a host and a guest that cannot work together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +222,18 @@ pub enum ProjectEdit {
     /// it to everyone as [`HostMsg::Picture`]. A picture the session has under the same name with
     /// other content is refused.
     AddPicture { picture: Picture },
+    /// Replace symbols and parts the project has with newer versions: their vendored files, and
+    /// lock entries naming the library source each came from, with the version the sender's
+    /// copy had before (`(item, source, before)`, `before` the lock hash). What a participant
+    /// sends when they update an item from the library. Refused as a whole when the project
+    /// does not have one of them in its `before` version any more (someone else updated or
+    /// took it back meanwhile).
+    UpdateItems {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        symbols: Vec<(Symbol, String, String)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<(Part, String, String)>,
+    },
     /// Several edits made by one user action (a device renamed on its pages and in the device
     /// list), checked and applied together in order: all of them or none, as one change in the
     /// history. Only [`ProjectEdit::batchable`] edits can be in it.
@@ -314,6 +326,14 @@ impl ProjectEdit {
                     .collect();
                 format!("Add {} to the project", names.join(", "))
             }
+            Self::UpdateItems { symbols, parts } => {
+                let names: Vec<&str> = symbols
+                    .iter()
+                    .map(|(s, _, _)| s.id.as_str())
+                    .chain(parts.iter().map(|(p, _, _)| p.id.as_str()))
+                    .collect();
+                format!("Update {} from the library", names.join(", "))
+            }
         }
     }
 
@@ -364,7 +384,7 @@ impl ProjectEdit {
                     }
                 }
             }
-            Self::SetPages { .. } | Self::AddItems { .. } | Self::AddPicture { .. } => {}
+            Self::SetPages { .. } | Self::AddItems { .. } | Self::UpdateItems { .. } | Self::AddPicture { .. } => {}
         }
         Parts::read(project, &keys)
     }
@@ -377,6 +397,7 @@ impl ProjectEdit {
             self,
             Self::SetPages { .. }
                 | Self::AddItems { .. }
+                | Self::UpdateItems { .. }
                 | Self::AddPicture { .. }
                 | Self::Restore { .. }
                 | Self::Batch { .. }
@@ -586,6 +607,14 @@ pub enum HostMsg {
     /// [`HostMsg::Welcome`] (one message each, so a project with many underlays stays under the
     /// line limit), and each one a participant adds with [`ProjectEdit::AddPicture`].
     Picture { picture: Picture },
+    /// Symbol and part files a change locks again in a version the participants may no longer
+    /// have (an undone [`ProjectEdit::UpdateItems`]): sent right before that change.
+    Items {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        symbols: Vec<Symbol>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<Part>,
+    },
     /// The host ended the session.
     Closed,
 }
@@ -648,6 +677,14 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
                 project.lock.symbols.insert(s.id.clone(), lock_entry(source, s.hash()));
             }
             for (p, source) in parts {
+                project.lock.parts.insert(p.id.clone(), lock_entry(source, p.hash()));
+            }
+        }
+        ProjectEdit::UpdateItems { symbols, parts } => {
+            for (s, source, _) in symbols {
+                project.lock.symbols.insert(s.id.clone(), lock_entry(source, s.hash()));
+            }
+            for (p, source, _) in parts {
                 project.lock.parts.insert(p.id.clone(), lock_entry(source, p.hash()));
             }
         }
@@ -781,6 +818,38 @@ pub(crate) fn check_edit(
                 }
                 if lock.get(id).is_some_and(|e| e.hash != hash) {
                     return invalid(format!("the project already has {kind} {id} in another version"));
+                }
+            }
+            Ok(())
+        }
+        ProjectEdit::UpdateItems { symbols, parts } => {
+            if symbols.is_empty() && parts.is_empty() {
+                return invalid("nothing to update".into());
+            }
+            let items = symbols
+                .iter()
+                .map(|(s, _, before)| ("symbol", &project.lock.symbols, s.id.as_str(), before))
+                .chain(
+                    parts
+                        .iter()
+                        .map(|(p, _, before)| ("part", &project.lock.parts, p.id.as_str(), before)),
+                );
+            let mut seen = std::collections::BTreeSet::new();
+            for (kind, lock, id, before) in items {
+                if let Err(e) = wc_core::store::check_id(id) {
+                    return invalid(format!("{kind} {id}: {e}"));
+                }
+                if !seen.insert((kind, id)) {
+                    return invalid(format!("{kind} {id} is listed twice"));
+                }
+                match lock.get(id) {
+                    None => return invalid(format!("the project no longer has {kind} {id}; use it again to add it")),
+                    Some(e) if e.hash != *before => {
+                        return invalid(format!(
+                            "{kind} {id} was changed in the session since your copy had it (someone else updated it); your copy takes the session's version"
+                        ));
+                    }
+                    Some(_) => {}
                 }
             }
             Ok(())

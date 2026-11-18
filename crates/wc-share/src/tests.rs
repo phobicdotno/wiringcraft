@@ -3043,3 +3043,108 @@ fn a_picture_with_a_long_name_that_fits_the_folder_is_written() -> TestResult {
     assert_eq!(std::fs::read(tmp.path().join(&file))?, logo.data);
     Ok(())
 }
+
+fn update_symbol(from: &wc_core::Symbol, to: &wc_core::Symbol) -> ProjectEdit {
+    ProjectEdit::UpdateItems {
+        symbols: vec![(to.clone(), "starter".into(), from.hash())],
+        parts: vec![],
+    }
+}
+
+#[test]
+fn an_update_of_an_item_reaches_everyone_and_an_undo_puts_the_old_version_back() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    let (_b, link_b, mut b) = s.join("Kari")?;
+    let (v1, v2, v3) = (
+        symbol("coil", "Coil"),
+        symbol("coil", "Coil v2"),
+        symbol("coil", "Coil v3"),
+    );
+    link_a.send(a.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    }))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let hash = |p: &Project| p.lock.symbols.get("coil").map(|e| e.hash.clone());
+
+    // Ola updates the coil: every copy gets the new file and lock entry.
+    link_a.send(a.edit_project(update_symbol(&v1, &v2)))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert_eq!(hash(s.host.project()), Some(v2.hash()));
+    assert_eq!(b.symbols.get("coil"), Some(&v2));
+    assert_eq!(b.project.as_ref().and_then(hash), Some(v2.hash()));
+    assert_eq!(s.host.files().0.get("coil"), Some(&v2));
+    assert_eq!(
+        s.log.0.borrow().last().map(|c| c.message.clone()).as_deref(),
+        Some("Update coil from the library")
+    );
+
+    // Kari still started from the first version: refused, and told why.
+    let changes = s.log.0.borrow().len();
+    link_b.send(b.edit_project(update_symbol(&v1, &v3)))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let refused = b.refusals.last().map(ToString::to_string).unwrap_or_default();
+    assert!(refused.contains("changed in the session since"), "{refused}");
+    assert_eq!(hash(s.host.project()), Some(v2.hash()));
+    assert_eq!(s.log.0.borrow().len(), changes);
+    // Not an update of an item the project does not have either.
+    let refused = s.host.edit_project(update_symbol(&v1, &symbol("lamp", "Lamp")));
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { reason }) if reason.contains("no longer has symbol lamp")),
+        "{refused:?}"
+    );
+
+    // Ola's undo puts the first version back everywhere, file and lock entry.
+    link_a.send(GuestMsg::Undo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert_eq!(hash(s.host.project()), Some(v1.hash()));
+    assert_eq!(s.host.files().0.get("coil"), Some(&v1));
+    assert_eq!(b.symbols.get("coil"), Some(&v1));
+    assert_eq!(a.symbols.get("coil"), Some(&v1));
+    assert_eq!(b.project.as_ref().and_then(hash), Some(v1.hash()));
+    // And the redo the new one.
+    link_a.send(GuestMsg::Redo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert_eq!(hash(s.host.project()), Some(v2.hash()));
+    assert_eq!(b.symbols.get("coil"), Some(&v2));
+    Ok(())
+}
+
+#[test]
+fn an_update_is_committed_with_its_file_and_an_undo_writes_the_old_file_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let journal = GitJournal::open(dir)?;
+    let git = journal.git().clone();
+    git.commit("Start")?;
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(journal));
+    let (v1, v2) = (symbol("lamp", "Lamp"), symbol("lamp", "Lamp v2"));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.edit_project(update_symbol(&v1, &v2))?;
+    assert_eq!(store::read_vendored_symbol(dir, "lamp")?, v2);
+    assert_eq!(
+        store::load(dir)?.lock.symbols.get("lamp").map(|e| e.hash.clone()),
+        Some(v2.hash())
+    );
+    let path = store::vendor_path(dir, wc_core::lock::ItemKind::Symbol, "lamp")?;
+    let rel = path.strip_prefix(dir)?.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        git.show("HEAD", &rel),
+        Some(store::to_json(&v2)?),
+        "file and lock in one commit"
+    );
+    host.undo()?;
+    assert_eq!(store::read_vendored_symbol(dir, "lamp")?, v1);
+    assert_eq!(
+        store::load(dir)?.lock.symbols.get("lamp").map(|e| e.hash.clone()),
+        Some(v1.hash())
+    );
+    Ok(())
+}

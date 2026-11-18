@@ -23,9 +23,10 @@ pub struct Change {
 pub trait Journal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()>;
 
-    /// Called before `record` for a change that adds symbols and parts
-    /// ([`crate::ProjectEdit::AddItems`]): store their files with the project, so the commit
-    /// holds them next to their lock entries.
+    /// Called before `record` for a change that adds or updates symbols and parts
+    /// ([`crate::ProjectEdit::AddItems`], [`crate::ProjectEdit::UpdateItems`], and an undo that
+    /// locks an earlier version again): store their files with the project, so the commit holds
+    /// them next to their lock entries.
     fn vendor(&mut self, _symbols: &[Symbol], _parts: &[Part]) -> Result<()> {
         Ok(())
     }
