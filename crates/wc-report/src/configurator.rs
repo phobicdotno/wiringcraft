@@ -51,7 +51,8 @@ pub const CONFIGURATOR_COLUMNS: [&str; 19] = [
 /// - `Plate` and `Rail` rows: each panel layout that holds the strip or one of its terminals,
 ///   with the plate's size, and each DIN rail they sit on with its length and rotation (rails
 ///   are horizontal, `0`).
-/// - `Terminal` rows in strip order (natural order of the terminal numbers), with the
+/// - `Terminal` rows in strip order (the terminal plan's: natural order of the terminal numbers,
+///   or the order the terminal strip editor set, spares included), with the
 ///   terminal's part, its level on a multi-level terminal, and the cross-section and colour of
 ///   the wires on its upper (pin 1) and lower (pin 2) side.
 /// - `Jumper` rows: the terminals each jumper joins, with the jumper's part when it has one.
@@ -105,13 +106,22 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
             strip: strip.clone(),
             ..Row::default()
         };
+        // A spare terminal (not drawn) is the device `-X1.<number>`, when the project has one.
+        let spare_tag = |number: &str| -> Option<DeviceTag> {
+            if info.contains_key(&(strip.clone(), number.to_owned())) {
+                return None;
+            }
+            let mut tag = strip_tag.clone();
+            tag.product.push(number.to_owned());
+            Some(tag)
+        };
         // The device each terminal is drawn as: `-X1.3`, or the strip itself for a terminal
         // tagged only with its strip (numbered in drawing order).
         let device_of = |number: &str| -> Option<(&DeviceTag, &wc_core::Device)> {
-            let tag = info
-                .get(&(strip.clone(), number.to_owned()))
-                .and_then(|t| t.tag.as_ref())?;
-            i.project.devices.get_key_value(tag)
+            match info.get(&(strip.clone(), number.to_owned())) {
+                Some(t) => i.project.devices.get_key_value(t.tag.as_ref()?),
+                None => i.project.devices.get_key_value(&spare_tag(number)?),
+            }
         };
 
         let (mut plates, mut rails) = (0, 0);
@@ -155,6 +165,9 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
             } else if let Some(tag) = info.get(&(strip.clone(), number.clone())).and_then(|t| t.tag.as_ref()) {
                 // Drawn but without a device entry yet: the import back makes one.
                 r.target = Some(Target::Part(tag.clone()));
+            } else if let Some(tag) = spare_tag(number) {
+                // A spare without a device entry: the import back makes one too.
+                r.target = Some(Target::Part(tag));
             }
             if let Some([(us, uc), (ls, lc)]) = info.get(&(strip.clone(), number.clone())).map(|t| &t.sides) {
                 r.upper_section = join(us);

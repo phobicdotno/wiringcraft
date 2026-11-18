@@ -3598,6 +3598,107 @@ fn pages_written_by_project_edits_may_not_start_using_a_symbol_the_session_lacks
 }
 
 #[test]
+fn a_page_set_is_judged_by_which_wire_ends_dangle_not_by_their_labels() -> TestResult {
+    // A wire already on a pin the locked version lacks (drawn before the update).
+    let mut project = demo();
+    wired(&mut project.pages[1], "A2");
+    let mut host = Host::new(
+        project,
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(coil_with(&["A1"]), "starter".into())],
+        parts: vec![],
+    })?;
+    let was = host.project().page("p0002").ok_or("page")?.clone();
+
+    // A tag given to the coil relabels the end already dangling: no new end, accepted.
+    let mut page = was.clone();
+    page.symbols.iter_mut().find(|s| s.id == "k1").ok_or("k1")?.tag = Some(wc_core::DeviceTag::parse("-K5")?);
+    host.edit_project(ProjectEdit::SetPages {
+        pages: vec![page.clone()],
+        before: vec![was],
+    })?;
+
+    // A second wire on the same missing pin has the same label, but is a new end: refused.
+    let before = host.project().clone();
+    let mut more = page.clone();
+    let mut second = more.wires[0].clone();
+    second.id = "w2".into();
+    more.wires.push(second);
+    let err = host
+        .edit_project(ProjectEdit::SetPages {
+            pages: vec![more],
+            before: vec![page.clone()],
+        })
+        .err()
+        .ok_or("refused")?;
+    assert!(err.to_string().contains("-K5:A2"), "{err}");
+    assert_eq!(host.project(), &before);
+
+    // Nor one that shares the first wire's id and its dangling end, going elsewhere.
+    let mut twin = page.clone();
+    let mut second = twin.wires[0].clone();
+    second.to = wc_core::Endpoint::Point {
+        at: Point::new(90.0, 90.0),
+    };
+    twin.wires.push(second);
+    let err = host
+        .edit_project(ProjectEdit::SetPages {
+            pages: vec![twin],
+            before: vec![page],
+        })
+        .err()
+        .ok_or("refused")?;
+    assert!(err.to_string().contains("-K5:A2"), "{err}");
+    assert_eq!(host.project(), &before);
+    Ok(())
+}
+
+#[test]
+fn a_page_edit_or_undo_adding_a_second_end_on_a_missing_pin_is_refused() -> TestResult {
+    // Two wires already on a pin the locked version lacks.
+    let mut project = demo();
+    wired(&mut project.pages[1], "A2");
+    let mut second = project.pages[1].wires[0].clone();
+    second.id = "w2".into();
+    project.pages[1].wires.push(second);
+    let mut host = Host::new(
+        project,
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(coil_with(&["A1"]), "starter".into())],
+        parts: vec![],
+    })?;
+    host.open(Some("p0002"))?;
+    let both = host.project().page("p0002").ok_or("page")?.clone();
+    // w2 taken away: one end fewer, accepted.
+    let mut one = both.clone();
+    one.wires.retain(|w| w.id == "w1");
+    host.edit_page(one.clone())?;
+
+    // Drawn again by a page edit: the same label as w1's end, but a new end. Refused.
+    let before = host.project().clone();
+    let err = host.edit_page(both).err().ok_or("refused")?;
+    assert!(err.to_string().contains("k1:A2"), "{err}");
+    assert_eq!(host.project(), &before);
+
+    // Brought back by undoing its removal: refused too, the history left as it is.
+    let history: Vec<u64> = host.history().iter().map(|e| e.id).collect();
+    let err = host.undo().err().ok_or("refused")?;
+    assert!(err.to_string().contains("k1:A2"), "{err}");
+    assert_eq!(host.project(), &before);
+    assert_eq!(host.history().iter().map(|e| e.id).collect::<Vec<_>>(), history);
+    assert_eq!(host.project().page("p0002"), Some(&one));
+    Ok(())
+}
+
+#[test]
 fn a_shared_file_holding_another_symbol_is_the_file_of_neither() {
     use wc_core::lock::{ItemKind, LockEntry};
     let b = symbol("b", "B");

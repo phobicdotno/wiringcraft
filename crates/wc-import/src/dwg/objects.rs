@@ -4,8 +4,10 @@
 //! `AcDb:Handles` is the object map: each object's handle and where it starts in
 //! `AcDb:AcDbObjects`. Each object there is a size, then bit-packed data:
 //! its type, its own handle and fields, and at the end a stream of references to other objects
-//! by handle (its owner, its layer, the block an INSERT shows). In AutoCAD 2010 drawings the
-//! texts of an object are in a third stream at the end of its data.
+//! by handle (its owner, its layer, the block an INSERT shows). In AutoCAD 2007 and 2010
+//! drawings the texts of an object are in a third stream at the end of its data. 2007 objects
+//! are otherwise written like 2004 ones (type as a bit short, data size in bits), with the
+//! entity fields added in 2007 (material, shadow, attribute lock, MTEXT rectangle height).
 //!
 //! The entities read are LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE (2D and 3D) with their
 //! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), HATCH,
@@ -253,11 +255,11 @@ struct Object<'a> {
 }
 
 impl Object<'_> {
-    /// TV: a text, from the data stream (2004) or the string stream (2010).
+    /// TV: a text, from the data stream (2004) or the string stream (2007 and 2010).
     fn text(&mut self) -> Result<String> {
         match self.version {
             Version::R2004 => Ok(self.decoding.decode(&self.data.t8_bytes()?)),
-            Version::R2010 => self
+            Version::R2007 | Version::R2010 => self
                 .strings
                 .as_mut()
                 .ok_or_else(|| bad("an object's text is missing"))?
@@ -288,7 +290,7 @@ fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Re
     let (size, n) = modular_short(rest)?;
     let mut start = at + n;
     let handle_bits = match version {
-        Version::R2004 => 0,
+        Version::R2004 | Version::R2007 => 0,
         Version::R2010 => {
             let (h, m) = modular_char(objects.get(start..).unwrap_or_default(), false)?;
             start += m;
@@ -301,16 +303,19 @@ fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Re
         .ok_or_else(|| bad("an object is cut off"))?;
     let total = size * 8;
     let mut head = Bits::new(bytes, 0, total);
+    // A bit short up to 2007, a bit pair and one or two bytes from 2010 on.
     let kind = match version {
-        Version::R2004 => head.bs()?,
+        Version::R2004 | Version::R2007 => head.bs()?,
         Version::R2010 => match head.bb()? {
             0 => u16::from(head.rc()?),
             1 => u16::from(head.rc()?) + 0x1F0,
             _ => head.rs()?,
         },
     };
+    // Where the data ends and the handles start: a size in bits up to 2007, from 2010 on
+    // the handle stream's size before the type.
     let end = match version {
-        Version::R2004 => head.rl()? as usize,
+        Version::R2004 | Version::R2007 => head.rl()? as usize,
         Version::R2010 => total
             .checked_sub(handle_bits)
             .ok_or_else(|| bad("an object's handle stream is larger than the object"))?,
@@ -318,12 +323,17 @@ fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Re
     if end > total || end < head.pos() {
         return Err(bad("an object's data size is out of range"));
     }
-    let mut data = Bits::new(bytes, head.pos(), end);
-    let handle = data.h()?.1;
-    let strings = match version {
-        Version::R2004 => None,
-        Version::R2010 => string_stream(bytes, end)?,
+    // From 2007 on the texts and their size and flag end the data: the other fields stop
+    // where they start.
+    let (data_end, strings) = match version {
+        Version::R2004 => (end, None),
+        Version::R2007 | Version::R2010 => string_stream(bytes, end)?,
     };
+    if data_end < head.pos() {
+        return Err(bad("an object's texts overlap its type"));
+    }
+    let mut data = Bits::new(bytes, head.pos(), data_end);
+    let handle = data.h()?.1;
     Ok(Object {
         version,
         decoding,
@@ -335,15 +345,16 @@ fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Re
     })
 }
 
-/// The string stream of a 2010 object whose data ends at bit `end`: a flag in the last bit, a
-/// size before it (in one or two 16-bit parts), and the texts before that.
-pub(crate) fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>> {
+/// The string stream of a 2007 or 2010 object whose data ends at bit `end`: a flag in the last
+/// bit, a size before it (in one or two 16-bit parts), and the texts before that. Also returns
+/// where the other fields end: where the texts start, or at the flag when there are none.
+pub(crate) fn string_stream(bytes: &[u8], end: usize) -> Result<(usize, Option<Bits<'_>>)> {
     let all = Bits::new(bytes, 0, end);
     let Some(flag_at) = end.checked_sub(1) else {
-        return Ok(None);
+        return Ok((0, None));
     };
     if !all.bit_at(flag_at)? {
-        return Ok(None);
+        return Ok((flag_at, None));
     }
     let cut = || bad("an object's texts are cut off");
     let mut at = flag_at.checked_sub(16).ok_or_else(cut)?;
@@ -354,7 +365,7 @@ pub(crate) fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>
         size = (size & 0x7FFF) | (hi << 15);
     }
     let start = at.checked_sub(size).ok_or_else(cut)?;
-    Ok(Some(Bits::new(bytes, start, at)))
+    Ok((start, Some(Bits::new(bytes, start, at))))
 }
 
 /// Where an entity belongs.
@@ -453,7 +464,8 @@ fn read_entity(kind: u16) -> Option<&'static str> {
 /// The base point of a BLOCK_HEADER whose name has been read.
 fn block_base(o: &mut Object) -> Result<(f64, f64)> {
     // The xref flags of a table entry: 64-flag, xref index and xref dependent up to 2004, only
-    // the xref index from 2007 on.
+    // the xref index from 2007 on (the specification lists all three for every version; a
+    // real 2007 file has only the index, as 2010 files do).
     if o.version == Version::R2004 {
         o.data.b()?;
         o.data.bs()?;
@@ -964,6 +976,8 @@ struct Common {
 /// Read the data every entity has, from both the data and the handle streams.
 fn entity_common(o: &mut Object) -> Result<Common> {
     let r2010 = o.version == Version::R2010;
+    // Material and shadow flags are there from 2007 on, visual styles from 2010 on.
+    let r2007 = o.version != Version::R2004;
     o.skip_eed()?;
     if o.data.b()? {
         // A preview picture of the entity.
@@ -985,9 +999,11 @@ fn entity_common(o: &mut Object) -> Result<Common> {
     let plotstyle = o.data.bb()?;
     let mut material = 0;
     let mut styles = [false; 3];
-    if r2010 {
+    if r2007 {
         material = o.data.bb()?;
         o.data.rc()?;
+    }
+    if r2010 {
         for s in &mut styles {
             *s = o.data.b()?;
         }
@@ -1072,14 +1088,15 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
         e.s(1, value);
         return Ok(());
     }
-    // ATTRIB and ATTDEF: the tag and flags, and for ATTDEF the prompt.
+    // ATTRIB and ATTDEF: the tag and flags, and for ATTDEF the prompt. A version byte from
+    // 2010 on, a lock position flag from 2007 on.
     if o.version == Version::R2010 {
         o.data.rc()?;
     }
     let tag = o.text()?;
     o.data.bs()?;
     let attr_flags = o.data.rc()?;
-    if o.version == Version::R2010 {
+    if o.version != Version::R2004 {
         o.data.b()?;
     }
     e.s(1, value).s(2, tag).i(70, i64::from(attr_flags));
@@ -1132,7 +1149,8 @@ fn mtext(o: &mut Object, e: &mut Codes) -> Result<()> {
     let (_, _, z) = d.bd3()?;
     let (dx, dy, _) = d.bd3()?;
     d.bd()?;
-    if o.version == Version::R2010 {
+    // The reference rectangle's height, from 2007 on.
+    if o.version != Version::R2004 {
         d.bd()?;
     }
     let height = d.bd()?;

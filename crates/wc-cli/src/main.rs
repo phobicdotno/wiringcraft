@@ -99,6 +99,10 @@ enum Cmd {
     /// Jumpers (bridges) between terminals of one strip: jumpered terminals are one potential.
     #[command(subcommand)]
     Jumper(JumperCmd),
+    /// Terminal strip editor: the order of a strip's terminals on the rail, spare terminals and
+    /// terminal levels. The terminal plan and the WAGO configurator export follow it.
+    #[command(subcommand)]
+    Strip(StripCmd),
     /// The project logo, shown on the cover page and in every title block.
     #[command(subcommand)]
     Logo(LogoCmd),
@@ -367,6 +371,39 @@ enum JumperCmd {
 }
 
 #[derive(Subcommand)]
+enum StripCmd {
+    /// List terminal strips with their terminals in rail order; spares are marked `(spare)`.
+    /// Give a strip to list only that one, e.g. `strip list -- -X1`.
+    List { strip: Option<String> },
+    /// Put a strip's terminals in this rail order, e.g. `strip order -- -X1 3 1 2`. Terminals
+    /// left out follow at the end; no terminals goes back to the order by number.
+    Order { strip: String, terminals: Vec<String> },
+    /// Move a terminal to a place on the rail (1 is first), e.g. `strip move -- -X1 3 1`.
+    Move { strip: String, terminal: String, to: usize },
+    /// Add a spare terminal (on the rail, not drawn), e.g. `strip spare --after 2 -- -X1 S1`;
+    /// without `--after` it goes at the end.
+    Spare {
+        strip: String,
+        terminal: String,
+        /// The terminal it goes right after.
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// Take a spare terminal off the strip (and out of its jumper), e.g.
+    /// `strip unspare -- -X1 S1`.
+    Unspare { strip: String, terminal: String },
+    /// Set a terminal's level on a multi-level terminal (1 is the bottom), e.g.
+    /// `strip level -- -X1 4 2`; leave the level out to clear the terminal's own `Level`
+    /// property. Levels are inferred in number order, not rail order: a terminal whose next
+    /// number up has level 2 or more is still level 1.
+    Level {
+        strip: String,
+        terminal: String,
+        level: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
 enum PageCmd {
     Add {
         id: String,
@@ -514,8 +551,10 @@ enum ImportCmd {
         lib: PathBuf,
     },
     /// Parts from an EDZ file (EPLAN Data Exchange archive, 7-Zip or zip): part number, maker,
-    /// description and the EPLAN part properties. Macros are listed, with the macro each part
-    /// names and whether the archive holds it, but not drawn; pictures are counted.
+    /// description and the EPLAN part properties. Each macro's multi-line representation,
+    /// variant A, becomes a library symbol (`eplan.<macro name>`) with its connection points as
+    /// pins, and each part gets the symbol made from the macro it names; what the macros leave
+    /// out is reported. Pictures are counted.
     PartsEdz {
         file: PathBuf,
         #[arg(long)]
@@ -1202,6 +1241,91 @@ fn run(cli: Cli) -> Res<()> {
                             Some(part) => println!("{} {} ({part})", j.strip, j.terminals.join(" ")),
                             None => println!("{} {}", j.strip, j.terminals.join(" ")),
                         }
+                    }
+                }
+            }
+        }
+        Cmd::Strip(sc) => {
+            let mut p = load(dir)?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let rail = |p: &Project, strip: &DeviceTag| -> Vec<(String, bool)> {
+                wc_core::project::strip_terminals(p, |id| symbols.get(id).map(|s| s.role))
+                    .remove(strip)
+                    .unwrap_or_default()
+            };
+            match sc {
+                StripCmd::List { strip } => {
+                    let only = strip.map(|s| DeviceTag::parse(&s).map_err(e)).transpose()?;
+                    let all = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+                    for (strip, list) in all {
+                        if only.as_ref().is_some_and(|o| *o != strip) {
+                            continue;
+                        }
+                        let terms: Vec<String> = list
+                            .iter()
+                            .map(|(t, spare)| {
+                                let t = escape_field(t);
+                                if *spare { format!("{t} (spare)") } else { t }
+                            })
+                            .collect();
+                        println!("{strip} {}", terms.join(" "));
+                    }
+                }
+                StripCmd::Order { strip, terminals } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    if p.meta.set_terminal_order(&strip, &terminals)? {
+                        save(dir, &p)?;
+                    }
+                }
+                StripCmd::Move { strip, terminal, to } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    if to == 0 {
+                        return Err("places on the rail count from 1".into());
+                    }
+                    let current = rail(&p, &strip);
+                    if p.meta.move_terminal(&strip, terminal.trim(), to - 1, &current)? {
+                        save(dir, &p)?;
+                    }
+                }
+                StripCmd::Spare { strip, terminal, after } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    let current = rail(&p, &strip);
+                    p.add_spare(&strip, &terminal, after.as_deref().map(str::trim), &current)?;
+                    save(dir, &p)?;
+                }
+                StripCmd::Unspare { strip, terminal } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    let current = rail(&p, &strip);
+                    if !p.remove_spare(&strip, terminal.trim(), &current) {
+                        return Err(format!("{strip} has no spare terminal {}", terminal.trim()));
+                    }
+                    save(dir, &p)?;
+                }
+                StripCmd::Level { strip, terminal, level } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    if level == Some(0) {
+                        return Err("levels start at 1".into());
+                    }
+                    let terminal = terminal.trim();
+                    if !rail(&p, &strip).iter().any(|(t, _)| t == terminal) {
+                        return Err(format!("{strip} has no terminal {terminal}"));
+                    }
+                    let tag = DeviceTag::parse(&format!("{strip}.{terminal}")).map_err(e)?;
+                    let before = p.devices.get(&tag).cloned();
+                    let d = p.devices.entry(tag.clone()).or_default();
+                    match level {
+                        Some(l) => {
+                            d.properties.insert(wc_report::LEVEL_PROPERTY.into(), l.to_string());
+                        }
+                        None => {
+                            d.properties.remove(wc_report::LEVEL_PROPERTY);
+                        }
+                    }
+                    if before.is_none() && level.is_none() {
+                        p.devices.remove(&tag);
+                    }
+                    if p.devices.get(&tag) != before.as_ref() {
+                        save(dir, &p)?;
                     }
                 }
             }
@@ -2790,10 +2914,55 @@ fn import_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>) -> Res<(usize,
         None => None,
     };
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
-    let (mut parts, mut report, warnings) =
-        wc_import::edz::read(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    let wc_import::edz::Edz {
+        mut parts,
+        symbols,
+        mut report,
+        mut warnings,
+    } = wc_import::edz::read_all(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    // The parts whose symbol the map chose.
+    let mut mapped: std::collections::BTreeSet<String> = Default::default();
     if let Some(map) = &map {
+        let mut probe: Vec<wc_core::Part> = parts
+            .iter()
+            .map(|p| wc_core::Part {
+                symbol: None,
+                ..p.clone()
+            })
+            .collect();
+        wc_import::edz::apply_symbol_map(&mut probe, map, &mut report.clone());
+        mapped = probe.into_iter().filter(|p| p.symbol.is_some()).map(|p| p.id).collect();
         wc_import::edz::apply_symbol_map(&mut parts, map, &mut report);
+    }
+    // Symbols first, so no part is written pointing at a symbol the library lacks. A symbol that
+    // cannot be written is skipped, and its parts are written without it.
+    let mut unwritten: std::collections::BTreeSet<String> = Default::default();
+    for s in &symbols {
+        if let Err(x) = wc_library::write_symbol(lib, s) {
+            warnings.push(format!("symbol {} not written: {x}", s.id));
+            unwritten.insert(s.id.clone());
+        }
+    }
+    if !unwritten.is_empty() {
+        // A link the symbol map chose is kept while the library still holds a readable symbol of
+        // that id; a link to the macro's own symbol, which was not saved, is dropped.
+        let readable = |id: &str| {
+            std::fs::read_to_string(lib.join("symbols").join(format!("{id}.json")))
+                .ok()
+                .and_then(|t| serde_json::from_str::<wc_core::Symbol>(&t).ok())
+                .is_some()
+        };
+        let keep = |part: &str, id: &str| !unwritten.contains(id) || (mapped.contains(part) && readable(id));
+        for p in &mut parts {
+            if p.symbol.as_deref().is_some_and(|s| !keep(&p.id, s)) {
+                p.symbol = None;
+            }
+        }
+        for m in &mut report.part_macros {
+            if m.symbol.as_deref().is_some_and(|s| !keep(&m.part, s)) {
+                m.symbol = None;
+            }
+        }
     }
     for p in &parts {
         wc_library::write_part(lib, p).map_err(e)?;
@@ -4435,6 +4604,69 @@ mod tests {
     }
 
     #[test]
+    fn terminal_strips_are_reordered_given_spares_and_levels_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        for (k, tag) in ["-X1.1", "-X1.2", "-X1.3"].into_iter().enumerate() {
+            p.pages[0].symbols.push(PlacedSymbol {
+                id: format!("t{k}"),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0 * k as f64, 10.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: DeviceTag::parse(tag).ok(),
+            });
+        }
+        save(&dir, &p).unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let rail = || -> Vec<String> {
+            let p = load(&dir).unwrap();
+            let (symbols, _) = store::vendored_symbols(&dir, &p);
+            wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role))
+                .remove(&x1)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(t, spare)| if spare { format!("{t}*") } else { t })
+                .collect()
+        };
+        assert_eq!(rail(), ["1", "2", "3"]);
+        cli(&dir, &["strip", "move", "--", "-X1", "3", "1"]).unwrap();
+        assert_eq!(rail(), ["3", "1", "2"]);
+        cli(&dir, &["strip", "spare", "--after", "1", "--", "-X1", "S1"]).unwrap();
+        cli(&dir, &["strip", "spare", "--", "-X1", "S2"]).unwrap();
+        assert_eq!(rail(), ["3", "1", "S1*", "2", "S2*"]);
+        assert!(
+            cli(&dir, &["strip", "spare", "--", "-X1", "2"]).is_err(),
+            "drawn already"
+        );
+        assert!(cli(&dir, &["strip", "move", "--", "-X1", "3", "0"]).is_err());
+        cli(&dir, &["strip", "list"]).unwrap();
+        cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).unwrap();
+        assert!(cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).is_err());
+        cli(&dir, &["strip", "order", "--", "-X1", "2", "S1"]).unwrap();
+        assert_eq!(rail(), ["2", "S1*", "1", "3"], "left out ones follow by number");
+        // Levels are the terminal device's Level property.
+        cli(&dir, &["strip", "level", "--", "-X1", "S1", "2"]).unwrap();
+        let level = |t: &str| {
+            load(&dir)
+                .unwrap()
+                .devices
+                .get(&DeviceTag::parse(t).unwrap())
+                .and_then(|d| d.properties.get(wc_report::LEVEL_PROPERTY).cloned())
+        };
+        assert_eq!(level("-X1.S1").as_deref(), Some("2"));
+        cli(&dir, &["strip", "level", "--", "-X1", "S1"]).unwrap();
+        assert_eq!(level("-X1.S1"), None);
+        assert!(cli(&dir, &["strip", "level", "--", "-X1", "9", "2"]).is_err());
+        assert!(cli(&dir, &["strip", "level", "--", "-X1", "1", "0"]).is_err());
+        // Back to the order by number; the spare stays.
+        cli(&dir, &["strip", "order", "--", "-X1"]).unwrap();
+        assert_eq!(rail(), ["1", "2", "3", "S1*"]);
+    }
+
+    #[test]
     fn a_jumper_part_is_set_and_cleared_from_the_command_line() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -5535,6 +5767,69 @@ mod tests {
             z.finish().unwrap();
         }
         cli(&dir, &["import", "archive", only.to_str().unwrap()]).unwrap();
+    }
+
+    #[test]
+    fn an_edz_symbol_that_cannot_be_written_is_a_warning_and_its_part_is_written_without_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("contactor.edz");
+        let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="SIE.3RT2015" P_ARTICLE_MANUFACTURER="SIE" P_ARTICLE_MACRO="SIE\SIE_3RT2015.ema"/></partsmanagement>"#;
+        let ema = r#"<EplanPxfRoot><MacroVariant MacroFuncType="1"><O31 A531="0/0" A532="1/1"/></MacroVariant></EplanPxfRoot>"#;
+        let mut w = sevenz_rust2::ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("parts.xml"), Some(xml.as_bytes()))
+            .unwrap();
+        w.push_archive_entry(
+            sevenz_rust2::ArchiveEntry::new_file("SIE_3RT2015.ema"),
+            Some(ema.as_bytes()),
+        )
+        .unwrap();
+        std::fs::write(&file, w.finish().unwrap().into_inner()).unwrap();
+        let lib = tmp.path().join("lib");
+        // A folder where the symbol's file would go makes writing it fail.
+        std::fs::create_dir_all(lib.join("symbols").join("eplan.sie_3rt2015.json")).unwrap();
+        let (n, report, warnings) = import_edz(&file, &lib, None).unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("symbol eplan.sie_3rt2015 not written")),
+            "{warnings:?}"
+        );
+        assert_eq!(report.part_macros[0].symbol, None);
+        let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+        let p: wc_core::Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(p.symbol, None);
+
+        // Once the symbol can be written, the part points at it and it loads back.
+        std::fs::remove_dir(lib.join("symbols").join("eplan.sie_3rt2015.json")).unwrap();
+        let (_, _, warnings) = import_edz(&file, &lib, None).unwrap();
+        assert!(warnings.iter().all(|w| !w.contains("not written")), "{warnings:?}");
+        let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+        let p: wc_core::Part = serde_json::from_str(&json).unwrap();
+        let id = p.symbol.unwrap();
+        let json = std::fs::read_to_string(lib.join("symbols").join(format!("{id}.json"))).unwrap();
+        let mut s: wc_core::Symbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(s.id, id);
+
+        // The library now holds a different, readable symbol of that id, and the new one cannot
+        // replace it (a folder blocks its staging file).
+        s.description = "kept from before".into();
+        wc_library::write_symbol(&lib, &s).unwrap();
+        std::fs::create_dir_all(lib.join("symbols").join(format!("{id}.json.tmp"))).unwrap();
+        let part_symbol = |lib: &Path| {
+            let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+            serde_json::from_str::<wc_core::Part>(&json).unwrap().symbol
+        };
+        // The macro's own link is dropped: its symbol was not saved.
+        let (_, _, warnings) = import_edz(&file, &lib, None).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("not written")), "{warnings:?}");
+        assert_eq!(part_symbol(&lib), None);
+        // A link the symbol map chose to that readable symbol is kept.
+        let map = tmp.path().join("map.txt");
+        std::fs::write(&map, format!("SIE_3RT2015 = {id}\n")).unwrap();
+        let (_, report, _) = import_edz(&file, &lib, Some(&map)).unwrap();
+        assert_eq!(part_symbol(&lib).as_deref(), Some(id.as_str()));
+        assert_eq!(report.part_macros[0].symbol.as_deref(), Some(id.as_str()));
     }
 
     #[test]
