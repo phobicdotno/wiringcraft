@@ -650,6 +650,12 @@ impl Open {
         };
         for w in &clip.wires {
             let mut w = w.clone();
+            // A core of a pasted cable runs in that cable under its new tag.
+            if let Some(c) = &mut w.cable
+                && let Some(t) = renamed.get(&c.cable)
+            {
+                c.cable = t.clone();
+            }
             w.id = p.next_id("w");
             w.number = None;
             for v in &mut w.via {

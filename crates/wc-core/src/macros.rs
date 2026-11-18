@@ -321,6 +321,12 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
         .ok_or_else(|| Error::Invalid(format!("no page {page}")))?;
     for w in &m.wires {
         let mut w = w.clone();
+        // A core of a cable the macro holds runs in that cable under its new tag.
+        if let Some(c) = &mut w.cable
+            && let Some(t) = renamed.get(&c.cable)
+        {
+            c.cable = t.clone();
+        }
         w.id = p.next_id("w");
         w.number = None;
         for v in &mut w.via {
@@ -743,6 +749,29 @@ mod tests {
         assert!(matches!(&w.to, Endpoint::Point { at } if *at == Point::new(60.0, 60.0)));
         assert!(matches!(&page.graphics[0], Shape::Text { at, .. } if *at == Point::new(70.0, 80.0)));
         assert!(place(&mut p, "p9", &m, Point::new(0.0, 0.0)).is_err());
+
+        // A wire that is a core of the macro's cable follows the cable to its new tag.
+        let w1 = DeviceTag::parse("-W1")?;
+        let mut cabled = m.clone();
+        cabled.symbols.push(PlacedSymbol {
+            id: "s2".into(),
+            symbol: "wc.cable".into(),
+            at: Point::new(40.0, 30.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(w1.clone()),
+        });
+        cabled.wires[0].cable = Some(crate::project::CableCore {
+            cable: w1.clone(),
+            core: "BN".into(),
+        });
+        p.devices.insert(w1.clone(), Device::default());
+        let ids = place(&mut p, "p1", &cabled, Point::new(0.0, 0.0))?;
+        let page = &p.pages[0];
+        let cable = page.symbol(&ids[1]).and_then(|s| s.tag.clone());
+        assert_eq!(cable.as_ref().map(ToString::to_string).as_deref(), Some("-W2"));
+        let wire = page.wires.iter().find(|w| w.id == ids[2]).and_then(|w| w.cable.clone());
+        assert_eq!(wire.map(|c| c.cable), cable, "the core runs in the placed cable");
         Ok(())
     }
 }
