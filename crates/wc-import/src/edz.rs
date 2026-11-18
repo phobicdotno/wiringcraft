@@ -55,7 +55,8 @@ pub struct Limits {
     pub entry: u64,
     /// The most files an archive may hold.
     pub entries: usize,
-    /// The most part XML read in all, in bytes.
+    /// The most part XML read in all, in bytes; macros have a budget of the same size of their
+    /// own, so they never crowd out part XML.
     pub total: u64,
     /// The most a 7-Zip archive may unpack to in all, in bytes.
     pub unpacked: u64,
@@ -134,6 +135,17 @@ fn macro_file_name(path: &str) -> String {
         .to_lowercase()
 }
 
+/// A macro path for matching: lower case, `/` between folders, without a leading
+/// `$(MD_MACROS)`-like variable.
+fn macro_path(path: &str) -> String {
+    let p = path.trim().replace('\\', "/").to_lowercase();
+    let p = match p.strip_prefix("$(") {
+        Some(rest) => rest.split_once(')').map_or("", |(_, r)| r).to_owned(),
+        None => p,
+    };
+    p.trim_start_matches('/').to_owned()
+}
+
 /// The keys a symbol map may name a macro by: its full name, its file name and its file name
 /// without `.ema`, all in lower case.
 fn macro_keys(name: &str) -> [String; 3] {
@@ -163,9 +175,12 @@ pub fn apply_symbol_map(parts: &mut [Part], map: &BTreeMap<String, String>, repo
         part.symbol = Some(symbol.clone());
         chosen.insert((part.id.clone(), name), symbol);
     }
+    let mapped: std::collections::BTreeSet<&String> = chosen.keys().map(|(part, _)| part).collect();
     for m in &mut report.part_macros {
         if let Some(symbol) = chosen.get(&(m.part.clone(), m.name.clone())) {
             m.symbol = Some(symbol.clone());
+        } else if mapped.contains(&m.part) {
+            m.symbol = None;
         }
     }
     chosen.len()
@@ -244,7 +259,14 @@ pub fn read(bytes: &[u8]) -> Result<(Vec<Part>, Report, Vec<String>)> {
 
 /// [`read`] with other limits.
 pub fn read_with(bytes: &[u8], limits: Limits) -> Result<(Vec<Part>, Report, Vec<String>)> {
-    let edz = read_all_with(bytes, limits)?;
+    let mut edz = read_all_with(bytes, limits)?;
+    // The symbols are not returned here, so no part points at one.
+    for p in &mut edz.parts {
+        p.symbol = None;
+    }
+    for m in &mut edz.report.part_macros {
+        m.symbol = None;
+    }
     Ok((edz.parts, edz.report, edz.warnings))
 }
 
@@ -254,15 +276,22 @@ pub fn read_all(bytes: &[u8]) -> Result<Edz> {
     read_all_with(bytes, LIMITS)
 }
 
-/// [`read_all`] with other limits. Macros count towards [`Limits::total`] like part XML.
+/// [`read_all`] with other limits. Macros have a [`Limits::total`] budget of their own, apart
+/// from the part XML's.
 pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
     let too_many = || Error::Format(format!("the archive holds more than {} files", limits.entries));
     let mut report = Report::default();
     let mut xml: Vec<(String, Vec<u8>)> = Vec::new();
     let mut macro_data: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut total = 0u64;
+    // Bytes read of part XML and of macros, each against its own budget.
+    let (mut xml_total, mut macro_total) = (0u64, 0u64);
     let mut take = |name: &str, size: u64, data: &mut dyn Read, report: &mut Report| -> Result<bool> {
         let kind = entry_kind(name);
+        let total = if kind == Entry::Macro {
+            &mut macro_total
+        } else {
+            &mut xml_total
+        };
         if kind == Entry::Macro {
             report.macros += 1;
             report.macro_files.push(name.to_owned());
@@ -281,7 +310,7 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
                 if buf.len() as u64 > limits.entry || total.saturating_add(buf.len() as u64) > limits.total {
                     report.too_large += 1;
                 } else {
-                    total += buf.len() as u64;
+                    *total += buf.len() as u64;
                     if kind == Entry::Macro {
                         macro_data.push((name.to_owned(), buf));
                     } else {
@@ -379,7 +408,8 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
     // Each macro read as a symbol, by its file name in lower case.
     macro_data.sort_by(|a, b| a.0.cmp(&b.0));
     let mut symbols: BTreeMap<String, wc_core::Symbol> = BTreeMap::new();
-    let mut by_file: BTreeMap<String, String> = BTreeMap::new();
+    // Symbol ids by macro file name, each with the macro's path in the archive.
+    let mut by_file: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (name, data) in macro_data {
         let text = crate::csv::decode(&data);
         match macros::read(&name, &text) {
@@ -402,13 +432,18 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
                 }
                 by_file
                     .entry(macro_file_name(&name))
-                    .or_insert_with(|| m.symbol.id.clone());
+                    .or_default()
+                    .push((macro_path(&name), m.symbol.id.clone()));
                 report.macro_symbols += 1;
                 symbols.insert(m.symbol.id.clone(), m.symbol);
             }
             Err(e) => {
                 report.macros_unread += 1;
-                warnings.push(format!("macro {} not imported: it {e}", printable(&name)));
+                warnings.push(format!(
+                    "macro {} not imported: it {}",
+                    printable(&name),
+                    printable(&e.to_string())
+                ));
             }
         }
     }
@@ -424,11 +459,31 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
             format!("{file}.ema")
         }
     };
+    // The symbol of the macro a part names: the only macro of that file name, else the one whose
+    // path ends with the path the part gives.
+    let symbol_of = |name: &str, file: &str| -> Option<String> {
+        match by_file.get(file)?.as_slice() {
+            [(_, id)] => Some(id.clone()),
+            several => {
+                let mut want = macro_path(name);
+                if !want.ends_with(".ema") {
+                    want.push_str(".ema");
+                }
+                let want = format!("/{}", want.trim_start_matches('/'));
+                let mut hits = several.iter().filter(|(path, _)| format!("/{path}").ends_with(&want));
+                match (hits.next(), hits.next()) {
+                    (Some((_, id)), None) => Some(id.clone()),
+                    _ => None,
+                }
+            }
+        }
+    };
     for p in parts.values_mut() {
+        let first = report.part_macros.len();
         for k in MACRO_PROPERTIES {
             if let Some(name) = p.properties.get(k) {
                 let file = file_of(name);
-                let symbol = by_file.get(&file).cloned();
+                let symbol = symbol_of(name, &file);
                 if p.symbol.is_none()
                     && let Some(s) = &symbol
                 {
@@ -440,6 +495,15 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
                     in_archive: in_archive.contains(&file),
                     symbol,
                 });
+            }
+        }
+        // Only the macro whose symbol the part got reports one.
+        let mut given = false;
+        for m in report.part_macros.iter_mut().skip(first) {
+            if !given && m.symbol.is_some() && m.symbol == p.symbol {
+                given = true;
+            } else {
+                m.symbol = None;
             }
         }
     }

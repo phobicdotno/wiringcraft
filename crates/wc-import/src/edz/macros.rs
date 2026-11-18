@@ -48,7 +48,7 @@ use wc_core::symbol::{Pin, PinDir, SymbolRole};
 
 use super::pick_language;
 use crate::eplan::EplanFunction;
-use crate::eplan::drawing::{UniqueNames, dir_index, rotation_of, symbol_for, vector};
+use crate::eplan::drawing::{KIND_TERMINAL, UniqueNames, dir_index, rotation_of, symbol_for, vector};
 use crate::{Error, Result, id_segment};
 
 /// Representation type of a multi-line schematic.
@@ -486,7 +486,12 @@ fn turned(d: PinDir, variant: u8) -> PinDir {
 pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     let all = variants(text)?;
     let multi: Vec<&Variant> = all.iter().filter(|v| v.doc == Some(MULTI_LINE)).collect();
-    let Some(v) = multi.iter().find(|v| v.id == 0).or_else(|| multi.first()).copied() else {
+    if !multi.is_empty() && !multi.iter().any(|v| v.id == 0) {
+        return Err(Error::Format(
+            "has no variant A of its multi-line representation".into(),
+        ));
+    }
+    let Some(v) = multi.iter().find(|v| v.id == 0).copied() else {
         let mut kinds: Vec<String> = Vec::new();
         for k in all.iter().map(|v| representation(v.doc)) {
             if !kinds.contains(&k) {
@@ -640,9 +645,15 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         for g in &s.graphics {
             graphics.push(g.placed(origin, rotation, mirror));
         }
-        for pin in &s.pins {
+        // A terminal keeps the macro's own designations, in order.
+        let own = |k: usize| -> Option<String> {
+            (p.kind == KIND_TERMINAL)
+                .then(|| names.get(k).filter(|n| !n.is_empty()).cloned())
+                .flatten()
+        };
+        for (k, pin) in s.pins.iter().enumerate() {
             pins.push(Pin {
-                name: pin.name.clone(),
+                name: own(k).unwrap_or_else(|| pin.name.clone()),
                 at: origin + pin.at.transform(rotation, mirror),
                 dir: turned(pin.dir, p.variant),
             });
@@ -696,6 +707,9 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     for g in &graphics {
         let (a, b) = g.bounds();
         pts.extend([a, b]);
+    }
+    if pts.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return Err(Error::Format("has coordinates too large to draw".into()));
     }
     let (min, _) = bounds_of(&pts);
     let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);

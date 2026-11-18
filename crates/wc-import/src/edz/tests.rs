@@ -481,3 +481,65 @@ fn a_part_naming_its_macro_without_the_extension_gets_its_symbol() -> TestResult
     assert!(m.in_archive, "{m:?}");
     Ok(())
 }
+
+#[test]
+fn macros_do_not_use_up_the_part_xml_budget() -> TestResult {
+    let edz = zip(&[("a.ema", CONTACTOR_MACRO.as_bytes()), ("parts.xml", PARTS.as_bytes())])?;
+    let total = PARTS.len().max(CONTACTOR_MACRO.len()) as u64 + 1;
+    let got = read_all_with(&edz, Limits { total, ..LIMITS })?;
+    assert_eq!(got.report.too_large, 0);
+    assert!(got.report.parts > 0);
+    assert_eq!(got.symbols.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn the_parts_only_reader_links_no_part_to_a_symbol_it_does_not_return() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="SIE.3RT2015" P_ARTICLE_MANUFACTURER="SIE" P_ARTICLE_MACRO="SIE_3RT2015.ema"/></partsmanagement>"#;
+    let edz = zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("SIE_3RT2015.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?;
+    let (parts, report, _) = read(&edz)?;
+    assert_eq!(parts.first().and_then(|p| p.symbol.clone()), None);
+    assert!(report.part_macros.iter().all(|m| m.symbol.is_none()));
+    Ok(())
+}
+
+#[test]
+fn macros_of_the_same_file_name_are_told_apart_by_their_path() -> TestResult {
+    let other = CONTACTOR_MACRO.replace("P20013=\"Q\"", "P20013=\"K\"");
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="B.1" P_ARTICLE_MANUFACTURER="B" P_ARTICLE_MACRO="$(MD_MACROS)\B\relay.ema"/></partsmanagement>"#;
+    let edz = zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("macros/A/relay.ema", CONTACTOR_MACRO.as_bytes()),
+        ("macros/B/relay.ema", other.as_bytes()),
+    ])?;
+    let got = read_all(&edz)?;
+    let part = got.parts.first().ok_or("no part")?;
+    let id = part.symbol.clone().ok_or("no symbol")?;
+    let s = got.symbols.iter().find(|s| s.id == id).ok_or("no such symbol")?;
+    assert_eq!(s.letter_code, "K");
+    Ok(())
+}
+
+#[test]
+fn only_the_macro_whose_symbol_a_part_got_reports_it() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="B.1" P_ARTICLE_MANUFACTURER="B" P_ARTICLE_MACRO="one.ema" P_ARTICLE_GROUPSYMBOLMACRO="two.ema"/></partsmanagement>"#;
+    let edz = zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("one.ema", CONTACTOR_MACRO.as_bytes()),
+        ("two.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?;
+    let got = read_all(&edz)?;
+    let symbols: Vec<Option<&str>> = got.report.part_macros.iter().map(|m| m.symbol.as_deref()).collect();
+    assert_eq!(symbols, [Some("eplan.one"), None]);
+    assert!(got.report.part_macros.iter().all(|m| m.in_archive));
+    // A map choosing the group symbol macro takes the report row with it.
+    let (mut parts, mut report) = (got.parts.clone(), got.report.clone());
+    let map: BTreeMap<String, String> = [("two".to_owned(), "wc.coil".to_owned())].into();
+    apply_symbol_map(&mut parts, &map, &mut report);
+    let symbols: Vec<Option<&str>> = report.part_macros.iter().map(|m| m.symbol.as_deref()).collect();
+    assert_eq!(symbols, [None, Some("wc.coil")]);
+    Ok(())
+}

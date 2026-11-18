@@ -416,3 +416,28 @@ fn the_letter_is_that_of_the_device_with_the_most_pins() -> TestResult {
     assert_eq!(read("circuit.ema", text)?.symbol.letter_code, "K");
     Ok(())
 }
+
+#[test]
+fn a_macro_without_a_multi_line_variant_a_is_not_read_from_another_variant() {
+    let text = r#"<EplanPxfRoot><MacroVariant MacroFuncType="1" VariantId="1"><O31 A531="0/0" A532="1/1"/></MacroVariant></EplanPxfRoot>"#;
+    let e = read("x.ema", text).err().map(|e| e.to_string()).unwrap_or_default();
+    assert_eq!(e, "has no variant A of its multi-line representation");
+}
+
+#[test]
+fn coordinates_that_overflow_on_the_way_are_refused() {
+    let text = r#"<EplanPxfRoot><MacroVariant MacroFuncType="1" ReferencePoint="-1e308/0"><O31 A531="1e308/0" A532="1/1"/></MacroVariant></EplanPxfRoot>"#;
+    let e = read("x.ema", text).err().map(|e| e.to_string()).unwrap_or_default();
+    assert_eq!(e, "has coordinates too large to draw");
+}
+
+#[test]
+fn a_terminal_keeps_the_macros_own_designations() -> TestResult {
+    let text = r#"<EplanPxfRoot><MacroVariant MacroFuncType="1" ReferencePoint="0/0">
+        <O17 A1381="100" A185="L;R"><S40x1201 A762="0/0"/><P144 P20013="X" P20014="1"/></O17>
+        </MacroVariant></EplanPxfRoot>"#;
+    let s = read("x.ema", text)?.symbol;
+    let names: Vec<&str> = s.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["L", "R"]);
+    Ok(())
+}

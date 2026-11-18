@@ -5594,6 +5594,17 @@ mod tests {
         let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
         let p: wc_core::Part = serde_json::from_str(&json).unwrap();
         assert_eq!(p.symbol, None);
+
+        // Once the symbol can be written, the part points at it and it loads back.
+        std::fs::remove_dir(lib.join("symbols").join("eplan.sie_3rt2015.json")).unwrap();
+        let (_, _, warnings) = import_edz(&file, &lib, None).unwrap();
+        assert!(warnings.iter().all(|w| !w.contains("not written")), "{warnings:?}");
+        let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+        let p: wc_core::Part = serde_json::from_str(&json).unwrap();
+        let id = p.symbol.unwrap();
+        let json = std::fs::read_to_string(lib.join("symbols").join(format!("{id}.json"))).unwrap();
+        let s: wc_core::Symbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(s.id, id);
     }
 
     #[test]
