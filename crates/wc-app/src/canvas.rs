@@ -1004,16 +1004,13 @@ fn leave_unpickable_layer(ed: &mut Editor) {
         Tool::Comment => Layer::Comments,
         Tool::Select | Tool::Place | Tool::Wire => return,
     };
-    if ed.layers.pickable(layer) {
+    let Some(why) = ed.layers.refusal(layer) else {
         return;
-    }
+    };
     ed.tool = Tool::Select;
     ed.shape_points.clear();
     ed.shape_page = None;
-    ed.message = format!(
-        "The layer {} is hidden or locked: show and unlock it in View → Layers to draw on it.",
-        layer.title()
-    );
+    ed.message = why;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2584,7 +2581,8 @@ mod tests {
     }
 
     /// Page 2 with a free text, a numbered wire, a coil -K1 whose contact is on page 3 (so a
-    /// cross-reference shows under the coil), and a review comment.
+    /// cross-reference shows under the coil), a review comment and a scanned sheet whose
+    /// picture is missing (so its placeholder text shows).
     fn annotated() -> (tempfile::TempDir, Open, Editor) {
         let (tmp, mut o) = project();
         o.project.pages.push(Page::new("p0003", "3", "Contacts"));
@@ -2595,6 +2593,11 @@ mod tests {
             s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
         }
         let page = &mut o.project.pages[1];
+        page.underlay = Some(wc_core::Underlay {
+            file: "scans/missing-scan.png".into(),
+            min: Point::new(20.0, 100.0),
+            max: Point::new(120.0, 180.0),
+        });
         page.graphics.push(
             serde_json::from_value(serde_json::json!({
                 "kind": "text", "at": {"x": 40.0, "y": 150.0}, "text": "Hello note", "height": 5.0
@@ -2642,7 +2645,7 @@ mod tests {
             .map(|(t, _)| t.clone())
             .unwrap_or_default();
         assert!(!xref.is_empty(), "a cross-reference to page 3 is drawn: {all:?}");
-        for want in ["Hello note", "W101", "742", xref.as_str()] {
+        for want in ["Hello note", "W101", "742", "missing-scan", xref.as_str()] {
             assert!(has(&all, want), "{want} is drawn: {all:?}");
         }
         for (layer, gone) in [
@@ -2650,12 +2653,13 @@ mod tests {
             (Layer::WireNumbers, "W101"),
             (Layer::CrossReferences, xref.as_str()),
             (Layer::Comments, "742"),
+            (Layer::Underlay, "missing-scan"),
         ] {
             ed.layers = Default::default();
             ed.layers.set_shown(layer, false);
             let texts = painted(&ctx, &mut o, &mut ed, 0.2, vec![]);
             assert!(!has(&texts, gone), "{layer:?} hidden: {gone} is not drawn");
-            for other in ["Hello note", "W101", "742", xref.as_str()]
+            for other in ["Hello note", "W101", "742", "missing-scan", xref.as_str()]
                 .into_iter()
                 .filter(|w| *w != gone)
             {

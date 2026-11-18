@@ -1717,24 +1717,7 @@ impl App {
                             || enter)
                             && !text.trim().is_empty()
                         {
-                            if let Some(o) = self.open.as_mut()
-                                && let Some(why) = o.held_reason(self.ed.page)
-                            {
-                                self.ed.message = why;
-                            } else if let Some(o) = self.open.as_mut()
-                                && let Some(sel) = o.add_graphic(
-                                    self.ed.page,
-                                    wc_core::geom::Shape::Text {
-                                        at: *at,
-                                        text: text.trim().to_owned(),
-                                        height: 3.5,
-                                        align: wc_core::geom::Align::Left,
-                                        angle: 0.0,
-                                    },
-                                )
-                            {
-                                self.ed.select_only(sel);
-                            }
+                            self.add_text(*at, text);
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1755,21 +1738,8 @@ impl App {
                         if ui
                             .add_enabled(!text.trim().is_empty(), egui::Button::new("Add comment"))
                             .clicked()
-                            && let Some(o) = self.open.as_mut()
-                            && let Some(page) = o.project.pages.get(self.ed.page).map(|p| p.id.clone())
                         {
-                            let mut next = o.project.clone();
-                            match next.add_comment(&page, Some(*at), &state::author_name(), state::now_secs(), text) {
-                                Ok(id) => {
-                                    o.checkpoint();
-                                    o.project = next;
-                                    self.ed.selection.clear();
-                                    self.ed.message = format!("Comment {id} added.");
-                                    self.ed.comment = Some(id);
-                                    self.ed.tool = Tool::Select;
-                                }
-                                Err(err) => self.ed.message = err.to_string(),
-                            }
+                            self.add_comment_at(*at, text);
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -2924,6 +2894,56 @@ impl App {
             find_window::FindOutcome::Close => self.find = None,
             find_window::FindOutcome::Go { page, select } => self.show_found(&page, select),
             find_window::FindOutcome::Replace => self.replace_found(),
+        }
+    }
+
+    /// The Text dialog's OK: a free text at `at` on the page shown. Not on a page someone else
+    /// holds, nor while the drawings layer is hidden or locked (it may have changed while the
+    /// dialog was open).
+    fn add_text(&mut self, at: wc_core::geom::Point, text: &str) {
+        let Some(o) = self.open.as_mut() else { return };
+        if let Some(why) = o.held_reason(self.ed.page) {
+            self.ed.message = why;
+            return;
+        }
+        if let Some(why) = self.prefs.layers.refusal(layers::Layer::Drawings) {
+            self.ed.message = why;
+            return;
+        }
+        let shape = wc_core::geom::Shape::Text {
+            at,
+            text: text.trim().to_owned(),
+            height: 3.5,
+            align: wc_core::geom::Align::Left,
+            angle: 0.0,
+        };
+        if let Some(sel) = o.add_graphic(self.ed.page, shape) {
+            self.ed.select_only(sel);
+        }
+    }
+
+    /// The Comment dialog's button: a review comment at `at` on the page shown, unless the
+    /// comments layer is hidden or locked by now.
+    fn add_comment_at(&mut self, at: wc_core::geom::Point, text: &str) {
+        if let Some(why) = self.prefs.layers.refusal(layers::Layer::Comments) {
+            self.ed.message = why;
+            return;
+        }
+        let Some(o) = self.open.as_mut() else { return };
+        let Some(page) = o.project.pages.get(self.ed.page).map(|p| p.id.clone()) else {
+            return;
+        };
+        let mut next = o.project.clone();
+        match next.add_comment(&page, Some(at), &state::author_name(), state::now_secs(), text) {
+            Ok(id) => {
+                o.checkpoint();
+                o.project = next;
+                self.ed.selection.clear();
+                self.ed.message = format!("Comment {id} added.");
+                self.ed.comment = Some(id);
+                self.ed.tool = Tool::Select;
+            }
+            Err(err) => self.ed.message = err.to_string(),
         }
     }
 

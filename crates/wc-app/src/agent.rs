@@ -4409,6 +4409,35 @@ mod tests {
     }
 
     #[test]
+    fn the_text_and_comment_dialogs_add_nothing_to_a_layer_hidden_while_they_were_open() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.page = 1;
+        let at = wc_core::geom::Point::new(40.0, 40.0);
+        for hide in [true, false] {
+            for l in [Layer::Drawings, Layer::Comments] {
+                if hide {
+                    a.prefs.layers.set_shown(l, false);
+                } else {
+                    a.prefs.layers.set_locked(l, true);
+                }
+            }
+            a.add_text(at, "Note");
+            assert!(page2(&a).graphics.is_empty());
+            assert!(a.ed.message.contains("Drawings and notes"), "{}", a.ed.message);
+            a.add_comment_at(at, "Check");
+            assert!(a.open.as_ref().unwrap().project.comments.is_empty());
+            assert!(a.ed.message.contains("Review comments"), "{}", a.ed.message);
+            a.prefs.layers = Default::default();
+        }
+        // Shown and unlocked, both are added.
+        a.add_text(at, "Note");
+        assert_eq!(page2(&a).graphics.len(), 1);
+        a.add_comment_at(at, "Check");
+        assert_eq!(a.open.as_ref().unwrap().project.comments.len(), 1);
+    }
+
+    #[test]
     fn the_assistant_cannot_change_a_page_someone_else_holds_but_can_read_and_comment_there() {
         let (_tmp, mut a) = app(vec![]);
         call(

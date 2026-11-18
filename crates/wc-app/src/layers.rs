@@ -100,6 +100,16 @@ impl Layers {
         self.shown(l) && !self.locked(l)
     }
 
+    /// Why nothing can be added to `l` now: it is hidden or locked. `None` when it can.
+    pub fn refusal(&self, l: Layer) -> Option<String> {
+        (!self.pickable(l)).then(|| {
+            format!(
+                "The layer {} is hidden or locked: show and unlock it in View → Layers to add to it.",
+                l.title()
+            )
+        })
+    }
+
     pub fn set_shown(&mut self, l: Layer, shown: bool) {
         if shown {
             self.hidden.remove(&l);
