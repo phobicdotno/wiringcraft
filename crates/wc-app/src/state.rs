@@ -550,11 +550,8 @@ impl Open {
                     self.undo_error = Some(e);
                     return false;
                 }
-                // A library source added or removed: symbols of a source that is gone are no longer
-                // offered, and those of one that came back are.
-                if self.redo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries) {
-                    self.refresh_library();
-                }
+                let sources = self.redo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
+                self.follow_step(sources);
                 self.dirty = true;
                 self.history += 1;
                 true
@@ -576,14 +573,37 @@ impl Open {
                     self.undo_error = Some(e);
                     return false;
                 }
-                if self.undo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries) {
-                    self.refresh_library();
-                }
+                let sources = self.undo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
+                self.follow_step(sources);
                 self.dirty = true;
                 self.history += 1;
                 true
             }
             None => false,
+        }
+    }
+
+    /// After an undo or redo: rebuild the library list when the step added or removed a library
+    /// source (`sources_changed`), so symbols of a source that is gone are no longer offered and
+    /// those of one that came back are; then load every part a device uses that is not loaded,
+    /// since a redo can bring back an assignment whose part an earlier rebuild dropped.
+    fn follow_step(&mut self, sources_changed: bool) {
+        if sources_changed {
+            self.refresh_library();
+        }
+        let missing: Vec<String> = self
+            .project
+            .devices
+            .values()
+            .flat_map(|d| d.all_parts())
+            .map(|(id, _)| id)
+            .filter(|id| !self.parts.contains_key(*id))
+            .map(str::to_owned)
+            .collect();
+        for id in missing {
+            if let Ok(p) = store::read_vendored_part(&self.dir, &id) {
+                self.parts.insert(id, p);
+            }
         }
     }
 
@@ -3181,5 +3201,31 @@ pub(crate) mod tests {
         assert!(!listed(&o), "undo removed the source, so its symbols go");
         assert!(o.redo());
         assert!(listed(&o), "redo brings them back");
+
+        // A part assigned after the source: undo both steps, then redo both. The rebuild on the
+        // first redo drops the part (no device uses it yet); the second redo loads it again.
+        let part = Part {
+            id: "acme.relay".into(),
+            manufacturer: "Acme".into(),
+            ..Default::default()
+        };
+        store::write_vendored_part(&o.dir, &part).unwrap();
+        o.checkpoint();
+        o.project.devices.insert(
+            DeviceTag::parse("-K1").unwrap(),
+            wc_core::Device {
+                part: Some(part.id.clone()),
+                ..Default::default()
+            },
+        );
+        o.parts.insert(part.id.clone(), part.clone());
+        assert!(o.undo() && o.undo());
+        assert!(!o.parts.contains_key("acme.relay"));
+        assert!(o.redo() && o.redo());
+        assert_eq!(
+            o.parts.get("acme.relay"),
+            Some(&part),
+            "the device's part is loaded again"
+        );
     }
 }
