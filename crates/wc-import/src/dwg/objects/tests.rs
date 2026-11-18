@@ -1305,6 +1305,11 @@ fn a_2004_drawing_in_windows_1251_reads_cyrillic() -> TestResult {
     // An unknown code page still reads, as Windows-1252, and is named in a warning.
     let d = drawing(&cyrillic_2004(31))?;
     assert_eq!(d.blocks.len(), 1);
-    assert!(d.skipped.keys().any(|k| k.contains("code page 31")), "{:?}", d.skipped);
+    assert!(d.skipped.is_empty(), "not an entity count: {:?}", d.skipped);
+    assert!(
+        d.warnings.iter().any(|w| w.contains("code page 31")),
+        "{:?}",
+        d.warnings
+    );
     Ok(())
 }

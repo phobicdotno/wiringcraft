@@ -59,6 +59,8 @@ pub struct Drawing {
     /// then why base points counted under [`BASE_UNREAD`] could not be read, for the first
     /// [`MAX_REASONS`] of them.
     pub damaged: Vec<String>,
+    /// Notes about the file as a whole, such as a code page its texts cannot be decoded in.
+    pub warnings: Vec<String>,
 }
 
 /// The most reasons [`Drawing::damaged`] keeps.
@@ -75,6 +77,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
         drawing: d,
         mut skipped,
         damaged,
+        warnings,
     } = dxf_drawing(sections)?;
     // One budget for model space and every block, so nested blocks cannot multiply the work.
     let mut budget = dxf::MAX_DRAWN;
@@ -102,6 +105,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
         model_points,
         skipped,
         damaged,
+        warnings,
     })
 }
 
@@ -110,6 +114,8 @@ pub(crate) struct Read {
     pub(crate) drawing: dxf::Drawing,
     pub(crate) skipped: BTreeMap<String, usize>,
     pub(crate) damaged: Vec<String>,
+    /// Notes about the file as a whole (an unknown code page).
+    pub(crate) warnings: Vec<String>,
 }
 
 /// The entities of a DWG file as the DXF reader's entities, by block and model space, with a
@@ -128,11 +134,12 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     // 2004 texts are in the drawing's code page; one this reader does not know is read as
     // before (UTF-8 or Windows-1252) and said.
     let (decoding, known) = Decoding::of(sections.codepage);
+    let mut warnings = Vec::new();
     if sections.version == Version::R2004 && !known {
-        skipped.insert(
-            format!("texts in {} (read as Windows-1252)", Decoding::name(sections.codepage)),
-            1,
-        );
+        warnings.push(format!(
+            "its texts are in {}, which is not supported: read as Windows-1252",
+            Decoding::name(sections.codepage)
+        ));
     }
     for (handle, at) in map {
         if let Err(e) = decode(
@@ -160,6 +167,7 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
         drawing: decoded.assemble(&mut skipped),
         skipped,
         damaged,
+        warnings,
     })
 }
 

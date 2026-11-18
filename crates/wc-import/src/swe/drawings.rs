@@ -110,6 +110,9 @@ impl SweDrawings {
         for (k, n) in read.skipped {
             *self.skipped.entry(k).or_default() += n;
         }
+        for w in &read.warnings {
+            self.warnings.push(format!("{what}: {w}"));
+        }
         // A drawing read in part is used; why the rest is missing is said once per file.
         if damaged > 0 {
             let first = read.damaged.first().map(String::as_str).unwrap_or("");

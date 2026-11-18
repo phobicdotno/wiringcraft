@@ -1,7 +1,8 @@
 //! The single-byte Windows code pages an AutoCAD 2004 drawing may store its texts in, by the
 //! code page number of the file header (byte 0x13), as LibreDWG's `codepages.h` numbers them.
 //! Bytes below 0x80 are ASCII in all of them; each table gives the characters of 0x80 to 0xFF
-//! (U+FFFD where the code page has none). Generated from the code page definitions.
+//! (U+FFFD where the code page has none), as the Windows code page definitions give them
+//! (the same as Python's `cpNNNN` codecs, from which they were written out).
 
 /// The characters of bytes 0x80 to 0xFF of a code page.
 type Upper = [u16; 128];
