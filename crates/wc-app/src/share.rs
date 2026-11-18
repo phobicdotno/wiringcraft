@@ -496,12 +496,49 @@ pub fn incoming(local: &mut Project, auth: &Project) -> bool {
     changed
 }
 
+/// The symbols and parts `local` uses in what it changed since `base` (the last sync): placed on
+/// a page that differs from the base's, or named by a device or jumper that does. A use the
+/// last sync brought in is not one: the session may have taken it back since.
+fn fresh_uses(
+    local: &Project,
+    base: &Project,
+) -> (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>) {
+    let symbols = local
+        .pages
+        .iter()
+        .filter(|p| base.page(&p.id) != Some(*p))
+        .flat_map(|p| p.symbols.iter().map(|s| s.symbol.clone()))
+        .collect();
+    let parts = local
+        .devices
+        .iter()
+        .filter(|(tag, d)| base.devices.get(*tag) != Some(*d))
+        .flat_map(|(_, d)| d.all_parts().into_iter().map(|(p, _)| p.to_owned()))
+        .chain(
+            local
+                .meta
+                .jumpers
+                .iter()
+                .filter(|j| !base.meta.jumpers.contains(j))
+                .filter_map(|j| j.part.clone()),
+        )
+        .collect();
+    (symbols, parts)
+}
+
 /// Items the session locked at the last sync (`was`) and no longer locks were taken back (an
 /// undo): drop them from `local`'s lock too, so they are not sent again as new items. Kept are
-/// items this copy locks in another version, and items it uses (placed here since and not sent
-/// yet): those go out again with the change that uses them. Returns the items dropped.
-pub fn taken_back(local: &mut Project, was: &wc_core::Lockfile, auth: &Project) -> Vec<(ItemKind, String)> {
-    let (symbols, parts) = (local.used_symbols(), local.used_parts());
+/// items this copy locks in another version, and items it uses in a change made since the last
+/// sync (`base`) and not sent yet: those go out again with the change that uses them. A use
+/// the last sync brought in does not keep an item: the session took that use back with it.
+/// Returns the items dropped.
+pub fn taken_back(
+    local: &mut Project,
+    base: &Project,
+    was: &wc_core::Lockfile,
+    auth: &Project,
+) -> Vec<(ItemKind, String)> {
+    let (symbols, parts) = fresh_uses(local, base);
     let mut dropped = Vec::new();
     for kind in [ItemKind::Symbol, ItemKind::Part] {
         let used = match kind {
@@ -529,9 +566,9 @@ pub fn taken_back(local: &mut Project, was: &wc_core::Lockfile, auth: &Project) 
 /// Drop from `open` what the session took back since the last look (`seen`, the session's lock
 /// then, updated to `auth`'s): the lock entries ([`taken_back`]) and the loaded copies, so placing
 /// the item again takes it afresh and locks it, instead of drawing a loaded copy without a pin.
-fn follow_take_backs(seen: &mut Option<wc_core::Lockfile>, open: &mut Open, auth: &Project) {
+fn follow_take_backs(seen: &mut Option<wc_core::Lockfile>, open: &mut Open, base: &Project, auth: &Project) {
     let was = seen.take().unwrap_or_else(|| auth.lock.clone());
-    let dropped = taken_back(&mut open.project, &was, auth);
+    let dropped = taken_back(&mut open.project, base, &was, auth);
     for (kind, id) in &dropped {
         match kind {
             ItemKind::Symbol => {
@@ -545,6 +582,8 @@ fn follow_take_backs(seen: &mut Option<wc_core::Lockfile>, open: &mut Open, auth
     if !dropped.is_empty() {
         // The lock changed, not yet in this copy's files.
         open.dirty = true;
+        // The lists offer an item taken back only when a library here has it to take again.
+        open.refresh_library();
     }
     *seen = Some(auth.lock.clone());
 }
@@ -1618,7 +1657,7 @@ impl Share {
         // without its symbols, and an item the session refused is sent again a few times.
         let auth = role.project()?;
         // Items the session took back are dropped here first, or they would look new below.
-        follow_take_backs(&mut self.session_lock, open, auth);
+        follow_take_backs(&mut self.session_lock, open, base, auth);
         // An item the session took is done; one this copy no longer locks (an undo, or an
         // assistant command that rewrote the project) is not sent again, so nothing waits for it.
         self.items_out
@@ -1728,7 +1767,8 @@ impl Share {
                 conflicting.join(", ")
             ));
         }
-        follow_take_backs(&mut self.session_lock, open, auth);
+        let base = self.base.get_or_insert_with(|| open.project.clone());
+        follow_take_backs(&mut self.session_lock, open, base, auth);
         let changed = incoming(&mut open.project, auth);
         let (symbols, parts) = role.files();
         let failed: Vec<String> = take_files(open, symbols, parts)

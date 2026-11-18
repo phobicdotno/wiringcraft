@@ -711,7 +711,30 @@ impl Host {
             ChangeKind::Redo => format!("Redo: {what}"),
             _ => format!("Undo: {what}"),
         };
-        if let Err(refusal) = self.record(by, entry.info.page.clone(), message.clone()) {
+        // The files of the versions it locks again go in first, written as the session has them:
+        // a change that was not recorded may have left another version of the file behind.
+        let symbols: Vec<wc_core::Symbol> = entry
+            .before
+            .lock_symbols
+            .iter()
+            .filter(|(_, e)| e.is_some())
+            .filter_map(|(id, _)| self.symbols.get(id).cloned())
+            .collect();
+        let parts: Vec<wc_core::Part> = entry
+            .before
+            .lock_parts
+            .iter()
+            .filter(|(_, e)| e.is_some())
+            .filter_map(|(id, _)| self.parts.get(id).cloned())
+            .collect();
+        let stored = if symbols.is_empty() && parts.is_empty() {
+            Ok(())
+        } else {
+            self.journal
+                .vendor(&symbols, &parts)
+                .map_err(|e| Refusal::NotRecorded { reason: e.to_string() })
+        };
+        if let Err(refusal) = stored.and_then(|()| self.record(by, entry.info.page.clone(), message.clone())) {
             self.project = before;
             self.restore_files(by);
             return Err(refusal);

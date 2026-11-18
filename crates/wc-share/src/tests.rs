@@ -2330,6 +2330,61 @@ fn a_redo_is_refused_once_the_session_has_another_version_of_the_item() -> TestR
 }
 
 #[test]
+fn bringing_back_a_page_that_uses_a_symbol_taken_back_since_is_refused() -> TestResult {
+    let mut s = Session::new();
+    s.host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(symbol("coil", "Coil"), "starter".into())],
+        parts: vec![],
+    })?;
+    let added = s.host.history().last().map(|c| c.id).ok_or("added")?;
+    s.host.open(Some("p0003"))?;
+    let mut page = s.host.project().page("p0003").cloned().ok_or("page")?;
+    place(&mut page, "s1", 10.0);
+    s.host.edit_page(page)?;
+    s.host.open(None)?;
+    s.host.edit_project(ProjectEdit::RemovePage { id: "p0003".into() })?;
+    let removed = s.host.history().last().map(|c| c.id).ok_or("removed")?;
+    // With the page gone nothing uses the coil, so its adding can be taken back.
+    s.host.revert(added)?;
+    assert!(!s.host.project().lock.symbols.contains_key("coil"));
+    // Bringing the page back would place a symbol the project no longer locks.
+    let changes = s.log.0.borrow().len();
+    let refused = s.host.revert(removed);
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { reason }) if reason.contains("would use symbol coil")),
+        "{refused:?}"
+    );
+    assert!(s.host.project().page("p0003").is_none());
+    assert_eq!(s.log.0.borrow().len(), changes);
+    Ok(())
+}
+
+#[test]
+fn a_redo_writes_the_item_file_as_the_session_has_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let journal = GitJournal::open(dir)?;
+    journal.git().commit("Start")?;
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(journal));
+    let lamp = symbol("lamp", "Lamp");
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(lamp.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.undo()?;
+    // A change that was not recorded left another version of the file behind.
+    store::write_vendored_symbol(dir, &symbol("lamp", "Other lamp"))?;
+    host.redo()?;
+    assert_eq!(store::read_vendored_symbol(dir, "lamp")?, lamp);
+    assert_eq!(
+        store::load(dir)?.lock.symbols.get("lamp").map(|e| e.hash.clone()),
+        Some(lamp.hash())
+    );
+    Ok(())
+}
+
+#[test]
 fn added_symbols_are_committed_with_their_files() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path();

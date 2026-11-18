@@ -457,6 +457,19 @@ fn an_item_the_session_took_back_leaves_the_local_lock() -> TestResult {
     let mut session = Project::new("Demo");
     session.lock.symbols.insert("wc.coil".into(), entry("abc"));
     session.lock.parts.insert("acme.relay".into(), entry("p1"));
+    // Placed in the session at the last sync and taken back with the coil since: this copy
+    // has not seen that yet, so the stale placement does not keep the coil.
+    let mut stale = Page::new("p0002", "2", "Two");
+    stale.symbols.push(wc_core::PlacedSymbol {
+        id: "s9".into(),
+        symbol: "wc.coil".into(),
+        at: Default::default(),
+        rotation: Default::default(),
+        mirror: false,
+        tag: None,
+    });
+    session.pages.push(stale);
+    let base = session.clone();
     let mut local = session.clone();
     // Used here and not sent yet: the session never had it, so it still has to go out.
     local.lock.symbols.insert("wc.lamp".into(), entry("def"));
@@ -478,7 +491,7 @@ fn an_item_the_session_took_back_leaves_the_local_lock() -> TestResult {
     local.lock.parts.get_mut("acme.relay").ok_or("relay")?.source = "other".into();
     // The session undid the changes that added the coil, the relay and the placed symbol.
     let auth = Project::new("Demo");
-    let dropped = taken_back(&mut local, &was, &auth);
+    let dropped = taken_back(&mut local, &base, &was, &auth);
     assert_eq!(
         dropped,
         [
