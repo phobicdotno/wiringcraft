@@ -1515,9 +1515,15 @@ fn an_ellipse_not_a_number_and_a_spline_short_of_knots_are_damaged() -> TestResu
         spline(0x303, &[0.0, 0.0, 1.0, 1.0]),
         spline(0x304, &[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]),
         spline(0x305, &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+        spline(0x306, &[0.0, 0.0, 0.0, f64::NAN, 1.0, 1.0]),
     ];
     let d = drawing(&sections(v, &objs, &[]))?;
-    assert_eq!(d.skipped.get(DAMAGED), Some(&3), "{:?}", d.skipped);
+    assert_eq!(d.skipped.get(DAMAGED), Some(&4), "{:?}", d.skipped);
+    assert!(
+        d.damaged.iter().any(|r| r.starts_with("object 306")),
+        "the NaN knot: {:?}",
+        d.damaged
+    );
     assert!(d.damaged.iter().any(|r| r.contains("4 knots for 3")), "{:?}", d.damaged);
     assert!(
         d.damaged.iter().any(|r| r.contains("not numbers in order")),
@@ -1525,5 +1531,49 @@ fn an_ellipse_not_a_number_and_a_spline_short_of_knots_are_damaged() -> TestResu
         d.damaged
     );
     assert_eq!(d.model.len(), 1, "the good quadratic is drawn: {:?}", d.model);
+    Ok(())
+}
+
+#[test]
+fn a_spline_whose_knots_make_no_curve_is_drawn_through_its_points_and_said() -> TestResult {
+    let v = Version::R2010;
+    let model = head(None);
+    // A cubic over three control points (degree too high), and a quadratic whose knots leave
+    // no interval: both pass the count and order checks.
+    let spline = |h: u64, degree: u32, knots: &[f64]| {
+        let mut sp = entity(v, 36, h, model);
+        sp.data
+            .bl(1)
+            .bl(degree)
+            .b(false)
+            .b(false)
+            .b(false)
+            .bd(0.0)
+            .bd(0.0)
+            .bl(knots.len() as u32)
+            .bl(3)
+            .b(false);
+        for k in knots {
+            sp.data.bd(*k);
+        }
+        for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
+            sp.data.bd3(p);
+        }
+        sp
+    };
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        spline(0x300, 3, &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+        spline(0x301, 2, &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0]),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.model.len(), 2, "{:?}", d.model);
+    assert_eq!(
+        d.skipped.get("SPLINE whose knots make no curve"),
+        Some(&2),
+        "{:?}",
+        d.skipped
+    );
     Ok(())
 }
