@@ -665,16 +665,22 @@ fn bspline_points(ctrl: &[(f64, f64)], knots: &[f64], weights: &[f64], degree: u
     Some(out)
 }
 
-/// Points of a SPLINE entity: the curve through its control points, else through its fit
-/// points; and whether it is closed.
-/// The most fit points a spline is interpolated through; beyond, they are joined straight.
-const MAX_FIT_POINTS: usize = 10_000;
+/// The most fit points a spline is interpolated through; beyond, they are joined straight (the
+/// curve is sampled at most 2000 times, too few to pass through more points).
+const MAX_FIT_POINTS: usize = 500;
 
 /// Points along the B-spline of degree `degree` (3 when 0, at most one less than the points)
 /// that passes through `fit`: global interpolation with chord-length parameters and averaged
-/// knots, as a CAD program derives the control points of a spline drawn by its fit points.
-/// `None` when there are fewer than three distinct points or the system cannot be solved.
-fn through_fit_points(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f64, f64)>> {
+/// knots (The NURBS Book, 9.2.1), as a CAD program derives the control points of a spline drawn
+/// by its fit points. With `tangents` (start and end directions) the curve also leaves and
+/// enters along them (9.2.2): two more control points, each tangent scaled to the length of the
+/// fit polygon. A degree of 1 is the fit points themselves. `None` when there are fewer than
+/// three distinct points (two with tangents) or the system cannot be solved.
+fn through_fit_points(
+    fit: &[(f64, f64)],
+    degree: usize,
+    tangents: Option<((f64, f64), (f64, f64))>,
+) -> Option<Vec<(f64, f64)>> {
     let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
     for &pt in fit {
         if !(pt.0.is_finite() && pt.1.is_finite()) {
@@ -685,10 +691,20 @@ fn through_fit_points(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f64, f64
         }
     }
     let n = q.len();
-    if !(3..=MAX_FIT_POINTS).contains(&n) {
+    // Unit start and end directions, when both are given and usable.
+    let unit = |(x, y): (f64, f64)| {
+        let l = x.hypot(y);
+        (l.is_finite() && l > 1e-12).then(|| (x / l, y / l))
+    };
+    let tangents = tangents.and_then(|(a, b)| Some((unit(a)?, unit(b)?)));
+    let fewest = if tangents.is_some() { 2 } else { 3 };
+    if !(fewest..=MAX_FIT_POINTS).contains(&n) {
         return None;
     }
-    let p = if degree == 0 { 3 } else { degree }.min(n - 1).min(MAX_SPLINE_DEGREE);
+    let p = if degree == 0 { 3 } else { degree }.min(MAX_SPLINE_DEGREE);
+    if p == 1 {
+        return Some(q);
+    }
     // Chord-length parameters from 0 to 1.
     let mut params = vec![0.0; n];
     let mut total = 0.0;
@@ -703,36 +719,94 @@ fn through_fit_points(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f64, f64
         *t /= total;
     }
     params[n - 1] = 1.0;
-    // Clamped knots, the inner ones averaged from the parameters.
-    let mut knots = vec![0.0; p + 1];
-    for j in 1..n - p {
-        knots.push(params[j..j + p].iter().sum::<f64>() / p as f64);
+    match tangents {
+        None => {
+            let p = p.min(n - 1);
+            // Clamped knots, the inner ones averaged from the parameters (9.8).
+            let mut knots = vec![0.0; p + 1];
+            for j in 1..n - p {
+                knots.push(params[j..j + p].iter().sum::<f64>() / p as f64);
+            }
+            knots.extend(std::iter::repeat_n(1.0, p + 1));
+            let mut rows = Vec::with_capacity(n);
+            for &u in &params {
+                let span = (p + knots.get(p + 1..n)?.partition_point(|&t| t <= u)).min(n - 1);
+                rows.push((span - p, basis(&knots, span, u, p)?));
+            }
+            let ctrl = solve_band(&rows, &q, p)?;
+            bspline_points(&ctrl, &knots, &[], p)
+        }
+        Some((d0, d1)) => {
+            // n + 2 control points; inner knots averaged over p parameters each (9.22).
+            let p = p.min(n);
+            let count = n + 2;
+            let mut knots = vec![0.0; p + 1];
+            for j in 0..=n.checked_sub(p)? {
+                knots.push(params[j..j + p].iter().sum::<f64>() / p as f64);
+            }
+            knots.extend(std::iter::repeat_n(1.0, p + 1));
+            if knots.len() != count + p + 1 {
+                return None;
+            }
+            let (first, last) = (knots[p + 1], knots[count - 1]);
+            let (q0, qn) = (q[0], q[n - 1]);
+            let start = (
+                q0.0 + first / p as f64 * total * d0.0,
+                q0.1 + first / p as f64 * total * d0.1,
+            );
+            let end = (
+                qn.0 - (1.0 - last) / p as f64 * total * d1.0,
+                qn.1 - (1.0 - last) / p as f64 * total * d1.1,
+            );
+            // Rows: P0 = Q0, P1 from the start tangent, one per inner fit point, P(n) from the end
+            // tangent, P(n + 1) = Q(n - 1).
+            let mut rows = vec![(0, vec![1.0]), (1, vec![1.0])];
+            let mut rhs = vec![q0, start];
+            for (k, &u) in params.iter().enumerate().take(n - 1).skip(1) {
+                let span = (p + knots.get(p + 1..count)?.partition_point(|&t| t <= u)).min(count - 1);
+                rows.push((span - p, basis(&knots, span, u, p)?));
+                rhs.push(q[k]);
+            }
+            rows.push((count - 2, vec![1.0]));
+            rows.push((count - 1, vec![1.0]));
+            rhs.push(end);
+            rhs.push(qn);
+            let ctrl = solve_band(&rows, &rhs, p)?;
+            bspline_points(&ctrl, &knots, &[], p)
+        }
     }
-    knots.extend(std::iter::repeat_n(1.0, p + 1));
-    // The collocation matrix is banded (each row's nonzeros lie within p of its diagonal) and
-    // totally positive, so it is solved in its band without pivoting.
+}
+
+/// Solve the square system whose row `i` has the values `rows[i].1` from column `rows[i].0` on,
+/// for two right-hand sides at once. The matrix is banded (no value more than `p` columns from
+/// the diagonal) and totally positive, so it is solved in its band without pivoting: O(n p^2).
+/// `None` when a value lies outside the band, a pivot is zero, or the result is not numbers.
+fn solve_band(rows: &[(usize, Vec<f64>)], rhs: &[(f64, f64)], p: usize) -> Option<Vec<(f64, f64)>> {
+    let n = rows.len();
+    if rhs.len() != n {
+        return None;
+    }
     let w = 2 * p + 1;
     let mut band = vec![0.0; n * w];
     let at = |i: usize, c: usize| (c + p).checked_sub(i).filter(|o| *o < w).map(|o| i * w + o);
-    for (k, &u) in params.iter().enumerate() {
-        let span = (p + knots.get(p + 1..n)?.partition_point(|&t| t <= u)).min(n - 1);
-        for (r, v) in basis(&knots, span, u, p)?.into_iter().enumerate() {
-            *band.get_mut(at(k, span + r - p)?)? = v;
+    for (i, (from, vals)) in rows.iter().enumerate() {
+        for (r, v) in vals.iter().enumerate() {
+            *band.get_mut(at(i, from + r)?)? = *v;
         }
     }
-    let (mut x, mut y): (Vec<f64>, Vec<f64>) = q.iter().copied().unzip();
+    let (mut x, mut y): (Vec<f64>, Vec<f64>) = rhs.iter().copied().unzip();
     for j in 0..n {
-        let pivot = band[at(j, j)?];
+        let pivot = *band.get(at(j, j)?)?;
         if pivot.abs() < 1e-14 {
             return None;
         }
         for i in j + 1..n.min(j + p + 1) {
-            let f = band[at(i, j)?] / pivot;
+            let f = *band.get(at(i, j)?)? / pivot;
             if f == 0.0 {
                 continue;
             }
             for c in j..n.min(j + p + 1) {
-                let v = band[at(j, c)?];
+                let v = *band.get(at(j, c)?)?;
                 *band.get_mut(at(i, c)?)? -= f * v;
             }
             x[i] -= f * x[j];
@@ -741,19 +815,16 @@ fn through_fit_points(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f64, f64
     }
     for j in (0..n).rev() {
         for c in j + 1..n.min(j + p + 1) {
-            let v = band[at(j, c)?];
+            let v = *band.get(at(j, c)?)?;
             x[j] -= v * x[c];
             y[j] -= v * y[c];
         }
-        let d = band[at(j, j)?];
+        let d = *band.get(at(j, j)?)?;
         x[j] /= d;
         y[j] /= d;
     }
     let ctrl: Vec<(f64, f64)> = x.into_iter().zip(y).collect();
-    if !ctrl.iter().all(|(a, b)| a.is_finite() && b.is_finite()) {
-        return None;
-    }
-    bspline_points(&ctrl, &knots, &[], p)
+    ctrl.iter().all(|(a, b)| a.is_finite() && b.is_finite()).then_some(ctrl)
 }
 
 /// The p + 1 B-spline basis functions not zero at `u` in knot span `span` (The NURBS Book,
@@ -777,6 +848,8 @@ fn basis(knots: &[f64], span: usize, u: f64, p: usize) -> Option<Vec<f64>> {
     Some(n)
 }
 
+/// Points of a SPLINE entity: the curve through its control points, else through its fit
+/// points (with its end tangents, codes 12/22 and 13/23, when given); and whether it is closed.
 fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool) {
     let closed = (e.f(70) as i64) & 1 == 1;
     // Whole pairs only, both coordinates finite: a NaN would make the project file unreadable.
@@ -787,7 +860,9 @@ fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool) {
     if let Some(pts) = bspline_points(&ctrl, &e.all(40), &e.all(41), degree) {
         return (pts, closed);
     }
-    if let Some(pts) = through_fit_points(&fit, degree) {
+    let tangent = |x: i32, y: i32| e.get(x).zip(e.get(y)).map(|_| (e.f(x), e.f(y)));
+    let tangents = tangent(12, 22).zip(tangent(13, 23));
+    if let Some(pts) = through_fit_points(&fit, degree, tangents) {
         return (pts, closed);
     }
     if fit.len() >= 2 {
@@ -811,6 +886,16 @@ impl Cursor<'_> {
         }
         self.i += 1;
         v.trim().parse::<f64>().ok().filter(|v| v.is_finite()).or(Some(0.0))
+    }
+    /// Whether the pair `ahead` places on holds `code` with a number (not moving the cursor).
+    fn valid_at(&self, ahead: usize, code: i32) -> bool {
+        self.codes
+            .get(self.i + ahead)
+            .is_some_and(|(c, v)| *c == code && v.trim().parse::<f64>().is_ok_and(f64::is_finite))
+    }
+    /// Whether the next pair holds `code` with a number.
+    fn valid(&self, code: i32) -> bool {
+        self.valid_at(0, code)
     }
     fn count(&mut self, code: i32) -> usize {
         self.take(code).map_or(0, |n| n.clamp(0.0, 100_000.0) as usize)
@@ -946,10 +1031,18 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                         let fit_follows = matches!(cur.codes.get(cur.i + 1), Some((11 | 12, _)))
                             || (next_is_count && (zero || edge + 1 < edges));
                         let nf = if fit_follows { cur.count(97) } else { 0 };
-                        let fit: Vec<(f64, f64)> = (0..nf).filter_map(|_| cur.point(11, 21)).collect();
-                        let _ = (cur.point(12, 22), cur.point(13, 23));
+                        // Fit points are interpolated only when they are all numbers (the cursor
+                        // reads anything else as 0).
+                        let mut numbers = true;
+                        let fit: Vec<(f64, f64)> = (0..nf)
+                            .filter_map(|_| {
+                                numbers &= cur.valid(11) && cur.valid_at(1, 21);
+                                cur.point(11, 21)
+                            })
+                            .collect();
+                        let tangents = cur.point(12, 22).zip(cur.point(13, 23));
                         bspline_points(&ctrl, &knots, &weights, degree)
-                            .or_else(|| through_fit_points(&fit, degree))
+                            .or_else(|| numbers.then(|| through_fit_points(&fit, degree, tangents)).flatten())
                             .or((fit.len() >= 2).then_some(fit))
                             .unwrap_or(ctrl)
                     }
@@ -1588,7 +1681,7 @@ mod tests {
     fn interpolation_through_fit_points_holds_them_all() {
         // A wave of 50 points: the curve passes through each one.
         let fit: Vec<(f64, f64)> = (0..50).map(|i| (i as f64, (i as f64 * 0.4).sin() * 3.0)).collect();
-        let pts = through_fit_points(&fit, 3).unwrap_or_default();
+        let pts = through_fit_points(&fit, 3, None).unwrap_or_default();
         assert!(!pts.is_empty(), "a wave can be interpolated");
         for f in &fit {
             let d = pts
@@ -1598,11 +1691,11 @@ mod tests {
             assert!(d < 0.05, "{f:?} is {d} away");
         }
         // Two distinct points, a repeated point and points that are not numbers give none.
-        assert!(through_fit_points(&[(0.0, 0.0), (1.0, 1.0)], 3).is_none());
-        assert!(through_fit_points(&[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], 3).is_none());
-        assert!(through_fit_points(&[(0.0, 0.0), (f64::NAN, 1.0), (2.0, 0.0)], 3).is_none());
+        assert!(through_fit_points(&[(0.0, 0.0), (1.0, 1.0)], 3, None).is_none());
+        assert!(through_fit_points(&[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], 3, None).is_none());
+        assert!(through_fit_points(&[(0.0, 0.0), (f64::NAN, 1.0), (2.0, 0.0)], 3, None).is_none());
         // Straight points stay on their line.
-        let line = through_fit_points(&[(0.0, 0.0), (1.0, 1.0), (3.0, 3.0), (4.0, 4.0)], 3);
+        let line = through_fit_points(&[(0.0, 0.0), (1.0, 1.0), (3.0, 3.0), (4.0, 4.0)], 3, None);
         assert!(line.is_some_and(|l| l.iter().all(|q| (q.0 - q.1).abs() < 1e-9)));
     }
 
@@ -2117,6 +2210,54 @@ mod tests {
                 b: Point::new(5.0, 0.0)
             }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn end_tangents_set_the_directions_and_degree_1_is_the_points() {
+        // Through (0, 0), (5, 5), (10, 0) leaving along +x and arriving along +x.
+        let pts = through_fit_points(
+            &[(0.0, 0.0), (5.0, 5.0), (10.0, 0.0)],
+            3,
+            Some(((1.0, 0.0), (1.0, 0.0))),
+        )
+        .unwrap_or_default();
+        assert!(pts.len() > 10, "{pts:?}");
+        // The slope of the first and last sampled chords: near flat along the tangents, steep
+        // (about 2) without them.
+        let slope = |a: (f64, f64), b: (f64, f64)| ((b.1 - a.1) / (b.0 - a.0)).abs();
+        let free = through_fit_points(&[(0.0, 0.0), (5.0, 5.0), (10.0, 0.0)], 3, None).unwrap_or_default();
+        assert!(slope(pts[0], pts[1]) < 0.15, "leaves along x: {:?}", &pts[..2]);
+        assert!(slope(pts[pts.len() - 2], pts[pts.len() - 1]) < 0.15, "arrives along x");
+        assert!(slope(free[0], free[1]) > 1.0, "without tangents it leaves steeply");
+        let d = pts
+            .iter()
+            .map(|q| (q.0 - 5.0).hypot(q.1 - 5.0))
+            .fold(f64::MAX, f64::min);
+        assert!(d < 0.05, "through the middle point: {d}");
+        // Two points with tangents make a curve; degree 1 is the points themselves.
+        assert!(through_fit_points(&[(0.0, 0.0), (10.0, 0.0)], 3, Some(((0.0, 1.0), (0.0, -1.0)))).is_some());
+        let corner = [(0.0, 0.0), (1.0, 1.0), (100.0, 0.0)];
+        assert_eq!(through_fit_points(&corner, 1, None), Some(corner.to_vec()));
+    }
+
+    #[test]
+    fn a_hatch_spline_edge_by_fit_points_is_a_curve_unless_one_is_not_a_number() -> Result<()> {
+        // One loop: a spline edge by fit points (0, 0), (5, 5), (10, 0), closed by a line.
+        let hatch = |mid: &str| {
+            format!(
+                "0\nHATCH\n2\nANSI31\n70\n0\n91\n1\n92\n1\n93\n2\n\
+                 72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n3\n11\n0\n21\n0\n11\n5\n21\n{mid}\n11\n10\n21\n0\n\
+                 72\n1\n10\n10\n20\n0\n11\n0\n21\n0\n97\n0\n"
+            )
+        };
+        let (g, _) = drawn(&hatch("5"), "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert!(s.len() > 10, "a curve: {s:?}");
+        // A fit point that is not a number: joined straight, not interpolated through 0.
+        let (g, _) = drawn(&hatch("NaN"), "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert!(s.len() <= 4, "straight: {s:?}");
         Ok(())
     }
 }
