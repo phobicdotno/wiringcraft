@@ -496,7 +496,7 @@ mod tests {
             title: "Parts".into(),
             columns: vec!["Order number".into(), "Description".into()],
             rows: vec![
-                vec!["0042".into(), "=SUM(A1) & <b>".into()],
+                vec!["0042".into(), "=SUM(A1) & <b>\r\n_x000D_".into()],
                 vec!["1e3".into(), String::new()],
             ],
             ..wc_report::Table::default()

@@ -142,7 +142,9 @@ fn esc(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            '\t' | '\n' | '\r' => out.push(c),
+            // XML readers turn a carriage return into a line feed: written as its escape.
+            '\r' => out.push_str("_x000D_"),
+            '\t' | '\n' => out.push(c),
             c if (c as u32) < 0x20 || c == '\u{FFFE}' || c == '\u{FFFF}' => {}
             c => out.push(c),
         }
@@ -356,6 +358,9 @@ mod tests {
     fn a_literal_spreadsheet_escape_is_written_so_it_reads_back_as_written() {
         assert_eq!(esc("part_x0041_"), "part_x005F_x0041_");
         assert_eq!(esc("a_b _x00_ _xZZZZ_"), "a_b _x00_ _xZZZZ_");
+        // A carriage return and the literal text of its escape stay apart.
+        assert_eq!(esc("a\rb"), "a_x000D_b");
+        assert_eq!(esc("a_x000D_b"), "a_x005F_x000D_b");
     }
 
     #[test]
