@@ -1113,13 +1113,36 @@ struct Form {
     browse_error: Option<String>,
     sessions: Vec<wc_share::discovery::Session>,
     error: Option<String>,
+    /// The field `error` is about.
+    error_about: ErrorAbout,
+}
+
+/// Which field of the join form an error is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ErrorAbout {
+    /// The host: it could not be reached, or it refused.
+    #[default]
+    Address,
+    /// The folder to keep the copy in.
+    Folder,
 }
 
 impl Form {
-    /// A refusal is about the address it was for: once another address is picked or typed,
-    /// it no longer applies.
-    fn forget_error_unless(&mut self, addr: &str) {
-        if self.addr != addr {
+    /// Show an error about one field.
+    fn fail(&mut self, about: ErrorAbout, error: String) {
+        self.error = Some(error);
+        self.error_about = about;
+    }
+
+    /// An error is about the field it was for: once that field is changed (another address
+    /// picked or typed, another folder typed), it no longer applies. `addr` and `folder` are
+    /// the fields as they were before this frame's edits.
+    fn forget_error_unless(&mut self, addr: &str, folder: &str) {
+        let changed = match self.error_about {
+            ErrorAbout::Address => self.addr != addr,
+            ErrorAbout::Folder => self.folder != folder,
+        };
+        if changed {
             self.error = None;
         }
     }
@@ -1150,6 +1173,7 @@ impl Default for Form {
             browse_error: None,
             sessions: Vec::new(),
             error: None,
+            error_about: ErrorAbout::Address,
         }
     }
 }
@@ -1462,7 +1486,7 @@ impl Share {
             if let Some(why) = refused {
                 self.show_join();
                 if let Some(f) = self.form.as_mut() {
-                    f.error = Some(why);
+                    f.fail(ErrorAbout::Address, why);
                 }
             }
             return None;
@@ -1809,7 +1833,7 @@ impl Share {
                         None => "None found yet. Over a VPN, type the host's address below.".into(),
                     });
                 }
-                let typed = form.addr.clone();
+                let typed = (form.addr.clone(), form.folder.clone());
                 for s in &form.sessions {
                     let (label, joinable) = session_row(s);
                     // A session on another version cannot be joined, so it cannot be picked either.
@@ -1833,7 +1857,7 @@ impl Share {
                     ui.text_edit_singleline(&mut form.folder);
                     ui.end_row();
                 });
-                form.forget_error_unless(&typed);
+                form.forget_error_unless(&typed.0, &typed.1);
                 if let Some(e) = &form.error {
                     ui.colored_label(ui.visuals().error_fg_color, e);
                 }
@@ -1843,8 +1867,12 @@ impl Share {
             });
         if join {
             let (addr, name, email) = (form.addr.clone(), form.name.clone(), form.email.clone());
-            let joined =
-                crate::prefs::project_path(&form.folder).and_then(|folder| self.join(&addr, &name, &email, folder));
+            let joined = crate::prefs::project_path(&form.folder)
+                .map_err(|e| (ErrorAbout::Folder, e))
+                .and_then(|folder| {
+                    self.join(&addr, &name, &email, folder)
+                        .map_err(|e| (ErrorAbout::Address, e))
+                });
             match joined {
                 Ok(()) => {
                     if let Some(f) = self.form.as_mut() {
@@ -1852,9 +1880,9 @@ impl Share {
                     }
                     self.view = View::Status;
                 }
-                Err(e) => {
+                Err((about, e)) => {
                     if let Some(f) = self.form.as_mut() {
-                        f.error = Some(e);
+                        f.fail(about, e);
                     }
                 }
             }

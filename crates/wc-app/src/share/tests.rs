@@ -1834,8 +1834,57 @@ fn a_session_on_another_version_is_listed_as_such_and_cannot_be_picked() {
     assert_eq!(label, "Pump station  ·  Ola  (192.168.1.20:47812)");
     let (label, joinable) = session_row(&row(0));
     assert!(!joinable);
-    assert!(label.contains("version 0, this one uses"), "{label}");
+    assert!(
+        label.contains(&format!("version 0, this one uses {};", wc_share::PROTOCOL_VERSION)),
+        "{label}"
+    );
     assert!(label.contains("cannot be joined"), "{label}");
+}
+
+#[test]
+fn a_session_on_another_version_cannot_be_picked_in_the_join_dialog() {
+    let row = |protocol, last| wc_share::discovery::Session {
+        project: "Pump station".into(),
+        host: "Ola".into(),
+        addr: ([192, 168, 1, last], 47812).into(),
+        protocol,
+    };
+    let mut s = Share {
+        form: Some(Form {
+            addr: String::new(),
+            sessions: vec![row(0, 20), row(wc_share::PROTOCOL_VERSION, 21)],
+            ..Form::default()
+        }),
+        view: View::Join,
+        ..Default::default()
+    };
+    let ctx = egui::Context::default();
+    let frame = |s: &mut Share, events: Vec<egui::Event>| {
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| s.join_window(ctx));
+    };
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    };
+    let addr = |s: &Share| s.form.as_ref().map(|f| f.addr.clone()).unwrap_or_default();
+    frame(&mut s, Vec::new());
+    // Step through the dialog with the keyboard and pick the first row that takes it: the
+    // older session's row comes first but cannot be focused or picked.
+    for _ in 0..8 {
+        frame(&mut s, vec![key(egui::Key::Tab)]);
+        frame(&mut s, vec![key(egui::Key::Space)]);
+        if !addr(&s).is_empty() {
+            break;
+        }
+    }
+    assert_eq!(addr(&s), "192.168.1.21:47812");
 }
 
 #[test]
@@ -1845,9 +1894,27 @@ fn a_refusal_is_forgotten_once_another_address_is_chosen() {
         error: Some("The host declined your request to join.".into()),
         ..Form::default()
     };
-    form.forget_error_unless("192.168.1.20:47812");
+    let folder = form.folder.clone();
+    form.forget_error_unless("192.168.1.20:47812", &folder);
     assert!(form.error.is_some(), "same address: still shown");
     form.addr = "192.168.1.21:47812".into();
-    form.forget_error_unless("192.168.1.20:47812");
+    form.forget_error_unless("192.168.1.20:47812", &folder);
+    assert!(form.error.is_none());
+}
+
+#[test]
+fn a_folder_error_stays_until_the_folder_changes() {
+    let mut form = Form {
+        addr: "192.168.1.20:47812".into(),
+        folder: "~x".into(),
+        ..Form::default()
+    };
+    form.fail(ErrorAbout::Folder, "That folder cannot be used.".into());
+    // Another address does not make the folder usable.
+    form.addr = "192.168.1.21:47812".into();
+    form.forget_error_unless("192.168.1.20:47812", "~x");
+    assert!(form.error.is_some(), "the folder is still the same");
+    form.folder = "/tmp/shared".into();
+    form.forget_error_unless("192.168.1.21:47812", "~x");
     assert!(form.error.is_none());
 }
