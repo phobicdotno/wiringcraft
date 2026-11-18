@@ -101,7 +101,40 @@ fn a_macro_is_placed_with_the_chosen_value_set() -> TestResult {
     )?;
     assert_eq!(ids.trim(), "s2 w2");
 
+    // The file name works too, and a pinned symbol whose copy is gone comes back only in its
+    // pinned version.
+    let pin = wc_core::store::load(&dir)?
+        .lock
+        .symbols
+        .get("wc.coil")
+        .cloned()
+        .ok_or("pinned")?;
+    let copy = wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Symbol, "wc.coil")?;
+    std::fs::remove_file(&copy)?;
+    let original = std::fs::read_to_string(lib.join("symbols/wc.coil.json"))?;
+    let mut newer: serde_json::Value = serde_json::from_str(&original)?;
+    newer["description"] = "A newer coil".into();
+    std::fs::write(lib.join("symbols/wc.coil.json"), newer.to_string())?;
+    let Err(err) = wiringcraft(
+        &dir,
+        &["macro", "place", "p1", "starter.json", "--at", "0,0", "--set", "3 kW"],
+    ) else {
+        return Err("placed with a newer version of a pinned symbol".into());
+    };
+    assert!(err.contains("no library has the version the project pins"), "{err}");
+    std::fs::write(lib.join("symbols/wc.coil.json"), &original)?;
+    let ids = wiringcraft(
+        &dir,
+        &["macro", "place", "p1", "starter.json", "--at", "0,0", "--set", "3 kW"],
+    )?;
+    assert_eq!(ids.trim(), "s3 w3");
+    assert!(copy.exists(), "the pinned copy is put back");
     let p = wc_core::store::load(&dir)?;
+    assert_eq!(p.lock.symbols.get("wc.coil"), Some(&pin), "the pin is kept");
+    let page = p.page("p1").ok_or("page")?;
+    let s3 = page.symbol("s3").ok_or("s3")?;
+    assert_eq!((s3.at.x, s3.at.y), (10.0, 20.0));
+
     let page = p.page("p1").ok_or("page")?;
     let device = |id: &str| -> Result<wc_core::Device, String> {
         let tag = page.symbol(id).and_then(|s| s.tag.clone()).ok_or("tag")?;
@@ -113,7 +146,7 @@ fn a_macro_is_placed_with_the_chosen_value_set() -> TestResult {
     assert_eq!(small.description, "Starter 0.8 kW", "the typed value wins");
     assert_eq!(small.part.as_deref(), Some("SIE.3RV2011-1AA10"));
     let sections: Vec<Option<&str>> = page.wires.iter().map(|w| w.spec.section.as_deref()).collect();
-    assert_eq!(sections, [Some("2.5 mm²"), Some("1.5 mm²")]);
+    assert_eq!(sections, [Some("2.5 mm²"), Some("1.5 mm²"), Some("2.5 mm²")]);
     let s2 = page.symbol("s2").ok_or("s2")?;
     assert_eq!((s2.at.x, s2.at.y), (100.0, 80.0));
     Ok(())

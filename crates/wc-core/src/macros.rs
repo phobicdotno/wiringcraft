@@ -283,7 +283,10 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
             };
             s.tag = Some(t);
         }
-        let p = &mut project.pages[index];
+        let p = project
+            .pages
+            .get_mut(index)
+            .ok_or_else(|| Error::Invalid(format!("no page {page}")))?;
         let id = p.next_id("s");
         ids.insert(s.id.clone(), id.clone());
         s.id = id.clone();
@@ -291,7 +294,10 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
         p.symbols.push(s);
         out.push(id);
     }
-    let p = &mut project.pages[index];
+    let p = project
+        .pages
+        .get_mut(index)
+        .ok_or_else(|| Error::Invalid(format!("no page {page}")))?;
     for w in &m.wires {
         let mut w = w.clone();
         w.id = p.next_id("w");

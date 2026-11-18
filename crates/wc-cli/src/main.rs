@@ -1387,8 +1387,10 @@ fn run(cli: Cli) -> Res<()> {
                 .into_iter()
                 .map(|(id, path)| ("project".to_owned(), id, path))
                 .collect();
-            if let Ok(lib) = wc_library::Library::open(dir, &p) {
-                found.extend(lib.macros());
+            // A library that cannot be opened is reported; the project's macros stay usable.
+            match wc_library::Library::open(dir, &p) {
+                Ok(lib) => found.extend(lib.macros()),
+                Err(err) => eprintln!("warning: the library's macros are not listed: {err}"),
             }
             match mc {
                 MacroCmd::List => {
@@ -1416,8 +1418,10 @@ fn run(cli: Cli) -> Res<()> {
                     values,
                 } => {
                     let mut wanted = None;
+                    let file = name.trim();
+                    let file = file.strip_suffix(".json").unwrap_or(file);
                     for (_, id, path) in &found {
-                        if id.eq_ignore_ascii_case(&name) {
+                        if id.eq_ignore_ascii_case(file) {
                             wanted = Some(path.clone());
                             break;
                         }
@@ -1438,16 +1442,43 @@ fn run(cli: Cli) -> Res<()> {
                     let m = wc_core::macros::read_macro(&path)
                         .and_then(|m| m.apply(set.as_deref(), &typed))
                         .map_err(e)?;
+                    // A pinned symbol keeps its pinned version: a missing copy is put back from
+                    // a library that still has that version, never from a newer one. A symbol
+                    // without a pin is taken from the library and pinned, also when a copy is
+                    // left from an earlier attempt that failed before it was pinned.
                     let symbols: std::collections::BTreeSet<&str> =
                         m.symbols.iter().map(|s| s.symbol.as_str()).collect();
-                    let missing: Vec<&str> = symbols
-                        .into_iter()
-                        .filter(|id| store::read_vendored_symbol(dir, id).is_err())
-                        .collect();
-                    if !missing.is_empty() {
-                        let lib = wc_library::Library::open(dir, &p).map_err(e)?;
-                        for id in missing {
-                            wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(e)?;
+                    let mut lib = None;
+                    for id in symbols {
+                        let lib = match &lib {
+                            Some(lib) => lib,
+                            None => lib.insert(wc_library::Library::open(dir, &p).map_err(e)?),
+                        };
+                        match p.lock.symbols.get(id).cloned() {
+                            Some(pin) => {
+                                let vendored = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
+                                if vendored.exists() {
+                                    continue;
+                                }
+                                let fits = |s: &wc_core::Symbol| {
+                                    if s.id != id {
+                                        Err(format!("its file holds {}", s.id))
+                                    } else if s.hash() != pin.hash {
+                                        Err("another version".to_owned())
+                                    } else {
+                                        Ok(())
+                                    }
+                                };
+                                let s = lib.find_version(ItemKind::Symbol, id, &pin.source, fits).map_err(|why| {
+                                    format!(
+                                        "symbol {id}: its copy in the project is missing and no library has the version the project pins ({why})"
+                                    )
+                                })?;
+                                store::write_vendored_symbol(dir, &s).map_err(e)?;
+                            }
+                            None => {
+                                wc_library::take(dir, &mut p, lib, ItemKind::Symbol, id).map_err(e)?;
+                            }
                         }
                     }
                     let page_id = page_mut(&mut p, &page)?.id.clone();
