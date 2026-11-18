@@ -578,7 +578,10 @@ mod tests {
         assert!(points.iter().all(|p| p.y < 20.0 - SCALLOP / 2.0));
         assert!(points.iter().all(|p| (p.x - 40.0).abs() <= TAG_SIZE / 2.0 + 1e-9));
         assert!(c.hit(Point::new(40.0, 14.0), 0.5), "on the tag");
-        assert!(c.hit(Point::new(25.0, 20.0), 0.5), "on the top side");
+        // The top side has five scallops of 3 mm radius, centred at x = 13, 19, 25, ...
+        assert!(c.hit(Point::new(25.0, 17.0), 0.5), "on the top of a scallop");
+        assert!(c.hit(Point::new(22.0, 20.0), 0.5), "where two scallops meet");
+        assert!(!c.hit(Point::new(25.0, 20.0), 0.5), "under a scallop, off the outline");
         assert!(!c.hit(Point::new(25.0, 26.0), 0.5), "inside the area");
         assert!(!c.hit(Point::new(80.0, 26.0), 0.5), "far off");
     }

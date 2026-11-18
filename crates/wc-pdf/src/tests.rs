@@ -1491,9 +1491,12 @@ fn revision_clouds_and_the_revision_table_are_drawn() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     // Without the table, only the cloud's tag can print its revision letter.
     let tag = format!("{} Tj", writer::pdf_text("B"));
-    assert!(!plain.contains(&tag));
     let cloud_only = String::from_utf8_lossy(&export(&project, &BTreeMap::new(), &Options::default()).0).into_owned();
-    assert!(cloud_only.contains(&tag), "the cloud's tag prints B");
+    assert_eq!(
+        cloud_only.matches(&tag).count(),
+        plain.matches(&tag).count() + 1,
+        "the cloud's tag prints B"
+    );
     project
         .set_revision_table("p1", Some(Point::new(200.0, 30.0)))
         .map_err(|e| e.to_string())?;
