@@ -62,9 +62,10 @@ pub struct Drawing {
     pub model_points: Vec<Point>,
     /// How many of each kind of entity or object were not read, by type name.
     pub skipped: BTreeMap<String, usize>,
-    /// Why objects counted under [`DAMAGED`] could not be decoded (handle, offset and reason),
-    /// then why base points counted under [`BASE_UNREAD`] could not be read, for the first
-    /// [`MAX_REASONS`] of them.
+    /// Why the class section could not be read when it is counted under [`CLASSES_DAMAGED`]
+    /// (always first), then why objects counted under [`DAMAGED`] could not be decoded (handle,
+    /// offset and reason), then why base points counted under [`BASE_UNREAD`] could not be
+    /// read, for the first [`MAX_REASONS`] of them.
     pub damaged: Vec<String>,
     /// Notes about the file as a whole, such as a code page its texts cannot be decoded in.
     pub warnings: Vec<String>,
@@ -120,6 +121,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
 pub(crate) struct Read {
     pub(crate) drawing: dxf::Drawing,
     pub(crate) skipped: BTreeMap<String, usize>,
+    /// As [`Drawing::damaged`]: the class section's reason first when it is damaged.
     pub(crate) damaged: Vec<String>,
     /// Notes about the file as a whole (an unknown code page).
     pub(crate) warnings: Vec<String>,

@@ -1057,6 +1057,11 @@ pub(crate) enum TestEntity {
 
 /// An AutoCAD 2010 drawing whose model space holds `items`, for tests elsewhere in the crate.
 pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
+    model_space_dwg_with_classes(items, None)
+}
+
+/// [`model_space_dwg`] with an `AcDb:Classes` section holding `classes` as given.
+pub(crate) fn model_space_dwg_with_classes(items: &[TestEntity], classes: Option<Vec<u8>>) -> Vec<u8> {
     const FRAME_H: u64 = 0x22;
     let v = Version::R2010;
     let model = head(None);
@@ -1113,21 +1118,26 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
     let (_, objects) = sections_bytes(&objs, &[]);
     let past_end: Vec<(u64, usize)> = damaged.iter().map(|&h| (h, objects.len() + 10)).collect();
     let (map, objects) = sections_bytes(&objs, &past_end);
-    write_dwg(
-        b"AC1024",
-        &[
-            TestSection {
-                name: "AcDb:AcDbObjects",
-                data: objects,
-                ..Default::default()
-            },
-            TestSection {
-                name: "AcDb:Handles",
-                data: map,
-                ..Default::default()
-            },
-        ],
-    )
+    let mut sections = vec![
+        TestSection {
+            name: "AcDb:AcDbObjects",
+            data: objects,
+            ..Default::default()
+        },
+        TestSection {
+            name: "AcDb:Handles",
+            data: map,
+            ..Default::default()
+        },
+    ];
+    if let Some(data) = classes {
+        sections.push(TestSection {
+            name: "AcDb:Classes",
+            data,
+            ..Default::default()
+        });
+    }
+    write_dwg(b"AC1024", &sections)
 }
 
 /// A BLOCK_HEADER with every field up to its base point; an xref has no owned-object count.
@@ -2033,6 +2043,12 @@ fn classes_section_max(v: Version, max: u16, classes: &[(u16, &str, bool)]) -> V
 
 /// [`classes_section_max`] with each class's item class id given as written.
 fn classes_section_ids(v: Version, max: u16, classes: &[(u16, &str, u16)]) -> Vec<u8> {
+    classes_section_layout(v, true, max, classes)
+}
+
+/// [`classes_section_ids`] with or without the second size field a 2010 drawing of
+/// maintenance release 4 and later has (`second`; ignored for 2004).
+fn classes_section_layout(v: Version, second: bool, max: u16, classes: &[(u16, &str, u16)]) -> Vec<u8> {
     const SENTINEL: [u8; 16] = [
         0x8D, 0xA1, 0xC4, 0xB8, 0xC4, 0xA9, 0xF8, 0xC5, 0xC0, 0xDC, 0xF4, 0x5F, 0xE7, 0xCF, 0xB6, 0x8A,
     ];
@@ -2061,16 +2077,19 @@ fn classes_section_ids(v: Version, max: u16, classes: &[(u16, &str, u16)]) -> Ve
             out.rl(data.bytes().len() as u32).append(&data);
         }
         Version::R2010 => {
-            // Data, texts, their size and the flag; the flag sits `bitsize` after bit 191.
+            // Data, texts, their size and the flag; the flag sits `bitsize` after bit 191, or
+            // after bit 159 without the second size.
             let mut body = W::default();
             body.append(&data).append(&strings);
             body.rs(strings.0.len() as u16).b(true);
-            let flag_at = 28 * 8 + body.0.len() - 1;
+            let head = if second { 28 } else { 24 };
+            let flag_at = head * 8 + body.0.len() - 1;
             // As real files: the size covers the bit size field, the data and the texts.
-            out.rl(body.bytes().len() as u32 + 4)
-                .rl(0)
-                .rl((flag_at - 191) as u32)
-                .append(&body);
+            out.rl(body.bytes().len() as u32 + 4);
+            if second {
+                out.rl(0);
+            }
+            out.rl((flag_at - (head * 8 - 33)) as u32).append(&body);
         }
     }
     // A CRC and the closing sentinel after the class data area.
@@ -2082,13 +2101,18 @@ fn classes_section_ids(v: Version, max: u16, classes: &[(u16, &str, u16)]) -> Ve
 
 /// `sections` plus a class section, maintenance release 6.
 fn sections_with_classes(v: Version, objs: &[Obj], classes: Vec<u8>) -> Sections {
+    sections_with_classes_maint(v, objs, classes, 6)
+}
+
+/// [`sections_with_classes`] of maintenance release `maint`.
+fn sections_with_classes_maint(v: Version, objs: &[Obj], classes: Vec<u8>, maint: u8) -> Sections {
     let mut s = sections(v, objs, &[]);
     s.sections.push(Section {
         name: "AcDb:Classes".into(),
         id: 3,
         data: classes,
     });
-    s.maint = 6;
+    s.maint = maint;
     s
 }
 
@@ -2116,6 +2140,39 @@ fn cyrillic_2004(codepage: u16) -> Sections {
     let mut s = sections(v, &objs, &[]);
     s.codepage = codepage;
     s
+}
+
+#[test]
+fn a_2010_class_section_of_release_3_has_no_second_size() -> TestResult {
+    // Releases 0 to 3: the bit size follows the first size, the flag sits `bitsize` after bit 159.
+    let v = Version::R2010;
+    let ids = [(500, "WIPEOUT", 0x1F2), (501, "ACDBDICTIONARYWDFLT", 0x1F3)];
+    let mut wipeout = entity(v, 500, 0x300, head(None));
+    wipeout.data.bd(0.0);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        wipeout,
+        Obj::new(v, 501, 0x301),
+    ];
+    for maint in [0, 3] {
+        let classes = classes_section_layout(v, false, 501, &ids);
+        let d = drawing(&sections_with_classes_maint(v, &objs, classes, maint))?;
+        assert_eq!(
+            d.skipped.get("WIPEOUT"),
+            Some(&1),
+            "{maint}: {:?} {:?}",
+            d.skipped,
+            d.damaged
+        );
+        assert_eq!(d.skipped.len(), 1, "{maint}: {:?}", d.skipped);
+        assert!(d.damaged.is_empty(), "{maint}: {:?}", d.damaged);
+    }
+    // The same section read as release 4 looks for a second size that is not there.
+    let classes = classes_section_layout(v, false, 501, &ids);
+    let d = drawing(&sections_with_classes_maint(v, &objs, classes, 4))?;
+    assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{:?}", d.skipped);
+    Ok(())
 }
 
 #[test]
