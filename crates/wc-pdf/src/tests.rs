@@ -1184,3 +1184,33 @@ fn portrait_large_and_custom_sheets_export_at_their_size() {
         assert!(svg(page).contains(&format!("viewBox=\"0 0 {w} {h}\"")), "{size:?}");
     }
 }
+
+#[test]
+fn report_pages_move_to_a_larger_sheet_when_the_first_page_is_too_short() {
+    let short = PageSize::Custom {
+        width: 300,
+        height: 100,
+    };
+    // Room for a few rows under the usual title block: the report keeps the sheet.
+    assert_eq!(layout::report_size(short, 30.0), short);
+    // A 60 mm title block leaves no row on it: the smallest ISO sheet with room is used.
+    assert_eq!(layout::report_size(short, 60.0), PageSize::A4);
+    assert_eq!(layout::report_size(PageSize::A3, 60.0), PageSize::A3);
+}
+
+#[test]
+fn an_upright_a1_page_prints_on_an_upright_a1_sheet() {
+    let mut project = Project::new("x");
+    let mut page = Page::new("p1", "1", "Sheet");
+    page.size = PageSize::A1Portrait;
+    page.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    project.pages = vec![page];
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let (pdf, _) = export(&project, &symbols, &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(
+        text.contains("/MediaBox [0 0 1683.78 2383.94]"),
+        "upright A1 is 594 x 841 mm"
+    );
+}

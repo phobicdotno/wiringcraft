@@ -865,9 +865,24 @@ const CELL_PAD: f64 = 1.5;
 /// How many table rows fit on one report page of this size (below the heading and header row),
 /// above a title block band `band` mm high.
 pub fn rows_per_page(size: PageSize, band: f64) -> usize {
+    (report_rows(size, band).floor() as usize).max(1)
+}
+
+/// How many table rows the sheet height leaves room for, before rounding down.
+fn report_rows(size: PageSize, band: f64) -> f64 {
     let (_, h) = size.mm();
     let usable = h - 2.0 * MARGIN - HEADER - band - 14.0 - ROW_H;
-    ((usable / ROW_H).floor() as usize).max(1)
+    usable / ROW_H
+}
+
+/// The sheet report pages are printed on: `wanted` (the first schematic page's size) when it
+/// has room for its title block and at least one table row, otherwise the smallest ISO sheet
+/// that does (A3 when none does).
+pub fn report_size(wanted: PageSize, band: f64) -> PageSize {
+    std::iter::once(wanted)
+        .chain(PageSize::NAMED)
+        .find(|s| report_rows(*s, band) >= 1.0)
+        .unwrap_or(PageSize::A3)
 }
 
 /// Column widths for a table that must fit `avail` mm: natural widths, shrunk proportionally

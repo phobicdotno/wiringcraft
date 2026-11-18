@@ -1479,6 +1479,7 @@ mod tests {
         };
         let old = serde_json::to_value(page(PageSize::A2)).unwrap();
         assert_eq!(old["size"], "A2");
+        assert_eq!(serde_json::from_value::<Page>(old).unwrap().size, PageSize::A2);
         for size in [
             PageSize::A0Portrait,
             PageSize::Custom {
