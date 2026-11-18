@@ -1122,12 +1122,15 @@ fn run(cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
+            let pictures = wc_pdf::read_pictures(dir, &p);
             let (drawings, report) = wc_pdf::page_drawings(
                 &p,
                 &symbols,
                 &wc_pdf::Options {
                     pages,
                     date,
+                    underlays: pictures.files,
+                    unreadable: pictures.unreadable,
                     ..Default::default()
                 },
             );
