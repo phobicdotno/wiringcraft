@@ -1477,5 +1477,53 @@ fn an_ellipse_not_a_number_and_a_spline_short_of_knots_are_damaged() -> TestResu
         "{:?}",
         d.damaged
     );
+    // A z that is not a number, 4 knots for a non-periodic quadratic over 3 points, and
+    // decreasing knots: each damaged.
+    let mut el = entity(v, 35, 0x302, model);
+    el.data
+        .bd3((0.0, 0.0, f64::NAN))
+        .bd3((10.0, 0.0, 0.0))
+        .bd3((0.0, 0.0, 1.0))
+        .bd(0.5)
+        .bd(0.0)
+        .bd(1.0);
+    let spline = |h: u64, knots: &[f64]| {
+        let mut sp = entity(v, 36, h, model);
+        sp.data
+            .bl(1)
+            .bl(2)
+            .b(false)
+            .b(false)
+            .b(false)
+            .bd(0.0)
+            .bd(0.0)
+            .bl(knots.len() as u32)
+            .bl(3)
+            .b(false);
+        for k in knots {
+            sp.data.bd(*k);
+        }
+        for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
+            sp.data.bd3(p);
+        }
+        sp
+    };
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        el,
+        spline(0x303, &[0.0, 0.0, 1.0, 1.0]),
+        spline(0x304, &[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]),
+        spline(0x305, &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&3), "{:?}", d.skipped);
+    assert!(d.damaged.iter().any(|r| r.contains("4 knots for 3")), "{:?}", d.damaged);
+    assert!(
+        d.damaged.iter().any(|r| r.contains("not numbers in order")),
+        "{:?}",
+        d.damaged
+    );
+    assert_eq!(d.model.len(), 1, "the good quadratic is drawn: {:?}", d.model);
     Ok(())
 }

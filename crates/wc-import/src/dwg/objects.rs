@@ -432,12 +432,15 @@ fn block_base(o: &mut Object) -> Result<(f64, f64)> {
 /// parameters (radians, as in DXF).
 fn ellipse(o: &mut Object, e: &mut Codes) -> Result<()> {
     let d = &mut o.data;
-    let (cx, cy, _) = d.bd3()?;
-    let (mx, my, _) = d.bd3()?;
-    let (_, _, z) = d.bd3()?;
+    let (cx, cy, cz) = d.bd3()?;
+    let (mx, my, mz) = d.bd3()?;
+    let (ex, ey, z) = d.bd3()?;
     let ratio = d.bd()?;
     let (start, end) = (d.bd()?, d.bd()?);
-    if ![cx, cy, mx, my, z, ratio, start, end].iter().all(|v| v.is_finite()) {
+    if ![cx, cy, cz, mx, my, mz, ex, ey, z, ratio, start, end]
+        .iter()
+        .all(|v| v.is_finite())
+    {
         return Err(bad("an ellipse has a value that is not a number"));
     }
     e.f(10, cx).f(20, cy).f(11, mx).f(21, my).f(230, z);
@@ -469,20 +472,30 @@ fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
         let d = &mut o.data;
         let _rational = d.b()?;
         let closed = d.b()?;
-        let _periodic = d.b()?;
+        let periodic = d.b()?;
         d.bd()?;
         d.bd()?;
         let knots = spline_count(o, "knots")?;
         let points = spline_count(o, "control points")?;
         let weighted = o.data.b()?;
-        // A curve of degree d over n control points needs n + d + 1 knots; fewer than n + 1
-        // fits no encoding (a periodic one may list fewer than n + d + 1).
-        if knots < points.saturating_add(1) {
-            return Err(bad(format!("a spline lists {knots} knots for {points} control points")));
+        // A curve of degree d over n control points needs n + d + 1 knots; a periodic one may
+        // list fewer, but never fewer than n + 1.
+        let full = points.saturating_add(degree).saturating_add(1);
+        if knots < points.saturating_add(1) || (!periodic && knots != full) {
+            return Err(bad(format!(
+                "a spline of degree {degree} lists {knots} knots for {points} control points"
+            )));
         }
         e.i(70, i64::from(closed)).i(71, i64::from(degree));
+        let mut last = f64::NEG_INFINITY;
         for _ in 0..knots {
-            e.f(40, o.data.bd()?);
+            let k = o.data.bd()?;
+            // Knots are numbers that never decrease (repeats are fine).
+            if !k.is_finite() || k < last {
+                return Err(bad("a spline's knots are not numbers in order"));
+            }
+            last = k;
+            e.f(40, k);
         }
         for _ in 0..points {
             let (x, y, _) = o.data.bd3()?;
