@@ -2163,6 +2163,31 @@ mod tests {
             String::from_utf8_lossy(&pdf).matches(" c\n").count()
         };
         assert_eq!(curves(&back), curves(&bare) + 3, "260° in three curves in the PDF");
+
+        // A full turn backwards (720° to 0°) is a circle in the SVG and DXF.
+        back.pages[0].graphics = vec![Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 0.0,
+        }];
+        let (full_pages, _) = wc_pdf::page_drawings(&back, &again.symbols, &wc_pdf::Options::default());
+        assert!(wc_pdf::svg(&full_pages[0]).contains("<circle"), "a circle in the SVG");
+        let count = |d: &str, kind: &str| d.lines().filter(|l| l.trim() == kind).count();
+        let full_dxf = wc_pdf::dxf(&full_pages[0]);
+        assert_eq!(
+            count(&full_dxf, "CIRCLE"),
+            count(&bare_dxf, "CIRCLE") + 1,
+            "a circle in the DXF"
+        );
+        // Angles stored far out draw one turn at most: a circle's four curves, not millions.
+        back.pages[0].graphics = vec![Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 1e9,
+            end: 0.0,
+        }];
+        assert!(curves(&back) <= curves(&bare) + 4, "at most a full turn in the PDF");
     }
 
     #[test]
