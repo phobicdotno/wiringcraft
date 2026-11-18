@@ -2221,6 +2221,223 @@ fn guests_get_the_symbol_files_and_symbols_added_during_the_session() -> TestRes
 }
 
 #[test]
+fn undoing_an_added_item_takes_back_its_lock_entry() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    let (_b, link_b, mut b) = s.join("Kari")?;
+    let coil = symbol("coil", "Coil");
+    let part = wc_core::Part {
+        id: "acme.coil".into(),
+        ..Default::default()
+    };
+    link_a.send(a.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(coil.clone(), "starter".into())],
+        parts: vec![(part.clone(), "acme".into())],
+    }))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(s.host.project().lock.symbols.contains_key("coil"));
+
+    // Undo takes the lock entries back on the host and on every copy.
+    link_a.send(GuestMsg::Undo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    for lock in [
+        Some(&s.host.project().lock),
+        a.project.as_ref().map(|p| &p.lock),
+        b.project.as_ref().map(|p| &p.lock),
+    ] {
+        let lock = lock.ok_or("project")?;
+        assert!(!lock.symbols.contains_key("coil"));
+        assert!(!lock.parts.contains_key("acme.coil"));
+    }
+    // The file stays, so a redo can lock it again.
+    assert_eq!(s.host.files().0.get("coil"), Some(&coil));
+
+    // Redo brings them back everywhere.
+    link_a.send(GuestMsg::Redo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert_eq!(
+        s.host.project().lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(coil.hash())
+    );
+    assert!(s.host.project().lock.parts.contains_key("acme.coil"));
+    for g in [&a, &b] {
+        assert_eq!(g.project.as_ref().map(|p| &p.lock), Some(&s.host.project().lock));
+    }
+
+    // Once a page places the symbol, taking its lock entry back is refused: the undo of the
+    // added item (reached through "Undo this change") would leave the page without it.
+    let added = s
+        .host
+        .history()
+        .iter()
+        .rev()
+        .find(|c| c.message.starts_with("Redo"))
+        .map(|c| c.id)
+        .ok_or("redo")?;
+    link_b.send(b.open(Some("p0002")))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let mut page = b
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place(&mut page, "s1", 10.0);
+    link_b.send(b.edit_page(page).ok_or("lock")?)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let changes = s.log.0.borrow().len();
+    link_a.send(GuestMsg::Revert { change: added })?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert_eq!(s.log.0.borrow().len(), changes);
+    let refused = a.refusals.last().map(ToString::to_string).unwrap_or_default();
+    assert!(refused.contains("would use symbol coil"), "{refused}");
+    assert!(s.host.project().lock.symbols.contains_key("coil"));
+    Ok(())
+}
+
+#[test]
+fn a_redo_is_refused_once_the_session_has_another_version_of_the_item() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    let (_b, link_b, mut b) = s.join("Kari")?;
+    let add = |name: &str| ProjectEdit::AddItems {
+        symbols: vec![(symbol("coil", name), "starter".into())],
+        parts: vec![],
+    };
+    // Ola adds coil and undoes it; Kari then uses coil in another version and undoes that.
+    link_a.send(a.edit_project(add("Coil")))?;
+    link_a.send(GuestMsg::Undo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    link_b.send(b.edit_project(add("Other coil")))?;
+    link_b.send(GuestMsg::Undo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(b.refusals.is_empty(), "{:?}", b.refusals);
+    assert_eq!(s.host.files().0.get("coil"), Some(&symbol("coil", "Other coil")));
+    // Ola's redo would lock the first version, whose file the session no longer has.
+    let changes = s.log.0.borrow().len();
+    link_a.send(GuestMsg::Redo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let refused = a.refusals.last().map(ToString::to_string).unwrap_or_default();
+    assert!(
+        refused.contains("no longer has that version of symbol coil"),
+        "{refused}"
+    );
+    assert_eq!(s.log.0.borrow().len(), changes);
+    assert!(!s.host.project().lock.symbols.contains_key("coil"));
+    Ok(())
+}
+
+#[test]
+fn bringing_back_a_page_that_uses_a_symbol_taken_back_since_is_refused() -> TestResult {
+    let mut s = Session::new();
+    s.host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(symbol("coil", "Coil"), "starter".into())],
+        parts: vec![],
+    })?;
+    let added = s.host.history().last().map(|c| c.id).ok_or("added")?;
+    s.host.open(Some("p0003"))?;
+    let mut page = s.host.project().page("p0003").cloned().ok_or("page")?;
+    place(&mut page, "s1", 10.0);
+    s.host.edit_page(page)?;
+    s.host.open(None)?;
+    s.host.edit_project(ProjectEdit::RemovePage { id: "p0003".into() })?;
+    let removed = s.host.history().last().map(|c| c.id).ok_or("removed")?;
+    // With the page gone nothing uses the coil, so its adding can be taken back.
+    s.host.revert(added)?;
+    assert!(!s.host.project().lock.symbols.contains_key("coil"));
+    // Bringing the page back would place a symbol the project no longer locks.
+    let changes = s.log.0.borrow().len();
+    let refused = s.host.revert(removed);
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { reason }) if reason.contains("would use symbol coil")),
+        "{refused:?}"
+    );
+    assert!(s.host.project().page("p0003").is_none());
+    assert_eq!(s.log.0.borrow().len(), changes);
+    Ok(())
+}
+
+/// Records everything; storing item files fails while `fail` is set.
+struct NoVendor {
+    fail: Rc<RefCell<bool>>,
+    log: Shared,
+}
+
+impl Journal for NoVendor {
+    fn record(&mut self, project: &Project, change: &Change) -> Result<()> {
+        self.log.record(project, change)
+    }
+
+    fn vendor(&mut self, _symbols: &[wc_core::Symbol], _parts: &[wc_core::Part]) -> Result<()> {
+        if *self.fail.borrow() {
+            Err(Error::Closed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn an_item_file_that_cannot_be_stored_is_reported_to_the_host() -> TestResult {
+    let fail = Rc::new(RefCell::new(false));
+    let journal = NoVendor {
+        fail: fail.clone(),
+        log: Shared::default(),
+    };
+    let mut host = Host::new(demo(), "Hanna Host", "h@x.no", Box::new(journal));
+    let add = ProjectEdit::AddItems {
+        symbols: vec![(symbol("coil", "Coil"), "starter".into())],
+        parts: vec![],
+    };
+    *fail.borrow_mut() = true;
+    assert!(matches!(
+        host.edit_project(add.clone()),
+        Err(Refusal::NotRecorded { .. })
+    ));
+    let errors = host.take_journal_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].0.message, "Add coil to the project");
+    // The same for a redo that has to store the file again.
+    *fail.borrow_mut() = false;
+    host.edit_project(add)?;
+    host.undo()?;
+    *fail.borrow_mut() = true;
+    assert!(matches!(host.redo(), Err(Refusal::NotRecorded { .. })));
+    let errors = host.take_journal_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].0.message.starts_with("Redo"), "{errors:?}");
+    assert!(!host.project().lock.symbols.contains_key("coil"));
+    Ok(())
+}
+
+#[test]
+fn a_redo_writes_the_item_file_as_the_session_has_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let journal = GitJournal::open(dir)?;
+    journal.git().commit("Start")?;
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(journal));
+    let lamp = symbol("lamp", "Lamp");
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(lamp.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.undo()?;
+    // A change that was not recorded left another version of the file behind.
+    store::write_vendored_symbol(dir, &symbol("lamp", "Other lamp"))?;
+    host.redo()?;
+    assert_eq!(store::read_vendored_symbol(dir, "lamp")?, lamp);
+    assert_eq!(
+        store::load(dir)?.lock.symbols.get("lamp").map(|e| e.hash.clone()),
+        Some(lamp.hash())
+    );
+    Ok(())
+}
+
+#[test]
 fn added_symbols_are_committed_with_their_files() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path();
