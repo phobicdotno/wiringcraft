@@ -453,7 +453,7 @@ fn paint_frame(p: &egui::Painter, xf: &Xf, open: &Open, page: &Page, c: Color32,
     let idx = open.project.pages.iter().position(|q| q.id == page.id).unwrap_or(0);
     for m in wc_pdf::frame_marks(&open.project, page, idx, total, "") {
         // A title-block value too small to read at this zoom still shows that it is there.
-        if let Some((a, b)) = value_placeholder(&m, page.size.mm(), xf.zoom) {
+        if let Some((a, b)) = value_placeholder(&m, page.size.mm(), open.project.meta.template.band_height(), xf.zoom) {
             p.rect_filled(Rect::from_two_pos(xf.s(a), xf.s(b)), 0.0, faint.gamma_multiply(0.6));
             continue;
         }
@@ -471,9 +471,15 @@ const MIN_TEXT_PX: f32 = 3.0;
 
 /// The bar (corners in mm) drawn instead of a title-block value that is too small to read at
 /// `zoom` (px per mm) on a sheet of `size` mm: as wide as the text and a little lower than it,
-/// so the user sees a value is there. `None` for every other mark, and for a value big enough
-/// to draw; other small texts (column numbers, labels) are simply left out as before.
-pub(crate) fn value_placeholder(m: &wc_pdf::FrameMark, size: (f64, f64), zoom: f32) -> Option<(Point, Point)> {
+/// so the user sees a value is there; `band` is the title block's height in mm. `None` for
+/// every other mark, and for a value big enough to draw; other small texts (column numbers,
+/// labels) are simply left out as before.
+pub(crate) fn value_placeholder(
+    m: &wc_pdf::FrameMark,
+    size: (f64, f64),
+    band: f64,
+    zoom: f32,
+) -> Option<(Point, Point)> {
     let Shape::Text {
         at,
         text,
@@ -491,7 +497,7 @@ pub(crate) fn value_placeholder(m: &wc_pdf::FrameMark, size: (f64, f64), zoom: f
     // letters, drawn in the same ink, sit above it or outside the frame.
     let margin = wc_core::project::FRAME_MARGIN;
     let (x0, x1, y1) = (margin, size.0 - margin, size.1 - margin);
-    let band = y1 - wc_core::template::TITLE_HEIGHT;
+    let band = y1 - band;
     if at.x < x0 || at.x > x1 || at.y <= band || at.y > y1 {
         return None;
     }
@@ -1534,11 +1540,14 @@ mod tests {
         };
         assert!(*height < 1.25, "the value is shrunk: {height}");
         // At zoom 2 the text is under 3 px: a bar as wide as the text, ending on its baseline.
-        let (a, b) = value_placeholder(customer, size, 2.0).unwrap();
+        let (a, b) = value_placeholder(customer, size, wc_core::template::TITLE_HEIGHT, 2.0).unwrap();
         let w = wc_pdf::text_width_mm(long, *height);
         assert!((b.x - a.x - w).abs() < 1e-9 && b.y == at.y && a.y < b.y, "{a:?} {b:?}");
         // Zoomed in far enough the text itself is drawn.
-        assert_eq!(value_placeholder(customer, size, 4.0), None);
+        assert_eq!(
+            value_placeholder(customer, size, wc_core::template::TITLE_HEIGHT, 4.0),
+            None
+        );
         // Column numbers (along the top) and row letters (outside the frame), as small at zoom
         // 0.5, are left out as before.
         let mut checked = 0;
@@ -1546,7 +1555,11 @@ mod tests {
             if let Shape::Text { text, at, .. } = &m.shape
                 && ((text == "1" && at.y < size.1 / 2.0) || text == "A")
             {
-                assert_eq!(value_placeholder(m, size, 0.5), None, "{text}");
+                assert_eq!(
+                    value_placeholder(m, size, wc_core::template::TITLE_HEIGHT, 0.5),
+                    None,
+                    "{text}"
+                );
                 checked += 1;
             }
         }
@@ -1556,8 +1569,28 @@ mod tests {
             marks
                 .iter()
                 .filter(|m| m.ink != wc_pdf::Ink::Thin || !matches!(m.shape, Shape::Text { .. }))
-                .all(|m| value_placeholder(m, size, 0.5).is_none())
+                .all(|m| value_placeholder(m, size, wc_core::template::TITLE_HEIGHT, 0.5).is_none())
         );
+    }
+
+    #[test]
+    fn a_value_in_the_added_band_area_shows_as_a_bar_only_for_a_taller_band() {
+        let page = wc_core::Page::new("p1", "1", "Main");
+        let size = page.size.mm();
+        let y1 = size.1 - wc_core::project::FRAME_MARGIN;
+        // A small value 30 mm above the frame's foot: inside a 36 mm band, above a 24 mm one.
+        let m = wc_pdf::FrameMark {
+            shape: Shape::Text {
+                at: Point::new(100.0, y1 - 30.0),
+                text: "Notes".into(),
+                height: 1.0,
+                align: Align::Left,
+                angle: 0.0,
+            },
+            ink: wc_pdf::Ink::Thin,
+        };
+        assert!(value_placeholder(&m, size, 36.0, 0.5).is_some());
+        assert_eq!(value_placeholder(&m, size, 24.0, 0.5), None);
     }
 
     #[test]

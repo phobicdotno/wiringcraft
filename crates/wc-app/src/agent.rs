@@ -391,15 +391,16 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "get_template",
-            "The page template every page is drawn on: columns (reference columns across the frame) and the title block's boxes (label; left and right in mm from the frame side named by left_from/right_from, \"left\" or \"right\"; top and bottom in mm down the 24 mm title block band; texts with values such as project.name, page.title, page.number, page.sheet or title-block field keys, size, y, align and inset; logo for the logo box). is_default tells whether it is the built-in layout.",
+            "The page template every page is drawn on: columns (reference columns across the frame) and the title block's boxes (label; left and right in mm from the frame side named by left_from/right_from, \"left\" or \"right\"; top and bottom in mm down the title block band, whose height in mm is height; texts with values such as project.name, page.title, page.number, page.sheet or title-block field keys, size, y, align and inset; logo for the logo box). is_default tells whether it is the built-in layout.",
             json!({}),
             &[],
         ),
         tool(
             "set_template",
-            "Change the page template as one undo step: set the column count (1 to 40), replace the title block's boxes (in get_template's format), or reset to the built-in layout.",
+            "Change the page template as one undo step: set the column count (1 to 40), the title block's height (10 to 60 mm), replace its boxes (in get_template's format), or reset to the built-in layout.",
             json!({
                 "columns": {"type": "integer", "minimum": 1, "maximum": 40},
+                "height": {"type": "number", "minimum": 10, "maximum": 60, "description": "The title block band's height in mm (24 by default)."},
                 "boxes": {"type": "array", "items": {"type": "object"}, "description": "Every box of the title block, as get_template returns them."},
                 "reset": {"type": "boolean", "description": "Go back to the built-in layout; columns and boxes are then applied on top of it."}
             }),
@@ -1290,6 +1291,7 @@ impl App {
                 let t = &open.project.meta.template;
                 Ok(pretty(&json!({
                     "columns": t.columns,
+                    "height": t.height,
                     "boxes": t.boxes,
                     "is_default": t.is_default(),
                 })))
@@ -1840,6 +1842,9 @@ impl App {
                 .and_then(|c| usize::try_from(c).ok())
                 .filter(|c| (1..=max).contains(c))
                 .ok_or_else(|| format!("columns must be a whole number from 1 to {max}"))?;
+        }
+        if let Some(h) = v.get("height").filter(|h| !h.is_null()) {
+            t.height = h.as_f64().ok_or("height must be a number of millimetres")?;
         }
         if let Some(b) = v.get("boxes").filter(|b| !b.is_null()) {
             t.boxes = serde_json::from_value(b.clone()).map_err(|e| format!("boxes: {e}"))?;
@@ -2431,6 +2436,10 @@ mod tests {
         assert!(a.open.as_mut().unwrap().redo());
         assert_eq!(read(&mut a)["columns"], json!(12));
 
+        // The title block's height, checked like the rest.
+        assert!(call(&mut a, "set_template", json!({"height": 70})).is_err());
+        call(&mut a, "set_template", json!({"height": 36})).unwrap();
+        assert_eq!(read(&mut a)["height"], json!(36.0));
         call(&mut a, "set_template", json!({"reset": true})).unwrap();
         let t = read(&mut a);
         assert_eq!(t["is_default"], json!(true));
