@@ -2069,6 +2069,17 @@ mod tests {
             end: 450.0,
         };
         assert!(graphic_hit(&more_than_full, Point::new(-10.0, 0.0), 0.5));
+        // A negative sweep (720° to 100°, from a file) is drawn the long way back round: 260°
+        // in 26 steps, picked on that path and not on the 100° it leaves out.
+        let back = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 100.0,
+        };
+        assert_eq!(arc_points(Point::new(150.0, 100.0), 9.0, 720.0, 100.0).len(), 27);
+        assert!(graphic_hit(&back, Point::new(141.0, 100.0), 0.3), "180° is drawn");
+        assert!(!graphic_hit(&back, Point::new(155.79, 106.89), 0.3), "50° is not");
         // A box around the drawn quarter arc holds it (not the whole circle).
         let quarter = Shape::Arc {
             center: Point::new(100.0, 100.0),

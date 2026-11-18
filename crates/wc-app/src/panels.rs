@@ -37,8 +37,13 @@ pub struct PanelState {
     shape_error: Option<String>,
     /// The fields whose values were refused: the reason stays until one of them is entered again.
     shape_refused: Vec<usize>,
-    /// The page, index and number of drawings on the page `shape` was read for.
-    shape_slot: Option<(usize, usize, usize)>,
+    /// The page, index and [`PanelState::drawing_gen`] of the drawing `shape` was read for.
+    shape_slot: Option<(usize, usize, u64)>,
+    /// The drawing whose properties are shown: its page and index, a hash of the drawings
+    /// before it, how many the page had, and its kind. Another drawing at that index is told by these.
+    drawing_seen: Option<(usize, usize, u64, usize, std::mem::Discriminant<Shape>)>,
+    /// Counts the drawings shown: one more each time another drawing takes the place.
+    drawing_gen: u64,
     cable: String,
     core: String,
     cable_error: Option<String>,
@@ -629,11 +634,10 @@ fn shape_rows(
     ui: &mut egui::Ui,
     ps: &mut PanelState,
     drawing: &Shape,
-    slot: (usize, usize, usize),
+    slot: (usize, usize, u64),
 ) -> Option<ShapeCommit> {
     let now = shape_fields(drawing);
-    // A draft is for the drawing in its slot while the page has as many drawings: one deleted
-    // or added before it moves another drawing into the slot, and the draft is dropped.
+    // A draft is for the drawing in its slot: another drawing taking its place drops it.
     if ps.shape_slot != Some(slot) || ps.shape_in_use.len() != now.len() {
         ps.shape_in_use = vec![false; now.len()];
         ps.shape_slot = Some(slot);
@@ -643,10 +647,9 @@ fn shape_rows(
     if draft.len() != now.len() || base.len() != now.len() {
         (draft, base) = (now.clone(), now.clone());
     }
-    for (k, used) in ps.shape_in_use.iter().enumerate() {
+    for (((d, b), n), used) in draft.iter_mut().zip(base.iter_mut()).zip(&now).zip(&ps.shape_in_use) {
         if !used {
-            draft[k] = now[k];
-            base[k] = now[k];
+            (*d, *b) = (*n, *n);
         }
     }
     let mut shape = drawing.clone();
@@ -668,9 +671,13 @@ fn shape_rows(
         );
         ui.end_row();
         let done = r.drag_stopped() || r.lost_focus();
-        ended[field] = done;
+        if let Some(e) = ended.get_mut(field) {
+            *e = done;
+        }
         // A field still in use, also one focus just moved to as another one ended.
-        in_use[field] = (r.has_focus() || r.dragged()) && !done;
+        if let Some(u) = in_use.get_mut(field) {
+            *u = (r.has_focus() || r.dragged()) && !done;
+        }
         field += 1;
     };
     match &mut shape {
@@ -709,7 +716,7 @@ fn shape_rows(
     }
     let mut draft = shape_fields(&shape);
     ps.shape_in_use = in_use;
-    let fields: Vec<usize> = (0..ended.len()).filter(|&k| ended[k]).collect();
+    let fields: Vec<usize> = ended.iter().enumerate().filter_map(|(k, &e)| e.then_some(k)).collect();
     if fields.is_empty() {
         ps.shape = Some(shape);
         ps.shape_base = Some(with_fields(drawing, &base));
@@ -718,8 +725,10 @@ fn shape_rows(
     // Escape drops what was entered in the fields it ended (an arrow key may already have
     // changed one).
     if escape {
-        for &k in &fields {
-            draft[k] = base[k];
+        for (k, (d, b)) in draft.iter_mut().zip(&base).enumerate() {
+            if ended.get(k).copied().unwrap_or(false) {
+                *d = *b;
+            }
         }
         ps.shape = Some(with_fields(drawing, &draft));
         ps.shape_base = Some(with_fields(drawing, &base));
@@ -727,15 +736,18 @@ fn shape_rows(
     }
     let mut new = now.clone();
     let mut any = false;
-    for &k in &fields {
+    for (((d, b), n), e) in draft.iter().zip(base.iter_mut()).zip(new.iter_mut()).zip(&ended) {
+        if !e {
+            continue;
+        }
         // Not within reach of the shown value (a number that is not finite included).
-        let shown = (draft[k] - base[k]).abs() <= SAME_VALUE;
+        let shown = (d - *b).abs() <= SAME_VALUE;
         if !shown {
-            new[k] = draft[k];
+            *n = *d;
             any = true;
         }
         // What was entered is the baseline now.
-        base[k] = draft[k];
+        *b = *d;
     }
     ps.shape = Some(with_fields(drawing, &draft));
     ps.shape_base = Some(with_fields(drawing, &base));
@@ -1013,12 +1025,10 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 Shape::Text { .. } => "Text",
             };
             // The fields are this drawing's: one being typed in when another is selected goes
-            // with its drawing, not into the same field of the next one.
-            // With the drawings before it, and a text as it is: one deleted or added before it,
-            // or the drawing itself deleted, puts another drawing at this index, which must not
-            // take the field being typed in either. One appended after it leaves a text being
-            // typed alone. The number fields go with the page's count of drawings instead, as
-            // their drafts do (see `shape_rows`).
+            // with its drawing, not into the same field of the next one. Drawings carry no id, so
+            // the one at this index is taken for another when a drawing before it changes, or
+            // when the page has fewer drawings (one deleted, this one maybe): the fields then
+            // read it afresh and lose what was being typed. One appended after it leaves them be.
             let graphics = open
                 .project
                 .pages
@@ -1030,14 +1040,27 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 format!("{:?}", graphics.get(..i).unwrap_or_default()).hash(&mut h);
-                if matches!(g, Shape::Text { .. }) {
-                    format!("{g:?}").hash(&mut h);
-                } else {
-                    count.hash(&mut h);
-                }
                 h.finish()
             };
-            ui.push_id(("gfx-props", page_idx, i, before), |ui| {
+            // A drawing of another kind in its place is another drawing too.
+            let kind_now = std::mem::discriminant(&g);
+            let same = matches!(ps.drawing_seen, Some((p, j, h, n, k))
+                if p == page_idx && j == i && h == before && count >= n && k == kind_now);
+            if !same {
+                ps.drawing_gen += 1;
+                if let Shape::Text { text, height, .. } = &g {
+                    ps.text = text.clone();
+                    ps.text_height = *height;
+                }
+                ps.shape = None;
+                ps.shape_base = None;
+                ps.shape_in_use.clear();
+                ps.shape_error = None;
+                ps.shape_refused.clear();
+            }
+            ps.drawing_seen = Some((page_idx, i, before, count, kind_now));
+            let shown = ps.drawing_gen;
+            ui.push_id(("gfx-props", page_idx, i, shown), |ui| {
                 egui::Grid::new("gfx-props")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -1069,7 +1092,7 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                             ui.label(format!("{:.1}, {:.1} mm", at.x, at.y));
                             ui.end_row();
                         } else if matches!(g, Shape::Circle { .. } | Shape::Arc { .. } | Shape::Polyline { .. }) {
-                            if let Some(c) = shape_rows(ui, ps, &g, (page_idx, i, count)) {
+                            if let Some(c) = shape_rows(ui, ps, &g, (page_idx, i, shown)) {
                                 let set = c.new.map_or(Ok(false), |new| open.set_shape(page_idx, i, new));
                                 match set {
                                     // Refused (no radius, too few points to close): the reason is
@@ -2374,16 +2397,51 @@ mod tests {
     #[test]
     fn a_text_being_typed_does_not_go_to_a_drawing_moved_into_its_place() -> Result<(), Box<dyn std::error::Error>> {
         let n = tabs_to_text()?;
-        let mut p = ShapePanel::new(&[text("a"), text("c")]);
+        // Two texts alike: the second takes the first's place when it is deleted.
+        let mut p = ShapePanel::new(&[text("a"), text("a")]);
         p.tab(n);
         p.typed("b");
-        // The text is deleted; the next one takes its place in the list.
         let i = p.at[0];
         p.o.project.pages[0].graphics.remove(i);
         p.frame(Vec::new());
         p.key(egui::Key::Enter);
         p.frame(Vec::new());
-        assert_eq!(p.o.project.pages[0].graphics[i], text("c"));
+        assert_eq!(p.o.project.pages[0].graphics[i], text("a"), "Enter");
+        // Nor through the height field: it writes the text the drawing has.
+        p.tab(n + 1);
+        p.key(egui::Key::ArrowUp);
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        let Shape::Text { text: now, height, .. } = &p.o.project.pages[0].graphics[i] else {
+            return Err("still a text".into());
+        };
+        assert_eq!(now, "a", "Height");
+        assert!(*height > 3.5, "the height was set: {height}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_goes_when_a_drawing_of_another_kind_takes_its_place() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        // A polyline in the circle's place has no radius: the refusal is not its own.
+        let i = p.at[0];
+        p.o.project.pages[0].graphics[i] = Shape::Polyline {
+            points: vec![
+                wc_core::Point::new(10.0, 10.0),
+                wc_core::Point::new(20.0, 10.0),
+                wc_core::Point::new(20.0, 20.0),
+            ],
+            closed: false,
+            filled: false,
+        };
+        p.frame(Vec::new());
+        assert_eq!(p.ps.shape_error, None);
+        assert!(p.ps.shape_refused.is_empty());
         Ok(())
     }
 

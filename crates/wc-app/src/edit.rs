@@ -401,10 +401,11 @@ impl Open {
                 if moved.1 {
                     *end = turn(*end);
                 }
-                // The sweep as the canvas draws it: one that rounds to nothing (370.1° to
-                // 10.1°) leaves no arc either, while a negative one (720° to 100°) is drawn.
+                // Equal angles are refused, and so is a sweep as the canvas draws it that
+                // rounds to nothing (360° to 0°, 370.1° to 10.1°). Angles a whole turn apart
+                // are not alike for that: 720° to 0° draws a full turn, as 720° to 100° draws.
                 let drawn = crate::canvas::arc_sweep(*start, *end);
-                if (moved.0 || moved.1) && (turn(*start) == turn(*end) || drawn.abs() <= 1e-9) {
+                if (moved.0 || moved.1) && (*start == *end || drawn.abs() <= 1e-9) {
                     return Err("The start and end angles must differ.");
                 }
             }
@@ -1069,6 +1070,37 @@ mod tests {
         };
         assert_eq!(o.set_shape(page, n, wide.clone()), Ok(true));
         assert_eq!(o.project.pages[page].graphics[n], wide);
+        // 720° to 0° is a full turn as drawn, though the angles match within one turn.
+        o.project.pages[page].graphics[n] = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 90.0,
+        };
+        let full = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 0.0,
+        };
+        assert_eq!(o.set_shape(page, n, full.clone()), Ok(true));
+        assert_eq!(o.project.pages[page].graphics[n], full);
+        // 360° to 0° draws nothing.
+        let before = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 360.0,
+            end: 90.0,
+        };
+        o.project.pages[page].graphics[n] = before.clone();
+        let none = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 360.0,
+            end: 0.0,
+        };
+        assert!(o.set_shape(page, n, none).is_err());
+        assert_eq!(o.project.pages[page].graphics[n], before);
     }
 
     #[test]
