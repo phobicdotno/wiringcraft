@@ -28,6 +28,9 @@ pub enum Error {
     Source { name: String, message: String },
     #[error("{kind:?} {id:?} is not in any library source")]
     NotFound { kind: ItemKind, id: String },
+    /// An update failed and could not put back every file it had changed.
+    #[error("{error}; putting back the files the update changed failed too: {failed}")]
+    NotPutBack { error: Box<Error>, failed: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -297,18 +300,55 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
 /// Copy the library's current version of an item into the project and pin it.
 /// Returns the new lock entry.
 pub fn take(project_dir: &Path, project: &mut Project, lib: &Library, kind: ItemKind, id: &str) -> Result<LockEntry> {
-    let entry = match kind {
+    let item = fetch(lib, kind, id, None)?;
+    store_item(project_dir, project, id, item)
+}
+
+/// An item read from the library to be written into a project, with its lock entry.
+enum Fetched {
+    Symbol(Symbol, LockEntry),
+    Part(Part, LockEntry),
+}
+
+/// Read item `id` from the library and check that its file holds that id and, when `hash` is
+/// given, that it is that version.
+fn fetch(lib: &Library, kind: ItemKind, id: &str, hash: Option<&str>) -> Result<Fetched> {
+    let moved = |source: &str, what: &str| Error::Source {
+        name: source.to_owned(),
+        message: format!("the {what} {id} changed in the library while it was being updated; update again"),
+    };
+    Ok(match kind {
         ItemKind::Symbol => {
             let (s, source) = lib.symbol(id)?;
             same_id(&source, "symbol", id, &s.id)?;
-            store::write_vendored_symbol(project_dir, &s)?;
-            LockEntry { source, hash: s.hash() }
+            let h = s.hash();
+            if hash.is_some_and(|want| want != h) {
+                return Err(moved(&source, "symbol"));
+            }
+            Fetched::Symbol(s, LockEntry { source, hash: h })
         }
         ItemKind::Part => {
             let (p, source) = lib.part(id)?;
             same_id(&source, "part", id, &p.id)?;
+            let h = p.hash();
+            if hash.is_some_and(|want| want != h) {
+                return Err(moved(&source, "part"));
+            }
+            Fetched::Part(p, LockEntry { source, hash: h })
+        }
+    })
+}
+
+/// Write a fetched item into the project folder and pin it.
+fn store_item(project_dir: &Path, project: &mut Project, id: &str, item: Fetched) -> Result<LockEntry> {
+    let (kind, entry) = match item {
+        Fetched::Symbol(s, entry) => {
+            store::write_vendored_symbol(project_dir, &s)?;
+            (ItemKind::Symbol, entry)
+        }
+        Fetched::Part(p, entry) => {
             store::write_vendored_part(project_dir, &p)?;
-            LockEntry { source, hash: p.hash() }
+            (ItemKind::Part, entry)
         }
     };
     project.lock.map_mut(kind).insert(id.to_owned(), entry.clone());
@@ -398,26 +438,89 @@ pub fn update(
     lib: &Library,
     only: Option<&[String]>,
 ) -> Result<Vec<(ItemKind, String)>> {
-    let named = |s: &ItemStatus| only.is_none_or(|ids| ids.contains(&s.id));
     let all = status(project_dir, project, lib);
-    // An item named on purpose whose library file is wrong is an error, before anything is taken.
-    if only.is_some()
-        && let Some(bad) = all.iter().find(|s| s.state == State::WrongId && named(s))
-    {
-        return Err(Error::Source {
-            name: bad.library_source.clone().unwrap_or_default(),
-            message: bad.changes.join("; "),
-        });
+    if let Some(bad) = wrong_named(&all, only) {
+        return Err(bad);
     }
-    let todo: Vec<(ItemKind, String)> = all
-        .into_iter()
-        .filter(|s| s.state == State::Changed && named(s))
-        .map(|s| (s.kind, s.id))
-        .collect();
-    for (kind, id) in &todo {
-        take(project_dir, project, lib, *kind, id)?;
+    update_items(project_dir, project, lib, &changed(&all, only))
+}
+
+/// Of `all` (from [`status`]), an item named on purpose (`only`) whose library file declares
+/// another id, as the error an update stops with before anything is taken.
+pub fn wrong_named(all: &[ItemStatus], only: Option<&[String]>) -> Option<Error> {
+    let ids = only?;
+    let bad = all.iter().find(|s| s.state == State::WrongId && ids.contains(&s.id))?;
+    Some(Error::Source {
+        name: bad.library_source.clone().unwrap_or_default(),
+        message: bad.changes.join("; "),
+    })
+}
+
+/// Of `all` (from [`status`]), the items with a newer library version (only those named in
+/// `only`, when given), each with the hash of the version seen, for [`update_items`].
+pub fn changed(all: &[ItemStatus], only: Option<&[String]>) -> Vec<(ItemKind, String, String)> {
+    all.iter()
+        .filter(|s| s.state == State::Changed && only.is_none_or(|ids| ids.contains(&s.id)))
+        .filter_map(|s| Some((s.kind, s.id.clone(), s.library_hash.clone()?)))
+        .collect()
+}
+
+/// Take exactly these library versions, in order: each item `(kind, id, hash)` only in the
+/// version with that hash, read once and written as read. What a caller that looked at
+/// [`status`] first uses, so nothing is written that it has not seen. Every item is read and
+/// checked before any is written: an item whose library version is another one by now is an
+/// error and nothing is taken. When a write fails, the files already written are put back as
+/// they were and the lock is left as it was. Returns the items.
+pub fn update_items(
+    project_dir: &Path,
+    project: &mut Project,
+    lib: &Library,
+    items: &[(ItemKind, String, String)],
+) -> Result<Vec<(ItemKind, String)>> {
+    let fetched = items
+        .iter()
+        .map(|(kind, id, hash)| fetch(lib, *kind, id, Some(hash)))
+        .collect::<Result<Vec<_>>>()?;
+    // Every file as it is before any is written, so a failed write can put them all back. A
+    // file that cannot be read stops the update here: it could not be put back.
+    let mut before = Vec::with_capacity(items.len());
+    for (kind, id, _) in items {
+        let path = store::vendor_path(project_dir, *kind, id)?;
+        let was = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(wc_core::Error::io(&path, e).into()),
+        };
+        before.push((path, was));
     }
-    Ok(todo)
+    let lock = project.lock.clone();
+    for (n, ((_, id, _), item)) in items.iter().zip(fetched).enumerate() {
+        if let Err(e) = store_item(project_dir, project, id, item) {
+            project.lock = lock;
+            let failed: Vec<String> = before[..=n]
+                .iter()
+                .rev()
+                .filter_map(|(path, was)| {
+                    let put = match was {
+                        Some(text) => store::write_if_changed(path, text).map(|_| ()),
+                        None => match std::fs::remove_file(path) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(wc_core::Error::io(path, e)),
+                            _ => Ok(()),
+                        },
+                    };
+                    put.err().map(|e| e.to_string())
+                })
+                .collect();
+            if failed.is_empty() {
+                return Err(e);
+            }
+            return Err(Error::NotPutBack {
+                error: Box::new(e),
+                failed: failed.join("; "),
+            });
+        }
+    }
+    Ok(items.iter().map(|(k, id, _)| (*k, id.clone())).collect())
 }
 
 /// Propose a project's vendored version of an item back to a library source. The file goes to

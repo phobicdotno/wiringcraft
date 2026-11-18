@@ -600,8 +600,12 @@ enum ImportCmd {
         symbol_map: Option<PathBuf>,
     },
     /// The libraries of a SolidWorks Electrical archive (.tewzip): catalog parts with their
-    /// terminals, cable types with their cores, and symbol blocks as box symbols with their
-    /// connection points. Into a library folder with --lib, else vendored into the project.
+    /// terminals, cable types with their cores, and symbol blocks with their connection points,
+    /// drawn from the archive's block DWG files (boxes where a block has none). A symbol or part
+    /// the project already vendors with other content (an earlier import's box) is refused, not
+    /// replaced. To take the drawn version into such a project, import with --lib into a library
+    /// folder, add that folder as a source (`lib add`) and run `lib update <id>`. Into a library
+    /// folder with --lib, else vendored into the project.
     SweLibrary {
         path: PathBuf,
         /// A library folder to write into instead of the project.
@@ -1868,7 +1872,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let catalog_read = !is_db;
             if catalog_read {
                 let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
-                match wc_import::swe::library::from_archive(file) {
+                match wc_import::swe::library::catalog_from_archive(file) {
                     Ok(lib) => {
                         // Why a catalog row was left out, so a device it would have matched is
                         // not left unlinked without a reason.
@@ -2047,18 +2051,53 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     Kind::Dxf => {
                         let mut p = load(dir)?;
                         let id = format!("dxf-{next}");
-                        p.pages.push(Page::new(id.clone(), next.to_string(), name.clone()));
-                        p.sort_pages();
-                        save(dir, &p)?;
                         next += 1;
-                        import_cmd(
-                            dir,
-                            ImportCmd::PageDxf {
-                                file: path.clone(),
-                                page: id,
-                                scale: 1.0,
-                            },
-                        )
+                        // Page files are named by id, and some folders do not tell `DXF-300`
+                        // from `dxf-300`.
+                        if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
+                            // Never added over an earlier page: removing it again on failure
+                            // would delete that page.
+                            Err(format!(
+                                "page {id} exists; remove it or import with --first-page to number the pages from a free number"
+                            ))
+                        } else {
+                            p.pages
+                                .push(Page::new(id.clone(), (next - 1).to_string(), name.clone()));
+                            p.sort_pages();
+                            // A save that fails part way is cleaned up like a failed import.
+                            let r = save(dir, &p).and_then(|()| {
+                                import_cmd(
+                                    dir,
+                                    ImportCmd::PageDxf {
+                                        file: path.clone(),
+                                        page: id.clone(),
+                                        scale: 1.0,
+                                    },
+                                )
+                            });
+                            // A drawing that could not be imported leaves no blank page behind.
+                            // When that fails too, the entry's own error still counts and the
+                            // other entries still come in.
+                            if r.is_err() {
+                                let remove = || -> Res<()> {
+                                    let mut p = load(dir)?;
+                                    p.pages.retain(|pg| pg.id != id);
+                                    save(dir, &p)
+                                };
+                                if let Err(why) = remove() {
+                                    // The save may fail after the page file is gone already.
+                                    let left = load(dir).map_or(true, |p| p.pages.iter().any(|pg| pg.id == id));
+                                    if left {
+                                        eprintln!("warning: {name}: the empty page {id} could not be removed: {why}");
+                                    } else {
+                                        eprintln!(
+                                            "warning: {name}: the empty page {id} was removed, but the project could not be saved in full: {why}"
+                                        );
+                                    }
+                                }
+                            }
+                            r
+                        }
                     }
                     _ => {
                         let r = import_cmd(
@@ -2133,8 +2172,48 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     return Err(format!("{source}: the symbol file for {id:?} declares id {:?}", s.id));
                 }
             }
+            // What is in the vendor folder now, so a write that fails part way leaves no copy
+            // without its pin (a retry would skip a readable one).
+            let before: Vec<(PathBuf, Option<String>)> = needed
+                .iter()
+                .map(|id| {
+                    let path = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
+                    let was = match std::fs::read_to_string(&path) {
+                        Ok(text) => Some(text),
+                        Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(x) => return Err(format!("{}: {x}", path.display())),
+                    };
+                    Ok((path, was))
+                })
+                .collect::<Res<_>>()?;
+            let put_back = |why: String| -> String {
+                let failed: Vec<String> = before
+                    .iter()
+                    .filter_map(|(path, was)| {
+                        // Written only when it differs, and whole or not at all.
+                        let r = match was {
+                            Some(text) => store::write_if_changed(path, text)
+                                .map(|_| ())
+                                .map_err(|x| x.to_string()),
+                            None => std::fs::remove_file(path).or_else(|x| {
+                                if x.kind() == std::io::ErrorKind::NotFound {
+                                    Ok(())
+                                } else {
+                                    Err(format!("{}: {x}", path.display()))
+                                }
+                            }),
+                        };
+                        r.err()
+                    })
+                    .collect();
+                if failed.is_empty() {
+                    why
+                } else {
+                    format!("{why}; symbol copies could not be put back: {}", failed.join("; "))
+                }
+            };
             for id in needed {
-                wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(e)?;
+                wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(|x| put_back(x.to_string()))?;
             }
             let pg = page_mut(&mut p, &page)?;
             let n_g = imported.graphics.len();
@@ -3527,6 +3606,20 @@ mod tests {
         assert!(err.contains("no-such-page"), "{err}");
         assert!(store::read_vendored_symbol(&dir, "aa.good").is_err());
 
+        // A copy that cannot be written after `aa.good` was copied takes that copy away again.
+        let blocked = store::vendor_path(&dir, ItemKind::Symbol, "zz.bad").unwrap();
+        let mut tmp_path = blocked.as_os_str().to_owned();
+        tmp_path.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_path);
+        std::fs::create_dir_all(&tmp_path).unwrap();
+        cli(&dir, &args).unwrap_err();
+        assert!(
+            store::read_vendored_symbol(&dir, "aa.good").is_err(),
+            "the copy written first is gone again"
+        );
+        assert!(!load(&dir).unwrap().lock.symbols.contains_key("aa.good"));
+        std::fs::remove_dir(&tmp_path).unwrap();
+
         // And the retry pins both.
         cli(&dir, &args).unwrap();
         let p = load(&dir).unwrap();
@@ -4104,6 +4197,107 @@ mod tests {
 
         std::fs::write(&file, "not an archive").unwrap();
         assert!(cli(&dir, &["import", "swe-library", file.to_str().unwrap()]).is_err());
+    }
+
+    #[test]
+    fn a_dxf_in_an_archive_that_cannot_be_imported_leaves_no_blank_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let pages = load(&dir).unwrap().pages.len();
+        use std::io::Write;
+        let file = tmp.path().join("drawings.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            z.start_file("broken.dxf", opt).unwrap();
+            z.write_all(b"this is not a drawing").unwrap();
+            z.finish().unwrap();
+        }
+        // The drawing itself does not import, so the archive entry reaches that failure; the
+        // archive import still succeeds and only warns about it.
+        let broken = tmp.path().join("broken.dxf");
+        std::fs::write(&broken, b"this is not a drawing").unwrap();
+        let mut q = load(&dir).unwrap();
+        q.pages.push(Page::new("probe", "999", "Probe"));
+        save(&dir, &q).unwrap();
+        assert!(
+            cli(
+                &dir,
+                &["import", "page-dxf", broken.to_str().unwrap(), "--page", "probe"]
+            )
+            .is_err()
+        );
+        q.pages.retain(|pg| pg.id != "probe");
+        save(&dir, &q).unwrap();
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(
+            p.pages.len(),
+            pages,
+            "{:?}",
+            p.pages.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        assert!(p.pages.iter().all(|p| !p.id.starts_with("dxf-")));
+
+        // A page an earlier import left under the id this one would use is never touched.
+        let mut p = load(&dir).unwrap();
+        let mut earlier = Page::new("dxf-300", "300", "Earlier drawing");
+        earlier.title_block.insert("revision".into(), "B".into());
+        p.pages.push(earlier.clone());
+        save(&dir, &p).unwrap();
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.page("dxf-300"), Some(&earlier));
+        assert_eq!(p.pages.len(), pages + 1);
+
+        // Nor one whose id differs only in case: its file may be the same file.
+        let mut p = load(&dir).unwrap();
+        p.pages.retain(|pg| pg.id != "dxf-300");
+        // Saved apart: on a folder that ignores case, one save that drops `dxf-300` and adds
+        // `DXF-300` would delete the file it just wrote.
+        save(&dir, &p).unwrap();
+        let mut upper = Page::new("DXF-300", "299", "Earlier drawing");
+        upper.title_block.insert("revision".into(), "C".into());
+        p.pages.push(upper.clone());
+        save(&dir, &p).unwrap();
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
+        let mut p = load(&dir).unwrap();
+        assert_eq!(p.page("DXF-300"), Some(&upper));
+        assert!(p.page("dxf-300").is_none());
+        p.pages.retain(|pg| pg.id != "DXF-300");
+        save(&dir, &p).unwrap();
+
+        // Every save fails after the page files are written (a panel file that has to be
+        // rewritten cannot be): each drawing's page is still removed again, and every entry
+        // is tried.
+        p.panels
+            .push(wc_core::panel::Panel::new("cab", "Cabinet", 600.0, 800.0));
+        save(&dir, &p).unwrap();
+        let panel = dir.join("panels").join("cab.panel.json");
+        let text = std::fs::read_to_string(&panel).unwrap();
+        std::fs::write(&panel, format!("{text}\n\n")).unwrap();
+        std::fs::create_dir(dir.join("panels").join("cab.panel.json.tmp")).unwrap();
+        let two = tmp.path().join("two.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&two).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            for name in ["a.dxf", "b.dxf"] {
+                z.start_file(name, opt).unwrap();
+                z.write_all(b"this is not a drawing").unwrap();
+            }
+            z.finish().unwrap();
+        }
+        cli(&dir, &["import", "archive", two.to_str().unwrap()]).unwrap();
+        let p = load(&dir).unwrap();
+        assert!(p.pages.iter().all(|p| !p.id.starts_with("dxf-")));
+        let left: Vec<_> = std::fs::read_dir(dir.join("pages"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("dxf-"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]

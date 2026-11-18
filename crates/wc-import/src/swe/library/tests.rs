@@ -106,7 +106,7 @@ fn cable_types_become_parts_with_their_cores() {
 #[test]
 fn blocks_become_box_symbols_with_their_points_as_pins() {
     let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
-    let symbols = read_blocks(&db(APP_DATA), &mut report, &mut warnings).unwrap();
+    let symbols = read_blocks(&db(APP_DATA), None, &mut report, &mut warnings).unwrap();
     let ids: Vec<&str> = symbols.iter().map(|s| s.id.as_str()).collect();
     // Two blocks named `Coil` get distinct ids; the frame has no points and is left out.
     assert_eq!(ids, ["swe.lib.coil", "swe.lib.coil.2"]);
@@ -177,7 +177,7 @@ fn rows_of_the_wrong_type_are_counted_not_fatal() {
     c.execute_batch("INSERT INTO tew_block VALUES ('bad id', 'Odd', '');")
         .unwrap();
     let mut warnings = Vec::new();
-    let symbols = read_blocks(&c, &mut report, &mut warnings).unwrap();
+    let symbols = read_blocks(&c, None, &mut report, &mut warnings).unwrap();
     assert_eq!(report.blocks_in, 4);
     assert_eq!(symbols[0].pins.len(), 2);
     assert!(!warnings.is_empty());
@@ -339,4 +339,278 @@ fn an_imported_project_links_its_devices_to_the_archive_catalog() {
         .1;
     assert_eq!(w1.part.as_deref(), Some("maker-c.cbl-3g1"));
     assert!(built.parts.iter().any(|p| p.id == "maker-a.rly-24"));
+}
+
+#[test]
+fn library_blocks_are_drawn_from_their_dwg_files_in_the_archive() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    use wc_core::geom::Shape;
+    // A coil with a drawing, a lamp whose only drawing is another project's own copy, and a
+    // block whose drawing is damaged.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Lamp', ''), (3, 'Bad', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (1, 2, 'A2', 0, -5), (2, 1, 'X1', 0, 5), (3, 1, '1', 0, 0);
+"));
+    // y up in the drawing: a circle and a line from the circle up to A1.
+    let coil = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0), E::Line((0.0, 4.0), (0.0, 5.0))]);
+    let lamp = model_space_dwg(&[E::Circle((0.0, 0.0), 3.0)]);
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/coil.DWG", &coil),
+        ("Projects/2/Block/Lamp.dwg", &lamp),
+        ("Library/Block/Bad.dwg", b"AC1024 but nothing else"),
+    ]);
+    let lib = from_archive(buf).unwrap();
+    let ids: Vec<&str> = lib.symbols.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["swe.lib.bad", "swe.lib.coil", "swe.lib.lamp"]);
+
+    // The coil carries its drawing, y flipped, and the same pins as a box would.
+    let coil = &lib.symbols[1];
+    assert!(
+        coil.graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Circle { center, radius, .. } if *radius == 4.0 && center.x == 0.0 && center.y == 0.0)),
+        "{:?}",
+        coil.graphics
+    );
+    assert!(
+        coil.graphics.iter().any(|g| matches!(g, Shape::Line { a, b }
+            if (a.y, b.y) == (-4.0, -5.0) && a.x == 0.0 && b.x == 0.0)),
+        "{:?}",
+        coil.graphics
+    );
+    assert!(!coil.graphics.iter().any(|g| matches!(g, Shape::Rect { .. })));
+    let pins: Vec<(&str, f64, f64)> = coil.pins.iter().map(|p| (p.name.as_str(), p.at.x, p.at.y)).collect();
+    assert_eq!(pins, [("A1", 0.0, -5.0), ("A2", 0.0, 5.0)]);
+
+    // Another project's copy is not the library's, and a damaged drawing leaves a box.
+    for s in [&lib.symbols[0], &lib.symbols[2]] {
+        assert!(
+            matches!(s.graphics[..], [Shape::Rect { .. }]),
+            "{}: {:?}",
+            s.id,
+            s.graphics
+        );
+    }
+    assert_eq!((lib.report.blocks_out, lib.report.blocks_drawn), (3, 1));
+    assert!(
+        lib.report.lines()[2]
+            .contains("3 imported with their connection points: 1 drawn from their DWG file, 2 as boxes"),
+        "{:?}",
+        lib.report.lines()
+    );
+    assert!(
+        lib.warnings
+            .iter()
+            .any(|w| w.starts_with("block drawings:") && w.contains("Bad.dwg")),
+        "{:?}",
+        lib.warnings
+    );
+
+    // Without drawings every block is a box, and the archive is never read again for them.
+    let rewinds = std::rc::Rc::new(std::cell::Cell::new(0));
+    let lib = catalog_from_archive(Rewinds {
+        inner: archive(&[
+            ("readme.txt", b"first, so no entry starts at 0"),
+            ("Database/tew_app_data.sqlite", &app),
+            (
+                "Library/Block/coil.DWG",
+                &model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]),
+            ),
+        ]),
+        count: rewinds.clone(),
+        fail: false,
+    })
+    .unwrap();
+    assert_eq!(rewinds.get(), 1, "the catalog pass went back for the drawings");
+    assert!(
+        !lib.warnings.iter().any(|w| w.contains("block drawings")),
+        "{:?}",
+        lib.warnings
+    );
+    let ids: Vec<&str> = lib.symbols.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["swe.lib.bad", "swe.lib.coil", "swe.lib.lamp"]);
+    assert_eq!(lib.report.blocks_drawn, 0);
+    assert!(
+        lib.symbols
+            .iter()
+            .all(|s| matches!(s.graphics[..], [Shape::Rect { .. }]))
+    );
+}
+
+#[test]
+fn block_drawing_limits_and_unread_entities_are_reported() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    let app = db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Lamp', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (2, 1, 'X1', 0, 5);
+");
+    let mut d = SweDrawings::default();
+    d.add_block(
+        "Coil",
+        &model_space_dwg(&[E::Line((0.0, 0.0), (0.0, 5.0)), E::Line((1.0, 0.0), (1.0, 5.0))]),
+    )
+    .unwrap();
+    d.add_block("Lamp", &model_space_dwg(&[E::Circle((0.0, 0.0), 3.0)]))
+        .unwrap();
+    // One entity left: the coil is drawn in part and the lamp is a box.
+    d.set_draw_limit(1);
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let symbols = read_blocks(&app, Some(&d), &mut report, &mut warnings).unwrap();
+    assert_eq!(symbols[0].graphics.len(), 1, "{:?}", symbols[0].graphics);
+    assert_eq!((report.blocks_out, report.blocks_drawn), (2, 1));
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("1 symbol block(s) are drawn only in part")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.starts_with("1 symbol block(s) are boxes")),
+        "{warnings:?}"
+    );
+
+    // Everything fits: no limit warning.
+    d.set_draw_limit(100);
+    let mut warnings = Vec::new();
+    read_blocks(&app, Some(&d), &mut report, &mut warnings).unwrap();
+    assert_eq!(report.blocks_drawn, 2);
+    assert!(!warnings.iter().any(|w| w.contains("entity limit")), "{warnings:?}");
+
+    // A report used again for blocks that give nothing counts nothing drawn, and never underflows.
+    let empty = db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+");
+    read_blocks(&empty, Some(&d), &mut report, &mut Vec::new()).unwrap();
+    assert_eq!((report.blocks_out, report.blocks_drawn), (0, 0));
+    assert!(report.lines()[2].contains("0 drawn from their DWG file, 0 as boxes"));
+    // Without the block tables, counts a report holds from an earlier import are cleared too.
+    (report.blocks_in, report.blocks_out, report.blocks_drawn) = (2, 2, 2);
+    read_blocks(
+        &db("CREATE TABLE x (a INTEGER);"),
+        Some(&d),
+        &mut report,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!((report.blocks_in, report.blocks_out, report.blocks_drawn), (0, 0, 0));
+
+    // Entities the DWG reader skipped are named; damaged objects are not repeated.
+    d.skipped.insert("SPLINE".into(), 3);
+    d.skipped.insert(crate::dwg::objects::DAMAGED.into(), 1);
+    let w = read_warnings(&d);
+    assert!(
+        w.iter().any(|w| w == "block drawings: entities not read (SPLINE: 3)"),
+        "{w:?}"
+    );
+    assert!(!w.iter().any(|w| w.contains("damaged")), "{w:?}");
+
+    // A file name with a line break or a terminal escape is printed escaped.
+    d.warnings.push("Block/a\nwarning: fake\u{1b}[2J.dwg: bad".into());
+    let w = read_warnings(&d);
+    let named = w.iter().find(|w| w.contains("fake")).unwrap();
+    assert!(!named.chars().any(char::is_control), "{named:?}");
+    assert!(named.contains("a\\u{a}warning: fake\\u{1b}[2J.dwg"), "{named:?}");
+}
+
+/// An archive reader that counts seeks to its start and can fail every one after the first: the
+/// zip reader goes to the start once when it opens the archive, the drawing pass again after.
+struct Rewinds {
+    inner: std::io::Cursor<Vec<u8>>,
+    count: std::rc::Rc<std::cell::Cell<usize>>,
+    fail: bool,
+}
+
+impl std::io::Read for Rewinds {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Seek for Rewinds {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        if to == std::io::SeekFrom::Start(0) {
+            self.count.set(self.count.get() + 1);
+            if self.fail && self.count.get() > 1 {
+                return Err(std::io::Error::other("rewind refused"));
+            }
+        }
+        self.inner.seek(to)
+    }
+}
+
+#[test]
+fn a_failed_rewind_for_the_drawings_keeps_the_library_with_boxes() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    use wc_core::geom::Shape;
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5);
+"));
+    let entries = [
+        ("readme.txt", &b"first, so no entry starts at 0"[..]),
+        ("Database/tew_app_data.sqlite", &app),
+        (
+            "Library/Block/Coil.dwg",
+            &model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]),
+        ),
+    ];
+    let count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let reader = |fail| Rewinds {
+        inner: archive(&entries),
+        count: count.clone(),
+        fail,
+    };
+
+    // The rewind works: the coil is drawn.
+    let lib = from_archive(reader(false)).unwrap();
+    assert!(count.get() > 1, "the drawing pass did not rewind");
+    count.set(0);
+    assert_eq!(lib.report.blocks_drawn, 1);
+
+    // It fails: the database's blocks are still there, as boxes, and the warning says why.
+    let lib = from_archive(reader(true)).unwrap();
+    assert_eq!(lib.symbols.len(), 1);
+    assert_eq!(lib.symbols[0].pins.len(), 1);
+    assert!(matches!(lib.symbols[0].graphics[..], [Shape::Rect { .. }]));
+    assert!(
+        lib.warnings
+            .iter()
+            .any(|w| w.starts_with("block drawings were not read") && w.contains("rewind refused")),
+        "{:?}",
+        lib.warnings
+    );
+}
+
+#[test]
+fn a_drawing_whose_file_name_has_spaces_draws_its_block() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    let app = db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, ' Coil ', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5);
+");
+    let mut d = SweDrawings::default();
+    d.add_block("Coil ", &model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]))
+        .unwrap();
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let symbols = read_blocks(&app, Some(&d), &mut report, &mut warnings).unwrap();
+    assert_eq!(report.blocks_drawn, 1, "{:?}", symbols[0].graphics);
+
+    // A later file whose name differs only in spaces or case replaces the earlier one.
+    d.add_block(
+        " COIL",
+        &model_space_dwg(&[E::Circle((0.0, 0.0), 2.0), E::Circle((0.0, 0.0), 1.0)]),
+    )
+    .unwrap();
+    let symbols = read_blocks(&app, Some(&d), &mut report, &mut warnings).unwrap();
+    assert_eq!(symbols[0].graphics.len(), 2, "{:?}", symbols[0].graphics);
 }

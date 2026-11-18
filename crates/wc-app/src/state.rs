@@ -126,9 +126,6 @@ impl WireNumbering {
     }
 }
 
-/// How many undo steps a window keeps.
-const UNDO_LIMIT: usize = 200;
-
 /// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
 pub(crate) struct Mark {
     project: Project,
@@ -193,10 +190,26 @@ pub struct Open {
     /// Tests: a file whose backup read fails, though the file is a plain readable one.
     #[cfg(test)]
     unreadable: Option<PathBuf>,
+    /// Tests: a library file rewritten once the update's backups are taken, as if someone
+    /// saved it in between.
+    #[cfg(test)]
+    rewrite_after_snapshot: Option<(PathBuf, String)>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
     /// Parts the last Undo or Redo could not load, with the reason, though the step was done.
     step_warning: Option<String>,
+}
+
+/// The most Undo steps kept; older ones are dropped.
+const UNDO_STEPS: usize = 200;
+
+/// The history as it was before a library update, so a failed one leaves no trace in it.
+struct HistoryState {
+    redo: Vec<Project>,
+    /// The oldest Undo step, when the update's checkpoint pushes it out.
+    evicted: Option<Project>,
+    dirty: bool,
+    history: u64,
 }
 
 impl Open {
@@ -229,6 +242,8 @@ impl Open {
             block_after_snapshot: None,
             #[cfg(test)]
             unreadable: None,
+            #[cfg(test)]
+            rewrite_after_snapshot: None,
             undo_error: None,
             step_warning: None,
         };
@@ -500,7 +515,7 @@ impl Open {
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
         self.undo.push(self.project.clone());
-        if self.undo.len() > UNDO_LIMIT {
+        if self.undo.len() > UNDO_STEPS {
             self.undo.remove(0);
             self.undo_dropped += 1;
         }
@@ -798,20 +813,31 @@ impl Open {
         lib: &wc_library::Library,
         only: Option<&[String]>,
     ) -> Result<Vec<(ItemKind, String)>, String> {
-        let todo: Vec<(ItemKind, String)> = wc_library::status(&self.dir, &self.project, lib)
-            .into_iter()
-            .filter(|s| s.state == wc_library::State::Changed)
-            .filter(|s| only.is_none_or(|ids| ids.contains(&s.id)))
-            .map(|s| (s.kind, s.id))
-            .collect();
+        let all = wc_library::status(&self.dir, &self.project, lib);
+        // An item named on purpose whose library file is wrong stops the update.
+        if let Some(bad) = wc_library::wrong_named(&all, only) {
+            return Err(bad.to_string());
+        }
+        // Exactly these versions are taken, as seen here: an item whose library file changes
+        // after this (from a wrong id to a new version, or to yet another version) is not
+        // written without a backup; it waits for the next update.
+        let todo = wc_library::changed(&all, only);
         // Checked before anything is written: a new version that drops a wired pin stops the
         // whole update.
-        let mut dangling: Vec<String> = todo
-            .iter()
-            .filter(|(kind, _)| *kind == ItemKind::Symbol)
-            .filter_map(|(_, id)| Some(dangling_pins(&self.project, id, &lib.symbol(id).ok()?.0)))
-            .flatten()
-            .collect();
+        // The pins are checked on the very version the update will take: one that changed in the
+        // library since it was looked at is not taken at all.
+        let mut dangling: Vec<String> = Vec::new();
+        for (kind, id, hash) in &todo {
+            let Some((s, _)) = (*kind == ItemKind::Symbol).then(|| lib.symbol(id).ok()).flatten() else {
+                continue;
+            };
+            if s.hash() != *hash {
+                return Err(format!(
+                    "nothing was updated: the symbol {id} changed in the library while it was being updated; update again"
+                ));
+            }
+            dangling.extend(dangling_pins(&self.project, id, &s));
+        }
         if !dangling.is_empty() {
             dangling.sort();
             return Err(format!(
@@ -819,12 +845,11 @@ impl Open {
                 dangling.join(", ")
             ));
         }
-        // Undo puts back the lock and the symbol files; part files are kept here, so a write
-        // that fails halfway leaves none of them changed either.
-        let parts: Vec<(PathBuf, Option<Vec<u8>>)> = todo
+        // Every file the update may write, and the lock, are kept here: a failure puts them
+        // back directly, whatever undo can or cannot restore.
+        let files: Vec<(PathBuf, Option<Vec<u8>>)> = todo
             .iter()
-            .filter(|(kind, _)| *kind == ItemKind::Part)
-            .filter_map(|(kind, id)| store::vendor_path(&self.dir, *kind, id).ok())
+            .filter_map(|(kind, id, _)| store::vendor_path(&self.dir, *kind, id).ok())
             .map(|path| {
                 #[cfg(test)]
                 if self.unreadable.as_ref() == Some(&path) {
@@ -834,31 +859,31 @@ impl Open {
             })
             .collect::<Result<_, String>>()
             .map_err(|e| format!("nothing was updated: {e}"))?;
+        let lock = self.project.lock.clone();
+        let history = HistoryState {
+            redo: self.redo.clone(),
+            evicted: (self.undo.len() >= UNDO_STEPS)
+                .then(|| self.undo.first().cloned())
+                .flatten(),
+            dirty: self.dirty,
+            history: self.history,
+        };
         #[cfg(test)]
         if let Some(path) = self.block_after_snapshot.take() {
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::create_dir(&path);
         }
+        #[cfg(test)]
+        if let Some((path, text)) = self.rewrite_after_snapshot.take() {
+            std::fs::write(&path, text).map_err(|e| format!("test: {} cannot be rewritten: {e}", path.display()))?;
+        }
         self.archive_symbols();
         self.checkpoint();
-        let done = match wc_library::update(&self.dir, &mut self.project, lib, only) {
+        let done = match wc_library::update_items(&self.dir, &mut self.project, lib, &todo) {
             Ok(done) => done,
             Err(e) => {
-                // Some items may have been taken already: take them back too.
-                let mut unrestored: Vec<String> = parts
-                    .iter()
-                    .filter_map(|(path, was)| {
-                        restore_file(path, was.as_deref())
-                            .err()
-                            .map(|err| format!("{} ({err})", path.display()))
-                    })
-                    .collect();
-                self.reload_symbols();
-                let undone = self.undo();
-                self.redo.clear();
-                if let (false, Some(why)) = (undone, self.take_undo_error()) {
-                    unrestored.push(why);
-                }
+                // `update_items` put back what it wrote; only the undo step goes.
+                let unrestored = self.roll_back_update(&[], lock, history);
                 return Err(if unrestored.is_empty() {
                     e.to_string()
                 } else {
@@ -881,16 +906,53 @@ impl Open {
         }
         dangling.sort();
         let wires = dangling.join(", ");
-        if !self.undo() {
-            let why = self.take_undo_error().unwrap_or_default();
+        let unrestored = self.roll_back_update(&files, lock, history);
+        if !unrestored.is_empty() {
             return Err(format!(
-                "wires end on pins the new versions no longer have ({wires}), and the update could not be taken back: {why}"
+                "wires end on pins the new versions no longer have ({wires}), and the update could not be taken back: {}",
+                unrestored.join("; ")
             ));
         }
-        self.redo.clear();
         Err(format!(
             "nothing was updated: wires end on pins the new versions no longer have ({wires}). Move those wires first."
         ))
+    }
+
+    /// Take back a library update that failed: the files it wrote and the lock as they were
+    /// (`files`, `lock`), its undo step dropped, and the history as it was before it (`was`: the
+    /// Redo list, the oldest Undo step its checkpoint pushed out, whether there were unsaved
+    /// changes). Returns what could not be put back.
+    fn roll_back_update(
+        &mut self,
+        files: &[(PathBuf, Option<Vec<u8>>)],
+        lock: wc_core::Lockfile,
+        was: HistoryState,
+    ) -> Vec<String> {
+        let mut unrestored: Vec<String> = files
+            .iter()
+            .filter_map(|(path, was)| {
+                restore_file(path, was.as_deref())
+                    .err()
+                    .map(|err| format!("{} ({err})", path.display()))
+            })
+            .collect();
+        self.reload_symbols();
+        if !self.undo()
+            && let Some(why) = self.take_undo_error()
+        {
+            unrestored.push(why);
+        }
+        // Whatever undo managed, the lock is the one the files above match.
+        self.project.lock = lock;
+        self.redo = was.redo;
+        if let Some(oldest) = was.evicted {
+            self.undo.insert(0, oldest);
+            self.undo_dropped = self.undo_dropped.saturating_sub(1);
+        }
+        self.dirty = was.dirty;
+        self.history = was.history;
+        self.reload_symbols();
+        unrestored
     }
 
     /// Why the last Undo or Redo failed, once.
@@ -1186,7 +1248,7 @@ impl Open {
         // The set-aside steps counted as dropped while the change ran; they are back now.
         self.undo_dropped -= undo.len();
         undo.append(&mut self.undo);
-        let over = undo.len().saturating_sub(UNDO_LIMIT);
+        let over = undo.len().saturating_sub(UNDO_STEPS);
         undo.drain(..over);
         self.undo_dropped += over;
         self.undo = undo;
@@ -2144,6 +2206,106 @@ pub(crate) mod tests {
         let inside = o.start_live_form();
         o.keep(mark);
         assert_eq!(inside, o.undo_mark());
+    }
+
+    #[test]
+    fn an_update_takes_only_the_items_it_looked_at() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        // The library's coil file names another id: not an update when the update looks.
+        let mut wrong = old.clone();
+        wrong.id = "wc.other".into();
+        let lib = library_first(&mut o, tmp.path(), &wrong);
+        let file = tmp.path().join("mine/symbols/wc.coil.json");
+        std::fs::write(&file, serde_json::to_string(&wrong).unwrap()).unwrap();
+        // Fixed and changed right after the backups are taken.
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        o.rewrite_after_snapshot = Some((file, serde_json::to_string(&new).unwrap()));
+        let done = o.update_library(&lib, None).unwrap();
+        assert_eq!(done, vec![(ItemKind::Part, pid.to_owned())]);
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "the coil it did not look at is not taken"
+        );
+        assert_eq!(o.project.lock.symbols["wc.coil"].hash, old.hash());
+    }
+
+    #[test]
+    fn an_update_takes_no_newer_version_than_it_looked_at_and_keeps_redo() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        // An edit undone before the update: Redo must still bring it back after a failed one.
+        o.checkpoint();
+        o.project.pages[1].title = "Renamed".into();
+        assert!(o.undo());
+        assert!(o.can_redo());
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let part_before = std::fs::read(&part_file).unwrap();
+        let mut seen = changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        // The part changes again right after the backups are taken.
+        seen.description = "Changed again".into();
+        o.rewrite_after_snapshot = Some((
+            tmp.path().join(format!("mine/parts/{pid}.json")),
+            serde_json::to_string(&seen).unwrap(),
+        ));
+        let lock = o.project.lock.clone();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(
+            err.contains("changed in the library while it was being updated"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&part_file).unwrap(),
+            part_before,
+            "the part file is as it was"
+        );
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "and the coil"
+        );
+        assert_eq!(o.project.lock, lock);
+        assert!(o.can_redo(), "the earlier Redo is kept");
+        assert!(o.redo());
+        assert_eq!(o.project.pages[1].title, "Renamed");
+    }
+
+    #[test]
+    fn a_failed_update_leaves_a_full_undo_history_and_a_saved_project_as_they_were() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        for n in 0..UNDO_STEPS {
+            o.checkpoint();
+            o.project.pages[1].title = format!("Step {n}");
+        }
+        let mut seen = changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.save().unwrap();
+        let (undo, history, dropped) = (o.undo.clone(), o.history, o.undo_dropped);
+        seen.description = "Changed again".into();
+        o.rewrite_after_snapshot = Some((
+            tmp.path().join(format!("mine/parts/{pid}.json")),
+            serde_json::to_string(&seen).unwrap(),
+        ));
+        assert!(o.update_library(&lib, None).is_err());
+        assert_eq!(o.undo, undo, "the oldest Undo step is still there");
+        assert_eq!((o.history, o.undo_dropped), (history, dropped));
+        assert!(!o.dirty, "nothing to save");
     }
 
     #[test]
