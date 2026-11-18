@@ -28,6 +28,7 @@ marker text (or the line columns) and the count need mapping; Type and Group hel
 | Text lines | Line 1 to Line 3 | `--line marker,description` | one column per line; default one marker line |
 | Language | Language | `--lang en\|de\|nb` | the header row and the Type column |
 | One terminal strip | Terminal strip, or a terminal's menu in the Devices list | `--strip -X1` | limits the terminals to that strip; other kinds chosen as well (such as wires) are listed in full |
+| Level separator | Level separator | `--level-separator " / "` | written between the numbers of a multi-level terminal's levels; default ` / ` |
 
 A line shows one of:
 
@@ -40,6 +41,15 @@ A line shows one of:
 With a strip and no kinds, only that strip's terminals are written. With a strip and kinds, the
 strip limits the terminals and the other kinds are listed in full. An unknown kind, line,
 language or strip is refused before anything is written.
+
+## Multi-level terminals
+
+A double- or triple-deck terminal gets one marker, not one per level. A terminal's level is its
+`Level` device property (`1` at the bottom, `2` above it, ...): a terminal with level 2 or more
+sits on the same block as the terminal before it in the strip. So with `-X1.2` at level 2,
+`-X1.1` and `-X1.2` print as one marker `1 / 2`. The bottom level needs no property of its own.
+The terminal plan lists each level in its Level column. A `Level` that is not a whole number
+from 1 up is ignored, and the export warns about it with the device, the value and the reason.
 
 The app writes `export/wago-marking.csv`, or `export/wago-marking-<strip>.csv` for one strip.
 

@@ -288,7 +288,7 @@ fn terminal_plan_shows_jumpers() {
         symbols: &s,
         parts: &parts,
     });
-    assert_eq!(t.columns.last().map(String::as_str), Some("Jumpered with"));
+    assert_eq!(t.columns[6], "Jumpered with");
     let row = |strip: &str, n: &str| t.rows.iter().find(|r| r[0] == strip && r[1] == n).unwrap().clone();
     assert_eq!(row("-X1", "1")[6], "2");
     assert_eq!(row("-X1", "2")[6], "1");
@@ -889,4 +889,193 @@ fn only_a_terminal_on_an_overview_page_counts_as_drawn_for_a_jumper() {
     // A real terminal there does.
     p.pages.last_mut().unwrap().symbols[0].symbol = "term".into();
     assert!(!warned(&p), "an overview terminal counts");
+}
+
+#[test]
+fn a_two_level_terminal_shows_its_levels_and_shares_one_marker() {
+    let (mut p, s, parts) = fixture();
+    // -X1.1 and -X1.2 are the two levels of one terminal; -X1.3 and -X1.4 another one whose
+    // bottom level says so itself; -X1.5 stands alone.
+    for (id, tag, x) in [("t3", "-X1.3", 130.0), ("t4", "-X1.4", 135.0), ("t5", "-X1.5", 140.0)] {
+        p.pages[0].symbols.push(place(id, "term", x, Some(tag)));
+    }
+    for (tag, level) in [("-X1.2", "2"), ("-X1.3", "1"), ("-X1.4", " 2 "), ("-X1.5", "x")] {
+        let tag = DeviceTag::parse(tag).unwrap();
+        p.devices
+            .entry(tag)
+            .or_default()
+            .properties
+            .insert(LEVEL_PROPERTY.into(), level.into());
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let plan = terminal_plan(&i);
+    assert_eq!(plan.columns.last().map(String::as_str), Some("Level"));
+    let levels: Vec<(&str, &str)> = plan
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| (r[1].as_str(), r[7].as_str()))
+        .collect();
+    assert_eq!(
+        levels,
+        [("1", "1"), ("2", "2"), ("3", "1"), ("4", "2"), ("5", "")],
+        "the bottom level is 1 without a property; a bad level is none"
+    );
+    let marked = |sep: &str| -> Vec<String> {
+        let o = MarkingOptions {
+            strip: Some("-X1".into()),
+            level_separator: sep.into(),
+            ..MarkingOptions::default()
+        };
+        marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect()
+    };
+    assert_eq!(marked(LEVEL_SEPARATOR), ["1 / 2", "3 / 4", "5"]);
+    assert_eq!(marked("+"), ["1+2", "3+4", "5"]);
+    // Other strips are untouched.
+    assert_eq!(plan.rows.iter().find(|r| r[0] == "-X2").unwrap()[7], "");
+}
+
+#[test]
+fn levels_join_only_upwards_within_one_strip() {
+    let rows = |v: &[(&str, &str, Option<u32>)]| -> Vec<(String, String, Option<u32>)> {
+        v.iter().map(|(a, b, l)| ((*a).into(), (*b).into(), *l)).collect()
+    };
+    let got = marking::terminal_markers(
+        rows(&[
+            ("-X1", "1", Some(1)),
+            ("-X1", "2", Some(2)),
+            ("-X1", "3", Some(3)),
+            ("-X1", "4", Some(2)),
+            ("-X2", "1", Some(2)),
+            ("-X2", "2", None),
+        ]),
+        "/",
+    );
+    let got: Vec<String> = got.into_iter().map(|(s, m)| format!("{s} {m}")).collect();
+    assert_eq!(got, ["-X1 1/2/3", "-X1 4", "-X2 1", "-X2 2"]);
+}
+
+#[test]
+fn a_bad_level_is_warned_about_with_its_device_value_and_reason() {
+    let (mut p, _, _) = fixture();
+    for (tag, level) in [("-X1.1", "1"), ("-X1.2", "two"), ("-X1.3", "0")] {
+        p.devices
+            .entry(DeviceTag::parse(tag).unwrap())
+            .or_default()
+            .properties
+            .insert(LEVEL_PROPERTY.into(), level.into());
+    }
+    let w = level_warnings(&p);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("-X1.2") && w[0].contains("\"two\"") && w[0].contains("not a whole number"));
+    assert!(w[1].contains("-X1.3") && w[1].contains("\"0\"") && w[1].contains("start at 1"));
+}
+
+#[test]
+fn a_bottom_level_drawn_twice_gets_its_level_on_every_occurrence() {
+    let (mut p, s, parts) = fixture();
+    // -X1.1 is drawn a second time; -X1.2 says it is level 2.
+    p.pages[0].symbols.push(place("t9", "term", 150.0, Some("-X1.1")));
+    p.devices
+        .entry(DeviceTag::parse("-X1.2").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "2".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let levels: Vec<(String, String)> = terminal_plan(&i)
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| (r[1].clone(), r[7].clone()))
+        .collect();
+    assert!(
+        levels.iter().filter(|(n, _)| n == "1").all(|(_, l)| l == "1"),
+        "{levels:?}"
+    );
+    let o = MarkingOptions {
+        strip: Some("-X1".into()),
+        ..MarkingOptions::default()
+    };
+    let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
+    assert_eq!(marked, ["1 / 2"]);
+}
+
+#[test]
+fn strips_with_equal_natural_keys_keep_their_levels_together() {
+    let (mut p, s, parts) = fixture();
+    for (id, tag, x) in [
+        ("a1", "-X01.1", 160.0),
+        ("a2", "-X01.2", 165.0),
+        ("b1", "-X9.1", 170.0),
+        ("b2", "-X9.2", 175.0),
+        ("c1", "-X09.1", 180.0),
+        ("c2", "-X09.2", 185.0),
+    ] {
+        p.pages[0].symbols.push(place(id, "term", x, Some(tag)));
+    }
+    for tag in ["-X01.2", "-X9.2", "-X09.2"] {
+        p.devices
+            .entry(DeviceTag::parse(tag).unwrap())
+            .or_default()
+            .properties
+            .insert(LEVEL_PROPERTY.into(), "2".into());
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let marked: Vec<String> = marking_list_with(&i, &MarkingOptions::default())
+        .rows
+        .iter()
+        .filter(|r| r[2].contains(" / "))
+        .map(|r| r[2].clone())
+        .collect();
+    assert_eq!(
+        marked,
+        ["1 / 2", "1 / 2", "1 / 2"],
+        "-X01, -X09 and -X9 each give one block"
+    );
+}
+
+#[test]
+fn a_bottom_level_is_inferred_in_the_marking_order_and_never_over_a_bad_value() {
+    let set = |p: &mut wc_core::Project, tag: &str, level: &str| {
+        p.devices
+            .entry(DeviceTag::parse(tag).unwrap())
+            .or_default()
+            .properties
+            .insert(LEVEL_PROPERTY.into(), level.into());
+    };
+    let marked = |p: &wc_core::Project, s, parts| -> Vec<String> {
+        let i = Inputs {
+            project: p,
+            symbols: s,
+            parts,
+        };
+        let o = MarkingOptions {
+            strip: Some("-X1".into()),
+            ..MarkingOptions::default()
+        };
+        marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect()
+    };
+    // `1`, `01` and `2` in drawing order, only `2` at level 2: `1` is its bottom level.
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("t01", "term", 105.0, Some("-X1.01")));
+    set(&mut p, "-X1.2", "2");
+    assert_eq!(marked(&p, &s, &parts), ["01", "1 / 2"]);
+    // A bad value below level 2 is not taken as level 1.
+    let (mut p, s, parts) = fixture();
+    set(&mut p, "-X1.1", "two");
+    set(&mut p, "-X1.2", "2");
+    assert_eq!(marked(&p, &s, &parts), ["1", "2"]);
+    assert_eq!(level_warnings(&p).len(), 1);
 }

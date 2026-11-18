@@ -154,6 +154,7 @@ For the other areas, the chapter to read in each help is:
 | Terminal plan report | yes | yes | yes | done |
 | Terminal strip editor (reorder, add spares) | yes | yes | no | later |
 | Jumpers (bridges) between terminals | yes | yes | yes: project file, one net, terminal plan column, CLI and app; SolidWorks import to follow | done (#108) |
+| Multi-level terminals | yes | yes | yes: `Level` device property, terminal plan column, one WAGO marker per block | done (#124) |
 | Terminal and wire marking export (label printers) | yes | yes | yes: WAGO smartScript CSV with lines, engraving text, language and one-strip export ([docs](wago-marking.md)) | done (#57, #129) |
 | SolidWorks terminal strips on import | - | - | open | open PR (#104, issue #70) |
 
