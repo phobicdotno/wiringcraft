@@ -57,6 +57,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Delete),
             None,
             Some(Action::NumberWires),
+            Some(Action::TerminalStrips),
         ],
     ),
     (

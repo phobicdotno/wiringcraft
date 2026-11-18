@@ -863,6 +863,14 @@ fn check_names_a_jumper_terminal_drawn_nowhere() {
         "{found:?}"
     );
     assert!(!found.iter().any(|m| m.contains("terminal 1 is drawn nowhere")));
+    // A spare terminal is on the rail, not drawn: no warning.
+    p.meta.add_spare(&x1, "9", None, &[]).unwrap();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(!check(&i).iter().any(|f| f.message.contains("drawn nowhere")));
 }
 
 #[test]
@@ -1363,4 +1371,187 @@ fn a_jumper_part_is_counted_in_the_parts_list_and_written_for_the_configurator()
     .rows;
     let j1 = rows.iter().find(|r| r[0] == "-X1/J1").unwrap();
     assert_eq!((j1[6].as_str(), j1[8].as_str()), ("acme.bridge", "2-way jumper"));
+}
+
+#[test]
+fn the_terminal_strip_editors_order_and_spares_show_in_the_plan_and_the_configurator() {
+    let (mut p, s, mut parts) = fixture();
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    let term = Part {
+        id: "wago.2002-1201".into(),
+        manufacturer: "WAGO".into(),
+        order_number: "2002-1201".into(),
+        description: "2-conductor through terminal block".into(),
+        ..Default::default()
+    };
+    parts.insert(term.id.clone(), term.clone());
+    // Terminal 2 first, a spare S1 between 2 and 1, jumpered with 1; the spare has a part.
+    let current = vec![("1".to_owned(), false), ("2".to_owned(), false)];
+    p.meta.move_terminal(&x1, "2", 0, &current).unwrap();
+    let current = vec![("2".to_owned(), false), ("1".to_owned(), false)];
+    p.meta.add_spare(&x1, "S1", Some("2"), &current).unwrap();
+    p.meta.add_jumper(&x1, &["S1".to_owned(), "1".to_owned()]).unwrap();
+    p.devices.insert(
+        DeviceTag::parse("-X1.S1").unwrap(),
+        Device {
+            part: Some(term.id.clone()),
+            ..Default::default()
+        },
+    );
+    // A strip that is only spares.
+    p.meta
+        .add_spare(&DeviceTag::parse("-X9").unwrap(), "1", None, &[])
+        .unwrap();
+    let inputs = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = terminal_plan(&inputs);
+    let x1_rows: Vec<(&str, &str, &str)> = t
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| (r[1].as_str(), r[5].as_str(), r[6].as_str()))
+        .collect();
+    assert_eq!(x1_rows.len(), 3, "{x1_rows:?}");
+    assert_eq!(
+        (x1_rows[0].0, x1_rows[1], x1_rows[2].0),
+        ("2", ("S1", SPARE_PAGE, "1"), "1")
+    );
+    // The drawn terminals keep their wiring.
+    let one = t.rows.iter().find(|r| r[0] == "-X1" && r[1] == "1").unwrap();
+    assert_eq!(one[2], "=A+C1-K1:14");
+    assert_eq!(one[6], "S1");
+    let x9 = t.rows.iter().find(|r| r[0] == "-X9").unwrap();
+    assert_eq!((x9[1].as_str(), x9[5].as_str()), ("1", SPARE_PAGE));
+
+    let out = configurator_list(&inputs);
+    let terminals: Vec<(&str, &str, &str, &str)> = out
+        .table
+        .rows
+        .iter()
+        .filter(|r| r[1] == "Terminal" && r[2] == "-X1")
+        .map(|r| (r[3].as_str(), r[4].as_str(), r[6].as_str(), r[0].as_str()))
+        .collect();
+    assert_eq!(
+        terminals,
+        [
+            ("1", "2", "", "-X1/T1"),
+            ("2", "S1", "2002-1201", "-X1/T2"),
+            ("3", "1", "", "-X1/T3"),
+        ]
+    );
+    // The spare's row imports back onto its own device.
+    assert!(matches!(
+        out.targets.get("-X1/T2"),
+        Some(configurator::Target::Part(t)) if t.to_string() == "-X1.S1"
+    ));
+    // A spare without a device entry still names its own device for the import back.
+    assert!(matches!(
+        out.targets.get("-X9/T1"),
+        Some(configurator::Target::Part(t)) if t.to_string() == "-X9.1"
+    ));
+}
+
+#[test]
+fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_the_potential() {
+    let (mut p, s, parts) = fixture();
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    // -X1.1 and -X1.2 are one two-level terminal (the level above says so).
+    p.devices
+        .entry(DeviceTag::parse("-X1.2").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "2".into());
+    // On the rail 2 comes first, and a spare 1a (between 1 and 2 by number) is added.
+    let current = vec![("1".to_owned(), false), ("2".to_owned(), false)];
+    p.meta.move_terminal(&x1, "2", 0, &current).unwrap();
+    let current = vec![("2".to_owned(), false), ("1".to_owned(), false)];
+    p.meta.add_spare(&x1, "1a", None, &current).unwrap();
+    // -X2.1 is on 0V; a spare jumpered to it is too.
+    let x2 = DeviceTag::parse("-X2").unwrap();
+    p.meta.add_spare(&x2, "S1", None, &[("1".to_owned(), false)]).unwrap();
+    p.meta.add_jumper(&x2, &["1".to_owned(), "S1".to_owned()]).unwrap();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let plan = terminal_plan(&i);
+    let levels: Vec<(&str, &str)> = plan
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| (r[1].as_str(), r[7].as_str()))
+        .collect();
+    assert_eq!(levels, [("2", "2"), ("1", "1"), ("1a", "")]);
+    let o = MarkingOptions {
+        strip: Some("-X1".into()),
+        level_separator: LEVEL_SEPARATOR.into(),
+        ..MarkingOptions::default()
+    };
+    let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
+    assert_eq!(marked, ["1 / 2", "1a"]);
+    let spare = plan.rows.iter().find(|r| r[0] == "-X2" && r[1] == "S1").unwrap();
+    assert_eq!((spare[2].as_str(), spare[4].as_str()), ("", "0V"));
+
+    // A page numbered "spare" is not taken for a spare: the potential still comes through, and
+    // the drawn terminals keep their marker order.
+    for page in p.pages.iter_mut() {
+        page.number = SPARE_PAGE.into();
+    }
+    // A drawn terminal 0 without a level, on that page, is not taken for a spare either: its
+    // marker comes first, by number, not after the block.
+    let mut zero = p
+        .pages
+        .iter()
+        .flat_map(|pg| &pg.symbols)
+        .find(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == "-X1.1"))
+        .cloned()
+        .unwrap();
+    zero.id = "zero".into();
+    zero.at.x += 200.0;
+    zero.tag = Some(DeviceTag::parse("-X1.0").unwrap());
+    p.pages[0].symbols.push(zero);
+    // A spare with a bad level does not join the inference: 1 keeps level 1.
+    p.devices
+        .entry(DeviceTag::parse("-X1.1a").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "x".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let plan = terminal_plan(&i);
+    let level_of = |n: &str| plan.rows.iter().find(|r| r[0] == "-X1" && r[1] == n).unwrap()[7].clone();
+    assert_eq!((level_of("1"), level_of("1a")), ("1".to_owned(), String::new()));
+    let spare = plan.rows.iter().find(|r| r[0] == "-X2" && r[1] == "S1").unwrap();
+    assert_eq!(spare[4], "0V");
+    let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
+    assert_eq!(marked, ["0", "1 / 2", "1a"]);
+    // The spare -X1.1a has a device entry, but it is marked once, as a terminal.
+    let all = marking_list_with(&i, &MarkingOptions::default());
+    let named: Vec<&Vec<String>> = all.rows.iter().filter(|r| r.iter().any(|c| c.contains("1a"))).collect();
+    assert_eq!(named.len(), 1, "{named:?}");
+
+    // A spare named like a cable (W1) with a level of its own is a terminal, not a cable end.
+    p.meta.add_spare(&x1, "W1", None, &[]).unwrap();
+    p.devices
+        .entry(DeviceTag::parse("-X1.W1").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "1".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let all = marking_list_with(&i, &MarkingOptions::default());
+    let named: Vec<&Vec<String>> = all.rows.iter().filter(|r| r.iter().any(|c| c.contains("W1"))).collect();
+    assert_eq!(named.len(), 1, "{named:?}");
+    let terminal = MarkerKind::Terminals.label(MarkingOptions::default().language);
+    assert_eq!(named[0][..3], [terminal.to_owned(), "-X1".to_owned(), "W1".to_owned()]);
 }

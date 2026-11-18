@@ -1476,4 +1476,49 @@ mod tests {
         assert_eq!(plan.assignments.len(), 1, "{plan:#?}");
         assert_eq!(plan.assignments[0].slot, Slot::Accessory(0));
     }
+
+    #[test]
+    fn an_article_for_a_spare_terminal_survives_the_import_and_a_reload() {
+        let (mut p, symbols) = project();
+        let x1 = tag("-X1");
+        let current: Vec<(String, bool)> = ["1", "2", "3"].iter().map(|n| ((*n).to_owned(), false)).collect();
+        p.meta.add_spare(&x1, "S1", None, &current).unwrap();
+        let parts = candidates();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let out = wc_report::configurator_list(&inputs);
+        let index = out
+            .targets
+            .iter()
+            .find(|(_, t)| matches!(t, Target::Part(d) if *d == tag("-X1.S1")))
+            .map(|(k, _)| k.clone())
+            .unwrap();
+        let mut t = out.table;
+        let r = t.rows.iter_mut().find(|r| r[0] == index).unwrap();
+        r[6] = "2002-1201".into();
+        r[7] = "WAGO".into();
+        let bytes = wc_report::to_smartscript_csv(&t);
+        let (rows, _) = read_configured(bytes.as_bytes()).unwrap();
+        let plan = plan(&inputs, &library(&parts), &rows);
+        assert!(apply(&mut p, &plan) >= 1, "{plan:?}");
+        assert_eq!(
+            p.devices.get(&tag("-X1.S1")).and_then(|d| d.part.as_deref()),
+            Some("wago.2002-1201")
+        );
+        // The device key of the spare loads again, with the spare still on its strip.
+        let dir = tempfile::tempdir().unwrap();
+        wc_core::store::save(dir.path(), &p).unwrap();
+        let back = wc_core::store::load(dir.path()).unwrap();
+        assert_eq!(
+            back.devices.get(&tag("-X1.S1")).and_then(|d| d.part.as_deref()),
+            Some("wago.2002-1201")
+        );
+        assert_eq!(
+            back.meta.strip_layout(&x1).map(|l| l.spares.clone()),
+            Some(vec!["S1".to_owned()])
+        );
+    }
 }

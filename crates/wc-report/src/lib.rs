@@ -496,7 +496,7 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
 pub const LEVEL_PROPERTY: &str = "Level";
 
 /// A [`LEVEL_PROPERTY`] value as a level, or why it is not one.
-fn parse_level(value: &str) -> Result<u32, String> {
+pub fn parse_level(value: &str) -> Result<u32, String> {
     match value.trim().parse::<u32>() {
         Ok(0) => Err("levels start at 1".into()),
         Ok(l) => Ok(l),
@@ -538,6 +538,51 @@ pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
         .collect()
 }
 
+/// The level of each terminal of `strip` that has one: its own valid [`LEVEL_PROPERTY`], or 1
+/// for a terminal with no `Level` of its own right below one at level 2 or more. `drawn` is the
+/// strip's drawn terminals in the usual (number) order, each once.
+///
+/// Levels are inferred in that order, so moving terminals on the rail never changes a terminal's
+/// level or which block it is in. The strip's spares count only when they have a valid level of
+/// their own, so adding a spare without one never splits a block; a spare with a valid level
+/// joins the number order and can change the blocks (and their markers) like a drawn terminal
+/// with that level would. This is what the terminal plan's Level column
+/// shows; the terminal strip editor shows it too.
+pub fn strip_levels(project: &wc_core::Project, strip: &str, drawn: Vec<String>) -> BTreeMap<String, u32> {
+    let mut usual = drawn;
+    let layout = project.meta.strips.iter().find(|l| l.strip.to_string() == strip);
+    for spare in layout.iter().flat_map(|l| &l.spares) {
+        // Only a valid level of its own counts; a bad value is reported by level_warnings.
+        if usual.contains(spare) || terminal_level(project, strip, spare).is_none() {
+            continue;
+        }
+        let key = (natural_key(spare), spare.clone());
+        let at = usual.partition_point(|n| (natural_key(n), n.clone()) < key);
+        usual.insert(at, spare.clone());
+    }
+    let mut by_number = BTreeMap::new();
+    for (k, n) in usual.iter().enumerate() {
+        let own = terminal_level(project, strip, n);
+        // The bottom level of a block needs no property of its own: the level above says so.
+        // A bad value is not missing: that terminal stays single-level, as its warning says.
+        let missing = level_value(project, strip, n).is_none();
+        let below = || {
+            usual
+                .get(k + 1)
+                .and_then(|up| terminal_level(project, strip, up))
+                .filter(|l| missing && *l >= 2)
+                .map(|_| 1)
+        };
+        if let Some(l) = own.or_else(below) {
+            by_number.insert(n.clone(), l);
+        }
+    }
+    by_number
+}
+
+/// What the terminal plan's Page column says for a spare terminal, which no page draws.
+pub const SPARE_PAGE: &str = "spare";
+
 /// Terminal plan: for every terminal strip, each terminal with what connects to its two sides.
 ///
 /// The last column is the terminal's level on a multi-level terminal (see [`LEVEL_PROPERTY`]):
@@ -546,8 +591,17 @@ pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
 ///
 /// A terminal is a symbol with the terminal role. Its strip and number come from the tag:
 /// `-X1.3` is terminal 3 of strip `-X1`. Terminals tagged with just the strip (`-X1`) are
-/// numbered in drawing order (page, then left to right).
+/// numbered in drawing order (page, then left to right). Terminals come by number, unless the
+/// terminal strip editor put the strip in another order ([`wc_core::project::StripLayout`]);
+/// its spare terminals are listed with [`SPARE_PAGE`] in the Page column.
 pub fn terminal_plan(i: &Inputs<'_>) -> Table {
+    terminal_plan_with_spares(i).0
+}
+
+/// [`terminal_plan`], with which of its rows are spare terminals (by row index): a spare is
+/// known by where it comes from, not by what its Page cell says.
+pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usize>) {
+    let mut spare_rows: BTreeSet<usize> = BTreeSet::new();
     let mut t = Table::new(
         "Terminal plan",
         &[
@@ -651,6 +705,10 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
     for term in terms {
         strips.entry(term.strip.clone()).or_default().push(term);
     }
+    // A strip arranged in the terminal strip editor is listed even when only spares are on it.
+    for l in &i.project.meta.strips {
+        strips.entry(l.strip.to_string()).or_default();
+    }
     for (strip, mut list) in strips {
         // Numbered ones by number; unnumbered ones keep drawing order and are numbered after.
         let page_order = |id: &str| i.project.pages.iter().position(|p| p.id == id).unwrap_or(usize::MAX);
@@ -667,6 +725,15 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                     .then(a.x.total_cmp(&b.x)),
             }
         });
+        // As wc_core::project::terminal_numbers: a spare's number is taken.
+        let spares = i
+            .project
+            .meta
+            .strips
+            .iter()
+            .find(|l| l.strip.to_string() == strip)
+            .map(|l| l.spares.as_slice())
+            .unwrap_or(&[]);
         let mut next = list
             .iter()
             .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
@@ -678,36 +745,79 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 let number = term
                     .number
                     .clone()
-                    .or_else(|| wc_core::project::next_number(&mut next))
+                    .or_else(|| wc_core::project::next_free_number(&mut next, spares))
                     .unwrap_or_default();
                 (term, number)
             })
             .collect();
-        // Levels are inferred over distinct terminals: a terminal drawn twice has one level.
-        let mut distinct: Vec<&str> = numbered.iter().map(|(_, n)| n.as_str()).collect();
-        distinct.dedup();
-        let mut by_number: BTreeMap<&str, u32> = BTreeMap::new();
-        for (k, n) in distinct.iter().enumerate() {
-            let own = terminal_level(i.project, &strip, n);
-            // The bottom level of a block needs no property of its own: the level above says so.
-            // A bad value is not missing: that terminal stays single-level, as its warning says.
-            let missing = level_value(i.project, &strip, n).is_none();
-            let below = || {
-                distinct
-                    .get(k + 1)
-                    .and_then(|up| terminal_level(i.project, &strip, up))
-                    .filter(|l| missing && *l >= 2)
-                    .map(|_| 1)
-            };
-            if let Some(l) = own.or_else(below) {
-                by_number.insert(n, l);
+        // The rail order and spares the terminal strip editor set: a terminal drawn twice
+        // stays together, a spare gets a row of its own with nothing connected.
+        let layout = i.project.meta.strips.iter().find(|l| l.strip.to_string() == strip);
+        let mut usual: Vec<String> = numbered.iter().map(|(_, n)| n.clone()).collect();
+        usual.dedup();
+        let by_number = strip_levels(i.project, &strip, usual);
+        let numbered: Vec<(Option<Term>, String)> = match layout {
+            None => numbered.into_iter().map(|(t, n)| (Some(t), n)).collect(),
+            Some(layout) => {
+                let mut drawn: Vec<String> = numbered.iter().map(|(_, n)| n.clone()).collect();
+                drawn.dedup();
+                let mut rest: Vec<Option<(Term, String)>> = numbered.into_iter().map(Some).collect();
+                let mut out = Vec::new();
+                for (n, spare) in layout.arrange(&drawn) {
+                    if spare {
+                        out.push((None, n));
+                        continue;
+                    }
+                    for slot in rest.iter_mut() {
+                        if slot.as_ref().is_some_and(|(_, m)| *m == n)
+                            && let Some((t, m)) = slot.take()
+                        {
+                            out.push((Some(t), m));
+                        }
+                    }
+                }
+                out
             }
-        }
+        };
         let levels: Vec<Option<u32>> = numbered
             .iter()
             .map(|(_, n)| by_number.get(n.as_str()).copied())
             .collect();
         for ((term, number), level) in numbered.into_iter().zip(levels) {
+            let level = level.map(|l| l.to_string()).unwrap_or_default();
+            let Some(term) = term else {
+                // A spare: on the rail, not drawn. Its jumper can still be set.
+                let jumpered = DeviceTag::parse(&strip)
+                    .ok()
+                    .and_then(|st| {
+                        i.project
+                            .meta
+                            .jumpers
+                            .iter()
+                            .find(|j| j.strip == st && j.terminals.contains(&number))
+                    })
+                    .map(|j| {
+                        j.terminals
+                            .iter()
+                            .filter(|t| **t != number)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                spare_rows.insert(t.rows.len());
+                t.rows.push(vec![
+                    strip.clone(),
+                    number,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    SPARE_PAGE.to_owned(),
+                    jumpered,
+                    level,
+                ]);
+                continue;
+            };
             let side = |n: usize| -> (String, Option<String>) {
                 let Some(pin) = term.pins.get(n) else {
                     return (String::new(), None);
@@ -725,11 +835,44 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 pa.or(pb).unwrap_or_default(),
                 term.page.clone(),
                 term.jumpered.clone(),
-                level.map(|l| l.to_string()).unwrap_or_default(),
+                level,
             ]);
         }
     }
-    t
+    // A spare has no wiring of its own, but a jumper to a drawn terminal puts it on that
+    // terminal's potential.
+    for &k in &spare_rows {
+        let cell = |r: &[String], c: usize| r.get(c).cloned().unwrap_or_default();
+        let Some(row) = t.rows.get(k) else { continue };
+        if !cell(row, 4).is_empty() {
+            continue;
+        }
+        let (strip, number) = (cell(row, 0), cell(row, 1));
+        let Some(jumper) = DeviceTag::parse(&strip).ok().and_then(|st| {
+            i.project
+                .meta
+                .jumpers
+                .iter()
+                .find(|j| j.strip == st && j.terminals.contains(&number))
+        }) else {
+            continue;
+        };
+        let potential = t
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(n, r)| {
+                !spare_rows.contains(n)
+                    && cell(r, 0) == strip
+                    && jumper.terminals.contains(&cell(r, 1))
+                    && !cell(r, 4).is_empty()
+            })
+            .map(|(_, r)| cell(r, 4));
+        if let (Some(p), Some(slot)) = (potential, t.rows.get_mut(k).and_then(|r| r.get_mut(4))) {
+            *slot = p;
+        }
+    }
+    (t, spare_rows)
 }
 
 /// Table of contents: every schematic page with its title and what is drawn on it.

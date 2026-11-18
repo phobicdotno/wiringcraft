@@ -57,6 +57,7 @@ pub enum Action {
     ExportWagoMarking,
     ExportWagoConfigurator,
     ImportWagoConfigurator,
+    TerminalStrips,
     NumberWires,
     Reports,
     Check,
@@ -168,6 +169,7 @@ impl Action {
         Action::ExportWagoMarking,
         Action::ExportWagoConfigurator,
         Action::ImportWagoConfigurator,
+        Action::TerminalStrips,
         Action::NumberWires,
         Action::Reports,
         Action::Check,
@@ -430,6 +432,12 @@ impl Action {
                 Icon::Reports,
                 "",
             ),
+            Action::TerminalStrips => i(
+                "Terminal strips",
+                "Edit terminal strips: order the terminals on the rail, add spares, set levels; the terminal plan and WAGO export follow",
+                Icon::Reports,
+                "",
+            ),
             Action::NumberWires => i(
                 "Number wires",
                 "Give every connection without a number one, from its page and column (3.4)",
@@ -610,6 +618,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::DeletePage,
                 ],
             ),
+            ("Terminals", &[Action::TerminalStrips]),
             (
                 "View",
                 &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],

@@ -2617,6 +2617,7 @@ mod tests {
             share: Default::default(),
             symbol_editor: None,
             find: None,
+            strip_editor: None,
         };
         (tmp, app)
     }
