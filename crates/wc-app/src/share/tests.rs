@@ -530,6 +530,48 @@ fn a_version_the_copy_has_not_taken_yet_still_goes_when_the_session_takes_back_t
     assert_eq!(next_seen(&seen, &v2, &v2), v2.lock);
 }
 
+#[test]
+fn a_part_taken_back_leaves_the_part_list_unless_a_library_offers_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(&tmp.path().join("p"))?;
+    let lib = wc_library::Library::open(&open.dir, &open.project)?;
+    let (lamp, _) = lib.part("example.ex-lamp-24-gn")?;
+    let mut own = lamp.clone();
+    own.id = "own.part".into();
+    store::write_vendored_part(&open.dir, &own)?;
+    for p in [&lamp, &own] {
+        let entry = wc_core::LockEntry {
+            hash: p.hash(),
+            source: "starter".into(),
+        };
+        open.project.lock.parts.insert(p.id.clone(), entry);
+        open.parts.insert(p.id.clone(), p.clone());
+        if !open.part_library.iter().any(|(i, _)| *i == p.id) {
+            open.part_library.push((p.id.clone(), p.id.clone()));
+        }
+    }
+    let mut seen = Some(open.project.lock.clone());
+    let base = open.project.clone();
+    let auth = Project::new("Pump station");
+    let mut unload = std::collections::BTreeSet::new();
+    assert_eq!(follow_take_backs(&mut seen, &mut unload, &mut open, &base, &auth), None);
+    assert!(open.project.lock.parts.is_empty());
+    assert!(
+        open.part_library.iter().any(|(i, _)| i == "example.ex-lamp-24-gn"),
+        "the library still offers it"
+    );
+    assert!(
+        !open.part_library.iter().any(|(i, _)| i == "own.part"),
+        "nothing offers it any more"
+    );
+    assert!(open.parts.is_empty() && unload.is_empty(), "neither copy is used here");
+    assert!(
+        store::read_vendored_part(&open.dir, "own.part").is_ok(),
+        "the file stays"
+    );
+    Ok(())
+}
+
 /// Run frames of both windows until `done` or a few seconds have passed.
 fn until(
     a: (&mut Share, &mut Open, &str),
