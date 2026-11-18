@@ -8,8 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::geom::Align;
 
-/// Height of the title block band at the bottom of every page, in millimetres.
+/// Height of the title block band at the bottom of every page, in millimetres, unless the
+/// template sets another ([`PageTemplate::height`]).
 pub const TITLE_HEIGHT: f64 = 24.0;
+/// The lowest title block band a template can ask for, in millimetres.
+pub const MIN_TITLE_HEIGHT: f64 = 10.0;
+/// The tallest title block band a template can ask for, in millimetres.
+pub const MAX_TITLE_HEIGHT: f64 = 60.0;
 /// The most reference columns a template can ask for.
 pub const MAX_COLUMNS: usize = 40;
 /// Padding between a title-block text and its box's sides, in millimetres.
@@ -39,6 +44,10 @@ pub struct PageTemplate {
     /// numbers by column use the same count.
     #[serde(default = "default_columns")]
     pub columns: usize,
+    /// Height of the title block band in millimetres ([`MIN_TITLE_HEIGHT`] to
+    /// [`MAX_TITLE_HEIGHT`]); [`TITLE_HEIGHT`] when not set.
+    #[serde(default = "default_height", skip_serializing_if = "is_default_height")]
+    pub height: f64,
     /// The title block's boxes, drawn in this order.
     #[serde(default, rename = "box")]
     pub boxes: Vec<TitleBox>,
@@ -46,6 +55,14 @@ pub struct PageTemplate {
 
 fn default_columns() -> usize {
     10
+}
+
+fn default_height() -> f64 {
+    TITLE_HEIGHT
+}
+
+fn is_default_height(h: &f64) -> bool {
+    *h == TITLE_HEIGHT
 }
 
 /// Which side of the frame a box edge is measured from.
@@ -65,7 +82,7 @@ impl Side {
 
 /// One box of the title block. Its sides are millimetres from the frame's left or right edge,
 /// so boxes measured from the right stay at the right on every sheet size; its top and bottom
-/// are millimetres down from the top of the title block band (0 to [`TITLE_HEIGHT`]).
+/// are millimetres down from the top of the title block band (0 to its height).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TitleBox {
     /// The small caption in the box's top-left corner; empty for none.
@@ -153,8 +170,9 @@ impl TitleBox {
     }
 
     /// The box's sides on a frame running from `x0` to `x1`, clamped to the frame, and its top
-    /// and bottom below the band's top, clamped to the band. `None` when nothing is left of it.
-    pub fn resolve(&self, x0: f64, x1: f64) -> Option<(f64, f64, f64, f64)> {
+    /// and bottom below the band's top, clamped to the band of height `band`. `None` when
+    /// nothing is left of it.
+    pub fn resolve(&self, x0: f64, x1: f64, band: f64) -> Option<(f64, f64, f64, f64)> {
         let at = |mm: f64, from: Side| match from {
             Side::Left => x0 + mm,
             Side::Right => x1 - mm,
@@ -162,8 +180,8 @@ impl TitleBox {
         let clamp = |v: f64, lo: f64, hi: f64| if v.is_nan() { lo } else { v.clamp(lo, hi) };
         let left = clamp(at(self.left, self.left_from), x0, x1);
         let right = clamp(at(self.right, self.right_from), x0, x1);
-        let top = clamp(self.top, 0.0, TITLE_HEIGHT);
-        let bottom = clamp(self.bottom, 0.0, TITLE_HEIGHT);
+        let top = clamp(self.top, 0.0, band);
+        let bottom = clamp(self.bottom, 0.0, band);
         (right - left > 1e-6 && bottom - top > 1e-6).then_some((left, top, right, bottom))
     }
 }
@@ -177,6 +195,7 @@ impl Default for PageTemplate {
         let full = TITLE_HEIGHT;
         Self {
             columns: default_columns(),
+            height: TITLE_HEIGHT,
             boxes: vec![
                 TitleBox::new("Customer", (0.0, Left), (80.0, Left), 0.0, half).with(BoxText::new(
                     &["customer"],
@@ -245,6 +264,66 @@ impl PageTemplate {
         *self == Self::default()
     }
 
+    /// Why this template cannot be used, if it cannot: a column count outside 1 to
+    /// [`MAX_COLUMNS`], or a box or text whose numbers are not finite, a box that is not inside
+    /// the title block band (top above bottom, both within 0 to its height), a band height
+    /// outside [`MIN_TITLE_HEIGHT`] to [`MAX_TITLE_HEIGHT`], a negative
+    /// edge distance or a text height that is not positive. For templates that come from
+    /// outside the app's form (the assistant, a hand-edited file).
+    pub fn problem(&self) -> Option<String> {
+        if !(1..=MAX_COLUMNS).contains(&self.columns) {
+            return Some(format!(
+                "the column count must be 1 to {MAX_COLUMNS}, not {}",
+                self.columns
+            ));
+        }
+        if !(MIN_TITLE_HEIGHT..=MAX_TITLE_HEIGHT).contains(&self.height) {
+            return Some(format!(
+                "the title block height must be {MIN_TITLE_HEIGHT} to {MAX_TITLE_HEIGHT} mm, not {}",
+                self.height
+            ));
+        }
+        let band = self.height;
+        for (i, b) in self.boxes.iter().enumerate() {
+            let name = if b.label.is_empty() {
+                format!("box {}", i + 1)
+            } else {
+                format!("box {} ({})", i + 1, b.label)
+            };
+            if ![b.left, b.right, b.top, b.bottom].iter().all(|v| v.is_finite()) {
+                return Some(format!("{name}: every edge must be a number"));
+            }
+            if b.left < 0.0 || b.right < 0.0 {
+                return Some(format!(
+                    "{name}: left and right are distances from the frame edge, 0 or more"
+                ));
+            }
+            if !(0.0 <= b.top && b.top < b.bottom && b.bottom <= band) {
+                return Some(format!(
+                    "{name}: top must be above bottom, both 0 to {band} mm down the title block"
+                ));
+            }
+            for t in &b.texts {
+                if !(t.size.is_finite() && t.size > 0.0 && t.y.is_finite() && t.inset.is_finite()) {
+                    return Some(format!(
+                        "{name}: a text needs a positive height and numbers for y and inset"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// The title block band's height in use: [`Self::height`] kept within [`MIN_TITLE_HEIGHT`]
+    /// to [`MAX_TITLE_HEIGHT`] ([`TITLE_HEIGHT`] for a value that is not a number).
+    pub fn band_height(&self) -> f64 {
+        if self.height.is_finite() {
+            self.height.clamp(MIN_TITLE_HEIGHT, MAX_TITLE_HEIGHT)
+        } else {
+            TITLE_HEIGHT
+        }
+    }
+
     /// The column count in use: [`Self::columns`] kept within 1 to [`MAX_COLUMNS`].
     pub fn column_count(&self) -> usize {
         self.columns.clamp(1, MAX_COLUMNS)
@@ -297,17 +376,85 @@ mod tests {
         let b = &t.boxes[0];
         assert_eq!((b.top, b.bottom, b.right_from), (0.0, TITLE_HEIGHT, Side::Right));
         assert_eq!((b.texts[0].align, b.texts[0].inset), (Align::Left, PAD));
-        assert_eq!(b.resolve(10.0, 410.0), Some((10.0, 0.0, 360.0, TITLE_HEIGHT)));
+        assert_eq!(
+            b.resolve(10.0, 410.0, TITLE_HEIGHT),
+            Some((10.0, 0.0, 360.0, TITLE_HEIGHT))
+        );
     }
 
     #[test]
     fn boxes_are_clamped_to_the_frame_and_empty_ones_dropped() {
         let b = TitleBox::new("", (-5.0, Side::Left), (500.0, Side::Left), -1.0, 99.0);
-        assert_eq!(b.resolve(10.0, 410.0), Some((10.0, 0.0, 410.0, TITLE_HEIGHT)));
+        assert_eq!(
+            b.resolve(10.0, 410.0, TITLE_HEIGHT),
+            Some((10.0, 0.0, 410.0, TITLE_HEIGHT))
+        );
         let b = TitleBox::new("", (50.0, Side::Left), (40.0, Side::Left), 0.0, 12.0);
-        assert_eq!(b.resolve(10.0, 410.0), None);
+        assert_eq!(b.resolve(10.0, 410.0, TITLE_HEIGHT), None);
         let b = TitleBox::new("", (f64::NAN, Side::Left), (40.0, Side::Left), 0.0, 12.0);
-        assert_eq!(b.resolve(10.0, 410.0), Some((10.0, 0.0, 50.0, 12.0)));
+        assert_eq!(b.resolve(10.0, 410.0, TITLE_HEIGHT), Some((10.0, 0.0, 50.0, 12.0)));
+    }
+
+    #[test]
+    fn the_title_block_height_is_saved_only_when_changed_and_kept_in_range() {
+        let t = PageTemplate::default();
+        assert_eq!(t.height, TITLE_HEIGHT);
+        assert!(!toml::to_string(&t).unwrap().contains("height"));
+        let tall = PageTemplate {
+            height: 36.0,
+            ..Default::default()
+        };
+        let text = toml::to_string(&tall).unwrap();
+        assert!(text.contains("height = 36"), "{text}");
+        assert_eq!(toml::from_str::<PageTemplate>(&text).unwrap(), tall);
+        assert!(!tall.is_default());
+        assert_eq!(tall.problem(), None);
+        // Out of range: named by problem, clamped where drawn.
+        for (h, used) in [
+            (5.0, MIN_TITLE_HEIGHT),
+            (70.0, MAX_TITLE_HEIGHT),
+            (f64::NAN, TITLE_HEIGHT),
+        ] {
+            let t = PageTemplate {
+                height: h,
+                ..Default::default()
+            };
+            assert!(t.problem().is_some_and(|p| p.contains("height")), "{h}");
+            assert_eq!(t.band_height(), used);
+        }
+        // A box may reach the bottom of a taller band, not past it.
+        let mut t = tall.clone();
+        t.boxes[0].bottom = 36.0;
+        assert_eq!(t.problem(), None);
+        t.boxes[0].bottom = 36.5;
+        assert!(t.problem().is_some_and(|p| p.contains("box 1")));
+        assert_eq!(t.boxes[0].resolve(10.0, 410.0, 36.0).map(|r| r.3), Some(36.0));
+    }
+
+    #[test]
+    fn the_built_in_template_is_valid_and_bad_ones_say_why() {
+        assert_eq!(PageTemplate::default().problem(), None);
+        let t = PageTemplate {
+            columns: 0,
+            ..Default::default()
+        };
+        assert!(t.problem().is_some_and(|p| p.contains("column count")));
+        let mut t = PageTemplate::default();
+        t.boxes[0].bottom = TITLE_HEIGHT + 1.0;
+        assert!(t.problem().is_some_and(|p| p.contains("box 1")));
+        let mut t = PageTemplate::default();
+        t.boxes[0].left = f64::NAN;
+        assert!(t.problem().is_some());
+        let mut t = PageTemplate::default();
+        t.boxes.push(
+            TitleBox::new("x", (0.0, Side::Left), (1.0, Side::Left), 0.0, 5.0).with(BoxText::new(
+                &["x"],
+                0.0,
+                1.0,
+                Align::Left,
+            )),
+        );
+        assert!(t.problem().is_some_and(|p| p.contains("text")));
     }
 
     #[test]

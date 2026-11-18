@@ -33,6 +33,10 @@ pub const MAX_OBJECTS: usize = 4_000_000;
 
 /// The key under which objects that could not be decoded are counted in [`Drawing::skipped`].
 pub const DAMAGED: &str = "damaged objects";
+
+/// The skipped-count key for blocks whose base point could not be read: they are kept, placed
+/// as if their base point were (0, 0).
+pub const BASE_UNREAD: &str = "block base points not read (placed from 0, 0)";
 /// The key under which entities whose owner is not in the drawing are counted.
 pub const ORPHANS: &str = "entities without an owner";
 
@@ -50,8 +54,9 @@ pub struct Drawing {
     pub model_points: Vec<Point>,
     /// How many of each kind of entity or object were not read, by type name.
     pub skipped: BTreeMap<String, usize>,
-    /// Why objects counted under [`DAMAGED`] could not be decoded: handle, offset and reason,
-    /// for the first [`MAX_REASONS`] of them.
+    /// Why objects counted under [`DAMAGED`] could not be decoded (handle, offset and reason),
+    /// then why base points counted under [`BASE_UNREAD`] could not be read, for the first
+    /// [`MAX_REASONS`] of them.
     pub damaged: Vec<String>,
 }
 
@@ -125,6 +130,12 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
             if damaged.len() < MAX_REASONS {
                 damaged.push(format!("object {handle:X} at {at}: {e}"));
             }
+        }
+    }
+    for reason in std::mem::take(&mut decoded.base_errors) {
+        *skipped.entry(BASE_UNREAD.to_owned()).or_default() += 1;
+        if damaged.len() < MAX_REASONS {
+            damaged.push(reason);
         }
     }
     Ok(Read {
@@ -323,6 +334,10 @@ struct Decoded {
     items: Vec<Item>,
     /// Block names by the handle of their BLOCK_HEADER.
     blocks: HashMap<u64, String>,
+    /// Block base points other than (0, 0), by the handle of their BLOCK_HEADER.
+    bases: HashMap<u64, (f64, f64)>,
+    /// Why a block's base point could not be read, per block.
+    base_errors: Vec<String>,
     /// Layer names by handle.
     layers: HashMap<u64, String>,
     /// Invisible entities, whose vertices and attributes are left out with them.
@@ -385,6 +400,34 @@ fn read_entity(kind: u16) -> Option<&'static str> {
     })
 }
 
+/// The base point of a BLOCK_HEADER whose name has been read.
+fn block_base(o: &mut Object) -> Result<(f64, f64)> {
+    // The xref flags of a table entry: 64-flag, xref index and xref dependent up to 2004, only
+    // the xref index from 2007 on.
+    if o.version == Version::R2004 {
+        o.data.b()?;
+        o.data.bs()?;
+        o.data.b()?;
+    } else {
+        o.data.bs()?;
+    }
+    // Anonymous, has attributes, is an xref, is an overlaid xref, xref loaded.
+    o.data.b()?;
+    o.data.b()?;
+    let xref = o.data.b()?;
+    let overlaid = o.data.b()?;
+    o.data.b()?;
+    // How many objects it owns, for a block that is not an xref.
+    if !xref && !overlaid {
+        o.data.bl()?;
+    }
+    let (x, y, _) = o.data.bd3()?;
+    if !(x.is_finite() && y.is_finite()) {
+        return Err(bad("a block's base point is not a number"));
+    }
+    Ok((x, y))
+}
+
 /// Decode the object at `at` into `out`.
 fn decode(
     objects: &[u8],
@@ -404,12 +447,21 @@ fn decode(
         o.data.bl()?;
         o.data.b()?;
         let name = o.text()?;
-        let table = if o.kind == LAYER {
-            &mut out.layers
+        if o.kind == LAYER {
+            out.layers.insert(handle, name);
         } else {
-            &mut out.blocks
-        };
-        table.insert(handle, name);
+            // A base point that cannot be read leaves the block at (0, 0) rather than unnamed.
+            match block_base(&mut o) {
+                Ok(base) if base != (0.0, 0.0) => {
+                    out.bases.insert(handle, base);
+                }
+                Ok(_) => {}
+                Err(e) => out
+                    .base_errors
+                    .push(format!("base point of block {name} (object {handle:X}): {e}")),
+            }
+            out.blocks.insert(handle, name);
+        }
         return Ok(());
     }
     if let Some(name) = unread_entity(o.kind) {
@@ -800,6 +852,8 @@ impl Decoded {
         let Decoded {
             items,
             blocks,
+            bases,
+            base_errors: _,
             layers,
             hidden,
         } = self;
@@ -815,9 +869,12 @@ impl Decoded {
             }
         }
         let mut d = dxf::Drawing::default();
-        for name in blocks.values() {
+        for (h, name) in &blocks {
             if !is_space(name) {
                 d.blocks.entry(name.clone()).or_default();
+                if let Some(base) = bases.get(h) {
+                    d.bases.insert(name.clone(), *base);
+                }
             }
         }
         for item in &items {

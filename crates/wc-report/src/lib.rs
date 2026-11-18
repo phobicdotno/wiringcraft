@@ -261,6 +261,16 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
             }
         }
     }
+    // Jumpers with a part count once each, under their strip.
+    for j in &i.project.meta.jumpers {
+        if let Some(part) = &j.part {
+            let (n, tags) = by_part.entry(part.clone()).or_default();
+            *n += 1;
+            if !tags.contains(&j.strip) {
+                tags.push(j.strip.clone());
+            }
+        }
+    }
     let mut pos = 0;
     for (part_id, (qty, tags)) in &by_part {
         pos += 1;

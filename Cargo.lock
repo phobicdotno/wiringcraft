@@ -3771,6 +3771,7 @@ dependencies = [
  "serde_json",
  "sevenz-rust2",
  "tempfile",
+ "toml 0.8.23",
  "wc-core",
  "wc-import",
  "wc-library",
@@ -3844,6 +3845,7 @@ dependencies = [
 name = "wc-share"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "tempfile",

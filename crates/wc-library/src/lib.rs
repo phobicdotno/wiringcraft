@@ -245,6 +245,14 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
                     .iter()
                     .filter(|(_, d)| d.uses_part(&id))
                     .map(|(t, _)| t.to_string())
+                    .chain(
+                        project
+                            .meta
+                            .jumpers
+                            .iter()
+                            .filter(|j| j.part.as_deref() == Some(id.as_str()))
+                            .map(|j| format!("{} jumper {}", j.strip, j.terminals.join("-"))),
+                    )
                     .collect(),
             };
             let changes = if state == State::Changed {
