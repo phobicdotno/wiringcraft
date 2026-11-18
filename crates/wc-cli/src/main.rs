@@ -54,6 +54,27 @@ enum Cmd {
         #[arg(long)]
         mirror: bool,
     },
+    /// Draw a black box (device box) for a device without a symbol: a rectangle with its
+    /// top-left corner at `--at`, and connection points on its edges that wires attach to like
+    /// symbol pins. It is stored as a symbol of the project (`box.<page>.<id>`), so it carries a
+    /// device tag and part and shows in the reports and checks like any symbol. Prints its id.
+    Box {
+        page: String,
+        /// Top-left corner in mm, `x,y`.
+        #[arg(long, value_parser = parse_point)]
+        at: Point,
+        /// Width and height in mm, `w,h`.
+        #[arg(long, value_parser = parse_point)]
+        size: Point,
+        /// Device tag, e.g. `-A1` (taken as a value, though it starts with `-`).
+        #[arg(long, allow_hyphen_values = true)]
+        tag: Option<String>,
+        /// A connection point, `name:side:offset`: side `left`, `right`, `top` or `bottom`, and
+        /// the offset in mm along that edge from its left or top end, e.g. `L1:top:10`. Repeat
+        /// for each point.
+        #[arg(long = "pin")]
+        pins: Vec<String>,
+    },
     /// Number the wires by rule. Every wire of one connection gets the same number.
     /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
     /// where the connection starts) or `potential` (the potential's name, else sequential).
@@ -741,6 +762,26 @@ fn parse_end(page: &Page, s: &str) -> Res<Endpoint> {
     })
 }
 
+/// A black box's connection point from `name:side:offset` (`L1:top:10`); the name may itself
+/// hold a colon.
+fn parse_box_pin(s: &str) -> Res<wc_core::BoxPin> {
+    let mut parts = s.rsplitn(3, ':');
+    let (Some(offset), Some(side), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(format!("{s:?}: expected name:side:offset, e.g. L1:top:10"));
+    };
+    let side =
+        wc_core::BoxSide::parse(side).ok_or_else(|| format!("{s:?}: the side must be left, right, top or bottom"))?;
+    let offset = offset
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("{s:?}: the offset must be a number of mm"))?;
+    Ok(wc_core::BoxPin {
+        name: name.to_owned(),
+        side,
+        offset,
+    })
+}
+
 fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
@@ -1074,6 +1115,54 @@ fn run(cli: Cli) -> Res<()> {
                 tag,
             });
             save(dir, &p)?;
+            println!("{id}");
+        }
+        Cmd::Box {
+            page,
+            at,
+            size,
+            tag,
+            pins,
+        } => {
+            let mut p = load(dir)?;
+            let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
+            let pins = pins.iter().map(|s| parse_box_pin(s)).collect::<Res<Vec<_>>>()?;
+            let pg = page_mut(&mut p, &page)?;
+            let id = pg.next_id("s");
+            let symbol_id = format!("box.{}.{id}", pg.id);
+            let name = tag
+                .as_ref()
+                .map_or_else(|| "Black box".to_owned(), |t| format!("Black box {t}"));
+            let symbol = wc_core::black_box(&symbol_id, &name, size.x, size.y, &pins).map_err(e)?;
+            pg.symbols.push(PlacedSymbol {
+                id: id.clone(),
+                symbol: symbol_id.clone(),
+                at,
+                rotation: Rotation::R0,
+                mirror: false,
+                tag: tag.clone(),
+            });
+            if let Some(t) = &tag {
+                p.devices.entry(t.clone()).or_default();
+            }
+            // A symbol file left by an earlier box under the same id would be taken over.
+            if store::read_vendored_symbol(dir, &symbol_id).is_ok() || p.lock.symbols.contains_key(&symbol_id) {
+                return Err(format!("symbol {symbol_id} exists already; remove it first"));
+            }
+            p.lock.symbols.insert(
+                symbol_id.clone(),
+                wc_core::LockEntry {
+                    source: "project".into(),
+                    hash: symbol.hash(),
+                },
+            );
+            store::write_vendored_symbol(dir, &symbol).map_err(e)?;
+            if let Err(err) = save(dir, &p) {
+                if let Ok(path) = store::vendor_path(dir, ItemKind::Symbol, &symbol_id) {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(err);
+            }
             println!("{id}");
         }
         Cmd::Wire {
@@ -5767,6 +5856,91 @@ mod tests {
             z.finish().unwrap();
         }
         cli(&dir, &["import", "archive", only.to_str().unwrap()]).unwrap();
+    }
+
+    #[test]
+    fn a_black_box_is_drawn_wired_tagged_listed_and_reloaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        let boxed = |args: &[&str]| {
+            let mut all = vec!["box", "p1"];
+            all.extend_from_slice(args);
+            cli(&dir, &all)
+        };
+        boxed(&[
+            "--at",
+            "50,50",
+            "--size",
+            "40,20",
+            "--tag",
+            "-A1",
+            "--pin",
+            "1:left:5",
+            "--pin",
+            "2:right:15",
+        ])
+        .unwrap();
+        boxed(&[
+            "--at",
+            "150,50",
+            "--size",
+            "20,20",
+            "--tag",
+            "-A2",
+            "--pin",
+            "X1:1:left:15",
+        ])
+        .unwrap();
+        // Refused before anything is written: a point off its edge, a side that is not one.
+        assert!(boxed(&["--at", "0,0", "--size", "10,10", "--pin", "1:left:11"]).is_err());
+        assert!(boxed(&["--at", "0,0", "--size", "10,10", "--pin", "1:middle:1"]).is_err());
+        assert!(boxed(&["--at", "0,0", "--size", "0,10"]).is_err());
+
+        let p = load(&dir).unwrap();
+        let page = p.page("p1").unwrap();
+        assert_eq!(page.symbols.len(), 2);
+        let (a1, a2) = (page.symbols[0].id.clone(), page.symbols[1].id.clone());
+        assert_eq!(page.symbols[0].symbol, format!("box.p1.{a1}"));
+        assert_eq!(p.lock.symbols[&page.symbols[0].symbol].source, "project");
+        let symbol = store::read_vendored_symbol(&dir, &page.symbols[1].symbol).unwrap();
+        assert_eq!(symbol.pins[0].name, "X1:1");
+        assert_eq!(symbol.pins[0].at, Point::new(0.0, 15.0));
+
+        cli(&dir, &["wire", "p1", &format!("{a1}:2"), &format!("{a2}:X1:1")]).unwrap();
+        let part = wc_core::Part {
+            id: "acme.ctrl".into(),
+            manufacturer: "Acme".into(),
+            order_number: "CTRL-1".into(),
+            description: "Controller".into(),
+            ..wc_core::Part::default()
+        };
+        store::write_vendored_part(&dir, &part).unwrap();
+        cli(&dir, &["device", "--part", "acme.ctrl", "--", "-A1"]).unwrap();
+
+        let p = load(&dir).unwrap();
+        let (symbols, missing) = store::vendored_symbols(&dir, &p);
+        assert!(missing.is_empty(), "{missing:?}");
+        let parts = vendored_parts(&dir, &p);
+        let inputs = wc_report::Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let bom = wc_report::build(wc_report::Kind::Parts, &inputs).to_csv();
+        assert!(bom.contains("CTRL-1"), "{bom}");
+        let wires = wc_report::build(wc_report::Kind::Wires, &inputs).to_csv();
+        assert!(wires.contains("-A1:2") && wires.contains("-A2:X1:1"), "{wires}");
+        let devices = wc_report::build(wc_report::Kind::Devices, &inputs).to_csv();
+        assert!(devices.contains("-A1") && devices.contains("-A2"), "{devices}");
+        // Nothing in the project check about the boxes' symbols.
+        let found = wc_report::check(&inputs);
+        assert!(
+            !found.iter().any(|f| f.message.contains("box.p1")),
+            "{:?}",
+            found.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
