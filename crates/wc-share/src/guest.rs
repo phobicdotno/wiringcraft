@@ -51,6 +51,9 @@ pub struct Guest {
     /// Project edits sent and not answered yet, by number, each with the page it adds or
     /// removes, if any.
     unanswered: BTreeMap<u64, Option<String>>,
+    /// Pages whose content here comes from an unanswered edit that added or removed them, with
+    /// that edit's number: a refusal of it brings the host's page back whole.
+    replaced: BTreeMap<String, u64>,
 }
 
 impl Default for Guest {
@@ -76,6 +79,7 @@ impl Guest {
             parts: BTreeMap::new(),
             last_edit: 0,
             unanswered: BTreeMap::new(),
+            replaced: BTreeMap::new(),
         }
     }
 
@@ -149,6 +153,9 @@ impl Guest {
             ProjectEdit::RemovePage { id } => Some(id.clone()),
             _ => None,
         };
+        if let Some(page) = &structural {
+            self.replaced.insert(page.clone(), self.last_edit);
+        }
         self.unanswered.insert(self.last_edit, structural);
         GuestMsg::EditProject {
             edit,
@@ -221,6 +228,7 @@ impl Guest {
                 self.locks.clear();
                 self.taking_back = 0;
                 self.unanswered.clear();
+                self.replaced.clear();
             }
             HostMsg::PageChanged { page, .. } => {
                 if self.answered(&page.id) {
@@ -230,12 +238,10 @@ impl Guest {
                     *p = page;
                 }
             }
-            HostMsg::Unchanged { seq } => {
-                self.unanswered.remove(&seq);
-            }
+            HostMsg::Unchanged { seq } => self.taken(seq),
             HostMsg::ProjectChanged { edit, by, seq } => {
                 if let Some(seq) = seq {
-                    self.unanswered.remove(&seq);
+                    self.taken(seq);
                 }
                 if matches!(edit, ProjectEdit::Restore { .. }) && Some(by) == self.me {
                     self.taking_back = self.taking_back.saturating_sub(1);
@@ -269,9 +275,15 @@ impl Guest {
                 edit,
                 put_back,
             } => {
-                let structural = edit.and_then(|seq| self.unanswered.remove(&seq)).flatten();
+                // The host's page comes back whole only while the content here is still the
+                // refused page's replacement; once one refusal put the host's page back, later
+                // edits of it are kept.
+                let whole = edit
+                    .and_then(|seq| self.unanswered.remove(&seq))
+                    .flatten()
+                    .filter(|page| self.replaced.remove(page).is_some());
                 if let Some(parts) = put_back {
-                    self.put_back(*parts, structural.as_deref());
+                    self.put_back(*parts, whole.as_deref());
                 }
                 // Only the refusal of an undo, redo or revert answers one: a refusal of an
                 // earlier edit, arriving first, must not end the wait for the restoration.
@@ -310,6 +322,15 @@ impl Guest {
             }
         }
         parts.apply(project);
+    }
+
+    /// The host took (or did not need) project edit `seq`.
+    fn taken(&mut self, seq: u64) {
+        if let Some(Some(page)) = self.unanswered.remove(&seq)
+            && self.replaced.get(&page) == Some(&seq)
+        {
+            self.replaced.remove(&page);
+        }
     }
 
     fn switching_to(&self, page: &str) -> bool {

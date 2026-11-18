@@ -717,6 +717,62 @@ fn a_refused_removal_and_new_page_bring_back_the_hosts_page_the_guest_had_open()
 }
 
 #[test]
+fn work_on_the_page_put_back_by_one_refusal_survives_the_next() -> TestResult {
+    let log = Shared::default();
+    let mut s = Session {
+        host: Host::new(
+            demo(),
+            "Hanna Host",
+            "h@x.no",
+            Box::new(Flaky {
+                fail: 1,
+                log: log.clone(),
+            }),
+        ),
+        hub: Hub::new(),
+        log,
+    };
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    a_link.send(a.edit_project(ProjectEdit::RemovePage { id: "p0002".into() }))?;
+    a_link.send(a.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0002", "2", "New"),
+    }))?;
+    s.hub.pump(&mut s.host);
+    let mut refusals = 0;
+    for msg in a_link.drain() {
+        let refused = matches!(msg, HostMsg::Refused { edit: Some(_), .. });
+        a.handle(msg);
+        if !refused {
+            continue;
+        }
+        refusals += 1;
+        let mine = a
+            .project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .cloned()
+            .ok_or("page")?;
+        if refusals == 1 {
+            // The host's page is back; drawn on before the second refusal arrives.
+            assert_ne!(mine.title, "New");
+            let mut page = mine;
+            place(&mut page, "s1", 10.0);
+            a_link.send(a.edit_page(page).ok_or("lock")?)?;
+        } else {
+            assert_eq!(mine.symbols.len(), 1, "the drawing is kept");
+        }
+    }
+    assert_eq!(refusals, 2);
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(s.host.project().page("p0002").is_some_and(|p| p.symbols.len() == 1));
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert_eq!(a.unanswered_edits(), 0);
+    Ok(())
+}
+
+#[test]
 fn a_project_edit_before_approval_is_answered() -> TestResult {
     let mut s = Session::new();
     let (id, link, mut guest) = s.connect();
