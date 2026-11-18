@@ -571,6 +571,12 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         ed.view.fit = false;
     }
 
+    // The view the user saw when they clicked: a zoom or pan in the same frame must not move
+    // where a click lands.
+    let shown = Xf {
+        origin: rect.min + ed.view.offset,
+        zoom: ed.view.zoom,
+    };
     // Zoom about the pointer with the wheel; pan with the middle or right button.
     if resp.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.zoom_delta().ln() * 200.0);
@@ -952,7 +958,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
             }
         }
         Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline => {
-            shape_tool(&painter, &resp, open, ed, &xf, &t, finish, snap_step)
+            shape_tool(&painter, &resp, open, ed, &xf, &shown, &t, finish, snap_step)
         }
     }
 }
@@ -1408,6 +1414,7 @@ fn shape_tool(
     open: &mut Open,
     ed: &mut Editor,
     xf: &Xf,
+    shown: &Xf,
     t: &theme::Theme,
     enter: bool,
     snap_step: f64,
@@ -1427,9 +1434,9 @@ fn shape_tool(
         let tol = if snap_step > 0.0 {
             0.0
         } else {
-            f64::from(REPEAT_SLOP_PX / xf.zoom)
+            f64::from(REPEAT_SLOP_PX / shown.zoom)
         };
-        shape_input(open, ed, snap(xf.mm(pos), snap_step), now, tol);
+        shape_input(open, ed, snap(shown.mm(pos), snap_step), now, tol);
     }
     let Some(cur) = ed.cursor else { return };
     let ghost = Stroke::new(1.5_f32, t.ghost);
@@ -1496,6 +1503,11 @@ pub(crate) fn shape_input(open: &mut Open, ed: &mut Editor, at: Point, now: f64,
         }
         return;
     }
+    // A click near the first point of a polyline of three or more closes it on that point.
+    let at = match ed.shape_points.first() {
+        Some(&first) if ed.tool == Tool::Polyline && ed.shape_points.len() >= 3 && same(&first) => first,
+        _ => at,
+    };
     shape_click(open, ed, at);
 }
 
@@ -1758,6 +1770,19 @@ mod tests {
         shape_input(&mut open, &mut ed, p(10.0, 0.0), 4.0, 0.0);
         shape_input(&mut open, &mut ed, p(11.0, 0.0), 4.1, 0.0);
         assert_eq!(ed.shape_points.len(), 3);
+        // Unsnapped, a click a hair off the first point closes the line on that point.
+        ed.shape_points.clear();
+        for (i, q) in [p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0), p(0.1, -0.2)]
+            .into_iter()
+            .enumerate()
+        {
+            shape_input(&mut open, &mut ed, q, 10.0 + i as f64, 0.5);
+        }
+        assert!(ed.shape_points.is_empty());
+        assert!(matches!(
+            open.project.pages[0].graphics.last(),
+            Some(Shape::Polyline { points, closed: true, .. }) if points.len() == 3
+        ));
     }
 
     #[test]
@@ -1873,6 +1898,26 @@ mod tests {
         );
         assert_eq!(ed.shape_points.len(), 2);
         assert_ne!(ed.shape_points[0], ed.shape_points[1], "the second point is at A");
+        // Released at A, then moved to B and zoomed in the same frame: the point still goes
+        // where A was in the view the user saw.
+        ed.shape_points.clear();
+        click(&mut open, &mut ed, b, 8.0);
+        let (p0, zoom) = (ed.shape_points[0], ed.view.zoom);
+        frame(
+            &mut open,
+            &mut ed,
+            9.0,
+            vec![egui::Event::PointerMoved(a), button(a, true)],
+        );
+        frame(
+            &mut open,
+            &mut ed,
+            9.01,
+            vec![button(a, false), egui::Event::PointerMoved(b), egui::Event::Zoom(2.0)],
+        );
+        assert!(ed.view.zoom > zoom, "the view zoomed");
+        let want = Point::new(p0.x - 100.0 / f64::from(zoom), p0.y);
+        assert!(ed.shape_points[1].distance(want) <= 1.0, "{:?}", ed.shape_points); // 1 mm snap
     }
 
     #[test]
