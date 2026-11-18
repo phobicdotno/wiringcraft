@@ -119,6 +119,10 @@ pub enum ProjectEdit {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parts: Vec<(Part, String)>,
     },
+    /// Several edits made by one user action (a device renamed on its pages and in the device
+    /// list), checked and applied together in order: all of them or none, as one change in the
+    /// history. Only [`ProjectEdit::batchable`] edits can be in it.
+    Batch { edits: Vec<ProjectEdit> },
 }
 
 impl ProjectEdit {
@@ -197,6 +201,7 @@ impl ProjectEdit {
                 _ => format!("Edit {} pages", pages.len()),
             },
             Self::Restore { .. } => "Put back an earlier state".to_owned(),
+            Self::Batch { edits } => edits.iter().map(Self::describe).collect::<Vec<_>>().join("; "),
             Self::AddItems { symbols, parts } => {
                 let names: Vec<&str> = symbols
                     .iter()
@@ -242,18 +247,87 @@ impl ProjectEdit {
             }
             Self::SetMeta { .. } => keys.meta = Some(Box::new(project.meta.clone())),
             Self::Restore { parts } => keys = (**parts).clone(),
+            Self::Batch { edits } => {
+                // What the parts applied at once touch.
+                for e in edits.iter().filter(|e| e.applied_at_once()) {
+                    let t = e.touches(project);
+                    keys.pages.extend(t.pages);
+                    keys.devices.extend(t.devices);
+                    keys.panels.extend(t.panels);
+                    keys.comments.extend(t.comments);
+                    if t.meta.is_some() {
+                        keys.meta = t.meta;
+                    }
+                }
+            }
             Self::SetPages { .. } | Self::AddItems { .. } => {}
         }
         Parts::read(project, &keys)
     }
 
     /// Whether a participant applies this change to its own copy at once, before the host
-    /// answers (see [`ProjectEdit::touches`]).
+    /// answers (see [`ProjectEdit::touches`]). Of a batch, the edits that are applied at once
+    /// are (see [`ProjectEdit::apply_at_once`]); the batch itself counts as not.
     pub fn applied_at_once(&self) -> bool {
         !matches!(
             self,
-            Self::SetPages { .. } | Self::AddItems { .. } | Self::Restore { .. }
+            Self::SetPages { .. } | Self::AddItems { .. } | Self::Restore { .. } | Self::Batch { .. }
         )
+    }
+
+    /// Whether any of this change is applied at once (for a batch: any of its edits).
+    pub fn partly_applied_at_once(&self) -> bool {
+        match self {
+            Self::Batch { edits } => Self::well_formed(edits) && edits.iter().any(Self::applied_at_once),
+            e => e.applied_at_once(),
+        }
+    }
+
+    /// Whether these edits make a batch the host can accept: two or more, each batchable.
+    fn well_formed(edits: &[ProjectEdit]) -> bool {
+        edits.len() >= 2 && edits.iter().all(Self::batchable)
+    }
+
+    /// Apply to a participant's own copy what of this change is applied at once.
+    pub fn apply_at_once(&self, project: &mut Project) {
+        match self {
+            // A batch the host will refuse whole (one that holds an edit that cannot be batched)
+            // is not applied here either, so this copy stays as the host's.
+            Self::Batch { edits } if Self::well_formed(edits) => {
+                for e in edits.iter().filter(|e| e.applied_at_once()) {
+                    apply_edit(project, e);
+                }
+            }
+            e if e.applied_at_once() => apply_edit(project, e),
+            _ => {}
+        }
+    }
+
+    /// Whether this edit can be part of a [`ProjectEdit::Batch`]. Pages added or removed,
+    /// symbols and parts added, and restores go on their own: they are tracked or stored apart.
+    pub fn batchable(&self) -> bool {
+        matches!(
+            self,
+            Self::SetDevice { .. }
+                | Self::SetComments { .. }
+                | Self::SetPanel { .. }
+                | Self::RemovePanel { .. }
+                | Self::Renumber { .. }
+                | Self::SetMeta { .. }
+                | Self::SetPages { .. }
+        )
+    }
+
+    /// `edits` as they go to the host: those that cannot be batched first, on their own and in
+    /// order, then the others together as one [`ProjectEdit::Batch`] (or alone when only one).
+    pub fn batched(edits: Vec<ProjectEdit>) -> Vec<ProjectEdit> {
+        let (mut batch, mut out): (Vec<_>, Vec<_>) = edits.into_iter().partition(Self::batchable);
+        match batch.len() {
+            0 => {}
+            1 => out.append(&mut batch),
+            _ => out.push(Self::Batch { edits: batch }),
+        }
+        out
     }
 
     /// The one page this change is about, if it is about one page.
@@ -444,6 +518,11 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
         }
         ProjectEdit::SetMeta { meta, .. } => project.meta = (**meta).clone(),
         ProjectEdit::Restore { parts } => parts.apply(project),
+        ProjectEdit::Batch { edits } => {
+            for e in edits {
+                apply_edit(project, e);
+            }
+        }
         ProjectEdit::AddItems { symbols, parts } => {
             for (s, source) in symbols {
                 project.lock.symbols.insert(s.id.clone(), lock_entry(source, s.hash()));
@@ -577,6 +656,21 @@ pub(crate) fn check_edit(
                 if lock.get(id).is_some_and(|e| e.hash != hash) {
                     return invalid(format!("the project already has {kind} {id} in another version"));
                 }
+            }
+            Ok(())
+        }
+        ProjectEdit::Batch { edits } => {
+            if edits.len() < 2 {
+                return invalid("a batch holds two edits or more".into());
+            }
+            // Each is checked against the project as the ones before it leave it.
+            let mut after = project.clone();
+            for e in edits {
+                if !e.batchable() {
+                    return invalid(format!("{} cannot be part of a batch", e.describe()));
+                }
+                check_edit(&after, locks, by, e)?;
+                apply_edit(&mut after, e);
             }
             Ok(())
         }

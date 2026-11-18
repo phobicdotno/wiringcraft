@@ -1309,7 +1309,9 @@ impl Share {
             out.edits.clear();
         }
         let sent = out.page.is_some() || !out.edits.is_empty();
-        for edit in out.edits {
+        // One action, one change: the edits that can go together are checked and recorded by
+        // the host as one batch, all or nothing.
+        for edit in ProjectEdit::batched(out.edits) {
             role.edit_project(edit, &mut self.notes);
         }
         if let Some(p) = out.page {

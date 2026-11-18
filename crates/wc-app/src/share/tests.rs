@@ -299,9 +299,8 @@ fn project_level_changes_go_through_the_host_to_everyone() -> TestResult {
     assert_eq!(
         log.messages(),
         [
-            "Change project properties",
-            "Change device -K1",
-            "Comments on page p0003",
+            // One frame's project changes are one change.
+            "Change project properties; Change device -K1; Comments on page p0003",
             "Add page 4 Terminals"
         ]
     );
@@ -545,10 +544,11 @@ fn pages_nobody_has_open_go_out_together_as_one_change() -> TestResult {
     guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves -K1".into();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
 
-    // The two pages nobody holds are one change; the guest's own page is its page edit.
+    // The device and the two pages nobody holds are one change; the guest's own page is its
+    // page edit.
     assert_eq!(
         log.messages()[before..],
-        ["Change device -K1", "Edit 2 pages", "Edit page 3 Valves -K1"]
+        ["Change device -K1; Edit 2 pages", "Edit page 3 Valves -K1"]
     );
     assert!(host_open.project.devices.contains_key(&k1));
     assert_eq!(host_open.project.pages, guest_open.project.pages);

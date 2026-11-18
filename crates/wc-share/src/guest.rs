@@ -149,10 +149,8 @@ impl Guest {
         };
         let has = |p: &Option<wc_core::Project>, id: &str| p.as_ref().is_some_and(|p| p.page(id).is_some());
         let before = target.as_deref().map(|id| has(&self.project, id));
-        if edit.applied_at_once()
-            && let Some(p) = self.project.as_mut()
-        {
-            apply_edit(p, &edit);
+        if let Some(p) = self.project.as_mut() {
+            edit.apply_at_once(p);
         }
         self.last_edit += 1;
         // Only an edit that really added or removed the page here leaves content that is not
