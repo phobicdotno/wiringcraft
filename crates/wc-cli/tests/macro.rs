@@ -149,5 +149,13 @@ fn a_macro_is_placed_with_the_chosen_value_set() -> TestResult {
     assert_eq!(sections, [Some("2.5 mm²"), Some("1.5 mm²"), Some("2.5 mm²")]);
     let s2 = page.symbol("s2").ok_or("s2")?;
     assert_eq!((s2.at.x, s2.at.y), (100.0, 80.0));
+
+    // With the library gone, a project macro whose symbols all have their pinned copies is
+    // still placed.
+    std::fs::create_dir_all(dir.join("macros"))?;
+    std::fs::copy(lib.join("macros/starter.json"), dir.join("macros/starter.json"))?;
+    std::fs::remove_dir_all(&lib)?;
+    let ids = wiringcraft(&dir, &["macro", "place", "p1", "starter", "--at", "0,0", "--set", "3 kW"])?;
+    assert_eq!(ids.trim(), "s4 w4");
     Ok(())
 }

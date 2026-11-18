@@ -1448,18 +1448,25 @@ fn run(cli: Cli) -> Res<()> {
                     // left from an earlier attempt that failed before it was pinned.
                     let symbols: std::collections::BTreeSet<&str> =
                         m.symbols.iter().map(|s| s.symbol.as_str()).collect();
-                    let mut lib = None;
+                    // The library is opened only when a symbol needs it, so a macro whose
+                    // symbols all have their pinned copies works without it.
+                    let mut lib: Option<wc_library::Library> = None;
                     for id in symbols {
-                        let lib = match &lib {
-                            Some(lib) => lib,
-                            None => lib.insert(wc_library::Library::open(dir, &p).map_err(e)?),
+                        let pin = p.lock.symbols.get(id).cloned();
+                        if pin.is_some() {
+                            let vendored = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
+                            if vendored.exists() {
+                                // A copy that cannot be read is reported now, not after saving.
+                                store::read_vendored_symbol(dir, id).map_err(e)?;
+                                continue;
+                            }
+                        }
+                        let lib = match &mut lib {
+                            Some(lib) => &*lib,
+                            None => &*lib.insert(wc_library::Library::open(dir, &p).map_err(e)?),
                         };
-                        match p.lock.symbols.get(id).cloned() {
+                        match pin {
                             Some(pin) => {
-                                let vendored = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
-                                if vendored.exists() {
-                                    continue;
-                                }
                                 let fits = |s: &wc_core::Symbol| {
                                     if s.id != id {
                                         Err(format!("its file holds {}", s.id))

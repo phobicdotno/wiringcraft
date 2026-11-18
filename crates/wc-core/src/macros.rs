@@ -105,6 +105,27 @@ impl Macro {
             }
             names.push(n);
         }
+        let symbols: BTreeSet<&str> = self.symbols.iter().map(|s| s.id.as_str()).collect();
+        for w in &self.wires {
+            for end in [&w.from, &w.to] {
+                if let Endpoint::Pin { item, .. } = end
+                    && !symbols.contains(item.as_str())
+                {
+                    return bad(format!("wire {} ends on {item}, which is not in the macro", w.id));
+                }
+            }
+        }
+        let mut open = None;
+        self.for_each_text(|t| {
+            if open.is_none() && unterminated(t) {
+                open = Some(t.to_owned());
+            }
+        });
+        if let Some(t) = open {
+            return bad(format!(
+                "{t:?} opens a placeholder with {{{{ but does not close it with }}}}"
+            ));
+        }
         let declared = |n: &str| names.iter().any(|m| key(m) == key(n));
         for used in self.used_placeholders() {
             if !declared(&used) {
@@ -327,6 +348,17 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
 /// How placeholder and value set names are compared: trimmed, without regard to case.
 fn key(name: &str) -> String {
     name.trim().to_lowercase()
+}
+
+/// Whether `text` has a `{{` that no `}}` closes.
+fn unterminated(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { return true };
+        rest = &after[end + 2..];
+    }
+    false
 }
 
 /// The names written as `{{name}}` in `text`, trimmed, in order.
@@ -646,6 +678,23 @@ mod tests {
             ..Default::default()
         });
         assert!(twice.check().is_err());
+
+        // A placeholder left open is refused, and a closed one still works.
+        let mut open = starter()?;
+        if let Some(d) = open.devices.values_mut().next() {
+            d.part = Some("{{part".into());
+        }
+        assert!(err_of(open.check()).contains("does not close"));
+        assert!(open.apply(Some("3 kW"), &none).is_err());
+        assert!(starter()?.apply(Some("3 kW"), &none).is_ok());
+
+        // A wire ending on a symbol the macro does not hold is refused.
+        let mut dangling = starter()?;
+        dangling.wires[0].from = Endpoint::Pin {
+            item: "s9".into(),
+            pin: "1".into(),
+        };
+        assert!(err_of(dangling.check()).contains("s9"));
 
         let mut stray = starter()?;
         stray.value_sets[0].values.insert("voltage".into(), "400".into());
