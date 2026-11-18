@@ -1088,9 +1088,10 @@ pub fn new_items(
                 }
             }
             // A repair whose file is not back here yet waits quietly: the session works as is.
-            // One that is back but cannot be sent says why.
+            // One that is back but cannot be sent says why, and so does one whose file cannot
+            // be looked for (no access, or an id that makes no file name).
             Err(e) if before.is_none() && auth.lock.symbols.contains_key(&id) => {
-                if store::vendor_path(dir, ItemKind::Symbol, &id).is_ok_and(|p| p.exists()) {
+                if !store::vendor_path(dir, ItemKind::Symbol, &id).is_ok_and(|p| matches!(p.try_exists(), Ok(false))) {
                     out.unsent_repairs.push((item_name(ItemKind::Symbol, &id), e));
                 }
             }
@@ -1108,7 +1109,7 @@ pub fn new_items(
                 }
             }
             Err(e) if before.is_none() && auth.lock.parts.contains_key(&id) => {
-                if store::vendor_path(dir, ItemKind::Part, &id).is_ok_and(|p| p.exists()) {
+                if !store::vendor_path(dir, ItemKind::Part, &id).is_ok_and(|p| matches!(p.try_exists(), Ok(false))) {
                     out.unsent_repairs.push((item_name(ItemKind::Part, &id), e));
                 }
             }
@@ -2352,13 +2353,21 @@ fn panel_mentions(panel: &wc_core::panel::Panel, tag: &dyn Fn(&wc_core::DeviceTa
 }
 
 /// One symbol or part sent to the session and not taken yet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ItemOut {
     at: std::time::Instant,
     tries: u32,
     /// Not taken after [`ITEM_TRIES`] tries: changes no longer wait for it, and it is sent again
     /// only every [`ITEM_RETRY_LATER`].
     gave_up: bool,
+    /// The version (lock hash here) it was sent in: a later version of the item is another
+    /// send, not held back by this one's wait.
+    hash: Option<String>,
+}
+
+/// The hash this copy locks the item [`item_name`] names in.
+fn local_hash(local: &Project, name: &str) -> Option<String> {
+    named(name).and_then(|(kind, id)| local.lock.map(kind).get(id).map(|e| e.hash.clone()))
 }
 
 /// How long an item sent to the session may take to be answered before it is sent again.
@@ -2785,7 +2794,11 @@ impl Share {
             .iter()
             // One given up is still sent now and then, so it gets in once its file can be read
             // or the session can store it; changes no longer wait for it.
-            .filter(|(_, o)| o.at.elapsed() < if o.gave_up { ITEM_RETRY_LATER } else { ITEM_WAIT })
+            // A version changed here since is sent at once.
+            .filter(|(n, o)| {
+                o.at.elapsed() < if o.gave_up { ITEM_RETRY_LATER } else { ITEM_WAIT }
+                    && o.hash == local_hash(&open.project, n)
+            })
             .map(|(n, _)| n.clone())
             .collect();
         // An item sent before and not taken goes alone, so one the session cannot store does
@@ -2804,11 +2817,22 @@ impl Share {
         for (name, why) in &items.unreadable {
             // A file that cannot be read counts as a try: the changes that may draw the item
             // wait for it as for a sent one, and go once the tries are used up.
+            let hash = local_hash(&open.project, name);
             let out = self.items_out.entry(name.clone()).or_insert(ItemOut {
                 at: now,
                 tries: 0,
                 gave_up: false,
+                hash: hash.clone(),
             });
+            // Another version starts its tries afresh.
+            if out.hash != hash {
+                *out = ItemOut {
+                    at: now,
+                    tries: 0,
+                    gave_up: false,
+                    hash,
+                };
+            }
             out.at = now;
             out.tries += 1;
             if self.unreadable.insert(name.clone()) {
@@ -2826,11 +2850,22 @@ impl Share {
         }
         for name in &items.sent {
             self.unreadable.remove(name);
+            let hash = local_hash(&open.project, name);
             let out = self.items_out.entry(name.clone()).or_insert(ItemOut {
                 at: now,
                 tries: 0,
                 gave_up: false,
+                hash: hash.clone(),
             });
+            // Another version starts its tries afresh.
+            if out.hash != hash {
+                *out = ItemOut {
+                    at: now,
+                    tries: 0,
+                    gave_up: false,
+                    hash,
+                };
+            }
             out.at = now;
             out.tries += 1;
         }

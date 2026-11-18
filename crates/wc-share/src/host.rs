@@ -130,12 +130,19 @@ impl Host {
 
     /// The project's vendored symbol and part files, sent to every guest that joins so they can
     /// draw the project without the host's libraries.
-    pub fn share_files(&mut self, symbols: BTreeMap<String, wc_core::Symbol>, parts: BTreeMap<String, wc_core::Part>) {
+    /// A file holding another item than the one it is the file of is no file of either.
+    pub fn share_files(
+        &mut self,
+        mut symbols: BTreeMap<String, wc_core::Symbol>,
+        mut parts: BTreeMap<String, wc_core::Part>,
+    ) {
         use wc_core::lock::ItemKind;
+        symbols.retain(|id, s| s.id == *id);
+        parts.retain(|id, p| p.id == *id);
         self.file_hashes = symbols
-            .values()
-            .map(|s| ((ItemKind::Symbol, s.id.clone()), s.hash()))
-            .chain(parts.values().map(|p| ((ItemKind::Part, p.id.clone()), p.hash())))
+            .iter()
+            .map(|(id, s)| ((ItemKind::Symbol, id.clone()), s.hash()))
+            .chain(parts.iter().map(|(id, p)| ((ItemKind::Part, id.clone()), p.hash())))
             .collect();
         self.symbols = symbols;
         self.parts = parts;

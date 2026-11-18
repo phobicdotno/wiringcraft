@@ -1138,12 +1138,16 @@ impl Open {
     /// symbol with no pin is taken from the library as it is now.
     /// [`Open::ensure_symbol`] for each of `ids`, all or none: when one can't be loaded, the
     /// pins and loaded symbols the others added are taken back, and the error names the symbol.
+    /// Terminal tracking goes back with them: a copy put back restarted it from that copy.
     pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
         let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
+        let (jumpers, terminals) = (self.project.meta.jumpers.clone(), self.terminals_before.clone());
         for id in ids {
             if let Err(e) = self.ensure_symbol(id) {
                 self.project.lock = lock;
                 self.symbols = symbols;
+                self.project.meta.jumpers = jumpers;
+                self.terminals_before = terminals;
                 let named = e.starts_with(&format!("symbol {id}:"));
                 return Err(if named { e } else { format!("symbol {id}: {e}") });
             }
@@ -1169,8 +1173,17 @@ impl Open {
                     "symbol {id}: its copy in the project is not the version the project pins ({why}); put the pinned copy back or update the symbol from the library"
                 )
             };
-            let fixed = store::read_vendored_symbol(&self.dir, id).map_err(|e| refused(e.to_string()))?;
-            version_fits(&fixed.id, &fixed.hash(), id, &pin.hash).map_err(refused)?;
+            let pin = pin.clone();
+            let vendored = store::vendor_path(&self.dir, ItemKind::Symbol, id).map_err(|e| e.to_string())?;
+            let fixed = if matches!(vendored.try_exists(), Ok(false)) {
+                // The copy is gone: the pinned version is looked for in the libraries, as when
+                // nothing was loaded.
+                self.pinned_symbol(id, &pin)?
+            } else {
+                let fixed = store::read_vendored_symbol(&self.dir, id).map_err(|e| refused(e.to_string()))?;
+                version_fits(&fixed.id, &fixed.hash(), id, &pin.hash).map_err(refused)?;
+                fixed
+            };
             // Terminals were numbered with the copy loaded so far: the change in progress is
             // settled with it, and tracking starts again from the pinned copy, so putting it
             // back does not read as terminals moved.
@@ -1181,38 +1194,10 @@ impl Open {
             }
             return Ok(());
         }
-        let lib = || wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string());
         let s = match self.project.lock.symbols.get(id).cloned() {
-            Some(pin) => {
-                let vendored = store::vendor_path(&self.dir, ItemKind::Symbol, id).map_err(|e| e.to_string())?;
-                let exists = vendored
-                    .try_exists()
-                    .map_err(|e| format!("symbol {id}: {} cannot be checked: {e}", vendored.display()))?;
-                let fits = |s: &Symbol| version_fits(&s.id, &s.hash(), id, &pin.hash);
-                if exists {
-                    let copy = store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?;
-                    if fits(&copy).is_err() {
-                        return Err(format!(
-                            "symbol {id}: its copy in the project is not the version the project pins; put the pinned copy back or update the symbol from the library"
-                        ));
-                    }
-                    copy
-                } else {
-                    // The source the pin names first, then every other: any may still have the
-                    // pinned version.
-                    let s = lib()?
-                        .find_version(ItemKind::Symbol, id, &pin.source, fits)
-                        .map_err(|why| {
-                            format!(
-                                "symbol {id}: its copy in the project is missing and no library has the version the project pins ({why}); put the copy back or update the symbol from the library"
-                            )
-                        })?;
-                    store::write_vendored_symbol(&self.dir, &s).map_err(|e| e.to_string())?;
-                    s
-                }
-            }
+            Some(pin) => self.pinned_symbol(id, &pin)?,
             None => {
-                let lib = lib()?;
+                let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
                 wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Symbol, id)
                     .map_err(|e| e.to_string())?;
                 store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?
@@ -1220,6 +1205,37 @@ impl Open {
         };
         self.symbols.insert(id.to_owned(), s);
         Ok(())
+    }
+
+    /// The version of symbol `id` that `pin` names: its copy in the project, or, when there is
+    /// none, that version put back from the libraries (written as the copy).
+    fn pinned_symbol(&self, id: &str, pin: &wc_core::lock::LockEntry) -> Result<Symbol, String> {
+        let vendored = store::vendor_path(&self.dir, ItemKind::Symbol, id).map_err(|e| e.to_string())?;
+        let exists = vendored
+            .try_exists()
+            .map_err(|e| format!("symbol {id}: {} cannot be checked: {e}", vendored.display()))?;
+        let fits = |s: &Symbol| version_fits(&s.id, &s.hash(), id, &pin.hash);
+        if exists {
+            let copy = store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?;
+            if fits(&copy).is_err() {
+                return Err(format!(
+                    "symbol {id}: its copy in the project is not the version the project pins; put the pinned copy back or update the symbol from the library"
+                ));
+            }
+            return Ok(copy);
+        }
+        // The source the pin names first, then every other: any may still have the pinned
+        // version.
+        let s = wc_library::Library::open(&self.dir, &self.project)
+            .map_err(|e| e.to_string())?
+            .find_version(ItemKind::Symbol, id, &pin.source, fits)
+            .map_err(|why| {
+                format!(
+                    "symbol {id}: its copy in the project is missing and no library has the version the project pins ({why}); put the copy back or update the symbol from the library"
+                )
+            })?;
+        store::write_vendored_symbol(&self.dir, &s).map_err(|e| e.to_string())?;
+        Ok(s)
     }
 
     /// Suggest the next free tag for a letter code, e.g. `=PUMP+CAB1-K3`. Function and location
@@ -2411,6 +2427,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_pinned_symbol_loaded_in_another_version_whose_file_is_gone_comes_from_the_library() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert_eq!(o.symbols["wc.coil"], new);
+        // The wrong copy removed: the library still has the pinned version.
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    #[test]
     fn putting_back_a_pinned_terminal_copy_keeps_jumpers_on_their_terminals() {
         let (_tmp, mut o) = project();
         let terminal = |id: &str, role| Symbol {
@@ -2464,6 +2498,61 @@ pub(crate) mod tests {
         o.place(1, "test.term", Point::new(80.0, 10.0)).unwrap();
         o.checkpoint();
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
+    fn a_terminal_copy_put_back_by_a_paste_that_fails_later_leaves_jumpers_alone() {
+        let (_tmp, mut o) = project();
+        let terminal = |id: &str, role| Symbol {
+            id: id.into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let pinned = terminal("test.term", wc_core::symbol::SymbolRole::Terminal);
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        let other = terminal("test.term2", wc_core::symbol::SymbolRole::Terminal);
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.project.lock.symbols.insert(
+            "test.term".into(),
+            wc_core::lock::LockEntry {
+                source: "starter".into(),
+                hash: pinned.hash(),
+            },
+        );
+        for (id, x, symbol) in [
+            ("a", 10.0, "test.term"),
+            ("b", 20.0, "test.term2"),
+            ("c", 30.0, "test.term2"),
+        ] {
+            o.project.pages[1].symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: symbol.into(),
+                at: Point::new(x, 10.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse("-X1").unwrap()),
+            });
+        }
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        o.save().unwrap();
+        // Opened with a copy in which A is no terminal: B and C are 1 and 2 here.
+        store::write_vendored_symbol(&o.dir, &terminal("test.term", wc_core::symbol::SymbolRole::Main)).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        o.checkpoint();
+        let jumpers = o.project.meta.jumpers.clone();
+        // A paste puts the pinned copy back, then fails on a symbol no library has.
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        assert!(o.ensure_symbols(["test.term", "no.such.symbol"]).is_err());
+        // Nothing was added, and the next step does not read the rollback as terminals moved.
+        o.checkpoint();
+        assert_eq!(o.project.meta.jumpers, jumpers);
     }
 
     #[test]
