@@ -2034,6 +2034,38 @@ fn a_file_here_under_the_name_of_a_picture_the_session_uses_is_kept_and_not_shar
 }
 
 #[test]
+fn a_refusal_of_a_picture_this_copy_never_sent_shares_nothing() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
+    let logo = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    host_open.project.meta.logo = logo.clone();
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // A refusal naming a path this copy never sent.
+    if let Some(Role::Guest(j)) = g.role.as_mut() {
+        j.guest.refusals.push(wc_share::Refusal::PictureNameTaken {
+            file: "pictures/brand.png".into(),
+        });
+    }
+    for _ in 0..4 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(guest_open.project.meta.logo, logo, "not renamed");
+    assert_eq!(host_open.project.meta.logo, logo);
+    assert_eq!(h.role.as_ref().map(|r| r.pictures().len()), Some(1), "nothing shared");
+    Ok(())
+}
+
+#[test]
 fn a_picture_that_could_not_be_written_is_tried_again_only_after_a_while() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {

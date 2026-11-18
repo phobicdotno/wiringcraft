@@ -2236,7 +2236,13 @@ impl Share {
         }
         // A picture whose name the session (or the host's folder) has for another file gets a
         // new name here; the picture and the changes naming it go out again under that name.
-        let mut taken = role.picture_names_taken();
+        // Only a refusal of a picture this copy sent counts: a refusal naming any other path
+        // must not make this copy share a file of its own.
+        let mut taken: Vec<String> = role
+            .picture_names_taken()
+            .into_iter()
+            .filter(|f| self.pictures_out.contains_key(f))
+            .collect();
         taken.append(&mut self.clashes);
         rename_pictures(
             open,
