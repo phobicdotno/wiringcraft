@@ -401,13 +401,11 @@ impl Open {
                 if moved.1 {
                     *end = turn(*end);
                 }
-                // The sweep as the canvas draws it (`canvas::arc_points`): one that rounds to
-                // nothing (370.1° to 10.1°) leaves no arc either.
-                let drawn = {
-                    let sweep = *end - *start;
-                    if sweep <= 0.0 { sweep + 360.0 } else { sweep }
-                };
-                if (moved.0 || moved.1) && (turn(*start) == turn(*end) || drawn <= 1e-9) {
+                // Equal angles are refused, and so is a sweep as the canvas draws it that
+                // rounds to nothing (360° to 0°, 370.1° to 10.1°). Angles a whole turn apart
+                // are not alike for that: 720° to 0° draws a full turn, as 720° to 100° draws.
+                let drawn = crate::canvas::arc_sweep(*start, *end);
+                if (moved.0 || moved.1) && (*start == *end || drawn.abs() <= 1e-9) {
                     return Err("The start and end angles must differ.");
                 }
             }
@@ -588,17 +586,16 @@ impl Open {
     }
 
     /// Paste so the clipboard's anchor lands on `at`. Pasted symbols get fresh ids and the next
-    /// free device tags (one new device per copied device). Returns the pasted items.
-    pub fn paste(&mut self, page: usize, clip: &Clipboard, at: Point) -> Vec<Selection> {
+    /// free device tags (one new device per copied device). Returns the pasted items, or why
+    /// nothing was pasted when a symbol it needs can't be loaded (nothing is added then).
+    pub fn paste(&mut self, page: usize, clip: &Clipboard, at: Point) -> Result<Vec<Selection>, String> {
         if clip.is_empty() || self.project.pages.get(page).is_none() || self.held_reason(page).is_some() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        for s in &clip.symbols {
-            // Symbols copied from another project are taken from the library when possible.
-            if !self.symbols.contains_key(&s.symbol) {
-                let _ = self.ensure_symbol(&s.symbol);
-            }
-        }
+        // Every symbol it uses, checked against its pin (a loaded copy may be another version);
+        // those copied from another project are taken from the library when possible.
+        let ids: std::collections::BTreeSet<&str> = clip.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        self.ensure_symbols(ids)?;
         self.checkpoint();
         let d = Point::new(at.x - clip.anchor.x, at.y - clip.anchor.y);
         let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
@@ -633,7 +630,7 @@ impl Open {
             out.push(Selection::Symbol(id));
         }
         let Some(p) = self.project.pages.get_mut(page) else {
-            return out;
+            return Ok(out);
         };
         for w in &clip.wires {
             let mut w = w.clone();
@@ -659,7 +656,7 @@ impl Open {
             p.graphics.push(g.translate(d));
             out.push(Selection::Graphic(p.graphics.len() - 1));
         }
-        out
+        Ok(out)
     }
 }
 
@@ -790,7 +787,7 @@ mod tests {
         let sel = o.select_all(page);
         let clip = o.copy(page, &sel);
         assert_eq!((clip.symbols.len(), clip.wires.len()), (2, 1));
-        let pasted = o.paste(page, &clip, Point::new(150.0, 100.0));
+        let pasted = o.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
         assert_eq!(pasted.len(), 3);
         let p = &o.project.pages[page];
         assert_eq!(p.symbols.len(), 4);
@@ -1057,6 +1054,52 @@ mod tests {
             )
             .is_err()
         );
+        // Stored from a file past a full turn: the canvas draws 720° to 100° as -260°.
+        o.project.pages[page].graphics[n] = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 90.0,
+        };
+        let wide = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 100.0,
+        };
+        assert_eq!(o.set_shape(page, n, wide.clone()), Ok(true));
+        assert_eq!(o.project.pages[page].graphics[n], wide);
+        // 720° to 0° is a full turn as drawn, though the angles match within one turn.
+        o.project.pages[page].graphics[n] = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 90.0,
+        };
+        let full = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 0.0,
+        };
+        assert_eq!(o.set_shape(page, n, full.clone()), Ok(true));
+        assert_eq!(o.project.pages[page].graphics[n], full);
+        // 360° to 0° draws nothing.
+        let before = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 360.0,
+            end: 90.0,
+        };
+        o.project.pages[page].graphics[n] = before.clone();
+        let none = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 360.0,
+            end: 0.0,
+        };
+        assert!(o.set_shape(page, n, none).is_err());
+        assert_eq!(o.project.pages[page].graphics[n], before);
     }
 
     #[test]
@@ -1101,7 +1144,7 @@ mod tests {
         );
         let clip = o.copy(page, &boxed);
         assert_eq!(clip.graphics.len(), 2);
-        let pasted = o.paste(page, &clip, Point::new(10.0, 10.0));
+        let pasted = o.paste(page, &clip, Point::new(10.0, 10.0)).unwrap();
         assert_eq!(pasted, vec![Selection::Graphic(2), Selection::Graphic(3)]);
         o.delete_many(page, &[line]);
         let left = &o.project.pages[page].graphics;

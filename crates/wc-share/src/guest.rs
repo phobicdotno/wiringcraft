@@ -72,6 +72,10 @@ pub struct Guest {
     /// back whole. The window takes them too, dropping what was changed meanwhile. Taken by
     /// whoever shows the project.
     pub retaken: Vec<String>,
+    /// The project records (devices, panels, pins...) such a refused change touched, as the
+    /// host has them: put back in this copy, and to be put back in the window with the pages.
+    /// No pages: those are named in `retaken`.
+    pub retaken_records: crate::Parts,
 }
 
 impl Default for Guest {
@@ -102,6 +106,7 @@ impl Guest {
             replaced: BTreeMap::new(),
             own_pages: BTreeMap::new(),
             retaken: Vec::new(),
+            retaken_records: crate::Parts::default(),
         }
     }
 
@@ -381,6 +386,13 @@ impl Guest {
                 }
                 whole.extend(own.iter().cloned());
                 if let Some(parts) = put_back {
+                    if !own.is_empty() {
+                        // The own pages are put back by id (`retaken`); other pages the batch
+                        // touched (one renumbered with it) stay listed, for their number.
+                        let mut records = (*parts).clone();
+                        records.pages.retain(|id, _| !own.contains(id));
+                        self.retaken_records.merge(records);
+                    }
                     self.put_back(*parts, &whole);
                 }
                 self.retaken.extend(own);

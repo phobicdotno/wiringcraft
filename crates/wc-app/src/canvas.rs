@@ -181,12 +181,17 @@ fn snap(p: Point, step: f64) -> Point {
     Point::new((p.x / step).round() * step, (p.y / step).round() * step)
 }
 
+/// The signed sweep from `start` to `end` in degrees as an arc is drawn: counterclockwise,
+/// a full turn when they are equal. Angles stored past a full turn (from a file) can make it
+/// negative, which draws the other way round.
+pub(crate) fn arc_sweep(start: f64, end: f64) -> f64 {
+    let sweep = end - start;
+    if sweep <= 0.0 { sweep + 360.0 } else { sweep }
+}
+
 pub(crate) fn arc_points(center: Point, r: f64, start: f64, end: f64) -> Vec<Point> {
-    let mut sweep = end - start;
-    if sweep <= 0.0 {
-        sweep += 360.0;
-    }
-    let n = ((sweep / 10.0).ceil() as usize).clamp(2, 72);
+    let sweep = arc_sweep(start, end);
+    let n = ((sweep.abs() / 10.0).ceil() as usize).clamp(2, 72);
     (0..=n)
         .map(|i| {
             let t = (start + sweep * i as f64 / n as f64).to_radians();
@@ -2064,6 +2069,17 @@ mod tests {
             end: 450.0,
         };
         assert!(graphic_hit(&more_than_full, Point::new(-10.0, 0.0), 0.5));
+        // A negative sweep (720° to 100°, from a file) is drawn the long way back round: 260°
+        // in 26 steps, picked on that path and not on the 100° it leaves out.
+        let back = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 100.0,
+        };
+        assert_eq!(arc_points(Point::new(150.0, 100.0), 9.0, 720.0, 100.0).len(), 27);
+        assert!(graphic_hit(&back, Point::new(141.0, 100.0), 0.3), "180° is drawn");
+        assert!(!graphic_hit(&back, Point::new(155.79, 106.89), 0.3), "50° is not");
         // A box around the drawn quarter arc holds it (not the whole circle).
         let quarter = Shape::Arc {
             center: Point::new(100.0, 100.0),
@@ -2118,6 +2134,60 @@ mod tests {
             String::from_utf8_lossy(&pdf).matches(" m\n").count()
         };
         assert_eq!(paths(&again.project), paths(&bare) + 3, "three more paths in the PDF");
+
+        // An arc stored past a full turn (720° to 100°) is exported along the path the canvas
+        // draws: 260° back round, through 180° and not through 50°.
+        let mut back = bare.clone();
+        back.pages[0].graphics = vec![Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 100.0,
+        }];
+        let (back_pages, _) = wc_pdf::page_drawings(&back, &again.symbols, &wc_pdf::Options::default());
+        let svg = wc_pdf::svg(&back_pages[0]);
+        // From 100° clockwise to 0° (360°): the large arc.
+        assert!(svg.contains(" A9 9 0 1 1 "), "the 260° arc in the SVG: {svg}");
+        let dxf = wc_pdf::dxf(&back_pages[0]);
+        let arc: Vec<&str> = dxf.lines().map(str::trim).skip_while(|l| *l != "ARC").collect();
+        let value = |code: &str| {
+            arc.iter()
+                .position(|l| *l == code)
+                .and_then(|k| arc.get(k + 1))
+                .copied()
+        };
+        // Counter-clockwise with y up from 0° to 260°: page angles 100° to 360°.
+        assert_eq!((value("50"), value("51")), (Some("0"), Some("260")), "{dxf}");
+        let curves = |p: &wc_core::Project| {
+            let (pdf, _) = wc_pdf::export(p, &again.symbols, &wc_pdf::Options::default());
+            String::from_utf8_lossy(&pdf).matches(" c\n").count()
+        };
+        assert_eq!(curves(&back), curves(&bare) + 3, "260° in three curves in the PDF");
+
+        // A full turn backwards (720° to 0°) is a circle in the SVG and DXF.
+        back.pages[0].graphics = vec![Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 0.0,
+        }];
+        let (full_pages, _) = wc_pdf::page_drawings(&back, &again.symbols, &wc_pdf::Options::default());
+        assert!(wc_pdf::svg(&full_pages[0]).contains("<circle"), "a circle in the SVG");
+        let count = |d: &str, kind: &str| d.lines().filter(|l| l.trim() == kind).count();
+        let full_dxf = wc_pdf::dxf(&full_pages[0]);
+        assert_eq!(
+            count(&full_dxf, "CIRCLE"),
+            count(&bare_dxf, "CIRCLE") + 1,
+            "a circle in the DXF"
+        );
+        // Angles stored far out draw one turn at most: a circle's four curves, not millions.
+        back.pages[0].graphics = vec![Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 1e9,
+            end: 0.0,
+        }];
+        assert!(curves(&back) <= curves(&bare) + 4, "at most a full turn in the PDF");
     }
 
     #[test]

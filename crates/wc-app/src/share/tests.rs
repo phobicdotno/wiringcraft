@@ -888,6 +888,31 @@ fn a_refused_rename_on_your_own_page_takes_back_the_page_and_a_move_made_meanwhi
 }
 
 #[test]
+fn a_refused_rename_on_your_own_page_puts_the_page_back_after_it_was_deleted_meanwhile() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    let start = coil_on(&guest_open, &coil)?;
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    guest_open.project.rename_device(&k1, &k2);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // The guest deletes its page before the answer comes.
+    guest_open.project.pages.retain(|p| p.id != "p0003");
+    g.frame(Some(&mut guest_open), Some("p0002".into()), false);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0002"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0002"));
+
+    // The refused action is not kept: the page is back, and the session never lost it.
+    assert_eq!(coil_on(&host_open, &coil)?, start);
+    assert_eq!(coil_on(&guest_open, &coil)?, start);
+    assert_eq!(host_open.project.pages, guest_open.project.pages);
+    assert_eq!(host_open.project.devices, guest_open.project.devices);
+    Ok(())
+}
+
+#[test]
 fn a_refused_rename_on_your_own_page_is_taken_back_also_when_the_session_ends_with_it() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, _log, mut host_open, mut g, mut guest_open), coil) =
@@ -898,13 +923,49 @@ fn a_refused_rename_on_your_own_page_is_taken_back_also_when_the_session_ends_wi
     h.frame(Some(&mut host_open), Some("p0002".into()), false);
     guest_open.project.rename_device(&k1, &k2);
     g.frame(Some(&mut guest_open), Some("p0003".into()), false);
-    // The host refuses, then ends the session before the guest's next frame.
+    // The host refuses, changes -K1 again, then ends the session before the guest's next
+    // frame: the guest gets all three at once.
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor, 2".into();
     h.frame(Some(&mut host_open), Some("p0002".into()), false);
     h.stop();
     g.frame(Some(&mut guest_open), Some("p0003".into()), false);
     assert!(!g.active());
     assert_eq!(coil_on(&guest_open, &coil)?, start);
+    // The device records come back with the page: -K1 as the session has it last, no -K2.
+    assert_eq!(
+        guest_open.project.devices.get(&k1).map(|d| d.description.as_str()),
+        Some("Pump contactor, 2")
+    );
+    assert!(!guest_open.project.devices.contains_key(&k2));
     assert!(g.take_notes().iter().any(|n| n.contains("nor what you did on it")));
+    Ok(())
+}
+
+#[test]
+fn a_page_renumbered_with_a_refused_change_of_your_own_page_gets_its_number_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), _coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    let number = guest_open.project.page("p0001").ok_or("no page")?.number.clone();
+    let title = guest_open.project.page("p0001").ok_or("no page")?.title.clone();
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    // One action: the guest renames -K1 on its page and renumbers the cover, all refused.
+    guest_open.project.rename_device(&k1, &k2);
+    guest_open.project.page_mut("p0001").ok_or("no page")?.number = "90".into();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // The session ends before the guest's next sync.
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    h.stop();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(!g.active());
+    // The cover has its number back, and keeps the rest as it was.
+    let cover = guest_open.project.page("p0001").ok_or("no page")?;
+    assert_eq!(cover.number, number);
+    assert_eq!(cover.title, title);
+    assert!(!guest_open.project.devices.contains_key(&k2));
     Ok(())
 }
 
@@ -1573,6 +1634,91 @@ fn a_guest_without_the_libraries_draws_every_symbol_of_the_project() -> TestResu
     Ok(())
 }
 
+/// Make every item `s` has sent due to be sent again, also one given up on: the next frame
+/// tries it, however many tries slow frames have used up.
+fn retry_due(s: &mut Share) {
+    let past = std::time::Instant::now().checked_sub(ITEM_RETRY_LATER * 2);
+    for out in s.items_out.values_mut() {
+        if let Some(past) = past {
+            out.at = past;
+        }
+    }
+}
+
+#[test]
+fn a_pinned_copy_the_host_puts_back_during_a_session_reaches_the_guests() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+        o.save()?;
+        // Shared with the coil pinned and its copy gone.
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil")?)?;
+        o.symbols.remove("wc.coil");
+        Ok(())
+    })?;
+    // A guest that has no copy either (it took one from the library as it joined).
+    std::fs::remove_file(store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.coil")?)?;
+    guest_open.symbols.remove("wc.coil");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(store::read_vendored_symbol(&guest_open.dir, "wc.coil").is_err());
+    let source = host_open.project.lock.symbols.get("wc.coil").map(|e| e.source.clone());
+    let steps = match h.role.as_ref() {
+        Some(Role::Host(hosting)) => hosting.host.history().len(),
+        _ => return Err("still hosting".into()),
+    };
+    // Placed again while the host cannot store files: the host puts the pinned version back
+    // from the library, the session refuses the file, and the placement waits for it.
+    log.fail_vendor(true);
+    let item = host_open.place(1, "wc.coil", wc_core::Point::new(60.0, 120.0))?;
+    // The copy here names another library for the pin: the session's entry stays as it is.
+    host_open
+        .project
+        .lock
+        .symbols
+        .get_mut("wc.coil")
+        .ok_or("pinned")?
+        .source = "elsewhere".into();
+    let coil = host_open.symbols.get("wc.coil").cloned();
+    assert!(coil.is_some());
+    // The host's page as the session (and so the guest) has it.
+    let drawn = |o: &Open| {
+        o.project
+            .page("p0002")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(store::read_vendored_symbol(&guest_open.dir, "wc.coil").is_err());
+    assert!(!drawn(&guest_open), "the page waits for the file");
+    // The host can store it again: the next try gets it in, and the page follows.
+    log.fail_vendor(false);
+    retry_due(&mut h);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(store::read_vendored_symbol(&guest_open.dir, "wc.coil").ok(), coil);
+    assert_eq!(guest_open.symbols.get("wc.coil").cloned(), coil);
+    assert!(drawn(&guest_open), "the placement reaches the guest");
+    let messages = log.messages();
+    let add = messages.iter().position(|m| m == "Add wc.coil to the project");
+    let edit = messages.iter().position(|m| m.contains("Edit page 2"));
+    assert!(add.is_some() && add < edit, "the file goes in first: {messages:?}");
+    // The pin is the session's as it was, and the file alone is no step to undo.
+    assert_eq!(
+        guest_open.project.lock.symbols.get("wc.coil").map(|e| e.source.clone()),
+        source
+    );
+    match h.role.as_ref() {
+        Some(Role::Host(hosting)) => {
+            assert_eq!(hosting.host.files().0.get("wc.coil").cloned(), coil);
+            assert_eq!(hosting.host.history().len(), steps + 1, "only the page edit");
+        }
+        _ => return Err("still hosting".into()),
+    }
+    // Sent once.
+    let n = log.messages().len();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages().len(), n);
+    Ok(())
+}
+
 #[test]
 fn a_symbol_used_for_the_first_time_reaches_the_host_with_its_file() -> TestResult {
     let tmp = tempfile::tempdir()?;
@@ -1644,7 +1790,7 @@ fn a_page_waits_until_the_session_has_the_symbols_it_draws() -> TestResult {
 
     // The host can store it again: the next try gets it in, and the page follows.
     log.fail_vendor(false);
-    std::thread::sleep(ITEM_WAIT);
+    retry_due(&mut g);
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert!(drawn(&host_open));
     assert!(host_open.project.lock.symbols.contains_key("wc.contact.no"));
@@ -1889,6 +2035,41 @@ fn a_symbol_whose_file_becomes_unreadable_holds_only_the_change_that_uses_it() -
     assert!(g.items_out.is_empty());
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert!(has_item(&host_open), "the waiting change follows it");
+    Ok(())
+}
+
+#[test]
+fn another_version_of_an_item_given_up_on_is_sent_without_waiting_for_its_retry() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    for _ in 0..=ITEM_TRIES {
+        std::thread::sleep(ITEM_WAIT);
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(
+        g.items_out.values().any(|o| o.gave_up),
+        "the first version is given up on: {:?}",
+        g.items_out
+    );
+    // The host can store files again, and the symbol is changed here: the new version goes
+    // out at once, not after the first one's retry wait.
+    log.fail_vendor(false);
+    let mut sym = guest_open.symbols.get("wc.contact.no").cloned().ok_or("not loaded")?;
+    sym.name = format!("{}, revised", sym.name);
+    store::write_vendored_symbol(&guest_open.dir, &sym)?;
+    guest_open
+        .project
+        .lock
+        .symbols
+        .get_mut("wc.contact.no")
+        .ok_or("pinned")?
+        .hash = sym.hash();
+    guest_open.symbols.insert(sym.id.clone(), sym.clone());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(host_open.symbols.get("wc.contact.no"), Some(&sym));
     Ok(())
 }
 
@@ -2739,6 +2920,7 @@ fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestRes
         &auth,
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     );
     assert!(out.edits.is_empty(), "{:?}", out.edits);
     assert_eq!(out.stale, ["symbol coil"]);
@@ -2750,6 +2932,7 @@ fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestRes
         &fresh,
         &base,
         &auth,
+        &Default::default(),
         &Default::default(),
         &Default::default(),
     );
@@ -3274,7 +3457,7 @@ fn items_sent_before_and_not_taken_go_each_in_an_edit_of_its_own() -> TestResult
             .collect()
     };
     let none = Default::default();
-    let out = new_items(&open.dir, &open.project, &before, &before, &none, &none);
+    let out = new_items(&open.dir, &open.project, &before, &before, &none, &none, &none);
     assert_eq!(
         added(&out.edits),
         [vec!["wc.coil", "wc.contact.no"]],
@@ -3283,7 +3466,7 @@ fn items_sent_before_and_not_taken_go_each_in_an_edit_of_its_own() -> TestResult
     // The contact was sent before and the session did not take it: it goes alone, so the coil
     // gets in even when the session cannot store the contact.
     let apart = [item_name(ItemKind::Symbol, "wc.contact.no")].into();
-    let out = new_items(&open.dir, &open.project, &before, &before, &none, &apart);
+    let out = new_items(&open.dir, &open.project, &before, &before, &none, &apart, &none);
     assert_eq!(added(&out.edits), [vec!["wc.contact.no"], vec!["wc.coil"]]);
     Ok(())
 }
@@ -3456,4 +3639,22 @@ fn a_page_too_large_to_go_twice_in_one_message_is_not_folded_into_the_batch() {
     base.pages[0].title = "x".repeat(FOLD_LIMIT / 2);
     let out = fold(&base, "y".repeat(FOLD_LIMIT / 2));
     assert!(out.page.is_some() && out.edits.len() == 1);
+    // One that fits, though it is more than half of what a message may carry, is folded.
+    base.pages[0].title = "x".repeat(net::MAX_LINE * 3 / 8);
+    let out = fold(&base, "y".repeat(net::MAX_LINE * 3 / 8));
+    assert!(out.page.is_none() && out.edits.len() == 2);
+    // Many small edits whose sizes add up to just under the limit: the commas between them take
+    // it over, so the page stays apart.
+    base.pages[0].title = "One".into();
+    let mut page = base.pages[0].clone();
+    page.title = "Two".into();
+    let each = json_len(&device);
+    let n = (FOLD_LIMIT - json_len(&page) - json_len(&base.pages[0])) / each;
+    let mut out = Outgoing {
+        page: Some(page),
+        edits: vec![device.clone(); n],
+        dropped: Vec::new(),
+    };
+    fold_own_page(&mut out, &base);
+    assert!(out.page.is_some() && out.edits.len() == n);
 }
