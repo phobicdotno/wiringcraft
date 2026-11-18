@@ -1061,6 +1061,9 @@ impl App {
                     page
                 };
                 let open = need_open(self.open.as_mut())?;
+                if let Some(why) = open.held_reason(to) {
+                    return Err(why);
+                }
                 let sel = open.selections(page, &strings(v, "ids"))?;
                 let clip = open.copy(page, &sel);
                 let at = match (num(v, "x"), num(v, "y")) {
@@ -1123,6 +1126,13 @@ impl App {
                 let page = self.page_of(v, "page")?;
                 let up = need_s(v, "direction")? == "up";
                 let open = need_open(self.open.as_mut())?;
+                let other = if up { page.checked_sub(1) } else { Some(page + 1) };
+                if let Some(why) = open
+                    .held_reason(page)
+                    .or_else(|| other.and_then(|o| open.held_reason(o)))
+                {
+                    return Err(why);
+                }
                 let i = open.move_page(page, up).ok_or("The page is already at that end.")?;
                 self.ed.page = i;
                 Ok("Page moved.".into())
@@ -2322,6 +2332,163 @@ mod tests {
         let msg = &a.symbol_editor.as_ref().unwrap().message;
         assert!(msg.starts_with("The project's library could not be opened: "), "{msg}");
         assert!(msg.contains("bogus"), "{msg}");
+    }
+
+    #[test]
+    fn editing_actions_are_off_and_do_nothing_on_a_page_someone_else_holds() {
+        use crate::chrome::Status;
+        let (_tmp, mut a) = app(vec![]);
+        {
+            let o = a.open.as_mut().unwrap();
+            o.project.pages[0].graphics.push(wc_core::Shape::Line {
+                a: wc_core::geom::Point::new(50.0, 50.0),
+                b: wc_core::geom::Point::new(80.0, 50.0),
+            });
+        }
+        a.ed.selection = vec![crate::state::Selection::Graphic(0)];
+        a.clipboard = a.open.as_ref().unwrap().copy(0, &a.ed.selection);
+        let status = |a: &App, act: Action| {
+            crate::StatusView {
+                open: a.open.as_ref(),
+                ed: &a.ed,
+                prefs: &a.prefs,
+                clipboard: &a.clipboard,
+                sharing: true,
+                share_undo: false,
+                share_redo: false,
+            }
+            .enabled(act)
+        };
+        let editing = [
+            Action::Delete,
+            Action::Cut,
+            Action::Paste,
+            Action::PlaceSymbol,
+            Action::DrawWire,
+            Action::TextTool,
+            Action::LineTool,
+            Action::RectTool,
+            Action::PageProps,
+        ];
+        for act in editing {
+            assert!(status(&a, act), "{act:?} works on your own page");
+        }
+
+        let page_id = a.open.as_ref().unwrap().project.pages[0].id.clone();
+        a.ed.held_by.insert(page_id, "Ola".into());
+        for act in editing {
+            assert!(!status(&a, act), "{act:?} is greyed out on a held page");
+        }
+        for act in [
+            Action::Select,
+            Action::ZoomIn,
+            Action::ZoomFit,
+            Action::Copy,
+            Action::CommentTool,
+        ] {
+            assert!(status(&a, act), "{act:?} still works");
+        }
+
+        // Pressed anyway (a shortcut): nothing changes, and the status line says why.
+        let before = a.open.as_ref().unwrap().project.clone();
+        for act in editing {
+            a.run(act);
+        }
+        assert_eq!(a.open.as_ref().unwrap().project, before, "no project change");
+        assert_eq!(a.ed.tool, crate::state::Tool::Select, "no drawing tool was picked");
+        assert!(a.ed.message.contains("Ola"), "{}", a.ed.message);
+        assert!(a.dialog.is_none(), "no page properties dialog");
+
+        // Moving the held page up or down is refused too: both page numbers stay.
+        a.ed.page = 0;
+        let numbers = |a: &App| -> Vec<String> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .pages
+                .iter()
+                .map(|p| p.number.clone())
+                .collect()
+        };
+        let before_numbers = numbers(&a);
+        assert!(!status(&a, Action::PageDown));
+        a.run(Action::PageDown);
+        assert_eq!(numbers(&a), before_numbers);
+
+        // With a panel shown instead of the held page, the page's own actions stay refused,
+        // while the panel's are not affected.
+        a.ed.panel = Some(0);
+        let schematic = a.open.as_ref().unwrap().project.pages[0].clone();
+        for act in [
+            Action::PageProps,
+            Action::DeletePage,
+            Action::PageDown,
+            // These work on the schematic page under the panel.
+            Action::Paste,
+            Action::Cut,
+            Action::Rotate,
+            Action::Mirror,
+        ] {
+            assert!(!status(&a, act), "{act:?} is still about the held page");
+            a.run(act);
+        }
+        assert!(a.dialog.is_none());
+        assert_eq!(numbers(&a), before_numbers);
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[0],
+            schematic,
+            "the held page is as it was"
+        );
+
+        // A page properties dialog opened before the page became held cannot change it.
+        let id = schematic.id.clone();
+        let o = a.open.as_mut().unwrap();
+        let refused = crate::confirm_page_props(o, &a.ed, &id, "99", "Renamed", schematic.size, false);
+        assert!(refused.is_err_and(|e| e.contains("Ola")));
+        assert_eq!(o.project.pages[0], schematic);
+        assert!(status(&a, Action::ArrangePanel), "the panel's own actions work");
+        a.ed.panel = None;
+
+        // On another page everything works as before.
+        a.ed.page = 1;
+        assert!(status(&a, Action::DrawWire));
+
+        // Held too, the second page cannot move up past the first: both numbers stay.
+        let second = a.open.as_ref().unwrap().project.pages[1].id.clone();
+        a.ed.held_by.insert(second.clone(), "Ola".into());
+        assert!(!status(&a, Action::PageUp));
+        a.run(Action::PageUp);
+        assert_eq!(numbers(&a), before_numbers);
+
+        // Only the neighbour held: the first page cannot move down past it either, as that
+        // would renumber the held page.
+        a.ed.held_by.clear();
+        a.ed.held_by.insert(second, "Ola".into());
+        a.open.as_mut().unwrap().held_by_others = a.ed.held_by.clone();
+        a.ed.page = 0;
+        assert!(!status(&a, Action::PageDown));
+        a.run(Action::PageDown);
+        assert_eq!(numbers(&a), before_numbers);
+        assert!(a.ed.message.contains("Ola"), "{}", a.ed.message);
+        assert_eq!(
+            a.open.as_mut().unwrap().move_page(0, false),
+            None,
+            "refused below the menu too"
+        );
+        assert_eq!(numbers(&a), before_numbers);
+        // The assistant's tools say who holds the page instead of claiming the page is at the end
+        // or that nothing was pasted.
+        let first = before_numbers[0].clone();
+        let moved = call(&mut a, "move_page", json!({"page": first, "direction": "down"}));
+        assert!(moved.is_err_and(|e| e.contains("Ola")));
+        let copied = call(
+            &mut a,
+            "copy_items",
+            json!({"page": first, "to_page": before_numbers[1], "ids": []}),
+        );
+        assert!(copied.is_err_and(|e| e.contains("Ola")));
+        assert_eq!(numbers(&a), before_numbers);
     }
 
     #[test]

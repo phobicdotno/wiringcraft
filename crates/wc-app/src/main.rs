@@ -201,6 +201,9 @@ impl chrome::Status for StatusView<'_> {
 
     fn enabled(&self, a: Action) -> bool {
         let has = self.open.is_some();
+        if self.open.is_some_and(|o| held_for(a, self.ed, &o.project).is_some()) {
+            return false;
+        }
         match a {
             Action::NewProject
             | Action::Open
@@ -368,6 +371,10 @@ impl App {
     fn run(&mut self, a: Action) {
         let page = self.ed.page;
         applog::info(&format!("command {a:?}"));
+        if let Some(name) = self.open.as_ref().and_then(|o| held_for(a, &self.ed, &o.project)) {
+            self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
+            return;
+        }
         if a == Action::ReportProblem {
             self.dialog = Some(Dialog::Report {
                 log: applog::tail(REPORT_LOG_BYTES),
@@ -1444,10 +1451,7 @@ impl App {
                         if ui.button("OK").clicked()
                             && let Some(o) = self.open.as_mut()
                         {
-                            let at = o.project.pages.iter().position(|p| p.id == *id);
-                            match at
-                                .ok_or_else(|| "This page was removed by another participant.".to_owned())
-                                .and_then(|i| o.set_page_props(i, number, title, *size, *overview))
+                            match confirm_page_props(o, &self.ed, id, number, title, *size, *overview)
                             {
                                 Ok(i) => {
                                     self.ed.page = i;
@@ -1592,6 +1596,10 @@ impl App {
                             && !text.trim().is_empty()
                         {
                             if let Some(o) = self.open.as_mut()
+                                && let Some(why) = o.held_reason(self.ed.page)
+                            {
+                                self.ed.message = why;
+                            } else if let Some(o) = self.open.as_mut()
                                 && let Some(sel) = o.add_graphic(
                                     self.ed.page,
                                     wc_core::geom::Shape::Text {
@@ -2897,6 +2905,60 @@ impl App {
             }
         }
     }
+}
+
+/// The page properties dialog's OK: refused when the page was removed, or when someone else
+/// opened it while the dialog was open.
+fn confirm_page_props(
+    o: &mut Open,
+    ed: &Editor,
+    id: &str,
+    number: &str,
+    title: &str,
+    size: wc_core::PageSize,
+    overview: bool,
+) -> Result<usize, String> {
+    let i = o
+        .project
+        .pages
+        .iter()
+        .position(|p| p.id == id)
+        .ok_or_else(|| "This page was removed by another participant.".to_owned())?;
+    if let Some(name) = ed.held_by.get(id) {
+        return Err(format!(
+            "{name} has this page open; it is read-only here until they leave it."
+        ));
+    }
+    o.set_page_props(i, number, title, size, overview)
+}
+
+/// Who holds the page action `a` would change, in a shared session: then it is refused. Page
+/// actions (properties, delete, move up or down) are about the current page even while a panel
+/// is shown; canvas actions only when the page itself is shown, as in the panel view they work
+/// on the panel.
+fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
+    // With a panel shown these still work on the schematic page under it (Delete goes to the
+    // panel first), so they follow that page's hold.
+    let on_page_under_panel =
+        ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Rotate | Action::Mirror);
+    let name = if a.edits_page_itself() || on_page_under_panel {
+        let page = project.pages.get(ed.page)?;
+        // Moving a page up or down renumbers its neighbour too.
+        let neighbour = match a {
+            Action::PageUp => ed.page.checked_sub(1).and_then(|i| project.pages.get(i)),
+            Action::PageDown => project.pages.get(ed.page + 1),
+            _ => None,
+        };
+        ed.held_by
+            .get(&page.id)
+            .or_else(|| neighbour.and_then(|n| ed.held_by.get(&n.id)))
+            .map(String::as_str)
+    } else if a.edits_page() {
+        ed.held_page(project)
+    } else {
+        None
+    };
+    name.map(str::to_owned)
 }
 
 /// A note across the top of the canvas: someone else has this page open, so it is read-only.

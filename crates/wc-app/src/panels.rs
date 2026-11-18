@@ -14,7 +14,9 @@ use crate::theme::Theme;
 pub struct PanelState {
     pub search: String,
     /// Edit buffers for the properties panel and the selection they belong to.
-    loaded_for: Option<Selection>,
+    /// The page and item the fields were loaded from: the same item id on another page is
+    /// another item.
+    loaded_for: Option<(usize, Selection)>,
     tag: String,
     description: String,
     number: String,
@@ -513,10 +515,11 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
 
 fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
     let one = ed.one().cloned();
-    if ps.loaded_for == one {
+    let key = one.clone().map(|s| (ed.page, s));
+    if ps.loaded_for == key {
         return;
     }
-    ps.loaded_for = one.clone();
+    ps.loaded_for = key;
     ps.tag_error = None;
     let Some(page) = open.project.pages.get(ed.page) else {
         return;
@@ -569,6 +572,38 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
         comment_properties(ui, open, ed, ps, &id, &t);
         return;
     }
+    if ed.selection.is_empty() {
+        // The page and its comments: comments are not part of the page, so they stay usable on
+        // a page someone else holds.
+        if let Some(p) = open.project.pages.get(ed.page) {
+            ui.label(format!("Page {} · {}", p.number, p.title));
+            ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.faint));
+        }
+        ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.faint));
+        page_comments(ui, open, ed, &t);
+        return;
+    }
+    // On a page someone else holds the values are shown, not edited. A value half typed when
+    // the page became held is dropped (the fields are read from the project again each frame),
+    // and if a field still commits as it loses focus, the change and its undo step are taken back.
+    let held = open
+        .project
+        .pages
+        .get(ed.page)
+        .is_some_and(|p| ed.held_by.contains_key(&p.id));
+    if held {
+        ps.loaded_for = None;
+        ps.spec_for = Default::default();
+        open.without_changes(|open| {
+            ui.add_enabled_ui(false, |ui| selection_properties(ui, open, ed, ps, &t));
+        });
+    } else {
+        selection_properties(ui, open, ed, ps, &t);
+    }
+}
+
+/// The properties of the selected items (not a comment, not nothing).
+fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState, t: &Theme) {
     load_buffers(open, ed, ps);
     let page_idx = ed.page;
     if ed.selection.len() > 1 {
@@ -613,7 +648,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                 ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.faint));
             }
             ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.faint));
-            page_comments(ui, open, ed, &t);
+            page_comments(ui, open, ed, t);
         }
         Some(Selection::Symbol(id)) => {
             let Some(placed) = open.project.pages.get(page_idx).and_then(|p| p.symbol(&id)).cloned() else {
@@ -706,7 +741,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
                     ui.end_row();
                 });
             if let Some(tag) = placed.tag.clone() {
-                device_section(ui, open, ps, &tag, &t);
+                device_section(ui, open, ps, &tag, t);
             }
             if let Some(sym) = open.symbols.get(&placed.symbol) {
                 ui.add_space(6.0);
@@ -1318,6 +1353,213 @@ fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_half_typed_value_is_dropped_when_the_page_becomes_held() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let tag = DeviceTag::parse("-K1")?;
+        o.project.pages[0].symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "iec.coil".into(),
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag),
+        });
+        let mut ed = Editor::default();
+        ed.selection = vec![Selection::Symbol("s1".into())];
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, ps: &mut PanelState| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        };
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.tag, "-K1");
+        // A new tag half typed, then Ola opens the page.
+        ps.tag = "-K9".into();
+        let before = o.project.clone();
+        let page = o.project.pages[0].id.clone();
+        ed.held_by.insert(page, "Ola".into());
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.tag, "-K1", "the field shows the project's value again");
+        assert_eq!(o.project, before, "nothing was changed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_being_typed_in_changes_nothing_when_the_page_becomes_held() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        o.project.pages[0].symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "iec.coil".into(),
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(DeviceTag::parse("-K1")?),
+        });
+        let mut ed = Editor::default();
+        ed.selection = vec![Selection::Symbol("s1".into())];
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, ps: &mut PanelState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        frame(&mut o, &mut ed, &mut ps, Vec::new());
+        // Tab to the tag field and type in it.
+        let mut typing = false;
+        for _ in 0..12 {
+            frame(&mut o, &mut ed, &mut ps, vec![key(egui::Key::Tab)]);
+            frame(&mut o, &mut ed, &mut ps, vec![egui::Event::Text("9".into())]);
+            if ps.tag.ends_with('9') {
+                typing = true;
+                break;
+            }
+        }
+        assert!(typing, "the tag field never took the typing");
+        let (before, mark, dirty) = (o.project.clone(), o.undo_mark(), o.dirty);
+
+        // Ola opens the page: the field is disabled and loses focus.
+        let page = o.project.pages[0].id.clone();
+        ed.held_by.insert(page, "Ola".into());
+        frame(&mut o, &mut ed, &mut ps, Vec::new());
+        frame(&mut o, &mut ed, &mut ps, vec![key(egui::Key::Enter)]);
+        assert_eq!(o.project, before, "nothing was changed");
+        assert_eq!(o.undo_mark(), mark, "no undo step");
+        assert_eq!(o.dirty, dirty);
+        assert_eq!(ps.tag, "-K1");
+        Ok(())
+    }
+
+    #[test]
+    fn a_comment_on_a_held_page_can_still_be_replied_to() -> Result<(), Box<dyn std::error::Error>> {
+        // Comments are not part of the page: their controls stay enabled while someone else
+        // has the page open. A disabled reply field would not take the typing.
+        let (_tmp, mut o) = crate::state::tests::project();
+        let page = o.project.pages[0].id.clone();
+        let id = o.project.add_comment(&page, None, "Kari", 1, "Check this")?;
+        let mut ed = Editor::default();
+        ed.comment = Some(id);
+        ed.held_by.insert(page, "Ola".into());
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, ps: &mut PanelState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        };
+        let tab = egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        frame(&mut o, &mut ed, &mut ps, Vec::new());
+        for _ in 0..8 {
+            frame(&mut o, &mut ed, &mut ps, vec![tab.clone()]);
+            frame(&mut o, &mut ed, &mut ps, vec![egui::Event::Text("x".into())]);
+            if ps.reply.ends_with('x') {
+                break;
+            }
+        }
+        assert!(ps.reply.ends_with('x'), "the reply field took no typing");
+        Ok(())
+    }
+
+    #[test]
+    fn a_wire_colour_draft_is_dropped_when_the_page_becomes_held() {
+        use wc_core::geom::Point;
+        let (_tmp, mut o) = crate::state::tests::project();
+        let at = |x: f64| wc_core::Endpoint::Point {
+            at: Point::new(x, 10.0),
+        };
+        o.add_wire(0, at(10.0), at(20.0), Vec::new());
+        o.add_wire(0, at(30.0), at(40.0), Vec::new());
+        let ids: Vec<String> = o.project.pages[0].wires.iter().map(|w| w.id.clone()).collect();
+        o.set_wire_spec(0, &ids, SpecPart::Colour, Some("BU".into()));
+        let mut ed = Editor::default();
+        ed.selection = ids.iter().map(|id| Selection::Wire(id.clone())).collect();
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, ps: &mut PanelState| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        };
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.spec[1].buffer, "BU");
+        // RD half typed for both wires: kept while the page is yours.
+        ps.spec[1].buffer = "RD".into();
+        ps.spec[1].dirty = true;
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.spec[1].buffer, "RD", "a draft stays on your own page");
+        // Then Ola opens the page: the field shows the project's colour again.
+        let before = o.project.clone();
+        let page = o.project.pages[0].id.clone();
+        ed.held_by.insert(page, "Ola".into());
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.spec[1].buffer, "BU");
+        assert!(!ps.spec[1].dirty);
+        assert_eq!(o.project, before);
+    }
+
+    #[test]
+    fn the_same_item_id_on_another_page_loads_that_pages_values() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        for (page, tag) in [(0, "-K1"), (1, "-K2")] {
+            o.project.pages[page].symbols.push(wc_core::PlacedSymbol {
+                id: "s1".into(),
+                symbol: "iec.coil".into(),
+                at: wc_core::geom::Point::new(50.0, 50.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, ps: &mut PanelState| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        };
+        ed.selection = vec![Selection::Symbol("s1".into())];
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.tag, "-K1");
+        // Nothing selected for a frame, then s1 on the next page.
+        ed.selection.clear();
+        frame(&mut o, &mut ed, &mut ps);
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol("s1".into())];
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.tag, "-K2");
+        Ok(())
+    }
 
     #[test]
     fn spec_drafts_are_forgotten_when_no_wire_rows_show() {

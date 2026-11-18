@@ -527,6 +527,24 @@ impl Open {
         }
     }
 
+    /// Run `f` and then take back everything it changed in the project and its undo history:
+    /// for showing a form on a page someone else holds, where a field that still commits must
+    /// leave no trace (no change, no undo step, redo kept, not marked as changed).
+    pub(crate) fn without_changes<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let project = self.project.clone();
+        let undo = std::mem::take(&mut self.undo);
+        let redo = std::mem::take(&mut self.redo);
+        let (undo_dropped, history, form_step, dirty) = (self.undo_dropped, self.history, self.form_step, self.dirty);
+        let terminals_before = self.terminals_before.clone();
+        let r = f(self);
+        self.project = project;
+        self.undo = undo;
+        self.redo = redo;
+        (self.undo_dropped, self.history, self.form_step, self.dirty) = (undo_dropped, history, form_step, dirty);
+        self.terminals_before = terminals_before;
+        r
+    }
+
     /// Take a snapshot before a change, so it can be undone.
     pub fn checkpoint(&mut self) {
         // The change before this one is done: its jumpers follow their terminals first, so the
@@ -1142,6 +1160,14 @@ impl Open {
         Ok(self.index_of(&id))
     }
 
+    /// Why `page` cannot be changed here: in a shared session someone else has it open.
+    pub fn held_reason(&self, page: usize) -> Option<String> {
+        let id = &self.project.pages.get(page)?.id;
+        self.held_by_others
+            .get(id)
+            .map(|name| format!("{name} has this page open; it is read-only here until they leave it."))
+    }
+
     /// Delete a page. The last page of a project cannot be deleted. Returns the page to show next.
     pub fn delete_page(&mut self, page: usize) -> Result<usize, String> {
         if self.project.pages.len() <= 1 {
@@ -1149,6 +1175,9 @@ impl Open {
         }
         if page >= self.project.pages.len() {
             return Err("No such page.".into());
+        }
+        if let Some(why) = self.held_reason(page) {
+            return Err(why);
         }
         self.checkpoint();
         self.project.pages.remove(page);
@@ -1160,6 +1189,10 @@ impl Open {
     pub fn move_page(&mut self, page: usize, up: bool) -> Option<usize> {
         let other = if up { page.checked_sub(1)? } else { page + 1 };
         if other >= self.project.pages.len() || page >= self.project.pages.len() {
+            return None;
+        }
+        // Both pages get a new number: refused when someone else has either open.
+        if self.held_reason(page).is_some() || self.held_reason(other).is_some() {
             return None;
         }
         self.checkpoint();
@@ -1212,6 +1245,9 @@ impl Open {
     /// Insert a macro on a page where it was drawn (its anchor), like a paste. Returns the
     /// inserted items, selected so they can be moved into place.
     pub fn insert_macro(&mut self, page: usize, path: &Path) -> Result<Vec<Selection>, String> {
+        if let Some(why) = self.held_reason(page) {
+            return Err(why);
+        }
         let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
         let clip = crate::edit::Clipboard::from(m);
         let at = clip.anchor;
@@ -2370,6 +2406,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_change_made_without_changes_leaves_no_trace_in_the_undo_history() {
+        let (_tmp, mut o) = project();
+        o.checkpoint();
+        o.project.pages[0].title = "First".into();
+        assert!(o.undo());
+        o.dirty = false;
+        let (project, mark) = (o.project.clone(), o.undo_mark());
+        assert!(o.can_redo());
+        o.without_changes(|o| {
+            o.checkpoint();
+            o.project.pages[0].title = "Second".into();
+        });
+        assert_eq!(o.project, project);
+        assert_eq!(o.undo_mark(), mark, "no undo step");
+        assert!(o.can_redo(), "redo kept");
+        assert!(!o.dirty, "not marked as changed");
+    }
+
+    #[test]
     fn the_cover_form_shows_changes_as_typed_and_keeps_them_as_one_undo_step() {
         let (_tmp, mut o) = project();
         assert_eq!(o.cover_page(), Ok(0), "a new project's first page is its cover");
@@ -2768,6 +2823,39 @@ pub(crate) mod tests {
         let a1 = o.pin_pos(&pg, &a, "A1").unwrap();
         let (item, pin, _) = o.pin_near(&pg, a1 + Point::new(0.5, 0.5), 2.0).unwrap();
         assert_eq!((item.as_str(), pin.as_str()), (a.as_str(), "A1"));
+    }
+
+    #[test]
+    fn a_page_someone_else_has_open_is_neither_deleted_nor_written_on() {
+        // A Delete page or Text dialog confirmed after the page became held changes nothing.
+        let (_tmp, mut o) = project();
+        let id = o.project.pages[1].id.clone();
+        o.held_by_others.insert(id, "Ola".into());
+        let before = o.project.clone();
+        let text = wc_core::geom::Shape::Text {
+            at: wc_core::geom::Point::new(10.0, 10.0),
+            text: "Note".into(),
+            height: 3.5,
+            align: wc_core::geom::Align::Left,
+            angle: 0.0,
+        };
+        assert!(o.delete_page(1).is_err_and(|e| e.contains("Ola")));
+        assert!(o.add_graphic(1, text.clone()).is_none());
+        assert!(o.held_reason(1).is_some_and(|e| e.contains("Ola")));
+        // Nor renumbered by moving its neighbour past it, nor given a macro or a paste.
+        assert_eq!(o.move_page(0, false), None);
+        let path = o.dir.join("missing.wcmacro");
+        assert!(o.insert_macro(1, &path).is_err_and(|e| e.contains("Ola")));
+        let clip = crate::edit::Clipboard {
+            graphics: vec![text.clone()],
+            ..Default::default()
+        };
+        assert!(o.paste(1, &clip, wc_core::geom::Point::new(0.0, 0.0)).is_empty());
+        assert_eq!(o.project, before);
+        assert!(!o.can_undo(), "nothing was recorded");
+        // The other page is not held.
+        assert!(o.held_reason(0).is_none());
+        assert!(o.add_graphic(0, text).is_some());
     }
 
     #[test]

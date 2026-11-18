@@ -258,9 +258,12 @@ impl Open {
         out
     }
 
-    /// Add a free drawing to a page and return its selection.
+    /// Add a free drawing to a page and return its selection. Refused (None) on a page someone else has open in a shared session.
     pub fn add_graphic(&mut self, page: usize, g: Shape) -> Option<Selection> {
         self.project.pages.get(page)?;
+        if self.held_reason(page).is_some() {
+            return None;
+        }
         self.checkpoint();
         let p = self.project.pages.get_mut(page)?;
         p.graphics.push(g);
@@ -446,7 +449,7 @@ impl Open {
     /// Paste so the clipboard's anchor lands on `at`. Pasted symbols get fresh ids and the next
     /// free device tags (one new device per copied device). Returns the pasted items.
     pub fn paste(&mut self, page: usize, clip: &Clipboard, at: Point) -> Vec<Selection> {
-        if clip.is_empty() || self.project.pages.get(page).is_none() {
+        if clip.is_empty() || self.project.pages.get(page).is_none() || self.held_reason(page).is_some() {
             return Vec::new();
         }
         for s in &clip.symbols {
