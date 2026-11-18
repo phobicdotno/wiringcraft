@@ -125,11 +125,35 @@ impl SweDrawings {
         budget: &mut usize,
         skipped: &mut BTreeMap<String, usize>,
     ) -> Option<Vec<Shape>> {
-        let d = self.blocks.get(&s.block.to_lowercase())?;
         let (sx, sy) = s.scale;
         let (sin, cos) = s.angle.to_radians().sin_cos();
         let m = [cos * sx, -sin * sx, sin * sy, cos * sy];
-        let (shapes, _) = dxf::draw_mapped(d, &d.entities, m, s.angle, skipped, budget);
+        self.mapped(&s.block, m, s.angle, budget, skipped)
+    }
+
+    /// The shapes of block `name` as they are, unturned and unscaled, in the symbol's own frame:
+    /// y down, the insertion point at the origin. `None` when the archive has no drawing for the
+    /// block or it draws nothing. Used for library symbols (#230).
+    pub(crate) fn block_graphics(
+        &self,
+        name: &str,
+        budget: &mut usize,
+        skipped: &mut BTreeMap<String, usize>,
+    ) -> Option<Vec<Shape>> {
+        self.mapped(name, [1.0, 0.0, 0.0, 1.0], 0.0, budget, skipped)
+    }
+
+    /// Block `name` drawn with the linear map `m` and texts turned by `rot` degrees, rounded.
+    fn mapped(
+        &self,
+        name: &str,
+        m: [f64; 4],
+        rot: f64,
+        budget: &mut usize,
+        skipped: &mut BTreeMap<String, usize>,
+    ) -> Option<Vec<Shape>> {
+        let d = self.blocks.get(&name.to_lowercase())?;
+        let (shapes, _) = dxf::draw_mapped(d, &d.entities, m, rot, skipped, budget);
         let shapes: Vec<Shape> = shapes.into_iter().filter_map(|(_, sh)| rounded(&sh)).collect();
         (!shapes.is_empty()).then_some(shapes)
     }

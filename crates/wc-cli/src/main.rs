@@ -600,8 +600,8 @@ enum ImportCmd {
         symbol_map: Option<PathBuf>,
     },
     /// The libraries of a SolidWorks Electrical archive (.tewzip): catalog parts with their
-    /// terminals, cable types with their cores, and symbol blocks as box symbols with their
-    /// connection points. Into a library folder with --lib, else vendored into the project.
+    /// terminals, cable types with their cores, and symbol blocks with their connection points,
+    /// drawn from the archive's block DWG files (boxes where a block has none). Into a library folder with --lib, else vendored into the project.
     SweLibrary {
         path: PathBuf,
         /// A library folder to write into instead of the project.
@@ -1867,7 +1867,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let catalog_read = !is_db;
             if catalog_read {
                 let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
-                match wc_import::swe::library::from_archive(file) {
+                match wc_import::swe::library::catalog_from_archive(file) {
                     Ok(lib) => {
                         // Why a catalog row was left out, so a device it would have matched is
                         // not left unlinked without a reason.

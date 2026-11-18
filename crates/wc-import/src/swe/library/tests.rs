@@ -106,7 +106,7 @@ fn cable_types_become_parts_with_their_cores() {
 #[test]
 fn blocks_become_box_symbols_with_their_points_as_pins() {
     let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
-    let symbols = read_blocks(&db(APP_DATA), &mut report, &mut warnings).unwrap();
+    let symbols = read_blocks(&db(APP_DATA), None, &mut report, &mut warnings).unwrap();
     let ids: Vec<&str> = symbols.iter().map(|s| s.id.as_str()).collect();
     // Two blocks named `Coil` get distinct ids; the frame has no points and is left out.
     assert_eq!(ids, ["swe.lib.coil", "swe.lib.coil.2"]);
@@ -177,7 +177,7 @@ fn rows_of_the_wrong_type_are_counted_not_fatal() {
     c.execute_batch("INSERT INTO tew_block VALUES ('bad id', 'Odd', '');")
         .unwrap();
     let mut warnings = Vec::new();
-    let symbols = read_blocks(&c, &mut report, &mut warnings).unwrap();
+    let symbols = read_blocks(&c, None, &mut report, &mut warnings).unwrap();
     assert_eq!(report.blocks_in, 4);
     assert_eq!(symbols[0].pins.len(), 2);
     assert!(!warnings.is_empty());
@@ -339,4 +339,89 @@ fn an_imported_project_links_its_devices_to_the_archive_catalog() {
         .1;
     assert_eq!(w1.part.as_deref(), Some("maker-c.cbl-3g1"));
     assert!(built.parts.iter().any(|p| p.id == "maker-a.rly-24"));
+}
+
+#[test]
+fn library_blocks_are_drawn_from_their_dwg_files_in_the_archive() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    use wc_core::geom::Shape;
+    // A coil with a drawing, a lamp whose only drawing is another project's own copy, and a
+    // block whose drawing is damaged.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Lamp', ''), (3, 'Bad', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (1, 2, 'A2', 0, -5), (2, 1, 'X1', 0, 5), (3, 1, '1', 0, 0);
+"));
+    // y up in the drawing: a circle and a line from the circle up to A1.
+    let coil = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0), E::Line((0.0, 4.0), (0.0, 5.0))]);
+    let lamp = model_space_dwg(&[E::Circle((0.0, 0.0), 3.0)]);
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/coil.DWG", &coil),
+        ("Projects/2/Block/Lamp.dwg", &lamp),
+        ("Library/Block/Bad.dwg", b"AC1024 but nothing else"),
+    ]);
+    let lib = from_archive(buf).unwrap();
+    let ids: Vec<&str> = lib.symbols.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["swe.lib.bad", "swe.lib.coil", "swe.lib.lamp"]);
+
+    // The coil carries its drawing, y flipped, and the same pins as a box would.
+    let coil = &lib.symbols[1];
+    assert!(
+        coil.graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Circle { center, radius, .. } if *radius == 4.0 && center.x == 0.0 && center.y == 0.0)),
+        "{:?}",
+        coil.graphics
+    );
+    assert!(
+        coil.graphics.iter().any(|g| matches!(g, Shape::Line { a, b }
+            if (a.y, b.y) == (-4.0, -5.0) && a.x == 0.0 && b.x == 0.0)),
+        "{:?}",
+        coil.graphics
+    );
+    assert!(!coil.graphics.iter().any(|g| matches!(g, Shape::Rect { .. })));
+    let pins: Vec<(&str, f64, f64)> = coil.pins.iter().map(|p| (p.name.as_str(), p.at.x, p.at.y)).collect();
+    assert_eq!(pins, [("A1", 0.0, -5.0), ("A2", 0.0, 5.0)]);
+
+    // Another project's copy is not the library's, and a damaged drawing leaves a box.
+    for s in [&lib.symbols[0], &lib.symbols[2]] {
+        assert!(
+            matches!(s.graphics[..], [Shape::Rect { .. }]),
+            "{}: {:?}",
+            s.id,
+            s.graphics
+        );
+    }
+    assert_eq!((lib.report.blocks_out, lib.report.blocks_drawn), (3, 1));
+    assert!(
+        lib.report.lines()[2]
+            .contains("3 imported with their connection points: 1 drawn from their DWG file, 2 as boxes"),
+        "{:?}",
+        lib.report.lines()
+    );
+    assert!(
+        lib.warnings
+            .iter()
+            .any(|w| w.starts_with("block drawings:") && w.contains("Bad.dwg")),
+        "{:?}",
+        lib.warnings
+    );
+
+    // Without drawings every block is a box.
+    let lib = catalog_from_archive(archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        (
+            "Library/Block/coil.DWG",
+            &model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]),
+        ),
+    ]))
+    .unwrap();
+    assert_eq!(lib.report.blocks_drawn, 0);
+    assert!(
+        lib.symbols
+            .iter()
+            .all(|s| matches!(s.graphics[..], [Shape::Rect { .. }]))
+    );
 }
