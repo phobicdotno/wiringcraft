@@ -55,6 +55,19 @@ pub(crate) struct Drawing {
     pub(crate) blocks: BTreeMap<String, Vec<Entity>>,
 }
 
+impl Drawing {
+    /// The entities of block `name`: its own spelling first, else any spelling (block names are
+    /// not case-sensitive).
+    fn block(&self, name: &str) -> Option<&Vec<Entity>> {
+        self.blocks.get(name).or_else(|| {
+            self.blocks
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, ents)| ents)
+        })
+    }
+}
+
 /// The most entities one import draws, block references expanded: a few nested blocks that
 /// each insert the next many times would otherwise fill the memory.
 pub const MAX_DRAWN: usize = 2_000_000;
@@ -435,8 +448,8 @@ fn shapes(
                 None
             }
             // A dimension is drawn by its (anonymous) block, placed as it is.
-            "DIMENSION" if e.get(2).is_some_and(|n| d.blocks.contains_key(n)) => {
-                if let Some(inner) = e.get(2).and_then(|n| d.blocks.get(n)) {
+            "DIMENSION" if e.get(2).and_then(|n| d.block(n)).is_some() => {
+                if let Some(inner) = e.get(2).and_then(|n| d.block(n)) {
                     shapes(d, inner, xf, scale, depth + 1, skip_layer, out, points, skipped, budget);
                 }
                 None
@@ -1839,14 +1852,16 @@ mod tests {
     #[test]
     fn a_dimension_is_drawn_by_its_block() -> Result<()> {
         let blocks = "0\nBLOCK\n2\n*D1\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
-        let (g, skipped) = drawn("0\nDIMENSION\n2\n*D1\n10\n7\n20\n7\n0\nDIMENSION\n2\n*D9\n", blocks)?;
-        assert_eq!(
-            g,
-            [Shape::Line {
-                a: Point::new(0.0, 0.0),
-                b: Point::new(0.0, -5.0)
-            }]
-        );
+        // The second refers to the block in other letters; the third to a missing one.
+        let (g, skipped) = drawn(
+            "0\nDIMENSION\n2\n*D1\n10\n7\n20\n7\n0\nDIMENSION\n2\n*d1\n0\nDIMENSION\n2\n*D9\n",
+            blocks,
+        )?;
+        let line = Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(0.0, -5.0),
+        };
+        assert_eq!(g, [line.clone(), line]);
         assert_eq!(skipped.get("DIMENSION"), Some(&1));
         Ok(())
     }
