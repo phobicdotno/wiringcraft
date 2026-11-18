@@ -800,7 +800,8 @@ fn unload_taken_back(unload: &mut std::collections::BTreeSet<(ItemKind, String)>
 
 /// The items `local` locks in another version than the session `auth`: someone else used them
 /// first, and [`incoming`] gives this copy the session's version. As `symbol id` or `part id`.
-pub fn conflicts(local: &Project, auth: &Project) -> Vec<String> {
+/// An update made here since the last sync (`base`, see [`updated_here`]) is none.
+pub fn conflicts(local: &Project, base: &Project, auth: &Project) -> Vec<String> {
     [ItemKind::Symbol, ItemKind::Part]
         .into_iter()
         .flat_map(|kind| {
@@ -809,9 +810,25 @@ pub fn conflicts(local: &Project, auth: &Project) -> Vec<String> {
                 .map(kind)
                 .iter()
                 .filter(move |(id, e)| auth.lock.map(kind).get(*id).is_some_and(|a| a.hash != e.hash))
+                .filter(move |(id, _)| !updated_here(local, base, auth, kind, id))
+                // A copy still on the version the last sync brought did not change it here.
+                .filter(move |(id, e)| base.lock.map(kind).get(*id).is_none_or(|b| b.hash != e.hash))
                 .map(move |(id, _)| item_name(kind, id))
         })
         .collect()
+}
+
+/// Whether `local` holds item `id` in a version it updated to since the last sync (`base`):
+/// the session `auth` still has the version the last sync brought, and this copy another.
+fn updated_here(local: &Project, base: &Project, auth: &Project, kind: ItemKind, id: &str) -> bool {
+    let (Some(l), Some(b), Some(a)) = (
+        local.lock.map(kind).get(id),
+        base.lock.map(kind).get(id),
+        auth.lock.map(kind).get(id),
+    ) else {
+        return false;
+    };
+    b.hash == a.hash && l.hash != a.hash
 }
 
 /// An item as messages name it: `symbol wc.coil`, `part acme.relay`.
@@ -824,10 +841,35 @@ fn item_name(kind: ItemKind, id: &str) -> String {
 
 /// Whether the session's project locks the item [`item_name`] names.
 fn session_has(auth: &Project, name: &str) -> bool {
-    match name.split_once(' ') {
-        Some(("symbol", id)) => auth.lock.symbols.contains_key(id),
-        Some(("part", id)) => auth.lock.parts.contains_key(id),
-        _ => false,
+    named(name).is_some_and(|(kind, id)| auth.lock.map(kind).contains_key(id))
+}
+
+/// Whether the session took what this copy sent of the item [`item_name`] names: it locks the
+/// item, and not still in the version the last sync (`base`) brought while this copy updated
+/// it ([`updated_here`]).
+fn session_took(auth: &Project, local: &Project, base: &Project, name: &str) -> bool {
+    named(name)
+        .is_some_and(|(kind, id)| auth.lock.map(kind).contains_key(id) && !updated_here(local, base, auth, kind, id))
+}
+
+/// Take in the session's answers to this person's updates: the version it took is what this copy
+/// synced to (`base`), so a later change here goes out as an update from it, and one the session
+/// took is not waited for or sent again, even when a later change (an undo) put it back since.
+fn take_updates(role: &mut Role, base: &mut Project, items_out: &mut BTreeMap<String, ItemOut>) {
+    for (kind, id, hash) in role.took_updates() {
+        if let Some(e) = base.lock.map_mut(kind).get_mut(&id) {
+            e.hash = hash;
+        }
+        items_out.remove(&item_name(kind, &id));
+    }
+}
+
+/// The kind and id of the item [`item_name`] names.
+fn named(name: &str) -> Option<(ItemKind, &str)> {
+    match name.split_once(' ')? {
+        ("symbol", id) => Some((ItemKind::Symbol, id)),
+        ("part", id) => Some((ItemKind::Part, id)),
+        _ => None,
     }
 }
 
@@ -844,51 +886,97 @@ fn check_locked<T>(read: wc_core::Result<T>, hash: impl Fn(&T) -> String, locked
 /// What [`new_items`] found.
 #[derive(Debug, Default)]
 pub struct NewItems {
-    /// The edit that adds them, with their files.
-    pub edit: Option<ProjectEdit>,
+    /// The edits that add them and update them, with their files.
+    pub edits: Vec<ProjectEdit>,
     /// The items it holds, as [`item_name`] names them.
     pub sent: Vec<String>,
     /// Items whose file could not be read, with the reason; they are not sent.
     pub unreadable: Vec<(String, String)>,
+    /// Items this copy updated whose earlier version the session took back since the last sync
+    /// (`base` has them, the session no longer does): not sent, as an add would undo that.
+    pub stale: Vec<String>,
 }
 
 /// The symbols and parts locked in `local` and not in the session's project `auth`, with their
-/// vendored files from `dir`, as one edit: what this person started using. Items named in
-/// `skip` (sent and not answered yet) are left out. An item whose file cannot be read is not
-/// sent; it is returned with the reason and tried again next time.
-pub fn new_items(dir: &Path, local: &Project, auth: &Project, skip: &std::collections::BTreeSet<String>) -> NewItems {
+/// vendored files from `dir`, as one edit: what this person started using. Then those this
+/// copy updated since the last sync (`base`, see [`updated_here`]), as a second edit that
+/// names the version the session has. Items named in `skip` (sent and not answered yet) are
+/// left out. An item whose file cannot be read is not sent; it is returned with the reason and
+/// tried again next time.
+pub fn new_items(
+    dir: &Path,
+    local: &Project,
+    base: &Project,
+    auth: &Project,
+    skip: &std::collections::BTreeSet<String>,
+) -> NewItems {
     let mut out = NewItems::default();
-    let fresh = |kind: ItemKind| {
+    // (id, source, hash here, the session's hash when it is an update)
+    let wanted = |kind: ItemKind| {
         local
             .lock
             .map(kind)
             .iter()
-            .filter(move |(id, _)| !auth.lock.map(kind).contains_key(*id))
             .filter(move |(id, _)| !skip.contains(&item_name(kind, id)))
-            .map(|(id, e)| (id.clone(), e.source.clone(), e.hash.clone()))
+            .filter_map(move |(id, e)| match auth.lock.map(kind).get(id) {
+                // The session had it at the last sync in another version, and took it back since.
+                None if base.lock.map(kind).get(id).is_some_and(|b| b.hash != e.hash) => None,
+                None => Some((id.clone(), e.source.clone(), e.hash.clone(), None)),
+                Some(a) if updated_here(local, base, auth, kind, id) => {
+                    Some((id.clone(), e.source.clone(), e.hash.clone(), Some(a.hash.clone())))
+                }
+                Some(_) => None,
+            })
             .collect::<Vec<_>>()
     };
-    let mut symbols = Vec::new();
-    for (id, source, hash) in fresh(ItemKind::Symbol) {
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        out.stale.extend(
+            local
+                .lock
+                .map(kind)
+                .iter()
+                .filter(|(id, e)| {
+                    !auth.lock.map(kind).contains_key(*id)
+                        && base.lock.map(kind).get(*id).is_some_and(|b| b.hash != e.hash)
+                })
+                .map(|(id, _)| item_name(kind, id)),
+        );
+    }
+    let (mut symbols, mut new_symbols) = (Vec::new(), Vec::new());
+    for (id, source, hash, before) in wanted(ItemKind::Symbol) {
         match check_locked(store::read_vendored_symbol(dir, &id), Symbol::hash, &hash) {
             Ok(s) => {
                 out.sent.push(item_name(ItemKind::Symbol, &id));
-                symbols.push((s, source));
+                match before {
+                    None => symbols.push((s, source)),
+                    Some(before) => new_symbols.push((s, source, before)),
+                }
             }
             Err(e) => out.unreadable.push((item_name(ItemKind::Symbol, &id), e)),
         }
     }
-    let mut parts = Vec::new();
-    for (id, source, hash) in fresh(ItemKind::Part) {
+    let (mut parts, mut new_parts) = (Vec::new(), Vec::new());
+    for (id, source, hash, before) in wanted(ItemKind::Part) {
         match check_locked(store::read_vendored_part(dir, &id), Part::hash, &hash) {
             Ok(p) => {
                 out.sent.push(item_name(ItemKind::Part, &id));
-                parts.push((p, source));
+                match before {
+                    None => parts.push((p, source)),
+                    Some(before) => new_parts.push((p, source, before)),
+                }
             }
             Err(e) => out.unreadable.push((item_name(ItemKind::Part, &id), e)),
         }
     }
-    out.edit = (!symbols.is_empty() || !parts.is_empty()).then_some(ProjectEdit::AddItems { symbols, parts });
+    if !symbols.is_empty() || !parts.is_empty() {
+        out.edits.push(ProjectEdit::AddItems { symbols, parts });
+    }
+    if !new_symbols.is_empty() || !new_parts.is_empty() {
+        out.edits.push(ProjectEdit::UpdateItems {
+            symbols: new_symbols,
+            parts: new_parts,
+        });
+    }
     out
 }
 
@@ -1119,6 +1207,8 @@ pub struct Hosting {
     announcer: Option<Announcer>,
     pub port: u16,
     dir: PathBuf,
+    /// Items of the host's own updates the session took, as [`Guest::took_updates`].
+    took_updates: Vec<(ItemKind, String, String)>,
 }
 
 /// A guest's side: its view of the session and the connection to the host.
@@ -1239,8 +1329,10 @@ impl Role {
     fn edit_project(&mut self, edit: ProjectEdit, notes: &mut Vec<String>) {
         match self {
             Role::Host(h) => {
-                if let Err(e) = h.host.edit_project(edit) {
-                    notes.push(format!("Your change was not kept: {e}"));
+                let updated = edit.updated_items();
+                match h.host.edit_project(edit) {
+                    Ok(()) => h.took_updates.extend(updated),
+                    Err(e) => notes.push(format!("Your change was not kept: {e}")),
                 }
             }
             Role::Guest(j) => {
@@ -1249,6 +1341,15 @@ impl Role {
                 let msg = j.guest.edit_project(edit);
                 send(&j.link, msg, notes);
             }
+        }
+    }
+
+    /// The items of this person's updates the session took since the last call, as
+    /// [`Guest::took_updates`].
+    fn took_updates(&mut self) -> Vec<(ItemKind, String, String)> {
+        match self {
+            Role::Host(h) => std::mem::take(&mut h.took_updates),
+            Role::Guest(j) => std::mem::take(&mut j.guest.took_updates),
         }
     }
 
@@ -1522,7 +1623,8 @@ pub struct Share {
     /// changes wait while one is on its way, so a page never reaches the session before what it
     /// draws.
     items_out: BTreeMap<String, ItemOut>,
-    /// Items whose file could not be read, sent or taken, reported once each.
+    /// Items whose file could not be read, sent or taken, and updates not sent because the
+    /// session took their item back (`stale <name>`), reported once each.
     unreadable: std::collections::BTreeSet<String>,
     /// Pictures looked at for the session and not taken yet, by project path, with when: each
     /// is looked at again only after [`ITEM_RETRY_LATER`]. Changes never wait for a picture.
@@ -1726,6 +1828,7 @@ impl Share {
             announcer,
             port,
             dir: open.dir.clone(),
+            took_updates: Vec::new(),
         })));
         self.base = Some(open.project.clone());
         self.forget_items();
@@ -1884,6 +1987,7 @@ impl Share {
         }
         let mine = page.as_deref().filter(|p| role.holds(p));
         let me = role.me().unwrap_or(HOST);
+        take_updates(role, base, &mut self.items_out);
         // Symbols and parts used for the first time go out first. Until the session has them,
         // the changes that may draw them wait in the window: a page must not reach the session
         // without its symbols, and an item the session refused is sent again a few times.
@@ -1900,13 +2004,19 @@ impl Share {
         // An item the session took is done; one this copy no longer locks (an undo, or an
         // assistant command that rewrote the project) is not sent again, so nothing waits for it.
         self.items_out
-            .retain(|name, _| !session_has(auth, name) && session_has(&open.project, name));
+            .retain(|name, _| !session_took(auth, &open.project, base, name) && session_has(&open.project, name));
         for (name, out) in self.items_out.iter_mut() {
             if !out.gave_up && out.tries >= ITEM_TRIES && out.at.elapsed() >= ITEM_WAIT {
                 out.gave_up = true;
-                self.notes.push(format!(
-                    "The session did not take {name}; your changes that use it are sent without it."
-                ));
+                // An update is not kept apart from the project: the copy takes the session's
+                // version again below, as everyone else works on that one.
+                self.notes.push(if session_has(auth, name) {
+                    format!(
+                        "The session did not take your update of {name}; your copy takes the session's version again."
+                    )
+                } else {
+                    format!("The session did not take {name}; your changes that use it are sent without it.")
+                });
             }
         }
         let skip = self
@@ -1917,7 +2027,7 @@ impl Share {
             .filter(|(_, o)| o.at.elapsed() < if o.gave_up { ITEM_RETRY_LATER } else { ITEM_WAIT })
             .map(|(n, _)| n.clone())
             .collect();
-        let items = new_items(&open.dir, &open.project, auth, &skip);
+        let items = new_items(&open.dir, &open.project, base, auth, &skip);
         let now = std::time::Instant::now();
         for (name, why) in &items.unreadable {
             // A file that cannot be read counts as a try: the changes that may draw the item
@@ -1935,6 +2045,13 @@ impl Share {
                 ));
             }
         }
+        for name in &items.stale {
+            if self.unreadable.insert(format!("stale {name}")) {
+                self.notes.push(format!(
+                    "Your update of {name} was not sent: the session took that item back meanwhile."
+                ));
+            }
+        }
         for name in &items.sent {
             self.unreadable.remove(name);
             let out = self.items_out.entry(name.clone()).or_insert(ItemOut {
@@ -1945,11 +2062,15 @@ impl Share {
             out.at = now;
             out.tries += 1;
         }
-        if let Some(edit) = items.edit {
-            role.edit_project(edit, &mut self.notes);
+        if !items.edits.is_empty() {
+            for edit in items.edits {
+                role.edit_project(edit, &mut self.notes);
+            }
             role.pump(&mut self.notes);
+            take_updates(role, base, &mut self.items_out);
             let auth = role.project()?;
-            self.items_out.retain(|name, _| !session_has(auth, name));
+            self.items_out
+                .retain(|name, _| !session_took(auth, &open.project, base, name));
             // What the session took in is the baseline now, so a take-back before the last
             // look of this frame is still seen.
             follow_take_backs(
@@ -2008,15 +2129,16 @@ impl Share {
             // The host answers what was sent this frame at once; the reply goes out now.
             role.pump(&mut self.notes);
         }
+        let base = self.base.get_or_insert_with(|| open.project.clone());
+        take_updates(role, base, &mut self.items_out);
         let auth = role.project()?;
-        let conflicting = conflicts(&open.project, auth);
+        let conflicting = conflicts(&open.project, base, auth);
         if !conflicting.is_empty() {
             self.notes.push(format!(
                 "Someone else used {} first in another version; your copy takes theirs.",
                 conflicting.join(", ")
             ));
         }
-        let base = self.base.get_or_insert_with(|| open.project.clone());
         follow_take_backs(
             &mut self.session_lock,
             &mut self.unload,
@@ -2026,6 +2148,11 @@ impl Share {
             auth,
         );
         let changed = incoming(&mut open.project, auth);
+        // The session's versions are what this copy has synced to: an item updated here later
+        // differs from them ([`updated_here`]).
+        if let Some(base) = self.base.as_mut() {
+            base.lock = auth.lock.clone();
+        }
         // This copy now holds the session's versions: a take-back of those is what is followed.
         if let Some(seen) = self.session_lock.as_mut() {
             *seen = next_seen(seen, &open.project, auth);
@@ -2374,18 +2501,47 @@ fn write_copy(
     let leaf = crate::prefs::folder_name(&project.meta.name).unwrap_or_else(|| "shared-project".into());
     let dir = fresh_dir(folder, &leaf)?;
     store::save(&dir, project).map_err(|e| e.to_string())?;
-    for s in symbols.values() {
+    // A file the session sent ahead of the change that locks it (an undo's earlier version)
+    // waits: the copy takes it once that change is here.
+    for (id, s) in symbols {
+        if project.lock.symbols.get(id).is_some_and(|e| e.hash != s.hash()) {
+            continue;
+        }
         store::write_vendored_symbol(&dir, s).map_err(|e| e.to_string())?;
     }
-    for p in parts.values() {
+    for (id, p) in parts {
+        if project.lock.parts.get(id).is_some_and(|e| e.hash != p.hash()) {
+            continue;
+        }
         store::write_vendored_part(&dir, p).map_err(|e| e.to_string())?;
     }
     let mut open = Open::load(&dir)?;
-    let wanted: Vec<String> = open.project.lock.symbols.keys().cloned().collect();
+    // Symbols the session did not send come from the libraries here, but only in the version the
+    // session pinned: another version would make this copy differ from everyone else's.
+    let wanted: Vec<(String, String)> = open
+        .project
+        .lock
+        .symbols
+        .iter()
+        .filter(|(id, _)| !open.symbols.contains_key(*id))
+        .map(|(id, e)| (id.clone(), e.hash.clone()))
+        .collect();
     let mut missing = Vec::new();
-    for id in wanted {
-        if let Err(e) = open.ensure_symbol(&id) {
-            missing.push(format!("{id} ({e})"));
+    if !wanted.is_empty() {
+        match wc_library::Library::open(&dir, &open.project) {
+            Ok(lib) => {
+                for (id, pin) in wanted {
+                    match lib.symbol(&id) {
+                        Ok((s, _)) if s.hash() == pin => {
+                            store::write_vendored_symbol(&dir, &s).map_err(|e| e.to_string())?;
+                            open.symbols.insert(id, s);
+                        }
+                        Ok(_) => missing.push(format!("{id} (the library here has another version)")),
+                        Err(e) => missing.push(format!("{id} ({e})")),
+                    }
+                }
+            }
+            Err(e) => missing.extend(wanted.into_iter().map(|(id, _)| format!("{id} ({e})"))),
         }
     }
     if !missing.is_empty() {

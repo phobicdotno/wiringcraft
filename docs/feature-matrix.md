@@ -71,8 +71,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Project with numbered schematic pages, page navigator | yes | yes | yes | done |
-| Page properties: number, title, size | yes | yes | yes (A4, A3, A2 landscape) | done |
-| Portrait pages and A1/A0 or custom sizes | yes | yes | no | later |
+| Page properties: number, title, size | yes | yes | yes (A4 to A0, landscape or portrait, or a custom size in mm; #261) | done |
 | Page types (schematic, single-line overview, graphic, report, panel layout) | yes | yes | partly: schematic, overview flag, panel layouts, report pages in the PDF | done for the basics; more types later |
 | Structure identifiers per page (function `=` and location `+`) | yes | yes (book / file / location) | yes: IEC 81346 tags, page defaults | done |
 | Locations list with descriptions | yes | yes | yes: project properties, `wiringcraft location`, Locations report, SolidWorks and AutomationML import | done |
@@ -92,7 +91,8 @@ For the other areas, the chapter to read in each help is:
 | Select, box select, copy, cut, paste, delete, undo/redo | yes | yes | yes | done |
 | Grid, snap, zoom, pan, fit page | yes | yes | yes | done |
 | Free graphics: lines, rectangles, texts | yes | yes | yes | done |
-| Circles, arcs, polylines and dimensions in the editor | yes | yes | partly: kept from imports, not drawn by hand | later |
+| Circles, arcs and polylines in the editor | yes | yes | yes: drawn by hand (Graphics toolbar), picked, moved, deleted and exported like other drawings | done |
+| Dimensions in the editor | yes | yes | partly: kept from imports (drawn by their block), not drawn by hand | later |
 | Find and replace texts, tags and wire numbers across the project | yes | yes | yes: Edit → Find (Ctrl+F), `wiringcraft find` | done (#109) |
 | Macros / window macros (save and insert groups) | yes | yes | yes | done |
 | Macro placeholders and value sets (one macro, several variants) | yes | partly | no | later |
@@ -153,7 +153,7 @@ For the other areas, the chapter to read in each help is:
 | Terminals and terminal strips | yes | yes | yes | done |
 | Terminal plan report | yes | yes | yes | done |
 | Terminal strip editor (reorder, add spares) | yes | yes | no | later |
-| Jumpers (bridges) between terminals | yes | yes | yes: project file, one net, terminal plan column, CLI and app; SolidWorks import to follow | done (#108) |
+| Jumpers (bridges) between terminals | yes | yes | yes: project file, one net, terminal plan column, CLI and app; jumpers from the SolidWorks Electrical terminal strip editor are imported (#247) | done (#108) |
 | Multi-level terminals | yes | yes | yes: `Level` device property, terminal plan column, one WAGO marker per block | done (#124) |
 | Terminal and wire marking export (label printers) | yes | yes | yes: WAGO smartScript CSV with lines, engraving text, language and one-strip export ([docs](wago-marking.md)) | done (#57, #129) |
 | SolidWorks terminal strips on import | - | - | open | open PR (#104, issue #70) |

@@ -1482,3 +1482,13 @@ fn overlapping_2007_pages_are_refused() -> TestResult {
     assert!(read_sections(&write_dwg_2007(&again)).is_ok());
     Ok(())
 }
+
+#[test]
+fn the_code_page_is_read_from_the_file_header() -> TestResult {
+    let mut file = write_dwg(b"AC1018", &sample_sections()[..1]);
+    assert_eq!(read_sections(&file)?.codepage, 0);
+    // ANSI_1251, at 0x13 of the file header (outside the second header and its CRC).
+    file[0x13..0x15].copy_from_slice(&29u16.to_le_bytes());
+    assert_eq!(read_sections(&file)?.codepage, 29);
+    Ok(())
+}

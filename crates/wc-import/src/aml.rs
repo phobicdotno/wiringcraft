@@ -333,6 +333,9 @@ pub struct Built {
     pub title_block: BTreeMap<String, String>,
     /// Cabinet panel layouts, from importers that have them.
     pub panels: Vec<wc_core::panel::Panel>,
+    /// Terminal jumpers, from importers that have them; jumpers of one strip that share a
+    /// terminal are already one.
+    pub jumpers: Vec<wc_core::project::Jumper>,
 }
 
 const PIN_STEP: f64 = 7.5;

@@ -384,6 +384,10 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
         version: Version::R2007,
         sections,
         skipped,
+        codepage: bytes
+            .get(0x13..0x15)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u16::from_le_bytes),
     })
 }
 
