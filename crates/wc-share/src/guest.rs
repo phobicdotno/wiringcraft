@@ -68,14 +68,23 @@ pub struct Guest {
     /// page is written into this copy when the edit is sent, and no further edit of it goes out
     /// until the host answers ([`Guest::own_page_waits`]).
     own_pages: BTreeMap<u64, Vec<String>>,
+    /// The display numbers such an edit (one in `own_pages`) set on other pages, by number, as
+    /// (page id, number sent): a refusal of it takes back only these numbers.
+    own_numbers: BTreeMap<u64, Vec<(String, String)>>,
     /// Pages this guest holds whose change the host refused: this copy took the host's page
     /// back whole. The window takes them too, dropping what was changed meanwhile. Taken by
     /// whoever shows the project.
     pub retaken: Vec<String>,
     /// The project records (devices, panels, pins...) such a refused change touched, as the
     /// host has them: put back in this copy, and to be put back in the window with the pages.
-    /// No pages: those are named in `retaken`.
+    /// No pages: this guest's own are named in `retaken`, and the others it renumbered in
+    /// `retaken_numbers`.
     pub retaken_records: crate::Parts,
+    /// Other pages such a refused change renumbered, by id, with the number it sent: the window
+    /// takes the session's number back only while it still shows the one sent (a newer number
+    /// set there meanwhile is kept and goes out), and drops a page the session no longer has.
+    /// A page the change set without renumbering it (a device rename, say) keeps its number.
+    pub retaken_numbers: BTreeMap<String, String>,
 }
 
 impl Default for Guest {
@@ -105,8 +114,10 @@ impl Guest {
             unanswered: BTreeMap::new(),
             replaced: BTreeMap::new(),
             own_pages: BTreeMap::new(),
+            own_numbers: BTreeMap::new(),
             retaken: Vec::new(),
             retaken_records: crate::Parts::default(),
+            retaken_numbers: BTreeMap::new(),
         }
     }
 
@@ -199,6 +210,14 @@ impl Guest {
                 // Counted as an edit of the page on its way, so the answer to an older one
                 // does not replace it.
                 *self.in_flight.entry(page.id.clone()).or_default() += 1;
+            }
+            let numbers: Vec<(String, String)> = edit
+                .renumbers()
+                .filter(|(id, _)| !own.iter().any(|p| &p.id == id))
+                .cloned()
+                .collect();
+            if !numbers.is_empty() {
+                self.own_numbers.insert(self.last_edit, numbers);
             }
             self.own_pages
                 .insert(self.last_edit, own.into_iter().map(|p| p.id).collect());
@@ -304,6 +323,7 @@ impl Guest {
                 self.unanswered.clear();
                 self.replaced.clear();
                 self.own_pages.clear();
+                self.own_numbers.clear();
             }
             HostMsg::PageChanged { page, .. } => {
                 if self.answered(&page.id) {
@@ -381,17 +401,19 @@ impl Guest {
                 // Pages of this guest's own set with the refused change come back whole too:
                 // what was written here was the refused content.
                 let own = edit.and_then(|seq| self.own_pages.remove(&seq)).unwrap_or_default();
+                let numbers = edit.and_then(|seq| self.own_numbers.remove(&seq)).unwrap_or_default();
                 for page in &own {
                     self.answered(page);
                 }
                 whole.extend(own.iter().cloned());
                 if let Some(parts) = put_back {
                     if !own.is_empty() {
-                        // The own pages are put back by id (`retaken`); other pages the batch
-                        // touched (one renumbered with it) stay listed, for their number.
+                        // The own pages are put back by id (`retaken`), and only the numbers
+                        // the batch set on other pages are taken back (`retaken_numbers`).
                         let mut records = (*parts).clone();
-                        records.pages.retain(|id, _| !own.contains(id));
+                        records.pages.clear();
                         self.retaken_records.merge(records);
+                        self.retaken_numbers.extend(numbers);
                     }
                     self.put_back(*parts, &whole);
                 }
@@ -438,6 +460,7 @@ impl Guest {
 
     /// The host took (or did not need) project edit `seq`.
     fn taken(&mut self, seq: u64) {
+        self.own_numbers.remove(&seq);
         for page in self.own_pages.remove(&seq).unwrap_or_default() {
             self.answered(&page);
         }

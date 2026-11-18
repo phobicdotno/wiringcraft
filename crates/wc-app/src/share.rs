@@ -201,41 +201,50 @@ pub fn outgoing(
 
 /// Put back in the window (and in `base`, the last state synced) what a refused change of this
 /// person's own page touched: the pages `ids` as the session has them (also one deleted here
-/// meanwhile, or one the session no longer has) and the project `records` it touched (as the
-/// session has them now), so the action is not left half kept.
+/// meanwhile, or one the session no longer has), the project `records` it touched (as the
+/// session has them now), and the display `numbers` it set on other pages (by id, with the
+/// number sent), so the action is not left half kept.
 fn take_back_pages(
     open: &mut Open,
-    base: Option<&mut Project>,
+    mut base: Option<&mut Project>,
     auth: &Project,
     ids: &[String],
     records: wc_share::Parts,
+    numbers: &BTreeMap<String, String>,
     notes: &mut Vec<String>,
 ) {
     // The records it touched as the session has them now: a later change to one may have come
     // in with the refusal.
     let mut parts = wc_share::Parts::read(auth, &records);
-    // Another page it touched (one renumbered with it) takes back only its display number:
-    // its content is not what was refused.
-    let numbers: Vec<(String, String)> = std::mem::take(&mut parts.pages)
-        .into_iter()
-        .filter(|(id, _)| !ids.contains(id))
-        .filter_map(|(id, page)| Some((id, page?.number)))
-        .collect();
-    let renumber = |project: &mut Project| {
-        for (id, number) in &numbers {
-            if let Some(page) = project.page_mut(id) {
-                page.number.clone_from(number);
-            }
-        }
-    };
-    renumber(&mut open.project);
     for id in ids {
         parts.pages.insert(id.clone(), auth.page(id).cloned());
     }
     parts.apply(&mut open.project);
-    if let Some(base) = base {
+    if let Some(base) = base.as_deref_mut() {
         parts.apply(base);
-        renumber(base);
+    }
+    // Another page it renumbered takes back only its display number (its content is not what
+    // was refused), and only where it still has the number sent: a newer one set here
+    // meanwhile is kept, and goes out as its own renumbering. A page the session no longer
+    // has (the host removed it) goes, as it went there.
+    for (id, sent) in numbers.iter().filter(|(id, _)| !ids.contains(id)) {
+        let session = auth.page(id).map(|p| p.number.clone());
+        let back = |project: &mut Project| match &session {
+            Some(number) => {
+                if let Some(page) = project.page_mut(id)
+                    && page.number == *sent
+                {
+                    page.number.clone_from(number);
+                }
+            }
+            None => {
+                project.pages.retain(|p| p.id != *id);
+            }
+        };
+        back(&mut open.project);
+        if let Some(base) = base.as_deref_mut() {
+            back(base);
+        }
     }
     open.dirty = true;
     notes.push(format!(
@@ -246,12 +255,12 @@ fn take_back_pages(
 
 /// Take back in the window what the session refused since the last look ([`Role::retaken`]).
 fn drain_retaken(role: &mut Role, open: &mut Open, base: Option<&mut Project>, notes: &mut Vec<String>) {
-    let (ids, records) = role.retaken();
+    let (ids, records, numbers) = role.retaken();
     if ids.is_empty() {
         return;
     }
     if let Some(auth) = role.project() {
-        take_back_pages(open, base, auth, &ids, records, notes);
+        take_back_pages(open, base, auth, &ids, records, &numbers, notes);
     }
 }
 
@@ -1601,13 +1610,14 @@ impl Role {
     }
 
     /// This person's pages whose change the session refused, taken back whole since the last
-    /// call ([`Guest::retaken`]).
-    fn retaken(&mut self) -> (Vec<String>, wc_share::Parts) {
+    /// call ([`Guest::retaken`]), with the records and other pages' numbers it touched.
+    fn retaken(&mut self) -> (Vec<String>, wc_share::Parts, BTreeMap<String, String>) {
         match self {
             Role::Host(_) => Default::default(),
             Role::Guest(j) => (
                 std::mem::take(&mut j.guest.retaken),
                 std::mem::take(&mut j.guest.retaken_records),
+                std::mem::take(&mut j.guest.retaken_numbers),
             ),
         }
     }

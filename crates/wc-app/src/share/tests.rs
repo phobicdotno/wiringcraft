@@ -970,6 +970,92 @@ fn a_page_renumbered_with_a_refused_change_of_your_own_page_gets_its_number_back
 }
 
 #[test]
+fn a_newer_number_set_while_a_refused_renumbering_was_on_its_way_is_kept_and_sent() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), _coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    // One action renames -K1 on the guest's page and renumbers the cover to 90; it is refused.
+    guest_open.project.rename_device(&k1, &k2);
+    guest_open.project.page_mut("p0001").ok_or("no page")?.number = "90".into();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // Before the refusal arrives, the guest renumbers the cover again.
+    guest_open.project.page_mut("p0001").ok_or("no page")?.number = "91".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert_eq!(guest_open.project.page("p0001").ok_or("no page")?.number, "91");
+    // The newer number goes out on its own and the session takes it.
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(host_open.project.page("p0001").ok_or("no page")?.number, "91");
+    assert_eq!(guest_open.project.page("p0001").ok_or("no page")?.number, "91");
+    assert!(!guest_open.project.devices.contains_key(&k2));
+    Ok(())
+}
+
+#[test]
+fn a_page_the_host_removed_before_ending_goes_with_the_refused_renumbering() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), _coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    guest_open.project.rename_device(&k1, &k2);
+    guest_open.project.page_mut("p0001").ok_or("no page")?.number = "90".into();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // The host refuses, removes the cover, and ends the session before the guest's next frame.
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    host_open.project.pages.retain(|p| p.id != "p0001");
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    h.stop();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(!g.active());
+    // The cover is gone here too, not left with the refused number.
+    assert!(guest_open.project.page("p0001").is_none());
+    assert!(!guest_open.project.devices.contains_key(&k2));
+    Ok(())
+}
+
+#[test]
+fn a_page_a_refused_rename_set_without_renumbering_keeps_a_newer_local_number() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut coil = String::new();
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        let k1 = DeviceTag::parse("-K1")?;
+        coil = o.place(2, "wc.coil", wc_core::Point::new(40.0, 120.0))?;
+        let cover = o.place(0, "wc.coil", wc_core::Point::new(40.0, 120.0))?;
+        for (page, id) in [(2, &coil), (0, &cover)] {
+            if let Some(s) = o.project.pages[page].symbols.iter_mut().find(|s| s.id == *id) {
+                s.tag = Some(k1.clone());
+            }
+        }
+        o.project.devices.insert(k1, Device::default());
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    // The rename sets the cover (it shows -K1 too) with the guest's page, without renumbering it.
+    guest_open.project.rename_device(&k1, &k2);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // Before the refusal arrives, the guest renumbers the cover.
+    guest_open.project.page_mut("p0001").ok_or("no page")?.number = "90".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert_eq!(guest_open.project.page("p0001").ok_or("no page")?.number, "90");
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(host_open.project.page("p0001").ok_or("no page")?.number, "90");
+    Ok(())
+}
+
+#[test]
 fn a_change_to_a_free_page_made_before_someone_elses_change_arrived_is_not_kept() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
