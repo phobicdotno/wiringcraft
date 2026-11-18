@@ -1306,3 +1306,61 @@ fn configurator_free_texts_that_look_like_formulas_are_written_as_text() {
     assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
     assert!(out.warnings[0].contains("-X1/T1") && out.warnings[0].contains("=1+1"));
 }
+
+#[test]
+fn a_jumper_part_is_counted_in_the_parts_list_and_written_for_the_configurator() {
+    let (mut p, s, mut parts) = fixture();
+    let jumper = Part {
+        id: "wago.2002-402".into(),
+        manufacturer: "WAGO".into(),
+        order_number: "2002-402".into(),
+        description: "Push-in jumper, 2-way".into(),
+        ..Default::default()
+    };
+    parts.insert(jumper.id.clone(), jumper.clone());
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    p.meta.add_jumper(&x1, &["1".to_owned(), "2".to_owned()]).unwrap();
+    p.meta.add_jumper(&x1, &["3".to_owned(), "4".to_owned()]).unwrap();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // Without parts, jumpers are not in the parts list and the configurator rows name no article.
+    assert!(!parts_list(&i).rows.iter().any(|r| r[3] == "2002-402"));
+    let rows = configurator_list(&i).table.rows;
+    let j1 = rows.iter().find(|r| r[0] == "-X1/J1").unwrap();
+    assert_eq!((j1[6].as_str(), j1[8].as_str()), ("", "2-way jumper"));
+
+    for t in ["1", "3"] {
+        p.meta.set_jumper_part(&x1, t, Some(&jumper.id)).unwrap();
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = parts_list(&i);
+    let row = t.rows.iter().find(|r| r[3] == "2002-402").unwrap();
+    assert_eq!(
+        (row[1].as_str(), row[2].as_str(), row[5].as_str()),
+        ("2", "WAGO", "-X1")
+    );
+    let rows = configurator_list(&i).table.rows;
+    let j1 = rows.iter().find(|r| r[0] == "-X1/J1").unwrap();
+    assert_eq!(
+        (j1[6].as_str(), j1[7].as_str(), j1[8].as_str()),
+        ("2002-402", "WAGO", "Push-in jumper, 2-way")
+    );
+    // A part the project has no copy of is written by its id, with the jumper's own description.
+    p.meta.set_jumper_part(&x1, "1", Some("acme.bridge")).unwrap();
+    let rows = configurator_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .table
+    .rows;
+    let j1 = rows.iter().find(|r| r[0] == "-X1/J1").unwrap();
+    assert_eq!((j1[6].as_str(), j1[8].as_str()), ("acme.bridge", "2-way jumper"));
+}

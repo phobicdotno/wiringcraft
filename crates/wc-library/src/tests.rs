@@ -195,3 +195,19 @@ fn macros_are_listed_per_source_in_order() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_jumper_part_is_listed_as_used_by_its_jumper() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut f = fixture()?;
+    let x1 = wc_core::DeviceTag::parse("-X1")?;
+    f.project.meta.add_jumper(&x1, &["1".into(), "2".into()])?;
+    f.project.meta.set_jumper_part(&x1, "1", Some("wago.2002-402"))?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    let st = status(&f.proj, &f.project, &lib);
+    let jumper = st
+        .iter()
+        .find(|s| s.kind == ItemKind::Part && s.id == "wago.2002-402")
+        .ok_or_else(|| format!("the jumper's part is not listed: {st:?}"))?;
+    assert_eq!(jumper.used_by, vec!["-X1 jumper 1-2"]);
+    Ok(())
+}

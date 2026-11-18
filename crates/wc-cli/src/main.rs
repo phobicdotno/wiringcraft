@@ -354,6 +354,14 @@ enum JumperCmd {
     },
     /// Take terminals out of their jumper, e.g. `jumper remove -- -X1 4`.
     Remove { strip: String, terminals: Vec<String> },
+    /// Give the jumper holding a terminal a part (article), e.g.
+    /// `jumper part -- -X1 3 wago.2002-402`; leave the part out to clear it. A part the project
+    /// does not have yet is taken from its libraries.
+    Part {
+        strip: String,
+        terminal: String,
+        part: Option<String>,
+    },
     /// List the project's jumpers.
     List,
 }
@@ -1147,9 +1155,29 @@ fn run(cli: Cli) -> Res<()> {
                     }
                     save(dir, &p)?;
                 }
+                JumperCmd::Part { strip, terminal, part } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    let part = part.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty());
+                    // Checked first, so a part is not taken into a project for nothing.
+                    if p.meta
+                        .clone()
+                        .set_jumper_part(&strip, terminal.trim(), part.as_deref())?
+                        && let Some(part) = &part
+                        && store::read_vendored_part(dir, part).is_err()
+                    {
+                        let lib = wc_library::Library::open(dir, &p).map_err(e)?;
+                        wc_library::take(dir, &mut p, &lib, ItemKind::Part, part).map_err(e)?;
+                    }
+                    if p.meta.set_jumper_part(&strip, terminal.trim(), part.as_deref())? {
+                        save(dir, &p)?;
+                    }
+                }
                 JumperCmd::List => {
                     for j in &p.meta.jumpers {
-                        println!("{} {}", j.strip, j.terminals.join(" "));
+                        match &j.part {
+                            Some(part) => println!("{} {} ({part})", j.strip, j.terminals.join(" ")),
+                            None => println!("{} {}", j.strip, j.terminals.join(" ")),
+                        }
                     }
                 }
             }
@@ -2376,7 +2404,7 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
     Ok(out)
 }
 
-/// The project's vendored parts by id (parts referenced by devices).
+/// The project's vendored parts by id (parts used by devices, their accessories and jumpers).
 /// What [`export_wago_marking`] wrote.
 struct Exported {
     markers: usize,
@@ -2449,21 +2477,15 @@ fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
         })
         .collect();
     let mut parts = vendored_parts(dir, &p);
-    // Accessories are read here too; a part that is used but could not be read is written by
-    // its id, and the warning says why.
-    let used: std::collections::BTreeSet<&str> = p
-        .devices
-        .values()
-        .flat_map(|d| d.all_parts())
-        .map(|(id, _)| id)
-        .collect();
-    for id in used {
-        if parts.contains_key(id) {
+    // Every used part (devices, their accessories and jumpers) that could not be read is
+    // written by its id, and the warning says why.
+    for id in p.used_parts() {
+        if parts.contains_key(&id) {
             continue;
         }
-        match store::read_vendored_part(dir, id) {
+        match store::read_vendored_part(dir, &id) {
             Ok(part) => {
-                parts.insert(id.to_owned(), part);
+                parts.insert(id, part);
             }
             Err(err) => warnings.push(format!(
                 "part {id} could not be read ({err}); its article number is written as the part id"
@@ -2723,10 +2745,9 @@ fn import_qet(
 }
 
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
-    p.devices
-        .values()
-        .filter_map(|d| d.part.as_ref())
-        .filter_map(|id| store::read_vendored_part(dir, id).ok().map(|part| (id.clone(), part)))
+    p.used_parts()
+        .into_iter()
+        .filter_map(|id| store::read_vendored_part(dir, &id).ok().map(|part| (id, part)))
         .collect()
 }
 
@@ -3668,6 +3689,43 @@ mod tests {
     }
 
     #[test]
+    fn a_jumper_part_is_set_and_cleared_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.meta.libraries.push(LibrarySource {
+            name: "starter".into(),
+            kind: "folder".into(),
+            location: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../library")
+                .to_string_lossy()
+                .into_owned(),
+            reference: None,
+        });
+        save(&dir, &p).unwrap();
+        cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap();
+        let err = cli(&dir, &["jumper", "part", "--", "-X1", "9", "example.ex-tb-2-5"]).unwrap_err();
+        assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
+        assert!(
+            store::read_vendored_part(&dir, "example.ex-tb-2-5").is_err(),
+            "nothing taken"
+        );
+        assert!(cli(&dir, &["jumper", "part", "--", "-X1", "3", "no.such.part"]).is_err());
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].part, None);
+
+        cli(&dir, &["jumper", "part", "--", "-X1", "4", "example.ex-tb-2-5"]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.meta.jumpers[0].part.as_deref(), Some("example.ex-tb-2-5"));
+        assert!(p.lock.parts.contains_key("example.ex-tb-2-5"), "taken into the project");
+        assert!(vendored_parts(&dir, &p).contains_key("example.ex-tb-2-5"));
+        cli(&dir, &["jumper", "list"]).unwrap();
+
+        cli(&dir, &["jumper", "part", "--", "-X1", "3"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].part, None);
+    }
+
+    #[test]
     fn bmecat_parts_land_in_the_library_also_from_latin1_files() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("cat.xml");
@@ -4384,6 +4442,20 @@ mod tests {
         let w = done.warnings.iter().find(|w| w.contains("broken.part"));
         assert!(
             w.is_some_and(|w| w.contains("could not be read (")),
+            "{:?}",
+            done.warnings
+        );
+
+        // The same for a jumper's part.
+        p.meta.set_jumper_part(&x1, "1", Some("broken.jumper")).unwrap();
+        store::save(&dir, &p).unwrap();
+        let path = store::vendor_path(&dir, wc_core::lock::ItemKind::Part, "broken.jumper").unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        let done = export_wago_configurator(&dir, &out).unwrap();
+        assert!(
+            done.warnings
+                .iter()
+                .any(|w| w.starts_with("part broken.jumper could not be read (")),
             "{:?}",
             done.warnings
         );

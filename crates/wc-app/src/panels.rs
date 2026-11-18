@@ -137,27 +137,27 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
     let Some(p) = open.project.pages.get(page) else {
         return;
     };
-    let mut terms: Vec<(DeviceTag, String, DeviceTag)> = Vec::new();
+    // Each terminal's strip and number as the terminal plan has them, so a terminal tagged
+    // with only its strip (numbered automatically) is offered the same as a numbered one.
+    let numbers = open.terminal_numbers();
+    let mut terms: Vec<(DeviceTag, String)> = Vec::new();
     for id in ids {
-        let Some(s) = p.symbol(id) else { return };
-        let is_terminal = open
-            .symbols
-            .get(&s.symbol)
-            .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal);
-        let Some(tag) = s.tag.clone().filter(|_| is_terminal) else {
+        if p.symbol(id).is_none() {
+            return;
+        }
+        let Some(term) = numbers.get(&(p.id.clone(), id.clone())) else {
             return;
         };
-        let (strip, Some(n)) = tag.terminal_parts() else { return };
-        terms.push((strip, n, tag));
+        terms.push(term.clone());
     }
-    let Some((strip, number, tag)) = terms.first().cloned() else {
+    let Some((strip, number)) = terms.first().cloned() else {
         return;
     };
-    if terms.iter().any(|(s, _, _)| *s != strip) {
+    if terms.iter().any(|(s, _)| *s != strip) {
         return;
     }
     if terms.len() == 1 {
-        let others = open.project.meta.jumper_of(&tag).map(|j| {
+        let others = jumper_with(open, &strip, &number).map(|j| {
             j.terminals
                 .iter()
                 .filter(|t| **t != number)
@@ -172,9 +172,10 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
                     open.remove_from_jumper(&strip, &number);
                 }
             });
+            jumper_part(ui, open, &strip, &number);
         }
     } else {
-        let numbers: Vec<String> = terms.into_iter().map(|(_, n, _)| n).collect();
+        let numbers: Vec<String> = terms.into_iter().map(|(_, n)| n).collect();
         // Only offered when it changes something; when it cannot be done, say why.
         match open.jumper_offer(&strip, &numbers) {
             Ok(true) => {
@@ -191,6 +192,45 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
                 ui.weak(format!("No jumper: {why}"));
             }
         }
+    }
+}
+
+/// The jumper that holds terminal `number` of `strip`.
+fn jumper_with<'a>(open: &'a Open, strip: &DeviceTag, number: &str) -> Option<&'a wc_core::project::Jumper> {
+    open.project
+        .meta
+        .jumpers
+        .iter()
+        .find(|j| j.strip == *strip && j.terminals.iter().any(|t| t == number))
+}
+
+/// The part of the jumper that holds terminal `number` of `strip`: pick one from the project's
+/// and the libraries' parts, or none.
+fn jumper_part(ui: &mut egui::Ui, open: &mut Open, strip: &DeviceTag, number: &str) {
+    let current = jumper_with(open, strip, number).and_then(|j| j.part.clone());
+    let search_id = ui.id().with("jumper part search");
+    let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
+    let pick = ui
+        .horizontal(|ui| {
+            ui.label("Jumper part");
+            part_picker(
+                ui,
+                "jumper part",
+                200.0,
+                &open.part_library,
+                current.as_deref(),
+                &mut search,
+            )
+        })
+        .inner;
+    ui.data_mut(|d| d.insert_temp(search_id, search));
+    let error_id = ui.id().with("jumper part error");
+    if let Some(choice) = pick {
+        let result = open.set_jumper_part(strip, number, choice.as_deref()).err();
+        ui.data_mut(|d| d.insert_temp(error_id, result));
+    }
+    if let Some(Some(e)) = ui.data(|d| d.get_temp::<Option<String>>(error_id)) {
+        ui.label(RichText::new(e).color(Theme::of(ui.ctx()).error).small());
     }
 }
 
@@ -1000,44 +1040,51 @@ fn accessories_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, 
     }
 }
 
-/// Part and own properties of the selected symbol's device.
-fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: &DeviceTag, t: &Theme) {
-    subsection(ui, "Part");
-    let current = open.project.devices.get(tag).and_then(|d| d.part.clone());
-    let label = current
-        .as_ref()
-        .map(|id| {
-            open.part_library
+/// A drop-down to pick a part from `library` (id, label), or none, with a search field
+/// (`search`) at its top. Shows `current` by its label. Returns the pick, if one was made:
+/// `Some(None)` for none.
+fn part_picker(
+    ui: &mut egui::Ui,
+    salt: &str,
+    max_width: f32,
+    library: &[(String, String)],
+    current: Option<&str>,
+    search: &mut String,
+) -> Option<Option<String>> {
+    let label = current.map_or_else(
+        || "none".to_owned(),
+        |id| {
+            library
                 .iter()
                 .find(|(p, _)| p == id)
-                .map_or(id.clone(), |(_, l)| l.clone())
-        })
-        .unwrap_or_else(|| "none".into());
-    let mut pick: Option<Option<String>> = None;
+                .map_or(id.to_owned(), |(_, l)| l.clone())
+        },
+    );
     let short: String = if label.chars().count() > 34 {
         format!("{}\u{2026}", label.chars().take(33).collect::<String>())
     } else {
-        label.clone()
+        label
     };
-    egui::ComboBox::from_id_salt("part")
-        .width(ui.available_width().min(240.0))
+    let mut pick = None;
+    egui::ComboBox::from_id_salt(salt)
+        .width(ui.available_width().min(max_width))
         .selected_text(short)
         .height(320.0)
         .show_ui(ui, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut ps.part_search).hint_text("Search parts"));
+            ui.add(egui::TextEdit::singleline(search).hint_text("Search parts"));
             if ui
                 .selectable_label(current.is_none(), RichText::new("none").italics())
                 .clicked()
             {
                 pick = Some(None);
             }
-            let q = ps.part_search.to_lowercase();
-            for (id, l) in &open.part_library {
+            let q = search.to_lowercase();
+            for (id, l) in library {
                 if !q.is_empty() && !id.to_lowercase().contains(&q) && !l.to_lowercase().contains(&q) {
                     continue;
                 }
                 if ui
-                    .selectable_label(current.as_deref() == Some(id.as_str()), l)
+                    .selectable_label(current == Some(id.as_str()), l)
                     .on_hover_text(id)
                     .clicked()
                 {
@@ -1045,6 +1092,21 @@ fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: 
                 }
             }
         });
+    pick
+}
+
+/// Part and own properties of the selected symbol's device.
+fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: &DeviceTag, t: &Theme) {
+    subsection(ui, "Part");
+    let current = open.project.devices.get(tag).and_then(|d| d.part.clone());
+    let pick = part_picker(
+        ui,
+        "part",
+        240.0,
+        &open.part_library,
+        current.as_deref(),
+        &mut ps.part_search,
+    );
     if let Some(choice) = pick {
         ps.part_error = open.set_device_part(tag, choice.as_deref()).err();
     }
@@ -1353,6 +1415,61 @@ fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The texts drawn by one frame of `jumper_controls` for `ids` on page `page`.
+    fn jumper_texts(o: &mut Open, page: usize, ids: &[String]) -> Vec<String> {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| jumper_controls(ui, o, page, ids));
+        });
+        let mut texts = Vec::new();
+        for clipped in out.shapes {
+            if let egui::Shape::Text(t) = clipped.shape {
+                texts.push(t.galley.text().to_owned());
+            }
+        }
+        texts
+    }
+
+    #[test]
+    fn a_terminal_numbered_automatically_has_its_jumper_and_part_controls() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let page = o
+            .project
+            .pages
+            .iter()
+            .position(|p| p.id == "p0002")
+            .ok_or("no page p0002")?;
+        let x1 = DeviceTag::parse("-X1")?;
+        let mut ids = Vec::new();
+        for at in [10.0, 20.0] {
+            let id = o.place(page, "wc.terminal", wc_core::geom::Point::new(at, 20.0))?;
+            let s = o.project.pages[page]
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or("not placed")?;
+            s.tag = Some(x1.clone());
+            ids.push(id);
+        }
+        // Both tagged with only the strip: numbered 1 and 2 by the terminal plan.
+        let texts = jumper_texts(&mut o, page, &ids);
+        assert!(
+            texts.iter().any(|t| t.contains("Jumper these 2 terminals")),
+            "{texts:?}"
+        );
+        o.add_jumper(&x1, &["1".into(), "2".into()])?;
+        o.set_jumper_part(&x1, "2", Some("example.ex-tb-2-5"))?;
+        let texts = jumper_texts(&mut o, page, &ids[..1]);
+        assert!(texts.iter().any(|t| t == "Jumpered with 2"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Jumper part"), "{texts:?}");
+        assert!(
+            texts.iter().all(|t| t != "none"),
+            "the jumper's part is shown: {texts:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn a_half_typed_value_is_dropped_when_the_page_becomes_held() -> Result<(), Box<dyn std::error::Error>> {
