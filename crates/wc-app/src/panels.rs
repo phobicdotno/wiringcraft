@@ -582,7 +582,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
     }
     // On a page someone else holds the values are shown, not edited. A value half typed when
     // the page became held is dropped (the fields are read from the project again each frame),
-    // and if a field still commits as it loses focus, the change is taken back.
+    // and if a field still commits as it loses focus, the change and its undo step are taken back.
     let held = open
         .project
         .pages
@@ -590,13 +590,12 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
         .is_some_and(|p| ed.held_by.contains_key(&p.id));
     if held {
         ps.loaded_for = None;
-    }
-    let before = held.then(|| open.project.clone());
-    ui.add_enabled_ui(!held, |ui| selection_properties(ui, open, ed, ps, &t));
-    if let Some(before) = before
-        && open.project != before
-    {
-        open.project = before;
+        ps.spec_for = Default::default();
+        open.without_changes(|open| {
+            ui.add_enabled_ui(false, |ui| selection_properties(ui, open, ed, ps, &t));
+        });
+    } else {
+        selection_properties(ui, open, ed, ps, &t);
     }
 }
 
@@ -1385,6 +1384,44 @@ mod tests {
         assert_eq!(ps.tag, "-K1", "the field shows the project's value again");
         assert_eq!(o.project, before, "nothing was changed");
         Ok(())
+    }
+
+    #[test]
+    fn a_wire_colour_draft_is_dropped_when_the_page_becomes_held() {
+        use wc_core::geom::Point;
+        let (_tmp, mut o) = crate::state::tests::project();
+        let at = |x: f64| wc_core::Endpoint::Point {
+            at: Point::new(x, 10.0),
+        };
+        o.add_wire(0, at(10.0), at(20.0), Vec::new());
+        o.add_wire(0, at(30.0), at(40.0), Vec::new());
+        let ids: Vec<String> = o.project.pages[0].wires.iter().map(|w| w.id.clone()).collect();
+        o.set_wire_spec(0, &ids, SpecPart::Colour, Some("BU".into()));
+        let mut ed = Editor::default();
+        ed.selection = ids.iter().map(|id| Selection::Wire(id.clone())).collect();
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, ps: &mut PanelState| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        };
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.spec[1].buffer, "BU");
+        // RD half typed for both wires: kept while the page is yours.
+        ps.spec[1].buffer = "RD".into();
+        ps.spec[1].dirty = true;
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.spec[1].buffer, "RD", "a draft stays on your own page");
+        // Then Ola opens the page: the field shows the project's colour again.
+        let before = o.project.clone();
+        let page = o.project.pages[0].id.clone();
+        ed.held_by.insert(page, "Ola".into());
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.spec[1].buffer, "BU");
+        assert!(!ps.spec[1].dirty);
+        assert_eq!(o.project, before);
     }
 
     #[test]

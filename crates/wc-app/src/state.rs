@@ -527,6 +527,24 @@ impl Open {
         }
     }
 
+    /// Run `f` and then take back everything it changed in the project and its undo history:
+    /// for showing a form on a page someone else holds, where a field that still commits must
+    /// leave no trace (no change, no undo step, redo kept, not marked as changed).
+    pub(crate) fn without_changes<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let project = self.project.clone();
+        let undo = std::mem::take(&mut self.undo);
+        let redo = std::mem::take(&mut self.redo);
+        let (undo_dropped, history, form_step, dirty) = (self.undo_dropped, self.history, self.form_step, self.dirty);
+        let terminals_before = self.terminals_before.clone();
+        let r = f(self);
+        self.project = project;
+        self.undo = undo;
+        self.redo = redo;
+        (self.undo_dropped, self.history, self.form_step, self.dirty) = (undo_dropped, history, form_step, dirty);
+        self.terminals_before = terminals_before;
+        r
+    }
+
     /// Take a snapshot before a change, so it can be undone.
     pub fn checkpoint(&mut self) {
         // The change before this one is done: its jumpers follow their terminals first, so the
@@ -2367,6 +2385,25 @@ pub(crate) mod tests {
         let before = o.project.meta.logo.clone();
         assert!(o.set_logo_from(&txt).unwrap_err().contains("PNG or JPEG"));
         assert_eq!(o.project.meta.logo, before);
+    }
+
+    #[test]
+    fn a_change_made_without_changes_leaves_no_trace_in_the_undo_history() {
+        let (_tmp, mut o) = project();
+        o.checkpoint();
+        o.project.pages[0].title = "First".into();
+        assert!(o.undo());
+        o.dirty = false;
+        let (project, mark) = (o.project.clone(), o.undo_mark());
+        assert!(o.can_redo());
+        o.without_changes(|o| {
+            o.checkpoint();
+            o.project.pages[0].title = "Second".into();
+        });
+        assert_eq!(o.project, project);
+        assert_eq!(o.undo_mark(), mark, "no undo step");
+        assert!(o.can_redo(), "redo kept");
+        assert!(!o.dirty, "not marked as changed");
     }
 
     #[test]
