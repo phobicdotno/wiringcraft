@@ -54,6 +54,8 @@ const DATA_PAGE: u32 = 0x4163_043B;
 const DATA_PAGE_MASK: u32 = 0x4164_536B;
 /// Length of a system page's header (page map, section map) and of a data page's header.
 const SYSTEM_PAGE_HEADER: usize = 0x14;
+/// Where the second header keeps its CRC-32.
+const HEADER_CRC_AT: usize = 0x68;
 const DATA_PAGE_HEADER: usize = 0x20;
 /// Length of a section description in the section map, without its page list.
 const SECTION_DESCRIPTION: usize = 0x60;
@@ -147,7 +149,7 @@ pub fn read_sections_with(bytes: &[u8], max_total: usize) -> Result<Sections> {
         section_map_at,
         Some(section_map_extent),
         SECTION_MAP,
-        "section map",
+        &format!("section map (page {section_map_id})"),
     )?;
     read_section_map(bytes, &section_map, &pages, version, max_total)
 }
@@ -161,7 +163,46 @@ fn second_header(bytes: &[u8]) -> Result<Reader<Vec<u8>>> {
     if !header.starts_with(HEADER_MAGIC) {
         return Err(bad("the file header is damaged"));
     }
+    // A CRC-32 of the header with its own field as zero.
+    let stored = Reader(&header).u32(HEADER_CRC_AT)?;
+    let mut zeroed = header.clone();
+    zeroed[HEADER_CRC_AT..HEADER_CRC_AT + 4].fill(0);
+    if crc32(&zeroed) != stored {
+        return Err(bad("the file header is damaged (wrong checksum)"));
+    }
     Ok(Reader(header))
+}
+
+/// The checksum of system and data pages: two sums of the bytes modulo 65521, the first
+/// continuing from the low half of `seed` and the second from its high half (Adler-32 with a
+/// seed).
+pub(crate) fn page_checksum(seed: u32, data: &[u8]) -> u32 {
+    let (mut low, mut high) = (u64::from(seed & 0xFFFF), u64::from(seed >> 16));
+    for chunk in data.chunks(0x15B0) {
+        for &b in chunk {
+            low += u64::from(b);
+            high += low;
+        }
+        low %= 0xFFF1;
+        high %= 0xFFF1;
+    }
+    ((high as u32) << 16) | low as u32
+}
+
+/// The CRC-32 (as zlib computes it) of `data`.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 /// XOR `data` with the byte sequence the second header is scrambled with. Doing it twice gives
@@ -199,6 +240,15 @@ fn system_page(bytes: &[u8], at: u64, extent: Option<u64>, kind: u32, what: &str
     let data = bytes
         .get(data_at..data_at.saturating_add(compressed_size))
         .ok_or_else(|| bad(format!("the {what} is cut off")))?;
+    // The checksum of the header (its own field as zero), carried on over the data.
+    let mut zeroed = bytes
+        .get(start..start + SYSTEM_PAGE_HEADER)
+        .ok_or_else(|| bad(format!("the {what} is cut off")))?
+        .to_vec();
+    zeroed[0x10..0x14].fill(0);
+    if page_checksum(page_checksum(0, &zeroed), data) != head.u32(0x10)? {
+        return Err(bad(format!("the {what} is damaged (wrong checksum)")));
+    }
     match compression {
         2 => decompress(data, size).map_err(|e| bad(format!("the {what}: {e}"))),
         1 => data
@@ -360,9 +410,20 @@ fn data_page(
         .get(data_at..data_at.saturating_add(data_size))
         .ok_or_else(|| bad("the page's data is cut off"))?;
     let too_much = || bad("the file's pages decompress to too much");
-    // Every page costs at least a byte, also an empty one listed many times.
+    // Every page costs at least a byte, also an empty one listed many times; checking and
+    // reading its stored bytes costs them.
     if data_size.max(1) > *budget {
-        return Err(too_much());
+        return Err(bad("the file's pages hold too much to read"));
+    }
+    // The data's checksum, then the header's (its own field as zero) carried on from it.
+    let data_sum = page_checksum(0, data);
+    if data_sum != head.u32(0x1C)? {
+        return Err(bad("the page's data is damaged (wrong checksum)"));
+    }
+    let mut zeroed = head.0.clone();
+    zeroed[0x18..0x1C].fill(0);
+    if page_checksum(data_sum, &zeroed) != head.u32(0x18)? {
+        return Err(bad("the page header is damaged (wrong checksum)"));
     }
     let page = match compressed {
         2 => decompress_at_most(data, to_usize(max_page, MAX_PAGE, "page")?)?,
