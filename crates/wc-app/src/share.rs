@@ -852,18 +852,6 @@ fn session_took(auth: &Project, local: &Project, base: &Project, name: &str) -> 
         .is_some_and(|(kind, id)| auth.lock.map(kind).contains_key(id) && !updated_here(local, base, auth, kind, id))
 }
 
-/// The items an update edit names, as (kind, id, hash).
-fn updated_items(edit: &ProjectEdit) -> Vec<(ItemKind, String, String)> {
-    match edit {
-        ProjectEdit::UpdateItems { symbols, parts } => symbols
-            .iter()
-            .map(|(s, _, _)| (ItemKind::Symbol, s.id.clone(), s.hash()))
-            .chain(parts.iter().map(|(p, _, _)| (ItemKind::Part, p.id.clone(), p.hash())))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// Take in the session's answers to this person's updates: the version it took is what this copy
 /// synced to (`base`), so a later change here goes out as an update from it, and one the session
 /// took is not waited for or sent again, even when a later change (an undo) put it back since.
@@ -1323,7 +1311,7 @@ impl Role {
     fn edit_project(&mut self, edit: ProjectEdit, notes: &mut Vec<String>) {
         match self {
             Role::Host(h) => {
-                let updated = updated_items(&edit);
+                let updated = edit.updated_items();
                 match h.host.edit_project(edit) {
                     Ok(()) => h.took_updates.extend(updated),
                     Err(e) => notes.push(format!("Your change was not kept: {e}")),
@@ -2502,11 +2490,32 @@ fn write_copy(
         store::write_vendored_part(&dir, p).map_err(|e| e.to_string())?;
     }
     let mut open = Open::load(&dir)?;
-    let wanted: Vec<String> = open.project.lock.symbols.keys().cloned().collect();
+    // Symbols the session did not send come from the libraries here, but only in the version the
+    // session pinned: another version would make this copy differ from everyone else's.
+    let wanted: Vec<(String, String)> = open
+        .project
+        .lock
+        .symbols
+        .iter()
+        .filter(|(id, _)| !open.symbols.contains_key(*id))
+        .map(|(id, e)| (id.clone(), e.hash.clone()))
+        .collect();
     let mut missing = Vec::new();
-    for id in wanted {
-        if let Err(e) = open.ensure_symbol(&id) {
-            missing.push(format!("{id} ({e})"));
+    if !wanted.is_empty() {
+        match wc_library::Library::open(&dir, &open.project) {
+            Ok(lib) => {
+                for (id, pin) in wanted {
+                    match lib.symbol(&id) {
+                        Ok((s, _)) if s.hash() == pin => {
+                            store::write_vendored_symbol(&dir, &s).map_err(|e| e.to_string())?;
+                            open.symbols.insert(id, s);
+                        }
+                        Ok(_) => missing.push(format!("{id} (the library here has another version)")),
+                        Err(e) => missing.push(format!("{id} ({e})")),
+                    }
+                }
+            }
+            Err(e) => missing.extend(wanted.into_iter().map(|(id, _)| format!("{id} ({e})"))),
         }
     }
     if !missing.is_empty() {

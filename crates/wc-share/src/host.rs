@@ -705,14 +705,10 @@ impl Host {
         check_edit(&self.project, &self.locks, by, &edit)?;
         let before = self.project.clone();
         apply_edit(&mut self.project, &edit);
-        // A symbol locked again in an older version must still have every pin wired since.
-        let dangling: Vec<String> = entry
-            .before
-            .lock_symbols
-            .iter()
-            .filter_map(|(id, e)| Some((id, self.symbol_version(id, &e.as_ref()?.hash)?)))
-            .flat_map(|(id, s)| self.project.dangling_pins(id, &s))
-            .collect();
+        // Every wire end the undo leaves must be on a pin of its symbol's locked version: a symbol
+        // locked again in an older version, or a wire put back on a pin a later update dropped.
+        let was = self.dangling_in(&before);
+        let dangling: Vec<String> = self.dangling_in(&self.project).difference(&was).cloned().collect();
         if !dangling.is_empty() {
             self.project = before;
             return invalid(format!(
@@ -881,6 +877,18 @@ impl Host {
     }
 
     /// Symbol `id` in the version `hash`: the one guests get, or one an update replaced.
+    /// Wire ends in `project` on pins the locked version of their symbol does not have, for the
+    /// versions the session has.
+    fn dangling_in(&self, project: &Project) -> BTreeSet<String> {
+        project
+            .lock
+            .symbols
+            .iter()
+            .filter_map(|(id, e)| Some((id, self.symbol_version(id, &e.hash)?)))
+            .flat_map(|(id, s)| project.dangling_pins(id, &s))
+            .collect()
+    }
+
     fn symbol_version(&self, id: &str, hash: &str) -> Option<wc_core::Symbol> {
         match self.symbols.get(id) {
             Some(s) if s.hash() == hash => Some(s.clone()),

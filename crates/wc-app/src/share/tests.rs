@@ -2376,3 +2376,61 @@ fn an_update_undone_before_its_sender_looked_is_not_sent_again_and_others_see_no
     );
     Ok(())
 }
+
+#[test]
+fn a_joined_copy_takes_a_library_symbol_only_in_the_version_the_session_pinned() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let item = |id: &str, name: &str| Symbol {
+        id: id.into(),
+        name: name.into(),
+        category: String::new(),
+        letter_code: String::new(),
+        role: Default::default(),
+        graphics: vec![],
+        pins: vec![],
+        tag_at: Default::default(),
+        description: String::new(),
+    };
+    let (coil_v1, coil_v2, lamp) = (item("coil", "Coil"), item("coil", "Coil v2"), item("lamp", "Lamp"));
+    // The library here has a newer coil than the session pinned, and the lamp it pinned.
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    for s in [&coil_v2, &lamp] {
+        std::fs::write(
+            lib.join("symbols").join(format!("{}.json", s.id)),
+            serde_json::to_string(s)?,
+        )?;
+    }
+    let mut project = Project::new("Demo");
+    project.meta.libraries.push(wc_core::project::LibrarySource {
+        name: "here".into(),
+        kind: "folder".into(),
+        location: lib.to_string_lossy().into_owned(),
+        reference: None,
+    });
+    for s in [&coil_v1, &lamp] {
+        project.lock.symbols.insert(
+            s.id.clone(),
+            wc_core::LockEntry {
+                source: "here".into(),
+                hash: s.hash(),
+            },
+        );
+    }
+    let open = write_copy(&tmp.path().join("copies"), &project, &BTreeMap::new(), &BTreeMap::new())?;
+    assert_eq!(open.symbols.get("lamp"), Some(&lamp));
+    assert!(!open.symbols.contains_key("coil"), "not the library's other version");
+    assert_eq!(
+        open.project.lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(coil_v1.hash())
+    );
+    assert_eq!(
+        store::load(&open.dir)?.lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(coil_v1.hash())
+    );
+    assert!(
+        store::read_vendored_symbol(&open.dir, "coil").is_err(),
+        "no coil file written"
+    );
+    Ok(())
+}

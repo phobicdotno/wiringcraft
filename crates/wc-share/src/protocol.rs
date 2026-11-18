@@ -241,6 +241,20 @@ pub enum ProjectEdit {
 }
 
 impl ProjectEdit {
+    /// The items an [`ProjectEdit::UpdateItems`] puts in, as (kind, id, new hash); empty for
+    /// other edits.
+    pub fn updated_items(&self) -> Vec<(wc_core::lock::ItemKind, String, String)> {
+        use wc_core::lock::ItemKind;
+        match self {
+            ProjectEdit::UpdateItems { symbols, parts } => symbols
+                .iter()
+                .map(|(s, _, _)| (ItemKind::Symbol, s.id.clone(), s.hash()))
+                .chain(parts.iter().map(|(p, _, _)| (ItemKind::Part, p.id.clone(), p.hash())))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// What the record a whole-record edit replaces (a device, one page's comments, a panel,
     /// the project properties) is in `project`, as a short content hash; `None` for other
     /// edits.

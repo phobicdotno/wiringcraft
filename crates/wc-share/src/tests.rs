@@ -3251,6 +3251,77 @@ fn an_update_is_not_taken_back_while_a_wire_uses_a_pin_only_it_has() -> TestResu
 }
 
 #[test]
+fn a_page_undo_does_not_put_a_wire_back_on_a_pin_a_later_update_dropped() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1", "A2"]), coil_with(&["A1"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.open(Some("p0002"))?;
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    wired(&mut page, "A2");
+    host.edit_page(page.clone())?;
+    page.wires.clear();
+    host.edit_page(page)?;
+    let removal = host.history().last().ok_or("recorded")?.id;
+    // A2 is free, so the update without it is taken; taking the wire removal back would put the
+    // wire on a pin the coil no longer has.
+    host.edit_project(update_symbol(&v1, &v2))?;
+    let err = host.revert(removal).err().ok_or("refused")?;
+    assert!(err.to_string().contains("page 2 k1:A2"), "{err}");
+    assert!(host.project().page("p0002").ok_or("page")?.wires.is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn an_update_whose_commit_fails_leaves_the_old_version_saved_and_pinned() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let journal = GitJournal::open(dir)?;
+    journal.git().commit("start")?;
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(journal));
+    let (v1, v2) = (symbol("coil", "Coil"), symbol("coil", "Coil v2"));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    let head = |dir: &std::path::Path| -> std::io::Result<Vec<u8>> {
+        Ok(std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()?
+            .stdout)
+    };
+    let before = head(dir)?;
+    let hook = dir.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(dir.join(".git/hooks"))?;
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n")?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+
+    let updated = host.edit_project(update_symbol(&v1, &v2));
+    assert!(matches!(updated, Err(Refusal::NotRecorded { .. })), "{updated:?}");
+    assert_eq!(head(dir)?, before, "no commit");
+    let saved = store::load(dir)?;
+    assert_eq!(saved.lock.symbols.get("coil").map(|e| e.hash.clone()), Some(v1.hash()));
+    assert_eq!(store::read_vendored_symbol(dir, "coil")?, v1, "the old file is back");
+    assert_eq!(
+        host.project().lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(v1.hash())
+    );
+    Ok(())
+}
+
+#[test]
 fn a_git_journal_puts_vendored_files_back_when_a_change_is_not_recorded() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path();

@@ -280,13 +280,7 @@ impl Guest {
                     }
                     ProjectEdit::UpdateItems { symbols, parts } => {
                         if Some(by) == self.me {
-                            use wc_core::lock::ItemKind;
-                            self.took_updates.extend(
-                                symbols
-                                    .iter()
-                                    .map(|(s, _, _)| (ItemKind::Symbol, s.id.clone(), s.hash()))
-                                    .chain(parts.iter().map(|(p, _, _)| (ItemKind::Part, p.id.clone(), p.hash()))),
-                            );
+                            self.took_updates.extend(edit.updated_items());
                         }
                         self.symbols
                             .extend(symbols.iter().map(|(s, _, _)| (s.id.clone(), s.clone())));

@@ -69,7 +69,11 @@ they are and says which. Undo takes back your own latest change, and "Undo this 
 session's change list takes back any change whose parts were not changed again since (#78).
 Updating a symbol or part from the library during a session sends the new version to everyone
 as one change, refused when someone else updated it first or when wires in the session end on a
-pin the new version drops; undoing it puts the old version back in every copy (#197).
+pin the new version drops; undoing it puts the old version back in every copy (#197). An undo
+is refused while a wire ends on a pin the version it brings back does not have, for example a
+pin the update added that has been wired since: move or remove that wire, then undo again. A
+joining copy takes a symbol the session did not send from its own libraries only in the version
+the session pinned; otherwise it reports the symbol as missing.
 
 Host and guests must run builds with the same session protocol version
 (`wc_share::PROTOCOL_VERSION`, raised whenever a message changes). A guest on another version is
