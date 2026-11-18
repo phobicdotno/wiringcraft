@@ -122,9 +122,13 @@ impl W {
         self
     }
     fn t8(&mut self, s: &str) -> &mut Self {
-        self.bs(s.len() as u16);
-        for b in s.bytes() {
-            self.rc(b);
+        self.t8_bytes(s.as_bytes())
+    }
+    /// A TV of these bytes (2004): its length, then the bytes.
+    fn t8_bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        self.bs(bytes.len() as u16);
+        for b in bytes {
+            self.rc(*b);
         }
         self
     }
@@ -658,6 +662,7 @@ fn sections(v: Version, objs: &[Obj], extra: &[(u64, usize)]) -> Sections {
             },
         ],
         skipped: Vec::new(),
+        codepage: 30,
     }
 }
 
@@ -1126,7 +1131,12 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
 
 /// A BLOCK_HEADER with every field up to its base point; an xref has no owned-object count.
 fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: bool) -> Obj {
-    let mut o = named(v, BLOCK_HEADER, handle, name);
+    block_fields(named(v, BLOCK_HEADER, handle, name), base, xref)
+}
+
+/// The fields a BLOCK_HEADER has after its name, written onto `o`.
+fn block_fields(mut o: Obj, base: (f64, f64), xref: bool) -> Obj {
+    let v = o.version;
     match v {
         Version::R2004 => o.data.b(true).bs(0).b(false),
         Version::R2010 => o.data.bs(0),
@@ -1954,5 +1964,52 @@ fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestRes
     let d = drawing(&sections(v, &objs, &[]))?;
     assert!(d.model.is_empty(), "{:?}", d.model);
     assert_eq!(d.skipped.get("SPLINE with too few points"), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+/// A 2004 drawing with a block named "Реле" holding the text "Пуск", both in Windows-1251.
+fn cyrillic_2004(codepage: u16) -> Sections {
+    let v = Version::R2004;
+    let mut block = Obj::new(v, BLOCK_HEADER, 0x100);
+    block.data.bs(0).bl(0).b(true).t8_bytes(&[0xD0, 0xE5, 0xEB, 0xE5]);
+    let block = block_fields(block, (0.0, 0.0), false);
+    let mut text = entity(v, 1, 0x200, head(Some(0x100)));
+    text.data
+        .rc(0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80)
+        .rd(0.0)
+        .rd(0.0)
+        .be((0.0, 0.0, 1.0))
+        .bt(0.0)
+        .rd(2.5);
+    text.data.t8_bytes(&[0xCF, 0xF3, 0xF1, 0xEA]);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        block,
+        text,
+    ];
+    let mut s = sections(v, &objs, &[]);
+    s.codepage = codepage;
+    s
+}
+
+#[test]
+fn a_2004_drawing_in_windows_1251_reads_cyrillic() -> TestResult {
+    let d = drawing(&cyrillic_2004(29))?;
+    assert!(d.blocks.contains_key("Реле"), "{:?}", d.blocks.keys());
+    assert_eq!(texts(&d.blocks["Реле"]), ["Пуск"]);
+    assert!(d.skipped.is_empty(), "{:?}", d.skipped);
+    // An unknown code page still reads, as Windows-1252, and is named in a warning.
+    let d = drawing(&cyrillic_2004(31))?;
+    assert_eq!(d.blocks.len(), 1);
+    // Its text is kept, decoded the legacy way (not UTF-8, so Windows-1252).
+    assert_eq!(texts(&d.blocks["Ðåëå"]), ["Ïóñê"]);
+    assert!(d.skipped.is_empty(), "not an entity count: {:?}", d.skipped);
+    assert_eq!(
+        d.warnings.iter().filter(|w| w.contains("code page 31")).count(),
+        1,
+        "one warning per drawing: {:?}",
+        d.warnings
+    );
     Ok(())
 }
