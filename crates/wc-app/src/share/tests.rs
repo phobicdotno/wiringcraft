@@ -2723,8 +2723,68 @@ fn a_waiting_rename_is_dropped_whole_when_the_session_changed_one_of_its_pages()
     let mut session = base.clone();
     session.pages[0].title = "Theirs".into();
     let before = session.clone();
-    assert_eq!(held.put_back(&mut session), ["page 1"]);
+    assert_eq!(
+        held.put_back(&mut session),
+        ["page 1", "the device rename that waited with it"]
+    );
     assert_eq!(session, before);
+    Ok(())
+}
+
+#[test]
+fn a_waiting_page_the_session_left_alone_is_kept_when_another_one_is_lost() -> TestResult {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("pa", "1", "A"));
+    base.pages.push(Page::new("pb", "2", "B"));
+    let mut local = base.clone();
+    local.pages[0].symbols.push(symbol("s1", 10.0));
+    local.pages[1].symbols.push(symbol("s2", 10.0));
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    let mut session = base.clone();
+    session.pages[0].title = "Theirs".into();
+    assert_eq!(held.put_back(&mut session), ["page 1"]);
+    assert_eq!(session.pages[0].title, "Theirs");
+    assert_eq!(session.pages[1], local.pages[1]);
+    Ok(())
+}
+
+#[test]
+fn comments_on_a_new_page_held_for_a_renamed_device_wait_with_it() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    // A new page that waits only because it names the renamed device.
+    let mut new_page = Page::new("p9", "9", "New");
+    new_page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k2.clone()),
+        ..symbol("s9", 10.0)
+    });
+    local.pages.push(new_page);
+    let note = Comment {
+        id: "c1".into(),
+        page: "p9".into(),
+        at: None,
+        author: "Ola".into(),
+        time: 0,
+        text: "Check this".into(),
+        resolved: false,
+        replies: Vec::new(),
+    };
+    local.comments.push(note.clone());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    let mut session = base.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session.comments, [note]);
     Ok(())
 }
 

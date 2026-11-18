@@ -1718,6 +1718,18 @@ struct Held {
     was: wc_share::Parts,
     /// The items they wait for, by [`item_name`].
     items: Vec<String>,
+    /// The targets of a device rename that waits ([`Held::hold_renames`]): put back all
+    /// together or not at all.
+    rename: RenameGroup,
+}
+
+/// See [`Held::rename`].
+#[derive(Debug, Default)]
+struct RenameGroup {
+    pages: BTreeSet<String>,
+    devices: BTreeSet<wc_core::DeviceTag>,
+    panels: BTreeSet<String>,
+    meta: bool,
 }
 
 impl Held {
@@ -1733,11 +1745,6 @@ impl Held {
             if !new.is_empty() {
                 items.extend(new.iter().map(|id| item_name(ItemKind::Symbol, id)));
                 held.now.pages.insert((*id).to_owned(), local.page(id).cloned());
-                // A new page's comments wait with it: the session has no page to put them on.
-                if base.page(id).is_none() {
-                    let on: Vec<_> = local.comments.iter().filter(|c| c.page == **id).cloned().collect();
-                    held.now.comments.insert((*id).to_owned(), on);
-                }
             }
         }
         for (tag, parts) in &fresh.devices {
@@ -1755,6 +1762,19 @@ impl Held {
             held.now.meta = Some(Box::new(local.meta.clone()));
         }
         held.hold_renames(local, base);
+        // A new page's comments wait with it, however it came to wait: the session has no page
+        // to put them on.
+        let new_pages: Vec<String> = held
+            .now
+            .pages
+            .keys()
+            .filter(|id| base.page(id).is_none())
+            .cloned()
+            .collect();
+        for id in new_pages {
+            let on: Vec<_> = local.comments.iter().filter(|c| c.page == id).cloned().collect();
+            held.now.comments.insert(id, on);
+        }
         held.was = wc_share::Parts::read(base, &held.now);
         held.items = items.into_iter().collect();
         held
@@ -1799,19 +1819,24 @@ impl Held {
             .filter(|t| !local.devices.contains_key(*t) && renamed_from(t))
         {
             self.now.devices.insert(tag.clone(), None);
+            self.rename.devices.insert(tag.clone());
         }
+        self.rename.devices.extend(new_tags.iter().cloned());
         for p in &local.pages {
             if page_mentions(p, &named) && base.page(&p.id) != Some(p) {
                 self.now.pages.insert(p.id.clone(), Some(p.clone()));
+                self.rename.pages.insert(p.id.clone());
             }
         }
         for panel in &local.panels {
             if panel_mentions(panel, &named) && base.panels.iter().find(|b| b.id == panel.id) != Some(panel) {
                 self.now.panels.insert(panel.id.clone(), Some(panel.clone()));
+                self.rename.panels.insert(panel.id.clone());
             }
         }
         if local.meta != base.meta && local.meta.jumpers.iter().any(|j| named(&j.strip)) {
             self.now.meta = Some(Box::new(local.meta.clone()));
+            self.rename.meta = true;
         }
     }
 
@@ -1819,13 +1844,14 @@ impl Held {
         self.now.is_empty()
     }
 
-    /// Put the held changes back into `project`, which now holds the session's project. When the
-    /// session changed any target meanwhile, every target keeps the session's version and the
-    /// changed ones are returned. A page
+    /// Put the held changes back into `project`, which now holds the session's project. A target
+    /// the session changed meanwhile keeps the session's version; those are returned. The
+    /// targets of a waiting rename go together: when one of them is lost, all are. A page
     /// counts as unchanged when only its number changed, and keeps the session's number unless
     /// this copy renumbered it.
     fn put_back(&self, project: &mut Project) -> Vec<String> {
         let mut lost = Vec::new();
+        let mut rename_lost = false;
         let mut keep = wc_share::Parts::default();
         for (id, now) in &self.now.pages {
             let Some(now) = now else { continue };
@@ -1842,7 +1868,10 @@ impl Held {
                 (None, None) => {
                     keep.pages.insert(id.clone(), Some(now.clone()));
                 }
-                _ => lost.push(format!("page {}", now.number)),
+                _ => {
+                    rename_lost |= self.rename.pages.contains(id);
+                    lost.push(format!("page {}", now.number));
+                }
             }
         }
         for (tag, now) in &self.now.devices {
@@ -1850,6 +1879,7 @@ impl Held {
             if project.devices.get(tag) == was.as_ref() {
                 keep.devices.insert(tag.clone(), now.clone());
             } else {
+                rename_lost |= self.rename.devices.contains(tag);
                 lost.push(format!("device {tag}"));
             }
         }
@@ -1858,6 +1888,7 @@ impl Held {
             if project.panels.iter().find(|p| &p.id == id) == was.as_ref() {
                 keep.panels.insert(id.clone(), now.clone());
             } else {
+                rename_lost |= self.rename.panels.contains(id);
                 lost.push(format!("panel {id}"));
             }
         }
@@ -1874,14 +1905,23 @@ impl Held {
             if project.meta == **was {
                 keep.meta = Some(now.clone());
             } else {
+                rename_lost |= self.rename.meta;
                 lost.push("the project properties".into());
             }
         }
-        // Kept whole or not at all: a rename whose page the session changed must not leave the
-        // new tag here without the page that uses it, nor the page without its device.
-        if lost.is_empty() {
-            keep.apply(project);
+        // A rename whose page the session changed must not leave the new tag here without the
+        // page that uses it, nor the page without its device.
+        if rename_lost {
+            keep.pages.retain(|id, _| !self.rename.pages.contains(id));
+            keep.comments.retain(|id, _| !self.rename.pages.contains(id));
+            keep.devices.retain(|tag, _| !self.rename.devices.contains(tag));
+            keep.panels.retain(|id, _| !self.rename.panels.contains(id));
+            if self.rename.meta {
+                keep.meta = None;
+            }
+            lost.push("the device rename that waited with it".into());
         }
+        keep.apply(project);
         // The items they use stay locked here: `incoming` keeps entries the session lacks.
         lost
     }
