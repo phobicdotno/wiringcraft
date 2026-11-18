@@ -1729,7 +1729,7 @@ mod tests {
         };
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
-        let mut frame = |open: &mut Open, ed: &mut Editor| {
+        let frame = |open: &mut Open, ed: &mut Editor| {
             // No pointer over the canvas at all.
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
