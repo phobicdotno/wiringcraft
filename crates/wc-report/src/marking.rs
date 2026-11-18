@@ -367,27 +367,32 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
         }
     }
 
+    // Terminals have terminal markers: the drawn ones and the spares the terminal strip editor
+    // keeps (a spare that is drawn too is a drawn terminal already).
+    let mut terminals: BTreeSet<DeviceTag> = BTreeSet::new();
+    for l in &i.project.meta.strips {
+        for n in &l.spares {
+            if let Ok(tag) = DeviceTag::parse(&format!("{}.{n}", l.strip)) {
+                terminals.insert(tag);
+            }
+        }
+    }
+    for page in &i.project.pages {
+        for s in &page.symbols {
+            let role = i.symbols.get(&s.symbol).map(|y| y.role);
+            if matches!(role, Some(SymbolRole::Terminal))
+                && let Some(tag) = &s.tag
+            {
+                terminals.insert(tag.clone());
+            }
+        }
+    }
+
     if wanted(MarkerKind::Devices) {
         // Devices are marked by their tag; terminals and cables have markers of their own,
         // and interruption points (links between pages) are not devices.
         let mut skip: BTreeSet<DeviceTag> = cables.clone();
-        // Spare terminals (terminal strip editor) have terminal markers too.
-        let (plan, spares) = crate::terminal_plan_with_spares(i);
-        for r in spares.iter().filter_map(|k| plan.rows.get(*k)) {
-            if let Ok(tag) = DeviceTag::parse(&format!("{}.{}", r[0], r[1])) {
-                skip.insert(tag);
-            }
-        }
-        for page in &i.project.pages {
-            for s in &page.symbols {
-                let role = i.symbols.get(&s.symbol).map(|y| y.role);
-                if matches!(role, Some(SymbolRole::Terminal))
-                    && let Some(tag) = &s.tag
-                {
-                    skip.insert(tag.clone());
-                }
-            }
-        }
+        skip.extend(terminals.iter().cloned());
         let mut list: Vec<DeviceTag> = crate::all_tags(i)
             .into_iter()
             .filter(|t| !skip.contains(t) && !is_cable_tag(t))
@@ -402,10 +407,21 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
     }
 
     if wanted(MarkerKind::Cables) {
-        // Cables drawn as cores of wires, and cable devices listed without cores yet.
+        // Cables drawn as cores of wires, and cable devices listed without cores yet; a
+        // terminal named like a cable (-X1.W1) is a terminal.
         let mut list: BTreeSet<DeviceTag> = cables;
-        list.extend(crate::all_tags(i).into_iter().filter(is_cable_tag));
-        list.extend(i.project.devices.keys().filter(|t| is_cable_tag(t)).cloned());
+        list.extend(
+            crate::all_tags(i)
+                .into_iter()
+                .filter(|t| is_cable_tag(t) && !terminals.contains(t)),
+        );
+        list.extend(
+            i.project
+                .devices
+                .keys()
+                .filter(|t| is_cable_tag(t) && !terminals.contains(*t))
+                .cloned(),
+        );
         let mut list: Vec<DeviceTag> = list.into_iter().collect();
         list.sort_by_key(|t| natural_key(&t.to_string()));
         for tag in list {

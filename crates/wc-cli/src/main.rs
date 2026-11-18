@@ -1288,14 +1288,13 @@ fn run(cli: Cli) -> Res<()> {
                 StripCmd::Spare { strip, terminal, after } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
                     let current = rail(&p, &strip);
-                    p.meta
-                        .add_spare(&strip, &terminal, after.as_deref().map(str::trim), &current)?;
+                    p.add_spare(&strip, &terminal, after.as_deref().map(str::trim), &current)?;
                     save(dir, &p)?;
                 }
                 StripCmd::Unspare { strip, terminal } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
                     let current = rail(&p, &strip);
-                    if !p.meta.remove_spare(&strip, terminal.trim(), &current) {
+                    if !p.remove_spare(&strip, terminal.trim(), &current) {
                         return Err(format!("{strip} has no spare terminal {}", terminal.trim()));
                     }
                     save(dir, &p)?;

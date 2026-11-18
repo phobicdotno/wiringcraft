@@ -1493,6 +1493,51 @@ pub struct Project {
 }
 
 impl Project {
+    /// Add spare terminal `number` to `strip` ([`ProjectMeta::add_spare`]), refused also when
+    /// its tag (`-X1.S1`) is drawn as a device that is not a terminal of the strip: the spare
+    /// would take over that device's part.
+    pub fn add_spare(
+        &mut self,
+        strip: &DeviceTag,
+        number: &str,
+        after: Option<&str>,
+        current: &[(String, bool)],
+    ) -> Result<(), String> {
+        let number = number.trim();
+        if let Ok(tag) = DeviceTag::parse(&format!("{strip}.{number}"))
+            && !current.iter().any(|(t, _)| t == number)
+            && self.is_drawn(&tag)
+        {
+            return Err(format!(
+                "{tag} is drawn as a device that is not a terminal of {strip}; pick another number"
+            ));
+        }
+        self.meta.add_spare(strip, number, after, current)
+    }
+
+    /// Take spare terminal `number` off `strip` ([`ProjectMeta::remove_spare`]). A spare that is
+    /// not drawn anywhere also loses its device entry (its part, level and the like), so the bill
+    /// of materials no longer counts it; a drawn one keeps it. Returns whether it was a spare.
+    pub fn remove_spare(&mut self, strip: &DeviceTag, number: &str, current: &[(String, bool)]) -> bool {
+        let number = number.trim();
+        if !self.meta.remove_spare(strip, number, current) {
+            return false;
+        }
+        if let Ok(tag) = DeviceTag::parse(&format!("{strip}.{number}"))
+            && !self.is_drawn(&tag)
+        {
+            self.devices.remove(&tag);
+        }
+        true
+    }
+
+    /// Whether a symbol on a page carries `tag`.
+    fn is_drawn(&self, tag: &DeviceTag) -> bool {
+        self.pages
+            .iter()
+            .any(|p| p.symbols.iter().any(|s| s.tag.as_ref() == Some(tag)))
+    }
+
     /// Wire ends on pins of symbol `id` that `symbol` does not have: `page 3 -K1:13` each. What
     /// replacing the symbol with that version would leave unconnected.
     pub fn dangling_pins(&self, id: &str, symbol: &crate::Symbol) -> Vec<String> {
@@ -2324,6 +2369,52 @@ mod tests {
         p.pages[0].symbols.retain(|s| s.id != "t2");
         follow_terminals_in(&mut p, &before, role);
         assert_eq!(p.meta.jumpers[0].terminals, ["1", "S1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_spare_never_takes_over_another_device_and_leaves_no_part_behind() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        // -X1.1 is a terminal; -X1.K1 is drawn as another kind of device.
+        for (id, tag) in [("t1", "-X1.1"), ("k1", "-X1.K1")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: id.into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        p.pages.push(page);
+        let current = vec![("1".to_owned(), false)];
+        let err = p.add_spare(&x1, "K1", None, &current).err().unwrap_or_default();
+        assert!(err.contains("-X1.K1"), "{err}");
+        assert!(p.meta.strips.is_empty());
+        // A spare given a part (WAGO import) and taken off again leaves no device entry.
+        p.add_spare(&x1, "S1", None, &current)?;
+        let s1 = DeviceTag::parse("-X1.S1")?;
+        p.devices.entry(s1.clone()).or_default().part = Some("wago.2002-1201".into());
+        let current = vec![("1".to_owned(), false), ("S1".to_owned(), true)];
+        assert!(p.remove_spare(&x1, "S1", &current));
+        assert!(!p.devices.contains_key(&s1));
+        // A spare that is drawn by now keeps its device entry.
+        p.add_spare(&x1, "S2", None, &[("1".to_owned(), false)])?;
+        let s2 = DeviceTag::parse("-X1.S2")?;
+        p.devices.entry(s2.clone()).or_default().part = Some("wago.2002-1201".into());
+        p.pages[0].symbols.push(PlacedSymbol {
+            id: "t2".into(),
+            symbol: "term".into(),
+            at: Point::default(),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: Some(s2.clone()),
+        });
+        let current = vec![("1".to_owned(), false), ("S2".to_owned(), false)];
+        assert!(p.remove_spare(&x1, "S2", &current));
+        assert!(p.devices.contains_key(&s2));
         Ok(())
     }
 

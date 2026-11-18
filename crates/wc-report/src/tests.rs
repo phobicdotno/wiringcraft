@@ -1501,6 +1501,19 @@ fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_t
     for page in p.pages.iter_mut() {
         page.number = SPARE_PAGE.into();
     }
+    // A drawn terminal 0 without a level, on that page, is not taken for a spare either: its
+    // marker comes first, by number, not after the block.
+    let mut zero = p
+        .pages
+        .iter()
+        .flat_map(|pg| &pg.symbols)
+        .find(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == "-X1.1"))
+        .cloned()
+        .unwrap();
+    zero.id = "zero".into();
+    zero.at.x += 200.0;
+    zero.tag = Some(DeviceTag::parse("-X1.0").unwrap());
+    p.pages[0].symbols.push(zero);
     // A spare with a bad level does not join the inference: 1 keeps level 1.
     p.devices
         .entry(DeviceTag::parse("-X1.1a").unwrap())
@@ -1518,9 +1531,25 @@ fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_t
     let spare = plan.rows.iter().find(|r| r[0] == "-X2" && r[1] == "S1").unwrap();
     assert_eq!(spare[4], "0V");
     let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
-    assert_eq!(marked, ["1 / 2", "1a"]);
+    assert_eq!(marked, ["0", "1 / 2", "1a"]);
     // The spare -X1.1a has a device entry, but it is marked once, as a terminal.
     let all = marking_list_with(&i, &MarkingOptions::default());
     let named: Vec<&Vec<String>> = all.rows.iter().filter(|r| r.iter().any(|c| c.contains("1a"))).collect();
+    assert_eq!(named.len(), 1, "{named:?}");
+
+    // A spare named like a cable (W1) with a level of its own is a terminal, not a cable end.
+    p.meta.add_spare(&x1, "W1", None, &[]).unwrap();
+    p.devices
+        .entry(DeviceTag::parse("-X1.W1").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "1".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let all = marking_list_with(&i, &MarkingOptions::default());
+    let named: Vec<&Vec<String>> = all.rows.iter().filter(|r| r.iter().any(|c| c.contains("W1"))).collect();
     assert_eq!(named.len(), 1, "{named:?}");
 }

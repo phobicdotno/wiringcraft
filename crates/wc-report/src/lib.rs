@@ -831,11 +831,12 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
     // A spare has no wiring of its own, but a jumper to a drawn terminal puts it on that
     // terminal's potential.
     for &k in &spare_rows {
+        let cell = |r: &[String], c: usize| r.get(c).cloned().unwrap_or_default();
         let Some(row) = t.rows.get(k) else { continue };
-        if !row[4].is_empty() {
+        if !cell(row, 4).is_empty() {
             continue;
         }
-        let (strip, number) = (row[0].clone(), row[1].clone());
+        let (strip, number) = (cell(row, 0), cell(row, 1));
         let Some(jumper) = DeviceTag::parse(&strip).ok().and_then(|st| {
             i.project
                 .meta
@@ -850,11 +851,14 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
             .iter()
             .enumerate()
             .find(|(n, r)| {
-                !spare_rows.contains(n) && r[0] == strip && jumper.terminals.contains(&r[1]) && !r[4].is_empty()
+                !spare_rows.contains(n)
+                    && cell(r, 0) == strip
+                    && jumper.terminals.contains(&cell(r, 1))
+                    && !cell(r, 4).is_empty()
             })
-            .map(|(_, r)| r[4].clone());
-        if let (Some(p), Some(row)) = (potential, t.rows.get_mut(k)) {
-            row[4] = p;
+            .map(|(_, r)| cell(r, 4));
+        if let (Some(p), Some(slot)) = (potential, t.rows.get_mut(k).and_then(|r| r.get_mut(4))) {
+            *slot = p;
         }
     }
     (t, spare_rows)
