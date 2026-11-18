@@ -1013,6 +1013,29 @@ pub struct Project {
 }
 
 impl Project {
+    /// Wire ends on pins of symbol `id` that `symbol` does not have: `page 3 -K1:13` each. What
+    /// replacing the symbol with that version would leave unconnected.
+    pub fn dangling_pins(&self, id: &str, symbol: &crate::Symbol) -> Vec<String> {
+        let mut out = Vec::new();
+        for page in &self.pages {
+            for w in &page.wires {
+                for end in [&w.from, &w.to] {
+                    let crate::Endpoint::Pin { item, pin } = end else {
+                        continue;
+                    };
+                    let Some(placed) = page.symbol(item) else { continue };
+                    if placed.symbol == id && symbol.pin(pin).is_none() {
+                        let name = placed.tag.as_ref().map_or_else(|| item.clone(), ToString::to_string);
+                        out.push(format!("page {} {name}:{pin}", page.number));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             meta: ProjectMeta::new(name),
