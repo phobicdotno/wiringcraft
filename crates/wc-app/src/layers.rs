@@ -135,6 +135,25 @@ impl Layers {
         }
     }
 
+    /// Why `s` cannot be selected now, naming its layer and whether it is hidden or locked;
+    /// `None` when it can. Used when Find goes to a hit the canvas would drop at once.
+    pub fn unselectable_note(&self, s: &Selection) -> Option<String> {
+        let layer = match s {
+            Selection::Graphic(_) => Layer::Drawings,
+            Selection::Symbol(_) | Selection::Wire(_) => return None,
+        };
+        let (state, fix) = match (self.shown(layer), self.locked(layer)) {
+            (true, false) => return None,
+            (false, true) => ("hidden and locked", "Show and unlock"),
+            (false, false) => ("hidden", "Show"),
+            (true, true) => ("locked", "Unlock"),
+        };
+        Some(format!(
+            "The hit is on the {state} layer {}: {fix} it in View → Layers to select it.",
+            layer.title()
+        ))
+    }
+
     /// `items` without those on a layer that is hidden or locked.
     pub fn keep(&self, mut items: Vec<Selection>) -> Vec<Selection> {
         items.retain(|s| self.may_select(s));
@@ -216,6 +235,28 @@ mod tests {
             l.keep(sel),
             vec![Selection::Symbol("d1".into()), Selection::Wire("w1".into())]
         );
+    }
+
+    #[test]
+    fn an_item_on_a_hidden_or_locked_layer_says_why_it_is_not_selected() {
+        let mut l = Layers::default();
+        let text = Selection::Graphic(3);
+        assert_eq!(l.unselectable_note(&text), None);
+        l.set_locked(Layer::Drawings, true);
+        let note = l.unselectable_note(&text).unwrap();
+        assert!(note.contains("locked layer Drawings and notes"), "{note}");
+        assert!(note.contains("Unlock"), "{note}");
+        l.set_shown(Layer::Drawings, false);
+        let note = l.unselectable_note(&text).unwrap();
+        assert!(note.contains("hidden and locked layer Drawings and notes"), "{note}");
+        assert!(note.contains("Show and unlock"), "{note}");
+        l.set_locked(Layer::Drawings, false);
+        let note = l.unselectable_note(&text).unwrap();
+        assert!(note.contains("the hidden layer Drawings and notes"), "{note}");
+        assert!(note.contains(": Show it"), "{note}");
+        // Symbols and wires are on no layer.
+        assert_eq!(l.unselectable_note(&Selection::Symbol("d1".into())), None);
+        assert_eq!(l.unselectable_note(&Selection::Wire("w1".into())), None);
     }
 
     #[test]
