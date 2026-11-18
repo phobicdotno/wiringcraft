@@ -401,6 +401,16 @@ fn session_has(auth: &Project, name: &str) -> bool {
     }
 }
 
+/// Why a file read for the session cannot be used: it could not be read, or it holds another
+/// version than the lock names (edited by hand, or left by a merge).
+fn check_locked<T>(read: wc_core::Result<T>, hash: impl Fn(&T) -> String, locked: &str) -> Result<T, String> {
+    let item = read.map_err(|e| e.to_string())?;
+    if hash(&item) != locked {
+        return Err("its file holds another version than the project's lock".into());
+    }
+    Ok(item)
+}
+
 /// What [`new_items`] found.
 #[derive(Debug, Default)]
 pub struct NewItems {
@@ -425,27 +435,27 @@ pub fn new_items(dir: &Path, local: &Project, auth: &Project, skip: &std::collec
             .iter()
             .filter(move |(id, _)| !auth.lock.map(kind).contains_key(*id))
             .filter(move |(id, _)| !skip.contains(&item_name(kind, id)))
-            .map(|(id, e)| (id.clone(), e.source.clone()))
+            .map(|(id, e)| (id.clone(), e.source.clone(), e.hash.clone()))
             .collect::<Vec<_>>()
     };
     let mut symbols = Vec::new();
-    for (id, source) in fresh(ItemKind::Symbol) {
-        match store::read_vendored_symbol(dir, &id) {
+    for (id, source, hash) in fresh(ItemKind::Symbol) {
+        match check_locked(store::read_vendored_symbol(dir, &id), Symbol::hash, &hash) {
             Ok(s) => {
                 out.sent.push(item_name(ItemKind::Symbol, &id));
                 symbols.push((s, source));
             }
-            Err(e) => out.unreadable.push((item_name(ItemKind::Symbol, &id), e.to_string())),
+            Err(e) => out.unreadable.push((item_name(ItemKind::Symbol, &id), e)),
         }
     }
     let mut parts = Vec::new();
-    for (id, source) in fresh(ItemKind::Part) {
-        match store::read_vendored_part(dir, &id) {
+    for (id, source, hash) in fresh(ItemKind::Part) {
+        match check_locked(store::read_vendored_part(dir, &id), Part::hash, &hash) {
             Ok(p) => {
                 out.sent.push(item_name(ItemKind::Part, &id));
                 parts.push((p, source));
             }
-            Err(e) => out.unreadable.push((item_name(ItemKind::Part, &id), e.to_string())),
+            Err(e) => out.unreadable.push((item_name(ItemKind::Part, &id), e)),
         }
     }
     out.edit = (!symbols.is_empty() || !parts.is_empty()).then_some(ProjectEdit::AddItems { symbols, parts });
@@ -454,42 +464,58 @@ pub fn new_items(dir: &Path, local: &Project, auth: &Project, skip: &std::collec
 
 /// Write the session's files for items `open` locks but has not loaded in the locked version
 /// (symbols and parts someone else added, or used first in another version) into its vendor
-/// folder, and load them. Returns the ids that could not
-/// be written.
-pub fn take_files(open: &mut Open, symbols: &BTreeMap<String, Symbol>, parts: &BTreeMap<String, Part>) -> Vec<String> {
+/// folder, and load them. A file the session offers in another version than the lock names is
+/// neither written nor loaded. Returns the items that could not be taken, by [`item_name`],
+/// with the reason.
+pub fn take_files(
+    open: &mut Open,
+    symbols: &BTreeMap<String, Symbol>,
+    parts: &BTreeMap<String, Part>,
+) -> Vec<(String, String)> {
+    const OTHER: &str = "the session's file holds another version than its lock";
     let mut failed = Vec::new();
-    let wanted: Vec<String> = open
+    let wanted: Vec<(String, String)> = open
         .project
         .lock
         .symbols
         .iter()
         .filter(|(id, e)| open.symbols.get(*id).is_none_or(|s| s.hash() != e.hash))
-        .map(|(id, _)| id.clone())
+        .map(|(id, e)| (id.clone(), e.hash.clone()))
         .collect();
-    for id in wanted {
+    for (id, hash) in wanted {
         let Some(s) = symbols.get(&id) else { continue };
+        let name = item_name(ItemKind::Symbol, &id);
+        if s.hash() != hash {
+            failed.push((name, OTHER.into()));
+            continue;
+        }
         match store::write_vendored_symbol(&open.dir, s) {
             Ok(_) => {
                 open.symbols.insert(id, s.clone());
             }
-            Err(e) => failed.push(format!("{id} ({e})")),
+            Err(e) => failed.push((name, e.to_string())),
         }
     }
-    let wanted: Vec<String> = open
+    let wanted: Vec<(String, String)> = open
         .project
         .lock
         .parts
         .iter()
         .filter(|(id, e)| open.parts.get(*id).is_none_or(|p| p.hash() != e.hash))
-        .map(|(id, _)| id.clone())
+        .map(|(id, e)| (id.clone(), e.hash.clone()))
         .collect();
-    for id in wanted {
+    for (id, hash) in wanted {
         let Some(p) = parts.get(&id) else { continue };
+        let name = item_name(ItemKind::Part, &id);
+        if p.hash() != hash {
+            failed.push((name, OTHER.into()));
+            continue;
+        }
         match store::write_vendored_part(&open.dir, p) {
             Ok(_) => {
                 open.parts.insert(id, p.clone());
             }
-            Err(e) => failed.push(format!("{id} ({e})")),
+            Err(e) => failed.push((name, e.to_string())),
         }
     }
     failed
@@ -499,20 +525,21 @@ pub fn take_files(open: &mut Open, symbols: &BTreeMap<String, Symbol>, parts: &B
 struct Files {
     symbols: BTreeMap<String, Symbol>,
     parts: BTreeMap<String, Part>,
-    /// Locked items whose file could not be read: `symbol id (reason)`.
+    /// Locked items whose file cannot be shared, unreadable or not the locked version:
+    /// `symbol id (reason)`.
     unreadable: Vec<String>,
 }
 
 /// The project's vendored symbol and part files in `dir`, for every item its lock lists; the
-/// ones that cannot be read are named with the reason.
+/// ones that cannot be read or hold another version than the lock are named with the reason.
 fn vendored_files(dir: &Path, project: &Project) -> Files {
     let mut files = Files {
         symbols: BTreeMap::new(),
         parts: BTreeMap::new(),
         unreadable: Vec::new(),
     };
-    for id in project.lock.symbols.keys() {
-        match store::read_vendored_symbol(dir, id) {
+    for (id, e) in &project.lock.symbols {
+        match check_locked(store::read_vendored_symbol(dir, id), Symbol::hash, &e.hash) {
             Ok(s) => {
                 files.symbols.insert(id.clone(), s);
             }
@@ -521,8 +548,8 @@ fn vendored_files(dir: &Path, project: &Project) -> Files {
                 .push(format!("{} ({e})", item_name(ItemKind::Symbol, id))),
         }
     }
-    for id in project.lock.parts.keys() {
-        match store::read_vendored_part(dir, id) {
+    for (id, e) in &project.lock.parts {
+        match check_locked(store::read_vendored_part(dir, id), Part::hash, &e.hash) {
             Ok(p) => {
                 files.parts.insert(id.clone(), p);
             }
@@ -876,7 +903,7 @@ pub struct Share {
     /// changes wait while one is on its way, so a page never reaches the session before what it
     /// draws.
     items_out: BTreeMap<String, ItemOut>,
-    /// Items whose file could not be read, reported once each.
+    /// Items whose file could not be read, sent or taken, reported once each.
     unreadable: std::collections::BTreeSet<String>,
 }
 
@@ -1036,7 +1063,7 @@ impl Share {
         let files = vendored_files(&open.dir, &open.project);
         if !files.unreadable.is_empty() {
             self.notes.push(format!(
-                "These files could not be read, so guests without the libraries cannot draw them: {}",
+                "These files cannot be shared, so guests without the libraries cannot draw them: {}",
                 files.unreadable.join(", ")
             ));
         }
@@ -1050,6 +1077,7 @@ impl Share {
             dir: open.dir.clone(),
         })));
         self.base = Some(open.project.clone());
+        self.forget_items();
         self.opened = None;
         crate::applog::info(&format!("shared session started on port {port}"));
         Ok(())
@@ -1075,8 +1103,15 @@ impl Share {
             dir: None,
         })));
         self.base = None;
+        self.forget_items();
         self.opened = None;
         Ok(())
+    }
+
+    /// Items sent to a session, and problems reported about them, belong to that session.
+    fn forget_items(&mut self) {
+        self.items_out.clear();
+        self.unreadable.clear();
     }
 
     /// Leave or end the session.
@@ -1089,6 +1124,7 @@ impl Share {
             });
         }
         self.base = None;
+        self.forget_items();
         self.opened = None;
         self.took_back = false;
         if self.view == View::Status {
@@ -1104,6 +1140,7 @@ impl Share {
         if !role.pump(&mut self.notes) {
             self.role = None;
             self.base = None;
+            self.forget_items();
             return None;
         }
 
@@ -1191,14 +1228,20 @@ impl Share {
             .map(|(n, _)| n.clone())
             .collect();
         let items = new_items(&open.dir, &open.project, auth, &skip);
+        let now = std::time::Instant::now();
         for (name, why) in &items.unreadable {
+            // A file that cannot be read counts as a try, so the changes waiting for it go
+            // once the tries are used up.
+            if let Some(out) = self.items_out.get_mut(name) {
+                out.at = now;
+                out.tries += 1;
+            }
             if self.unreadable.insert(name.clone()) {
                 self.notes.push(format!(
                     "The file of {name} could not be read ({why}); others cannot draw it until it can."
                 ));
             }
         }
-        let now = std::time::Instant::now();
         for name in &items.sent {
             self.unreadable.remove(name);
             let out = self.items_out.entry(name.clone()).or_insert(ItemOut {
@@ -1250,10 +1293,14 @@ impl Share {
         }
         let changed = incoming(&mut open.project, auth);
         let (symbols, parts) = role.files();
-        let failed = take_files(open, symbols, parts);
+        let failed: Vec<String> = take_files(open, symbols, parts)
+            .into_iter()
+            .filter(|(name, _)| self.unreadable.insert(name.clone()))
+            .map(|(name, why)| format!("{name} ({why})"))
+            .collect();
         if !failed.is_empty() {
             self.notes.push(format!(
-                "Symbols and parts from the session could not be saved in your copy: {}",
+                "Symbols and parts from the session could not be taken into your copy: {}",
                 failed.join(", ")
             ));
         }

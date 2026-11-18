@@ -1073,3 +1073,85 @@ fn an_unreadable_file_is_named_once_and_not_sent() -> TestResult {
     assert!(files.unreadable.iter().any(|u| u.starts_with("symbol wc.contact.no (")));
     Ok(())
 }
+
+#[test]
+fn a_file_in_another_version_than_its_lock_is_not_shared_or_taken() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(&tmp.path().join("p"))?;
+    open.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+    open.save()?;
+    let mut edited = open.symbols.get("wc.coil").cloned().ok_or("no coil")?;
+    edited.name = "Edited by hand".into();
+    store::write_vendored_symbol(&open.dir, &edited)?;
+    let files = vendored_files(&open.dir, &open.project);
+    assert!(!files.symbols.contains_key("wc.coil"));
+    assert!(
+        files
+            .unreadable
+            .iter()
+            .any(|u| u.starts_with("symbol wc.coil (") && u.contains("another version")),
+        "{:?}",
+        files.unreadable
+    );
+
+    // Offered by a session in another version than the lock names: not written, not loaded.
+    open.symbols.remove("wc.coil");
+    let offered = [("wc.coil".to_owned(), edited.clone())].into_iter().collect();
+    let failed = take_files(&mut open, &offered, &BTreeMap::new());
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0, "symbol wc.coil");
+    assert!(!open.symbols.contains_key("wc.coil"));
+    Ok(())
+}
+
+#[test]
+fn leaving_a_session_forgets_the_items_sent_to_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(!g.items_out.is_empty(), "the refused symbol is still on its way");
+    g.stop();
+    assert!(g.items_out.is_empty() && g.unreadable.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_symbol_whose_file_becomes_unreadable_stops_holding_the_session() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    let item = guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let file = store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.contact.no")?;
+    std::fs::write(&file, "{ not json")?;
+    // Meanwhile the host changes its own page.
+    host_open.project.page_mut("p0002").ok_or("no page")?.title = "Motor, renamed".into();
+    for _ in 0..=ITEM_TRIES {
+        std::thread::sleep(ITEM_WAIT);
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        guest_open.project.page("p0002").map(|p| p.title.as_str()),
+        Some("Motor, renamed"),
+        "the session's changes come in again"
+    );
+    assert!(
+        host_open
+            .project
+            .page("p0003")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item)),
+        "the held change went out"
+    );
+    let notes = g.take_notes();
+    assert!(notes.iter().any(|n| n.contains("could not be read")), "{notes:?}");
+    assert!(
+        notes.iter().any(|n| n.contains("did not take symbol wc.contact.no")),
+        "{notes:?}"
+    );
+    Ok(())
+}
