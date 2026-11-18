@@ -364,10 +364,13 @@ pub fn follow_terminals_in(
     let mut after = numbers_after(project, before, &role);
     // A spare can only go with its strip to a tag no other device is drawn with there: it would
     // take over that device (its part, its panel place), as Project::add_spare refuses.
+    // Judged by what is drawn with the tag, not by the numbers terminals tagged with just the
+    // strip happen to get, which change as spares move.
     let drawn: std::collections::BTreeSet<DeviceTag> = project
         .pages
         .iter()
-        .flat_map(|p| p.symbols.iter().filter_map(|s| s.tag.clone()))
+        .flat_map(|p| p.symbols.iter())
+        .filter_map(|s| s.tag.clone().filter(|t| !is_terminal(t, role(&s.symbol))))
         .collect();
     // A strip's layout taken along to its new name brings its spares, which can change the
     // numbers of terminals tagged with only the strip there: followed again from the start
@@ -378,7 +381,7 @@ pub fn follow_terminals_in(
             layout.spares.iter().any(|n| {
                 let mut tag = to.clone();
                 tag.product.push(n.clone());
-                drawn.contains(&tag) && !after.values().any(|(s, m)| s == to && m == n)
+                drawn.contains(&tag)
             })
         };
         // Layouts first: a jumper on a spare that went with its strip goes along too.
@@ -2776,6 +2779,40 @@ mod tests {
         assert!(p.meta.strip_layout(&DeviceTag::parse("-X2")?).is_none());
         assert_eq!(p.devices.get(&DeviceTag::parse("-X1.S1")?), Some(&spare));
         assert!(!p.devices.contains_key(&DeviceTag::parse("-X2.S1")?));
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_only_terminal_numbered_like_a_blocked_spare_does_not_let_the_layout_move()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // -X1: terminal 1, a terminal tagged with just the strip (3, past spare 2), and spare 2.
+        // -X2.2 is drawn as something that is no terminal.
+        let mut p = strips_project(
+            &[("a", "-X1.1"), ("b", "-X1"), ("k", "-X2.2")],
+            &[("-X1", &["3", "2", "1"], &["2"])],
+        )?;
+        p.pages[0].symbols[2].symbol = "coil".into();
+        let x1 = DeviceTag::parse("-X1")?;
+        p.meta.add_jumper(&x1, &["1".to_owned(), "3".to_owned()])?;
+        let role = |id: &str| {
+            Some(if id == "term" {
+                crate::symbol::SymbolRole::Terminal
+            } else {
+                crate::symbol::SymbolRole::Main
+            })
+        };
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        retag(&mut p, "b", "-X2")?;
+        follow_terminals_in(&mut p, &before, role);
+        // The layout stays on -X1; the jumper names only terminals -X2 has.
+        assert!(p.meta.strip_layout(&DeviceTag::parse("-X2")?).is_none());
+        let now = terminal_numbers(&p, role);
+        for j in &p.meta.jumpers {
+            for t in &j.terminals {
+                assert!(now.values().any(|(s, n)| *s == j.strip && n == t), "{} {t}", j.strip);
+            }
+        }
         Ok(())
     }
 
