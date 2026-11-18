@@ -451,6 +451,9 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
         } else {
             // A row from a list written before #340: its terminal is the one at that place on
             // the rail now only when the row's terminal number says so.
+            // An old accessory row checked by its Connects above: the terminal that names its
+            // device now may be another of the device's terminals.
+            let mut legacy_accessory = false;
             let index = match old_index(&row.index) {
                 None => row.index.clone(),
                 Some((terminal_at, accessory)) => {
@@ -484,7 +487,32 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
                     }
                     match accessory {
                         None => index.clone(),
-                        Some(a) => format!("{index}{a}"),
+                        // The accessory slot of that terminal's device, whichever terminal
+                        // names it now (a device several terminals are drawn as is named by
+                        // its lowest number).
+                        Some(a) => {
+                            let slot = a
+                                .strip_prefix("/A")
+                                .and_then(|n| n.parse::<usize>().ok())
+                                .and_then(|n| n.checked_sub(1));
+                            let found = match (now.targets.get(index), slot) {
+                                (Some(Target::Part(tag)), Some(k)) => now
+                                    .targets
+                                    .iter()
+                                    .find(|(_, t)| matches!(t, Target::Accessory(d, j) if d == tag && *j == k))
+                                    .map(|(i, _)| i.clone()),
+                                _ => None,
+                            };
+                            let Some(found) = found else {
+                                miss(
+                                    "the project has no such row now (the strip changed?); export the list again"
+                                        .into(),
+                                );
+                                continue;
+                            };
+                            legacy_accessory = true;
+                            found
+                        }
                     }
                 }
             };
@@ -509,6 +537,7 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
             // An accessory's index names its terminal; a Connects that names another one (a
             // row moved by hand) is not guessed at.
             if kind == "Accessory"
+                && !legacy_accessory
                 && let Some(file) = &row.connects
                 && file != connects
             {
@@ -1567,6 +1596,47 @@ mod tests {
         let plan = super::plan(&inputs, &library(&parts), &rows);
         assert!(plan.assignments.is_empty(), "{plan:#?}");
         assert!(plan.unmatched[0].contains("older version"), "{plan:#?}");
+    }
+
+    #[test]
+    fn an_old_accessory_row_of_terminals_drawn_as_the_strip_is_found_through_their_device() {
+        use wc_core::DevicePart;
+        let (mut p, symbols) = project();
+        let parts = candidates();
+        let x2 = tag("-X2");
+        p.devices.entry(x2.clone()).or_default().accessories = vec![DevicePart {
+            part: "wago.2002-1301".into(),
+            qty: 1,
+        }];
+        // Exported before #340 with the rail [2, 1]: the accessory was named by terminal 2,
+        // first on the rail, as -X2/T1/A1. Now it is named by terminal 1.
+        assert_eq!(p.meta.set_terminal_order(&x2, &["2".into(), "1".into()]), Ok(true));
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let rows = read_configured(b"Index;Article;Quantity;Connects\n-X2/T1/A1;793-501;4;2\n")
+            .unwrap()
+            .0;
+        let plan = plan(&inputs, &library(&parts), &rows);
+        assert!(plan.unmatched.is_empty(), "{plan:#?}");
+        assert_eq!(plan.assignments.len(), 1, "{plan:#?}");
+        assert_eq!(
+            (&plan.assignments[0].tag, &plan.assignments[0].slot),
+            (&x2, &Slot::Accessory(0))
+        );
+        assert_eq!(plan.assignments[0].qty, 4);
+        // A Connects that is not the terminal at that place is still refused.
+        let rows = read_configured(b"Index;Article;Quantity;Connects\n-X2/T1/A1;793-501;4;1\n")
+            .unwrap()
+            .0;
+        let plan = super::plan(&inputs, &library(&parts), &rows);
+        assert!(plan.assignments.is_empty(), "{plan:#?}");
+        assert!(
+            plan.unmatched[0].contains("terminal 1 in the file but terminal 2 is at that place"),
+            "{plan:#?}"
+        );
     }
 
     #[test]
