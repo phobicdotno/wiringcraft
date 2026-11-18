@@ -3524,9 +3524,27 @@ mod tests {
         let open = a.open.as_mut().unwrap();
         let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
         let page = open.project.pages[1].id.clone();
-        a.find = Some(crate::find_window::FindState::default());
+        open.project.pages[1].graphics.push(wc_core::Shape::Text {
+            at: Point::new(60.0, 60.0),
+            text: "Pump 7 supply".into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        // The hit comes from a real search for the free text, as the Find window makes it.
+        let mut find = crate::find_window::FindState::default();
+        find.query = "Pump 7".into();
+        find.refresh(&open.project);
+        let Some(crate::find_window::FindOutcome::Go { page: hit_page, select }) =
+            find.hits.first().and_then(crate::find_window::go_to)
+        else {
+            panic!("no hit on the free text: {:?}", find.hits);
+        };
+        assert_eq!(hit_page, page);
+        assert_eq!(select, Some(Selection::Graphic(0)));
+        a.find = Some(find);
         a.prefs.layers.set_shown(crate::layers::Layer::Drawings, false);
-        a.show_found(&page, Some(Selection::Graphic(0)));
+        a.show_found(&hit_page, select);
         assert!(a.ed.selection.is_empty());
         assert!(
             a.ed.message.contains("hidden layer Drawings and notes"),
