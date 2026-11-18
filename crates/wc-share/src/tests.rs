@@ -2221,6 +2221,83 @@ fn guests_get_the_symbol_files_and_symbols_added_during_the_session() -> TestRes
 }
 
 #[test]
+fn undoing_an_added_item_takes_back_its_lock_entry() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    let (_b, link_b, mut b) = s.join("Kari")?;
+    let coil = symbol("coil", "Coil");
+    let part = wc_core::Part {
+        id: "acme.coil".into(),
+        ..Default::default()
+    };
+    link_a.send(a.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(coil.clone(), "starter".into())],
+        parts: vec![(part.clone(), "acme".into())],
+    }))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(s.host.project().lock.symbols.contains_key("coil"));
+
+    // Undo takes the lock entries back on the host and on every copy.
+    link_a.send(GuestMsg::Undo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    for lock in [
+        Some(&s.host.project().lock),
+        a.project.as_ref().map(|p| &p.lock),
+        b.project.as_ref().map(|p| &p.lock),
+    ] {
+        let lock = lock.ok_or("project")?;
+        assert!(!lock.symbols.contains_key("coil"));
+        assert!(!lock.parts.contains_key("acme.coil"));
+    }
+    // The file stays, so a redo can lock it again.
+    assert_eq!(s.host.files().0.get("coil"), Some(&coil));
+
+    // Redo brings them back everywhere.
+    link_a.send(GuestMsg::Redo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert_eq!(
+        s.host.project().lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(coil.hash())
+    );
+    assert!(s.host.project().lock.parts.contains_key("acme.coil"));
+    for g in [&a, &b] {
+        assert_eq!(g.project.as_ref().map(|p| &p.lock), Some(&s.host.project().lock));
+    }
+
+    // Once a page places the symbol, taking its lock entry back is refused: the undo of the
+    // added item (reached through "Undo this change") would leave the page without it.
+    let added = s
+        .host
+        .history()
+        .iter()
+        .rev()
+        .find(|c| c.message.starts_with("Redo"))
+        .map(|c| c.id)
+        .ok_or("redo")?;
+    link_b.send(b.open(Some("p0002")))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let mut page = b
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place(&mut page, "s1", 10.0);
+    link_b.send(b.edit_page(page).ok_or("lock")?)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let changes = s.log.0.borrow().len();
+    link_a.send(GuestMsg::Revert { change: added })?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert_eq!(s.log.0.borrow().len(), changes);
+    let refused = a.refusals.last().map(ToString::to_string).unwrap_or_default();
+    assert!(refused.contains("uses symbol coil"), "{refused}");
+    assert!(s.host.project().lock.symbols.contains_key("coil"));
+    Ok(())
+}
+
+#[test]
 fn added_symbols_are_committed_with_their_files() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path();

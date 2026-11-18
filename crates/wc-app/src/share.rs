@@ -453,11 +453,23 @@ fn number_of(p: &Project, page: &str) -> String {
 /// Make `local` the session's project `auth`, changing only what differs. The symbol lock stays
 /// local, except for items the session has: this copy takes their entries, so an item it lacks
 /// is added and one it has in another version (someone else used it first) takes the session's
-/// version. Their files come with the session, see [`take_files`]. Returns whether anything
+/// version. Their files come with the session, see [`take_files`]. An item the session locked
+/// at the last sync (`was`) and no longer locks was taken back (an undo): this copy drops its
+/// entry too, unless it locks another version, so it is not sent again. Returns whether anything
 /// changed.
-pub fn incoming(local: &mut Project, auth: &Project) -> bool {
+pub fn incoming(local: &mut Project, was: &wc_core::Lockfile, auth: &Project) -> bool {
     let mut changed = false;
     for kind in [ItemKind::Symbol, ItemKind::Part] {
+        let gone: Vec<String> = was
+            .map(kind)
+            .iter()
+            .filter(|(id, e)| !auth.lock.map(kind).contains_key(*id) && local.lock.map(kind).get(*id) == Some(*e))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            local.lock.map_mut(kind).remove(&id);
+            changed = true;
+        }
         for (id, entry) in auth.lock.map(kind) {
             if local.lock.map(kind).get(id).is_none_or(|e| e.hash != entry.hash) {
                 local.lock.map_mut(kind).insert(id.clone(), entry.clone());
@@ -1184,6 +1196,8 @@ pub struct Share {
     pub role: Option<Role>,
     /// The open project as of the last sync.
     base: Option<Project>,
+    /// The session's symbol lock as of the last sync: an item it no longer locks was taken back.
+    session_lock: Option<wc_core::Lockfile>,
     /// The page last opened in the session, and when it was asked for.
     opened: Option<Option<String>>,
     asked_at: Option<std::time::Instant>,
@@ -1438,6 +1452,7 @@ impl Share {
     /// Items sent to a session, and problems reported about them, belong to that session.
     fn forget_items(&mut self) {
         self.items_out.clear();
+        self.session_lock = None;
         self.unreadable.clear();
         self.pictures_out.clear();
         self.pictures_taken.clear();
@@ -1669,7 +1684,9 @@ impl Share {
                 conflicting.join(", ")
             ));
         }
-        let changed = incoming(&mut open.project, auth);
+        let was = self.session_lock.take().unwrap_or_else(|| auth.lock.clone());
+        let changed = incoming(&mut open.project, &was, auth);
+        self.session_lock = Some(auth.lock.clone());
         let (symbols, parts) = role.files();
         let failed: Vec<String> = take_files(open, symbols, parts)
             .into_iter()

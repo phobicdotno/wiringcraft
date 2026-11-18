@@ -434,7 +434,8 @@ fn coming_in_changes_only_what_differs_and_keeps_the_local_symbol_lock() {
     let mut auth = Project::new("Demo");
     auth.pages.push(Page::new("p0001", "1", "One"));
     let mut local = auth.clone();
-    assert!(!incoming(&mut local, &auth));
+    let was = auth.lock.clone();
+    assert!(!incoming(&mut local, &was, &auth));
     local.lock.symbols.insert(
         "wc.coil".into(),
         wc_core::LockEntry {
@@ -443,9 +444,30 @@ fn coming_in_changes_only_what_differs_and_keeps_the_local_symbol_lock() {
         },
     );
     auth.pages[0].title = "Changed".into();
-    assert!(incoming(&mut local, &auth));
+    assert!(incoming(&mut local, &was, &auth));
     assert_eq!(local.pages, auth.pages);
     assert!(local.lock.symbols.contains_key("wc.coil"));
+}
+
+#[test]
+fn an_item_the_session_took_back_leaves_the_local_lock() {
+    let entry = |hash: &str| wc_core::LockEntry {
+        hash: hash.into(),
+        source: "starter".into(),
+    };
+    let mut session = Project::new("Demo");
+    session.lock.symbols.insert("wc.coil".into(), entry("abc"));
+    session.lock.parts.insert("acme.relay".into(), entry("p1"));
+    let was = session.lock.clone();
+    let mut local = session.clone();
+    // Used here and not sent yet: the session never had it, so it still has to go out.
+    local.lock.symbols.insert("wc.lamp".into(), entry("def"));
+    // The session undid the change that added the coil and the relay.
+    let auth = Project::new("Demo");
+    assert!(incoming(&mut local, &was, &auth));
+    assert!(!local.lock.symbols.contains_key("wc.coil"));
+    assert!(!local.lock.parts.contains_key("acme.relay"));
+    assert!(local.lock.symbols.contains_key("wc.lamp"));
 }
 
 /// Run frames of both windows until `done` or a few seconds have passed.

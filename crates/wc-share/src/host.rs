@@ -660,6 +660,14 @@ impl Host {
                 entry.info.message
             ));
         }
+        let used = entry.before.unlocks_used(&self.project);
+        if !used.is_empty() {
+            return invalid(format!(
+                "\"{}\" cannot be taken back: a page or device uses {} since; remove that first",
+                entry.info.message,
+                used.join(", ")
+            ));
+        }
         let edit = ProjectEdit::Restore {
             parts: Box::new(entry.before.clone()),
         };
