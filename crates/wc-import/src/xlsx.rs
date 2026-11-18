@@ -91,11 +91,11 @@ fn part(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Option<S
 /// otherwise UTF-8 with any byte order mark left out.
 fn decode(data: &[u8]) -> String {
     let utf16 = |bytes: &[u8], big: bool| {
-        let units = bytes.chunks_exact(2).map(|p| {
+        let units = bytes.as_chunks::<2>().0.iter().map(|&p| {
             if big {
-                u16::from_be_bytes([p[0], p[1]])
+                u16::from_be_bytes(p)
             } else {
-                u16::from_le_bytes([p[0], p[1]])
+                u16::from_le_bytes(p)
             }
         });
         char::decode_utf16(units)
