@@ -2064,6 +2064,52 @@ fn a_logo_picked_by_a_guest_reaches_the_host_and_the_others() -> TestResult {
 }
 
 #[test]
+fn a_picture_replaced_here_under_its_name_reaches_the_session_under_a_name_of_its_own() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    // Written again with the same picture: nothing goes out.
+    let n = log.messages().len();
+    std::fs::write(guest_open.dir.join(&file), PNG)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(log.messages().len(), n, "{:?}", log.messages());
+    // The file is replaced in the folder under the same name.
+    let new = b"\x89PNG\r\n\x1a\nanother logo".to_vec();
+    std::fs::write(guest_open.dir.join(&file), &new)?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The session keeps its file of that name; the new one goes in under a name of its own,
+    // which the project names everywhere.
+    let renamed = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(renamed, file);
+    assert_eq!(file_bytes(&guest_open.dir, &renamed)?, new);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    assert_eq!(file_bytes(&host_open.dir, &renamed)?, new);
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    // Once: more frames send nothing new.
+    let n = log.messages().len();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages().len(), n);
+    Ok(())
+}
+
+#[test]
 fn a_logo_picked_by_the_host_reaches_the_guest() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
