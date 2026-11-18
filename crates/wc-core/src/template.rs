@@ -245,6 +245,48 @@ impl PageTemplate {
         *self == Self::default()
     }
 
+    /// Why this template cannot be used, if it cannot: a column count outside 1 to
+    /// [`MAX_COLUMNS`], or a box or text whose numbers are not finite, a box that is not inside
+    /// the title block band (top above bottom, both within 0 to [`TITLE_HEIGHT`]), a negative
+    /// edge distance or a text height that is not positive. For templates that come from
+    /// outside the app's form (the assistant, a hand-edited file).
+    pub fn problem(&self) -> Option<String> {
+        if !(1..=MAX_COLUMNS).contains(&self.columns) {
+            return Some(format!(
+                "the column count must be 1 to {MAX_COLUMNS}, not {}",
+                self.columns
+            ));
+        }
+        for (i, b) in self.boxes.iter().enumerate() {
+            let name = if b.label.is_empty() {
+                format!("box {}", i + 1)
+            } else {
+                format!("box {} ({})", i + 1, b.label)
+            };
+            if ![b.left, b.right, b.top, b.bottom].iter().all(|v| v.is_finite()) {
+                return Some(format!("{name}: every edge must be a number"));
+            }
+            if b.left < 0.0 || b.right < 0.0 {
+                return Some(format!(
+                    "{name}: left and right are distances from the frame edge, 0 or more"
+                ));
+            }
+            if !(0.0 <= b.top && b.top < b.bottom && b.bottom <= TITLE_HEIGHT) {
+                return Some(format!(
+                    "{name}: top must be above bottom, both 0 to {TITLE_HEIGHT} mm down the title block"
+                ));
+            }
+            for t in &b.texts {
+                if !(t.size.is_finite() && t.size > 0.0 && t.y.is_finite() && t.inset.is_finite()) {
+                    return Some(format!(
+                        "{name}: a text needs a positive height and numbers for y and inset"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// The column count in use: [`Self::columns`] kept within 1 to [`MAX_COLUMNS`].
     pub fn column_count(&self) -> usize {
         self.columns.clamp(1, MAX_COLUMNS)
@@ -308,6 +350,32 @@ mod tests {
         assert_eq!(b.resolve(10.0, 410.0), None);
         let b = TitleBox::new("", (f64::NAN, Side::Left), (40.0, Side::Left), 0.0, 12.0);
         assert_eq!(b.resolve(10.0, 410.0), Some((10.0, 0.0, 50.0, 12.0)));
+    }
+
+    #[test]
+    fn the_built_in_template_is_valid_and_bad_ones_say_why() {
+        assert_eq!(PageTemplate::default().problem(), None);
+        let t = PageTemplate {
+            columns: 0,
+            ..Default::default()
+        };
+        assert!(t.problem().is_some_and(|p| p.contains("column count")));
+        let mut t = PageTemplate::default();
+        t.boxes[0].bottom = TITLE_HEIGHT + 1.0;
+        assert!(t.problem().is_some_and(|p| p.contains("box 1")));
+        let mut t = PageTemplate::default();
+        t.boxes[0].left = f64::NAN;
+        assert!(t.problem().is_some());
+        let mut t = PageTemplate::default();
+        t.boxes.push(
+            TitleBox::new("x", (0.0, Side::Left), (1.0, Side::Left), 0.0, 5.0).with(BoxText::new(
+                &["x"],
+                0.0,
+                1.0,
+                Align::Left,
+            )),
+        );
+        assert!(t.problem().is_some_and(|p| p.contains("text")));
     }
 
     #[test]
