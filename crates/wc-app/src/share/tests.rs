@@ -1221,10 +1221,20 @@ fn a_line_moved_here_that_the_undo_removed_is_not_kept() -> TestResult {
 
 #[test]
 fn free_graphics_merge_item_by_item() {
+    use wc_core::geom::{Point, Shape};
     let [a, b, c, d] = [1.0, 2.0, 3.0, 4.0].map(line);
-    let m = |base: &[&wc_core::geom::Shape], auth: &[&wc_core::geom::Shape], local: &[&wc_core::geom::Shape]| {
-        let own = |v: &[&wc_core::geom::Shape]| v.iter().map(|x| (*x).clone()).collect::<Vec<_>>();
-        merge_unordered(&own(base), &own(auth), &own(local))
+    let text = Shape::Text {
+        at: Point::new(40.0, 40.0),
+        text: "Note".into(),
+        height: 3.5,
+        align: Default::default(),
+        angle: 0.0,
+    };
+    let m = |base: &[&Shape], auth: &[&Shape], local: &[&Shape]| {
+        let own = |v: &[&Shape]| v.iter().map(|x| (*x).clone()).collect::<Vec<_>>();
+        merge_unordered(&own(base), &own(auth), &own(local), |x, y| {
+            std::mem::discriminant(x) == std::mem::discriminant(y)
+        })
     };
     // Added on each side: both kept, the session's order first.
     assert_eq!(
@@ -1239,9 +1249,19 @@ fn free_graphics_merge_item_by_item() {
     // Removed on both sides, nothing added here: no clash.
     assert_eq!(m(&[&a, &b], &[&b], &[&b]), Some(vec![b.clone()]));
     // The same item added on both sides is there once.
-    assert_eq!(m(&[], &[&c], &[&c]), Some(vec![c.clone()]));
+    assert_eq!(m(&[&b], &[&b, &c], &[&b, &c]), Some(vec![b.clone(), c.clone()]));
+    // Both sides made the same change (the undo put a line back where it was also moved here).
+    assert_eq!(m(&[&a, &b], &[&c, &b], &[&c, &b]), Some(vec![c.clone(), b.clone()]));
+    // Only this window changed the graphics: its list, in its order.
+    assert_eq!(m(&[&a, &b], &[&a, &b], &[&c, &b]), Some(vec![c.clone(), b.clone()]));
     // Changed here (a to c) while the session changed it too (a to b): a clash.
     assert_eq!(m(&[&a], &[&b], &[&c]), None);
+    // Deleted on both sides while a text was added here: the text cannot be the line's new
+    // version, so it is kept.
+    assert_eq!(
+        m(&[&a, &b], &[&b, &d], &[&b, &text]),
+        Some(vec![b.clone(), d.clone(), text.clone()])
+    );
 }
 
 #[test]

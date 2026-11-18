@@ -278,6 +278,12 @@ impl App {
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
         });
         let mut shown = page.clone();
+        // The shown page's graphics, so a selection follows its items when a merge moves them.
+        let graphics_before = self
+            .open
+            .as_ref()
+            .and_then(|o| o.project.pages.get(self.ed.page))
+            .map(|p| (p.id.clone(), p.graphics.clone()));
         if let Some(joined) = self.share.frame(self.open.as_mut(), page, busy) {
             // The joined copy replaces the open project: keep its unsaved work first.
             if let Some(o) = self.open.as_mut()
@@ -310,6 +316,12 @@ impl App {
             && self.ed.page >= o.project.pages.len()
         {
             self.ed.page = o.project.pages.len().saturating_sub(1);
+        }
+        if let (Some((id, old)), Some(o)) = (&graphics_before, &self.open)
+            && let Some(p) = o.project.pages.get(self.ed.page)
+            && &p.id == id
+        {
+            edit::remap_graphics(&mut self.ed.selection, old, &p.graphics);
         }
         self.ed.held_by = self.share.held_by_others();
         if let Some(o) = self.open.as_mut() {

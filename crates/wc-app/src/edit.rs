@@ -90,6 +90,33 @@ fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
     (syms, wires)
 }
 
+/// Point the graphics in `sel` at the same items after the page's graphics changed from `old`
+/// to `new` (a shared session merged others' changes in, which can move an item to another
+/// place in the list). An item is found by its content, repeats by their order; a selected item
+/// that is gone is no longer selected. Symbols and wires are left as they are.
+pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
+    if old == new {
+        return;
+    }
+    sel.retain_mut(|s| {
+        let Selection::Graphic(i) = s else {
+            return true;
+        };
+        let Some(item) = old.get(*i) else {
+            return false;
+        };
+        // The how-many-th copy of this item it is, found again in the new list.
+        let nth = old[..*i].iter().filter(|x| *x == item).count();
+        match new.iter().enumerate().filter(|(_, x)| *x == item).nth(nth) {
+            Some((j, _)) => {
+                *i = j;
+                true
+            }
+            None => false,
+        }
+    });
+}
+
 fn graphic_ids(sel: &[Selection]) -> BTreeSet<usize> {
     sel.iter()
         .filter_map(|s| match s {
@@ -526,6 +553,37 @@ impl Open {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_graphic_selection_follows_its_item_when_the_list_is_merged() {
+        let l = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let mut sel = vec![
+            Selection::Graphic(0),
+            Selection::Symbol("s1".into()),
+            Selection::Graphic(2),
+            Selection::Graphic(3),
+        ];
+        // Item 0 moved to the end, item 1 dropped, a second copy of item 2 came in front of it.
+        let old = [l(1.0), l(2.0), l(3.0), l(4.0)];
+        let new = [l(3.0), l(3.0), l(4.0), l(1.0)];
+        remap_graphics(&mut sel, &old, &new);
+        assert_eq!(
+            sel,
+            vec![
+                Selection::Graphic(3),
+                Selection::Symbol("s1".into()),
+                Selection::Graphic(0),
+                Selection::Graphic(2)
+            ]
+        );
+        // A selected item that is gone is dropped.
+        let mut sel = vec![Selection::Graphic(1)];
+        remap_graphics(&mut sel, &old, &new);
+        assert!(sel.is_empty());
+    }
     use crate::state::tests::project;
 
     #[test]

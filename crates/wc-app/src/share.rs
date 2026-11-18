@@ -213,7 +213,9 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
     page.underlay = pick(&base.underlay, &auth.underlay, &local.underlay)?;
     page.overview = pick(&base.overview, &auth.overview, &local.overview)?;
     page.cover = pick(&base.cover, &auth.cover, &local.cover)?;
-    page.graphics = merge_unordered(&base.graphics, &auth.graphics, &local.graphics)?;
+    page.graphics = merge_unordered(&base.graphics, &auth.graphics, &local.graphics, |a, b| {
+        std::mem::discriminant(a) == std::mem::discriminant(b)
+    })?;
     let names: std::collections::BTreeSet<&String> =
         [base, auth, local].iter().flat_map(|p| p.title_block.keys()).collect();
     let mut title_block = BTreeMap::new();
@@ -247,14 +249,27 @@ fn pick<T: PartialEq + Clone>(base: &T, auth: &T, local: &T) -> Option<T> {
     }
 }
 
-/// A three-way merge of items without ids (a page's free graphics and texts), as multisets:
-/// the session's items in its order, less those removed here that the session still has, then
-/// the items added here (one the session added the same way is not added twice). A change to an
-/// item is its removal and the new version's addition, so `None` (a clash) when an item removed
-/// here is gone from the session too while this window also added something: it was most likely
-/// changed here and removed or changed by the session. Removed on both sides with nothing added
-/// here is no clash.
-fn merge_unordered<T: PartialEq + Clone>(base: &[T], auth: &[T], local: &[T]) -> Option<Vec<T>> {
+/// A three-way merge of items without ids (a page's free graphics and texts), as multisets.
+/// When only one side changed the list, or both made it the same, that list is taken as it is
+/// (its order kept). Otherwise: the session's items in its order, less those removed here that
+/// the session still has, then the items added here (one the session added the same way is not
+/// added twice). A change to an item is its removal and the new version's addition, so `None` (a
+/// clash) when an item removed here is gone from the session too and this window added an item
+/// that may be its new version (`same_kind`, such as another line for a line): it was most
+/// likely changed here and removed or changed by the session. Removed on both sides with nothing
+/// of its kind added here is no clash.
+fn merge_unordered<T: PartialEq + Clone>(
+    base: &[T],
+    auth: &[T],
+    local: &[T],
+    same_kind: impl Fn(&T, &T) -> bool,
+) -> Option<Vec<T>> {
+    if local == base || local == auth {
+        return Some(auth.to_vec());
+    }
+    if auth == base {
+        return Some(local.to_vec());
+    }
     // `a` less `b`, counting repeats.
     let minus = |a: &[T], b: &[T]| -> Vec<T> {
         let mut left: Vec<&T> = b.iter().collect();
@@ -273,17 +288,15 @@ fn merge_unordered<T: PartialEq + Clone>(base: &[T], auth: &[T], local: &[T]) ->
     let mut added_here = minus(local, base);
     let mut added_there = minus(auth, base);
     let mut out = auth.to_vec();
-    let mut gone_there = false;
     for r in &removed_here {
         match out.iter().position(|x| x == r) {
             Some(i) => {
                 out.remove(i);
             }
-            None => gone_there = true,
+            // Gone from the session too: a clash if it may have been changed here.
+            None if added_here.iter().any(|a| same_kind(a, r)) => return None,
+            None => {}
         }
-    }
-    if gone_there && !added_here.is_empty() {
-        return None;
     }
     added_here.retain(|x| match added_there.iter().position(|y| y == x) {
         Some(i) => {
