@@ -310,10 +310,22 @@ fn merge_unordered<T: PartialEq + Clone>(
                     return None;
                 }
             }
+            // Removed only here. With several equal copies left in the session, which one went
+            // matters when they sit at different places among the others; if taking out any
+            // one of them does not give the same list, it is not known which copy went.
             None => {
-                if let Some(i) = out.iter().position(|x| x == r) {
-                    out.remove(i);
+                let copies: Vec<usize> = (0..out.len()).filter(|&i| out[i] == *r).collect();
+                let without = |i: usize| {
+                    let mut v = out.clone();
+                    v.remove(i);
+                    v
+                };
+                let Some(&first) = copies.first() else { continue };
+                let after = without(first);
+                if copies[1..].iter().any(|&i| without(i) != after) {
+                    return None;
                 }
+                out = after;
             }
         }
     }

@@ -1271,6 +1271,12 @@ fn free_graphics_merge_item_by_item() {
     assert_eq!(m(&[&a, &a], &[&a], &[&a, &text]), Some(vec![a.clone(), text.clone()]));
     // The session kept both copies and added one: the copy removed here still goes.
     assert_eq!(m(&[&a, &a], &[&a, &a, &b], &[&a]), Some(vec![a.clone(), b.clone()]));
+    // The session put a line back as c while it was moved to d here and a line equal to c drawn
+    // here too: the move here clashes with the session's.
+    assert_eq!(m(&[&a], &[&c], &[&d, &c]), None);
+    // The last of two copies around another line removed here while the session added a text:
+    // which copy went decides what lies on top, and the session cannot tell, so a clash.
+    assert_eq!(m(&[&a, &b, &a], &[&a, &b, &a, &text], &[&a, &b]), None);
     // Moved to different places on the two sides, with a text added here: still a clash.
     assert_eq!(m(&[&a], &[&c], &[&d, &text]), None);
 }

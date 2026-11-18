@@ -110,8 +110,8 @@ pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
         };
         let copies = |list: &[Shape]| list.iter().filter(|x| *x == item).count();
         if copies(old) != copies(new) {
-            // Copies came or went: only one still in its own place is known to be the same.
-            return new.get(*i) == Some(item);
+            // Copies came or went: which one is the selected one is not known.
+            return false;
         }
         // The how-many-th copy of this item it is, found again in the new list.
         let nth = copies(&old[..*i]);
@@ -591,15 +591,23 @@ mod tests {
         let mut sel = vec![Selection::Graphic(1)];
         remap_graphics(&mut sel, &old, &new);
         assert!(sel.is_empty());
-        // Of two copies one changed: the one still in its place stays selected, the changed
-        // one is not handed to the other copy.
+        // Of two copies one changed: which copy is left is not known, so neither selection
+        // stays, and the changed one is not handed to the other copy.
         let (a, b, c) = (l(1.0), l(2.0), l(3.0));
         let (old, new) = ([a.clone(), b.clone(), a.clone()], [c.clone(), b.clone(), a.clone()]);
         let mut sel = vec![Selection::Graphic(2)];
         remap_graphics(&mut sel, &old, &new);
-        assert_eq!(sel, vec![Selection::Graphic(2)]);
+        assert!(sel.is_empty());
         let mut sel = vec![Selection::Graphic(0)];
         remap_graphics(&mut sel, &old, &new);
+        assert!(sel.is_empty());
+        // A copy came back in front of the selected one: an equal copy in its old place is
+        // not taken for it.
+        let (d, e) = (l(4.0), l(5.0));
+        let before = [b.clone(), a.clone(), d.clone()];
+        let after = [b.clone(), a.clone(), c.clone(), a.clone(), d.clone(), e.clone()];
+        let mut sel = vec![Selection::Graphic(1)];
+        remap_graphics(&mut sel, &before, &after);
         assert!(sel.is_empty());
         // Repeats that all moved keep their order.
         let new = [b.clone(), a.clone(), a.clone()];

@@ -3117,7 +3117,13 @@ mod tests {
         a.ed.page = 0;
 
         // A page added and shown, something selected on it, and the session takes the page
-        // back: nothing stays selected on the page shown instead.
+        // back: nothing stays selected on the page shown instead, though it has a graphic 0 too.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        for p in &mut open.project.pages {
+            p.graphics.push(line(5.0));
+        }
+        a.sync_session_now(false);
         let open = a.open.as_mut().unwrap();
         let i = open.duplicate_page(0).unwrap();
         a.sync_session_now(false);
@@ -3125,7 +3131,9 @@ mod tests {
         a.ed.selection = vec![Selection::Graphic(0)];
         a.share.undo().unwrap();
         a.sync_session_now(false);
-        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), i);
+        let pages = &a.open.as_ref().unwrap().project.pages;
+        assert_eq!(pages.len(), i);
+        assert!(!pages[a.ed.page].graphics.is_empty(), "graphic 0 is there to select");
         assert!(a.ed.selection.is_empty(), "{:?}", a.ed.selection);
     }
 
