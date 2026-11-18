@@ -434,6 +434,13 @@ fn shapes(
                 }
                 None
             }
+            // A dimension is drawn by its (anonymous) block, placed as it is.
+            "DIMENSION" if e.get(2).is_some_and(|n| d.blocks.contains_key(n)) => {
+                if let Some(inner) = e.get(2).and_then(|n| d.blocks.get(n)) {
+                    shapes(d, inner, xf, scale, depth + 1, skip_layer, out, points, skipped, budget);
+                }
+                None
+            }
             // Attribute templates of a block (their values come with the INSERT) and paper-space
             // viewports, which draw nothing themselves.
             "ATTDEF" | "VIEWPORT" => None,
@@ -1827,5 +1834,20 @@ mod tests {
             plain.iter().any(|p| (p.0.hypot(p.1) - 1.0).abs() > 0.01),
             "unweighted is no circle"
         );
+    }
+
+    #[test]
+    fn a_dimension_is_drawn_by_its_block() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\n*D1\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nDIMENSION\n2\n*D1\n10\n7\n20\n7\n0\nDIMENSION\n2\n*D9\n", blocks)?;
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, -5.0)
+            }]
+        );
+        assert_eq!(skipped.get("DIMENSION"), Some(&1));
+        Ok(())
     }
 }

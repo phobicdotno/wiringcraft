@@ -338,7 +338,6 @@ fn unread_entity(kind: u16) -> Option<&'static str> {
         12 => "VERTEX_MESH",
         13 => "VERTEX_PFACE",
         14 => "VERTEX_PFACE_FACE",
-        20..=26 => "DIMENSION",
         28 => "3DFACE",
         29 => "POLYLINE_PFACE",
         30 => "POLYLINE_MESH",
@@ -370,6 +369,7 @@ fn read_entity(kind: u16) -> Option<&'static str> {
         5 => "ENDBLK",
         6 => "SEQEND",
         7 => "INSERT",
+        20..=26 => "DIMENSION",
         10 | 11 => "VERTEX",
         15 | 16 => "POLYLINE",
         17 => "ARC",
@@ -430,6 +430,11 @@ fn decode(
     match o.kind {
         1..=3 => text(&mut o, &mut e)?,
         7 => block = Some(insert(&mut o, &mut e)?),
+        // Drawn by its anonymous block, which comes after the dimension style in the handles.
+        20..=26 => {
+            o.handle_ref()?;
+            block = Some(o.handle_ref()?);
+        }
         10 | 11 => {
             let flags = o.data.rc()?;
             let (x, y, _) = o.data.bd3()?;
@@ -853,6 +858,13 @@ impl Decoded {
                     }
                     list.push(entity);
                 }
+                "DIMENSION" => match item.block.and_then(|b| blocks.get(&b)) {
+                    Some(name) => {
+                        entity.codes.push((2, name.clone()));
+                        list.push(entity);
+                    }
+                    None => *skipped.entry("DIMENSION".to_owned()).or_default() += 1,
+                },
                 "INSERT" => {
                     if let Some(name) = item.block.and_then(|b| blocks.get(&b)) {
                         entity.codes.push((2, name.clone()));
