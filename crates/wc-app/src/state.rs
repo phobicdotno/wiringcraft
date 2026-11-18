@@ -2013,6 +2013,55 @@ impl Open {
         true
     }
 
+    /// Every terminal strip with its terminals in rail order, each with whether it is a spare
+    /// (see [`wc_core::project::strip_terminals`]).
+    pub fn strip_terminals(&self) -> BTreeMap<DeviceTag, Vec<(String, bool)>> {
+        wc_core::project::strip_terminals(&self.project, |id| self.symbols.get(id).map(|s| s.role))
+    }
+
+    /// Change how `strip` is arranged (terminal order, spares) with `f`, which gets the strip's
+    /// current rail order; one undo step when anything changed.
+    fn edit_strip(
+        &mut self,
+        strip: &DeviceTag,
+        f: impl FnOnce(&mut wc_core::project::ProjectMeta, &[(String, bool)]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.follow_terminals();
+        let current = self.strip_terminals().remove(strip).unwrap_or_default();
+        let mut meta = self.project.meta.clone();
+        f(&mut meta, &current)?;
+        if meta != self.project.meta {
+            self.checkpoint();
+            self.project.meta = meta;
+        }
+        Ok(())
+    }
+
+    /// Move terminal `number` of `strip` to place `to` (0 is first) on the rail.
+    pub fn move_terminal(&mut self, strip: &DeviceTag, number: &str, to: usize) -> Result<(), String> {
+        self.edit_strip(strip, |m, current| {
+            m.move_terminal(strip, number, to, current).map(|_| ())
+        })
+    }
+
+    /// Add spare terminal `number` to `strip`, right after terminal `after` or at the end.
+    pub fn add_spare(&mut self, strip: &DeviceTag, number: &str, after: Option<&str>) -> Result<(), String> {
+        self.edit_strip(strip, |m, current| m.add_spare(strip, number, after, current))
+    }
+
+    /// Take spare terminal `number` off `strip` (and out of its jumper).
+    pub fn remove_spare(&mut self, strip: &DeviceTag, number: &str) {
+        let _ = self.edit_strip(strip, |m, _| {
+            m.remove_spare(strip, number);
+            Ok(())
+        });
+    }
+
+    /// Put `strip` back in the order by terminal number; its spares go at the end.
+    pub fn reset_terminal_order(&mut self, strip: &DeviceTag) {
+        let _ = self.edit_strip(strip, |m, _| m.set_terminal_order(strip, &[]).map(|_| ()));
+    }
+
     /// Set one part of the spec (section, colour or type) on wires of a page; `None` clears it.
     /// One undo step for all of them; nothing happens when no wire changes. Returns how many
     /// wires changed.

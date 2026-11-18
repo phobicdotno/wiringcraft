@@ -40,6 +40,10 @@ pub struct ProjectMeta {
     /// Jumpers (bridges) between terminals of one strip; jumpered terminals are one potential.
     #[serde(default, rename = "jumper", skip_serializing_if = "Vec::is_empty")]
     pub jumpers: Vec<Jumper>,
+    /// Terminal strips arranged in the terminal strip editor: their terminal order and spare
+    /// terminals. A strip that is not listed keeps the usual order (by terminal number).
+    #[serde(default, rename = "strip", skip_serializing_if = "Vec::is_empty")]
+    pub strips: Vec<StripLayout>,
     /// The project's logo, shown on the cover page and in every title block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logo: Option<Logo>,
@@ -176,6 +180,105 @@ pub struct Jumper {
     /// list and written in the WAGO configurator export.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
+}
+
+/// How a terminal strip is arranged on its rail: the order of its terminals and the spare
+/// terminals it has beyond those drawn on the schematic. Written by the terminal strip editor;
+/// the terminal plan and the WAGO configurator export follow it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StripLayout {
+    /// The strip, e.g. `-X1`.
+    pub strip: DeviceTag,
+    /// Terminal numbers in rail order, spares included. Terminals it does not name (drawn
+    /// after the order was set) follow at the end in their usual order; numbers that are
+    /// neither drawn nor spare are skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    /// Spare terminals: on the rail but not drawn, e.g. `["S1"]`. A spare whose number is drawn
+    /// later is that drawn terminal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spares: Vec<String>,
+}
+
+impl StripLayout {
+    /// The strip's terminals in rail order, each once, with whether it is a spare (not drawn):
+    /// `drawn` are the drawn terminal numbers in their usual order. Terminals named in
+    /// [`StripLayout::order`] come first in that order; the others follow, drawn ones in their
+    /// usual order and then spares in natural order.
+    pub fn arrange(&self, drawn: &[String]) -> Vec<(String, bool)> {
+        let mut all: Vec<(String, bool)> = Vec::new();
+        for n in drawn {
+            if !all.iter().any(|(t, _)| t == n) {
+                all.push((n.clone(), false));
+            }
+        }
+        let mut spares: Vec<&String> = self.spares.iter().filter(|s| !drawn.contains(s)).collect();
+        spares.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
+        for s in spares {
+            if !all.iter().any(|(t, _)| t == s) {
+                all.push((s.clone(), true));
+            }
+        }
+        let mut out: Vec<(String, bool)> = Vec::with_capacity(all.len());
+        for n in &self.order {
+            if let Some(k) = all.iter().position(|(t, _)| t == n) {
+                out.push(all.remove(k));
+            }
+        }
+        out.extend(all);
+        out
+    }
+
+    /// Whether the layout says nothing: no order and no spares.
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty() && self.spares.is_empty()
+    }
+}
+
+/// Every terminal strip of the project with its terminals in rail order, each with whether it
+/// is a spare: the drawn terminals as [`terminal_numbers`] numbers them, arranged by the
+/// strip's [`StripLayout`], plus strips that only have spares.
+pub fn strip_terminals(
+    project: &Project,
+    role: impl Fn(&str) -> Option<SymbolRole>,
+) -> BTreeMap<DeviceTag, Vec<(String, bool)>> {
+    let numbers = terminal_numbers(project, role);
+    let mut drawn: BTreeMap<DeviceTag, Vec<String>> = BTreeMap::new();
+    for (strip, n) in numbers.values() {
+        let list = drawn.entry(strip.clone()).or_default();
+        if !list.contains(n) {
+            list.push(n.clone());
+        }
+    }
+    for list in drawn.values_mut() {
+        list.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
+    }
+    for l in &project.meta.strips {
+        drawn.entry(l.strip.clone()).or_default();
+    }
+    drawn
+        .into_iter()
+        .map(|(strip, list)| {
+            let arranged = match project.meta.strip_layout(&strip) {
+                Some(l) => l.arrange(&list),
+                None => list.into_iter().map(|n| (n, false)).collect(),
+            };
+            (strip, arranged)
+        })
+        .filter(|(_, list)| !list.is_empty())
+        .collect()
+}
+
+/// Whether `number` can be a terminal of `strip`: one more tag level (`1.2` would be two).
+fn check_terminal_number(strip: &DeviceTag, number: &str) -> Result<(), String> {
+    let mut tag = strip.clone();
+    tag.product.push(number.to_owned());
+    if number.is_empty() || DeviceTag::parse(&tag.to_string()).ok().as_ref() != Some(&tag) {
+        return Err(format!(
+            "{number:?} cannot be a terminal of {strip}: a terminal is one tag level"
+        ));
+    }
+    Ok(())
 }
 
 /// The next automatic terminal number after `last`, which it advances; `None` past the largest.
@@ -478,6 +581,7 @@ impl ProjectMeta {
             libraries: Vec::new(),
             locations: Vec::new(),
             jumpers: Vec::new(),
+            strips: Vec::new(),
             logo: None,
             template: crate::template::PageTemplate::default(),
         }
@@ -653,6 +757,130 @@ impl ProjectMeta {
         }
         j.part = part;
         Ok(true)
+    }
+
+    /// How `strip` is arranged in the terminal strip editor, if it was.
+    pub fn strip_layout(&self, strip: &DeviceTag) -> Option<&StripLayout> {
+        self.strips.iter().find(|l| &l.strip == strip)
+    }
+
+    /// The layout of `strip`, made when it has none; layouts stay in strip order.
+    fn strip_layout_mut(&mut self, strip: &DeviceTag) -> &mut StripLayout {
+        let k = match self.strips.iter().position(|l| &l.strip == strip) {
+            Some(k) => k,
+            None => {
+                self.strips.push(StripLayout {
+                    strip: strip.clone(),
+                    order: Vec::new(),
+                    spares: Vec::new(),
+                });
+                self.strips.sort_by(|a, b| {
+                    let key = |l: &StripLayout| l.strip.to_string();
+                    natural_key(&key(a))
+                        .cmp(&natural_key(&key(b)))
+                        .then_with(|| key(a).cmp(&key(b)))
+                });
+                self.strips.iter().position(|l| &l.strip == strip).unwrap_or_default()
+            }
+        };
+        &mut self.strips[k]
+    }
+
+    /// Drop layouts that say nothing any more.
+    fn drop_empty_layouts(&mut self) {
+        self.strips.retain(|l| !l.is_empty());
+    }
+
+    /// Put the terminals of `strip` in rail `order` (terminal numbers, spares included). An
+    /// empty order goes back to the usual order. Refused for a number given twice or one that
+    /// cannot be a terminal of the strip. Returns whether anything changed.
+    pub fn set_terminal_order(&mut self, strip: &DeviceTag, order: &[String]) -> Result<bool, String> {
+        let mut list: Vec<String> = Vec::new();
+        for n in order.iter().map(|n| n.trim()) {
+            check_terminal_number(strip, n)?;
+            if list.iter().any(|t| t == n) {
+                return Err(format!("terminal {n} of {strip} is given twice"));
+            }
+            list.push(n.to_owned());
+        }
+        let before = self.strips.clone();
+        self.strip_layout_mut(strip).order = list;
+        self.drop_empty_layouts();
+        Ok(self.strips != before)
+    }
+
+    /// Add spare terminal `number` to `strip`, placed right after terminal `after` when given
+    /// (`current` is the strip's rail order, see [`strip_terminals`]), else at the end. Refused
+    /// when the strip already has that terminal or the number cannot be a terminal of it.
+    pub fn add_spare(
+        &mut self,
+        strip: &DeviceTag,
+        number: &str,
+        after: Option<&str>,
+        current: &[(String, bool)],
+    ) -> Result<(), String> {
+        let number = number.trim();
+        check_terminal_number(strip, number)?;
+        if current.iter().any(|(t, _)| t == number)
+            || self
+                .strip_layout(strip)
+                .is_some_and(|l| l.spares.iter().any(|s| s == number))
+        {
+            return Err(format!("{strip} already has terminal {number}"));
+        }
+        let mut order: Vec<String> = current.iter().map(|(t, _)| t.clone()).collect();
+        let at = match after {
+            Some(a) => order
+                .iter()
+                .position(|t| t == a)
+                .map(|k| k + 1)
+                .ok_or_else(|| format!("{strip} has no terminal {a}"))?,
+            None => order.len(),
+        };
+        order.insert(at, number.to_owned());
+        let layout = self.strip_layout_mut(strip);
+        layout.spares.push(number.to_owned());
+        layout.order = order;
+        Ok(())
+    }
+
+    /// Take spare terminal `number` off `strip`, and out of its jumper. Returns whether it was
+    /// a spare.
+    pub fn remove_spare(&mut self, strip: &DeviceTag, number: &str) -> bool {
+        let Some(l) = self.strips.iter_mut().find(|l| &l.strip == strip) else {
+            return false;
+        };
+        let before = l.spares.len();
+        l.spares.retain(|s| s != number);
+        if l.spares.len() == before {
+            return false;
+        }
+        l.order.retain(|t| t != number);
+        self.drop_empty_layouts();
+        self.remove_from_jumper(strip, number);
+        true
+    }
+
+    /// Move terminal `number` of `strip` to `to` (0 is first) in its rail order; `current` is
+    /// the strip's rail order (see [`strip_terminals`]). Returns whether anything changed.
+    pub fn move_terminal(
+        &mut self,
+        strip: &DeviceTag,
+        number: &str,
+        to: usize,
+        current: &[(String, bool)],
+    ) -> Result<bool, String> {
+        let mut order: Vec<String> = current.iter().map(|(t, _)| t.clone()).collect();
+        let from = order
+            .iter()
+            .position(|t| t == number)
+            .ok_or_else(|| format!("{strip} has no terminal {number}"))?;
+        let n = order.remove(from);
+        order.insert(to.min(order.len()), n);
+        if order.iter().eq(current.iter().map(|(t, _)| t)) {
+            return Ok(false);
+        }
+        self.set_terminal_order(strip, &order)
     }
 
     /// The jumper a terminal (`-X1.4`) is in, if any.
@@ -1917,6 +2145,73 @@ mod tests {
         m.add_jumper(&x1, &["01".into(), "1".into()])?;
         assert_eq!(m, once, "the same terminals in another order change nothing");
         assert_eq!(m.jumpers[0].terminals, ["01", "1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn strip_layouts_order_terminals_add_spares_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let drawn = s(&["1", "2", "3"]);
+        let plain = |v: &[&str]| v.iter().map(|t| ((*t).to_owned(), false)).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        assert!(m.strip_layout(&x1).is_none());
+
+        // Reorder: 3 to the front.
+        assert!(m.move_terminal(&x1, "3", 0, &plain(&["1", "2", "3"]))?);
+        let l = m.strip_layout(&x1).ok_or("no layout")?.clone();
+        assert_eq!(l.arrange(&drawn), plain(&["3", "1", "2"]));
+        // Moving it to where it is changes nothing.
+        assert!(!m.move_terminal(&x1, "3", 0, &l.arrange(&drawn))?);
+        assert!(m.move_terminal(&x1, "9", 0, &l.arrange(&drawn)).is_err());
+
+        // A spare after terminal 1, and one at the end.
+        m.add_spare(&x1, "S1", Some("1"), &l.arrange(&drawn))?;
+        let current = m.strip_layout(&x1).ok_or("no layout")?.arrange(&drawn);
+        m.add_spare(&x1, "S2", None, &current)?;
+        let l = m.strip_layout(&x1).ok_or("no layout")?.clone();
+        assert_eq!(
+            l.arrange(&drawn),
+            vec![
+                ("3".to_owned(), false),
+                ("1".to_owned(), false),
+                ("S1".to_owned(), true),
+                ("2".to_owned(), false),
+                ("S2".to_owned(), true),
+            ]
+        );
+        let current = l.arrange(&drawn);
+        assert!(m.add_spare(&x1, "2", None, &current).is_err(), "drawn already");
+        assert!(m.add_spare(&x1, "S1", None, &current).is_err(), "spare already");
+        assert!(m.add_spare(&x1, "1.2", None, &current).is_err(), "two levels");
+        assert!(m.add_spare(&x1, "S3", Some("7"), &current).is_err(), "no terminal 7");
+
+        // A terminal drawn later follows at the end; a spare that gets drawn is that terminal.
+        let later = s(&["1", "2", "3", "4", "S2"]);
+        assert_eq!(
+            l.arrange(&later)
+                .iter()
+                .map(|(t, sp)| format!("{t}{}", if *sp { "*" } else { "" }))
+                .collect::<Vec<_>>(),
+            s(&["3", "1", "S1*", "2", "S2", "4"])
+        );
+
+        // Saved and read back.
+        let text = toml::to_string(&m)?;
+        assert!(text.contains("[[strip]]"), "{text}");
+        assert_eq!(toml::from_str::<ProjectMeta>(&text)?.strips, m.strips);
+        assert!(!toml::to_string(&ProjectMeta::new("t"))?.contains("strip"));
+
+        // A jumpered spare taken off leaves its jumper; the last spare and the order gone, the
+        // layout goes.
+        m.add_jumper(&x1, &s(&["S1", "2"]))?;
+        assert!(m.remove_spare(&x1, "S1"));
+        assert!(!m.remove_spare(&x1, "S1"));
+        assert!(m.jumpers.is_empty());
+        assert!(m.remove_spare(&x1, "S2"));
+        assert!(m.set_terminal_order(&x1, &[])?);
+        assert!(m.strips.is_empty());
+        assert!(m.set_terminal_order(&x1, &s(&["1", "1"])).is_err());
         Ok(())
     }
 

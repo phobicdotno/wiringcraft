@@ -237,7 +237,8 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
         }
     }
 
-    // Jumpers naming a terminal that is drawn nowhere join nothing there.
+    // Jumpers naming a terminal that is drawn nowhere join nothing there; a spare terminal of
+    // the strip (terminal strip editor) is on the rail without a drawing.
     if !p.meta.jumpers.is_empty() {
         let numbers = wc_core::project::terminal_numbers(p, role);
         for j in &p.meta.jumpers {
@@ -252,7 +253,12 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
                         })
                     })
                 };
-                if !numbers.values().any(|(s, n)| *s == j.strip && n == t) && !on_overview() {
+                let spare = || {
+                    p.meta
+                        .strip_layout(&j.strip)
+                        .is_some_and(|l| l.spares.iter().any(|s| s == t))
+                };
+                if !numbers.values().any(|(s, n)| *s == j.strip && n == t) && !spare() && !on_overview() {
                     out.push(Finding {
                         severity: Severity::Warning,
                         page_id: None,

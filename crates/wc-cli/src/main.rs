@@ -99,6 +99,10 @@ enum Cmd {
     /// Jumpers (bridges) between terminals of one strip: jumpered terminals are one potential.
     #[command(subcommand)]
     Jumper(JumperCmd),
+    /// Terminal strip editor: the order of a strip's terminals on the rail, spare terminals and
+    /// terminal levels. The terminal plan and the WAGO configurator export follow it.
+    #[command(subcommand)]
+    Strip(StripCmd),
     /// The project logo, shown on the cover page and in every title block.
     #[command(subcommand)]
     Logo(LogoCmd),
@@ -364,6 +368,37 @@ enum JumperCmd {
     },
     /// List the project's jumpers.
     List,
+}
+
+#[derive(Subcommand)]
+enum StripCmd {
+    /// List terminal strips with their terminals in rail order; spares are marked `(spare)`.
+    /// Give a strip to list only that one, e.g. `strip list -- -X1`.
+    List { strip: Option<String> },
+    /// Put a strip's terminals in this rail order, e.g. `strip order -- -X1 3 1 2`. Terminals
+    /// left out follow at the end; no terminals goes back to the order by number.
+    Order { strip: String, terminals: Vec<String> },
+    /// Move a terminal to a place on the rail (1 is first), e.g. `strip move -- -X1 3 1`.
+    Move { strip: String, terminal: String, to: usize },
+    /// Add a spare terminal (on the rail, not drawn), e.g. `strip spare --after 2 -- -X1 S1`;
+    /// without `--after` it goes at the end.
+    Spare {
+        strip: String,
+        terminal: String,
+        /// The terminal it goes right after.
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// Take a spare terminal off the strip (and out of its jumper), e.g.
+    /// `strip unspare -- -X1 S1`.
+    Unspare { strip: String, terminal: String },
+    /// Set a terminal's level on a multi-level terminal (1 is the bottom), e.g.
+    /// `strip level -- -X1 4 2`; leave the level out to make it single-level again.
+    Level {
+        strip: String,
+        terminal: String,
+        level: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1202,6 +1237,88 @@ fn run(cli: Cli) -> Res<()> {
                             Some(part) => println!("{} {} ({part})", j.strip, j.terminals.join(" ")),
                             None => println!("{} {}", j.strip, j.terminals.join(" ")),
                         }
+                    }
+                }
+            }
+        }
+        Cmd::Strip(sc) => {
+            let mut p = load(dir)?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let rail = |p: &Project, strip: &DeviceTag| -> Vec<(String, bool)> {
+                wc_core::project::strip_terminals(p, |id| symbols.get(id).map(|s| s.role))
+                    .remove(strip)
+                    .unwrap_or_default()
+            };
+            match sc {
+                StripCmd::List { strip } => {
+                    let only = strip.map(|s| DeviceTag::parse(&s).map_err(e)).transpose()?;
+                    let all = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+                    for (strip, list) in all {
+                        if only.as_ref().is_some_and(|o| *o != strip) {
+                            continue;
+                        }
+                        let terms: Vec<String> = list
+                            .iter()
+                            .map(|(t, spare)| if *spare { format!("{t} (spare)") } else { t.clone() })
+                            .collect();
+                        println!("{strip} {}", terms.join(" "));
+                    }
+                }
+                StripCmd::Order { strip, terminals } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    if p.meta.set_terminal_order(&strip, &terminals)? {
+                        save(dir, &p)?;
+                    }
+                }
+                StripCmd::Move { strip, terminal, to } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    if to == 0 {
+                        return Err("places on the rail count from 1".into());
+                    }
+                    let current = rail(&p, &strip);
+                    if p.meta.move_terminal(&strip, terminal.trim(), to - 1, &current)? {
+                        save(dir, &p)?;
+                    }
+                }
+                StripCmd::Spare { strip, terminal, after } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    let current = rail(&p, &strip);
+                    p.meta
+                        .add_spare(&strip, &terminal, after.as_deref().map(str::trim), &current)?;
+                    save(dir, &p)?;
+                }
+                StripCmd::Unspare { strip, terminal } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    if !p.meta.remove_spare(&strip, terminal.trim()) {
+                        return Err(format!("{strip} has no spare terminal {}", terminal.trim()));
+                    }
+                    save(dir, &p)?;
+                }
+                StripCmd::Level { strip, terminal, level } => {
+                    let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    if level == Some(0) {
+                        return Err("levels start at 1".into());
+                    }
+                    let terminal = terminal.trim();
+                    if !rail(&p, &strip).iter().any(|(t, _)| t == terminal) {
+                        return Err(format!("{strip} has no terminal {terminal}"));
+                    }
+                    let tag = DeviceTag::parse(&format!("{strip}.{terminal}")).map_err(e)?;
+                    let before = p.devices.get(&tag).cloned();
+                    let d = p.devices.entry(tag.clone()).or_default();
+                    match level {
+                        Some(l) => {
+                            d.properties.insert(wc_report::LEVEL_PROPERTY.into(), l.to_string());
+                        }
+                        None => {
+                            d.properties.remove(wc_report::LEVEL_PROPERTY);
+                        }
+                    }
+                    if before.is_none() && level.is_none() {
+                        p.devices.remove(&tag);
+                    }
+                    if p.devices.get(&tag) != before.as_ref() {
+                        save(dir, &p)?;
                     }
                 }
             }
@@ -4432,6 +4549,69 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn terminal_strips_are_reordered_given_spares_and_levels_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        for (k, tag) in ["-X1.1", "-X1.2", "-X1.3"].into_iter().enumerate() {
+            p.pages[0].symbols.push(PlacedSymbol {
+                id: format!("t{k}"),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0 * k as f64, 10.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: DeviceTag::parse(tag).ok(),
+            });
+        }
+        save(&dir, &p).unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let rail = || -> Vec<String> {
+            let p = load(&dir).unwrap();
+            let (symbols, _) = store::vendored_symbols(&dir, &p);
+            wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role))
+                .remove(&x1)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(t, spare)| if spare { format!("{t}*") } else { t })
+                .collect()
+        };
+        assert_eq!(rail(), ["1", "2", "3"]);
+        cli(&dir, &["strip", "move", "--", "-X1", "3", "1"]).unwrap();
+        assert_eq!(rail(), ["3", "1", "2"]);
+        cli(&dir, &["strip", "spare", "--after", "1", "--", "-X1", "S1"]).unwrap();
+        cli(&dir, &["strip", "spare", "--", "-X1", "S2"]).unwrap();
+        assert_eq!(rail(), ["3", "1", "S1*", "2", "S2*"]);
+        assert!(
+            cli(&dir, &["strip", "spare", "--", "-X1", "2"]).is_err(),
+            "drawn already"
+        );
+        assert!(cli(&dir, &["strip", "move", "--", "-X1", "3", "0"]).is_err());
+        cli(&dir, &["strip", "list"]).unwrap();
+        cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).unwrap();
+        assert!(cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).is_err());
+        cli(&dir, &["strip", "order", "--", "-X1", "2", "S1"]).unwrap();
+        assert_eq!(rail(), ["2", "S1*", "1", "3"], "left out ones follow by number");
+        // Levels are the terminal device's Level property.
+        cli(&dir, &["strip", "level", "--", "-X1", "S1", "2"]).unwrap();
+        let level = |t: &str| {
+            load(&dir)
+                .unwrap()
+                .devices
+                .get(&DeviceTag::parse(t).unwrap())
+                .and_then(|d| d.properties.get(wc_report::LEVEL_PROPERTY).cloned())
+        };
+        assert_eq!(level("-X1.S1").as_deref(), Some("2"));
+        cli(&dir, &["strip", "level", "--", "-X1", "S1"]).unwrap();
+        assert_eq!(level("-X1.S1"), None);
+        assert!(cli(&dir, &["strip", "level", "--", "-X1", "9", "2"]).is_err());
+        assert!(cli(&dir, &["strip", "level", "--", "-X1", "1", "0"]).is_err());
+        // Back to the order by number; the spare stays.
+        cli(&dir, &["strip", "order", "--", "-X1"]).unwrap();
+        assert_eq!(rail(), ["1", "2", "3", "S1*"]);
     }
 
     #[test]

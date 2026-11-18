@@ -538,6 +538,9 @@ pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
         .collect()
 }
 
+/// What the terminal plan's Page column says for a spare terminal, which no page draws.
+pub const SPARE_PAGE: &str = "spare";
+
 /// Terminal plan: for every terminal strip, each terminal with what connects to its two sides.
 ///
 /// The last column is the terminal's level on a multi-level terminal (see [`LEVEL_PROPERTY`]):
@@ -546,7 +549,9 @@ pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
 ///
 /// A terminal is a symbol with the terminal role. Its strip and number come from the tag:
 /// `-X1.3` is terminal 3 of strip `-X1`. Terminals tagged with just the strip (`-X1`) are
-/// numbered in drawing order (page, then left to right).
+/// numbered in drawing order (page, then left to right). Terminals come by number, unless the
+/// terminal strip editor put the strip in another order ([`wc_core::project::StripLayout`]);
+/// its spare terminals are listed with [`SPARE_PAGE`] in the Page column.
 pub fn terminal_plan(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Terminal plan",
@@ -651,6 +656,10 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
     for term in terms {
         strips.entry(term.strip.clone()).or_default().push(term);
     }
+    // A strip arranged in the terminal strip editor is listed even when only spares are on it.
+    for l in &i.project.meta.strips {
+        strips.entry(l.strip.to_string()).or_default();
+    }
     for (strip, mut list) in strips {
         // Numbered ones by number; unnumbered ones keep drawing order and are numbered after.
         let page_order = |id: &str| i.project.pages.iter().position(|p| p.id == id).unwrap_or(usize::MAX);
@@ -683,6 +692,32 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 (term, number)
             })
             .collect();
+        // The rail order and spares the terminal strip editor set: a terminal drawn twice
+        // stays together, a spare gets a row of its own with nothing connected.
+        let layout = i.project.meta.strips.iter().find(|l| l.strip.to_string() == strip);
+        let numbered: Vec<(Option<Term>, String)> = match layout {
+            None => numbered.into_iter().map(|(t, n)| (Some(t), n)).collect(),
+            Some(layout) => {
+                let mut drawn: Vec<String> = numbered.iter().map(|(_, n)| n.clone()).collect();
+                drawn.dedup();
+                let mut rest: Vec<Option<(Term, String)>> = numbered.into_iter().map(Some).collect();
+                let mut out = Vec::new();
+                for (n, spare) in layout.arrange(&drawn) {
+                    if spare {
+                        out.push((None, n));
+                        continue;
+                    }
+                    for slot in rest.iter_mut() {
+                        if slot.as_ref().is_some_and(|(_, m)| *m == n)
+                            && let Some((t, m)) = slot.take()
+                        {
+                            out.push((Some(t), m));
+                        }
+                    }
+                }
+                out
+            }
+        };
         // Levels are inferred over distinct terminals: a terminal drawn twice has one level.
         let mut distinct: Vec<&str> = numbered.iter().map(|(_, n)| n.as_str()).collect();
         distinct.dedup();
@@ -708,6 +743,39 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             .map(|(_, n)| by_number.get(n.as_str()).copied())
             .collect();
         for ((term, number), level) in numbered.into_iter().zip(levels) {
+            let level = level.map(|l| l.to_string()).unwrap_or_default();
+            let Some(term) = term else {
+                // A spare: on the rail, not drawn. Its jumper can still be set.
+                let jumpered = DeviceTag::parse(&strip)
+                    .ok()
+                    .and_then(|st| {
+                        i.project
+                            .meta
+                            .jumpers
+                            .iter()
+                            .find(|j| j.strip == st && j.terminals.contains(&number))
+                    })
+                    .map(|j| {
+                        j.terminals
+                            .iter()
+                            .filter(|t| **t != number)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                t.rows.push(vec![
+                    strip.clone(),
+                    number,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    SPARE_PAGE.to_owned(),
+                    jumpered,
+                    level,
+                ]);
+                continue;
+            };
             let side = |n: usize| -> (String, Option<String>) {
                 let Some(pin) = term.pins.get(n) else {
                     return (String::new(), None);
@@ -725,7 +793,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 pa.or(pb).unwrap_or_default(),
                 term.page.clone(),
                 term.jumpered.clone(),
-                level.map(|l| l.to_string()).unwrap_or_default(),
+                level,
             ]);
         }
     }
