@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use wc_core::lock::ItemKind;
 use wc_core::{Page, Project};
 
 use crate::{ChangeInfo, note, redo_target, undo_target};
@@ -48,6 +49,10 @@ pub struct Guest {
     /// [`ProjectEdit::AddItems`] and [`ProjectEdit::UpdateItems`], and as [`HostMsg::Items`]), by id: what this guest's copy needs to draw the project.
     pub symbols: BTreeMap<String, wc_core::Symbol>,
     pub parts: BTreeMap<String, wc_core::Part>,
+    /// The hash of each file in `symbols` and `parts`, by kind and id, kept as they come in:
+    /// [`Guest::files_missing`] is asked every frame, and hashing every file each time is not
+    /// cheap.
+    file_hashes: BTreeMap<(ItemKind, String), String>,
     /// Items of this guest's [`ProjectEdit::UpdateItems`] the session took, as (kind, id, hash),
     /// in the order the host recorded them: the answer to each update, even when a later change
     /// (someone's undo) put the item back before this guest looked. Taken by whoever sent them.
@@ -108,6 +113,7 @@ impl Guest {
             taking_back: 0,
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
+            file_hashes: BTreeMap::new(),
             pictures: BTreeMap::new(),
             took_updates: Vec::new(),
             last_edit: 0,
@@ -310,6 +316,8 @@ impl Guest {
                 let mut project = *project;
                 self.symbols = std::mem::take(&mut project.symbols);
                 self.parts = std::mem::take(&mut project.parts);
+                self.file_hashes.clear();
+                self.note_files(None);
                 self.project = Some(project.into());
                 self.locks = locks;
                 self.peers = peers;
@@ -346,6 +354,9 @@ impl Guest {
                         self.symbols
                             .extend(symbols.iter().map(|(s, _)| (s.id.clone(), s.clone())));
                         self.parts.extend(parts.iter().map(|(p, _)| (p.id.clone(), p.clone())));
+                        let ids = symbols.iter().map(|(s, _)| (ItemKind::Symbol, s.id.clone()));
+                        let ids = ids.chain(parts.iter().map(|(p, _)| (ItemKind::Part, p.id.clone())));
+                        self.note_files(Some(ids.collect()));
                     }
                     ProjectEdit::UpdateItems { symbols, parts } => {
                         if Some(by) == self.me {
@@ -355,6 +366,9 @@ impl Guest {
                             .extend(symbols.iter().map(|(s, _, _)| (s.id.clone(), s.clone())));
                         self.parts
                             .extend(parts.iter().map(|(p, _, _)| (p.id.clone(), p.clone())));
+                        let ids = symbols.iter().map(|(s, _, _)| (ItemKind::Symbol, s.id.clone()));
+                        let ids = ids.chain(parts.iter().map(|(p, _, _)| (ItemKind::Part, p.id.clone())));
+                        self.note_files(Some(ids.collect()));
                     }
                     _ => {}
                 }
@@ -366,8 +380,13 @@ impl Guest {
                 self.pictures.insert(picture.file, picture.data);
             }
             HostMsg::Items { symbols, parts } => {
+                let ids = symbols.iter().map(|s| (ItemKind::Symbol, s.id.clone()));
+                let ids: Vec<_> = ids
+                    .chain(parts.iter().map(|p| (ItemKind::Part, p.id.clone())))
+                    .collect();
                 self.symbols.extend(symbols.into_iter().map(|s| (s.id.clone(), s)));
                 self.parts.extend(parts.into_iter().map(|p| (p.id.clone(), p)));
+                self.note_files(Some(ids));
             }
             HostMsg::Recorded { change } => note(&mut self.history, change),
             HostMsg::Locks { locks } => {
@@ -442,6 +461,45 @@ impl Guest {
     /// host's display number, unless it is in `whole`: the refused edit added or removed that
     /// page, or set its content, so the content here is not the host's page, and the host's page
     /// comes back whole.
+    /// Hash the files named in `only` (all of them for `None`) into `file_hashes`.
+    fn note_files(&mut self, only: Option<Vec<(ItemKind, String)>>) {
+        let only = only.unwrap_or_else(|| {
+            let ids = self.symbols.keys().map(|id| (ItemKind::Symbol, id.clone()));
+            ids.chain(self.parts.keys().map(|id| (ItemKind::Part, id.clone())))
+                .collect()
+        });
+        for (kind, id) in only {
+            let hash = match kind {
+                ItemKind::Symbol => self.symbols.get(&id).filter(|s| s.id == id).map(|s| s.hash()),
+                ItemKind::Part => self.parts.get(&id).filter(|p| p.id == id).map(|p| p.hash()),
+            };
+            match hash {
+                Some(h) => self.file_hashes.insert((kind, id), h),
+                None => self.file_hashes.remove(&(kind, id)),
+            };
+        }
+    }
+
+    /// The items the session locks that it sent this guest no file of in that version (a host
+    /// that shared the project with a copy missing): kind and id. Others in the session cannot
+    /// draw a new use of one until the file comes in.
+    pub fn files_missing(&self) -> Vec<(ItemKind, String)> {
+        let Some(project) = &self.project else {
+            return Vec::new();
+        };
+        [ItemKind::Symbol, ItemKind::Part]
+            .into_iter()
+            .flat_map(|kind| {
+                project
+                    .lock
+                    .map(kind)
+                    .iter()
+                    .filter(move |(id, e)| self.file_hashes.get(&(kind, (*id).clone())) != Some(&e.hash))
+                    .map(move |(id, _)| (kind, id.clone()))
+            })
+            .collect()
+    }
+
     fn put_back(&mut self, mut parts: crate::Parts, whole: &[String]) {
         let me = self.me;
         let Some(project) = self.project.as_mut() else {

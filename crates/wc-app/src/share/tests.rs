@@ -1882,6 +1882,10 @@ fn a_new_placement_of_a_symbol_whose_file_the_session_lacks_waits_for_the_file()
         Ok(())
     })?;
     let coil = host_open.symbols.get("wc.coil").cloned().ok_or("loaded")?;
+    // A guest without a copy either (it took one from the library as it joined), so only the
+    // host can bring the file in.
+    std::fs::remove_file(store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.coil")?)?;
+    guest_open.symbols.remove("wc.coil");
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     // Placed again from the copy in memory: the session still has no file of the coil.
     let item = host_open.place(1, "wc.coil", wc_core::Point::new(60.0, 120.0))?;
@@ -1921,6 +1925,99 @@ fn a_new_placement_of_a_symbol_whose_file_the_session_lacks_waits_for_the_file()
     let add = messages.iter().position(|m| m == "Add wc.coil to the project");
     let edit = messages.iter().rposition(|m| m.contains("Edit page 2"));
     assert!(add.is_some() && add < edit, "the file goes in first: {messages:?}");
+    Ok(())
+}
+
+#[test]
+fn a_guests_new_placement_of_a_symbol_whose_file_the_session_lacks_reaches_other_guests_after_the_file() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+        o.save()?;
+        // Shared with the coil pinned and its copy gone: the session has no file of it.
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil")?)?;
+        o.symbols.remove("wc.coil");
+        Ok(())
+    })?;
+    // A second guest, without the library: it can draw the coil only from the session's file.
+    let mut g2 = guest(&mut h, "Kari", &tmp.path().join("guest2"));
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    let ids = pending(&h);
+    approve(&mut h, ids[0], true);
+    let mut kari_open = g2.frame(None, None, false).ok_or("the second guest got no project")?;
+    kari_open.project.meta.libraries.clear();
+    std::fs::remove_file(store::vendor_path(&kari_open.dir, ItemKind::Symbol, "wc.coil")?).ok();
+    kari_open.symbols.remove("wc.coil");
+    // A few frames of all three windows.
+    let run = |h: &mut Share, ho: &mut Open, g: &mut Share, go: &mut Open, g2: &mut Share, ko: &mut Open| {
+        for _ in 0..4 {
+            h.frame(Some(ho), Some("p0002".into()), false);
+            g.frame(Some(go), Some("p0003".into()), false);
+            g2.frame(Some(ko), Some("p0002".into()), false);
+        }
+    };
+    // The host cannot store files: the first guest's copy (taken from the library as it
+    // joined) goes out as the missing file, and the session refuses it.
+    log.fail_vendor(true);
+    run(&mut h, &mut host_open, &mut g, &mut guest_open, &mut g2, &mut kari_open);
+    assert!(!log.messages().iter().any(|m| m == "Add wc.coil to the project"));
+    // The first guest places the coil meanwhile: the placement waits for the file.
+    let item = guest_open.place(2, "wc.coil", wc_core::Point::new(60.0, 120.0))?;
+    let coil = guest_open
+        .symbols
+        .get("wc.coil")
+        .cloned()
+        .ok_or("placed from the library")?;
+    let drawn = |o: &Open| {
+        o.project
+            .page("p0003")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
+    run(&mut h, &mut host_open, &mut g, &mut guest_open, &mut g2, &mut kari_open);
+    assert!(drawn(&guest_open), "the guest's own copy keeps it");
+    assert!(!drawn(&kari_open), "the placement waits for the file");
+    // The session can store it again: the next try gets the file in, and the page follows.
+    log.fail_vendor(false);
+    retry_due(&mut g);
+    run(&mut h, &mut host_open, &mut g, &mut guest_open, &mut g2, &mut kari_open);
+    assert_eq!(kari_open.symbols.get("wc.coil"), Some(&coil));
+    assert!(drawn(&kari_open), "the placement follows the file");
+    assert!(g.holding.is_empty());
+    let messages = log.messages();
+    let add = messages.iter().position(|m| m == "Add wc.coil to the project");
+    let edit = messages.iter().position(|m| m.contains("Edit page 3"));
+    assert!(add.is_some() && add < edit, "the file goes in first: {messages:?}");
+    Ok(())
+}
+
+#[test]
+fn a_guest_with_the_pinned_copy_brings_in_the_file_the_session_lacks() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+        o.save()?;
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil")?)?;
+        o.symbols.remove("wc.coil");
+        Ok(())
+    })?;
+    // The guest took the pinned version from the library as it joined.
+    let coil = guest_open.symbols.get("wc.coil").cloned().ok_or("the guest's copy")?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    match h.role.as_ref() {
+        Some(Role::Host(hosting)) => {
+            assert_eq!(hosting.host.files().0.get("wc.coil"), Some(&coil));
+            assert!(hosting.host.files_missing().is_empty());
+        }
+        _ => return Err("still hosting".into()),
+    }
+    match g.role.as_ref() {
+        Some(Role::Guest(j)) => assert!(j.guest.files_missing().is_empty()),
+        _ => return Err("still a guest".into()),
+    }
+    // Sent once.
+    let n = log.messages().len();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages().len(), n);
     Ok(())
 }
 
