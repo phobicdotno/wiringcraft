@@ -1019,15 +1019,11 @@ fn live_spot(open: &Open, page: &Page, item: &str) -> Option<(Point, Point)> {
     }
     let w = page.wires.iter().find(|w| w.id == item)?;
     let pts = open.wire_points(page, w)?;
-    let mid = match pts.len() {
-        0 => return None,
-        1 => pts[0],
-        n => {
-            // The middle of the middle segment.
-            let (a, b) = (pts[(n - 1) / 2], pts[(n - 1) / 2 + 1]);
-            Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
-        }
-    };
+    // The middle of the middle segment, or the one point of a wire that has only one.
+    let i = pts.len().saturating_sub(1) / 2;
+    let a = *pts.get(i)?;
+    let b = pts.get(i + 1).copied().unwrap_or(a);
+    let mid = Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
     Some((mid, mid))
 }
 

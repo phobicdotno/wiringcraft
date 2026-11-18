@@ -2785,7 +2785,10 @@ impl eframe::App for App {
             .frame(side(t.toolbar_bg).inner_margin(egui::Margin::symmetric(10, 4)))
             .show_separator_line(false)
             .show(ctx, |ui| {
-                let live = self.prefs.live_check.then_some(self.live.busy());
+                let live = self
+                    .prefs
+                    .live_check
+                    .then(|| (self.live.status(), self.live.busy(), self.live.failed.is_some()));
                 if panels::status_bar(ui, self.open.as_ref(), &self.ed, live) {
                     self.dialog = Some(Dialog::Check(self.ed.live.clone()));
                 }
@@ -2886,7 +2889,9 @@ impl App {
         let poll = self
             .live
             .poll(&o.project, &o.symbols, &o.parts, std::time::Instant::now());
-        if poll.changed {
+        // Also after the editor was replaced (a project opened or a session joined) while the
+        // checker kept its findings for the same inputs.
+        if poll.changed || self.ed.live != self.live.findings {
             self.ed.live = self.live.findings.clone();
         }
         if let Some(after) = poll.again {
