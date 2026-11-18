@@ -2369,6 +2369,16 @@ fn an_update_undone_before_its_sender_looked_is_not_sent_again_and_others_see_no
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert_eq!(hash(&host_open), Some(v1.hash()), "the undo stays: {:?}", g.notes);
     assert_eq!(hash(&guest_open), Some(v1.hash()), "{:?}", g.notes);
+    assert_eq!(
+        guest_open.symbols.get("wc.coil"),
+        Some(&v1),
+        "the old version is loaded"
+    );
+    assert_eq!(
+        store::read_vendored_symbol(&guest_open.dir, "wc.coil")?,
+        v1,
+        "and written back"
+    );
     assert!(
         !g.notes.iter().any(|n| n.contains("first in another version")),
         "{:?}",
@@ -2432,5 +2442,31 @@ fn a_joined_copy_takes_a_library_symbol_only_in_the_version_the_session_pinned()
         store::read_vendored_symbol(&open.dir, "coil").is_err(),
         "no coil file written"
     );
+    Ok(())
+}
+
+#[test]
+fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let entry = |hash: &str| wc_core::LockEntry {
+        source: "starter".into(),
+        hash: hash.into(),
+    };
+    // At the last sync the session had coil v1; this copy updated it to v2; the session has
+    // since taken the coil back (an undo of its add).
+    let mut base = Project::new("Demo");
+    base.lock.symbols.insert("coil".into(), entry("v1"));
+    let mut local = base.clone();
+    local.lock.symbols.insert("coil".into(), entry("v2"));
+    let auth = Project::new("Demo");
+    let out = new_items(tmp.path(), &local, &base, &auth, &Default::default());
+    assert!(out.edits.is_empty(), "{:?}", out.edits);
+    assert_eq!(out.stale, ["symbol coil"]);
+    // An item the session never had is still sent as an add (here: unreadable, so tried).
+    let mut fresh = local.clone();
+    fresh.lock.symbols.insert("lamp".into(), entry("l1"));
+    let out = new_items(tmp.path(), &fresh, &base, &auth, &Default::default());
+    assert_eq!(out.unreadable.len(), 1, "{:?}", out.unreadable);
+    assert_eq!(out.unreadable[0].0, "symbol lamp");
     Ok(())
 }

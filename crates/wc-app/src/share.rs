@@ -892,6 +892,9 @@ pub struct NewItems {
     pub sent: Vec<String>,
     /// Items whose file could not be read, with the reason; they are not sent.
     pub unreadable: Vec<(String, String)>,
+    /// Items this copy updated whose earlier version the session took back since the last sync
+    /// (`base` has them, the session no longer does): not sent, as an add would undo that.
+    pub stale: Vec<String>,
 }
 
 /// The symbols and parts locked in `local` and not in the session's project `auth`, with their
@@ -916,6 +919,8 @@ pub fn new_items(
             .iter()
             .filter(move |(id, _)| !skip.contains(&item_name(kind, id)))
             .filter_map(move |(id, e)| match auth.lock.map(kind).get(id) {
+                // The session had it at the last sync in another version, and took it back since.
+                None if base.lock.map(kind).get(id).is_some_and(|b| b.hash != e.hash) => None,
                 None => Some((id.clone(), e.source.clone(), e.hash.clone(), None)),
                 Some(a) if updated_here(local, base, auth, kind, id) => {
                     Some((id.clone(), e.source.clone(), e.hash.clone(), Some(a.hash.clone())))
@@ -924,6 +929,19 @@ pub fn new_items(
             })
             .collect::<Vec<_>>()
     };
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        out.stale.extend(
+            local
+                .lock
+                .map(kind)
+                .iter()
+                .filter(|(id, e)| {
+                    !auth.lock.map(kind).contains_key(*id)
+                        && base.lock.map(kind).get(*id).is_some_and(|b| b.hash != e.hash)
+                })
+                .map(|(id, _)| item_name(kind, id)),
+        );
+    }
     let (mut symbols, mut new_symbols) = (Vec::new(), Vec::new());
     for (id, source, hash, before) in wanted(ItemKind::Symbol) {
         match check_locked(store::read_vendored_symbol(dir, &id), Symbol::hash, &hash) {
@@ -1605,7 +1623,8 @@ pub struct Share {
     /// changes wait while one is on its way, so a page never reaches the session before what it
     /// draws.
     items_out: BTreeMap<String, ItemOut>,
-    /// Items whose file could not be read, sent or taken, reported once each.
+    /// Items whose file could not be read, sent or taken, and updates not sent because the
+    /// session took their item back (`stale <name>`), reported once each.
     unreadable: std::collections::BTreeSet<String>,
     /// Pictures looked at for the session and not taken yet, by project path, with when: each
     /// is looked at again only after [`ITEM_RETRY_LATER`]. Changes never wait for a picture.
@@ -2023,6 +2042,13 @@ impl Share {
             if self.unreadable.insert(name.clone()) {
                 self.notes.push(format!(
                     "The file of {name} could not be read ({why}); others cannot draw it until it can."
+                ));
+            }
+        }
+        for name in &items.stale {
+            if self.unreadable.insert(format!("stale {name}")) {
+                self.notes.push(format!(
+                    "Your update of {name} was not sent: the session took that item back meanwhile."
                 ));
             }
         }

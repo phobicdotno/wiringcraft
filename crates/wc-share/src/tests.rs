@@ -3251,6 +3251,34 @@ fn an_update_is_not_taken_back_while_a_wire_uses_a_pin_only_it_has() -> TestResu
 }
 
 #[test]
+fn a_page_edit_with_a_wire_on_a_pin_an_update_dropped_is_refused() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1", "A2"]), coil_with(&["A1"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    // The update reaches the host before a page edit drawn on v1.
+    host.edit_project(update_symbol(&v1, &v2))?;
+    host.open(Some("p0002"))?;
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    wired(&mut page, "A2");
+    let err = host.edit_page(page).err().ok_or("refused")?;
+    assert!(err.to_string().contains("k1:A2"), "{err}");
+    assert!(host.project().page("p0002").ok_or("page")?.wires.is_empty());
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    wired(&mut page, "A1");
+    host.edit_page(page)?;
+    assert_eq!(host.project().page("p0002").ok_or("page")?.wires.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn a_page_undo_does_not_put_a_wire_back_on_a_pin_a_later_update_dropped() -> TestResult {
     let mut host = Host::new(
         demo(),

@@ -989,6 +989,20 @@ impl Open {
             }
         };
         self.reload_symbols();
+        // The loaded parts follow their new files too, so a copy compared with the lock later
+        // (after a refused session update puts the old pin back) is the version on disk.
+        for (kind, id) in &done {
+            if *kind == ItemKind::Part {
+                match store::read_vendored_part(&self.dir, id) {
+                    Ok(p) => {
+                        self.parts.insert(id.clone(), p);
+                    }
+                    Err(_) => {
+                        self.parts.remove(id);
+                    }
+                }
+            }
+        }
         let mut dangling: Vec<String> = done
             .iter()
             .filter(|(kind, _)| *kind == ItemKind::Symbol)

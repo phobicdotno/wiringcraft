@@ -448,7 +448,7 @@ impl Host {
                 Some(_) => Refusal::NoLock { page: page.id },
             });
         }
-        let Some(current) = self.project.page_mut(&page.id) else {
+        let Some(current) = self.project.page(&page.id) else {
             return Err(Refusal::UnknownPage { page: page.id });
         };
         // The display number is project-level: only `Renumber` changes it.
@@ -460,6 +460,27 @@ impl Host {
             }
             return Ok(());
         }
+        // A wire may not end on a pin the locked version of its symbol lacks: an update may have
+        // dropped the pin after the author drew the wire. Wires already like that may stay.
+        let on_page = |p: &Page| {
+            let mut probe = Project::new("");
+            probe.lock = self.project.lock.clone();
+            probe.pages = vec![p.clone()];
+            self.dangling_in(&probe)
+        };
+        let was = on_page(current);
+        let dangling: Vec<String> = on_page(&page).difference(&was).cloned().collect();
+        if !dangling.is_empty() {
+            return Err(Refusal::Invalid {
+                reason: format!(
+                    "wires end on pins the project's version of their symbol does not have ({}); the symbol was updated meanwhile",
+                    dangling.join(", ")
+                ),
+            });
+        }
+        let Some(current) = self.project.page_mut(&page.id) else {
+            return Err(Refusal::UnknownPage { page: page.id });
+        };
         let before = std::mem::replace(current, page.clone());
         let message = format!("Edit page {} {}", page.number, page.title);
         if let Err(refusal) = self.record(by, Some(page.id.clone()), message.clone()) {
