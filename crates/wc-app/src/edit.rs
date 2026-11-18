@@ -804,6 +804,43 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_cable_core_runs_in_the_pasted_cable() {
+        let (_tmp, mut o, page, a, _b) = setup();
+        // The first symbol stands for the cable; the wire is one of its cores.
+        let cable = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        o.project.pages[page].wires[0].cable = Some(wc_core::project::CableCore {
+            cable: cable.clone(),
+            core: "BN".into(),
+        });
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        // The original keeps its tag, so the copy's cable gets a new one.
+        let items = o.paste(page, &clip, Point::new(150.0, 50.0)).unwrap();
+        let p = &o.project.pages[page];
+        let new_cable = items
+            .iter()
+            .find_map(|i| match i {
+                Selection::Symbol(id) if p.symbol(id).unwrap().symbol == "wc.coil" => p.symbol(id)?.tag.clone(),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(new_cable, cable);
+        let wire = items
+            .iter()
+            .find_map(|i| match i {
+                Selection::Wire(id) => p.wires.iter().find(|w| &w.id == id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(wire.cable.as_ref().map(|c| &c.cable), Some(&new_cable));
+        assert_eq!(
+            p.wires[0].cable.as_ref().map(|c| &c.cable),
+            Some(&cable),
+            "the original is unchanged"
+        );
+    }
+
+    #[test]
     fn copy_paste_gets_new_ids_and_tags_and_keeps_the_wire() {
         let (_tmp, mut o, page, a, b) = setup();
         let sel = o.select_all(page);
