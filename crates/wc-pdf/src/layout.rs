@@ -1371,6 +1371,7 @@ mod template_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn labels_and_values_stay_inside_narrow_boxes() {
         let (mut p, page) = demo(PageSize::A3, false);
         let mut t = PageTemplate::default();
@@ -1399,7 +1400,7 @@ mod template_tests {
             .iter()
             .find(|(t, _)| t.starts_with("A label"))
             .cloned()
-            .unwrap_or_default();
+            .expect("narrow label is rendered");
         assert!(h < 1.8, "{label} drawn at {h}");
         assert!(crate::writer::text_width_mm(&label, h) <= 12.0 - 2.0 * PAD + 1e-6);
     }
