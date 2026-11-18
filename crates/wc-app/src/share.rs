@@ -1319,25 +1319,30 @@ fn pic_refs(project: &Project) -> Vec<(PicRef, String)> {
         .collect()
 }
 
+/// The pages and whether the project settings a refused change touched.
+type Refused = (BTreeSet<String>, bool);
+
 /// Drop the picks (of [`Share::picks`]) the session refused (`refused`: the pages and whether
-/// the project settings a refused change touched) and those that name another file now. A
-/// picture left with no pick gets no name of its own: it is taken out of what waits to be
-/// renamed (`renames_due`, `clashes`), and returned.
+/// the project settings a refused change touched, then the picks made since that change was
+/// sent, which it does not touch) and those that name another file now. A picture left with
+/// no pick gets no name of its own: it is taken out of what waits to be renamed
+/// (`renames_due`, `clashes`), and returned.
 fn withdraw_picks(
     picks: &mut BTreeMap<String, BTreeSet<PicRef>>,
     renames_due: &mut BTreeMap<String, std::time::Instant>,
     clashes: &mut Vec<String>,
     open: &Open,
-    refused: (BTreeSet<String>, bool),
+    refused: (Refused, &BTreeSet<(String, PicRef)>),
 ) -> BTreeSet<String> {
-    let (pages, meta) = refused;
+    let ((pages, meta), fresh) = refused;
     let mut withdrawn = BTreeSet::new();
     for (file, refs) in picks.iter_mut() {
         refs.retain(|r| {
-            let refused = match r {
-                PicRef::Logo => meta,
-                PicRef::Underlay(id) => pages.contains(id),
-            };
+            let refused = !fresh.contains(&(file.clone(), r.clone()))
+                && match r {
+                    PicRef::Logo => meta,
+                    PicRef::Underlay(id) => pages.contains(id),
+                };
             !refused && pic_ref_file(&open.project, r) == Some(file.as_str())
         });
         if refs.is_empty() {
@@ -3185,10 +3190,15 @@ impl Share {
         // References this copy's own changes pointed at a picture: a clash with one is a file
         // picked here. Recorded before anything is sent, and kept until compared, also while
         // the comparison waits.
+        // A pick made since the last frame (`fresh`) is of no change sent yet: a refusal that
+        // came meanwhile is of an earlier change, and leaves it.
+        let mut fresh = BTreeSet::new();
         for (r, file) in pic_refs(&open.project) {
             if pic_ref_file(base, &r) != Some(file.as_str()) {
                 self.withdrawn_picks.remove(&file);
-                self.picks.entry(file).or_default().insert(r);
+                if self.picks.entry(file.clone()).or_default().insert(r.clone()) {
+                    fresh.insert((file, r));
+                }
             }
         }
         // A withdrawn pick stays withdrawn for a refusal of its picture that comes later: that
@@ -3198,7 +3208,7 @@ impl Share {
             &mut self.renames_due,
             &mut self.clashes,
             open,
-            role.refused_targets(),
+            (role.refused_targets(), &fresh),
         );
         self.withdrawn_picks.extend(withdrawn);
         let mut taken: Vec<String> = role

@@ -3008,6 +3008,62 @@ fn a_session_picture_replaced_here_after_a_withdrawn_pick_of_its_name_is_renamed
 }
 
 #[test]
+fn a_pick_made_after_a_refused_one_was_sent_is_kept_through_its_refusal() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // The session has a picture brand.png that its drawings do not use.
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/a.png"), PNG)?;
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    // The guest's logo a.png goes out, and the session refuses it.
+    log.fail_guests(true);
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/a.png".into(),
+        cover: None,
+    });
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    log.fail_guests(false);
+    // The refusal takes the logo back in the guest's next frame.
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert_eq!(guest_open.project.meta.logo, None, "{:?}", g.notes);
+    // As when the refusal comes with the last answer of that frame, after the pictures were
+    // looked at: what it refused is still to be gone through at the next frame.
+    let Some(Role::Guest(j)) = g.role.as_mut() else {
+        return Err("not a guest".into());
+    };
+    j.guest.refused_meta = true;
+    // Before the next frame, the guest picks its own brand.png as the logo: that pick is
+    // kept, and the picture gets a name of its own.
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, mine, "kept");
+    let file = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(file, "pictures/brand.png", "{:?}", g.notes);
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, mine);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    assert_eq!(file_bytes(&host_open.dir, &file)?, mine);
+    Ok(())
+}
+
+#[test]
 fn a_picture_renamed_for_some_references_leaves_the_others() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut open = project(tmp.path())?;
@@ -3064,13 +3120,25 @@ fn a_pick_refused_or_pointed_elsewhere_is_withdrawn_with_its_waiting_rename() ->
     let mut due: BTreeMap<String, std::time::Instant> = [(a.clone(), now), (b.clone(), now)].into();
     let mut clashes = vec![a.clone(), b.clone()];
     // The logo's change was refused: a.png keeps its underlay pick; b.png's logo names a.png.
-    let gone = withdraw_picks(&mut picks, &mut due, &mut clashes, &open, (BTreeSet::new(), true));
+    let gone = withdraw_picks(
+        &mut picks,
+        &mut due,
+        &mut clashes,
+        &open,
+        ((BTreeSet::new(), true), &BTreeSet::new()),
+    );
     assert_eq!(gone, [b.clone()].into());
     assert_eq!(picks, [(a.clone(), [PicRef::Underlay(id.clone())].into())].into());
     assert_eq!(clashes, std::slice::from_ref(&a));
     assert!(due.contains_key(&a) && !due.contains_key(&b));
     // Then the underlay's page: nothing is left to rename.
-    let gone = withdraw_picks(&mut picks, &mut due, &mut clashes, &open, ([id].into(), false));
+    let gone = withdraw_picks(
+        &mut picks,
+        &mut due,
+        &mut clashes,
+        &open,
+        (([id].into(), false), &BTreeSet::new()),
+    );
     assert_eq!(gone, [a].into());
     assert!(picks.is_empty() && clashes.is_empty() && due.is_empty());
     Ok(())
