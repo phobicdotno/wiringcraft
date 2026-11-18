@@ -2421,6 +2421,13 @@ mod tests {
         // On another page everything works as before.
         a.ed.page = 1;
         assert!(status(&a, Action::DrawWire));
+
+        // Held too, the second page cannot move up past the first: both numbers stay.
+        let second = a.open.as_ref().unwrap().project.pages[1].id.clone();
+        a.ed.held_by.insert(second, "Ola".into());
+        assert!(!status(&a, Action::PageUp));
+        a.run(Action::PageUp);
+        assert_eq!(numbers(&a), before_numbers);
     }
 
     #[test]
