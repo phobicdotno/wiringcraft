@@ -3064,6 +3064,61 @@ fn a_pick_made_after_a_refused_one_was_sent_is_kept_through_its_refusal() -> Tes
 }
 
 #[test]
+fn a_picture_refused_while_a_symbol_waits_is_renamed_only_where_it_was_picked() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), _item) = waiting_session(tmp.path())?;
+    let file = "pictures/a.png";
+    // The host's page 2 has a.png as its underlay, a picture nobody has yet.
+    host_open.project.page_mut("p0002").ok_or("no page")?.underlay = Some(wc_core::Underlay {
+        file: file.into(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(10.0, 10.0),
+    });
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let underlay = |o: &Open| {
+        o.project
+            .page("p0002")
+            .and_then(|p| p.underlay.as_ref())
+            .map(|u| u.file.clone())
+    };
+    assert_eq!(underlay(&guest_open).as_deref(), Some(file));
+    // Looked for here meanwhile, and missing: looked at again only after a while.
+    std::thread::sleep(ITEM_RETRY_LATER + std::time::Duration::from_millis(50));
+    // The guest picks its own a.png as the logo, while the host's a.png comes into the session:
+    // the session refuses the guest's.
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join(file), &mine)?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: file.into(),
+        cover: None,
+    });
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    if let Some(Role::Host(hosting)) = h.role.as_mut() {
+        let mut all = hosting.host.pictures().clone();
+        all.insert(file.into(), PNG.to_vec());
+        hosting.host.share_pictures(all);
+    }
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!g.items_out.is_empty(), "the symbol still waits");
+    // The guest's logo gets a name of its own; the host's underlay keeps its picture.
+    let logo = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(logo, file, "{:?}", g.notes);
+    assert_eq!(file_bytes(&guest_open.dir, &logo)?, mine);
+    assert_eq!(underlay(&guest_open).as_deref(), Some(file), "{:?}", g.notes);
+    assert_eq!(underlay(&host_open).as_deref(), Some(file));
+    Ok(())
+}
+
+#[test]
 fn a_picture_renamed_for_some_references_leaves_the_others() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut open = project(tmp.path())?;
