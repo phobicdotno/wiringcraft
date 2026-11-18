@@ -1595,13 +1595,15 @@ struct Pictures<'a> {
 /// renamed: it is taken as the session's (into `pictures_taken`, no longer `replaced`), and
 /// nothing is sent. A picture this copy picked (in `picks`) is renamed only in the references
 /// it was picked in, unless its file replaced the session's (`replaced`): then in all.
+/// Returns the pictures renamed.
 fn rename_pictures(
     open: &mut Open,
     taken: Vec<String>,
     session: &BTreeMap<String, Vec<u8>>,
     pictures: Pictures<'_>,
     notes: &mut Vec<String>,
-) {
+) -> BTreeSet<String> {
+    let mut renamed = BTreeSet::new();
     let Pictures {
         renames_due,
         pictures_out,
@@ -1653,6 +1655,7 @@ fn rename_pictures(
                 pictures_out.remove(&file);
                 renames_due.remove(&file);
                 picks.remove(&file);
+                renamed.insert(file.clone());
                 notes.push(format!(
                     "The session already has another file named {file}; your picture is renamed {new} here and sent again under that name."
                 ));
@@ -1666,6 +1669,7 @@ fn rename_pictures(
             }
         }
     }
+    renamed
 }
 
 /// What [`take_pictures`] did: it writes the session's pictures that `open` uses and has not
@@ -2283,8 +2287,9 @@ pub struct Share {
     /// again) or they name another file.
     picks: BTreeMap<String, BTreeSet<PicRef>>,
     /// Pictures whose last pick was withdrawn ([`withdraw_picks`]), until this copy picks them
-    /// again, with the `seq` of the latest edit that had sent each then: a refusal of such a
-    /// picture renames nothing, unless it is of a later edit (a replacement sent since).
+    /// again, or that were renamed after a refusal, with the `seq` of the latest edit that had
+    /// sent each then: a refusal of such a picture renames nothing, unless it is of a later
+    /// edit (the picture sent again since).
     withdrawn_picks: BTreeMap<String, Option<u64>>,
     /// Files the session lacks ([`repairs_due`]) whose copy here was looked for and could not
     /// be sent (missing, unreadable, or another version), with when and [`repair_stamp`] then:
@@ -3254,7 +3259,7 @@ impl Share {
         note_withdrawn(&mut self.withdrawn_picks, &self.pictures_sent, withdrawn);
         let mut taken = names_to_rename(role.picture_names_taken(), &self.pictures_sent, &self.withdrawn_picks);
         taken.append(&mut self.clashes);
-        rename_pictures(
+        let renamed = rename_pictures(
             open,
             taken,
             role.pictures(),
@@ -3267,6 +3272,10 @@ impl Share {
             },
             &mut self.notes,
         );
+        // A refusal of an edit that sent a renamed picture is answered: one more of those (a
+        // picture sent twice) renames nothing, not even a reference to the session's file of
+        // that name that came in since.
+        note_withdrawn(&mut self.withdrawn_picks, &self.pictures_sent, renamed);
         // Pictures used for the first time go out before the change that names them. Changes do
         // not wait for them: without its picture a page still works, it just shows a gap.
         let session_pictures = role.pictures();
@@ -3295,12 +3304,12 @@ impl Share {
             };
             role.edit_project(edit, &mut self.notes);
             if let Some(file) = sent {
-                // A replacement of the session's file is an attempt of its own, renamed in every
-                // reference once refused: a pick of that name withdrawn earlier does not hold it
-                // back. A guest's refusal of the withdrawn pick's picture, arriving late, is told
-                // from it by its edit (`seq`); the host's refusals come at once.
+                // A picture sent again is an attempt of its own, renamed once refused: a pick of
+                // that name withdrawn earlier, or an earlier rename, does not hold it back. A
+                // guest's refusal of an earlier attempt, arriving late, is told from it by its
+                // edit (`seq`); the host's refusals come at once.
                 let seq = role.last_edit();
-                if seq.is_none() && self.pictures_replaced.contains(&file) {
+                if seq.is_none() {
                     self.withdrawn_picks.remove(&file);
                 }
                 self.pictures_sent.insert(file, seq);

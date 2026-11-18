@@ -3139,6 +3139,16 @@ fn a_late_refusal_of_a_withdrawn_picks_picture_is_told_from_a_later_attempts() {
     );
     // The host's refusals carry no edit: a withdrawn pick's picture is not renamed.
     assert!(names_to_rename(vec![(a.clone(), None)], &sent, &withdrawn).is_empty());
+    // Renamed after the refusal of edit 5: another refusal of that edit (the picture went out
+    // twice) renames nothing; one of the picture sent again (edit 7) does.
+    let mut settled = BTreeMap::new();
+    note_withdrawn(&mut settled, &sent, [a.clone()].into());
+    assert!(names_to_rename(vec![(a.clone(), Some(5))], &sent, &settled).is_empty());
+    let again: BTreeMap<String, Option<u64>> = [(a.clone(), Some(7))].into();
+    assert_eq!(
+        names_to_rename(vec![(a.clone(), Some(7))], &again, &settled),
+        vec![a.clone()]
+    );
     // Never sent from here: nothing.
     assert!(names_to_rename(vec![("pictures/c.png".into(), Some(9))], &sent, &BTreeMap::new()).is_empty());
 }
