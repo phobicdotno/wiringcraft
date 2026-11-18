@@ -395,12 +395,20 @@ impl Open {
                 taken.assignments.retain(|a| a.part != id);
             }
         }
-        let changed = if taken.assignments.is_empty() {
-            0
-        } else {
+        // Applied to a copy first: an undo step only for a change that is made, and pins only
+        // for the parts the result uses.
+        let mut staged = self.project.clone();
+        let changed = wc_import::wago::apply(&mut staged, &taken);
+        let used = staged.used_parts();
+        for id in plan.parts() {
+            if !used.contains(id) && !lock.parts.contains_key(id) {
+                self.project.lock.parts.remove(id);
+            }
+        }
+        if changed > 0 {
             self.checkpoint_with_lock(lock);
-            wc_import::wago::apply(&mut self.project, &taken)
-        };
+            wc_import::wago::apply(&mut self.project, &taken);
+        }
         let mut msg = format!(
             "WAGO configurator: {changed} device(s) or jumper(s) changed, {} row(s) already up to date, {} not matched.",
             plan.unchanged,
@@ -422,22 +430,43 @@ impl Open {
 
     /// Make sure a part is in the project (taken from the library when needed) and loaded.
     fn ensure_part(&mut self, id: &str) -> Result<(), String> {
-        let pinned = self.project.lock.parts.contains_key(id);
-        if pinned && self.parts.contains_key(id) {
+        let pin = self.project.lock.parts.get(id).cloned();
+        if pin.is_some() && self.parts.contains_key(id) {
             return Ok(());
         }
-        // Only go to the library when the project has no copy; a broken copy is reported as is.
         let vendored = store::vendor_path(&self.dir, ItemKind::Part, id).map_err(|e| e.to_string())?;
-        if !vendored.exists() {
-            let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
-            wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
-        } else if !pinned
-            && let Ok(lib) = wc_library::Library::open(&self.dir, &self.project)
-            && lib.part(id).is_ok()
-        {
-            // A copy left without its pin (an undone change that took it): pinned again from
-            // the library, so the project never uses a part its lock does not name.
-            wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
+        let lib = || wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string());
+        match (&pin, vendored.exists()) {
+            // No copy: taken from the library, a pinned part only in the version it pins.
+            (_, false) => {
+                let lib = lib()?;
+                if let Some(pin) = &pin {
+                    let (p, _) = lib.part(id).map_err(|e| e.to_string())?;
+                    if p.hash() != pin.hash {
+                        return Err(format!(
+                            "part {id}: its copy in the project is missing and the library has another version than the project pins; put the copy back or update the part from the library"
+                        ));
+                    }
+                }
+                wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
+            }
+            // A pinned copy: used as it is (a broken one is reported below).
+            (Some(_), true) => {}
+            // A copy without its pin (an undone change took the pin back): pinned again as it
+            // is, never replaced by a newer library version, to the library that has the part.
+            (None, true) => {
+                let copy = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
+                let (_, source) = lib()?.part(id).map_err(|_| {
+                    format!("part {id} has a copy in the project but no pin, and no library has it to pin it to")
+                })?;
+                self.project.lock.parts.insert(
+                    id.to_owned(),
+                    wc_core::LockEntry {
+                        source,
+                        hash: copy.hash(),
+                    },
+                );
+            }
         }
         let p = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
         self.parts.insert(id.to_owned(), p);
@@ -1645,10 +1674,14 @@ impl Open {
         if !meta.set_jumper_part(strip, terminal, part)? {
             return Ok(());
         }
-        if let Some(id) = part {
-            self.ensure_part(id)?;
+        let lock = self.project.lock.clone();
+        if let Some(id) = part
+            && let Err(e) = self.ensure_part(id)
+        {
+            self.project.lock = lock;
+            return Err(e);
         }
-        self.checkpoint();
+        self.checkpoint_with_lock(lock);
         self.project.meta.jumpers = meta.jumpers;
         Ok(())
     }
@@ -2006,6 +2039,61 @@ pub(crate) mod tests {
         )
         .unwrap();
         part
+    }
+
+    #[test]
+    fn a_jumper_part_is_one_undo_step_with_its_pin() {
+        let (_tmp, mut o) = project();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        for (x, tag) in [(20.0, "-X1.1"), (40.0, "-X1.2")] {
+            let id = o.place(1, "wc.terminal", Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(DeviceTag::parse(tag).unwrap());
+        }
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        let pid = "example.ex-tb-2-5";
+        let lock = o.project.lock.clone();
+        assert!(!lock.parts.contains_key(pid));
+        o.set_jumper_part(&x1, "2", Some(pid)).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid));
+        assert!(o.undo());
+        assert_eq!(o.project.lock, lock, "Undo takes the pin back with the part");
+        assert!(o.project.meta.jumpers[0].part.is_none());
+        assert!(o.redo());
+        assert!(o.project.lock.parts.contains_key(pid), "Redo brings it back");
+        assert_eq!(o.project.meta.jumpers[0].part.as_deref(), Some(pid));
+    }
+
+    #[test]
+    fn a_part_copy_without_its_pin_is_pinned_as_it_is_not_replaced() {
+        let (tmp, mut o) = project();
+        let pid = "example.ex-ct-9-24dc";
+        let tag = DeviceTag::parse("-K1").unwrap();
+        o.set_device_part(&tag, Some(pid)).unwrap();
+        // The pin is gone (an undone import left the copy), and the library has a newer one.
+        let copy = store::read_vendored_part(&o.dir, pid).unwrap();
+        o.project.lock.parts.remove(pid);
+        o.parts.remove(pid);
+        changed_part_in_mine(&o, tmp.path(), pid);
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let coil = o.symbols["wc.coil"].clone();
+        library_first(&mut o, tmp.path(), &coil);
+        let other = DeviceTag::parse("-K2").unwrap();
+        o.set_device_part(&other, Some(pid)).unwrap();
+        assert_eq!(
+            store::read_vendored_part(&o.dir, pid).unwrap(),
+            copy,
+            "the copy is kept"
+        );
+        assert_eq!(o.project.lock.parts[pid].hash, copy.hash(), "and pinned as it is");
+
+        // A pinned part whose copy is missing is not replaced by another library version.
+        o.parts.remove(pid);
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
+        let third = DeviceTag::parse("-K3").unwrap();
+        let err = o.set_device_part(&third, Some(pid)).unwrap_err();
+        assert!(err.contains("another version than the project pins"), "{err}");
+        assert!(o.project.devices.get(&third).is_none_or(|d| d.part.is_none()));
     }
 
     #[test]

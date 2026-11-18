@@ -2551,12 +2551,6 @@ struct WagoImported {
     warnings: Vec<String>,
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Tests: the next WAGO import's write of `library.lock` fails.
-    static FAIL_LOCK_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Write the articles of a configured WAGO configurator list onto the project in `dir` (see
 /// [`wc_import::wago`]). Articles are looked up among the project's own parts first, then its
 /// libraries; a library part that is used is taken into the project. Nothing is saved when
@@ -2601,13 +2595,39 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
         }
     }
     let changed = wc_import::wago::apply(&mut p, &taken);
-    if changed > 0 {
+    // A library part a device or jumper already uses without a pin (left by an import whose
+    // lock write failed before the lock went first) is pinned now, its copy as it is.
+    let mut repaired = 0;
+    for id in p.used_parts() {
+        if p.lock.parts.contains_key(&id) {
+            continue;
+        }
+        let (Some(_), Some(source)) = (
+            candidates.library.get(&id),
+            candidates.sources.get(&id).and_then(|&n| p.meta.libraries.get(n)),
+        ) else {
+            continue;
+        };
+        let hash = match store::read_vendored_part(dir, &id) {
+            Ok(copy) => copy.hash(),
+            Err(_) => match candidates.take(dir, &mut p, &id) {
+                Ok(()) => {
+                    repaired += 1;
+                    continue;
+                }
+                Err(why) => {
+                    warnings.push(format!("part {id} is used without a pin and cannot be taken: {why}"));
+                    continue;
+                }
+            },
+        };
+        let source = source.name.clone();
+        p.lock.parts.insert(id, wc_core::LockEntry { source, hash });
+        repaired += 1;
+    }
+    if changed > 0 || repaired > 0 {
         // The pins first: if a later write fails, a repeat import still finds the part
         // unassigned and saves again, instead of leaving it assigned without a pin.
-        #[cfg(test)]
-        if FAIL_LOCK_WRITE.with(|f| f.replace(false)) {
-            return Err("test: library.lock cannot be written".into());
-        }
         store::save_lock(dir, &p).map_err(e)?;
         save(dir, &p)?;
     }
@@ -4514,12 +4534,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (dir, out) = wago_project(tmp.path(), &[part("wago.2002-1201", "WAGO", "2002-1201")]);
         fill_wago_list(&out, "2002-1201", "");
-        let files =
-            |d: &Path| [store::PROJECT_FILE, "devices.json", store::LOCK_FILE].map(|f| std::fs::read(d.join(f)).ok());
+        let names = [store::PROJECT_FILE, store::DEVICES_FILE, store::LOCK_FILE];
+        let files = |d: &Path| names.map(|f| std::fs::read(d.join(f)).ok());
+        let times = |d: &Path| names.map(|f| std::fs::metadata(d.join(f)).and_then(|m| m.modified()).ok());
         let before = files(&dir);
-        FAIL_LOCK_WRITE.with(|f| f.set(true));
-        assert!(import_wago(&dir, &out).is_err());
-        assert_eq!(files(&dir), before, "nothing written: the lock goes first");
+        // The lock's write goes through library.lock.tmp: a folder there makes it fail.
+        let blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&blocker).unwrap();
+        let err = import_wago(&dir, &out).err().unwrap_or_default();
+        assert!(err.contains("library.lock"), "{err}");
+        assert_eq!(files(&dir), before, "the assignment is not written before its pin");
+        std::fs::remove_dir(&blocker).unwrap();
         let done = run_import_wago(&dir, &out);
         assert_eq!(done.changed, 1, "{:?}", done.unmatched);
         let p = load(&dir).unwrap();
@@ -4530,10 +4555,21 @@ mod tests {
         );
         assert!(p.lock.parts.contains_key("wago.2002-1201"), "pinned");
         // A repeat import of the pinned part writes nothing.
-        let saved = files(&dir);
+        let saved = times(&dir);
         let again = run_import_wago(&dir, &out);
         assert_eq!((again.changed, again.unchanged), (0, 1));
-        assert_eq!(files(&dir), saved);
+        assert_eq!(times(&dir), saved, "no file written again");
+
+        // A project left by the old order (assigned, pin missing) is repaired by a re-import.
+        let mut p = load(&dir).unwrap();
+        p.lock.parts.remove("wago.2002-1201");
+        save(&dir, &p).unwrap();
+        let again = run_import_wago(&dir, &out);
+        assert_eq!(again.changed, 0);
+        assert!(
+            load(&dir).unwrap().lock.parts.contains_key("wago.2002-1201"),
+            "pinned again"
+        );
     }
 
     #[test]
