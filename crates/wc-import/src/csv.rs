@@ -29,11 +29,14 @@ pub fn decode(bytes: &[u8]) -> String {
 /// (`'=A+C1-K1`, `'-K1`, see `wc_report::formula_safe`) taken off again. A `'` before anything
 /// else is part of the text and kept. A file cannot tell a guard from a `'` typed as text, so a
 /// field `'-K1` reads `-K1` from any CSV, as a spreadsheet shows it; WiringCraft's reports write
-/// a typed `'-K1` as `''-K1`, which reads back as `'-K1`.
+/// a typed `'-K1` as `''-K1` (one `'` more however many it has), which reads back as `'-K1`.
 fn unguard(field: String) -> String {
-    const FORMULA: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
     match field.strip_prefix('\'') {
-        Some(rest) if rest.starts_with(FORMULA) || rest.strip_prefix('\'').is_some_and(|r| r.starts_with(FORMULA)) => {
+        Some(rest)
+            if rest
+                .trim_start_matches('\'')
+                .starts_with(['=', '+', '-', '@', '\t', '\r']) =>
+        {
             rest.to_owned()
         }
         _ => field,
@@ -370,6 +373,7 @@ mod tests {
                 vec!["-X12".into(), "%I0.1".into(), "=A+C1-K1".into()],
                 vec!["+C1-K2".into(), "%I0.2".into(), "'quoted' text".into()],
                 vec!["-K3".into(), "%I0.3".into(), "'-K1".into()],
+                vec!["-K4".into(), "%I0.4".into(), "''=1".into()],
             ],
             ..wc_report::Table::default()
         };
@@ -385,7 +389,7 @@ mod tests {
         let (addresses, warnings) = plc_addresses(&csv)?;
         assert!(warnings.is_empty(), "{warnings:?}");
         let tags: Vec<String> = addresses.iter().map(|a| a.tag.to_string()).collect();
-        assert_eq!(tags, ["-K1", "-X12", "+C1-K2", "-K3"]);
+        assert_eq!(tags, ["-K1", "-X12", "+C1-K2", "-K3", "-K4"]);
         Ok(())
     }
 
