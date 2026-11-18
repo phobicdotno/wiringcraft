@@ -407,6 +407,18 @@ pub fn specs() -> Vec<Value> {
             &[],
         ),
         tool(
+            "jumpers",
+            "Jumpers bridging terminals of one strip: list them (strip, terminals in strip order, part), add (jumper the terminals of a strip together; a jumper that shares a terminal is merged), remove (take the terminals out of their jumpers; one left with fewer than two terminals goes), or part (give the jumper holding a terminal a part id from the project or its libraries; an empty part clears it).",
+            json!({
+                "action": {"type": "string", "enum": ["list", "add", "remove", "part"]},
+                "strip": {"type": "string", "description": "The strip's tag, e.g. -X1."},
+                "terminals": {"type": "array", "items": {"type": "string"}, "description": "Terminal numbers on the strip, e.g. [\"1\", \"4\"] (add, remove)."},
+                "terminal": {"type": "string", "description": "A terminal of the jumper (part)."},
+                "part": {"type": "string", "description": "The part id, e.g. wago.2002-402; empty to clear (part)."}
+            }),
+            &["action"],
+        ),
+        tool(
             "comments",
             "Review comments: list (open ones, or all), add (pinned at x, y on a page, or about the whole page), reply, resolve, reopen or delete.",
             json!({
@@ -540,12 +552,38 @@ fn num(v: &Value, key: &str) -> Option<f64> {
     v.get(key).and_then(Value::as_f64).filter(|n| n.is_finite())
 }
 
+/// Jumpers as the assistant sees them: strip, terminals in strip order, and the part if any.
+fn jumper_list(jumpers: &[wc_core::project::Jumper]) -> Vec<Value> {
+    jumpers
+        .iter()
+        .map(|j| json!({"strip": j.strip.to_string(), "terminals": j.terminals, "part": j.part}))
+        .collect()
+}
+
 fn need_s<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
     s(v, key).ok_or_else(|| format!("`{key}` is missing."))
 }
 
 fn need_num(v: &Value, key: &str) -> Result<f64, String> {
     num(v, key).ok_or_else(|| format!("`{key}` must be a number."))
+}
+
+/// `terminals` as texts: an entry that is not one is a mistake, so the whole request is refused
+/// rather than run on the rest.
+fn terminal_names(v: &Value) -> Result<Vec<String>, String> {
+    let Some(list) = v.get("terminals") else {
+        return Ok(Vec::new());
+    };
+    let list = list
+        .as_array()
+        .ok_or("`terminals` must be a list of terminal numbers.")?;
+    list.iter()
+        .map(|t| {
+            t.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("`terminals` holds {t}, which is not a terminal number in quotes."))
+        })
+        .collect()
 }
 
 fn strings(v: &Value, key: &str) -> Vec<String> {
@@ -841,7 +879,7 @@ impl wc_agent::Tools for AppTools<'_> {
             "set_device" => format!("Set device {}", s(input, "tag").unwrap_or_default()),
             "run_action" => format!("Ran {}", s(input, "action").unwrap_or_default()),
             "run_command" => format!("wiringcraft {}", strings(input, "args").join(" ")),
-            "comments" | "macros" | "panels" | "library" | "versions" => {
+            "comments" | "macros" | "panels" | "library" | "versions" | "jumpers" => {
                 format!("{name}: {}", s(input, "action").unwrap_or_default())
             }
             "export" => format!("Exported {}", s(input, "format").unwrap_or_default()),
@@ -1298,6 +1336,7 @@ impl App {
             }
             "set_template" => self.tool_set_template(v),
             "comments" => self.tool_comments(v),
+            "jumpers" => self.tool_jumpers(v),
             "macros" => self.tool_macros(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
@@ -1522,6 +1561,7 @@ impl App {
             "pages": pages,
             "panels": panels,
             "devices": open.project.devices.len(),
+            "jumpers": jumper_list(&open.project.meta.jumpers),
             "open_comments": open.project.comments.iter().filter(|c| !c.resolved).count(),
             "shown": shown,
             "selection": self.ed.selection.iter().map(selection_id).collect::<Vec<_>>(),
@@ -1918,6 +1958,64 @@ impl App {
                 Ok(format!("Comment {id}: {action} done."))
             }
             other => Err(format!("Unknown comments action {other}.")),
+        }
+    }
+
+    fn tool_jumpers(&mut self, v: &Value) -> Result<String, String> {
+        let action = need_s(v, "action")?;
+        let open = need_open(self.open.as_mut())?;
+        if action == "list" {
+            return Ok(pretty(&json!(jumper_list(&open.project.meta.jumpers))));
+        }
+        let strip = tag(need_s(v, "strip")?)?;
+        match action {
+            "add" => {
+                let terminals = terminal_names(v)?;
+                if !open.jumper_offer(&strip, &terminals)? {
+                    return Ok(format!(
+                        "Terminals {} of {strip} are jumpered together already.",
+                        terminals.join(", ")
+                    ));
+                }
+                open.add_jumper(&strip, &terminals)?;
+                Ok(format!("Jumpered {strip} {}.", terminals.join(", ")))
+            }
+            "remove" => {
+                let terminals = terminal_names(v)?;
+                if terminals.is_empty() {
+                    return Err("`terminals` is missing.".into());
+                }
+                // A terminal is one tag level, as `add` checks: refuse the whole request
+                // before anything changes.
+                for t in &terminals {
+                    let mut one = strip.clone();
+                    one.product.push(t.trim().to_owned());
+                    if DeviceTag::parse(&one.to_string()).ok().as_ref() != Some(&one) {
+                        return Err(format!(
+                            "{t:?} cannot be a terminal of {strip}: a terminal is one tag level."
+                        ));
+                    }
+                }
+                if !open.remove_from_jumpers(&strip, &terminals) {
+                    return Err(format!("No jumper of {strip} has terminal {}.", terminals.join(", ")));
+                }
+                Ok(format!("Took {strip} {} out of their jumpers.", terminals.join(", ")))
+            }
+            "part" => {
+                let terminal = need_s(v, "terminal")?.trim();
+                // Only a text, empty to clear it: a missing or other value is a mistake, not a
+                // request to clear the part.
+                if !v.get("part").is_some_and(Value::is_string) {
+                    return Err("`part` must be a part id, or an empty text to clear it.".into());
+                }
+                let part = s(v, "part").map(str::trim).filter(|p| !p.is_empty());
+                open.set_jumper_part(&strip, terminal, part)?;
+                Ok(match part {
+                    Some(p) => format!("The jumper with {strip} {terminal} has part {p}."),
+                    None => format!("The jumper with {strip} {terminal} has no part now."),
+                })
+            }
+            other => Err(format!("Unknown jumpers action {other}.")),
         }
     }
 
@@ -2444,6 +2542,108 @@ mod tests {
         let t = read(&mut a);
         assert_eq!(t["is_default"], json!(true));
         assert_eq!(t["boxes"], boxes);
+    }
+
+    #[test]
+    fn the_assistant_lists_adds_removes_and_gives_parts_to_jumpers() {
+        let (_tmp, mut a) = app(vec![]);
+        let list = |a: &mut App| -> Value {
+            serde_json::from_str(&call(a, "jumpers", json!({"action": "list"})).unwrap()).unwrap()
+        };
+        let undo_mark = |a: &App| a.open.as_ref().unwrap().undo_mark();
+        assert_eq!(list(&mut a), json!([]));
+
+        // Refusals change nothing and take no undo step.
+        let before = undo_mark(&a);
+        for bad in [
+            json!({"action": "add", "strip": "-X1", "terminals": ["1"]}),
+            json!({"action": "add", "strip": "-X1", "terminals": ["1", "2.1"]}),
+            json!({"action": "add", "terminals": ["1", "2"]}),
+            json!({"action": "remove", "strip": "-X1", "terminals": ["1"]}),
+            json!({"action": "part", "strip": "-X1", "terminal": "1", "part": "example.ex-tb-2-5"}),
+            json!({"action": "explode", "strip": "-X1"}),
+        ] {
+            assert!(call(&mut a, "jumpers", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(list(&mut a), json!([]));
+        assert_eq!(undo_mark(&a), before);
+
+        // Add: one undo step, and the state shows it.
+        call(
+            &mut a,
+            "jumpers",
+            json!({"action": "add", "strip": "-X1", "terminals": ["1", "2", "4"]}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 1);
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(
+            state["jumpers"],
+            json!([{"strip": "-X1", "terminals": ["1", "2", "4"], "part": null}])
+        );
+        let again = call(
+            &mut a,
+            "jumpers",
+            json!({"action": "add", "strip": "-X1", "terminals": ["2", "4"]}),
+        )
+        .unwrap();
+        assert!(again.contains("already"), "{again}");
+        assert_eq!(undo_mark(&a), before + 1);
+
+        // Part: an unknown part is refused; a library part is taken into the project.
+        let unknown = json!({"action": "part", "strip": "-X1", "terminal": "2", "part": "no.such"});
+        assert!(call(&mut a, "jumpers", unknown).is_err());
+        assert_eq!(undo_mark(&a), before + 1);
+        call(
+            &mut a,
+            "jumpers",
+            json!({"action": "part", "strip": "-X1", "terminal": "2", "part": "example.ex-tb-2-5"}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 2);
+        assert_eq!(list(&mut a)[0]["part"], json!("example.ex-tb-2-5"));
+        assert!(a.open.as_ref().unwrap().parts.contains_key("example.ex-tb-2-5"));
+
+        // Remove two terminals at once: one undo step, and the jumper (one left) goes.
+        call(
+            &mut a,
+            "jumpers",
+            json!({"action": "remove", "strip": "-X1", "terminals": ["1", "4"]}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 3);
+        assert_eq!(list(&mut a), json!([]));
+        assert!(a.open.as_mut().unwrap().undo());
+        let with_part = json!([{"strip": "-X1", "terminals": ["1", "2", "4"], "part": "example.ex-tb-2-5"}]);
+        assert_eq!(list(&mut a), with_part);
+
+        // A two-level or non-text terminal, or a part that is missing or not a text, is refused whole.
+        let mark = undo_mark(&a);
+        for bad in [
+            json!({"action": "remove", "strip": "-X1", "terminals": ["1", "2.1"]}),
+            json!({"action": "remove", "strip": "-X1", "terminals": ["1", 42]}),
+            json!({"action": "add", "strip": "-X1", "terminals": ["4", "5", 6]}),
+            json!({"action": "remove", "strip": "-X1", "terminals": "1"}),
+            json!({"action": "part", "strip": "-X1", "terminal": "4", "part": 42}),
+            json!({"action": "part", "strip": "-X1", "terminal": "4", "part": null}),
+            json!({"action": "part", "strip": "-X1", "terminal": "4"}),
+        ] {
+            assert!(call(&mut a, "jumpers", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(list(&mut a), with_part);
+        assert_eq!(undo_mark(&a), mark);
+
+        // Clearing the part keeps the jumper.
+        call(
+            &mut a,
+            "jumpers",
+            json!({"action": "part", "strip": "-X1", "terminal": "4", "part": ""}),
+        )
+        .unwrap();
+        assert_eq!(
+            list(&mut a),
+            json!([{"strip": "-X1", "terminals": ["1", "2", "4"], "part": null}])
+        );
     }
 
     #[test]

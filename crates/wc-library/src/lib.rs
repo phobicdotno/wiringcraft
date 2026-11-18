@@ -186,6 +186,9 @@ pub enum State {
     NotLocked,
     /// Pinned, but no source holds it any more. The vendored copy keeps working.
     GoneFromLibrary,
+    /// The library's file for it declares another id, so it cannot be taken (see `changes`).
+    /// The vendored copy, if any, keeps working.
+    WrongId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,16 +205,11 @@ pub struct ItemStatus {
     pub changes: Vec<String>,
 }
 
-fn library_version(lib: &Library, kind: ItemKind, id: &str) -> Option<(String, String, serde_json::Value)> {
+/// The library's version of an item: (hash, source, the id its file declares).
+fn library_version(lib: &Library, kind: ItemKind, id: &str) -> Option<(String, String, String)> {
     match kind {
-        ItemKind::Symbol => lib
-            .symbol(id)
-            .ok()
-            .map(|(s, src)| (s.hash(), src, serde_json::to_value(&s).unwrap_or_default())),
-        ItemKind::Part => lib
-            .part(id)
-            .ok()
-            .map(|(p, src)| (p.hash(), src, serde_json::to_value(&p).unwrap_or_default())),
+        ItemKind::Symbol => lib.symbol(id).ok().map(|(s, src)| (s.hash(), src, s.id)),
+        ItemKind::Part => lib.part(id).ok().map(|(p, src)| (p.hash(), src, p.id)),
     }
 }
 
@@ -228,7 +226,19 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
         for id in ids {
             let locked = project.lock.get(kind, &id).cloned();
             let lib_v = library_version(lib, kind, &id);
+            // A file declaring another id is no version of this item: `take` refuses it, so it
+            // is neither an update nor something to pin.
+            let wrong_id = lib_v
+                .as_ref()
+                .filter(|(_, _, inside)| *inside != id)
+                .map(|(_, src, inside)| {
+                    let what = if kind == ItemKind::Symbol { "symbol" } else { "part" };
+                    format!("the {what} file for {id:?} in {src:?} declares id {inside:?}; fix the library file")
+                });
+            let library_source = lib_v.as_ref().map(|v| v.1.clone());
+            let lib_v = lib_v.filter(|_| wrong_id.is_none());
             let state = match (&locked, &lib_v) {
+                _ if wrong_id.is_some() => State::WrongId,
                 (None, _) => State::NotLocked,
                 (Some(_), None) => State::GoneFromLibrary,
                 (Some(l), Some((h, _, _))) if &l.hash == h => State::UpToDate,
@@ -267,7 +277,7 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
                     },
                 }
             } else {
-                Vec::new()
+                wrong_id.into_iter().collect()
             };
             out.push(ItemStatus {
                 kind,
@@ -275,7 +285,7 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
                 state,
                 locked,
                 library_hash: lib_v.as_ref().map(|v| v.0.clone()),
-                library_source: lib_v.map(|v| v.1),
+                library_source,
                 used_by,
                 changes,
             });
@@ -290,11 +300,13 @@ pub fn take(project_dir: &Path, project: &mut Project, lib: &Library, kind: Item
     let entry = match kind {
         ItemKind::Symbol => {
             let (s, source) = lib.symbol(id)?;
+            same_id(&source, "symbol", id, &s.id)?;
             store::write_vendored_symbol(project_dir, &s)?;
             LockEntry { source, hash: s.hash() }
         }
         ItemKind::Part => {
             let (p, source) = lib.part(id)?;
+            same_id(&source, "part", id, &p.id)?;
             store::write_vendored_part(project_dir, &p)?;
             LockEntry { source, hash: p.hash() }
         }
@@ -303,22 +315,79 @@ pub fn take(project_dir: &Path, project: &mut Project, lib: &Library, kind: Item
     Ok(entry)
 }
 
-/// Pin every used item that is not pinned yet. Items missing from the library are returned.
-pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) -> Result<Vec<(ItemKind, String)>> {
-    let mut missing = Vec::new();
-    let todo: Vec<(ItemKind, String)> = status(project_dir, project, lib)
-        .into_iter()
-        .filter(|s| s.state == State::NotLocked)
-        .map(|s| (s.kind, s.id))
-        .collect();
+/// A library file must hold the item it is named after: the project stores the copy under the
+/// id inside it, so another id would write over that item's copy and pin a file that is not
+/// there.
+fn same_id(source: &str, kind: &str, wanted: &str, inside: &str) -> Result<()> {
+    if wanted == inside {
+        return Ok(());
+    }
+    Err(Error::Source {
+        name: source.to_owned(),
+        message: format!("the {kind} file for {wanted:?}{DECLARES}{inside:?}"),
+    })
+}
+
+/// The part of [`same_id`]'s message that marks it.
+const DECLARES: &str = " declares id ";
+
+/// Whether `take` refused a library file because it declares another id.
+fn is_wrong_id(e: &Error) -> bool {
+    matches!(e, Error::Source { message, .. } if message.contains(DECLARES))
+}
+
+/// What [`lock_missing`] could not pin.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Unpinned {
+    /// Used items that no library source holds.
+    pub missing: Vec<(ItemKind, String)>,
+    /// Used items whose library file declares another id, with the reason (see [`State::WrongId`]).
+    pub wrong_id: Vec<(ItemKind, String, String)>,
+}
+
+impl Unpinned {
+    pub fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.wrong_id.is_empty()
+    }
+}
+
+/// Pin every used item that is not pinned yet. Items it cannot pin are returned.
+pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) -> Result<Unpinned> {
+    lock_missing_then(project_dir, project, lib, || {})
+}
+
+/// [`lock_missing`], calling `after_scan` between reading the library's state and taking the
+/// items, so a test can change a library file in between.
+fn lock_missing_then(
+    project_dir: &Path,
+    project: &mut Project,
+    lib: &Library,
+    mut after_scan: impl FnMut(),
+) -> Result<Unpinned> {
+    let mut left = Unpinned::default();
+    let mut todo = Vec::new();
+    for s in status(project_dir, project, lib) {
+        match s.state {
+            State::NotLocked => todo.push((s.kind, s.id)),
+            // Used but not pinned, and its library file cannot be taken.
+            State::WrongId if s.locked.is_none() => left.wrong_id.push((s.kind, s.id, s.changes.join("; "))),
+            _ => {}
+        }
+    }
+    after_scan();
     for (kind, id) in todo {
         match take(project_dir, project, lib, kind, &id) {
             Ok(_) => {}
-            Err(Error::NotFound { .. }) => missing.push((kind, id)),
+            Err(Error::NotFound { .. }) => left.missing.push((kind, id)),
+            // The file changed since `status` read it: report it like the others and pin the rest.
+            Err(e) if is_wrong_id(&e) => {
+                let why = e.to_string();
+                left.wrong_id.push((kind, id, why));
+            }
             Err(e) => return Err(e),
         }
     }
-    Ok(missing)
+    Ok(left)
 }
 
 /// Take newer library versions. `only` limits it to the given ids; `None` updates everything
@@ -329,10 +398,20 @@ pub fn update(
     lib: &Library,
     only: Option<&[String]>,
 ) -> Result<Vec<(ItemKind, String)>> {
-    let todo: Vec<(ItemKind, String)> = status(project_dir, project, lib)
+    let named = |s: &ItemStatus| only.is_none_or(|ids| ids.contains(&s.id));
+    let all = status(project_dir, project, lib);
+    // An item named on purpose whose library file is wrong is an error, before anything is taken.
+    if only.is_some()
+        && let Some(bad) = all.iter().find(|s| s.state == State::WrongId && named(s))
+    {
+        return Err(Error::Source {
+            name: bad.library_source.clone().unwrap_or_default(),
+            message: bad.changes.join("; "),
+        });
+    }
+    let todo: Vec<(ItemKind, String)> = all
         .into_iter()
-        .filter(|s| s.state == State::Changed)
-        .filter(|s| only.is_none_or(|ids| ids.contains(&s.id)))
+        .filter(|s| s.state == State::Changed && named(s))
         .map(|s| (s.kind, s.id))
         .collect();
     for (kind, id) in &todo {

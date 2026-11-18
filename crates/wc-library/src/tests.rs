@@ -211,3 +211,173 @@ fn a_jumper_part_is_listed_as_used_by_its_jumper() -> std::result::Result<(), Bo
     assert_eq!(jumper.used_by, vec!["-X1 jumper 1-2"]);
     Ok(())
 }
+
+#[test]
+fn a_library_file_declaring_another_id_is_not_taken() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut f = fixture()?;
+    // `fake.json` in the library holds a symbol declaring `other`, with other contents than
+    // the library's `other`: taking it would write over the project's copy of `other`.
+    let fake = write_symbol(&f.company, &sym("other", 77.0))?;
+    std::fs::rename(&fake, f.company.join("symbols").join("fake.json"))?;
+    write_symbol(&f.company, &sym("other", 5.0))?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "other")?;
+    let kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "other")?)?;
+    let err = take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "fake")
+        .err()
+        .ok_or("taken")?;
+    assert!(err.to_string().contains("declares id \"other\""), "{err}");
+    assert!(!f.project.lock.symbols.contains_key("fake"), "not pinned");
+    assert!(is_wrong_id(&err), "classified as a wrong-id refusal: {err:?}");
+    let missing = take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "nope")
+        .err()
+        .ok_or("taken")?;
+    assert!(!is_wrong_id(&missing), "{missing:?}");
+    assert_eq!(
+        std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "other")?)?,
+        kept
+    );
+    Ok(())
+}
+
+#[test]
+fn a_library_part_file_declaring_another_id_is_not_taken() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut f = fixture()?;
+    let part = |description: &str| Part {
+        id: "other".into(),
+        description: description.into(),
+        ..Part::default()
+    };
+    // `fake.json` holds a part declaring `other`, with other contents than the library's `other`.
+    let fake = write_part(&f.company, &part("fake"))?;
+    std::fs::rename(&fake, f.company.join("parts").join("fake.json"))?;
+    write_part(&f.company, &part("the real one"))?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    take(&f.proj, &mut f.project, &lib, ItemKind::Part, "other")?;
+    let kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Part, "other")?)?;
+    let err = take(&f.proj, &mut f.project, &lib, ItemKind::Part, "fake")
+        .err()
+        .ok_or("taken")?;
+    assert!(matches!(err, Error::Source { .. }), "{err:?}");
+    assert!(err.to_string().contains("declares id \"other\""), "{err}");
+    assert!(!f.project.lock.parts.contains_key("fake"), "not pinned");
+    assert_eq!(
+        std::fs::read(store::vendor_path(&f.proj, ItemKind::Part, "other")?)?,
+        kept
+    );
+    Ok(())
+}
+
+#[test]
+fn a_library_file_declaring_another_id_is_no_update_and_nothing_to_pin()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut f = fixture()?;
+    let personal = f.proj.parent().ok_or("no parent")?.join("personal");
+    // `amp` sorts before `coil`, is pinned, and gets a valid newer version below.
+    write_symbol(&f.company, &sym("amp", 3.0))?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "amp")?;
+    let pinned = f.project.lock.symbols.get("coil").cloned().ok_or("not pinned")?;
+    let amp_pinned = f.project.lock.symbols.get("amp").cloned().ok_or("amp not pinned")?;
+    let kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?)?;
+    let amp_kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "amp")?)?;
+    write_symbol(&f.company, &sym("amp", 4.0))?;
+
+    // Both sources' `coil.json` now hold a symbol declaring `other`, with other contents.
+    for root in [&f.company, &personal] {
+        let wrong = write_symbol(root, &sym("other", 42.0))?;
+        std::fs::rename(&wrong, root.join("symbols").join("coil.json"))?;
+    }
+    write_symbol(&f.company, &sym("other", 5.0))?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    let st = status(&f.proj, &f.project, &lib);
+    let coil = st.iter().find(|s| s.id == "coil").ok_or("coil not listed")?;
+    assert_eq!(coil.state, State::WrongId, "{coil:?}");
+    assert!(coil.changes[0].contains("declares id \"other\""), "{:?}", coil.changes);
+    assert!(coil.library_hash.is_none());
+
+    // Naming it beside a valid update is an error before anything is taken.
+    let err = update(
+        &f.proj,
+        &mut f.project,
+        &lib,
+        Some(&["amp".to_owned(), "coil".to_owned()]),
+    )
+    .err()
+    .ok_or("updated")?;
+    assert!(err.to_string().contains("declares id \"other\""), "{err}");
+    assert_eq!(f.project.lock.symbols.get("amp"), Some(&amp_pinned));
+    assert_eq!(
+        std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "amp")?)?,
+        amp_kept
+    );
+    // Updating everything takes the valid one and skips it.
+    assert_eq!(
+        update(&f.proj, &mut f.project, &lib, None)?,
+        vec![(ItemKind::Symbol, "amp".to_owned())]
+    );
+    assert_ne!(f.project.lock.symbols.get("amp"), Some(&amp_pinned));
+    assert_eq!(f.project.lock.symbols.get("coil"), Some(&pinned));
+    assert_eq!(
+        std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?)?,
+        kept
+    );
+
+    // Not pinned yet: it is not pinned from the wrong file either, and nothing fails.
+    f.project.lock.symbols.remove("coil");
+    let st = status(&f.proj, &f.project, &lib);
+    assert_eq!(
+        st.iter().find(|s| s.id == "coil").map(|s| s.state),
+        Some(State::WrongId)
+    );
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(!f.project.lock.symbols.contains_key("coil"));
+    assert!(left.missing.is_empty(), "{left:?}");
+    assert_eq!(left.wrong_id.len(), 1, "{left:?}");
+    assert_eq!(
+        (left.wrong_id[0].0, left.wrong_id[0].1.as_str()),
+        (ItemKind::Symbol, "coil")
+    );
+    assert!(left.wrong_id[0].2.contains("declares id \"other\""), "{left:?}");
+    Ok(())
+}
+
+#[test]
+fn lock_missing_reports_a_file_that_turns_wrong_after_the_scan_and_pins_the_rest() -> Result<()> {
+    let mut f = fixture()?;
+    for id in ["aa", "bb", "cc"] {
+        write_symbol(&f.company, &sym(id, 5.0))?;
+        f.project.pages[0].symbols.push(PlacedSymbol {
+            id: format!("s-{id}"),
+            symbol: id.into(),
+            at: Point::new(30.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        });
+    }
+    let lib = Library::open(&f.proj, &f.project)?;
+    let bb = f.company.join("symbols").join("bb.json");
+    let company = f.company.clone();
+    let mut changed = Ok(());
+    let left = lock_missing_then(&f.proj, &mut f.project, &lib, || {
+        // After the scan saw `bb` as not pinned, its file starts declaring another id.
+        changed = write_symbol(&company, &sym("zz", 7.0))
+            .and_then(|zz| std::fs::rename(&zz, &bb).map_err(|e| wc_core::Error::io("rename", e).into()));
+    })?;
+    changed?;
+    assert_eq!(left.wrong_id.len(), 1, "{left:?}");
+    assert_eq!(
+        (left.wrong_id[0].0, left.wrong_id[0].1.as_str()),
+        (ItemKind::Symbol, "bb")
+    );
+    assert!(left.wrong_id[0].2.contains("declares id \"zz\""), "{left:?}");
+    assert!(left.missing.is_empty(), "{left:?}");
+    // Pinned before the refusal and after it; the refused one is not.
+    for id in ["aa", "cc", "coil"] {
+        assert!(f.project.lock.symbols.contains_key(id), "{id} pinned");
+    }
+    assert!(!f.project.lock.symbols.contains_key("bb"));
+    Ok(())
+}
