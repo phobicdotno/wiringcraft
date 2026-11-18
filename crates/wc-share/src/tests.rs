@@ -2595,3 +2595,26 @@ fn a_picture_folder_that_links_out_of_the_project_makes_nothing_there() -> TestR
     assert!(!elsewhere.join("deep").exists(), "no folder made outside the project");
     Ok(())
 }
+
+#[test]
+fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let pictures = dir.join("pictures");
+    std::fs::create_dir_all(&pictures)?;
+    // An earlier attempt stopped half-way and left its part file; it is not in the way.
+    let part = pictures.join(format!(".logo.png.{}.part", std::process::id()));
+    std::fs::write(&part, b"\x89PN")?;
+    let logo = picture("pictures/logo.png", b"\x89PNG\r\n\x1a\nlogo");
+    write_picture(dir, &logo)?;
+    assert_eq!(std::fs::read(pictures.join("logo.png"))?, logo.data);
+    let names: Vec<_> = std::fs::read_dir(&pictures)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(names, ["logo.png"], "nothing but the picture is left");
+    // The same picture again is fine; another under that name is refused and changes nothing.
+    write_picture(dir, &logo)?;
+    assert!(write_picture(dir, &picture("pictures/logo.png", b"other")).is_err());
+    assert_eq!(std::fs::read(pictures.join("logo.png"))?, logo.data);
+    Ok(())
+}

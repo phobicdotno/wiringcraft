@@ -146,10 +146,27 @@ fn session_with(
     tmp: &Path,
     setup: impl FnOnce(&mut Open) -> std::result::Result<(), Box<dyn std::error::Error>>,
 ) -> std::result::Result<Session, Box<dyn std::error::Error>> {
+    session_sharing(tmp, setup, BTreeMap::new())
+}
+
+/// Like [`session_with`], with `pictures` shared on top of the ones the host's project uses,
+/// before the guest is let in.
+fn session_sharing(
+    tmp: &Path,
+    setup: impl FnOnce(&mut Open) -> std::result::Result<(), Box<dyn std::error::Error>>,
+    pictures: BTreeMap<String, Vec<u8>>,
+) -> std::result::Result<Session, Box<dyn std::error::Error>> {
     let mut host_open = project(&tmp.join("host"))?;
     setup(&mut host_open)?;
     host_open.save()?;
     let (mut h, log) = host(&host_open);
+    if let Some(Role::Host(hosting)) = h.role.as_mut()
+        && !pictures.is_empty()
+    {
+        let mut all = hosting.host.pictures().clone();
+        all.extend(pictures);
+        hosting.host.share_pictures(all);
+    }
     let mut g = guest(&mut h, "Ola", &tmp.join("guest"));
     h.frame(Some(&mut host_open), Some("p0002".into()), false);
     let ids = pending(&h);
@@ -1546,14 +1563,18 @@ fn a_picture_outside_the_picture_folders_is_named_once_and_not_sent() -> TestRes
 #[test]
 fn a_picture_picked_here_is_not_written_over_by_the_sessions_picture_of_that_name() -> TestResult {
     let tmp = tempfile::tempdir()?;
-    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
     // The session has a picture under a name this copy does not use (yet).
-    if let Some(Role::Host(hosting)) = h.role.as_mut() {
-        hosting
-            .host
-            .share_pictures([("pictures/brand.png".to_owned(), PNG.to_vec())].into());
-    }
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        g.role.as_ref().and_then(|r| r.pictures().get("pictures/brand.png")),
+        Some(&PNG.to_vec()),
+        "the guest has the session's picture"
+    );
     // The guest picks its own picture of that name.
     let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
     std::fs::create_dir_all(guest_open.dir.join("pictures"))?;

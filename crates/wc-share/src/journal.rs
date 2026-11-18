@@ -168,21 +168,62 @@ pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
     if !folder.canonicalize()?.starts_with(&root) {
         return Err(outside());
     }
-    match std::fs::read(&path) {
-        Ok(have) if have == picture.data => return Ok(()),
-        Ok(_) => {
-            return Err(Error::new(
+    let existing = || -> Result<()> {
+        match std::fs::read(&path) {
+            Ok(have) if have == picture.data => Ok(()),
+            Ok(_) => Err(Error::new(
                 ErrorKind::AlreadyExists,
                 format!("the project already has another picture named {}", picture.file),
             )
-            .into());
+            .into()),
+            Err(e) => Err(e.into()),
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    };
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(outside());
     }
-    std::fs::write(&path, &picture.data)?;
-    Ok(())
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return existing(),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    // The whole file is written beside it first and then put in place without replacing
+    // anything, so a failed write never leaves a cut-off picture under the name.
+    let part = folder.join(format!(
+        ".{}.{}.part",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("picture"),
+        std::process::id()
+    ));
+    // A part file left by an earlier attempt that stopped half-way is not wanted any more.
+    let _ = std::fs::remove_file(&part);
+    let published = write_new(&part, &picture.data).and_then(|()| publish(&part, &path));
+    let _ = std::fs::remove_file(&part);
+    match published {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => existing(),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write `data` to a new file at `path`, removing it again when that fails.
+fn write_new(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let written = file.write_all(data).and_then(|()| file.sync_all());
+    drop(file);
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+/// Put the finished file `part` at `path`, failing with `AlreadyExists` when something is
+/// there. A hard link does that in one step; where a folder cannot hold hard links, the
+/// file is copied into a newly made file instead.
+fn publish(part: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::hard_link(part, path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => write_new(path, &std::fs::read(part)?),
+    }
 }
