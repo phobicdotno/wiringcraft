@@ -1179,3 +1179,25 @@ fn a_symbol_whose_file_becomes_unreadable_stops_holding_the_session() -> TestRes
     assert!(g.items_out.is_empty());
     Ok(())
 }
+
+#[test]
+fn an_item_this_copy_no_longer_locks_stops_holding_changes() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(!g.items_out.is_empty(), "the refused symbol is still on its way");
+    // This copy stops using it, as when an assistant command rewrote the project.
+    guest_open.project.lock.symbols.remove("wc.contact.no");
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves, renamed".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(g.items_out.is_empty());
+    assert_eq!(
+        host_open.project.page("p0003").map(|p| p.title.as_str()),
+        Some("Valves, renamed"),
+        "changes go out again"
+    );
+    Ok(())
+}

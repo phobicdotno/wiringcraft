@@ -1219,7 +1219,10 @@ impl Share {
         // the changes that may draw them wait in the window: a page must not reach the session
         // without its symbols, and an item the session refused is sent again a few times.
         let auth = role.project()?;
-        self.items_out.retain(|name, _| !session_has(auth, name));
+        // An item the session took is done; one this copy no longer locks (an undo, or an
+        // assistant command that rewrote the project) is not sent again, so nothing waits for it.
+        self.items_out
+            .retain(|name, _| !session_has(auth, name) && session_has(&open.project, name));
         for (name, out) in self.items_out.iter_mut() {
             if !out.gave_up && out.tries >= ITEM_TRIES && out.at.elapsed() >= ITEM_WAIT {
                 out.gave_up = true;
