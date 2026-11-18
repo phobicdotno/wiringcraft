@@ -11,16 +11,28 @@ type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 /// A journal the test can look at.
 #[derive(Clone, Default)]
-struct Log(Rc<RefCell<Vec<Change>>>);
+struct Log(Rc<RefCell<Vec<Change>>>, Rc<std::cell::Cell<bool>>);
 
 impl Journal for Log {
     fn record(&mut self, _project: &Project, change: &Change) -> wc_share::Result<()> {
         self.0.borrow_mut().push(change.clone());
         Ok(())
     }
+
+    /// Fails while [`Log::fail_vendor`] is set, as a host whose vendor folder is read-only.
+    fn vendor(&mut self, _symbols: &[Symbol], _parts: &[Part]) -> wc_share::Result<()> {
+        if self.1.get() {
+            return Err(std::io::Error::other("vendor folder is read-only").into());
+        }
+        Ok(())
+    }
 }
 
 impl Log {
+    fn fail_vendor(&self, fail: bool) {
+        self.1.set(fail);
+    }
+
     fn messages(&self) -> Vec<String> {
         self.0.borrow().iter().map(|c| c.message.clone()).collect()
     }
@@ -54,8 +66,8 @@ fn host(open: &Open) -> (Share, Log) {
         Box::new(log.clone()),
     );
     // As `Share::start_host` does.
-    let (symbols, parts) = vendored_files(&open.dir, &open.project);
-    host.share_files(symbols, parts);
+    let files = vendored_files(&open.dir, &open.project);
+    host.share_files(files.symbols, files.parts);
     let share = Share {
         role: Some(Role::Host(Box::new(Hosting {
             host,
@@ -934,5 +946,130 @@ fn a_symbol_used_for_the_first_time_reaches_the_host_with_its_file() -> TestResu
     let n = log.messages().len();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert_eq!(log.messages().len(), n);
+    Ok(())
+}
+
+#[test]
+fn a_page_waits_until_the_session_has_the_symbols_it_draws() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    let item = guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let drawn = |o: &Open| {
+        o.project
+            .page("p0003")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
+    assert!(!drawn(&host_open), "the page waits for its symbol");
+    assert!(
+        guest_open.project.lock.symbols.contains_key("wc.contact.no"),
+        "the guest keeps its own entry"
+    );
+    match &g.role {
+        Some(Role::Guest(j)) => assert!(
+            !j.guest
+                .project
+                .as_ref()
+                .is_some_and(|p| p.lock.symbols.contains_key("wc.contact.no")),
+            "the session's copy has no entry the host refused"
+        ),
+        _ => return Err("not a guest".into()),
+    }
+
+    // The host can store it again: the next try gets it in, and the page follows.
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_WAIT);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(drawn(&host_open));
+    assert!(host_open.project.lock.symbols.contains_key("wc.contact.no"));
+    let messages = log.messages();
+    let add = messages.iter().position(|m| m == "Add wc.contact.no to the project");
+    let edit = messages.iter().position(|m| m.starts_with("Edit page 3"));
+    assert!(add.is_some() && add < edit, "{messages:?}");
+    Ok(())
+}
+
+#[test]
+fn a_page_goes_without_a_symbol_the_session_keeps_refusing() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    let item = guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    for _ in 0..=ITEM_TRIES {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        std::thread::sleep(ITEM_WAIT);
+    }
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(
+        host_open
+            .project
+            .page("p0003")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item)),
+        "the change is not held forever"
+    );
+    let notes = g.take_notes();
+    assert!(
+        notes.iter().any(|n| n.contains("did not take symbol wc.contact.no")),
+        "{notes:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_symbol_someone_else_used_first_in_another_version_takes_the_sessions_version() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let session_coil = host_open.symbols.get("wc.coil").cloned().ok_or("no coil")?;
+    // The guest's copy holds another version, as when both used it at the same time.
+    let mut other = session_coil.clone();
+    other.name = "Coil, edited".into();
+    store::write_vendored_symbol(&guest_open.dir, &other)?;
+    guest_open.symbols.insert(other.id.clone(), other.clone());
+    if let Some(e) = guest_open.project.lock.symbols.get_mut("wc.coil") {
+        e.hash = other.hash();
+    }
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(guest_open.symbols.get("wc.coil"), Some(&session_coil));
+    assert_eq!(
+        guest_open.project.lock.symbols.get("wc.coil").map(|e| &e.hash),
+        Some(&session_coil.hash())
+    );
+    assert_eq!(store::read_vendored_symbol(&guest_open.dir, "wc.coil")?, session_coil);
+    assert!(
+        g.take_notes()
+            .iter()
+            .any(|n| n.contains("symbol wc.coil first in another version"))
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unreadable_file_is_named_once_and_not_sent() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    let file = store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.contact.no")?;
+    std::fs::write(&file, "{ not json")?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let notes = g.take_notes();
+    let named: Vec<_> = notes
+        .iter()
+        .filter(|n| n.contains("symbol wc.contact.no could not be read"))
+        .collect();
+    assert_eq!(named.len(), 1, "{notes:?}");
+    assert!(!log.messages().iter().any(|m| m.starts_with("Add ")));
+
+    // The host's own unreadable files are named when it shares.
+    let files = vendored_files(&guest_open.dir, &guest_open.project);
+    assert!(files.unreadable.iter().any(|u| u.starts_with("symbol wc.contact.no (")));
     Ok(())
 }

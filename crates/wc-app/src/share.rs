@@ -323,13 +323,15 @@ fn number_of(p: &Project, page: &str) -> String {
 }
 
 /// Make `local` the session's project `auth`, changing only what differs. The symbol lock stays
-/// local, except that items the session has and this copy lacks are added (their files come
-/// with the session, see [`take_files`]). Returns whether anything changed.
+/// local, except for items the session has: this copy takes their entries, so an item it lacks
+/// is added and one it has in another version (someone else used it first) takes the session's
+/// version. Their files come with the session, see [`take_files`]. Returns whether anything
+/// changed.
 pub fn incoming(local: &mut Project, auth: &Project) -> bool {
     let mut changed = false;
     for kind in [ItemKind::Symbol, ItemKind::Part] {
         for (id, entry) in auth.lock.map(kind) {
-            if !local.lock.map(kind).contains_key(id) {
+            if local.lock.map(kind).get(id).is_none_or(|e| e.hash != entry.hash) {
                 local.lock.map_mut(kind).insert(id.clone(), entry.clone());
                 changed = true;
             }
@@ -366,29 +368,93 @@ pub fn incoming(local: &mut Project, auth: &Project) -> bool {
     changed
 }
 
-/// The symbols and parts locked in `local` and not in `base` (the project after the last sync),
-/// with their vendored files from `dir`, as one edit: what this person started using since. An
-/// item whose file cannot be read is left out; the others still see it as unknown.
-pub fn new_items(dir: &Path, local: &Project, base: &Project) -> Option<ProjectEdit> {
+/// The items `local` locks in another version than the session `auth`: someone else used them
+/// first, and [`incoming`] gives this copy the session's version. As `symbol id` or `part id`.
+pub fn conflicts(local: &Project, auth: &Project) -> Vec<String> {
+    [ItemKind::Symbol, ItemKind::Part]
+        .into_iter()
+        .flat_map(|kind| {
+            local
+                .lock
+                .map(kind)
+                .iter()
+                .filter(move |(id, e)| auth.lock.map(kind).get(*id).is_some_and(|a| a.hash != e.hash))
+                .map(move |(id, _)| item_name(kind, id))
+        })
+        .collect()
+}
+
+/// An item as messages name it: `symbol wc.coil`, `part acme.relay`.
+fn item_name(kind: ItemKind, id: &str) -> String {
+    match kind {
+        ItemKind::Symbol => format!("symbol {id}"),
+        ItemKind::Part => format!("part {id}"),
+    }
+}
+
+/// Whether the session's project locks the item [`item_name`] names.
+fn session_has(auth: &Project, name: &str) -> bool {
+    match name.split_once(' ') {
+        Some(("symbol", id)) => auth.lock.symbols.contains_key(id),
+        Some(("part", id)) => auth.lock.parts.contains_key(id),
+        _ => false,
+    }
+}
+
+/// What [`new_items`] found.
+#[derive(Debug, Default)]
+pub struct NewItems {
+    /// The edit that adds them, with their files.
+    pub edit: Option<ProjectEdit>,
+    /// The items it holds, as [`item_name`] names them.
+    pub sent: Vec<String>,
+    /// Items whose file could not be read, with the reason; they are not sent.
+    pub unreadable: Vec<(String, String)>,
+}
+
+/// The symbols and parts locked in `local` and not in the session's project `auth`, with their
+/// vendored files from `dir`, as one edit: what this person started using. Items named in
+/// `skip` (sent and not answered yet) are left out. An item whose file cannot be read is not
+/// sent; it is returned with the reason and tried again next time.
+pub fn new_items(dir: &Path, local: &Project, auth: &Project, skip: &std::collections::BTreeSet<String>) -> NewItems {
+    let mut out = NewItems::default();
     let fresh = |kind: ItemKind| {
         local
             .lock
             .map(kind)
             .iter()
-            .filter(move |(id, _)| !base.lock.map(kind).contains_key(*id))
+            .filter(move |(id, _)| !auth.lock.map(kind).contains_key(*id))
+            .filter(move |(id, _)| !skip.contains(&item_name(kind, id)))
             .map(|(id, e)| (id.clone(), e.source.clone()))
+            .collect::<Vec<_>>()
     };
-    let symbols: Vec<(Symbol, String)> = fresh(ItemKind::Symbol)
-        .filter_map(|(id, source)| Some((store::read_vendored_symbol(dir, &id).ok()?, source)))
-        .collect();
-    let parts: Vec<(Part, String)> = fresh(ItemKind::Part)
-        .filter_map(|(id, source)| Some((store::read_vendored_part(dir, &id).ok()?, source)))
-        .collect();
-    (!symbols.is_empty() || !parts.is_empty()).then_some(ProjectEdit::AddItems { symbols, parts })
+    let mut symbols = Vec::new();
+    for (id, source) in fresh(ItemKind::Symbol) {
+        match store::read_vendored_symbol(dir, &id) {
+            Ok(s) => {
+                out.sent.push(item_name(ItemKind::Symbol, &id));
+                symbols.push((s, source));
+            }
+            Err(e) => out.unreadable.push((item_name(ItemKind::Symbol, &id), e.to_string())),
+        }
+    }
+    let mut parts = Vec::new();
+    for (id, source) in fresh(ItemKind::Part) {
+        match store::read_vendored_part(dir, &id) {
+            Ok(p) => {
+                out.sent.push(item_name(ItemKind::Part, &id));
+                parts.push((p, source));
+            }
+            Err(e) => out.unreadable.push((item_name(ItemKind::Part, &id), e.to_string())),
+        }
+    }
+    out.edit = (!symbols.is_empty() || !parts.is_empty()).then_some(ProjectEdit::AddItems { symbols, parts });
+    out
 }
 
-/// Write the session's files for items `open` locks but has not loaded (symbols and parts
-/// someone else added) into its vendor folder, and load them. Returns the ids that could not
+/// Write the session's files for items `open` locks but has not loaded in the locked version
+/// (symbols and parts someone else added, or used first in another version) into its vendor
+/// folder, and load them. Returns the ids that could not
 /// be written.
 pub fn take_files(open: &mut Open, symbols: &BTreeMap<String, Symbol>, parts: &BTreeMap<String, Part>) -> Vec<String> {
     let mut failed = Vec::new();
@@ -396,9 +462,9 @@ pub fn take_files(open: &mut Open, symbols: &BTreeMap<String, Symbol>, parts: &B
         .project
         .lock
         .symbols
-        .keys()
-        .filter(|id| !open.symbols.contains_key(*id))
-        .cloned()
+        .iter()
+        .filter(|(id, e)| open.symbols.get(*id).is_none_or(|s| s.hash() != e.hash))
+        .map(|(id, _)| id.clone())
         .collect();
     for id in wanted {
         let Some(s) = symbols.get(&id) else { continue };
@@ -413,9 +479,9 @@ pub fn take_files(open: &mut Open, symbols: &BTreeMap<String, Symbol>, parts: &B
         .project
         .lock
         .parts
-        .keys()
-        .filter(|id| !open.parts.contains_key(*id))
-        .cloned()
+        .iter()
+        .filter(|(id, e)| open.parts.get(*id).is_none_or(|p| p.hash() != e.hash))
+        .map(|(id, _)| id.clone())
         .collect();
     for id in wanted {
         let Some(p) = parts.get(&id) else { continue };
@@ -429,22 +495,43 @@ pub fn take_files(open: &mut Open, symbols: &BTreeMap<String, Symbol>, parts: &B
     failed
 }
 
-/// The project's vendored symbol and part files in `dir`, for every item its lock lists that
-/// has one.
-fn vendored_files(dir: &Path, project: &Project) -> (BTreeMap<String, Symbol>, BTreeMap<String, Part>) {
-    let symbols = project
-        .lock
-        .symbols
-        .keys()
-        .filter_map(|id| Some((id.clone(), store::read_vendored_symbol(dir, id).ok()?)))
-        .collect();
-    let parts = project
-        .lock
-        .parts
-        .keys()
-        .filter_map(|id| Some((id.clone(), store::read_vendored_part(dir, id).ok()?)))
-        .collect();
-    (symbols, parts)
+/// The project's vendored files in `dir`, as read for a session.
+struct Files {
+    symbols: BTreeMap<String, Symbol>,
+    parts: BTreeMap<String, Part>,
+    /// Locked items whose file could not be read: `symbol id (reason)`.
+    unreadable: Vec<String>,
+}
+
+/// The project's vendored symbol and part files in `dir`, for every item its lock lists; the
+/// ones that cannot be read are named with the reason.
+fn vendored_files(dir: &Path, project: &Project) -> Files {
+    let mut files = Files {
+        symbols: BTreeMap::new(),
+        parts: BTreeMap::new(),
+        unreadable: Vec::new(),
+    };
+    for id in project.lock.symbols.keys() {
+        match store::read_vendored_symbol(dir, id) {
+            Ok(s) => {
+                files.symbols.insert(id.clone(), s);
+            }
+            Err(e) => files
+                .unreadable
+                .push(format!("{} ({e})", item_name(ItemKind::Symbol, id))),
+        }
+    }
+    for id in project.lock.parts.keys() {
+        match store::read_vendored_part(dir, id) {
+            Ok(p) => {
+                files.parts.insert(id.clone(), p);
+            }
+            Err(e) => files
+                .unreadable
+                .push(format!("{} ({e})", item_name(ItemKind::Part, id))),
+        }
+    }
+    files
 }
 
 /// The host's side: the session itself, the connections and the announcement.
@@ -576,7 +663,9 @@ impl Role {
                 // it again then gives the same result, so every copy ends up the same. Whole
                 // pages wait for the host: it refuses them when someone else changed one first,
                 // and applying them here would hide that change until the next join.
-                if !matches!(edit, ProjectEdit::SetPages { .. })
+                // Symbols and parts wait for the host too: it refuses one the session has in
+                // another version, or cannot store, and this copy must not count it as taken.
+                if !matches!(edit, ProjectEdit::SetPages { .. } | ProjectEdit::AddItems { .. })
                     && let Some(p) = j.guest.project.as_mut()
                 {
                     apply_edit(p, &edit);
@@ -783,7 +872,31 @@ pub struct Share {
     /// An undo, redo or revert was asked for since the last sync: its restoration wins over
     /// local changes made in the meantime to the same pages.
     took_back: bool,
+    /// Symbols and parts sent to the session that it has not taken yet, by [`item_name`]. Other
+    /// changes wait while one is on its way, so a page never reaches the session before what it
+    /// draws.
+    items_out: BTreeMap<String, ItemOut>,
+    /// Items whose file could not be read, reported once each.
+    unreadable: std::collections::BTreeSet<String>,
 }
+
+/// One symbol or part sent to the session and not taken yet.
+#[derive(Debug, Clone, Copy)]
+struct ItemOut {
+    at: std::time::Instant,
+    tries: u32,
+    /// Not taken after [`ITEM_TRIES`] tries: no longer sent, and changes no longer wait for it.
+    gave_up: bool,
+}
+
+/// How long an item sent to the session may take to be answered before it is sent again.
+const ITEM_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(100)
+} else {
+    std::time::Duration::from_secs(5)
+};
+/// How often an item is sent before changes stop waiting for it.
+const ITEM_TRIES: u32 = 3;
 
 impl Share {
     pub fn active(&self) -> bool {
@@ -920,8 +1033,14 @@ impl Share {
             }
         };
         let mut host = Host::new(open.project.clone(), name, email, Box::new(journal));
-        let (symbols, parts) = vendored_files(&open.dir, &open.project);
-        host.share_files(symbols, parts);
+        let files = vendored_files(&open.dir, &open.project);
+        if !files.unreadable.is_empty() {
+            self.notes.push(format!(
+                "These files could not be read, so guests without the libraries cannot draw them: {}",
+                files.unreadable.join(", ")
+            ));
+        }
+        host.share_files(files.symbols, files.parts);
         self.role = Some(Role::Host(Box::new(Hosting {
             host,
             hub: Hub::new(),
@@ -1052,9 +1171,53 @@ impl Share {
         }
         let mine = page.as_deref().filter(|p| role.holds(p));
         let me = role.me().unwrap_or(HOST);
-        // Symbols and parts used for the first time go out first, whatever happens to the rest:
-        // pages that draw them may follow in this edit or a later one.
-        let items = new_items(&open.dir, &open.project, base);
+        // Symbols and parts used for the first time go out first. Until the session has them,
+        // the changes that may draw them wait in the window: a page must not reach the session
+        // without its symbols, and an item the session refused is sent again a few times.
+        let auth = role.project()?;
+        self.items_out.retain(|name, _| !session_has(auth, name));
+        for (name, out) in self.items_out.iter_mut() {
+            if !out.gave_up && out.tries >= ITEM_TRIES && out.at.elapsed() >= ITEM_WAIT {
+                out.gave_up = true;
+                self.notes.push(format!(
+                    "The session did not take {name}; your changes that use it are sent without it."
+                ));
+            }
+        }
+        let skip = self
+            .items_out
+            .iter()
+            .filter(|(_, o)| o.gave_up || o.at.elapsed() < ITEM_WAIT)
+            .map(|(n, _)| n.clone())
+            .collect();
+        let items = new_items(&open.dir, &open.project, auth, &skip);
+        for (name, why) in &items.unreadable {
+            if self.unreadable.insert(name.clone()) {
+                self.notes.push(format!(
+                    "The file of {name} could not be read ({why}); others cannot draw it until it can."
+                ));
+            }
+        }
+        let now = std::time::Instant::now();
+        for name in &items.sent {
+            self.unreadable.remove(name);
+            let out = self.items_out.entry(name.clone()).or_insert(ItemOut {
+                at: now,
+                tries: 0,
+                gave_up: false,
+            });
+            out.at = now;
+            out.tries += 1;
+        }
+        if let Some(edit) = items.edit {
+            role.edit_project(edit, &mut self.notes);
+            role.pump(&mut self.notes);
+            let auth = role.project()?;
+            self.items_out.retain(|name, _| !session_has(auth, name));
+        }
+        if self.items_out.values().any(|o| !o.gave_up) {
+            return None;
+        }
         let mut out = outgoing(&open.project, base, mine, &role.locks(), me);
         if !out.dropped.is_empty() {
             // One action is kept whole or not at all: a device renamed on two pages must not
@@ -1066,8 +1229,8 @@ impl Share {
             out.page = None;
             out.edits.clear();
         }
-        let sent = out.page.is_some() || !out.edits.is_empty() || items.is_some();
-        for edit in items.into_iter().chain(out.edits) {
+        let sent = out.page.is_some() || !out.edits.is_empty();
+        for edit in out.edits {
             role.edit_project(edit, &mut self.notes);
         }
         if let Some(p) = out.page {
@@ -1078,6 +1241,13 @@ impl Share {
             role.pump(&mut self.notes);
         }
         let auth = role.project()?;
+        let conflicting = conflicts(&open.project, auth);
+        if !conflicting.is_empty() {
+            self.notes.push(format!(
+                "Someone else used {} first in another version; your copy now uses theirs.",
+                conflicting.join(", ")
+            ));
+        }
         let changed = incoming(&mut open.project, auth);
         let (symbols, parts) = role.files();
         let failed = take_files(open, symbols, parts);
