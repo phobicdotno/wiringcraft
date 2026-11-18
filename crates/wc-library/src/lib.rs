@@ -353,6 +353,17 @@ impl Unpinned {
 
 /// Pin every used item that is not pinned yet. Items it cannot pin are returned.
 pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) -> Result<Unpinned> {
+    lock_missing_then(project_dir, project, lib, || {})
+}
+
+/// [`lock_missing`], calling `after_scan` between reading the library's state and taking the
+/// items, so a test can change a library file in between.
+fn lock_missing_then(
+    project_dir: &Path,
+    project: &mut Project,
+    lib: &Library,
+    mut after_scan: impl FnMut(),
+) -> Result<Unpinned> {
     let mut left = Unpinned::default();
     let mut todo = Vec::new();
     for s in status(project_dir, project, lib) {
@@ -363,6 +374,7 @@ pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) ->
             _ => {}
         }
     }
+    after_scan();
     for (kind, id) in todo {
         match take(project_dir, project, lib, kind, &id) {
             Ok(_) => {}

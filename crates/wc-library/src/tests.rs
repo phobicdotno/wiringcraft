@@ -228,7 +228,7 @@ fn a_library_file_declaring_another_id_is_not_taken() -> std::result::Result<(),
         .ok_or("taken")?;
     assert!(err.to_string().contains("declares id \"other\""), "{err}");
     assert!(!f.project.lock.symbols.contains_key("fake"), "not pinned");
-    assert!(is_wrong_id(&err), "lock_missing reports it and goes on: {err:?}");
+    assert!(is_wrong_id(&err), "classified as a wrong-id refusal: {err:?}");
     let missing = take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "nope")
         .err()
         .ok_or("taken")?;
@@ -340,5 +340,44 @@ fn a_library_file_declaring_another_id_is_no_update_and_nothing_to_pin()
         (ItemKind::Symbol, "coil")
     );
     assert!(left.wrong_id[0].2.contains("declares id \"other\""), "{left:?}");
+    Ok(())
+}
+
+#[test]
+fn lock_missing_reports_a_file_that_turns_wrong_after_the_scan_and_pins_the_rest() -> Result<()> {
+    let mut f = fixture()?;
+    for id in ["aa", "bb", "cc"] {
+        write_symbol(&f.company, &sym(id, 5.0))?;
+        f.project.pages[0].symbols.push(PlacedSymbol {
+            id: format!("s-{id}"),
+            symbol: id.into(),
+            at: Point::new(30.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        });
+    }
+    let lib = Library::open(&f.proj, &f.project)?;
+    let bb = f.company.join("symbols").join("bb.json");
+    let company = f.company.clone();
+    let mut changed = Ok(());
+    let left = lock_missing_then(&f.proj, &mut f.project, &lib, || {
+        // After the scan saw `bb` as not pinned, its file starts declaring another id.
+        changed = write_symbol(&company, &sym("zz", 7.0))
+            .and_then(|zz| std::fs::rename(&zz, &bb).map_err(|e| wc_core::Error::io("rename", e).into()));
+    })?;
+    changed?;
+    assert_eq!(left.wrong_id.len(), 1, "{left:?}");
+    assert_eq!(
+        (left.wrong_id[0].0, left.wrong_id[0].1.as_str()),
+        (ItemKind::Symbol, "bb")
+    );
+    assert!(left.wrong_id[0].2.contains("declares id \"zz\""), "{left:?}");
+    assert!(left.missing.is_empty(), "{left:?}");
+    // Pinned before the refusal and after it; the refused one is not.
+    for id in ["aa", "cc", "coil"] {
+        assert!(f.project.lock.symbols.contains_key(id), "{id} pinned");
+    }
+    assert!(!f.project.lock.symbols.contains_key("bb"));
     Ok(())
 }
