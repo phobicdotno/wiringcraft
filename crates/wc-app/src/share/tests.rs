@@ -580,6 +580,43 @@ fn a_change_to_a_free_page_made_before_someone_elses_change_arrived_is_not_kept(
 }
 
 #[test]
+fn a_tag_renamed_on_your_own_page_and_in_the_device_list_is_one_change() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        // A coil on page 3, the page the guest will have open.
+        o.place(2, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let before = log.messages().len();
+    let old = guest_open
+        .project
+        .page("p0003")
+        .and_then(|p| p.symbols.first())
+        .and_then(|s| s.tag.clone())
+        .ok_or("the coil has no tag")?;
+    let new = DeviceTag::parse("-K7")?;
+
+    // The guest renames the coil's tag: the device list and its own open page change together.
+    assert!(guest_open.project.rename_device(&old, &new) > 0);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    assert_eq!(log.messages().len(), before + 1, "{:?}", &log.messages()[before..]);
+    assert!(host_open.project.devices.contains_key(&new));
+    assert!(!host_open.project.devices.contains_key(&old));
+    assert_eq!(
+        host_open
+            .project
+            .page("p0003")
+            .and_then(|p| p.symbols.first())
+            .and_then(|s| s.tag.clone()),
+        Some(new)
+    );
+    assert_eq!(host_open.project.pages, guest_open.project.pages);
+    Ok(())
+}
+
+#[test]
 fn a_change_to_your_own_page_and_a_device_is_refused_whole() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let k1 = DeviceTag::parse("-K1")?;
