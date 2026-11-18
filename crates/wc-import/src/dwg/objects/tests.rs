@@ -493,10 +493,12 @@ fn sample(v: Version) -> Vec<Obj> {
         .bd(0.0)
         .bd(std::f64::consts::FRAC_PI_2);
     objs.push(a);
-    // Closed, with vertex ids: their count is there from 2010 on only.
+    // Closed; from 2010 on with vertex ids too, their count before the points and the ids
+    // after them.
+    let ids = v == Version::R2010;
     let mut p = entity(v, 77, 0x42, relay);
-    p.data.bs(512 | 1024).bl(3);
-    if v == Version::R2010 {
+    p.data.bs(if ids { 512 | 1024 } else { 512 }).bl(3);
+    if ids {
         p.data.bl(3);
     }
     p.data
@@ -506,6 +508,9 @@ fn sample(v: Version) -> Vec<Obj> {
         .dd(0.0, 0.0)
         .dd(4.0, 4.0)
         .dd(3.0, 0.0);
+    if ids {
+        p.data.bl(1).bl(2).bl(3);
+    }
     objs.push(p);
     let mut t = entity(v, 1, 0x43, relay);
     text_data(&mut t, (1.0, 2.0), "K1", 3.5, std::f64::consts::FRAC_PI_2);

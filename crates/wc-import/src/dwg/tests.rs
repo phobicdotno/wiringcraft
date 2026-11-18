@@ -1330,11 +1330,27 @@ fn a_2007_page_claiming_more_than_its_page_is_refused() {
         data: noise(300, 3),
         stored: true,
         plain: true,
-        claimed_extra: 0x10_0000,
+        // The page takes 512 bytes; 300 + 0x100 stored bytes reach past it but stay inside
+        // the file (the section map follows), so only the page's extent refuses them.
+        claimed_extra: 0x100,
         ..TestSection::default()
     };
-    let m = error_of(&write_dwg_2007(&[section]));
-    assert!(m.contains("AcDb:Classes") && m.contains("page 1"), "{m}");
+    let file = write_dwg_2007(&[section]);
+    assert!(file.len() > 0x480 + 300 + 0x100);
+    let m = error_of(&file);
+    assert!(
+        m.contains("AcDb:Classes") && m.contains("page 1") && m.contains("reaches past its page"),
+        "{m}"
+    );
+}
+
+#[test]
+fn a_2007_section_too_large_to_allocate_gives_an_error() {
+    // Past what a Vec may hold: refused with an error, not an abort, also without a limit.
+    let huge = |m: &mut Vec<u8>| m[..8].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    let file = write_dwg_2007_with(&sample_sections()[..1], &huge, &|_| {});
+    let m = read_sections_with(&file, usize::MAX).map_err(|e| e.to_string());
+    assert!(m.as_ref().is_err_and(|m| m.contains("cannot be allocated")), "{m:?}");
 }
 
 #[test]
@@ -1374,9 +1390,17 @@ fn cut_or_flipped_2007_files_give_errors_not_panics() -> TestResult {
         damaged[at] ^= 1 << (i % 8);
         let _ = read_sections(&damaged);
     }
-    // Every byte of the file header's words and of the maps, each set to 0xFF.
+    // Every byte of the file header's words is part of a checked code word: any change to
+    // one is refused.
+    for at in 0x80..0x80 + 3 * 255 {
+        let mut damaged = file.clone();
+        damaged[at] ^= 0x01;
+        assert!(read_sections(&damaged).is_err(), "header byte {at:#x} changed");
+    }
+    // The maps and the pages before them, each byte set to 0xFF: only no panic is asked
+    // here, as this range also holds padding after the code words that is never read.
     let maps = page_map.saturating_sub(0x1000)..file.len() - 0x400;
-    for at in (0x80..0x80 + 3 * 255).chain(maps) {
+    for at in maps {
         let mut damaged = file.clone();
         damaged[at] = 0xFF;
         let _ = read_sections(&damaged);
@@ -1424,13 +1448,29 @@ fn hostile_2007_maps_that_are_good_code_words_give_errors() {
         p[24..32].copy_from_slice(&first);
     });
     assert!(m.contains("listed twice"), "{m}");
+    // The section map's entry shrunk to 32 bytes, with unused space (a negative number) for
+    // the rest, so that the page map after it stays where the header puts it.
     let m = message(&no_sections, &|p: &mut Vec<u8>| {
         let at = p.len() - 32;
+        let mut size = [0u8; 8];
+        size.copy_from_slice(&p[at..at + 8]);
+        let rest = u64::from_le_bytes(size) - 0x20;
         p[at..at + 8].copy_from_slice(&0x20u64.to_le_bytes());
+        let filler: Vec<u8> = rest.to_le_bytes().into_iter().chain((-1i64).to_le_bytes()).collect();
+        p.splice(at + 16..at + 16, filler);
     });
     assert!(m.contains("section map") && m.contains("reaches past its page"), "{m}");
     let m = message(&no_sections, &|p: &mut Vec<u8>| p.extend([0u8; 8]));
     assert!(m.contains("page map ends inside an entry"), "{m}");
+    // The page map's own entry (the last) too small for what was read of it.
+    let m = message(&no_sections, &|p: &mut Vec<u8>| {
+        let at = p.len() - 16;
+        p[at..at + 8].copy_from_slice(&0x20u64.to_le_bytes());
+    });
+    assert!(m.contains("page map (page") && m.contains("with 32 bytes"), "{m}");
+    // A name length one byte past the name's.
+    let m = message(&set(0x20, 25), &no_map);
+    assert!(m.contains("odd length (25 bytes)"), "{m}");
     // The section map cut inside its last description (the unnamed one at the end).
     let m = message(&|m: &mut Vec<u8>| m.truncate(m.len() - 8), &no_map);
     assert!(m.contains("section map ends inside a section description"), "{m}");

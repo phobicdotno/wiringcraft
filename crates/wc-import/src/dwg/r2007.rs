@@ -114,7 +114,7 @@ pub(super) fn read_sections(bytes: &[u8], max_total: usize) -> Result<Sections> 
         .u64(0x38)?
         .checked_add(PAGES_START)
         .ok_or_else(|| bad("the page map address is out of range"))?;
-    let page_map = system_page(
+    let (page_map, page_map_length) = system_page(
         bytes,
         page_map_at,
         None,
@@ -126,13 +126,23 @@ pub(super) fn read_sections(bytes: &[u8], max_total: usize) -> Result<Sections> 
         "page map",
     )?;
     let pages = parse_page_map(&page_map, bytes.len())?;
+    // The page map lists itself: there it must be where the header puts it, and at least as
+    // long as what was read of it before its size was known.
+    let page_map_id = h.u64(0x40)?;
+    if let Some(&(at, extent)) = pages.get(&page_map_id)
+        && (at != page_map_at || extent < page_map_length)
+    {
+        return Err(bad(format!(
+            "the page map (page {page_map_id}) is listed at {at:#x} with {extent} bytes, but is read at {page_map_at:#x} with {page_map_length}"
+        )));
+    }
     let section_map_id = h.u64(0xC0)?;
     let (section_map_at, extent) = *pages.get(&section_map_id).ok_or_else(|| {
         bad(format!(
             "the section map (page {section_map_id}) is not in the page map"
         ))
     })?;
-    let section_map = system_page(
+    let (section_map, _) = system_page(
         bytes,
         section_map_at,
         Some(extent),
@@ -200,8 +210,9 @@ struct Stored {
 }
 
 /// Read a system page (page map or section map) at `at`. `extent` is the page's size from the
-/// page map, which it stays in (the page map itself is read before there is one).
-fn system_page(bytes: &[u8], at: u64, extent: Option<u64>, how: Stored, what: &str) -> Result<Vec<u8>> {
+/// page map, which it stays in (the page map itself is read before there is one). Gives the
+/// data and the length of the code words read.
+fn system_page(bytes: &[u8], at: u64, extent: Option<u64>, how: Stored, what: &str) -> Result<(Vec<u8>, u64)> {
     let start = offset(at, bytes.len(), what)?;
     let size = to_usize(u32::try_from(how.size).unwrap_or(u32::MAX), MAX_PAGE, what)?;
     let compressed = to_usize(u32::try_from(how.compressed).unwrap_or(u32::MAX), MAX_PAGE, what)?;
@@ -223,7 +234,8 @@ fn system_page(bytes: &[u8], at: u64, extent: Option<u64>, how: Stored, what: &s
     let packed = data
         .get(..compressed)
         .ok_or_else(|| bad(format!("the {what} is cut off")))?;
-    unpack(packed, size).map_err(|e| bad(format!("the {what}: {e}")))
+    let data = unpack(packed, size).map_err(|e| bad(format!("the {what}: {e}")))?;
+    Ok((data, length))
 }
 
 /// Data stored compressed when that made it shorter, else as it is.
@@ -290,7 +302,12 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
         let page_count = r.u64(pos + 0x38)?;
         pos += SECTION_DESCRIPTION;
         index += 1;
-        // The name in UTF-16, its length in bytes with the ending zero.
+        // The name in UTF-16, its length in bytes with the ending zero: even (0 for none).
+        if !name_len.is_multiple_of(2) {
+            return Err(bad(format!(
+                "a section name in the section map has an odd length ({name_len} bytes)"
+            )));
+        }
         let name_len = usize::try_from(name_len)
             .ok()
             .filter(|n| *n as u64 <= MAX_NAME && pos + n <= map.len())
@@ -321,7 +338,11 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
             1 => false,
             e => return Err(bad(format!("section {name} has unknown encoding {e}"))),
         };
-        let mut data = vec![0u8; size];
+        // Allocated fallibly: a caller's limit may let a size through that memory cannot hold.
+        let mut data = Vec::new();
+        data.try_reserve_exact(size)
+            .map_err(|e| bad(format!("section {name} ({size} bytes) cannot be allocated: {e}")))?;
+        data.resize(size, 0);
         // Every page listed so far, by start: a start may only be listed again for the same
         // page with the same sizes and checksum. Empty pages are in here too.
         let mut listed: BTreeMap<usize, PageEntry> = BTreeMap::new();
