@@ -6,6 +6,7 @@ pub mod aml;
 pub mod archive;
 pub mod bmecat;
 pub mod csv;
+pub mod dwg;
 pub mod dxf;
 pub mod edz;
 pub mod eplan;
