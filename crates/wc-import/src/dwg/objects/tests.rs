@@ -1115,3 +1115,45 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
         ],
     )
 }
+
+/// A BLOCK_HEADER with every field up to its base point.
+fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64)) -> Obj {
+    let mut o = entry(v, BLOCK_HEADER, handle, name);
+    o.data.b(false).bs(0);
+    for _ in 0..6 {
+        o.data.b(false);
+    }
+    o.data.bl(1).bd3((base.0, base.1, 0.0));
+    o
+}
+
+#[test]
+fn a_block_is_placed_by_its_base_point() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            block_header(v, 0x100, "B", (5.0, 5.0)),
+            line(v, 0x200, head(Some(0x100)), (5.0, 5.0), (10.0, 5.0)),
+            {
+                let mut i = entity(v, 7, 0x201, head(None));
+                i.data.bd3((0.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+                i.handles.h(5, 0x100);
+                i
+            },
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(
+            has_line(&d.model, Point::new(0.0, 0.0), Point::new(5.0, 0.0)),
+            "{v:?}: {:?}",
+            d.model
+        );
+        // The block on its own keeps its coordinates.
+        assert!(
+            has_line(&d.blocks["B"], Point::new(5.0, -5.0), Point::new(10.0, -5.0)),
+            "{:?}",
+            d.blocks["B"]
+        );
+    }
+    Ok(())
+}

@@ -53,6 +53,9 @@ impl Entity {
 pub(crate) struct Drawing {
     pub(crate) entities: Vec<Entity>,
     pub(crate) blocks: BTreeMap<String, Vec<Entity>>,
+    /// The base point of each block that has one other than (0, 0): the point of the block an
+    /// INSERT puts on its insertion point.
+    pub(crate) bases: BTreeMap<String, (f64, f64)>,
 }
 
 /// The most entities one import draws, block references expanded: a few nested blocks that
@@ -158,7 +161,12 @@ fn parse(text: &str) -> Result<Drawing> {
         if code == 0 {
             if let Some(e) = current.take() {
                 if e.kind == "BLOCK" {
-                    block = Some((e.get(2).unwrap_or("").to_owned(), Vec::new()));
+                    let name = e.get(2).unwrap_or("").to_owned();
+                    let base = (e.f(10), e.f(20));
+                    if base != (0.0, 0.0) {
+                        d.bases.insert(name.clone(), base);
+                    }
+                    block = Some((name, Vec::new()));
                 } else if e.kind == "ENDBLK" {
                     if let Some((name, ents)) = block.take() {
                         d.blocks.insert(name, ents);
@@ -220,6 +228,10 @@ impl Xf {
             at,
             rot,
         }
+    }
+    /// A move by `by`.
+    fn shift(by: (f64, f64)) -> Xf {
+        Xf { at: by, ..Xf::ID }
     }
     /// DXF coordinates (y up) to DXF coordinates.
     fn apply(&self, x: f64, y: f64) -> (f64, f64) {
@@ -417,8 +429,17 @@ fn shapes(
                 None
             }
             "INSERT" => {
-                if let Some(inner) = e.get(2).and_then(|n| d.blocks.get(n)) {
-                    let ixf = Xf::insert((e.f(10), e.f(20)), e.f_or(41, 1.0), e.f_or(42, 1.0), e.f(50)).then(&xf);
+                if let Some((name, inner)) = e.get(2).and_then(|n| d.blocks.get_key_value(n)) {
+                    // The block's base point goes on the insertion point.
+                    let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
+                    let ixf = Xf::shift((-bx, -by))
+                        .then(&Xf::insert(
+                            (e.f(10), e.f(20)),
+                            e.f_or(41, 1.0),
+                            e.f_or(42, 1.0),
+                            e.f(50),
+                        ))
+                        .then(&xf);
                     shapes(
                         d,
                         inner,
@@ -1827,5 +1848,29 @@ mod tests {
             plain.iter().any(|p| (p.0.hypot(p.1) - 1.0).abs() > 0.01),
             "unweighted is no circle"
         );
+    }
+
+    #[test]
+    fn a_block_is_placed_by_its_base_point() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nB\n10\n5\n20\n5\n0\nLINE\n10\n5\n20\n5\n11\n10\n21\n5\n0\nENDBLK\n";
+        let (g, _) = drawn("0\nINSERT\n2\nB\n10\n0\n20\n0\n", blocks)?;
+        // (0, 0) to (5, 0) in DXF coordinates; page coordinates flip y.
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(5.0, 0.0)
+            }]
+        );
+        // Turned and scaled about the base point too: (5, 5) stays on the insertion point.
+        let (g, _) = drawn("0\nINSERT\n2\nB\n10\n100\n20\n0\n41\n2\n50\n90\n", blocks)?;
+        let placed = |s: &Shape| match s {
+            Shape::Line { a, b } => {
+                a.distance(Point::new(100.0, 0.0)) < 1e-9 && b.distance(Point::new(100.0, -10.0)) < 1e-9
+            }
+            _ => false,
+        };
+        assert!(g.len() == 1 && g.iter().all(placed), "{g:?}");
+        Ok(())
     }
 }

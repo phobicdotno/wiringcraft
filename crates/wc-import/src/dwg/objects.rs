@@ -322,6 +322,8 @@ struct Decoded {
     items: Vec<Item>,
     /// Block names by the handle of their BLOCK_HEADER.
     blocks: HashMap<u64, String>,
+    /// Block base points other than (0, 0), by the handle of their BLOCK_HEADER.
+    bases: HashMap<u64, (f64, f64)>,
     /// Layer names by handle.
     layers: HashMap<u64, String>,
     /// Invisible entities, whose vertices and attributes are left out with them.
@@ -384,6 +386,23 @@ fn read_entity(kind: u16) -> Option<&'static str> {
     })
 }
 
+/// The base point of a BLOCK_HEADER whose name has been read.
+fn block_base(o: &mut Object) -> Result<(f64, f64)> {
+    // 64-flag, xref index, xref dependent, anonymous, has attributes, is xref, overlaid xref,
+    // loaded; then the number of objects it owns.
+    o.data.b()?;
+    o.data.bs()?;
+    for _ in 0..6 {
+        o.data.b()?;
+    }
+    o.data.bl()?;
+    let (x, y, _) = o.data.bd3()?;
+    if !(x.is_finite() && y.is_finite()) {
+        return Err(bad("a block's base point is not a number"));
+    }
+    Ok((x, y))
+}
+
 /// Decode the object at `at` into `out`.
 fn decode(
     objects: &[u8],
@@ -403,12 +422,17 @@ fn decode(
         o.data.bl()?;
         o.data.b()?;
         let name = o.text()?;
-        let table = if o.kind == LAYER {
-            &mut out.layers
+        if o.kind == LAYER {
+            out.layers.insert(handle, name);
         } else {
-            &mut out.blocks
-        };
-        table.insert(handle, name);
+            // A base point that cannot be read leaves the block at (0, 0) rather than unnamed.
+            if let Ok(base) = block_base(&mut o)
+                && base != (0.0, 0.0)
+            {
+                out.bases.insert(handle, base);
+            }
+            out.blocks.insert(handle, name);
+        }
         return Ok(());
     }
     if let Some(name) = unread_entity(o.kind) {
@@ -794,6 +818,7 @@ impl Decoded {
         let Decoded {
             items,
             blocks,
+            bases,
             layers,
             hidden,
         } = self;
@@ -809,9 +834,12 @@ impl Decoded {
             }
         }
         let mut d = dxf::Drawing::default();
-        for name in blocks.values() {
+        for (h, name) in &blocks {
             if !is_space(name) {
                 d.blocks.entry(name.clone()).or_default();
+                if let Some(base) = bases.get(h) {
+                    d.bases.insert(name.clone(), *base);
+                }
             }
         }
         for item in &items {
