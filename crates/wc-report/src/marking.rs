@@ -501,7 +501,7 @@ pub fn formula_warnings(t: &Table) -> Vec<String> {
 }
 
 /// Whether `s` is written exactly as a device tag is (`-K1`, `=A+C1-K1`, a number such as `-1`).
-fn is_tag(s: &str) -> bool {
+pub(crate) fn is_tag(s: &str) -> bool {
     DeviceTag::parse(s).is_ok_and(|t| t.to_string() == s)
 }
 
@@ -509,7 +509,9 @@ fn is_tag(s: &str) -> bool {
 /// a header row and CRLF line ends. Fields are quoted when they contain `;`, `"` or a line end.
 pub fn to_smartscript_csv(t: &Table) -> String {
     let mut out = String::from('\u{feff}');
-    out.push_str(&t.to_csv_with(';'));
+    // As it is: smartScript prints the text on the marker, and `formula_warnings` (or the
+    // configurator's own guard) has told the user about texts a spreadsheet would run.
+    out.push_str(&t.to_csv_raw_with(';'));
     out
 }
 
