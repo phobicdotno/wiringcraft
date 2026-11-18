@@ -1469,6 +1469,11 @@ fn overlapping_2007_pages_are_refused() -> TestResult {
     let moved = |m: &mut Vec<u8>| m[at..at + 8].copy_from_slice(&((MAX_PAGE_DATA - 0x100) as u64).to_le_bytes());
     let m = error_of(&write_dwg_2007_with(&section(), &moved, &|_| {}));
     assert!(m.contains("page 2 overlaps another page"), "{m}");
+    // The second page at the first page's start: refused before it overwrites it, whatever the
+    // pages' lengths.
+    let same = |m: &mut Vec<u8>| m[at..at + 8].copy_from_slice(&0u64.to_le_bytes());
+    let m = error_of(&write_dwg_2007_with(&section(), &same, &|_| {}));
+    assert!(m.contains("page 2 starts where page 1 does"), "{m}");
     // A page listed again at the same place is not an overlap.
     let again = vec![TestSection {
         listed_again: 1,

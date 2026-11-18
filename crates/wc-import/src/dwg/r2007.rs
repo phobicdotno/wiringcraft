@@ -324,7 +324,7 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
         let mut data = vec![0u8; size];
         // Where each page's bytes go, by start: pages may not overlap, but a page may be
         // listed again at the same place.
-        let mut spans: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut spans: BTreeMap<usize, (u64, usize)> = BTreeMap::new();
         for i in 0..page_count as usize {
             let at = list + i * PAGE_DESCRIPTION;
             let page = PageEntry {
@@ -346,21 +346,30 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
                 .ok_or_else(|| bad(format!("section {name}, page {number} starts past its end")))?;
             let read = data_page(bytes, address, extent, &page, interleaved, &mut budget)
                 .map_err(|e| bad(format!("section {name}, page {number}: {e}")))?;
-            let to = start
+            let end = start
                 .checked_add(read.len())
-                .and_then(|end| data.get_mut(start..end))
+                .filter(|e| *e <= data.len())
                 .ok_or_else(|| bad(format!("section {name}, page {number} reaches past its end")))?;
-            to.copy_from_slice(&read);
-            let end = start + read.len();
+            // Pages may not overlap; the same page may be listed again at its own start, but a
+            // different page at a start already used is refused before it is copied.
+            if let Some(&(other, other_end)) = spans.get(&start)
+                && (other != number || other_end != end)
+            {
+                return Err(bad(format!(
+                    "section {name}, page {number} starts where page {other} does"
+                )));
+            }
             if end > start {
-                let before = spans.range(..start).next_back().is_some_and(|(_, e)| *e > start);
+                let before = spans.range(..start).next_back().is_some_and(|(_, (_, e))| *e > start);
                 let after = spans.range(start + 1..).next().is_some_and(|(s, _)| *s < end);
                 if before || after {
                     return Err(bad(format!("section {name}, page {number} overlaps another page")));
                 }
-                let longest = spans.get(&start).map_or(end, |e| end.max(*e));
-                spans.insert(start, longest);
             }
+            if let Some(to) = data.get_mut(start..end) {
+                to.copy_from_slice(&read);
+            }
+            spans.insert(start, (number, end));
         }
         total += size;
         sections.push(Section { name, id: index, data });
