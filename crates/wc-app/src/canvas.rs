@@ -1842,6 +1842,19 @@ mod tests {
             &open.project.pages[0].graphics[..],
             [Shape::Polyline { points, .. }] if points.len() == 2
         ));
+        // A quick click on a new point C after B adds it (even though egui may count it as a
+        // double- or triple-click); a quick second click on C ends the line.
+        let c = egui::pos2(400.0, 400.0);
+        click(&mut open, &mut ed, a, 4.0);
+        click(&mut open, &mut ed, b, 4.1);
+        click(&mut open, &mut ed, c, 4.2);
+        assert_eq!(ed.shape_points.len(), 3, "C is added");
+        click(&mut open, &mut ed, c, 4.3);
+        assert!(ed.shape_points.is_empty());
+        assert!(matches!(
+            &open.project.pages[0].graphics[..],
+            [_, Shape::Polyline { points, .. }] if points.len() == 3
+        ));
         // Released at A, then moved on to B in the same frame: the point goes at A (at B it
         // would be a slow repeat and add nothing).
         click(&mut open, &mut ed, b, 5.0);
