@@ -1417,12 +1417,19 @@ fn shape_tool(
         finish_shape(open, ed);
         return;
     }
-    // A click places its point where it was made (a tap on a touch screen has no hover).
+    // A click places its point where the button was released (a tap on a touch screen has
+    // no hover, and the pointer may have moved on before this frame).
     if resp.clicked_by(egui::PointerButton::Primary)
-        && let Some(pos) = resp.interact_pointer_pos()
+        && let Some(pos) = primary_release_pos(&resp.ctx).or(resp.interact_pointer_pos())
     {
         let now = resp.ctx.input(|i| i.time);
-        shape_input(open, ed, snap(xf.mm(pos), snap_step), now);
+        // Unsnapped, a repeat may land a little off the last point.
+        let tol = if snap_step > 0.0 {
+            0.0
+        } else {
+            f64::from(REPEAT_SLOP_PX / xf.zoom)
+        };
+        shape_input(open, ed, snap(xf.mm(pos), snap_step), now, tol);
     }
     let Some(cur) = ed.cursor else { return };
     let ghost = Stroke::new(1.5_f32, t.ghost);
@@ -1454,14 +1461,34 @@ pub(crate) fn drop_draft_of_other_page(open: &Open, ed: &mut Editor) {
 /// double-click time).
 const REPEAT_SECS: f64 = 0.3;
 
+/// How far (in screen points) a repeat click may land from the last point with snapping off.
+const REPEAT_SLOP_PX: f32 = 4.0;
+
+/// Where the primary button was last released this frame, if it was.
+fn primary_release_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    ctx.input(|i| {
+        i.events.iter().rev().find_map(|e| match e {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                ..
+            } => Some(*pos),
+            _ => None,
+        })
+    })
+}
+
 /// A primary click at `at` at time `now` (seconds) with a drawing tool. A second click on a
 /// polyline's last point within [`REPEAT_SECS`] ends it; a slower one does nothing, and a quick
-/// click on another point adds that point.
-pub(crate) fn shape_input(open: &mut Open, ed: &mut Editor, at: Point, now: f64) {
-    let repeat = ed.shape_points.last() == Some(&at);
+/// click on another point adds that point. Points within `tol` (mm) of each other count as the
+/// same (0 when snapping, so a quick click on the next grid point still adds it).
+pub(crate) fn shape_input(open: &mut Open, ed: &mut Editor, at: Point, now: f64, tol: f64) {
+    let same = |p: &Point| p.distance(at) <= tol;
+    let repeat = ed.shape_points.last().is_some_and(same);
     let quick = ed
         .last_shape_click
-        .is_some_and(|(p, t)| p == at && now - t <= REPEAT_SECS);
+        .is_some_and(|(p, t)| same(&p) && now - t <= REPEAT_SECS);
     ed.last_shape_click = Some((at, now));
     if ed.tool == Tool::Polyline && repeat {
         if quick && ed.shape_points.len() >= 2 {
@@ -1477,6 +1504,11 @@ pub(crate) fn shape_input(open: &mut Open, ed: &mut Editor, at: Point, now: f64)
 pub(crate) fn shape_click(open: &mut Open, ed: &mut Editor, at: Point) {
     // A polyline does not take the same point twice in a row (a double-click on it ends it).
     if ed.tool == Tool::Polyline && ed.shape_points.last() == Some(&at) {
+        return;
+    }
+    // An arc's start on its centre would refuse every end: ask for another start.
+    if ed.tool == Tool::Arc && ed.shape_points.len() == 1 && ed.shape_points[0] == at {
+        ed.message = "The start must be away from the centre; click another point (Esc cancels).".into();
         return;
     }
     if ed.shape_points.is_empty() {
@@ -1699,22 +1731,33 @@ mod tests {
             ..Default::default()
         };
         let p = Point::new;
-        shape_input(&mut open, &mut ed, p(10.0, 10.0), 0.0);
-        shape_input(&mut open, &mut ed, p(20.0, 10.0), 0.08);
+        shape_input(&mut open, &mut ed, p(10.0, 10.0), 0.0, 0.0);
+        shape_input(&mut open, &mut ed, p(20.0, 10.0), 0.08, 0.0);
         // A quick click on another point adds that point.
-        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.16);
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.16, 0.0);
         assert_eq!(ed.shape_points.len(), 3);
         // A slow repeat on the last point (egui may still call it a triple-click) does nothing.
-        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.62);
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.62, 0.0);
         assert_eq!(ed.shape_points.len(), 3);
         assert!(open.project.pages[0].graphics.is_empty());
         // A quick repeat on the last point ends it with three points.
-        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.8);
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.8, 0.0);
         assert!(ed.shape_points.is_empty());
         assert!(matches!(
             &open.project.pages[0].graphics[..],
             [Shape::Polyline { points, closed: false, .. }] if points.len() == 3
         ));
+        // Unsnapped, a quick repeat a hair off the last point still ends the line; with no
+        // tolerance (snapping on) a quick click on a nearby grid point adds a vertex.
+        shape_input(&mut open, &mut ed, p(0.0, 0.0), 1.0, 0.5);
+        shape_input(&mut open, &mut ed, p(10.0, 0.0), 2.0, 0.5);
+        shape_input(&mut open, &mut ed, p(10.2, 0.1), 2.1, 0.5);
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(open.project.pages[0].graphics.len(), 2);
+        shape_input(&mut open, &mut ed, p(0.0, 0.0), 3.0, 0.0);
+        shape_input(&mut open, &mut ed, p(10.0, 0.0), 4.0, 0.0);
+        shape_input(&mut open, &mut ed, p(11.0, 0.0), 4.1, 0.0);
+        assert_eq!(ed.shape_points.len(), 3);
     }
 
     #[test]
@@ -1799,6 +1842,24 @@ mod tests {
             &open.project.pages[0].graphics[..],
             [Shape::Polyline { points, .. }] if points.len() == 2
         ));
+        // Released at A, then moved on to B in the same frame: the point goes at A (at B it
+        // would be a slow repeat and add nothing).
+        click(&mut open, &mut ed, b, 5.0);
+        frame(&mut open, &mut ed, 6.0, vec![egui::Event::PointerMoved(b)]);
+        frame(
+            &mut open,
+            &mut ed,
+            6.01,
+            vec![egui::Event::PointerMoved(a), button(a, true)],
+        );
+        frame(
+            &mut open,
+            &mut ed,
+            6.02,
+            vec![button(a, false), egui::Event::PointerMoved(b)],
+        );
+        assert_eq!(ed.shape_points.len(), 2);
+        assert_ne!(ed.shape_points[0], ed.shape_points[1], "the second point is at A");
     }
 
     #[test]
@@ -1823,6 +1884,15 @@ mod tests {
         }
         shape_click(&mut open, &mut ed, Point::new(10.0, 20.0));
         assert!(matches!(open.project.pages[0].graphics[..], [Shape::Arc { .. }]));
+        // A start on the centre is refused at once; the centre stays for a proper start.
+        shape_click(&mut open, &mut ed, c);
+        shape_click(&mut open, &mut ed, c);
+        assert_eq!(ed.shape_points, vec![c]);
+        assert!(ed.message.contains("away from the centre"), "{}", ed.message);
+        shape_click(&mut open, &mut ed, Point::new(20.0, 10.0));
+        shape_click(&mut open, &mut ed, Point::new(10.0, 20.0));
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(open.project.pages[0].graphics.len(), 2);
     }
 
     #[test]
