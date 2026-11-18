@@ -3884,6 +3884,44 @@ fn a_renumbering_here_the_session_repeats_leaves_no_empty_undo_step() -> TestRes
 }
 
 #[test]
+fn a_renumbering_here_and_back_the_session_then_makes_leaves_no_empty_undo_step() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    let original = number(&guest_open).ok_or("no page")?;
+    // A second waiting placement, then the guest numbers the page 30 and back.
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for to in ["30", original.as_str()] {
+        guest_open.checkpoint();
+        guest_open.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        guest_open.project.sort_pages();
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // Then the session numbers the page 30: the step before the guest's renumbering back is
+    // what the guest has now, and is no step to undo.
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    // One Undo takes back the second placement only.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(
+        has_placement(&guest_open, "p0003", &first),
+        "the first still waits: {:?}",
+        g.notes
+    );
+    assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
 fn a_page_renumbered_in_the_undo_history_keeps_the_pages_in_order() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut open = project(tmp.path())?;

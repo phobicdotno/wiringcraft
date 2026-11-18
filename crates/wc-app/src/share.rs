@@ -3260,11 +3260,13 @@ impl Share {
         // A waiting page the session renumbers keeps that number through an Undo here: every
         // step of the undo history that has the number the session replaced gets the new one.
         // A number this copy set (not synced yet) stays, so an Undo still takes it back.
+        let mut renumbered = false;
         for id in held.now.pages.keys() {
             if let (Some(was), Some(now)) = (base.page(id), auth.page(id))
                 && was.number != now.number
             {
                 open.renumber_in_history(id, &was.number, &now.number);
+                renumbered = true;
             }
         }
         let conflicting = conflicts(&open.project, base, auth);
@@ -3306,6 +3308,10 @@ impl Share {
                 ));
             }
             changed = open.project != *before;
+        }
+        // Compared with the project once it has the session's numbers too.
+        if renumbered {
+            open.forget_steps_like_now();
         }
         // The session's versions are what this copy has synced to: an item updated here later
         // differs from them ([`updated_here`]).

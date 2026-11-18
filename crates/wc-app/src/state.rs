@@ -737,8 +737,9 @@ impl Open {
     /// Give page `id` the number `to` in every undo and redo step where it has `from`: the
     /// session renumbered it from `from`, and an Undo here must not bring that number back.
     /// A step with another number for it (one this copy set) keeps that. A step that now
-    /// changes nothing (this copy had set the number the session set too) is dropped, so an
-    /// Undo never takes back nothing.
+    /// changes nothing next to the one after it (this copy had set the number the session set
+    /// too) is dropped, so an Undo never takes back nothing; once the project has the
+    /// session's number too, [`Open::forget_steps_like_now`] drops the ones next to it.
     pub fn renumber_in_history(&mut self, id: &str, from: &str, to: &str) {
         for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
             if let Some(page) = step.page_mut(id)
@@ -749,10 +750,15 @@ impl Open {
             }
         }
         self.undo.dedup();
+        self.redo.dedup();
+    }
+
+    /// Drop the latest undo and redo steps that are the project as it is now: an Undo or Redo
+    /// of them would change nothing.
+    pub fn forget_steps_like_now(&mut self) {
         while self.undo.last() == Some(&self.project) {
             self.undo.pop();
         }
-        self.redo.dedup();
         while self.redo.last() == Some(&self.project) {
             self.redo.pop();
         }
