@@ -1614,6 +1614,17 @@ impl App {
                 if a == Action::Assistant {
                     return Err("That would hide this panel.".into());
                 }
+                // The toolbar's own hold check (which page an action edits, with or without a
+                // panel shown): its refusal is an error here, as for the editing tools.
+                if let Some(name) = self
+                    .open
+                    .as_ref()
+                    .and_then(|o| crate::held_for(a, &self.ed, &o.project))
+                {
+                    return Err(format!(
+                        "{name} has this page open; it is read-only here until they leave it."
+                    ));
+                }
                 let before = self.dialog.is_some();
                 self.run(a);
                 if let Some(m) = self.take_message() {
@@ -4279,6 +4290,27 @@ mod tests {
             matches!(a.dialog, Some(Dialog::Template { since, .. }) if since == mark),
             "the form's undo mark is the window's"
         );
+    }
+
+    #[test]
+    fn a_toolbar_edit_on_a_held_page_is_an_error_for_the_assistant() {
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.ed.held_by.insert("p0002".into(), "Ola".into());
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let r = call(&mut a, "run_action", json!({"action": Action::Delete.name()}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola has this page open")), "{r:?}");
+        assert_eq!(page2(&a).graphics.len(), 1, "nothing deleted");
     }
 
     #[test]
