@@ -208,6 +208,11 @@ mod tests {
             write("Coil.svg", SVG),
             write("broken.svg", "<svg"),
             write("Relays.KICAD_SYM", KICAD),
+            // A derived symbol whose parent is missing: a warning, the file still imports.
+            write(
+                "orphans.kicad_sym",
+                r#"(kicad_symbol_lib (symbol "Orphan" (extends "Missing")))"#,
+            ),
             write("Lamp Red.elmt", ELMT),
             write("Line.dxf", DXF),
             write("notes.txt", "hello"),
@@ -230,6 +235,17 @@ mod tests {
         assert!(out.failed.iter().any(|f| f.contains("same id svg.coil")));
         let report = out.report(lib.path());
         assert!(report.starts_with("Imported 4 symbols"), "{report}");
+        // The warning names its file, in the outcome and in the report.
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("orphans.kicad_sym") && w.contains("Missing")),
+            "{out:?}"
+        );
+        assert!(
+            report.contains("Warnings:") && report.contains("orphans.kicad_sym"),
+            "{report}"
+        );
         assert!(report.contains("3 failed"), "{report}");
     }
 

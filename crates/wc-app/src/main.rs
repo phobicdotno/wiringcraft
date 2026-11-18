@@ -1063,7 +1063,10 @@ impl App {
                     });
                 }
                 Dialog::Message(m) => {
-                    ui.label(m.as_str());
+                    // A long message (an import listing every symbol) scrolls; OK stays in view.
+                    egui::ScrollArea::vertical()
+                        .max_height((screen.height() * 0.6).max(120.0))
+                        .show(ui, |ui| ui.label(m.as_str()));
                     if ui.button("OK").clicked() {
                         keep = false;
                     }
