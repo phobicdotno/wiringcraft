@@ -448,6 +448,149 @@ fn coming_in_changes_only_what_differs_and_keeps_the_local_symbol_lock() {
     assert!(local.lock.symbols.contains_key("wc.coil"));
 }
 
+#[test]
+fn an_item_the_session_took_back_leaves_the_local_lock() -> TestResult {
+    let entry = |hash: &str| wc_core::LockEntry {
+        hash: hash.into(),
+        source: "starter".into(),
+    };
+    let mut session = Project::new("Demo");
+    session.lock.symbols.insert("wc.coil".into(), entry("abc"));
+    session.lock.parts.insert("acme.relay".into(), entry("p1"));
+    // Placed in the session at the last sync and taken back with the coil since: this copy
+    // has not seen that yet, so the stale placement does not keep the coil.
+    let mut stale = Page::new("p0002", "2", "Two");
+    stale.symbols.push(wc_core::PlacedSymbol {
+        id: "s9".into(),
+        symbol: "wc.coil".into(),
+        at: Default::default(),
+        rotation: Default::default(),
+        mirror: false,
+        tag: None,
+    });
+    session.pages.push(stale);
+    let base = session.clone();
+    let mut local = session.clone();
+    // Renumbering that page here is no new use of the coil on it.
+    local.pages.iter_mut().find(|p| p.id == "p0002").ok_or("p0002")?.number = "20".into();
+    // Used here and not sent yet: the session never had it, so it still has to go out.
+    local.lock.symbols.insert("wc.lamp".into(), entry("def"));
+    // Taken back in the session, but placed here since: it goes out again with that change.
+    local.lock.symbols.insert("wc.placed".into(), entry("ghi"));
+    session.lock.symbols.insert("wc.placed".into(), entry("ghi"));
+    let was = session.lock.clone();
+    let mut page = Page::new("p0001", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        id: "s1".into(),
+        symbol: "wc.placed".into(),
+        at: Default::default(),
+        rotation: Default::default(),
+        mirror: false,
+        tag: None,
+    });
+    local.pages.push(page);
+    // Same hash from another source counts as the same version.
+    local.lock.parts.get_mut("acme.relay").ok_or("relay")?.source = "other".into();
+    // The session undid the changes that added the coil, the relay and the placed symbol.
+    let auth = Project::new("Demo");
+    let dropped = taken_back(&mut local, &base, &was, &auth);
+    assert_eq!(
+        dropped,
+        [
+            (ItemKind::Symbol, "wc.coil".to_owned()),
+            (ItemKind::Part, "acme.relay".to_owned())
+        ]
+    );
+    assert!(!local.lock.symbols.contains_key("wc.coil"));
+    assert!(!local.lock.parts.contains_key("acme.relay"));
+    assert!(local.lock.symbols.contains_key("wc.lamp"));
+    assert!(local.lock.symbols.contains_key("wc.placed"));
+    Ok(())
+}
+
+#[test]
+fn a_version_the_copy_has_not_taken_yet_still_goes_when_the_session_takes_back_the_next() {
+    let entry = |hash: &str| wc_core::LockEntry {
+        hash: hash.into(),
+        source: "starter".into(),
+    };
+    let mut v1 = Project::new("Demo");
+    v1.lock.symbols.insert("wc.coil".into(), entry("v1"));
+    let local = v1.clone();
+    // The session moved to v2 before this copy took it.
+    let mut v2 = Project::new("Demo");
+    v2.lock.symbols.insert("wc.coil".into(), entry("v2"));
+    let seen = next_seen(&v1.lock, &local, &v2);
+    assert_eq!(seen.symbols.get("wc.coil").map(|e| e.hash.as_str()), Some("v1"));
+    // Then took v2 back as well: the v1 copy here goes with it.
+    let mut local = local;
+    let dropped = taken_back(&mut local, &v1, &seen, &Project::new("Demo"));
+    assert_eq!(dropped, [(ItemKind::Symbol, "wc.coil".to_owned())]);
+    // Once this copy holds v2, the session's version is what is seen.
+    assert_eq!(next_seen(&seen, &v2, &v2), v2.lock);
+}
+
+#[test]
+fn a_part_taken_back_leaves_the_part_list_unless_a_library_offers_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(&tmp.path().join("p"))?;
+    let lib = wc_library::Library::open(&open.dir, &open.project)?;
+    let (lamp, _) = lib.part("example.ex-lamp-24-gn")?;
+    let mut own = lamp.clone();
+    own.id = "own.part".into();
+    store::write_vendored_part(&open.dir, &own)?;
+    for p in [&lamp, &own] {
+        let entry = wc_core::LockEntry {
+            hash: p.hash(),
+            source: "starter".into(),
+        };
+        open.project.lock.parts.insert(p.id.clone(), entry);
+        open.parts.insert(p.id.clone(), p.clone());
+        if !open.part_library.iter().any(|(i, _)| *i == p.id) {
+            open.part_library.push((p.id.clone(), p.id.clone()));
+        }
+    }
+    // A device here still names the project's own part from the last sync; the session took
+    // that assignment back with the part.
+    let device = Device {
+        part: Some("own.part".into()),
+        ..Default::default()
+    };
+    open.project.devices.insert(DeviceTag::parse("-K1")?, device);
+    let mut seen = Some(open.project.lock.clone());
+    let base = open.project.clone();
+    let mut auth = open.project.clone();
+    auth.lock = Default::default();
+    auth.devices.clear();
+    let (mut unload, mut delist) = Default::default();
+    follow_take_backs(&mut seen, &mut unload, &mut delist, &mut open, &base, &auth);
+    assert!(
+        open.parts.contains_key("own.part"),
+        "still drawn until the session's change is in"
+    );
+    assert!(incoming(&mut open.project, &auth));
+    unload_taken_back(&mut unload, &mut open);
+    assert_eq!(delist_taken_back(&mut delist, &mut open), None);
+    assert!(delist.is_empty());
+    // Reading the lists again does not bring the stale part back either.
+    open.refresh_library();
+    assert!(open.project.lock.parts.is_empty());
+    assert!(
+        open.part_library.iter().any(|(i, _)| i == "example.ex-lamp-24-gn"),
+        "the library still offers it"
+    );
+    assert!(
+        !open.part_library.iter().any(|(i, _)| i == "own.part"),
+        "nothing offers it any more"
+    );
+    assert!(open.parts.is_empty() && unload.is_empty(), "neither copy is used here");
+    assert!(
+        store::read_vendored_part(&open.dir, "own.part").is_ok(),
+        "the file stays"
+    );
+    Ok(())
+}
+
 /// Run frames of both windows until `done` or a few seconds have passed.
 fn until(
     a: (&mut Share, &mut Open, &str),
@@ -1372,6 +1515,27 @@ fn a_file_in_another_version_than_its_lock_is_not_shared_or_taken() -> TestResul
 }
 
 #[test]
+fn a_symbol_taken_from_the_session_is_offered_in_the_symbol_list() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(&tmp.path().join("p"))?;
+    open.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+    let coil = open.symbols.remove("wc.coil").ok_or("no coil")?;
+    open.library.retain(|(i, _)| i != "wc.coil");
+    let offered = [("wc.coil".to_owned(), coil)].into_iter().collect();
+    assert!(take_files(&mut open, &offered, &BTreeMap::new()).is_empty());
+    assert!(open.symbols.contains_key("wc.coil"));
+    assert!(open.library.iter().any(|(i, _)| i == "wc.coil"));
+    // A newer definition under the same id is listed by its new name.
+    let mut renamed = open.symbols["wc.coil"].clone();
+    renamed.name = "Coil B".into();
+    open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = renamed.hash();
+    let offered = [("wc.coil".to_owned(), renamed)].into_iter().collect();
+    assert!(take_files(&mut open, &offered, &BTreeMap::new()).is_empty());
+    assert!(open.library.iter().any(|(i, n)| i == "wc.coil" && n == "Coil B"));
+    Ok(())
+}
+
+#[test]
 fn leaving_a_session_forgets_the_items_sent_to_it() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
@@ -1931,5 +2095,41 @@ fn a_folder_error_stays_until_the_folder_changes() -> TestResult {
     form.folder = "C:\\shared".into();
     form.forget_error_unless("192.168.1.21:47812", "C:shared");
     assert!(form.error.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_symbol_whose_adding_was_undone_is_not_sent_again_and_is_locked_when_placed_again() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let id = "wc.contact.no";
+    assert!(!host_open.project.lock.symbols.contains_key(id), "new to the session");
+    guest_open.place(2, id, wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(host_open.project.lock.symbols.contains_key(id), "added");
+    // Undo the placement and its new device, then the change that added the symbol.
+    for _ in 0..3 {
+        g.undo()?;
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for open in [&host_open, &guest_open] {
+        assert!(
+            !open.project.lock.symbols.contains_key(id),
+            "taken back, and not sent again"
+        );
+    }
+    // Placed again: locked again, and the session gets it with the page.
+    guest_open.place(2, id, wc_core::Point::new(60.0, 100.0))?;
+    assert!(guest_open.project.lock.symbols.contains_key(id), "pinned when placed");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(host_open.project.lock.symbols.contains_key(id));
+    assert!(
+        host_open
+            .project
+            .page("p0003")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.symbol == id))
+    );
     Ok(())
 }

@@ -8,7 +8,8 @@
 //! texts of an object are in a third stream at the end of its data.
 //!
 //! The entities read are LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE (2D and 3D) with their
-//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), SOLID,
+//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), HATCH,
+//! ELLIPSE, SPLINE, SOLID,
 //! TRACE and POINT. Each entity belongs to
 //! the block whose BLOCK_HEADER owns it, or to model space; vertices belong to their polyline
 //! and attributes to their INSERT. The entities become the same entities the DXF reader works
@@ -388,8 +389,6 @@ fn unread_entity(kind: u16) -> Option<&'static str> {
         29 => "POLYLINE_PFACE",
         30 => "POLYLINE_MESH",
         33 => "SHAPE",
-        35 => "ELLIPSE",
-        36 => "SPLINE",
         37 => "REGION",
         38 => "3DSOLID",
         39 => "BODY",
@@ -398,7 +397,6 @@ fn unread_entity(kind: u16) -> Option<&'static str> {
         45 => "LEADER",
         46 => "TOLERANCE",
         47 => "MLINE",
-        78 => "HATCH",
         498 => "ACAD_PROXY_ENTITY",
         _ => return None,
     })
@@ -424,8 +422,11 @@ fn read_entity(kind: u16) -> Option<&'static str> {
         27 => "POINT",
         31 | 32 => "SOLID",
         34 => "VIEWPORT",
+        35 => "ELLIPSE",
+        36 => "SPLINE",
         44 => "MTEXT",
         77 => "LWPOLYLINE",
+        78 => "HATCH",
         _ => return None,
     })
 }
@@ -456,6 +457,281 @@ fn block_base(o: &mut Object) -> Result<(f64, f64)> {
         return Err(bad("a block's base point is not a number"));
     }
     Ok((x, y))
+}
+
+/// The most boundary paths, edges, knots, control or fit points or gradient colours a HATCH
+/// may list; more is a damaged object.
+const MAX_HATCH_ITEMS: u32 = 10_000;
+
+/// A count of a HATCH list, refused above [`MAX_HATCH_ITEMS`].
+fn hatch_count(o: &mut Object, what: &str) -> Result<u32> {
+    let n = o.data.bl()?;
+    if n > MAX_HATCH_ITEMS {
+        return Err(bad(format!("a hatch lists {n} {what}")));
+    }
+    Ok(n)
+}
+
+/// A colour (CMC) of 2004 and later: index, true colour, flags, then a name and a book name
+/// when the flags say so.
+fn skip_color(o: &mut Object) -> Result<()> {
+    o.data.bs()?;
+    o.data.bl()?;
+    let flags = o.data.rc()?;
+    if flags < 4 {
+        if flags & 1 != 0 {
+            o.text()?;
+        }
+        if flags & 2 != 0 {
+            o.text()?;
+        }
+    }
+    Ok(())
+}
+
+/// A point of a HATCH boundary: both coordinates numbers.
+fn hatch_point(o: &mut Object) -> Result<(f64, f64)> {
+    let (x, y) = o.data.rd2()?;
+    if !(x.is_finite() && y.is_finite()) {
+        return Err(bad("a hatch boundary point is not a number"));
+    }
+    Ok((x, y))
+}
+
+/// Two edge angles in degrees: numbers still after the conversion (a huge angle in radians is
+/// no number of degrees).
+fn hatch_degrees(a0: f64, a1: f64) -> Result<(f64, f64)> {
+    let (d0, d1) = (a0.to_degrees(), a1.to_degrees());
+    if !(d0.is_finite() && d1.is_finite()) {
+        return Err(bad("a hatch edge angle is too large"));
+    }
+    // Angles so far apart that their difference is no number are taken round the circle, so
+    // the sweep can be measured; ordinary angles are kept as they are.
+    if !(d1 - d0).is_finite() {
+        return Ok((d0.rem_euclid(360.0), d1.rem_euclid(360.0)));
+    }
+    Ok((d0, d1))
+}
+
+/// A value of a HATCH boundary (radius, angle, ratio, knot, weight): a number.
+fn hatch_value(o: &mut Object) -> Result<f64> {
+    let v = o.data.bd()?;
+    if !v.is_finite() {
+        return Err(bad("a hatch boundary value is not a number"));
+    }
+    Ok(v)
+}
+
+/// HATCH: the pattern name, the solid-fill flag, the boundary paths and the style, as the DXF
+/// codes the DXF reader draws a hatch from (2, 70, 91, 92, 72, 73, 93, 10/20, 42, ..., 75).
+/// Angles are radians in DWG and degrees in DXF. The pattern lines and seed points after the
+/// style are not needed.
+fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
+    // Gradient fill: kind, reserved, angle, shift, single colour, tint, the colours, a name.
+    o.data.bl()?;
+    o.data.bl()?;
+    o.data.bd()?;
+    o.data.bd()?;
+    o.data.bl()?;
+    o.data.bd()?;
+    for _ in 0..hatch_count(o, "gradient colours")? {
+        o.data.bd()?;
+        skip_color(o)?;
+    }
+    o.text()?;
+    // Elevation and extrusion (a downward one mirrors the hatch, as for other entities).
+    o.data.bd()?;
+    let (_, _, z) = o.data.bd3()?;
+    let name = o.text()?;
+    let solid = o.data.b()?;
+    o.data.b()?;
+    let paths = hatch_count(o, "boundary paths")?;
+    let mut boundary = 0u32;
+    e.f(230, z).s(2, name).i(70, i64::from(solid)).i(91, i64::from(paths));
+    for _ in 0..paths {
+        let flags = o.data.bl()?;
+        e.i(92, i64::from(flags));
+        if flags & 2 == 0 {
+            let edges = hatch_count(o, "edges")?;
+            e.i(93, i64::from(edges));
+            for _ in 0..edges {
+                let kind = o.data.rc()?;
+                e.i(72, i64::from(kind));
+                match kind {
+                    1 => {
+                        let (a, b) = (hatch_point(o)?, hatch_point(o)?);
+                        e.f(10, a.0).f(20, a.1).f(11, b.0).f(21, b.1);
+                    }
+                    2 => {
+                        let c = hatch_point(o)?;
+                        let r = hatch_value(o)?;
+                        let (a0, a1) = (hatch_value(o)?, hatch_value(o)?);
+                        let ccw = o.data.b()?;
+                        e.f(10, c.0).f(20, c.1).f(40, r);
+                        let (d0, d1) = hatch_degrees(a0, a1)?;
+                        e.f(50, d0).f(51, d1).i(73, i64::from(ccw));
+                    }
+                    3 => {
+                        let (c, m) = (hatch_point(o)?, hatch_point(o)?);
+                        let ratio = hatch_value(o)?;
+                        let (a0, a1) = (hatch_value(o)?, hatch_value(o)?);
+                        let ccw = o.data.b()?;
+                        e.f(10, c.0).f(20, c.1).f(11, m.0).f(21, m.1).f(40, ratio);
+                        let (d0, d1) = hatch_degrees(a0, a1)?;
+                        e.f(50, d0).f(51, d1).i(73, i64::from(ccw));
+                    }
+                    4 => {
+                        let degree = o.data.bl()?;
+                        let rational = o.data.b()?;
+                        let periodic = o.data.b()?;
+                        let knots = hatch_count(o, "knots")?;
+                        let points = hatch_count(o, "control points")?;
+                        e.i(94, i64::from(degree))
+                            .i(73, i64::from(rational))
+                            .i(74, i64::from(periodic));
+                        e.i(95, i64::from(knots)).i(96, i64::from(points));
+                        for _ in 0..knots {
+                            e.f(40, hatch_value(o)?);
+                        }
+                        for _ in 0..points {
+                            let p = hatch_point(o)?;
+                            e.f(10, p.0).f(20, p.1);
+                            if rational {
+                                e.f(42, hatch_value(o)?);
+                            }
+                        }
+                        // Fit points and their end tangents, from 2010.
+                        if o.version == Version::R2010 {
+                            let fit = hatch_count(o, "fit points")?;
+                            e.i(97, i64::from(fit));
+                            for _ in 0..fit {
+                                let p = hatch_point(o)?;
+                                e.f(11, p.0).f(21, p.1);
+                            }
+                            if fit > 0 {
+                                let (s, t) = (hatch_point(o)?, hatch_point(o)?);
+                                e.f(12, s.0).f(22, s.1).f(13, t.0).f(23, t.1);
+                            }
+                        }
+                    }
+                    k => return Err(bad(format!("a hatch edge has unknown type {k}"))),
+                }
+            }
+        } else {
+            let bulges = o.data.b()?;
+            let closed = o.data.b()?;
+            let n = hatch_count(o, "polyline points")?;
+            e.i(72, i64::from(bulges)).i(73, i64::from(closed)).i(93, i64::from(n));
+            for _ in 0..n {
+                let p = hatch_point(o)?;
+                e.f(10, p.0).f(20, p.1);
+                if bulges {
+                    e.f(42, hatch_value(o)?);
+                }
+            }
+        }
+        // The boundary objects: a count here, their handles in the handle stream (read after
+        // the data, so a hatch missing them is damaged).
+        boundary += hatch_count(o, "boundary objects")?;
+        e.i(97, 0);
+    }
+    e.i(75, i64::from(o.data.bs()?));
+    for _ in 0..boundary {
+        o.handle_ref()?;
+    }
+    Ok(())
+}
+
+/// ELLIPSE: centre, major axis end (relative), extrusion, axis ratio and the start and end
+/// parameters (radians, as in DXF).
+fn ellipse(o: &mut Object, e: &mut Codes) -> Result<()> {
+    let d = &mut o.data;
+    let (cx, cy, cz) = d.bd3()?;
+    let (mx, my, mz) = d.bd3()?;
+    let (ex, ey, z) = d.bd3()?;
+    let ratio = d.bd()?;
+    let (start, end) = (d.bd()?, d.bd()?);
+    if ![cx, cy, cz, mx, my, mz, ex, ey, z, ratio, start, end]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return Err(bad("an ellipse has a value that is not a number"));
+    }
+    e.f(10, cx).f(20, cy).f(11, mx).f(21, my).f(230, z);
+    e.f(40, ratio).f(41, start).f(42, end);
+    Ok(())
+}
+
+/// The most knots, control points or fit points a SPLINE may list; more is a damaged object.
+const MAX_SPLINE_POINTS: u32 = 10_000;
+
+fn spline_count(o: &mut Object, what: &str) -> Result<u32> {
+    let n = o.data.bl()?;
+    if n > MAX_SPLINE_POINTS {
+        return Err(bad(format!("a spline lists {n} {what}")));
+    }
+    Ok(n)
+}
+
+/// SPLINE, as DXF codes: 70 (closed), 71 degree, and either knots (40), control points (10/20)
+/// and weights (41), or fit points (11/21). Before 2013 a scenario says which: 1 control
+/// points, 2 fit points.
+fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
+    let scenario = o.data.bl()?;
+    if scenario != 1 && scenario != 2 {
+        return Err(bad(format!("a spline has unknown scenario {scenario}")));
+    }
+    let degree = o.data.bl()?;
+    if scenario == 1 {
+        let d = &mut o.data;
+        let _rational = d.b()?;
+        let closed = d.b()?;
+        let periodic = d.b()?;
+        d.bd()?;
+        d.bd()?;
+        let knots = spline_count(o, "knots")?;
+        let points = spline_count(o, "control points")?;
+        let weighted = o.data.b()?;
+        // A curve of degree d over n control points needs n + d + 1 knots; a periodic one may
+        // list fewer, but never fewer than n + 1.
+        let full = points.saturating_add(degree).saturating_add(1);
+        if knots < points.saturating_add(1) || (!periodic && knots != full) {
+            return Err(bad(format!(
+                "a spline of degree {degree} lists {knots} knots for {points} control points"
+            )));
+        }
+        e.i(70, i64::from(closed)).i(71, i64::from(degree));
+        let mut last = f64::NEG_INFINITY;
+        for _ in 0..knots {
+            let k = o.data.bd()?;
+            // Knots are numbers that never decrease (repeats are fine).
+            if !k.is_finite() || k < last {
+                return Err(bad("a spline's knots are not numbers in order"));
+            }
+            last = k;
+            e.f(40, k);
+        }
+        for _ in 0..points {
+            let (x, y, _) = o.data.bd3()?;
+            e.f(10, x).f(20, y);
+            if weighted {
+                e.f(41, o.data.bd()?);
+            }
+        }
+    } else {
+        // Fit tolerance, the start and end tangents (DXF 12/22 and 13/23), then the fit points.
+        o.data.bd()?;
+        let (sx, sy, _) = o.data.bd3()?;
+        let (ex, ey, _) = o.data.bd3()?;
+        let fit = spline_count(o, "fit points")?;
+        e.i(70, 0).i(71, i64::from(degree));
+        e.f(12, sx).f(22, sy).f(13, ex).f(23, ey);
+        for _ in 0..fit {
+            let (x, y, _) = o.data.bd3()?;
+            e.f(11, x).f(21, y);
+        }
+    }
+    Ok(())
 }
 
 /// Decode the object at `at` into `out`.
@@ -514,6 +790,9 @@ fn decode(
     match o.kind {
         1..=3 => text(&mut o, &mut e)?,
         7 => block = Some(insert(&mut o, &mut e)?),
+        78 => hatch(&mut o, &mut e)?,
+        35 => ellipse(&mut o, &mut e)?,
+        36 => spline(&mut o, &mut e)?,
         // Drawn by its anonymous block, which comes after the dimension style in the handles.
         20..=26 => {
             o.handle_ref()?;
