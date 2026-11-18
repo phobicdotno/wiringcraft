@@ -111,6 +111,8 @@ pub struct SymbolEditor {
     pub pin_name: String,
     pub message: String,
     undo: Vec<Symbol>,
+    /// Steps taken back by Undo, newest last; any new change clears them.
+    redo: Vec<Symbol>,
     /// A drag of the selected item under way.
     drag: Option<Drag>,
     /// Library symbols that can be opened: `(id, name)`.
@@ -217,6 +219,7 @@ impl SymbolEditor {
             pin_name: "1".into(),
             message: String::new(),
             undo: Vec::new(),
+            redo: Vec::new(),
             drag: None,
             choices: Vec::new(),
         }
@@ -238,7 +241,13 @@ impl SymbolEditor {
 
     fn checkpoint(&mut self) {
         self.props_dirty = false;
-        self.undo.push(self.symbol.clone());
+        self.push_undo(self.symbol.clone());
+    }
+
+    /// Record `before` as an undo step for a new change; what was undone can no longer be redone.
+    fn push_undo(&mut self, before: Symbol) {
+        self.redo.clear();
+        self.undo.push(before);
         if self.undo.len() > 100 {
             self.undo.remove(0);
         }
@@ -248,14 +257,33 @@ impl SymbolEditor {
         !self.undo.is_empty()
     }
 
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
     pub fn undo(&mut self) {
+        self.end_drag();
         if let Some(s) = self.undo.pop() {
-            self.props_dirty = false;
-            self.symbol = s;
-            self.selected = None;
-            self.clicks.clear();
-            self.drag = None;
+            let now = std::mem::replace(&mut self.symbol, s);
+            self.redo.push(now);
+            self.after_history_step();
         }
+    }
+
+    /// Take back the last Undo.
+    pub fn redo(&mut self) {
+        self.end_drag();
+        if let Some(s) = self.redo.pop() {
+            let now = std::mem::replace(&mut self.symbol, s);
+            self.undo.push(now);
+            self.after_history_step();
+        }
+    }
+
+    fn after_history_step(&mut self) {
+        self.props_dirty = false;
+        self.selected = None;
+        self.clicks.clear();
     }
 
     /// Change the tool; a shape half drawn is dropped.
@@ -271,10 +299,7 @@ impl SymbolEditor {
             return;
         }
         if !self.props_dirty {
-            self.undo.push(before);
-            if self.undo.len() > 100 {
-                self.undo.remove(0);
-            }
+            self.push_undo(before);
             self.props_dirty = true;
         }
     }
@@ -468,10 +493,7 @@ impl SymbolEditor {
         let Some(drag) = self.drag.take() else { return };
         if self.symbol != drag.before {
             self.props_dirty = false;
-            self.undo.push(drag.before);
-            if self.undo.len() > 100 {
-                self.undo.remove(0);
-            }
+            self.push_undo(drag.before);
         }
     }
 
@@ -521,17 +543,16 @@ impl SymbolEditor {
     pub fn delete_selected(&mut self) {
         self.end_drag();
         let Some(item) = self.selected.take() else { return };
-        self.checkpoint();
         match item {
             Item::Shape(i) if i < self.symbol.graphics.len() => {
+                self.checkpoint();
                 self.symbol.graphics.remove(i);
             }
             Item::Pin(i) if i < self.symbol.pins.len() => {
+                self.checkpoint();
                 self.symbol.pins.remove(i);
             }
-            _ => {
-                self.undo.pop();
-            }
+            _ => {}
         }
     }
 
@@ -618,6 +639,9 @@ impl SymbolEditor {
                     ui.separator();
                     if ui.add_enabled(self.can_undo(), egui::Button::new("Undo")).clicked() {
                         self.undo();
+                    }
+                    if ui.add_enabled(self.can_redo(), egui::Button::new("Redo")).clicked() {
+                        self.redo();
                     }
                     if ui
                         .add_enabled(self.selected.is_some(), egui::Button::new("Delete"))
@@ -1427,6 +1451,70 @@ mod tests {
             }
             assert_eq!(shown, shape);
         }
+    }
+
+    #[test]
+    fn redo_takes_back_an_undo_until_something_new_is_done() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        let drawn = e.symbol.clone();
+        assert!(!e.can_redo());
+        e.redo(); // nothing to redo: nothing happens
+        assert_eq!(e.symbol, drawn);
+
+        // Back two steps (the tag and the second pin), then forward again one at a time.
+        e.undo();
+        let one_back = e.symbol.clone();
+        e.undo();
+        assert_eq!(e.symbol.pins.len(), 1);
+        assert!(e.can_redo());
+        e.redo();
+        assert_eq!(e.symbol, one_back);
+        e.redo();
+        assert_eq!(e.symbol, drawn);
+        assert!(!e.can_redo());
+        e.undo();
+        e.redo();
+        assert_eq!(e.symbol, drawn, "undo and redo again lands on the same symbol");
+
+        // A new change after Undo clears Redo: a drag, a nudge, a property edit, a drawn shape.
+        let changes: [fn(&mut SymbolEditor); 4] = [
+            |e| {
+                e.set_tool(Tool::Select);
+                e.start_drag(Point::new(-5.0, 0.0));
+                e.drag_to(Point::new(0.0, 0.0));
+                e.end_drag();
+            },
+            |e| {
+                e.selected = Some(Item::Shape(0));
+                e.nudge(Point::new(SNAP, 0.0));
+            },
+            |e| {
+                let before = e.symbol.clone();
+                e.symbol.name = "Other".into();
+                e.note_property_edit(before);
+            },
+            |e| {
+                e.set_tool(Tool::Line);
+                e.click(Point::new(10.0, 10.0));
+                e.click(Point::new(15.0, 10.0));
+            },
+        ];
+        for change in changes {
+            e.undo();
+            assert!(e.can_redo());
+            change(&mut e);
+            assert!(!e.can_redo(), "a new change clears redo");
+            e.redo();
+            e.undo();
+            e.redo();
+        }
+
+        // Deleting with nothing valid selected changes nothing, so Redo stays.
+        e.undo();
+        e.selected = Some(Item::Shape(99));
+        e.delete_selected();
+        assert!(e.can_redo());
     }
 
     #[test]

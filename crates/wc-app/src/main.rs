@@ -2746,17 +2746,17 @@ impl App {
                     ed.undo();
                     false
                 }
+                Action::Redo => {
+                    ed.redo();
+                    false
+                }
                 Action::Delete => {
                     ed.delete_selected();
                     false
                 }
-                Action::Redo
-                | Action::Cut
-                | Action::Copy
-                | Action::Paste
-                | Action::Rotate
-                | Action::Mirror
-                | Action::SelectAll => false,
+                Action::Cut | Action::Copy | Action::Paste | Action::Rotate | Action::Mirror | Action::SelectAll => {
+                    false
+                }
                 _ => true,
             })
             .collect()
