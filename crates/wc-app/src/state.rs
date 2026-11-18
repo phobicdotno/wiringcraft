@@ -1624,9 +1624,19 @@ impl Open {
 
     /// Take a terminal of a strip out of its jumper, as one undo step. Returns whether it was in one.
     pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        self.remove_from_jumpers(strip, &[terminal.to_owned()])
+    }
+
+    /// Take terminals of a strip out of their jumpers, all as one undo step. Returns whether any
+    /// of them was in one.
+    pub fn remove_from_jumpers(&mut self, strip: &DeviceTag, terminals: &[String]) -> bool {
         self.follow_terminals();
         let mut meta = self.project.meta.clone();
-        if !meta.remove_from_jumper(strip, terminal) {
+        let mut changed = false;
+        for t in terminals {
+            changed |= meta.remove_from_jumper(strip, t.trim());
+        }
+        if !changed {
             return false;
         }
         self.checkpoint();
