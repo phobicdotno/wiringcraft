@@ -113,6 +113,7 @@ fn nobody_joins_without_approval() -> TestResult {
     link.send(GuestMsg::EditPage { page })?;
     link.send(GuestMsg::EditProject {
         edit: ProjectEdit::RemovePage { id: "p0003".into() },
+        seq: 1,
     })?;
     s.pump(&mut [(&link, &mut guest)]);
     assert_eq!(guest.refusals.len(), 3);
@@ -362,6 +363,7 @@ fn messages_survive_a_json_line() -> TestResult {
             edit: ProjectEdit::Renumber {
                 numbers: vec![("p1".into(), "2".into())],
             },
+            seq: 7,
         },
         GuestMsg::Leave,
     ];
@@ -407,6 +409,7 @@ fn messages_survive_a_json_line() -> TestResult {
     let restore = HostMsg::ProjectChanged {
         edit: ProjectEdit::Restore { parts: Box::new(parts) },
         by: 2,
+        seq: None,
     };
     assert_eq!(decode::<HostMsg>(&encode(&restore)?)?, restore);
     assert!(decode::<GuestMsg>("{\"type\":\"nope\"}").is_err());
@@ -576,6 +579,302 @@ fn a_change_that_cannot_be_recorded_is_undone() -> TestResult {
     assert_eq!(log[0].author, "Kari <kari@example.com>");
     assert!(s.host.project().page("p0002").is_some_and(|p| p.symbols.is_empty()));
     assert!(!s.host.project().devices.contains_key(&tag));
+    Ok(())
+}
+
+#[test]
+fn a_refused_project_edit_is_taken_back_from_the_guests_copy() -> TestResult {
+    let log = Shared::default();
+    let mut s = Session {
+        host: Host::new(
+            demo(),
+            "Hanna Host",
+            "h@x.no",
+            Box::new(Flaky {
+                fail: 1,
+                log: log.clone(),
+            }),
+        ),
+        hub: Hub::new(),
+        log,
+    };
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    b_link.send(b.open(Some("p0003")))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+
+    // Applied to Ola's copy at once, then not recorded on the host.
+    let tag = wc_core::DeviceTag::parse("-K1")?;
+    a_link.send(a.edit_project(ProjectEdit::SetDevice {
+        tag: tag.clone(),
+        device: Some(Device::default()),
+    }))?;
+    assert!(a.project.as_ref().is_some_and(|p| p.devices.contains_key(&tag)));
+    // Refused by the host's checks: a page someone else has open, a page that is not there.
+    a_link.send(a.edit_project(ProjectEdit::RemovePage { id: "p0003".into() }))?;
+    a_link.send(a.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0002".into(), "20".into()), ("p0099".into(), "99".into())],
+    }))?;
+    assert!(a.project.as_ref().is_some_and(|p| p.page("p0003").is_none()));
+    assert_eq!(a.unanswered_edits(), 3);
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(matches!(
+        a.refusals[..],
+        [
+            Refusal::NotRecorded { .. },
+            Refusal::PageLocked { .. },
+            Refusal::UnknownPage { .. }
+        ]
+    ));
+    assert_eq!(s.host.project(), &demo());
+    assert_eq!(a.project.as_ref(), Some(s.host.project()), "Ola's copy is put right");
+    assert_eq!(b.project.as_ref(), Some(s.host.project()));
+    assert_eq!(a.unanswered_edits(), 0);
+
+    // The same device again is recorded now, and reaches everyone.
+    a_link.send(a.edit_project(ProjectEdit::SetDevice {
+        tag: tag.clone(),
+        device: Some(Device::default()),
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(s.host.project().devices.contains_key(&tag));
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert_eq!(b.project.as_ref(), Some(s.host.project()));
+    Ok(())
+}
+
+#[test]
+fn a_refused_edit_does_not_take_back_work_on_the_page_the_guest_has_open() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    a_link.send(a.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0002".into(), "20".into()), ("p0099".into(), "99".into())],
+    }))?;
+    // Drawn before the refusal arrives: the put-back page must not undo it.
+    let mut page = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place(&mut page, "s1", 10.0);
+    a_link.send(a.edit_page(page).ok_or("lock")?)?;
+    s.hub.pump(&mut s.host);
+    let mut refused = false;
+    for msg in a_link.drain() {
+        refused |= matches!(msg, HostMsg::Refused { edit: Some(1), .. });
+        a.handle(msg);
+        if refused {
+            // Also right after the refusal, before the page edit's answer.
+            let mine = a.project.as_ref().and_then(|p| p.page("p0002")).ok_or("page")?;
+            assert_eq!((mine.number.as_str(), mine.symbols.len()), ("2", 1));
+        }
+    }
+    assert!(refused);
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    Ok(())
+}
+
+#[test]
+fn a_refused_removal_and_new_page_bring_back_the_hosts_page_the_guest_had_open() -> TestResult {
+    let log = Shared::default();
+    let mut s = Session {
+        host: Host::new(
+            demo(),
+            "Hanna Host",
+            "h@x.no",
+            Box::new(Flaky {
+                fail: 1,
+                log: log.clone(),
+            }),
+        ),
+        hub: Hub::new(),
+        log,
+    };
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    let old = s.host.project().page("p0002").cloned().ok_or("page")?;
+    // The removal is not recorded, so the host keeps the old page and refuses the new one.
+    a_link.send(a.edit_project(ProjectEdit::RemovePage { id: "p0002".into() }))?;
+    a_link.send(a.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0002", "2", "New"),
+    }))?;
+    assert!(
+        a.project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .is_some_and(|p| p.title == "New")
+    );
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert_eq!(a.refusals.len(), 2);
+    assert_eq!(s.host.project().page("p0002"), Some(&old));
+    assert_eq!(a.project.as_ref(), Some(s.host.project()), "the old page is back");
+    assert_eq!(a.unanswered_edits(), 0);
+    Ok(())
+}
+
+#[test]
+fn adding_a_page_that_is_there_already_does_not_take_back_work_on_it() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    // The page is there already: nothing changes here, and the host refuses it.
+    a_link.send(a.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0002", "2", "Again"),
+    }))?;
+    let draw = |a: &mut Guest, id: &str, x: f64| -> std::result::Result<GuestMsg, Box<dyn std::error::Error>> {
+        let mut page = a
+            .project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .cloned()
+            .ok_or("page")?;
+        place(&mut page, id, x);
+        Ok(a.edit_page(page).ok_or("lock")?)
+    };
+    a_link.send(draw(&mut a, "s1", 10.0)?)?;
+    s.hub.pump(&mut s.host);
+    let mut refused = false;
+    for msg in a_link.drain() {
+        let refusal = matches!(msg, HostMsg::Refused { edit: Some(1), .. });
+        a.handle(msg);
+        if refusal {
+            refused = true;
+            let mine = a.project.as_ref().and_then(|p| p.page("p0002")).ok_or("page")?;
+            assert_eq!(mine.symbols.len(), 1, "the drawing is kept");
+            // Drawn again before the first drawing's answer arrives.
+            a_link.send(draw(&mut a, "s2", 20.0)?)?;
+        }
+    }
+    assert!(refused);
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(s.host.project().page("p0002").is_some_and(|p| p.symbols.len() == 2));
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert_eq!(a.unanswered_edits(), 0);
+    Ok(())
+}
+
+#[test]
+fn work_on_the_page_put_back_by_one_refusal_survives_the_next() -> TestResult {
+    let log = Shared::default();
+    let mut s = Session {
+        host: Host::new(
+            demo(),
+            "Hanna Host",
+            "h@x.no",
+            Box::new(Flaky {
+                fail: 1,
+                log: log.clone(),
+            }),
+        ),
+        hub: Hub::new(),
+        log,
+    };
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    a_link.send(a.edit_project(ProjectEdit::RemovePage { id: "p0002".into() }))?;
+    a_link.send(a.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0002", "2", "New"),
+    }))?;
+    s.hub.pump(&mut s.host);
+    let mut refusals = 0;
+    for msg in a_link.drain() {
+        let refused = matches!(msg, HostMsg::Refused { edit: Some(_), .. });
+        a.handle(msg);
+        if !refused {
+            continue;
+        }
+        refusals += 1;
+        let mine = a
+            .project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .cloned()
+            .ok_or("page")?;
+        if refusals == 1 {
+            // The host's page is back; drawn on before the second refusal arrives.
+            assert_ne!(mine.title, "New");
+            let mut page = mine;
+            place(&mut page, "s1", 10.0);
+            a_link.send(a.edit_page(page).ok_or("lock")?)?;
+        } else {
+            assert_eq!(mine.symbols.len(), 1, "the drawing is kept");
+        }
+    }
+    assert_eq!(refusals, 2);
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(s.host.project().page("p0002").is_some_and(|p| p.symbols.len() == 1));
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert_eq!(a.unanswered_edits(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_project_edit_before_approval_is_answered() -> TestResult {
+    let mut s = Session::new();
+    let (id, link, mut guest) = s.connect();
+    link.send(guest.join("Ola", "ola@example.com"))?;
+    s.pump(&mut [(&link, &mut guest)]);
+    link.send(guest.edit_project(ProjectEdit::RemovePage { id: "p0002".into() }))?;
+    s.pump(&mut [(&link, &mut guest)]);
+    assert_eq!(guest.refusals, vec![Refusal::NotApproved]);
+    assert_eq!(guest.unanswered_edits(), 0);
+    assert!(s.host.approve(id));
+    s.pump(&mut [(&link, &mut guest)]);
+    assert_eq!(guest.unanswered_edits(), 0);
+    Ok(())
+}
+
+#[test]
+fn every_project_edit_of_a_guest_gets_exactly_one_answer() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    let device = ProjectEdit::SetDevice {
+        tag: wc_core::DeviceTag::parse("-K1")?,
+        device: Some(Device::default()),
+    };
+    // Applied, no change (the same again), refused, and a whole-page edit applied.
+    a_link.send(a.edit_project(device.clone()))?;
+    a_link.send(a.edit_project(device))?;
+    a_link.send(a.edit_project(ProjectEdit::RemovePage { id: "p0099".into() }))?;
+    let mut motor = s.host.project().page("p0002").cloned().ok_or("page")?;
+    let before = motor.clone();
+    place(&mut motor, "s1", 10.0);
+    a_link.send(a.edit_project(ProjectEdit::SetPages {
+        pages: vec![motor],
+        before: vec![before],
+    }))?;
+    s.hub.pump(&mut s.host);
+    let mut answers: Vec<u64> = Vec::new();
+    for msg in a_link.drain() {
+        match &msg {
+            HostMsg::ProjectChanged { seq: Some(n), .. } | HostMsg::Unchanged { seq: n } => answers.push(*n),
+            HostMsg::Refused { edit: Some(n), .. } => answers.push(*n),
+            _ => {}
+        }
+        a.handle(msg);
+    }
+    assert_eq!(answers, [1, 2, 3, 4]);
+    assert_eq!(a.unanswered_edits(), 0);
+    // The others' copies of the change carry no number.
+    let others: Vec<HostMsg> = b_link.drain();
+    assert!(
+        others
+            .iter()
+            .all(|m| !matches!(m, HostMsg::ProjectChanged { seq: Some(_), .. })),
+        "{others:?}"
+    );
+    for m in others {
+        b.handle(m);
+    }
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert_eq!(b.project.as_ref(), Some(s.host.project()));
     Ok(())
 }
 
@@ -1582,6 +1881,8 @@ fn only_the_answer_to_a_take_back_ends_the_wait_for_it() {
             reason: "earlier edit".into(),
         },
         take_back: false,
+        edit: None,
+        put_back: None,
     });
     assert!(g.taking_back());
     g.handle(HostMsg::Refused {
@@ -1589,12 +1890,16 @@ fn only_the_answer_to_a_take_back_ends_the_wait_for_it() {
             reason: "nothing to undo".into(),
         },
         take_back: true,
+        edit: None,
+        put_back: None,
     });
     assert!(!g.taking_back());
     // Without the flag the message reads as before, as an older host writes it.
     let line = serde_json::to_string(&HostMsg::Refused {
         refusal: Refusal::NotApproved,
         take_back: false,
+        edit: None,
+        put_back: None,
     })
     .unwrap_or_default();
     assert!(!line.contains("take_back"), "{line}");

@@ -33,8 +33,15 @@ pub enum GuestMsg {
     Open { page: Option<String> },
     /// The new content of the page the guest holds the lock for.
     EditPage { page: Page },
-    /// A change to project-level data.
-    EditProject { edit: ProjectEdit },
+    /// A change to project-level data. `seq` numbers this guest's project edits (from 1), so
+    /// the host's answer can say which one it answers: every one gets exactly one answer, a
+    /// [`HostMsg::ProjectChanged`] carrying it, a [`HostMsg::Unchanged`], or a
+    /// [`HostMsg::Refused`] with the data to put back.
+    EditProject {
+        edit: ProjectEdit,
+        #[serde(default)]
+        seq: u64,
+    },
     /// Take back this guest's own last change (see [`crate::undo_target`]).
     Undo,
     /// Take back this guest's own last undo (see [`crate::redo_target`]).
@@ -115,6 +122,54 @@ impl ProjectEdit {
                 format!("Add {} to the project", names.join(", "))
             }
         }
+    }
+
+    /// Which parts of the project this change touches, as keys (the values are those of
+    /// `project`): what a participant that applied it at once gets back when the host refuses
+    /// it, to put its copy right. Whole-page changes and added symbols and parts are applied
+    /// only when the host sends them, so they need nothing back.
+    pub fn touches(&self, project: &Project) -> Parts {
+        let mut keys = Parts::default();
+        match self {
+            Self::SetDevice { tag, .. } => {
+                keys.devices.insert(tag.clone(), None);
+            }
+            Self::SetComments { page, .. } => {
+                keys.comments.insert(page.clone(), Vec::new());
+            }
+            Self::SetPanel { panel } => {
+                keys.panels.insert(panel.id.clone(), None);
+            }
+            Self::RemovePanel { id } => {
+                keys.panels.insert(id.clone(), None);
+            }
+            Self::AddPage { page } => {
+                keys.pages.insert(page.id.clone(), None);
+                keys.comments.insert(page.id.clone(), Vec::new());
+            }
+            Self::RemovePage { id } => {
+                keys.pages.insert(id.clone(), None);
+                keys.comments.insert(id.clone(), Vec::new());
+            }
+            Self::Renumber { numbers } => {
+                for (id, _) in numbers {
+                    keys.pages.insert(id.clone(), None);
+                }
+            }
+            Self::SetMeta { .. } => keys.meta = Some(Box::new(project.meta.clone())),
+            Self::Restore { parts } => keys = (**parts).clone(),
+            Self::SetPages { .. } | Self::AddItems { .. } => {}
+        }
+        Parts::read(project, &keys)
+    }
+
+    /// Whether a participant applies this change to its own copy at once, before the host
+    /// answers (see [`ProjectEdit::touches`]).
+    pub fn applied_at_once(&self) -> bool {
+        !matches!(
+            self,
+            Self::SetPages { .. } | Self::AddItems { .. } | Self::Restore { .. }
+        )
     }
 
     /// The one page this change is about, if it is about one page.
@@ -222,8 +277,17 @@ pub enum HostMsg {
     /// A page changed (sent to everyone except the person who changed it).
     PageChanged { page: Page, by: PeerId },
     /// A project-level change was applied (sent to everyone, the author included, so all
-    /// copies apply the same edits in the same order).
-    ProjectChanged { edit: ProjectEdit, by: PeerId },
+    /// copies apply the same edits in the same order). The author's copy carries the `seq` of
+    /// its [`GuestMsg::EditProject`].
+    ProjectChanged {
+        edit: ProjectEdit,
+        by: PeerId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+    },
+    /// The guest's project edit `seq` was valid but changed nothing: the project already was
+    /// that way.
+    Unchanged { seq: u64 },
     /// A change was recorded in the history (sent to everyone after the change itself).
     Recorded { change: ChangeInfo },
     /// Who holds which page now: page id to participant.
@@ -236,6 +300,13 @@ pub enum HostMsg {
         refusal: Refusal,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         take_back: bool,
+        /// For a refused project edit: its `seq`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit: Option<u64>,
+        /// For a refused project edit: what it touches, as the host has it, so the guest's
+        /// copy (which applied the edit at once) matches the host's again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        put_back: Option<Box<Parts>>,
     },
     /// The host ended the session.
     Closed,
