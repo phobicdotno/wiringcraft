@@ -68,6 +68,12 @@ impl Drawing {
     }
 }
 
+/// How deep block references (and dimensions) are followed inside each other.
+const MAX_NESTING: usize = 8;
+
+/// The skipped-count key for entities in blocks nested deeper than [`MAX_NESTING`].
+pub const TOO_DEEP: &str = "entities in blocks nested too deep (or inserting themselves)";
+
 /// The most entities one import draws, block references expanded: a few nested blocks that
 /// each insert the next many times would otherwise fill the memory.
 pub const MAX_DRAWN: usize = 2_000_000;
@@ -282,8 +288,10 @@ fn shapes(
     skipped: &mut BTreeMap<String, usize>,
     budget: &mut usize,
 ) {
-    if depth > 8 {
-        return; // block nesting this deep is either a cycle or not worth drawing
+    if depth > MAX_NESTING {
+        // Block nesting this deep is either a cycle or not worth drawing; say what is left out.
+        *skipped.entry(TOO_DEEP.to_owned()).or_default() += ents.len();
+        return;
     }
     let p = |x: f64, y: f64| {
         let (x, y) = xf.apply(x, y);
@@ -1863,6 +1871,21 @@ mod tests {
         };
         assert_eq!(g, [line.clone(), line]);
         assert_eq!(skipped.get("DIMENSION"), Some(&1));
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimension_past_the_nesting_limit_is_counted() -> Result<()> {
+        // Blocks B0 .. B8 each insert the next; B9 holds a dimension of *D1.
+        let mut blocks = String::new();
+        for b in 0..9 {
+            blocks += &format!("0\nBLOCK\n2\nB{b}\n0\nINSERT\n2\nB{}\n0\nENDBLK\n", b + 1);
+        }
+        blocks += "0\nBLOCK\n2\nB9\n0\nDIMENSION\n2\n*D1\n0\nENDBLK\n";
+        blocks += "0\nBLOCK\n2\n*D1\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nB0\n", &blocks)?;
+        assert!(g.is_empty(), "{g:?}");
+        assert!(skipped.get(TOO_DEEP).is_some_and(|n| *n > 0), "{skipped:?}");
         Ok(())
     }
 }
