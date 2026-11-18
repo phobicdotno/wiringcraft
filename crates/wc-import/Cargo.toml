@@ -22,6 +22,7 @@ wc-library.workspace = true
 [dev-dependencies]
 # Tests write 7-Zip archives.
 sevenz-rust2 = { workspace = true, features = ["compress"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

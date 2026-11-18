@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use wc_core::lock::ItemKind;
-use wc_core::{DevicePart, DeviceTag, Part, Project, store};
+use wc_core::{Device, DevicePart, DeviceTag, Part, Project, store};
 use wc_report::{Inputs, Target};
 
 use crate::csv::{decode, records};
@@ -146,6 +146,20 @@ impl Candidates {
                     continue;
                 }
             };
+            // A library without a parts folder has no parts; one whose folder cannot be listed
+            // is reported, or its parts would look missing.
+            for s in &lib.sources {
+                let folder = s.root.join(ItemKind::Part.dir());
+                if let Err(why) = std::fs::read_dir(&folder)
+                    && why.kind() != std::io::ErrorKind::NotFound
+                {
+                    warnings.push(format!(
+                        "the parts of library {} cannot be listed ({}): {why}",
+                        source.name,
+                        folder.display()
+                    ));
+                }
+            }
             for id in lib.index(ItemKind::Part).into_keys() {
                 // The first library that has a part wins, as everywhere else.
                 if out.library.contains_key(&id) {
@@ -270,6 +284,7 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
     // (tag, slot) → (part, quantity, line) already planned, to catch two rows that disagree.
     let mut taken: BTreeMap<(DeviceTag, Slot), Taken> = BTreeMap::new();
     let mut conflicted: BTreeSet<(DeviceTag, Slot)> = BTreeSet::new();
+    let mut new_accessories: Vec<Assignment> = Vec::new();
     for row in rows {
         if row.article.is_empty() {
             continue;
@@ -368,19 +383,24 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
             Slot::Accessory(k) => device
                 .and_then(|d| d.accessories.get(*k))
                 .map_or((None, 1), |a| (Some(a.part.clone()), a.qty)),
-            Slot::NewAccessory => {
-                if device.is_some_and(|d| d.all_parts().iter().any(|(p, _)| *p == part)) {
-                    out.unchanged += 1;
-                    continue;
-                }
-                (None, 1)
-            }
+            Slot::NewAccessory => (None, 1),
         };
         let qty = match slot {
             Slot::Part => 1,
             _ => row.quantity.unwrap_or(now_qty).max(1),
         };
-        if slot != Slot::NewAccessory {
+        if slot == Slot::NewAccessory {
+            // Decided below, against the device as the other rows leave it.
+            new_accessories.push(Assignment {
+                line: row.line,
+                tag,
+                slot,
+                part,
+                qty,
+            });
+            continue;
+        }
+        {
             let key = (tag.clone(), slot.clone());
             if let Some(first) = taken.get_mut(&key) {
                 let (why, choose) = if first.part != part {
@@ -444,7 +464,43 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
     // A device part two rows disagree on gets neither article.
     out.assignments
         .retain(|a| !conflicted.contains(&(a.tag.clone(), a.slot.clone())));
+    // A new accessory the device has after the rows above (or an earlier new one) is there
+    // already.
+    let mut after: BTreeMap<DeviceTag, Device> = BTreeMap::new();
+    for a in &out.assignments {
+        put(after.entry(a.tag.clone()).or_insert_with(|| device_now(i, &a.tag)), a);
+    }
+    for a in new_accessories {
+        let d = after.entry(a.tag.clone()).or_insert_with(|| device_now(i, &a.tag));
+        if put(d, &a) {
+            out.assignments.push(a);
+        } else {
+            out.unchanged += 1;
+        }
+    }
     out
+}
+
+fn device_now(i: &Inputs<'_>, tag: &DeviceTag) -> Device {
+    i.project.devices.get(tag).cloned().unwrap_or_default()
+}
+
+/// Write one assignment onto a device; false for a new accessory the device has already.
+fn put(d: &mut Device, a: &Assignment) -> bool {
+    let part = DevicePart {
+        part: a.part.clone(),
+        qty: a.qty,
+    };
+    match a.slot {
+        Slot::Part => d.part = Some(a.part.clone()),
+        Slot::Accessory(k) => match d.accessories.get_mut(k) {
+            Some(slot) => *slot = part,
+            None => d.accessories.push(part),
+        },
+        Slot::NewAccessory if d.uses_part(&a.part) => return false,
+        Slot::NewAccessory => d.accessories.push(part),
+    }
+    true
 }
 
 /// The first row [`plan`] found for a device slot.
@@ -529,21 +585,12 @@ fn find_part(candidates: &Candidates, article: &str, manufacturer: &str) -> std:
 /// are those it had then.
 pub fn apply(project: &mut Project, plan: &Plan) -> usize {
     let mut changed: BTreeSet<&DeviceTag> = BTreeSet::new();
+    // New accessories come last in a plan, so a device keeps one only when a replacement
+    // that was planned (and not dropped since) does not keep it already.
     for a in &plan.assignments {
-        let d = project.devices.entry(a.tag.clone()).or_default();
-        let part = DevicePart {
-            part: a.part.clone(),
-            qty: a.qty,
-        };
-        match a.slot {
-            Slot::Part => d.part = Some(a.part.clone()),
-            Slot::Accessory(k) => match d.accessories.get_mut(k) {
-                Some(slot) => *slot = part,
-                None => d.accessories.push(part),
-            },
-            Slot::NewAccessory => d.accessories.push(part),
+        if put(project.devices.entry(a.tag.clone()).or_default(), a) {
+            changed.insert(&a.tag);
         }
-        changed.insert(&a.tag);
     }
     changed.len()
 }
@@ -555,7 +602,7 @@ mod tests {
     use super::*;
     use wc_core::geom::{Point, Rotation};
     use wc_core::symbol::{Pin, PinDir, SymbolRole};
-    use wc_core::{Device, Page, PlacedSymbol, Symbol};
+    use wc_core::{Page, PlacedSymbol, Symbol};
 
     fn tag(t: &str) -> DeviceTag {
         DeviceTag::parse(t).unwrap()
@@ -851,6 +898,76 @@ mod tests {
         c.project.insert("dup.a".into(), c.library["dup.a"].clone());
         let again = plan(&inputs, &c, &rows);
         assert_eq!(again.unmatched, first.unmatched);
+    }
+
+    #[test]
+    fn a_new_accessory_is_checked_against_the_device_after_the_other_rows() {
+        let (mut p, symbols) = project();
+        let parts = candidates();
+        // -X1's accessory 2002-1291 is replaced, and a new row asks for 2002-1291 again.
+        let rows = read_configured(b"Index;Article;Strip\n-X1/A1;249-116;-X1\n;2002-1291;-X1\n")
+            .unwrap()
+            .0;
+        let first = {
+            let inputs = Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            plan(&inputs, &library(&parts), &rows)
+        };
+        assert_eq!(first.assignments.len(), 2, "{first:#?}");
+        assert_eq!(apply(&mut p, &first), 1);
+        let had: Vec<&str> = p.devices[&tag("-X1")]
+            .accessories
+            .iter()
+            .map(|a| a.part.as_str())
+            .collect();
+        assert_eq!(had, ["wago.249-116", "wago.2002-1291"]);
+        // Again: nothing to change.
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let again = plan(&inputs, &library(&parts), &rows);
+        assert!(again.assignments.is_empty(), "{again:#?}");
+        assert_eq!(again.unchanged, 2);
+        // When the replacement is dropped (its part could not be taken), the new row adds nothing.
+        let (mut p, _) = project();
+        let mut dropped = first.clone();
+        dropped.assignments.retain(|a| a.part != "wago.249-116");
+        assert_eq!(apply(&mut p, &dropped), 0);
+        assert_eq!(p.devices[&tag("-X1")].accessories.len(), 1);
+    }
+
+    #[test]
+    fn a_library_whose_parts_cannot_be_listed_is_reported_and_the_others_still_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        let mut p = store::create(&dir, "Test").unwrap();
+        let good = tmp.path().join("good");
+        let (_, terminal) = part("wago.2002-1201", "WAGO", "2002-1201");
+        wc_library::write_part(&good, &terminal).unwrap();
+        // A file where the parts folder should be cannot be listed.
+        let bad = tmp.path().join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join(ItemKind::Part.dir()), "not a folder").unwrap();
+        for (name, root) in [("bad", &bad), ("good", &good)] {
+            p.meta.libraries.push(wc_core::project::LibrarySource {
+                name: name.into(),
+                kind: "folder".into(),
+                location: root.to_string_lossy().into_owned(),
+                reference: None,
+            });
+        }
+        let (c, warnings) = Candidates::load(&dir, &p);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("the parts of library bad cannot be listed"),
+            "{warnings:?}"
+        );
+        assert!(c.library.contains_key("wago.2002-1201"), "{c:?}");
     }
 
     #[test]
