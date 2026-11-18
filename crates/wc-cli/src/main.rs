@@ -3036,7 +3036,6 @@ fn fill_cover(p: &mut Project, fields: std::collections::BTreeMap<String, String
 }
 
 fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, source: &str) -> Result<(), String> {
-    let e = |x: wc_core::Error| x.to_string();
     let cover_fields = keep_one_cover(p, &mut built.pages);
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of
     // an earlier one and then fail half way.
@@ -3053,25 +3052,42 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
             page.number
         ));
     }
-    // A library item already in the project may come again only unchanged (same content hash).
+    // A library item already in the project may come again unchanged (same content hash), or
+    // in a new version when the project's copy is still the one its lock pinned: nobody changed
+    // it in the project, so the import replaces it (a block now drawn, a newer catalog).
+    let mut replaced: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for s in &built.symbols {
         if let Some(entry) = p.lock.symbols.get(&s.id)
             && entry.hash != s.hash()
         {
-            return Err(format!(
-                "symbol {} exists with other content; import into a fresh project",
-                s.id
-            ));
+            match store::read_vendored_symbol(dir, &s.id) {
+                Ok(have) if have.hash() == entry.hash => {
+                    replaced.push(vendored_bytes(dir, ItemKind::Symbol, &s.id)?);
+                }
+                _ => {
+                    return Err(format!(
+                        "symbol {} exists with other content; import into a fresh project",
+                        s.id
+                    ));
+                }
+            }
         }
     }
     for part in &built.parts {
         if let Some(entry) = p.lock.parts.get(&part.id)
             && entry.hash != part.hash()
         {
-            return Err(format!(
-                "part {} exists with other content; import into a fresh project",
-                part.id
-            ));
+            match store::read_vendored_part(dir, &part.id) {
+                Ok(have) if have.hash() == entry.hash => {
+                    replaced.push(vendored_bytes(dir, ItemKind::Part, &part.id)?);
+                }
+                _ => {
+                    return Err(format!(
+                        "part {} exists with other content; import into a fresh project",
+                        part.id
+                    ));
+                }
+            }
         }
     }
     if let Some(panel) = built
@@ -3094,9 +3110,21 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
             "device {tag} exists with other data; rename it or import into a fresh project"
         ));
     }
+    // A write that fails puts the copies it was replacing back, so each still matches its pin.
+    let put_back = |err: wc_core::Error| {
+        for (path, bytes) in &replaced {
+            let _ = std::fs::write(path, bytes);
+        }
+        err.to_string()
+    };
+    for s in &built.symbols {
+        store::write_vendored_symbol(dir, s).map_err(put_back)?;
+    }
+    for part in &built.parts {
+        store::write_vendored_part(dir, part).map_err(put_back)?;
+    }
     fill_cover(p, cover_fields);
     for s in &built.symbols {
-        store::write_vendored_symbol(dir, s).map_err(e)?;
         p.lock.symbols.insert(
             s.id.clone(),
             wc_core::LockEntry {
@@ -3106,7 +3134,6 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
         );
     }
     for part in &built.parts {
-        store::write_vendored_part(dir, part).map_err(e)?;
         p.lock.parts.insert(
             part.id.clone(),
             wc_core::LockEntry {
@@ -3136,6 +3163,13 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
     p.meta.fill_title_block(built.title_block);
     Ok(())
+}
+
+/// The path and bytes of a vendored copy, kept before an import replaces it.
+fn vendored_bytes(dir: &Path, kind: ItemKind, id: &str) -> Result<(PathBuf, Vec<u8>), String> {
+    let path = store::vendor_path(dir, kind, id).map_err(|x| x.to_string())?;
+    let bytes = std::fs::read(&path).map_err(|x| format!("{}: {x}", path.display()))?;
+    Ok((path, bytes))
 }
 
 /// The current time in UTC as `YYYY-MM-DDThh:mm:ssZ`.
@@ -3895,6 +3929,61 @@ mod tests {
 
         std::fs::write(&file, "<catalog/>").unwrap();
         assert!(import_bmecat(&file, &lib).is_err());
+    }
+
+    #[test]
+    fn an_import_replaces_an_item_the_project_has_not_changed_and_refuses_one_it_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let coil = |name: &str| wc_core::Symbol {
+            id: "swe.lib.coil".into(),
+            name: name.into(),
+            category: String::new(),
+            letter_code: "K".into(),
+            role: Default::default(),
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let relay = |text: &str| wc_core::Part {
+            id: "maker-a.rly-24".into(),
+            description: text.into(),
+            ..Default::default()
+        };
+        let built = |name: &str, text: &str| wc_import::aml::Built {
+            symbols: vec![coil(name)],
+            parts: vec![relay(text)],
+            ..Default::default()
+        };
+        let mut p = load(&dir).unwrap();
+        add_built(&dir, &mut p, built("Coil, box", "Relay"), "import:a.tewzip").unwrap();
+        save(&dir, &p).unwrap();
+
+        // The block is drawn now and the catalog is newer: both replace the untouched copies.
+        let mut p = load(&dir).unwrap();
+        add_built(&dir, &mut p, built("Coil, drawn", "Relay 24 V"), "import:a.tewzip").unwrap();
+        save(&dir, &p).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap(),
+            coil("Coil, drawn")
+        );
+        assert_eq!(p.lock.symbols["swe.lib.coil"].hash, coil("Coil, drawn").hash());
+        assert_eq!(p.lock.parts["maker-a.rly-24"].hash, relay("Relay 24 V").hash());
+
+        // Changed in the project since: still refused, and nothing is written.
+        store::write_vendored_symbol(&dir, &coil("Coil, edited here")).unwrap();
+        let mut p = load(&dir).unwrap();
+        let before = p.clone();
+        let err = add_built(&dir, &mut p, built("Coil, v3", "Relay 24 V, v3"), "import:a.tewzip").unwrap_err();
+        assert!(err.contains("symbol swe.lib.coil exists with other content"), "{err}");
+        assert_eq!(p, before);
+        assert_eq!(
+            store::read_vendored_part(&dir, "maker-a.rly-24").unwrap(),
+            relay("Relay 24 V")
+        );
     }
 
     #[test]
