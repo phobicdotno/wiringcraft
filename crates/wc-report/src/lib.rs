@@ -496,7 +496,7 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
 pub const LEVEL_PROPERTY: &str = "Level";
 
 /// A [`LEVEL_PROPERTY`] value as a level, or why it is not one.
-fn parse_level(value: &str) -> Result<u32, String> {
+pub fn parse_level(value: &str) -> Result<u32, String> {
     match value.trim().parse::<u32>() {
         Ok(0) => Err("levels start at 1".into()),
         Ok(l) => Ok(l),
@@ -736,9 +736,7 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
             .unwrap_or(&[]);
         let mut next = list
             .iter()
-            .filter_map(|t| t.number.as_deref())
-            .chain(spares.iter().map(String::as_str))
-            .filter_map(|n| n.parse::<u64>().ok())
+            .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
             .max()
             .unwrap_or(0);
         let numbered: Vec<(Term, String)> = list
@@ -747,7 +745,7 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
                 let number = term
                     .number
                     .clone()
-                    .or_else(|| wc_core::project::next_number(&mut next))
+                    .or_else(|| wc_core::project::next_free_number(&mut next, spares))
                     .unwrap_or_default();
                 (term, number)
             })

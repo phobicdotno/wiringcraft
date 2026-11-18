@@ -336,6 +336,18 @@ pub fn next_number(last: &mut u64) -> Option<String> {
     Some(last.to_string())
 }
 
+/// [`next_number`], passing over the numbers in `taken` (a strip's spares): a terminal tagged
+/// with just the strip never takes a spare's number, and adding a spare past the drawn numbers
+/// never renumbers it.
+pub fn next_free_number(last: &mut u64, taken: &[String]) -> Option<String> {
+    loop {
+        let n = next_number(last)?;
+        if !taken.contains(&n) {
+            return Some(n);
+        }
+    }
+}
+
 /// Keep the jumpers of `project` on their terminals after a change: `before` is the
 /// [`terminal_numbers`] from before it. A terminal that is still placed but no longer numbered
 /// (its page became an overview) counts as unchanged, not deleted. Returns whether a jumper
@@ -425,8 +437,8 @@ pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolR
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.page.cmp(&b.page).then(a.x.total_cmp(&b.x)),
         });
-        // Terminals tagged with just the strip are numbered after the largest number, spares
-        // included: a spare's number is taken even though nothing draws it.
+        // Terminals tagged with just the strip are numbered after the largest drawn number,
+        // passing over the spares' numbers: a spare's number is taken though nothing draws it.
         let spares = project
             .meta
             .strip_layout(&strip)
@@ -434,16 +446,14 @@ pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolR
             .unwrap_or(&[]);
         let mut next = list
             .iter()
-            .filter_map(|t| t.number.as_deref())
-            .chain(spares.iter().map(String::as_str))
-            .filter_map(|n| n.parse::<u64>().ok())
+            .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
             .max()
             .unwrap_or(0);
         for t in list {
             // A strip already at the largest number leaves the rest unnumbered.
             let number = match t.number {
                 Some(n) => n,
-                None => match next_number(&mut next) {
+                None => match next_free_number(&mut next, spares) {
                     Some(n) => n,
                     None => continue,
                 },
@@ -2448,6 +2458,11 @@ mod tests {
         let numbers: Vec<String> = terminal_numbers(&p, role).into_values().map(|(_, n)| n).collect();
         assert!(numbers.contains(&"3".to_owned()), "{numbers:?}");
         assert!(!numbers.contains(&"2".to_owned()), "{numbers:?}");
+        // A spare far past the drawn numbers does not renumber it.
+        p.meta
+            .add_spare(&x1, "10", None, &[("1".to_owned(), false), ("3".to_owned(), false)])?;
+        let numbers: Vec<String> = terminal_numbers(&p, role).into_values().map(|(_, n)| n).collect();
+        assert!(numbers.contains(&"3".to_owned()), "{numbers:?}");
         Ok(())
     }
 

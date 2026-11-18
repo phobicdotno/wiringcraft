@@ -1552,4 +1552,6 @@ fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_t
     let all = marking_list_with(&i, &MarkingOptions::default());
     let named: Vec<&Vec<String>> = all.rows.iter().filter(|r| r.iter().any(|c| c.contains("W1"))).collect();
     assert_eq!(named.len(), 1, "{named:?}");
+    let terminal = MarkerKind::Terminals.label(MarkingOptions::default().language);
+    assert_eq!(named[0][..3], [terminal.to_owned(), "-X1".to_owned(), "W1".to_owned()]);
 }

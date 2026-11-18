@@ -438,17 +438,17 @@ fn level_picker(ui: &mut egui::Ui, open: &Open, strip: &DeviceTag, number: &str,
         ui.label("");
         return None;
     };
-    let current = open
+    let own = open
         .project
         .devices
         .get(&tag)
         .and_then(|d| d.properties.get(wc_report::LEVEL_PROPERTY))
-        .cloned()
-        .unwrap_or_default();
+        .cloned();
+    let current = own.clone().unwrap_or_default();
     let mut picked = current.clone();
     egui::ComboBox::from_id_salt(("strip editor level", strip, number))
         .width(90.0)
-        .selected_text(level_text(&current, shown))
+        .selected_text(level_text(own.as_deref(), shown))
         .show_ui(ui, |ui| {
             for l in LEVELS {
                 ui.selectable_value(&mut picked, (*l).to_owned(), if l.is_empty() { "–" } else { l });
@@ -463,13 +463,15 @@ fn level_picker(ui: &mut egui::Ui, open: &Open, strip: &DeviceTag, number: &str,
 
 /// What the level picker shows: the terminal's own `Level`, else the level the terminal plan
 /// infers for it, marked as such, else – for none.
-fn level_text(own: &str, shown: Option<u32>) -> String {
-    match (own.is_empty(), shown) {
+fn level_text(own: Option<&str>, shown: Option<u32>) -> String {
+    match (own, shown) {
         // A value the terminal plan ignores (see wc_report::level_warnings) says so.
-        (false, Some(l)) if own.trim() == l.to_string() => own.to_owned(),
-        (false, _) => format!("{own} (ignored)"),
-        (true, Some(l)) => format!("{l} (inferred)"),
-        (true, None) => "–".to_owned(),
+        (Some(v), _) if wc_report::parse_level(v).is_err() => {
+            format!("{} (ignored)", if v.trim().is_empty() { "empty" } else { v })
+        }
+        (Some(v), _) => v.to_owned(),
+        (None, Some(l)) => format!("{l} (inferred)"),
+        (None, None) => "–".to_owned(),
     }
 }
 
@@ -721,9 +723,11 @@ mod tests {
         set_level(&mut o, &x1, "2", "")?;
         let shown = texts(&mut ed, &mut o);
         assert!(!shown.iter().any(|t| t.contains("(inferred)")), "{shown:?}");
-        assert_eq!(level_text("", None), "–");
-        assert_eq!(level_text("2", Some(2)), "2");
-        assert_eq!(level_text("0", None), "0 (ignored)");
+        assert_eq!(level_text(None, None), "–");
+        assert_eq!(level_text(Some("2"), Some(2)), "2");
+        assert_eq!(level_text(Some("02"), Some(2)), "02");
+        assert_eq!(level_text(Some("0"), None), "0 (ignored)");
+        assert_eq!(level_text(Some(""), None), "empty (ignored)");
 
         // New strip… in the picker opens the first-spare form beside the existing strip.
         ed.starting = true;

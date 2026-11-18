@@ -47,7 +47,7 @@ impl MarkerKind {
     }
 
     /// The marker type as written in the file's first column.
-    fn label(self, lang: Language) -> &'static str {
+    pub(crate) fn label(self, lang: Language) -> &'static str {
         use Language::*;
         match (self, lang) {
             (MarkerKind::Terminals, En) => "Terminal",
@@ -368,22 +368,25 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
     }
 
     // Terminals have terminal markers: the drawn ones and the spares the terminal strip editor
-    // keeps (a spare that is drawn too is a drawn terminal already).
+    // keeps (a spare that is drawn too is a drawn terminal already). Only the device and cable
+    // markers need them.
     let mut terminals: BTreeSet<DeviceTag> = BTreeSet::new();
-    for l in &i.project.meta.strips {
-        for n in &l.spares {
-            if let Ok(tag) = DeviceTag::parse(&format!("{}.{n}", l.strip)) {
-                terminals.insert(tag);
+    if wanted(MarkerKind::Devices) || wanted(MarkerKind::Cables) {
+        for l in &i.project.meta.strips {
+            for n in &l.spares {
+                if let Ok(tag) = DeviceTag::parse(&format!("{}.{n}", l.strip)) {
+                    terminals.insert(tag);
+                }
             }
         }
-    }
-    for page in &i.project.pages {
-        for s in &page.symbols {
-            let role = i.symbols.get(&s.symbol).map(|y| y.role);
-            if matches!(role, Some(SymbolRole::Terminal))
-                && let Some(tag) = &s.tag
-            {
-                terminals.insert(tag.clone());
+        for page in &i.project.pages {
+            for s in &page.symbols {
+                let role = i.symbols.get(&s.symbol).map(|y| y.role);
+                if matches!(role, Some(SymbolRole::Terminal))
+                    && let Some(tag) = &s.tag
+                {
+                    terminals.insert(tag.clone());
+                }
             }
         }
     }
