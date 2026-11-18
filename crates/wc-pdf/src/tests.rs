@@ -1,7 +1,7 @@
 use super::*;
 use wc_core::geom::Point;
 use wc_core::symbol::{Pin, PinDir, SymbolRole};
-use wc_core::{DeviceTag, Endpoint, Page, PlacedSymbol, Shape, Wire};
+use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Shape, Wire};
 
 fn sym(id: &str, role: SymbolRole, pins: [&str; 2]) -> Symbol {
     Symbol {
@@ -1135,4 +1135,45 @@ fn page_lines_leave_out_pictures_without_warning() {
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
     assert_eq!(svg_report.warnings.len(), 2, "{:?}", svg_report.warnings);
+}
+
+#[test]
+fn portrait_large_and_custom_sheets_export_at_their_size() {
+    let mut project = Project::new("Sizes");
+    let sizes = [
+        PageSize::A4Portrait,
+        PageSize::A1,
+        PageSize::A0Portrait,
+        PageSize::Custom {
+            width: 500,
+            height: 700,
+        },
+    ];
+    project.pages = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, size)| {
+            let mut p = Page::new(format!("p{i}"), (i + 1).to_string(), "Sheet");
+            p.size = *size;
+            p.symbols.push(place("s1", "coil", 50.0, "-K1"));
+            p
+        })
+        .collect();
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let (pdf, report) = export(&project, &symbols, &Options::default());
+    assert_eq!(report.pages, sizes.len());
+    let text = String::from_utf8_lossy(&pdf);
+    let pt = |mm: f64| mm / 25.4 * 72.0;
+    for size in sizes {
+        let (w, h) = size.mm();
+        let media = format!("/MediaBox [0 0 {:.2} {:.2}]", pt(w), pt(h));
+        assert!(text.contains(&media), "{size:?}: {media}");
+    }
+    let (pages, _) = page_drawings(&project, &symbols, &Options::default());
+    for (page, size) in pages.iter().zip(sizes) {
+        assert_eq!(page.size_mm, size.mm());
+        let (w, h) = size.mm();
+        assert!(svg(page).contains(&format!("viewBox=\"0 0 {w} {h}\"")), "{size:?}");
+    }
 }

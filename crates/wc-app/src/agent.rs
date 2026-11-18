@@ -332,13 +332,13 @@ pub fn specs() -> Vec<Value> {
         tool(
             "add_page",
             "Add a schematic page and show it. Returns its id and number.",
-            json!({"number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}}),
+            json!({"number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "description": "A4, A3, A2, A1 or A0 (landscape), the same with -portrait (A4-portrait), or WIDTHxHEIGHT in millimetres (500x700)"}}),
             &[],
         ),
         tool(
             "update_page",
             "Change a page's number, title or sheet size, mark it as an overview (a line diagram: its devices do not count as drawings in the project check), make it the project's cover page (it shows the project's name and fields; any other cover page loses the mark), or set the page's own title-block fields (get_page lists them).",
-            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}, "overview": {"type": "boolean"}, "cover": {"type": "boolean"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "The page's own title-block fields to change, such as revision, date, drawn_by, checked_by. They win over the project's on this page. An empty text or null clears a field so the project's shows again; fields left out are kept."}}),
+            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "description": "A4, A3, A2, A1 or A0 (landscape), the same with -portrait (A4-portrait), or WIDTHxHEIGHT in millimetres (500x700)"}, "overview": {"type": "boolean"}, "cover": {"type": "boolean"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "The page's own title-block fields to change, such as revision, date, drawn_by, checked_by. They win over the project's on this page. An empty text or null clears a field so the project's shows again; fields left out are kept."}}),
             &[],
         ),
         tool(
@@ -607,12 +607,7 @@ fn rotation(v: &Value) -> Result<Option<Rotation>, String> {
 fn page_size(v: &Value) -> Result<Option<PageSize>, String> {
     match s(v, "size") {
         None => Ok(None),
-        Some(t) => match t.to_ascii_uppercase().as_str() {
-            "A4" => Ok(Some(PageSize::A4)),
-            "A3" => Ok(Some(PageSize::A3)),
-            "A2" => Ok(Some(PageSize::A2)),
-            _ => Err(format!("size {t} is not A4, A3 or A2")),
-        },
+        Some(t) => PageSize::parse(t).map(Some),
     }
 }
 

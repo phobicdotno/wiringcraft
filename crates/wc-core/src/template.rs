@@ -65,6 +65,13 @@ fn is_default_height(h: &f64) -> bool {
     *h == TITLE_HEIGHT
 }
 
+/// A box's left, top, right and bottom ([`TitleBox::resolve`]).
+pub type BoxSides = (f64, f64, f64, f64);
+
+/// The least width, in millimetres, a box measured from both sides of the frame keeps before
+/// the title block is narrowed to fit ([`PageTemplate::boxes_on`]).
+pub const MIN_MIDDLE_BOX: f64 = 40.0;
+
 /// Which side of the frame a box edge is measured from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -173,9 +180,15 @@ impl TitleBox {
     /// and bottom below the band's top, clamped to the band of height `band`. `None` when
     /// nothing is left of it.
     pub fn resolve(&self, x0: f64, x1: f64, band: f64) -> Option<(f64, f64, f64, f64)> {
+        self.resolve_scaled(x0, x1, band, 1.0)
+    }
+
+    /// [`Self::resolve`] with every distance from a side multiplied by `scale`, for a frame
+    /// narrower than the layout needs ([`PageTemplate::boxes_on`]).
+    pub fn resolve_scaled(&self, x0: f64, x1: f64, band: f64, scale: f64) -> Option<(f64, f64, f64, f64)> {
         let at = |mm: f64, from: Side| match from {
-            Side::Left => x0 + mm,
-            Side::Right => x1 - mm,
+            Side::Left => x0 + mm * scale,
+            Side::Right => x1 - mm * scale,
         };
         let clamp = |v: f64, lo: f64, hi: f64| if v.is_nan() { lo } else { v.clamp(lo, hi) };
         let left = clamp(at(self.left, self.left_from), x0, x1);
@@ -312,6 +325,40 @@ impl PageTemplate {
             }
         }
         None
+    }
+
+    /// The frame width the title block needs as laid out: every box measured from both sides
+    /// keeps [`MIN_MIDDLE_BOX`] millimetres, and no box runs past the other side.
+    pub fn needed_width(&self) -> f64 {
+        self.boxes
+            .iter()
+            .map(|b| {
+                let v = |mm: f64| if mm.is_finite() { mm.max(0.0) } else { 0.0 };
+                match (b.left_from, b.right_from) {
+                    (Side::Left, Side::Right) => v(b.left) + v(b.right) + MIN_MIDDLE_BOX,
+                    (Side::Left, Side::Left) => v(b.right),
+                    (Side::Right, Side::Right) => v(b.left),
+                    (Side::Right, Side::Left) => v(b.left) + v(b.right),
+                }
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// The boxes on a frame from `x0` to `x1` with a band `band` high, each with its sides
+    /// ([`TitleBox::resolve`]). On a frame narrower than [`Self::needed_width`] (an upright
+    /// A4 sheet) the whole layout is narrowed to fit, so boxes keep their order and never
+    /// overlap; texts shrink to their boxes as always.
+    pub fn boxes_on(&self, x0: f64, x1: f64, band: f64) -> Vec<(&TitleBox, BoxSides)> {
+        let need = self.needed_width();
+        let scale = if need > x1 - x0 && need > 0.0 {
+            (x1 - x0) / need
+        } else {
+            1.0
+        };
+        self.boxes
+            .iter()
+            .filter_map(|b| b.resolve_scaled(x0, x1, band, scale).map(|r| (b, r)))
+            .collect()
     }
 
     /// The title block band's height in use: [`Self::height`] kept within [`MIN_TITLE_HEIGHT`]
@@ -466,5 +513,24 @@ mod tests {
         assert_eq!(t.column_count(), 1);
         t.columns = 1000;
         assert_eq!(t.column_count(), MAX_COLUMNS);
+    }
+
+    #[test]
+    fn a_narrow_frame_narrows_the_whole_title_block() {
+        let t = PageTemplate::default();
+        let band = t.band_height();
+        // A3 and A4 landscape are wide enough: the boxes are where they always were.
+        for x1 in [410.0, 287.0] {
+            let wide: Vec<_> = t.boxes.iter().filter_map(|b| b.resolve(10.0, x1, band)).collect();
+            let on: Vec<_> = t.boxes_on(10.0, x1, band).into_iter().map(|(_, r)| r).collect();
+            assert_eq!(on, wide);
+        }
+        // An upright A4 sheet (190 mm inside the frame) keeps every box, in the frame and in
+        // order: the project box still has room.
+        let on = t.boxes_on(10.0, 200.0, band);
+        assert_eq!(on.len(), t.boxes.len());
+        assert!(on.iter().all(|(_, (l, _, r, _))| *l >= 10.0 && *r <= 200.0 && r > l));
+        let project = on.iter().find(|(b, _)| b.label == "Project").map(|(_, r)| *r);
+        assert!(project.is_some_and(|(l, _, r, _)| r - l > 20.0), "{project:?}");
     }
 }

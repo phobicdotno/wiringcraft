@@ -374,6 +374,8 @@ enum PageCmd {
         number: String,
         #[arg(long, default_value = "")]
         title: String,
+        /// A4, A3, A2, A1 or A0, landscape unless followed by `-portrait` (`A4-portrait`), or
+        /// a sheet of its own as WIDTHxHEIGHT in millimetres (`500x700`).
         #[arg(long, default_value = "A3")]
         size: String,
         /// An overview (line diagram): its devices do not count as drawings in `check`.
@@ -393,6 +395,12 @@ enum PageCmd {
         id: String,
         #[arg(long)]
         off: bool,
+    },
+    /// Change a page's sheet size (as `page add --size` takes it). What is drawn stays where it
+    /// is; a smaller sheet can leave some of it outside the frame.
+    Size {
+        id: String,
+        size: String,
     },
     /// Make a page the project's cover page (any other page loses the mark), or with `--off` a
     /// normal page again.
@@ -903,12 +911,7 @@ fn run(cli: Cli) -> Res<()> {
                     }
                     let mut page = Page::new(id, number, title);
                     page.overview = overview;
-                    page.size = match size.to_uppercase().as_str() {
-                        "A4" => PageSize::A4,
-                        "A3" => PageSize::A3,
-                        "A2" => PageSize::A2,
-                        other => return Err(format!("unknown size {other}")),
-                    };
+                    page.size = PageSize::parse(&size)?;
                     p.pages.push(page);
                     if cover {
                         let i = p.pages.len() - 1;
@@ -949,6 +952,15 @@ fn run(cli: Cli) -> Res<()> {
                         .find(|pg| pg.id == id)
                         .ok_or_else(|| format!("no page {id:?}"))?;
                     page.overview = !off;
+                }
+                PageCmd::Size { id, size } => {
+                    let size = PageSize::parse(&size)?;
+                    let page = p
+                        .pages
+                        .iter_mut()
+                        .find(|pg| pg.id == id)
+                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    page.size = size;
                 }
                 PageCmd::Cover { id, off } => {
                     let i = p
@@ -1769,13 +1781,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 };
                 let mut page = Page::new(id, (first_page + i).to_string(), format!("{stem} p.{}", i + 1));
                 page.underlay = underlay;
-                page.size = if t.size_mm.0 > 500.0 {
-                    PageSize::A2
-                } else if t.size_mm.0 > 350.0 {
-                    PageSize::A3
-                } else {
-                    PageSize::A4
-                };
+                page.size = sheet_for(t.size_mm);
                 println!("page {}: {} shapes", page.number, t.graphics.len());
                 page.graphics = t.graphics;
                 p.pages.push(page);
@@ -2153,6 +2159,24 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// The named sheet a traced drawing of `(width, height)` millimetres fits best: the smallest
+/// ISO size whose long side holds the drawing's long side, upright when the drawing is.
+fn sheet_for((w, h): (f64, f64)) -> PageSize {
+    let long = w.max(h);
+    let (landscape, portrait) = if long > 1000.0 {
+        (PageSize::A0, PageSize::A0Portrait)
+    } else if long > 700.0 {
+        (PageSize::A1, PageSize::A1Portrait)
+    } else if long > 500.0 {
+        (PageSize::A2, PageSize::A2Portrait)
+    } else if long > 350.0 {
+        (PageSize::A3, PageSize::A3Portrait)
+    } else {
+        (PageSize::A4, PageSize::A4Portrait)
+    };
+    if h > w { portrait } else { landscape }
 }
 
 /// What `lib lock` could not pin, one line each.
@@ -3292,6 +3316,38 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn pages_can_be_upright_large_or_of_their_own_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        for (id, size, want) in [
+            ("up", "A4-portrait", PageSize::A4Portrait),
+            ("big", "A1", PageSize::A1),
+            (
+                "own",
+                "500x700",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+        ] {
+            cli(&dir, &["page", "add", id, "--number", id, "--size", size]).unwrap();
+            assert_eq!(load(&dir).unwrap().page(id).map(|p| p.size), Some(want), "{size}");
+        }
+        cli(&dir, &["page", "size", "big", "A0-portrait"]).unwrap();
+        assert_eq!(
+            load(&dir).unwrap().page("big").map(|p| p.size),
+            Some(PageSize::A0Portrait)
+        );
+        let err = cli(&dir, &["page", "add", "bad", "--number", "bad", "--size", "A5"]).unwrap_err();
+        assert!(err.contains("portrait"), "{err}");
+        assert_eq!(sheet_for((210.0, 297.0)), PageSize::A4Portrait);
+        assert_eq!(sheet_for((841.0, 594.0)), PageSize::A1);
+        assert_eq!(sheet_for((420.0, 297.0)), PageSize::A3);
     }
 
     #[test]

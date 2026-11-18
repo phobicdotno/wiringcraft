@@ -1446,12 +1446,30 @@ impl App {
                             ui.end_row();
                             ui.label("Sheet size");
                             egui::ComboBox::from_id_salt("pagesize")
-                                .selected_text(size_label(*size))
+                                .selected_text(size.label())
                                 .show_ui(ui, |ui| {
-                                    for s in [PageSize::A4, PageSize::A3, PageSize::A2] {
-                                        ui.selectable_value(size, s, size_label(s));
+                                    for s in PageSize::NAMED {
+                                        ui.selectable_value(size, s, s.label());
+                                    }
+                                    // A sheet of its own: starts from the size shown, as it is drawn.
+                                    let (w, h) = size.mm();
+                                    let own = PageSize::Custom {
+                                        width: w.round() as u32,
+                                        height: h.round() as u32,
+                                    };
+                                    if !matches!(size, PageSize::Custom { .. }) {
+                                        ui.selectable_value(size, own, "Custom size…");
                                     }
                                 });
+                            if let PageSize::Custom { width, height } = size {
+                                ui.end_row();
+                                ui.label("Custom size (mm)");
+                                ui.horizontal(|ui| {
+                                    let range = PageSize::MIN_MM..=PageSize::MAX_MM;
+                                    ui.add(egui::DragValue::new(width).range(range.clone()).suffix(" wide"));
+                                    ui.add(egui::DragValue::new(height).range(range).suffix(" high"));
+                                });
+                            }
                             ui.end_row();
                             ui.label("Overview");
                             ui.checkbox(overview, "Line diagram").on_hover_text(
@@ -2103,14 +2121,6 @@ impl App {
             }
             Err(e) => self.dialog = Some(Dialog::Message(format!("Could not create the branch:\n{e}"))),
         }
-    }
-}
-
-fn size_label(s: PageSize) -> &'static str {
-    match s {
-        PageSize::A4 => "A4 landscape",
-        PageSize::A3 => "A3 landscape",
-        PageSize::A2 => "A2 landscape",
     }
 }
 
