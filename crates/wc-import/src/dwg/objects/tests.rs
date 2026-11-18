@@ -1253,10 +1253,20 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
 
 /// A HATCH in model space: no gradient, pattern `name`, the paths written by `paths`.
 fn hatch_obj(v: Version, handle: u64, name: &str, solid: bool, count: u32, paths: impl Fn(&mut W)) -> Obj {
+    hatch_with(v, handle, name, solid, count, 1.0, paths)
+}
+
+/// [`hatch_obj`] with an extrusion of (0, 0, `z`) and a gradient of two colours, the second
+/// with a colour name and a book name.
+fn hatch_with(v: Version, handle: u64, name: &str, solid: bool, count: u32, z: f64, paths: impl Fn(&mut W)) -> Obj {
     let mut o = entity(v, 78, handle, head(None));
-    o.data.bl(0).bl(0).bd(0.0).bd(0.0).bl(0).bd(0.0).bl(0);
-    o.text("");
-    o.data.bd(0.0).bd3((0.0, 0.0, 1.0));
+    o.data.bl(1).bl(0).bd(0.0).bd(0.0).bl(0).bd(0.0).bl(2);
+    o.data.bd(0.0).bs(5).bl(0xC300_0005).rc(0);
+    o.data.bd(1.0).bs(7).bl(0xC200_FF00).rc(3);
+    o.text("Green");
+    o.text("Book");
+    o.text("LINEAR");
+    o.data.bd(0.0).bd3((0.0, 0.0, z));
     o.text(name);
     o.data.b(solid).b(false).bl(count);
     paths(&mut o.data);
@@ -1331,5 +1341,93 @@ fn a_hatch_listing_too_much_is_a_damaged_object() -> TestResult {
         "{:?}",
         d.damaged
     );
+    Ok(())
+}
+
+#[test]
+fn hatch_edges_of_every_kind_and_a_mirrored_hatch_are_read() -> TestResult {
+    use std::f64::consts::PI;
+    for v in [Version::R2004, Version::R2010] {
+        // A solid slot: a polyline path with bulges (two half circles joined by lines).
+        let slot = hatch_obj(v, 0x300, "SOLID", true, 1, |d| {
+            d.bl(2).b(true).b(true).bl(4);
+            for (p, bulge) in [
+                ((0.0, 0.0), 0.0),
+                ((10.0, 0.0), 1.0),
+                ((10.0, 4.0), 0.0),
+                ((0.0, 4.0), 1.0),
+            ] {
+                d.rd(p.0).rd(p.1).bd(bulge);
+            }
+            d.bl(0);
+        });
+        // An edge path: half an ellipse over (40, 0)..(60, 0), closed by a spline below it,
+        // with fit points (and tangents) in 2010.
+        let edges = hatch_obj(v, 0x301, "ANSI31", false, 1, |d| {
+            d.bl(1).bl(2);
+            d.rc(3).rd(50.0).rd(0.0).rd(10.0).rd(0.0).bd(0.5).bd(0.0).bd(PI).b(true);
+            d.rc(4).bl(2).b(false).b(false).bl(6).bl(3);
+            for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+                d.bd(k);
+            }
+            for p in [(40.0, 0.0), (50.0, -10.0), (60.0, 0.0)] {
+                d.rd(p.0).rd(p.1);
+            }
+            if v == Version::R2010 {
+                d.bl(2)
+                    .rd(40.0)
+                    .rd(0.0)
+                    .rd(60.0)
+                    .rd(0.0)
+                    .rd(1.0)
+                    .rd(0.0)
+                    .rd(1.0)
+                    .rd(0.0);
+            }
+            // Two boundary objects (their handles are in the handle stream).
+            d.bl(2);
+        });
+        // A solid triangle with a downward extrusion: mirrored in x.
+        let mirrored = hatch_with(v, 0x302, "SOLID", true, 1, -1.0, |d| {
+            d.bl(2).b(false).b(true).bl(3);
+            for p in [(100.0, 0.0), (110.0, 0.0), (100.0, 10.0)] {
+                d.rd(p.0).rd(p.1);
+            }
+            d.bl(0);
+        });
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            slot,
+            edges,
+            mirrored,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(d.skipped.is_empty(), "{v:?}: {:?}", d.skipped);
+        let polys: Vec<(&Vec<Point>, bool)> = d
+            .model
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline { points, filled, .. } => Some((points, *filled)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polys.len(), 3, "{v:?}: {:?}", d.model);
+        let near = |p: &Point, x: f64, y: f64| p.distance(Point::new(x, y)) < 1e-6;
+        // The slot's bulges reach 2 past its ends.
+        let (slot, filled) = polys[0];
+        assert!(
+            filled && slot.iter().any(|p| p.x > 11.9) && slot.iter().any(|p| p.x < -1.9),
+            "{slot:?}"
+        );
+        // The ellipse's top (y 5 up) and the spline's bottom (y 5 down), not filled.
+        let (edge, filled) = polys[1];
+        assert!(!filled, "{v:?}");
+        assert!(edge.iter().any(|p| near(p, 50.0, -5.0)), "{edge:?}");
+        assert!(edge.iter().any(|p| near(p, 50.0, 5.0)), "{edge:?}");
+        // The mirrored triangle lies at negative x.
+        let (tri, _) = polys[2];
+        assert!(tri.iter().all(|p| p.x <= -100.0 + 1e-9), "{tri:?}");
+    }
     Ok(())
 }

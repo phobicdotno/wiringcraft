@@ -475,14 +475,14 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
         skip_color(o)?;
     }
     o.text()?;
-    // Elevation and extrusion.
+    // Elevation and extrusion (a downward one mirrors the hatch, as for other entities).
     o.data.bd()?;
-    o.data.bd3()?;
+    let (_, _, z) = o.data.bd3()?;
     let name = o.text()?;
     let solid = o.data.b()?;
     o.data.b()?;
     let paths = hatch_count(o, "boundary paths")?;
-    e.s(2, name).i(70, i64::from(solid)).i(91, i64::from(paths));
+    e.f(230, z).s(2, name).i(70, i64::from(solid)).i(91, i64::from(paths));
     for _ in 0..paths {
         let flags = o.data.bl()?;
         e.i(92, i64::from(flags));
