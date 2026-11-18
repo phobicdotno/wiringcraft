@@ -1239,12 +1239,15 @@ impl Share {
         let items = new_items(&open.dir, &open.project, auth, &skip);
         let now = std::time::Instant::now();
         for (name, why) in &items.unreadable {
-            // A file that cannot be read counts as a try, so the changes waiting for it go
-            // once the tries are used up.
-            if let Some(out) = self.items_out.get_mut(name) {
-                out.at = now;
-                out.tries += 1;
-            }
+            // A file that cannot be read counts as a try: the changes that may draw the item
+            // wait for it as for a sent one, and go once the tries are used up.
+            let out = self.items_out.entry(name.clone()).or_insert(ItemOut {
+                at: now,
+                tries: 0,
+                gave_up: false,
+            });
+            out.at = now;
+            out.tries += 1;
             if self.unreadable.insert(name.clone()) {
                 self.notes.push(format!(
                     "The file of {name} could not be read ({why}); others cannot draw it until it can."

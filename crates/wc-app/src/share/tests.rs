@@ -1055,7 +1055,8 @@ fn an_unreadable_file_is_named_once_and_not_sent() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-    guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    let item = guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    let sym = guest_open.symbols.get("wc.contact.no").cloned().ok_or("not loaded")?;
     let file = store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.contact.no")?;
     std::fs::write(&file, "{ not json")?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
@@ -1067,8 +1068,22 @@ fn an_unreadable_file_is_named_once_and_not_sent() -> TestResult {
         .collect();
     assert_eq!(named.len(), 1, "{notes:?}");
     assert!(!log.messages().iter().any(|m| m.starts_with("Add ")));
+    let drawn = |o: &Open| {
+        o.project
+            .page("p0003")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
+    assert!(!drawn(&host_open), "the page waits for the symbol it draws");
+
+    // Readable again: the symbol goes out, then the page.
+    store::write_vendored_symbol(&guest_open.dir, &sym)?;
+    std::thread::sleep(ITEM_WAIT);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(host_open.symbols.get("wc.contact.no"), Some(&sym));
+    assert!(drawn(&host_open));
 
     // The host's own unreadable files are named when it shares.
+    std::fs::write(&file, "{ not json")?;
     let files = vendored_files(&guest_open.dir, &guest_open.project);
     assert!(files.unreadable.iter().any(|u| u.starts_with("symbol wc.contact.no (")));
     Ok(())
