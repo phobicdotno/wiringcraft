@@ -667,6 +667,116 @@ fn bspline_points(ctrl: &[(f64, f64)], knots: &[f64], weights: &[f64], degree: u
 
 /// Points of a SPLINE entity: the curve through its control points, else through its fit
 /// points; and whether it is closed.
+/// The most fit points a spline is interpolated through; beyond, they are joined straight.
+const MAX_FIT_POINTS: usize = 10_000;
+
+/// Points along the B-spline of degree `degree` (3 when 0, at most one less than the points)
+/// that passes through `fit`: global interpolation with chord-length parameters and averaged
+/// knots, as a CAD program derives the control points of a spline drawn by its fit points.
+/// `None` when there are fewer than three distinct points or the system cannot be solved.
+fn through_fit_points(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f64, f64)>> {
+    let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
+    for &pt in fit {
+        if !(pt.0.is_finite() && pt.1.is_finite()) {
+            return None;
+        }
+        if q.last().is_none_or(|l| (l.0 - pt.0).hypot(l.1 - pt.1) > 1e-12) {
+            q.push(pt);
+        }
+    }
+    let n = q.len();
+    if !(3..=MAX_FIT_POINTS).contains(&n) {
+        return None;
+    }
+    let p = if degree == 0 { 3 } else { degree }.min(n - 1).min(MAX_SPLINE_DEGREE);
+    // Chord-length parameters from 0 to 1.
+    let mut params = vec![0.0; n];
+    let mut total = 0.0;
+    for k in 1..n {
+        total += (q[k].0 - q[k - 1].0).hypot(q[k].1 - q[k - 1].1);
+        params[k] = total;
+    }
+    if !(total.is_finite() && total > 0.0) {
+        return None;
+    }
+    for t in &mut params {
+        *t /= total;
+    }
+    params[n - 1] = 1.0;
+    // Clamped knots, the inner ones averaged from the parameters.
+    let mut knots = vec![0.0; p + 1];
+    for j in 1..n - p {
+        knots.push(params[j..j + p].iter().sum::<f64>() / p as f64);
+    }
+    knots.extend(std::iter::repeat_n(1.0, p + 1));
+    // The collocation matrix is banded (each row's nonzeros lie within p of its diagonal) and
+    // totally positive, so it is solved in its band without pivoting.
+    let w = 2 * p + 1;
+    let mut band = vec![0.0; n * w];
+    let at = |i: usize, c: usize| (c + p).checked_sub(i).filter(|o| *o < w).map(|o| i * w + o);
+    for (k, &u) in params.iter().enumerate() {
+        let span = (p + knots.get(p + 1..n)?.partition_point(|&t| t <= u)).min(n - 1);
+        for (r, v) in basis(&knots, span, u, p)?.into_iter().enumerate() {
+            *band.get_mut(at(k, span + r - p)?)? = v;
+        }
+    }
+    let (mut x, mut y): (Vec<f64>, Vec<f64>) = q.iter().copied().unzip();
+    for j in 0..n {
+        let pivot = band[at(j, j)?];
+        if pivot.abs() < 1e-14 {
+            return None;
+        }
+        for i in j + 1..n.min(j + p + 1) {
+            let f = band[at(i, j)?] / pivot;
+            if f == 0.0 {
+                continue;
+            }
+            for c in j..n.min(j + p + 1) {
+                let v = band[at(j, c)?];
+                *band.get_mut(at(i, c)?)? -= f * v;
+            }
+            x[i] -= f * x[j];
+            y[i] -= f * y[j];
+        }
+    }
+    for j in (0..n).rev() {
+        for c in j + 1..n.min(j + p + 1) {
+            let v = band[at(j, c)?];
+            x[j] -= v * x[c];
+            y[j] -= v * y[c];
+        }
+        let d = band[at(j, j)?];
+        x[j] /= d;
+        y[j] /= d;
+    }
+    let ctrl: Vec<(f64, f64)> = x.into_iter().zip(y).collect();
+    if !ctrl.iter().all(|(a, b)| a.is_finite() && b.is_finite()) {
+        return None;
+    }
+    bspline_points(&ctrl, &knots, &[], p)
+}
+
+/// The p + 1 B-spline basis functions not zero at `u` in knot span `span` (The NURBS Book,
+/// algorithm A2.2).
+fn basis(knots: &[f64], span: usize, u: f64, p: usize) -> Option<Vec<f64>> {
+    let mut n = vec![0.0; p + 1];
+    let (mut left, mut right) = (vec![0.0; p + 1], vec![0.0; p + 1]);
+    n[0] = 1.0;
+    for j in 1..=p {
+        left[j] = u - knots.get((span + 1).checked_sub(j)?)?;
+        right[j] = knots.get(span + j)? - u;
+        let mut saved = 0.0;
+        for r in 0..j {
+            let denom = right[r + 1] + left[j - r];
+            let temp = if denom.abs() < 1e-300 { 0.0 } else { n[r] / denom };
+            n[r] = saved + right[r + 1] * temp;
+            saved = left[j - r] * temp;
+        }
+        n[j] = saved;
+    }
+    Some(n)
+}
+
 fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool) {
     let closed = (e.f(70) as i64) & 1 == 1;
     // Whole pairs only, both coordinates finite: a NaN would make the project file unreadable.
@@ -675,6 +785,9 @@ fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool) {
     let fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).filter(finite).collect();
     let degree = e.f_or(71, 3.0).max(0.0) as usize;
     if let Some(pts) = bspline_points(&ctrl, &e.all(40), &e.all(41), degree) {
+        return (pts, closed);
+    }
+    if let Some(pts) = through_fit_points(&fit, degree) {
         return (pts, closed);
     }
     if fit.len() >= 2 {
@@ -836,6 +949,7 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                         let fit: Vec<(f64, f64)> = (0..nf).filter_map(|_| cur.point(11, 21)).collect();
                         let _ = (cur.point(12, 22), cur.point(13, 23));
                         bspline_points(&ctrl, &knots, &weights, degree)
+                            .or_else(|| through_fit_points(&fit, degree))
                             .or((fit.len() >= 2).then_some(fit))
                             .unwrap_or(ctrl)
                     }
@@ -1456,8 +1570,40 @@ mod tests {
         let ents = "0\nSPLINE\n71\n3\n74\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n";
         let (g, _) = drawn(ents, "")?;
         let (s, _, _) = poly(&g[0]);
-        assert_eq!(s, [Point::new(0.0, 0.0), Point::new(5.0, -5.0), Point::new(10.0, 0.0)]);
+        // A smooth curve through the three points, not two straight segments.
+        let near = |a: &Point, b: Point| a.distance(b) < 1e-6;
+        assert!(s.len() > 10, "{s:?}");
+        assert!(near(&s[0], Point::new(0.0, 0.0)) && s.last().is_some_and(|q| near(q, Point::new(10.0, 0.0))));
+        assert!(
+            s.iter().any(|q| near(q, Point::new(5.0, -5.0))),
+            "through the middle: {s:?}"
+        );
+        // Above the straight segment (0, 0)-(5, 5) at x = 2.5 (page y is down).
+        let quarter = s.iter().min_by(|a, b| (a.x - 2.5).abs().total_cmp(&(b.x - 2.5).abs()));
+        assert!(quarter.is_some_and(|q| -q.y > 2.5 + 0.3), "{quarter:?}");
         Ok(())
+    }
+
+    #[test]
+    fn interpolation_through_fit_points_holds_them_all() {
+        // A wave of 50 points: the curve passes through each one.
+        let fit: Vec<(f64, f64)> = (0..50).map(|i| (i as f64, (i as f64 * 0.4).sin() * 3.0)).collect();
+        let pts = through_fit_points(&fit, 3).unwrap_or_default();
+        assert!(!pts.is_empty(), "a wave can be interpolated");
+        for f in &fit {
+            let d = pts
+                .iter()
+                .map(|q| (q.0 - f.0).hypot(q.1 - f.1))
+                .fold(f64::MAX, f64::min);
+            assert!(d < 0.05, "{f:?} is {d} away");
+        }
+        // Two distinct points, a repeated point and points that are not numbers give none.
+        assert!(through_fit_points(&[(0.0, 0.0), (1.0, 1.0)], 3).is_none());
+        assert!(through_fit_points(&[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], 3).is_none());
+        assert!(through_fit_points(&[(0.0, 0.0), (f64::NAN, 1.0), (2.0, 0.0)], 3).is_none());
+        // Straight points stay on their line.
+        let line = through_fit_points(&[(0.0, 0.0), (1.0, 1.0), (3.0, 3.0), (4.0, 4.0)], 3);
+        assert!(line.is_some_and(|l| l.iter().all(|q| (q.0 - q.1).abs() < 1e-9)));
     }
 
     #[test]
