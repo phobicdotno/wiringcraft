@@ -77,6 +77,7 @@ fn host_with(open: &Open, journal: Box<dyn Journal>) -> Share {
             port: 0,
             dir: open.dir.clone(),
             took_updates: Vec::new(),
+            names_taken: Vec::new(),
         }))),
         base: Some(open.project.clone()),
         ..Default::default()
@@ -2331,6 +2332,113 @@ fn a_logo_picked_by_a_guest_reaches_the_host_and_the_others() -> TestResult {
 }
 
 #[test]
+fn a_picture_replaced_here_under_its_name_reaches_the_session_under_a_name_of_its_own() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    // Written again with the same picture: nothing goes out.
+    let n = log.messages().len();
+    std::fs::write(guest_open.dir.join(&file), PNG)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(log.messages().len(), n, "{:?}", log.messages());
+    // The file is replaced in the folder under the same name.
+    let new = b"\x89PNG\r\n\x1a\nanother logo".to_vec();
+    std::fs::write(guest_open.dir.join(&file), &new)?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The session keeps its file of that name; the new one goes in under a name of its own,
+    // which the project names everywhere.
+    let renamed = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(renamed, file);
+    assert_eq!(file_bytes(&guest_open.dir, &renamed)?, new);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    assert_eq!(file_bytes(&host_open.dir, &renamed)?, new);
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    // Once: more frames send nothing new.
+    let n = log.messages().len();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages().len(), n);
+    Ok(())
+}
+
+#[test]
+fn a_picture_the_host_replaced_in_its_folder_gets_a_name_of_its_own() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    // The host replaces the file it took in its folder, under the same name.
+    let new = b"\x89PNG\r\n\x1a\nthe host's logo".to_vec();
+    std::fs::write(host_open.dir.join(&file), &new)?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let renamed = host_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(renamed, file);
+    assert_eq!(guest_open.project.meta.logo, host_open.project.meta.logo);
+    assert_eq!(file_bytes(&guest_open.dir, &renamed)?, new);
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, PNG);
+    assert!(!h.take_notes().iter().any(|n| n.contains("not kept")));
+    Ok(())
+}
+
+#[test]
+fn an_empty_file_put_in_place_of_a_picture_is_named_once_and_not_sent() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    g.take_notes();
+    let n = log.messages().len();
+    std::fs::write(guest_open.dir.join(&file), b"")?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(log.messages().len(), n, "{:?}", log.messages());
+    let notes = g.take_notes();
+    assert_eq!(
+        notes.iter().filter(|n| n.contains("cannot be shared")).count(),
+        1,
+        "{notes:?}"
+    );
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    Ok(())
+}
+
+#[test]
 fn a_logo_picked_by_the_host_reaches_the_guest() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
@@ -3697,4 +3805,15 @@ fn a_page_too_large_to_go_twice_in_one_message_is_not_folded_into_the_batch() {
     };
     fold_own_page(&mut out, &base);
     assert!(out.page.is_some() && out.edits.len() == n);
+}
+
+#[test]
+fn a_picture_whose_write_time_is_unknown_is_read_again_even_at_the_same_size() {
+    let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+    // Without a write time a same-size replacement looks the same: it must be read.
+    assert!(!still_taken(Some(&(4, None)), &(4, None)));
+    // With one, an unchanged size and time is the file taken in.
+    assert!(still_taken(Some(&(4, Some(at))), &(4, Some(at))));
+    assert!(!still_taken(Some(&(5, Some(at))), &(4, Some(at))));
+    assert!(!still_taken(None, &(4, Some(at))));
 }
