@@ -1249,19 +1249,25 @@ impl App {
                         Some(Some(src))
                     }
                 };
-                let fields: Vec<(String, String)> = fields.into_iter().collect();
-                open.set_project_props(&name, &fields, None)?;
-                match logo {
+                // The only way the properties can be refused; checked before the logo is copied,
+                // and the logo copied before the properties change, so a failure changes nothing.
+                if name.trim().is_empty() {
+                    return Err("The project name cannot be empty.".into());
+                }
+                let said = match logo {
                     Some(Some(src)) => {
                         let file = open.set_logo_from(&src)?;
-                        Ok(format!("Project properties set; the logo is {file}."))
+                        format!("Project properties set; the logo is {file}.")
                     }
                     Some(None) => {
                         open.remove_logo();
-                        Ok("Project properties set; the logo is removed.".into())
+                        "Project properties set; the logo is removed.".to_owned()
                     }
-                    None => Ok("Project properties set.".into()),
-                }
+                    None => "Project properties set.".to_owned(),
+                };
+                let fields: Vec<(String, String)> = fields.into_iter().collect();
+                open.set_project_props(&name, &fields, None)?;
+                Ok(said)
             }
             "comments" => self.tool_comments(v),
             "macros" => self.tool_macros(v),
@@ -2375,6 +2381,23 @@ mod tests {
         call(&mut a, "set_project", json!({"logo": ""})).unwrap();
         assert_eq!(logo_of(&mut a), Value::Null);
         assert!(dir.join("pictures/brand.png").exists(), "the file stays");
+
+        // A copy that fails (pictures/ is a file) leaves the name, fields and undo as they were.
+        std::fs::remove_dir_all(dir.join("pictures")).unwrap();
+        std::fs::write(dir.join("pictures"), b"in the way").unwrap();
+        let before = a.open.as_ref().unwrap().project.meta.clone();
+        let could_undo = a.open.as_ref().unwrap().can_undo();
+        assert!(
+            call(
+                &mut a,
+                "set_project",
+                json!({"logo": "docs/brand.png", "name": "Renamed", "title_block": {"customer": "Other"}})
+            )
+            .is_err()
+        );
+        assert_eq!(a.open.as_ref().unwrap().project.meta, before);
+        assert_eq!(a.open.as_ref().unwrap().can_undo(), could_undo);
+        assert!(call(&mut a, "set_project", json!({"name": "  "})).is_err());
     }
 
     #[test]
