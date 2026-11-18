@@ -18,7 +18,7 @@
 //! and a picture someone starts using goes out as an `AddPicture` edit before the change that
 //! names it, so every copy shows it and the host's folder keeps it with that change's commit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 
@@ -609,44 +609,83 @@ fn fresh_uses(
     local: &Project,
     base: &Project,
 ) -> (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>) {
-    let symbols = local
+    let fresh = FreshUses::find(local, base);
+    let symbols = fresh
         .pages
-        .iter()
-        .flat_map(|p| {
-            let had: std::collections::BTreeSet<(&str, &str)> = base
-                .page(&p.id)
-                .map(|b| b.symbols.iter().map(|o| (o.id.as_str(), o.symbol.as_str())).collect())
-                .unwrap_or_default();
-            p.symbols
-                .iter()
-                .filter(move |s| !had.contains(&(s.id.as_str(), s.symbol.as_str())))
-                .map(|s| s.symbol.clone())
-        })
+        .into_iter()
+        .flat_map(|(_, s)| s)
+        .map(str::to_owned)
         .collect();
-    let parts = local
+    let parts = fresh
         .devices
-        .iter()
-        .flat_map(|(tag, d)| {
-            let had: std::collections::BTreeSet<String> = base
-                .devices
-                .get(tag)
-                .map(|b| b.all_parts().into_iter().map(|(p, _)| p.to_owned()).collect())
-                .unwrap_or_default();
-            d.all_parts()
-                .into_iter()
-                .map(|(p, _)| p.to_owned())
-                .filter(move |p| !had.contains(p))
-        })
-        .chain(
-            local
-                .meta
-                .jumpers
-                .iter()
-                .filter(|j| !base.meta.jumpers.contains(j))
-                .filter_map(|j| j.part.clone()),
-        )
+        .into_iter()
+        .flat_map(|(_, p)| p)
+        .chain(fresh.jumpers)
+        .map(str::to_owned)
         .collect();
     (symbols, parts)
+}
+
+/// The fresh uses of [`fresh_uses`], by the target that has them (targets without any left out).
+struct FreshUses<'a> {
+    /// Page id, and the symbols of its placements the base's page does not have.
+    pages: Vec<(&'a str, Vec<&'a str>)>,
+    /// Device tag, and the parts it names that the base's device does not.
+    devices: Vec<(&'a wc_core::DeviceTag, Vec<&'a str>)>,
+    /// The parts of jumpers the base does not have.
+    jumpers: Vec<&'a str>,
+}
+
+impl<'a> FreshUses<'a> {
+    fn find(local: &'a Project, base: &Project) -> Self {
+        let pages = local
+            .pages
+            .iter()
+            .filter_map(|p| {
+                let had: std::collections::BTreeSet<(&str, &str)> = base
+                    .page(&p.id)
+                    .map(|b| b.symbols.iter().map(|o| (o.id.as_str(), o.symbol.as_str())).collect())
+                    .unwrap_or_default();
+                let new: Vec<&str> = p
+                    .symbols
+                    .iter()
+                    .filter(|s| !had.contains(&(s.id.as_str(), s.symbol.as_str())))
+                    .map(|s| s.symbol.as_str())
+                    .collect();
+                (!new.is_empty()).then_some((p.id.as_str(), new))
+            })
+            .collect();
+        let devices = local
+            .devices
+            .iter()
+            .filter_map(|(tag, d)| {
+                let had: std::collections::BTreeSet<String> = base
+                    .devices
+                    .get(tag)
+                    .map(|b| b.all_parts().into_iter().map(|(p, _)| p.to_owned()).collect())
+                    .unwrap_or_default();
+                let new: Vec<&str> = d
+                    .all_parts()
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .filter(|p| !had.contains(*p))
+                    .collect();
+                (!new.is_empty()).then_some((tag, new))
+            })
+            .collect();
+        let jumpers = local
+            .meta
+            .jumpers
+            .iter()
+            .filter(|j| !base.meta.jumpers.contains(j))
+            .filter_map(|j| j.part.as_deref())
+            .collect();
+        FreshUses {
+            pages,
+            devices,
+            jumpers,
+        }
+    }
 }
 
 /// Items the session locked at the last sync (`was`) and no longer locks were taken back (an
@@ -800,7 +839,8 @@ fn unload_taken_back(unload: &mut std::collections::BTreeSet<(ItemKind, String)>
 
 /// The items `local` locks in another version than the session `auth`: someone else used them
 /// first, and [`incoming`] gives this copy the session's version. As `symbol id` or `part id`.
-pub fn conflicts(local: &Project, auth: &Project) -> Vec<String> {
+/// An update made here since the last sync (`base`, see [`updated_here`]) is none.
+pub fn conflicts(local: &Project, base: &Project, auth: &Project) -> Vec<String> {
     [ItemKind::Symbol, ItemKind::Part]
         .into_iter()
         .flat_map(|kind| {
@@ -809,9 +849,25 @@ pub fn conflicts(local: &Project, auth: &Project) -> Vec<String> {
                 .map(kind)
                 .iter()
                 .filter(move |(id, e)| auth.lock.map(kind).get(*id).is_some_and(|a| a.hash != e.hash))
+                .filter(move |(id, _)| !updated_here(local, base, auth, kind, id))
+                // A copy still on the version the last sync brought did not change it here.
+                .filter(move |(id, e)| base.lock.map(kind).get(*id).is_none_or(|b| b.hash != e.hash))
                 .map(move |(id, _)| item_name(kind, id))
         })
         .collect()
+}
+
+/// Whether `local` holds item `id` in a version it updated to since the last sync (`base`):
+/// the session `auth` still has the version the last sync brought, and this copy another.
+fn updated_here(local: &Project, base: &Project, auth: &Project, kind: ItemKind, id: &str) -> bool {
+    let (Some(l), Some(b), Some(a)) = (
+        local.lock.map(kind).get(id),
+        base.lock.map(kind).get(id),
+        auth.lock.map(kind).get(id),
+    ) else {
+        return false;
+    };
+    b.hash == a.hash && l.hash != a.hash
 }
 
 /// An item as messages name it: `symbol wc.coil`, `part acme.relay`.
@@ -824,10 +880,35 @@ fn item_name(kind: ItemKind, id: &str) -> String {
 
 /// Whether the session's project locks the item [`item_name`] names.
 fn session_has(auth: &Project, name: &str) -> bool {
-    match name.split_once(' ') {
-        Some(("symbol", id)) => auth.lock.symbols.contains_key(id),
-        Some(("part", id)) => auth.lock.parts.contains_key(id),
-        _ => false,
+    named(name).is_some_and(|(kind, id)| auth.lock.map(kind).contains_key(id))
+}
+
+/// Whether the session took what this copy sent of the item [`item_name`] names: it locks the
+/// item, and not still in the version the last sync (`base`) brought while this copy updated
+/// it ([`updated_here`]).
+fn session_took(auth: &Project, local: &Project, base: &Project, name: &str) -> bool {
+    named(name)
+        .is_some_and(|(kind, id)| auth.lock.map(kind).contains_key(id) && !updated_here(local, base, auth, kind, id))
+}
+
+/// Take in the session's answers to this person's updates: the version it took is what this copy
+/// synced to (`base`), so a later change here goes out as an update from it, and one the session
+/// took is not waited for or sent again, even when a later change (an undo) put it back since.
+fn take_updates(role: &mut Role, base: &mut Project, items_out: &mut BTreeMap<String, ItemOut>) {
+    for (kind, id, hash) in role.took_updates() {
+        if let Some(e) = base.lock.map_mut(kind).get_mut(&id) {
+            e.hash = hash;
+        }
+        items_out.remove(&item_name(kind, &id));
+    }
+}
+
+/// The kind and id of the item [`item_name`] names.
+fn named(name: &str) -> Option<(ItemKind, &str)> {
+    match name.split_once(' ')? {
+        ("symbol", id) => Some((ItemKind::Symbol, id)),
+        ("part", id) => Some((ItemKind::Part, id)),
+        _ => None,
     }
 }
 
@@ -844,51 +925,124 @@ fn check_locked<T>(read: wc_core::Result<T>, hash: impl Fn(&T) -> String, locked
 /// What [`new_items`] found.
 #[derive(Debug, Default)]
 pub struct NewItems {
-    /// The edit that adds them, with their files.
-    pub edit: Option<ProjectEdit>,
+    /// The edits that add them and update them, with their files.
+    pub edits: Vec<ProjectEdit>,
     /// The items it holds, as [`item_name`] names them.
     pub sent: Vec<String>,
     /// Items whose file could not be read, with the reason; they are not sent.
     pub unreadable: Vec<(String, String)>,
+    /// Items this copy updated whose earlier version the session took back since the last sync
+    /// (`base` has them, the session no longer does): not sent, as an add would undo that.
+    pub stale: Vec<String>,
 }
 
 /// The symbols and parts locked in `local` and not in the session's project `auth`, with their
-/// vendored files from `dir`, as one edit: what this person started using. Items named in
-/// `skip` (sent and not answered yet) are left out. An item whose file cannot be read is not
-/// sent; it is returned with the reason and tried again next time.
-pub fn new_items(dir: &Path, local: &Project, auth: &Project, skip: &std::collections::BTreeSet<String>) -> NewItems {
+/// vendored files from `dir`, as one edit: what this person started using. Then those this
+/// copy updated since the last sync (`base`, see [`updated_here`]), as a second edit that
+/// names the version the session has. Items named in `skip` (sent and not answered yet) are
+/// left out. Items named in `apart` (sent before and not taken) go each in an edit of its own,
+/// so one the session cannot store does not keep the others out. An item whose file cannot be
+/// read is not sent; it is returned with the reason and tried again next time.
+pub fn new_items(
+    dir: &Path,
+    local: &Project,
+    base: &Project,
+    auth: &Project,
+    skip: &std::collections::BTreeSet<String>,
+    apart: &std::collections::BTreeSet<String>,
+) -> NewItems {
     let mut out = NewItems::default();
-    let fresh = |kind: ItemKind| {
+    // (id, source, hash here, the session's hash when it is an update)
+    let wanted = |kind: ItemKind| {
         local
             .lock
             .map(kind)
             .iter()
-            .filter(move |(id, _)| !auth.lock.map(kind).contains_key(*id))
             .filter(move |(id, _)| !skip.contains(&item_name(kind, id)))
-            .map(|(id, e)| (id.clone(), e.source.clone(), e.hash.clone()))
+            .filter_map(move |(id, e)| match auth.lock.map(kind).get(id) {
+                // The session had it at the last sync in another version, and took it back since.
+                None if base.lock.map(kind).get(id).is_some_and(|b| b.hash != e.hash) => None,
+                None => Some((id.clone(), e.source.clone(), e.hash.clone(), None)),
+                Some(a) if updated_here(local, base, auth, kind, id) => {
+                    Some((id.clone(), e.source.clone(), e.hash.clone(), Some(a.hash.clone())))
+                }
+                Some(_) => None,
+            })
             .collect::<Vec<_>>()
     };
-    let mut symbols = Vec::new();
-    for (id, source, hash) in fresh(ItemKind::Symbol) {
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        out.stale.extend(
+            local
+                .lock
+                .map(kind)
+                .iter()
+                .filter(|(id, e)| {
+                    !auth.lock.map(kind).contains_key(*id)
+                        && base.lock.map(kind).get(*id).is_some_and(|b| b.hash != e.hash)
+                })
+                .map(|(id, _)| item_name(kind, id)),
+        );
+    }
+    let (mut symbols, mut new_symbols) = (Vec::new(), Vec::new());
+    for (id, source, hash, before) in wanted(ItemKind::Symbol) {
         match check_locked(store::read_vendored_symbol(dir, &id), Symbol::hash, &hash) {
             Ok(s) => {
                 out.sent.push(item_name(ItemKind::Symbol, &id));
-                symbols.push((s, source));
+                match before {
+                    None => symbols.push((s, source)),
+                    Some(before) => new_symbols.push((s, source, before)),
+                }
             }
             Err(e) => out.unreadable.push((item_name(ItemKind::Symbol, &id), e)),
         }
     }
-    let mut parts = Vec::new();
-    for (id, source, hash) in fresh(ItemKind::Part) {
+    let (mut parts, mut new_parts) = (Vec::new(), Vec::new());
+    for (id, source, hash, before) in wanted(ItemKind::Part) {
         match check_locked(store::read_vendored_part(dir, &id), Part::hash, &hash) {
             Ok(p) => {
                 out.sent.push(item_name(ItemKind::Part, &id));
-                parts.push((p, source));
+                match before {
+                    None => parts.push((p, source)),
+                    Some(before) => new_parts.push((p, source, before)),
+                }
             }
             Err(e) => out.unreadable.push((item_name(ItemKind::Part, &id), e)),
         }
     }
-    out.edit = (!symbols.is_empty() || !parts.is_empty()).then_some(ProjectEdit::AddItems { symbols, parts });
+    let alone = |kind: ItemKind, id: &str| apart.contains(&item_name(kind, id));
+    for (s, source) in symbols.extract_if(.., |(s, _)| alone(ItemKind::Symbol, s.id.as_str())) {
+        out.edits.push(ProjectEdit::AddItems {
+            symbols: vec![(s, source)],
+            parts: Vec::new(),
+        });
+    }
+    for (p, source) in parts.extract_if(.., |(p, _)| alone(ItemKind::Part, p.id.as_str())) {
+        out.edits.push(ProjectEdit::AddItems {
+            symbols: Vec::new(),
+            parts: vec![(p, source)],
+        });
+    }
+    for s in new_symbols.extract_if(.., |(s, _, _)| alone(ItemKind::Symbol, s.id.as_str())) {
+        out.edits.push(ProjectEdit::UpdateItems {
+            symbols: vec![s],
+            parts: Vec::new(),
+        });
+    }
+    for p in new_parts.extract_if(.., |(p, _, _)| alone(ItemKind::Part, p.id.as_str())) {
+        out.edits.push(ProjectEdit::UpdateItems {
+            symbols: Vec::new(),
+            parts: vec![p],
+        });
+    }
+    if !symbols.is_empty() || !parts.is_empty() {
+        out.edits.push(ProjectEdit::AddItems { symbols, parts });
+    }
+    if !new_symbols.is_empty() || !new_parts.is_empty() {
+        out.edits.push(ProjectEdit::UpdateItems {
+            symbols: new_symbols,
+            parts: new_parts,
+        });
+    }
     out
 }
 
@@ -1037,19 +1191,140 @@ pub fn new_pictures(
     out
 }
 
-/// Write the session's pictures that `open` uses and has not taken yet (`taken`, by project
-/// path) into its folder, and forget what the window showed for them. A file of the same name
-/// with other content is never written over: a guest's copy starts in an empty folder, so such
-/// a file is one this person picked here, and it is kept (and named in the result). Pictures
-/// in `skip` (failed a moment ago) are left for later. Returns the pictures that could not be
-/// written, with the reason.
+/// Copy the picture `file` of `open` under a new name in the same folder, one the session is not
+/// likely to have (the name with a mark of the moment), and make the project name it instead.
+/// The old file stays. Returns the new name.
+fn rename_picture(open: &mut Open, file: &str) -> Result<String, String> {
+    // Read as an export reads it: never through a link out of the project folder.
+    let data = match wc_pdf::read_picture(&open.dir, file) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Err(format!("cannot read {file}: the file is gone")),
+        Err(why) => return Err(format!("cannot read {file}: {why}")),
+    };
+    let (folder, name) = file.rsplit_once('/').unwrap_or(("", file));
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    // Most file systems take names of up to 255 bytes: the stem gives way to the mark (a dash
+    // and up to ten hex digits), a count (up to "-15") and the extension.
+    let room = 255usize.saturating_sub(14 + if ext.is_empty() { 0 } else { ext.len() + 1 });
+    let mut cut = stem.len().min(room);
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = &stem[..cut];
+    let mark = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+        % 0xff_ffff_ffff;
+    let mut new = String::new();
+    for n in 0..16u32 {
+        let base = if n == 0 {
+            format!("{stem}-{mark:x}")
+        } else {
+            format!("{stem}-{mark:x}-{n}")
+        };
+        let candidate = match (folder.is_empty(), ext.is_empty()) {
+            (true, true) => base,
+            (true, false) => format!("{base}.{ext}"),
+            (false, true) => format!("{folder}/{base}"),
+            (false, false) => format!("{folder}/{base}.{ext}"),
+        };
+        if std::fs::symlink_metadata(open.dir.join(&candidate)).is_err() {
+            new = candidate;
+            break;
+        }
+    }
+    if new.is_empty() {
+        return Err("no free name".into());
+    }
+    let picture = Picture {
+        file: new.clone(),
+        data,
+    };
+    wc_share::write_picture(&open.dir, &picture).map_err(|e| e.to_string())?;
+    if let Some(logo) = open.project.meta.logo.as_mut()
+        && logo.file == file
+    {
+        logo.file = new.clone();
+    }
+    for page in &mut open.project.pages {
+        if let Some(u) = page.underlay.as_mut()
+            && u.file == file
+        {
+            u.file = new.clone();
+        }
+    }
+    open.dirty = true;
+    Ok(new)
+}
+
+/// Give the pictures in `taken`, whose names the session has for other files, a name of
+/// their own here, together with those whose rename failed a while ago. A failed rename is
+/// kept and tried again after [`ITEM_RETRY_LATER`] while the project still uses the picture,
+/// whether or not the session has the name: nothing else would bring it back. Meanwhile the
+/// picture stays in `pictures_out` (of [`Share`]), so it is not sent again under the taken name.
+fn rename_pictures(
+    open: &mut Open,
+    taken: Vec<String>,
+    renames_due: &mut BTreeMap<String, std::time::Instant>,
+    pictures_out: &mut BTreeMap<String, std::time::Instant>,
+    notes: &mut Vec<String>,
+) {
+    let used = used_pictures(&open.project);
+    renames_due.retain(|file, _| used.contains(file));
+    let due = renames_due
+        .iter()
+        .filter(|(_, at)| at.elapsed() >= ITEM_RETRY_LATER)
+        .map(|(file, _)| file.clone())
+        .collect::<Vec<_>>();
+    // A name met again before its wait is over is left for then.
+    let waiting = |f: &String| renames_due.get(f).is_some_and(|at| at.elapsed() < ITEM_RETRY_LATER);
+    let files: std::collections::BTreeSet<String> = taken
+        .into_iter()
+        .filter(|f| used.contains(f) && !waiting(f))
+        .chain(due)
+        .collect();
+    for file in files {
+        match rename_picture(open, &file) {
+            Ok(new) => {
+                pictures_out.remove(&file);
+                renames_due.remove(&file);
+                notes.push(format!(
+                    "The session already has another file named {file}; your picture is renamed {new} here and sent again under that name."
+                ));
+            }
+            Err(why) => {
+                if renames_due.insert(file.clone(), std::time::Instant::now()).is_none() {
+                    notes.push(format!(
+                        "The session already has another file named {file}, and your picture could not be given a new name yet: {why}. It is tried again now and then."
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// What [`take_pictures`] did: it writes the session's pictures that `open` uses and has not
+/// taken yet (`taken`, by project path) into its folder, and forgets what the window showed for
+/// them. A file of the same name with other content is never written over: a guest's copy
+/// starts in an empty folder, so such a file is one this person picked here, and it is kept
+/// (and named in the result, to get a name of its own). Pictures in `skip` (failed a moment
+/// ago) are left for later.
+#[derive(Debug, Default)]
+pub struct TakenPictures {
+    /// The pictures that could not be written, with the reason.
+    pub failed: Vec<(String, String)>,
+    /// The pictures this copy has another file under the session's name for.
+    pub clashes: Vec<String>,
+}
+
+/// See [`TakenPictures`].
 pub fn take_pictures(
     open: &mut Open,
     session: &BTreeMap<String, Vec<u8>>,
     taken: &mut std::collections::BTreeSet<String>,
     skip: &std::collections::BTreeSet<String>,
-) -> Vec<(String, String)> {
-    let mut failed = Vec::new();
+) -> TakenPictures {
+    let mut out = TakenPictures::default();
     for file in used_pictures(&open.project) {
         if taken.contains(&file) || skip.contains(&file) {
             continue;
@@ -1065,10 +1340,11 @@ pub fn take_pictures(
                 open.picture_problems.remove(&file);
                 taken.insert(file);
             }
-            Err(e) => failed.push((file, e.to_string())),
+            Err(wc_share::Error::PictureNameTaken(_)) => out.clashes.push(file),
+            Err(e) => out.failed.push((file, e.to_string())),
         }
     }
-    failed
+    out
 }
 
 /// The project's vendored files in `dir`, as read for a session.
@@ -1119,6 +1395,8 @@ pub struct Hosting {
     announcer: Option<Announcer>,
     pub port: u16,
     dir: PathBuf,
+    /// Items of the host's own updates the session took, as [`Guest::took_updates`].
+    took_updates: Vec<(ItemKind, String, String)>,
 }
 
 /// A guest's side: its view of the session and the connection to the host.
@@ -1182,6 +1460,21 @@ impl Role {
         }
     }
 
+    /// Pictures this guest sent whose name the session has for another file
+    /// ([`wc_share::Refusal::PictureNameTaken`]), since the last call.
+    fn picture_names_taken(&mut self) -> Vec<String> {
+        match self {
+            Role::Host(_) => Vec::new(),
+            Role::Guest(j) => std::mem::take(&mut j.guest.refusals)
+                .into_iter()
+                .filter_map(|r| match r {
+                    wc_share::Refusal::PictureNameTaken { file } => Some(file),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
     /// The symbol and part files the session has, by id.
     fn files(&self) -> (&BTreeMap<String, Symbol>, &BTreeMap<String, Part>) {
         match self {
@@ -1239,8 +1532,10 @@ impl Role {
     fn edit_project(&mut self, edit: ProjectEdit, notes: &mut Vec<String>) {
         match self {
             Role::Host(h) => {
-                if let Err(e) = h.host.edit_project(edit) {
-                    notes.push(format!("Your change was not kept: {e}"));
+                let updated = edit.updated_items();
+                match h.host.edit_project(edit) {
+                    Ok(()) => h.took_updates.extend(updated),
+                    Err(e) => notes.push(format!("Your change was not kept: {e}")),
                 }
             }
             Role::Guest(j) => {
@@ -1249,6 +1544,15 @@ impl Role {
                 let msg = j.guest.edit_project(edit);
                 send(&j.link, msg, notes);
             }
+        }
+    }
+
+    /// The items of this person's updates the session took since the last call, as
+    /// [`Guest::took_updates`].
+    fn took_updates(&mut self) -> Vec<(ItemKind, String, String)> {
+        match self {
+            Role::Host(h) => std::mem::take(&mut h.took_updates),
+            Role::Guest(j) => std::mem::take(&mut j.guest.took_updates),
         }
     }
 
@@ -1309,7 +1613,13 @@ impl Role {
                         }
                     }
                 }
-                for r in std::mem::take(&mut j.guest.refusals) {
+                // A picture name the session has for another file is handled by renaming the
+                // picture ([`Role::picture_names_taken`]), not reported.
+                let (taken, other): (Vec<_>, Vec<_>) = std::mem::take(&mut j.guest.refusals)
+                    .into_iter()
+                    .partition(|r| matches!(r, wc_share::Refusal::PictureNameTaken { .. }));
+                j.guest.refusals = taken;
+                for r in other {
                     notes.push(format!("The host did not take a change: {r}"));
                 }
                 match j.guest.status {
@@ -1522,16 +1832,399 @@ pub struct Share {
     /// changes wait while one is on its way, so a page never reaches the session before what it
     /// draws.
     items_out: BTreeMap<String, ItemOut>,
-    /// Items whose file could not be read, sent or taken, reported once each.
+    /// The items this copy's waiting changes wait for ([`Held`]), as of the last sync.
+    holding: Vec<String>,
+    /// Undo asked for while changes were waiting: they are taken back here at the next sync,
+    /// instead of an older change in the session.
+    drop_held: bool,
+    /// Items whose file could not be read, sent or taken, and updates not sent because the
+    /// session took their item back (`stale <name>`), reported once each.
     unreadable: std::collections::BTreeSet<String>,
     /// Pictures looked at for the session and not taken yet, by project path, with when: each
     /// is looked at again only after [`ITEM_RETRY_LATER`]. Changes never wait for a picture.
     pictures_out: BTreeMap<String, std::time::Instant>,
+    /// Pictures this copy sent to the session, by project path: only a refusal of one of
+    /// these makes this copy give a picture a name of its own. Kept while the session lasts,
+    /// as a refusal can arrive after the session's own picture of that name.
+    pictures_sent: std::collections::BTreeSet<String>,
     /// The session's pictures written into this copy (or found there already), by project path.
     pictures_taken: std::collections::BTreeSet<String>,
     /// Session pictures that could not be written into this copy, with when: each is tried
     /// again only after [`ITEM_RETRY_LATER`].
     pictures_failed: BTreeMap<String, std::time::Instant>,
+    /// Pictures whose name the session has for another file and that could not be given a new
+    /// name here, with when: tried again after [`ITEM_RETRY_LATER`] while the project uses them.
+    renames_due: BTreeMap<String, std::time::Instant>,
+    /// Pictures picked here under a name the session has for another file, found while taking
+    /// the session's pictures: they get a name of their own at the next sync, before what goes
+    /// out is worked out.
+    clashes: Vec<String>,
+}
+
+/// Changes of this copy kept back while the items they use are not in the session yet: the
+/// pages, devices and project properties that use such an item for the first time. Everything
+/// else goes out as usual.
+#[derive(Debug, Default)]
+struct Held {
+    /// Those targets as this copy has them.
+    now: wc_share::Parts,
+    /// The same targets as the copy had synced them.
+    was: wc_share::Parts,
+    /// The items they wait for, by [`item_name`].
+    items: Vec<String>,
+    /// The targets of each device rename that waits ([`Held::hold_renames`]): each group is
+    /// put back all together or not at all; separate renames are kept or lost on their own.
+    renames: Vec<RenameGroup>,
+}
+
+/// See [`Held::renames`].
+#[derive(Debug, Default)]
+struct RenameGroup {
+    pages: BTreeSet<String>,
+    devices: BTreeSet<wc_core::DeviceTag>,
+    panels: BTreeSet<String>,
+    meta: bool,
+}
+
+impl RenameGroup {
+    fn merge(&mut self, other: RenameGroup) {
+        self.pages.extend(other.pages);
+        self.devices.extend(other.devices);
+        self.panels.extend(other.panels);
+        self.meta |= other.meta;
+    }
+}
+
+impl Held {
+    /// The targets of `local` that use, for the first time since `base`, an item named in
+    /// `waiting`.
+    fn find(local: &Project, base: &Project, waiting: &BTreeSet<String>) -> Held {
+        let waits = |kind: ItemKind, id: &str| waiting.contains(&item_name(kind, id));
+        let fresh = FreshUses::find(local, base);
+        let mut held = Held::default();
+        let mut items = std::collections::BTreeSet::new();
+        for (id, symbols) in &fresh.pages {
+            let new: Vec<&&str> = symbols.iter().filter(|s| waits(ItemKind::Symbol, s)).collect();
+            if !new.is_empty() {
+                items.extend(new.iter().map(|id| item_name(ItemKind::Symbol, id)));
+                held.now.pages.insert((*id).to_owned(), local.page(id).cloned());
+            }
+        }
+        for (tag, parts) in &fresh.devices {
+            let new: Vec<&&str> = parts.iter().filter(|p| waits(ItemKind::Part, p)).collect();
+            if !new.is_empty() {
+                items.extend(new.iter().map(|id| item_name(ItemKind::Part, id)));
+                held.now
+                    .devices
+                    .insert((*tag).clone(), local.devices.get(*tag).cloned());
+            }
+        }
+        let jumper_parts: Vec<&&str> = fresh.jumpers.iter().filter(|p| waits(ItemKind::Part, p)).collect();
+        if !jumper_parts.is_empty() {
+            items.extend(jumper_parts.iter().map(|id| item_name(ItemKind::Part, id)));
+            held.now.meta = Some(Box::new(local.meta.clone()));
+        }
+        held.hold_renames(local, base);
+        // A new page's comments wait with it, however it came to wait: the session has no page
+        // to put them on.
+        let new_pages: Vec<String> = held
+            .now
+            .pages
+            .keys()
+            .filter(|id| base.page(id).is_none())
+            .cloned()
+            .collect();
+        for id in new_pages {
+            let on: Vec<_> = local.comments.iter().filter(|c| c.page == id).cloned().collect();
+            held.now.comments.insert(id, on);
+        }
+        held.was = wc_share::Parts::read(base, &held.now);
+        held.items = items.into_iter().collect();
+        held
+    }
+
+    /// A held device the base does not have may be a rename: the old device going away and
+    /// what was retagged to the new tag wait with it, so the session never has the new tag
+    /// without its device, nor loses the old one first.
+    fn hold_renames(&mut self, local: &Project, base: &Project) {
+        let new_tags: Vec<wc_core::DeviceTag> = self
+            .now
+            .devices
+            .keys()
+            .filter(|t| !base.devices.contains_key(*t))
+            .cloned()
+            .collect();
+        if new_tags.is_empty() {
+            return;
+        }
+        let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
+        let gone: Vec<wc_core::DeviceTag> = base
+            .devices
+            .keys()
+            .filter(|t| !local.devices.contains_key(*t))
+            .cloned()
+            .collect();
+        // Only a device gone since `base` whose placements or cables now name a new tag instead
+        // is the old side of a rename; other devices removed here go out as usual. Symbols and
+        // wires keep their ids, so each one names its own pair.
+        let mut pairs: BTreeSet<(wc_core::DeviceTag, wc_core::DeviceTag)> = BTreeSet::new();
+        for b in &base.pages {
+            let Some(l) = local.page(&b.id) else { continue };
+            for s in &b.symbols {
+                if let Some(old) = s.tag.as_ref().filter(|t| gone.contains(t))
+                    && let Some(new) = l.symbols.iter().find(|n| n.id == s.id).and_then(|n| n.tag.as_ref())
+                    && named(new)
+                {
+                    pairs.insert((old.clone(), new.clone()));
+                }
+            }
+            for w in &b.wires {
+                if let Some(old) = w.cable.as_ref().map(|c| &c.cable).filter(|t| gone.contains(t))
+                    && let Some(new) = l.wires.iter().find(|n| n.id == w.id).and_then(|n| n.cable.as_ref())
+                    && named(&new.cable)
+                {
+                    pairs.insert((old.clone(), new.cable.clone()));
+                }
+            }
+        }
+        // Panel footprints and jumpers carry no id: an old tag whose entries, in order, are
+        // exactly a new tag's entries now, and that kept none under its own tag, is renamed to
+        // it when no other tag matches either side. A removed entry may shift the others, so the place in the list says nothing.
+        use wc_core::panel::PanelItem;
+        let mut by_content: BTreeSet<(wc_core::DeviceTag, wc_core::DeviceTag)> = BTreeSet::new();
+        for b in &base.panels {
+            let Some(l) = local.panels.iter().find(|l| l.id == b.id) else {
+                continue;
+            };
+            let footprints = |p: &wc_core::panel::Panel, tag: &wc_core::DeviceTag| -> Vec<String> {
+                p.items
+                    .iter()
+                    .filter_map(|i| match i {
+                        PanelItem::Device {
+                            tag: t,
+                            at,
+                            width,
+                            height,
+                        } if t == tag => Some(format!("{at:?} {width} {height}")),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            for old in &gone {
+                let was = footprints(b, old);
+                if was.is_empty() || !footprints(l, old).is_empty() {
+                    continue;
+                }
+                for new in &new_tags {
+                    if footprints(l, new) == was && footprints(b, new).is_empty() {
+                        by_content.insert((old.clone(), new.clone()));
+                    }
+                }
+            }
+        }
+        let strips = |p: &Project, tag: &wc_core::DeviceTag| -> Vec<(Vec<String>, Option<String>)> {
+            p.meta
+                .jumpers
+                .iter()
+                .filter(|j| &j.strip == tag)
+                .map(|j| (j.terminals.clone(), j.part.clone()))
+                .collect()
+        };
+        for old in &gone {
+            let was = strips(base, old);
+            if was.is_empty() || !strips(local, old).is_empty() {
+                continue;
+            }
+            for new in &new_tags {
+                if strips(local, new) == was && strips(base, new).is_empty() {
+                    by_content.insert((old.clone(), new.clone()));
+                }
+            }
+        }
+        for (old, new) in &by_content {
+            let unique = by_content.iter().filter(|(o, _)| o == old).count() == 1
+                && by_content.iter().filter(|(_, n)| n == new).count() == 1;
+            if unique {
+                pairs.insert((old.clone(), new.clone()));
+            }
+        }
+        // Each rename is its own group; renames that share a tag or a target wait as one.
+        let mut groups: Vec<RenameGroup> = Vec::new();
+        let join = |groups: &mut Vec<RenameGroup>, tags: &[&wc_core::DeviceTag]| -> usize {
+            let hit: Vec<usize> = (0..groups.len())
+                .filter(|&i| tags.iter().any(|t| groups[i].devices.contains(*t)))
+                .collect();
+            let mut into = match hit.first() {
+                Some(&i) => i,
+                None => {
+                    groups.push(RenameGroup::default());
+                    groups.len() - 1
+                }
+            };
+            for &i in hit.iter().skip(1).rev() {
+                let g = groups.remove(i);
+                if i < into {
+                    into -= 1;
+                }
+                groups[into].merge(g);
+            }
+            groups[into].devices.extend(tags.iter().map(|t| (*t).clone()));
+            into
+        };
+        for (old, new) in &pairs {
+            self.now.devices.insert(old.clone(), None);
+            join(&mut groups, &[old, new]);
+        }
+        let paired: Vec<wc_core::DeviceTag> = pairs.iter().map(|(_, n)| n.clone()).collect();
+        // The paired new tags among those a target names.
+        let renamed_in = |names: &dyn Fn(&wc_core::DeviceTag) -> bool| -> Vec<&wc_core::DeviceTag> {
+            paired.iter().filter(|t| names(t)).collect()
+        };
+        for p in &local.pages {
+            if page_mentions(p, &named) && base.page(&p.id) != Some(p) {
+                self.now.pages.insert(p.id.clone(), Some(p.clone()));
+                let tags = renamed_in(&|t| page_mentions(p, &|x| x == t));
+                if !tags.is_empty() {
+                    let g = join(&mut groups, &tags);
+                    groups[g].pages.insert(p.id.clone());
+                }
+            }
+        }
+        for panel in &local.panels {
+            if panel_mentions(panel, &named) && base.panels.iter().find(|b| b.id == panel.id) != Some(panel) {
+                self.now.panels.insert(panel.id.clone(), Some(panel.clone()));
+                let tags = renamed_in(&|t| panel_mentions(panel, &|x| x == t));
+                if !tags.is_empty() {
+                    let g = join(&mut groups, &tags);
+                    groups[g].panels.insert(panel.id.clone());
+                }
+            }
+        }
+        if local.meta != base.meta && local.meta.jumpers.iter().any(|j| named(&j.strip)) {
+            self.now.meta = Some(Box::new(local.meta.clone()));
+            let tags = renamed_in(&|t| local.meta.jumpers.iter().any(|j| &j.strip == t));
+            if !tags.is_empty() {
+                let g = join(&mut groups, &tags);
+                groups[g].meta = true;
+            }
+        }
+        self.renames = groups;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.now.is_empty()
+    }
+
+    /// Put the held changes back into `project`, which now holds the session's project. A target
+    /// the session changed meanwhile keeps the session's version; those are returned. The
+    /// targets of a waiting rename go together: when one of them is lost, all are. A page
+    /// counts as unchanged when only its number changed, and keeps the session's number unless
+    /// this copy renumbered it.
+    fn put_back(&self, project: &mut Project) -> Vec<String> {
+        let mut lost = Vec::new();
+        let mut gone = RenameGroup::default();
+        let mut keep = wc_share::Parts::default();
+        for (id, now) in &self.now.pages {
+            let Some(now) = now else { continue };
+            let was = self.was.pages.get(id).cloned().flatten();
+            match (project.page(id), was) {
+                (Some(session), Some(was)) if wc_share::same_but_number(session, &was) => {
+                    let mut page = now.clone();
+                    if now.number == was.number {
+                        page.number = session.number.clone();
+                    }
+                    keep.pages.insert(id.clone(), Some(page));
+                }
+                // A page new here, and still free in the session.
+                (None, None) => {
+                    keep.pages.insert(id.clone(), Some(now.clone()));
+                }
+                _ => {
+                    gone.pages.insert(id.clone());
+                    lost.push(format!("page {}", now.number));
+                }
+            }
+        }
+        for (tag, now) in &self.now.devices {
+            let was = self.was.devices.get(tag).cloned().flatten();
+            if project.devices.get(tag) == was.as_ref() {
+                keep.devices.insert(tag.clone(), now.clone());
+            } else {
+                gone.devices.insert(tag.clone());
+                lost.push(format!("device {tag}"));
+            }
+        }
+        for (id, now) in &self.now.panels {
+            let was = self.was.panels.get(id).cloned().flatten();
+            if project.panels.iter().find(|p| &p.id == id) == was.as_ref() {
+                keep.panels.insert(id.clone(), now.clone());
+            } else {
+                gone.panels.insert(id.clone());
+                lost.push(format!("panel {id}"));
+            }
+        }
+        for (page, now) in &self.now.comments {
+            let was = self.was.comments.get(page).cloned().unwrap_or_default();
+            let session: Vec<_> = project.comments.iter().filter(|c| &c.page == page).cloned().collect();
+            if session == was {
+                keep.comments.insert(page.clone(), now.clone());
+            } else {
+                lost.push(format!("the comments on page {page}"));
+            }
+        }
+        if let (Some(now), Some(was)) = (&self.now.meta, &self.was.meta) {
+            if project.meta == **was {
+                keep.meta = Some(now.clone());
+            } else {
+                gone.meta = true;
+                lost.push("the project properties".into());
+            }
+        }
+        // A rename whose page the session changed must not leave the new tag here without the
+        // page that uses it, nor the page without its device.
+        for group in &self.renames {
+            let hit = !group.pages.is_disjoint(&gone.pages)
+                || !group.devices.is_disjoint(&gone.devices)
+                || !group.panels.is_disjoint(&gone.panels)
+                || (group.meta && gone.meta);
+            if !hit {
+                continue;
+            }
+            keep.pages.retain(|id, _| !group.pages.contains(id));
+            keep.comments.retain(|id, _| !group.pages.contains(id));
+            keep.devices.retain(|tag, _| !group.devices.contains(tag));
+            keep.panels.retain(|id, _| !group.panels.contains(id));
+            if group.meta {
+                keep.meta = None;
+            }
+            lost.push("the device rename that waited with it".into());
+        }
+        keep.apply(project);
+        // The items they use stay locked here: `incoming` keeps entries the session lacks.
+        lost
+    }
+
+    /// Take the held changes back in `project`: each target as the copy had synced it.
+    fn drop_from(&self, project: &mut Project) {
+        self.was.apply(project);
+    }
+}
+
+/// Whether a symbol or cable on `page` names a device `tag` picks.
+fn page_mentions(page: &Page, tag: &dyn Fn(&wc_core::DeviceTag) -> bool) -> bool {
+    page.symbols.iter().any(|s| s.tag.as_ref().is_some_and(tag))
+        || page
+            .wires
+            .iter()
+            .any(|w| w.cable.as_ref().is_some_and(|c| tag(&c.cable)))
+}
+
+/// Whether `panel` places a device `tag` picks.
+fn panel_mentions(panel: &wc_core::panel::Panel, tag: &dyn Fn(&wc_core::DeviceTag) -> bool) -> bool {
+    panel
+        .items
+        .iter()
+        .any(|i| matches!(i, wc_core::panel::PanelItem::Device { tag: t, .. } if tag(t)))
 }
 
 /// One symbol or part sent to the session and not taken yet.
@@ -1601,10 +2294,14 @@ impl Share {
 
     /// Whether Undo in the session has a change of this person's to take back.
     pub fn can_undo(&self) -> bool {
-        self.role
-            .as_ref()
-            .and_then(|r| Some(undo_target(&r.history(), r.me()?)))
-            .is_some_and(|t| t.is_some())
+        // A change waiting here is undone here (see `take_back`), even with nothing in the
+        // session's history yet.
+        !self.holding.is_empty()
+            || self
+                .role
+                .as_ref()
+                .and_then(|r| Some(undo_target(&r.history(), r.me()?)))
+                .is_some_and(|t| t.is_some())
     }
 
     /// Whether this window hosts the session.
@@ -1643,6 +2340,11 @@ impl Share {
         // sent now would reach the host ahead of them and take back an older change instead.
         if role.taking_back() {
             return Err("Your last undo is still on its way to the session; try again once it has come back.".into());
+        }
+        // The latest change here never reached the session: undo it here, not an older one there.
+        if !redo && change.is_none() && !self.holding.is_empty() {
+            self.drop_held = true;
+            return Ok(());
         }
         role.take_back(redo, change, &mut self.notes)?;
         self.took_back = true;
@@ -1726,6 +2428,7 @@ impl Share {
             announcer,
             port,
             dir: open.dir.clone(),
+            took_updates: Vec::new(),
         })));
         self.base = Some(open.project.clone());
         self.forget_items();
@@ -1767,8 +2470,13 @@ impl Share {
         self.delist.clear();
         self.unreadable.clear();
         self.pictures_out.clear();
+        self.pictures_sent.clear();
         self.pictures_taken.clear();
         self.pictures_failed.clear();
+        self.holding.clear();
+        self.drop_held = false;
+        self.renames_due.clear();
+        self.clashes.clear();
     }
 
     /// Leave or end the session.
@@ -1884,9 +2592,10 @@ impl Share {
         }
         let mine = page.as_deref().filter(|p| role.holds(p));
         let me = role.me().unwrap_or(HOST);
+        take_updates(role, base, &mut self.items_out);
         // Symbols and parts used for the first time go out first. Until the session has them,
         // the changes that may draw them wait in the window: a page must not reach the session
-        // without its symbols, and an item the session refused is sent again a few times.
+        // without its symbols, and an item the session refused is sent again until it is in.
         let auth = role.project()?;
         // Items the session took back are dropped here first, or they would look new below.
         follow_take_backs(
@@ -1900,13 +2609,21 @@ impl Share {
         // An item the session took is done; one this copy no longer locks (an undo, or an
         // assistant command that rewrote the project) is not sent again, so nothing waits for it.
         self.items_out
-            .retain(|name, _| !session_has(auth, name) && session_has(&open.project, name));
+            .retain(|name, _| !session_took(auth, &open.project, base, name) && session_has(&open.project, name));
         for (name, out) in self.items_out.iter_mut() {
             if !out.gave_up && out.tries >= ITEM_TRIES && out.at.elapsed() >= ITEM_WAIT {
                 out.gave_up = true;
-                self.notes.push(format!(
-                    "The session did not take {name}; your changes that use it are sent without it."
-                ));
+                // An update is not kept apart from the project: the copy takes the session's
+                // version again below, as everyone else works on that one.
+                self.notes.push(if session_has(auth, name) {
+                    format!(
+                        "The session did not take your update of {name}; your copy takes the session's version again."
+                    )
+                } else {
+                    format!(
+                        "The session did not take {name}; your changes that use it wait until it does, and it is sent again now and then."
+                    )
+                });
             }
         }
         let skip = self
@@ -1917,7 +2634,10 @@ impl Share {
             .filter(|(_, o)| o.at.elapsed() < if o.gave_up { ITEM_RETRY_LATER } else { ITEM_WAIT })
             .map(|(n, _)| n.clone())
             .collect();
-        let items = new_items(&open.dir, &open.project, auth, &skip);
+        // An item sent before and not taken goes alone, so one the session cannot store does
+        // not keep out the others it was sent with.
+        let apart = self.items_out.keys().cloned().collect();
+        let items = new_items(&open.dir, &open.project, base, auth, &skip, &apart);
         let now = std::time::Instant::now();
         for (name, why) in &items.unreadable {
             // A file that cannot be read counts as a try: the changes that may draw the item
@@ -1935,6 +2655,13 @@ impl Share {
                 ));
             }
         }
+        for name in &items.stale {
+            if self.unreadable.insert(format!("stale {name}")) {
+                self.notes.push(format!(
+                    "Your update of {name} was not sent: the session took that item back meanwhile."
+                ));
+            }
+        }
         for name in &items.sent {
             self.unreadable.remove(name);
             let out = self.items_out.entry(name.clone()).or_insert(ItemOut {
@@ -1945,11 +2672,15 @@ impl Share {
             out.at = now;
             out.tries += 1;
         }
-        if let Some(edit) = items.edit {
-            role.edit_project(edit, &mut self.notes);
+        if !items.edits.is_empty() {
+            for edit in items.edits {
+                role.edit_project(edit, &mut self.notes);
+            }
             role.pump(&mut self.notes);
+            take_updates(role, base, &mut self.items_out);
             let auth = role.project()?;
-            self.items_out.retain(|name, _| !session_has(auth, name));
+            self.items_out
+                .retain(|name, _| !session_took(auth, &open.project, base, name));
             // What the session took in is the baseline now, so a take-back before the last
             // look of this frame is still seen.
             follow_take_backs(
@@ -1961,6 +2692,23 @@ impl Share {
                 auth,
             );
         }
+        // A picture whose name the session (or the host's folder) has for another file gets a
+        // new name here; the picture and the changes naming it go out again under that name.
+        // Only a refusal of a picture this copy sent counts: a refusal naming any other path
+        // must not make this copy share a file of its own.
+        let mut taken: Vec<String> = role
+            .picture_names_taken()
+            .into_iter()
+            .filter(|f| self.pictures_sent.contains(f))
+            .collect();
+        taken.append(&mut self.clashes);
+        rename_pictures(
+            open,
+            taken,
+            &mut self.renames_due,
+            &mut self.pictures_out,
+            &mut self.notes,
+        );
         // Pictures used for the first time go out before the change that names them. Changes do
         // not wait for them: without its picture a page still works, it just shows a gap.
         let session_pictures = role.pictures();
@@ -1979,12 +2727,57 @@ impl Share {
             }
         }
         for edit in pictures.edits {
+            if let ProjectEdit::AddPicture { picture } = &edit {
+                self.pictures_sent.insert(picture.file.clone());
+            }
             role.edit_project(edit, &mut self.notes);
         }
+        // While an item is on its way (a few tries, seconds at most) everything waits: what
+        // comes in would put the session's lock entry back over an update sent from here.
         if self.items_out.values().any(|o| !o.gave_up) {
             return None;
         }
-        let mut out = outgoing(&open.project, base, mine, &role.locks(), me);
+        // After that, only a change that uses an item the session has not taken waits, however
+        // long: the session refuses a page that draws a symbol it does not have. Others' changes
+        // come in meanwhile; the session never had the item, so nothing replaces its entry here.
+        let undo = std::mem::take(&mut self.drop_held);
+        // For an Undo, what waited when it was asked waits still, also when its item has come
+        // in since: it never reached the session, so it is taken back here, not there.
+        let mut waiting: BTreeSet<String> = self.items_out.keys().cloned().collect();
+        if undo {
+            waiting.extend(self.holding.iter().cloned());
+        }
+        let held = Held::find(&open.project, self.base.as_ref()?, &waiting);
+        if undo && !held.is_empty() {
+            // Undo of a change that never reached the session: taken back here only.
+            let before = open.project.clone();
+            held.drop_from(&mut open.project);
+            if open.project != before {
+                // Also after a save: the copy on disk still has the change.
+                open.dirty = true;
+            }
+            self.holding.clear();
+            self.notes.push(format!(
+                "Your change that waited for {} was undone here; it had not reached the session.",
+                held.items.join(", ")
+            ));
+            return None;
+        }
+        self.holding = held.items.clone();
+        // Only what does not wait goes out: the waiting targets as the copy had synced them.
+        let sendable = (!held.is_empty()).then(|| {
+            let mut p = open.project.clone();
+            held.drop_from(&mut p);
+            p
+        });
+        let base = self.base.get_or_insert_with(|| open.project.clone());
+        let mut out = outgoing(
+            sendable.as_ref().unwrap_or(&open.project),
+            base,
+            mine,
+            &role.locks(),
+            me,
+        );
         if !out.dropped.is_empty() {
             // One action is kept whole or not at all: a device renamed on two pages must not
             // change the device while the page someone else holds keeps the old tag.
@@ -2008,15 +2801,16 @@ impl Share {
             // The host answers what was sent this frame at once; the reply goes out now.
             role.pump(&mut self.notes);
         }
+        let base = self.base.get_or_insert_with(|| open.project.clone());
+        take_updates(role, base, &mut self.items_out);
         let auth = role.project()?;
-        let conflicting = conflicts(&open.project, auth);
+        let conflicting = conflicts(&open.project, base, auth);
         if !conflicting.is_empty() {
             self.notes.push(format!(
                 "Someone else used {} first in another version; your copy takes theirs.",
                 conflicting.join(", ")
             ));
         }
-        let base = self.base.get_or_insert_with(|| open.project.clone());
         follow_take_backs(
             &mut self.session_lock,
             &mut self.unload,
@@ -2025,7 +2819,36 @@ impl Share {
             base,
             auth,
         );
-        let changed = incoming(&mut open.project, auth);
+        // Pictures this copy's own changes name: a clash among them is a file picked here.
+        let base_uses = used_pictures(base);
+        let named_here: std::collections::BTreeSet<String> = used_pictures(&open.project)
+            .into_iter()
+            .filter(|f| !base_uses.contains(f))
+            .collect();
+        let before = (!held.is_empty()).then(|| open.project.clone());
+        let mut changed = incoming(&mut open.project, auth);
+        // What this copy has synced to, with the session's lock; the waiting changes go on top
+        // and are found again next time.
+        let synced = before.as_ref().map(|_| {
+            let mut p = open.project.clone();
+            p.lock = auth.lock.clone();
+            p
+        });
+        if let Some(before) = &before {
+            let lost = held.put_back(&mut open.project);
+            if !lost.is_empty() {
+                self.notes.push(format!(
+                    "Your waiting change to {} was not kept: the session changed it meanwhile.",
+                    lost.join(", ")
+                ));
+            }
+            changed = open.project != *before;
+        }
+        // The session's versions are what this copy has synced to: an item updated here later
+        // differs from them ([`updated_here`]).
+        if let Some(base) = self.base.as_mut() {
+            base.lock = auth.lock.clone();
+        }
         // This copy now holds the session's versions: a take-back of those is what is followed.
         if let Some(seen) = self.session_lock.as_mut() {
             *seen = next_seen(seen, &open.project, auth);
@@ -2049,9 +2872,35 @@ impl Share {
             ));
         }
         self.pictures_failed.retain(|_, at| at.elapsed() < ITEM_RETRY_LATER);
-        let skip = self.pictures_failed.keys().cloned().collect();
-        let failed = take_pictures(open, role.pictures(), &mut self.pictures_taken, &skip);
+        // A clash whose rename waits to be tried again is not compared again meanwhile.
+        let skip = self
+            .pictures_failed
+            .keys()
+            .chain(
+                self.renames_due
+                    .iter()
+                    .filter(|(_, at)| at.elapsed() < ITEM_RETRY_LATER)
+                    .map(|(f, _)| f),
+            )
+            .cloned()
+            .collect();
+        let TakenPictures { failed, clashes } = take_pictures(open, role.pictures(), &mut self.pictures_taken, &skip);
+        // A picture picked here under a name the session has for another file gets a name of
+        // its own at the next sync, as when the session refuses it. One only the session's
+        // drawings name is theirs: the file here is kept, but neither renamed nor shared.
+        let (mine, theirs): (Vec<_>, Vec<_>) = clashes.into_iter().partition(|f| named_here.contains(f));
+        self.clashes = mine;
         let now = std::time::Instant::now();
+        for file in theirs {
+            if self.unreadable.insert(format!("clash {file}")) {
+                self.notes.push(format!(
+                    "The session's picture {file} differs from your file of that name; your copy keeps showing your file."
+                ));
+            }
+            // Compared again only after a while, as a picture that could not be written: once
+            // the file here is gone, the session's picture comes in.
+            self.pictures_failed.insert(file, now);
+        }
         for (file, _) in &failed {
             self.pictures_failed.insert(file.clone(), now);
         }
@@ -2070,7 +2919,12 @@ impl Share {
             // Others' changes are in the window, not yet in this copy's files.
             open.dirty = true;
         }
-        if changed || sent || !out.dropped.is_empty() {
+        if let Some(synced) = synced {
+            if changed || sent || !out.dropped.is_empty() {
+                open.forget_terminal_change();
+            }
+            self.base = Some(synced);
+        } else if changed || sent || !out.dropped.is_empty() {
             open.forget_terminal_change();
             self.base = Some(open.project.clone());
         }
@@ -2304,6 +3158,12 @@ impl Share {
                         });
                     }
                 }
+                if !self.holding.is_empty() {
+                    ui.label(format!(
+                        "Your changes that use {} wait until the session has it.",
+                        self.holding.join(", ")
+                    ));
+                }
                 ui.separator();
                 ui.label(RichText::new("Participants").strong());
                 let me = role.me();
@@ -2374,18 +3234,47 @@ fn write_copy(
     let leaf = crate::prefs::folder_name(&project.meta.name).unwrap_or_else(|| "shared-project".into());
     let dir = fresh_dir(folder, &leaf)?;
     store::save(&dir, project).map_err(|e| e.to_string())?;
-    for s in symbols.values() {
+    // A file the session sent ahead of the change that locks it (an undo's earlier version)
+    // waits: the copy takes it once that change is here.
+    for (id, s) in symbols {
+        if project.lock.symbols.get(id).is_some_and(|e| e.hash != s.hash()) {
+            continue;
+        }
         store::write_vendored_symbol(&dir, s).map_err(|e| e.to_string())?;
     }
-    for p in parts.values() {
+    for (id, p) in parts {
+        if project.lock.parts.get(id).is_some_and(|e| e.hash != p.hash()) {
+            continue;
+        }
         store::write_vendored_part(&dir, p).map_err(|e| e.to_string())?;
     }
     let mut open = Open::load(&dir)?;
-    let wanted: Vec<String> = open.project.lock.symbols.keys().cloned().collect();
+    // Symbols the session did not send come from the libraries here, but only in the version the
+    // session pinned: another version would make this copy differ from everyone else's.
+    let wanted: Vec<(String, String)> = open
+        .project
+        .lock
+        .symbols
+        .iter()
+        .filter(|(id, _)| !open.symbols.contains_key(*id))
+        .map(|(id, e)| (id.clone(), e.hash.clone()))
+        .collect();
     let mut missing = Vec::new();
-    for id in wanted {
-        if let Err(e) = open.ensure_symbol(&id) {
-            missing.push(format!("{id} ({e})"));
+    if !wanted.is_empty() {
+        match wc_library::Library::open(&dir, &open.project) {
+            Ok(lib) => {
+                for (id, pin) in wanted {
+                    match lib.symbol(&id) {
+                        Ok((s, _)) if s.hash() == pin => {
+                            store::write_vendored_symbol(&dir, &s).map_err(|e| e.to_string())?;
+                            open.symbols.insert(id, s);
+                        }
+                        Ok(_) => missing.push(format!("{id} (the library here has another version)")),
+                        Err(e) => missing.push(format!("{id} ({e})")),
+                    }
+                }
+            }
+            Err(e) => missing.extend(wanted.into_iter().map(|(id, _)| format!("{id} ({e})"))),
         }
     }
     if !missing.is_empty() {

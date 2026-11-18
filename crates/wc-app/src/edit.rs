@@ -167,6 +167,13 @@ pub fn graphic_bounds(g: &Shape) -> (Point, Point) {
             });
             wc_core::geom::bounds_of(&corners)
         }
+        // The drawn part of an arc, so a selection box around a quarter arc takes it.
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => wc_core::geom::bounds_of(&crate::canvas::arc_points(*center, *radius, *start, *end)),
         _ => g.bounds(),
     }
 }
@@ -218,7 +225,14 @@ pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
                 (d - radius).abs() <= tol
             }
         }
-        Shape::Arc { center, radius, .. } => (at.distance(*center) - radius).abs() <= tol,
+        // The same chords the canvas draws, so a click on the visible stroke picks it and the
+        // open part of the arc does not.
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => near_path(&crate::canvas::arc_points(*center, *radius, *start, *end)),
         Shape::Text { .. } => {
             let (a, b) = graphic_bounds(g);
             at.x >= a.x - tol && at.x <= b.x + tol && at.y >= a.y - tol && at.y <= b.y + tol

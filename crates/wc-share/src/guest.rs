@@ -44,10 +44,14 @@ pub struct Guest {
     /// Undo, redo and revert requests sent and not answered yet. The host answers each with
     /// its restoration (a `Restore` edit by this guest) or a refusal.
     taking_back: usize,
-    /// Symbol and part files the session sent (in the welcome and with each
-    /// [`ProjectEdit::AddItems`]), by id: what this guest's copy needs to draw the project.
+    /// Symbol and part files the session sent (in the welcome, with each
+    /// [`ProjectEdit::AddItems`] and [`ProjectEdit::UpdateItems`], and as [`HostMsg::Items`]), by id: what this guest's copy needs to draw the project.
     pub symbols: BTreeMap<String, wc_core::Symbol>,
     pub parts: BTreeMap<String, wc_core::Part>,
+    /// Items of this guest's [`ProjectEdit::UpdateItems`] the session took, as (kind, id, hash),
+    /// in the order the host recorded them: the answer to each update, even when a later change
+    /// (someone's undo) put the item back before this guest looked. Taken by whoever sent them.
+    pub took_updates: Vec<(wc_core::lock::ItemKind, String, String)>,
     /// Picture files the session sent ([`HostMsg::Picture`]), by project path: what this
     /// guest's copy needs to show the logo and underlays.
     pub pictures: BTreeMap<String, Vec<u8>>,
@@ -83,6 +87,7 @@ impl Guest {
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
             pictures: BTreeMap::new(),
+            took_updates: Vec::new(),
             last_edit: 0,
             unanswered: BTreeMap::new(),
             replaced: BTreeMap::new(),
@@ -267,10 +272,22 @@ impl Guest {
                 if matches!(edit, ProjectEdit::Restore { .. }) && Some(by) == self.me {
                     self.taking_back = self.taking_back.saturating_sub(1);
                 }
-                if let ProjectEdit::AddItems { symbols, parts } = &edit {
-                    self.symbols
-                        .extend(symbols.iter().map(|(s, _)| (s.id.clone(), s.clone())));
-                    self.parts.extend(parts.iter().map(|(p, _)| (p.id.clone(), p.clone())));
+                match &edit {
+                    ProjectEdit::AddItems { symbols, parts } => {
+                        self.symbols
+                            .extend(symbols.iter().map(|(s, _)| (s.id.clone(), s.clone())));
+                        self.parts.extend(parts.iter().map(|(p, _)| (p.id.clone(), p.clone())));
+                    }
+                    ProjectEdit::UpdateItems { symbols, parts } => {
+                        if Some(by) == self.me {
+                            self.took_updates.extend(edit.updated_items());
+                        }
+                        self.symbols
+                            .extend(symbols.iter().map(|(s, _, _)| (s.id.clone(), s.clone())));
+                        self.parts
+                            .extend(parts.iter().map(|(p, _, _)| (p.id.clone(), p.clone())));
+                    }
+                    _ => {}
                 }
                 if let Some(p) = self.project.as_mut() {
                     apply_edit(p, &edit);
@@ -278,6 +295,10 @@ impl Guest {
             }
             HostMsg::Picture { picture } => {
                 self.pictures.insert(picture.file, picture.data);
+            }
+            HostMsg::Items { symbols, parts } => {
+                self.symbols.extend(symbols.into_iter().map(|s| (s.id.clone(), s)));
+                self.parts.extend(parts.into_iter().map(|p| (p.id.clone(), p)));
             }
             HostMsg::Recorded { change } => note(&mut self.history, change),
             HostMsg::Locks { locks } => {

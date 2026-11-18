@@ -13,13 +13,26 @@ fn demo() -> Project {
     p.pages.push(Page::new("p0001", "1", "Cover"));
     p.pages.push(Page::new("p0002", "2", "Motor"));
     p.pages.push(Page::new("p0003", "3", "Pump"));
+    // The symbol `place` draws: the project has it, as a page may only use what it locks.
+    p.lock.symbols.insert(
+        "relay".into(),
+        wc_core::lock::LockEntry {
+            source: "test".into(),
+            hash: "relay-v1".into(),
+        },
+    );
     p
 }
 
+/// Place the symbol `relay`, which [`demo`] locks.
 fn place(page: &mut Page, id: &str, x: f64) {
+    place_symbol(page, id, x, "relay");
+}
+
+fn place_symbol(page: &mut Page, id: &str, x: f64, symbol: &str) {
     page.symbols.push(PlacedSymbol {
         id: id.into(),
-        symbol: "coil".into(),
+        symbol: symbol.into(),
         at: Point::new(x, 50.0),
         rotation: Default::default(),
         mirror: false,
@@ -525,6 +538,7 @@ fn every_change_is_a_commit_by_its_author_and_can_be_reverted() -> TestResult {
     let dir = tmp.path();
     let mut project = store::create(dir, "Demo")?;
     project.pages.push(Page::new("p0002", "2", "Motor"));
+    project.lock = demo().lock;
     store::save(dir, &project)?;
     let journal = GitJournal::open(dir)?;
     let git = journal.git().clone();
@@ -2284,7 +2298,7 @@ fn undoing_an_added_item_takes_back_its_lock_entry() -> TestResult {
         .and_then(|p| p.page("p0002"))
         .cloned()
         .ok_or("page")?;
-    place(&mut page, "s1", 10.0);
+    place_symbol(&mut page, "s1", 10.0, "coil");
     link_b.send(b.edit_page(page).ok_or("lock")?)?;
     s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
     let changes = s.log.0.borrow().len();
@@ -2339,7 +2353,7 @@ fn bringing_back_a_page_that_uses_a_symbol_taken_back_since_is_refused() -> Test
     let added = s.host.history().last().map(|c| c.id).ok_or("added")?;
     s.host.open(Some("p0003"))?;
     let mut page = s.host.project().page("p0003").cloned().ok_or("page")?;
-    place(&mut page, "s1", 10.0);
+    place_symbol(&mut page, "s1", 10.0, "coil");
     s.host.edit_page(page)?;
     s.host.open(None)?;
     s.host.edit_project(ProjectEdit::RemovePage { id: "p0003".into() })?;
@@ -2873,10 +2887,11 @@ fn guests_get_the_pictures_and_pictures_added_during_the_session() -> TestResult
     }
     s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
     assert_eq!(b.refusals.len(), 4, "{:?}", b.refusals);
-    assert!(
-        b.refusals[0].to_string().contains("another picture"),
-        "{}",
-        b.refusals[0]
+    assert_eq!(
+        b.refusals[0],
+        Refusal::PictureNameTaken {
+            file: "pictures/logo.png".into()
+        }
     );
     assert_eq!(a.pictures.get("pictures/logo.png"), Some(&png));
     assert_eq!(s.host.pictures().len(), 3);
@@ -2926,13 +2941,13 @@ fn an_added_picture_is_committed_with_the_change_that_names_it() -> TestResult {
     );
 
     // A file already in the folder under that name with other content is kept: the picture is
-    // refused.
+    // refused by name, so its sender can rename it.
     std::fs::write(dir.join("pictures/old.png"), b"old")?;
     let refused = host.edit_project(ProjectEdit::AddPicture {
         picture: picture("pictures/old.png", b"new"),
     });
     assert!(
-        matches!(&refused, Err(Refusal::NotRecorded { reason }) if reason.contains("another picture")),
+        matches!(&refused, Err(Refusal::PictureNameTaken { file }) if file == "pictures/old.png"),
         "{refused:?}"
     );
     assert_eq!(std::fs::read(dir.join("pictures/old.png"))?, b"old");
@@ -3028,8 +3043,21 @@ fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
     );
     // The same picture again is fine; another under that name is refused and changes nothing.
     write_picture(dir, &logo)?;
-    assert!(write_picture(dir, &picture("pictures/logo.png", b"other")).is_err());
+    assert!(matches!(
+        write_picture(dir, &picture("pictures/logo.png", b"other")),
+        Err(Error::PictureNameTaken(_))
+    ));
     assert_eq!(std::fs::read(pictures.join("logo.png"))?, logo.data);
+    Ok(())
+}
+
+#[test]
+fn a_file_in_the_way_of_a_pictures_folder_is_a_storage_failure_and_not_a_taken_name() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // `create_dir_all` fails with `AlreadyExists` here, which is no other picture's name.
+    std::fs::write(tmp.path().join("pictures"), b"not a folder")?;
+    let r = write_picture(tmp.path(), &picture("pictures/logo.png", b"png"));
+    assert!(matches!(r, Err(Error::Io(_))), "{r:?}");
     Ok(())
 }
 
@@ -3041,5 +3069,455 @@ fn a_picture_with_a_long_name_that_fits_the_folder_is_written() -> TestResult {
     let logo = picture(&file, b"\x89PNG\r\n\x1a\nlogo");
     write_picture(tmp.path(), &logo)?;
     assert_eq!(std::fs::read(tmp.path().join(&file))?, logo.data);
+    Ok(())
+}
+
+fn update_symbol(from: &wc_core::Symbol, to: &wc_core::Symbol) -> ProjectEdit {
+    ProjectEdit::UpdateItems {
+        symbols: vec![(to.clone(), "starter".into(), from.hash())],
+        parts: vec![],
+    }
+}
+
+#[test]
+fn an_update_of_an_item_reaches_everyone_and_an_undo_puts_the_old_version_back() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    let (_b, link_b, mut b) = s.join("Kari")?;
+    let (v1, v2, v3) = (
+        symbol("coil", "Coil"),
+        symbol("coil", "Coil v2"),
+        symbol("coil", "Coil v3"),
+    );
+    link_a.send(a.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    }))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let hash = |p: &Project| p.lock.symbols.get("coil").map(|e| e.hash.clone());
+
+    // Ola updates the coil: every copy gets the new file and lock entry.
+    link_a.send(a.edit_project(update_symbol(&v1, &v2)))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert_eq!(hash(s.host.project()), Some(v2.hash()));
+    assert_eq!(b.symbols.get("coil"), Some(&v2));
+    assert_eq!(b.project.as_ref().and_then(hash), Some(v2.hash()));
+    assert_eq!(s.host.files().0.get("coil"), Some(&v2));
+    assert_eq!(
+        s.log.0.borrow().last().map(|c| c.message.clone()).as_deref(),
+        Some("Update coil from the library")
+    );
+
+    // Kari still started from the first version: refused, and told why.
+    let changes = s.log.0.borrow().len();
+    link_b.send(b.edit_project(update_symbol(&v1, &v3)))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let refused = b.refusals.last().map(ToString::to_string).unwrap_or_default();
+    assert!(refused.contains("changed in the session since"), "{refused}");
+    assert_eq!(hash(s.host.project()), Some(v2.hash()));
+    assert_eq!(s.log.0.borrow().len(), changes);
+    // Not an update of an item the project does not have either.
+    let refused = s.host.edit_project(update_symbol(&v1, &symbol("lamp", "Lamp")));
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { reason }) if reason.contains("no longer has symbol lamp")),
+        "{refused:?}"
+    );
+
+    // Ola's undo puts the first version back everywhere, file and lock entry.
+    link_a.send(GuestMsg::Undo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert_eq!(hash(s.host.project()), Some(v1.hash()));
+    assert_eq!(s.host.files().0.get("coil"), Some(&v1));
+    assert_eq!(b.symbols.get("coil"), Some(&v1));
+    assert_eq!(a.symbols.get("coil"), Some(&v1));
+    assert_eq!(b.project.as_ref().and_then(hash), Some(v1.hash()));
+    // And the redo the new one.
+    link_a.send(GuestMsg::Redo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert_eq!(hash(s.host.project()), Some(v2.hash()));
+    assert_eq!(b.symbols.get("coil"), Some(&v2));
+    Ok(())
+}
+
+#[test]
+fn an_update_is_committed_with_its_file_and_an_undo_writes_the_old_file_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let journal = GitJournal::open(dir)?;
+    let git = journal.git().clone();
+    git.commit("Start")?;
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(journal));
+    let (v1, v2) = (symbol("lamp", "Lamp"), symbol("lamp", "Lamp v2"));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.edit_project(update_symbol(&v1, &v2))?;
+    assert_eq!(store::read_vendored_symbol(dir, "lamp")?, v2);
+    assert_eq!(
+        store::load(dir)?.lock.symbols.get("lamp").map(|e| e.hash.clone()),
+        Some(v2.hash())
+    );
+    let path = store::vendor_path(dir, wc_core::lock::ItemKind::Symbol, "lamp")?;
+    let rel = path.strip_prefix(dir)?.to_string_lossy().replace('\\', "/");
+    // The file and the lock entry naming its hash, both as the commit has them.
+    let committed =
+        |git: &wc_vcs::Git| -> std::result::Result<(Option<String>, Option<String>), Box<dyn std::error::Error>> {
+            let lock = git.show("HEAD", store::LOCK_FILE).ok_or("no lock in HEAD")?;
+            let lock: wc_core::Lockfile = toml::from_str(&lock)?;
+            Ok((git.show("HEAD", &rel), lock.symbols.get("lamp").map(|e| e.hash.clone())))
+        };
+    assert_eq!(
+        committed(&git)?,
+        (Some(store::to_json(&v2)?), Some(v2.hash())),
+        "file and lock in one commit"
+    );
+    host.undo()?;
+    assert_eq!(store::read_vendored_symbol(dir, "lamp")?, v1);
+    assert_eq!(
+        store::load(dir)?.lock.symbols.get("lamp").map(|e| e.hash.clone()),
+        Some(v1.hash())
+    );
+    assert_eq!(
+        committed(&git)?,
+        (Some(store::to_json(&v1)?), Some(v1.hash())),
+        "the undo commits the old file with its lock entry"
+    );
+    Ok(())
+}
+
+/// A coil symbol with these pins.
+fn coil_with(pins: &[&str]) -> wc_core::Symbol {
+    let mut s = symbol("coil", "Coil");
+    s.pins = pins
+        .iter()
+        .map(|n| wc_core::Pin {
+            name: (*n).into(),
+            at: Point::default(),
+            dir: Default::default(),
+        })
+        .collect();
+    s
+}
+
+/// Two coils `k1` and `k2` on `page`, wired from pin `pin` to pin `pin`.
+fn wired(page: &mut Page, pin: &str) {
+    place_symbol(page, "k1", 10.0, "coil");
+    place_symbol(page, "k2", 50.0, "coil");
+    let end = |item: &str| wc_core::Endpoint::Pin {
+        item: item.into(),
+        pin: pin.into(),
+    };
+    page.wires.push(wc_core::Wire {
+        id: "w1".into(),
+        from: end("k1"),
+        to: end("k2"),
+        via: Vec::new(),
+        number: None,
+        potential: None,
+        cable: None,
+        route: Default::default(),
+        spec: Default::default(),
+    });
+}
+
+#[test]
+fn an_update_that_drops_a_pin_wired_in_the_session_is_refused() -> TestResult {
+    let mut project = demo();
+    wired(&mut project.pages[1], "A2");
+    let mut host = Host::new(
+        project,
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1", "A2"]), coil_with(&["A1"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    let err = host.edit_project(update_symbol(&v1, &v2)).err().ok_or("refused")?;
+    assert!(err.to_string().contains("page 2 k1:A2"), "{err}");
+    assert_eq!(
+        host.project().lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(v1.hash())
+    );
+    Ok(())
+}
+
+#[test]
+fn an_update_is_not_taken_back_while_a_wire_uses_a_pin_only_it_has() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1"]), coil_with(&["A1", "A2"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.edit_project(update_symbol(&v1, &v2))?;
+    let update = host.history().last().ok_or("recorded")?.id;
+    host.open(Some("p0002"))?;
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    wired(&mut page, "A2");
+    host.edit_page(page.clone())?;
+    let err = host.revert(update).err().ok_or("refused")?;
+    assert!(err.to_string().contains("page 2 k1:A2"), "{err}");
+    let hash = |h: &Host| h.project().lock.symbols.get("coil").map(|e| e.hash.clone());
+    assert_eq!(hash(&host), Some(v2.hash()));
+    page.wires.clear();
+    host.edit_page(page)?;
+    host.revert(update)?;
+    assert_eq!(hash(&host), Some(v1.hash()), "taken back once the wire is gone");
+    Ok(())
+}
+
+#[test]
+fn a_page_edit_with_a_wire_on_a_pin_an_update_dropped_is_refused() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1", "A2"]), coil_with(&["A1"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    // The update reaches the host before a page edit drawn on v1.
+    host.edit_project(update_symbol(&v1, &v2))?;
+    host.open(Some("p0002"))?;
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    wired(&mut page, "A2");
+    let err = host.edit_page(page).err().ok_or("refused")?;
+    assert!(err.to_string().contains("k1:A2"), "{err}");
+    assert!(host.project().page("p0002").ok_or("page")?.wires.is_empty());
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    wired(&mut page, "A1");
+    host.edit_page(page)?;
+    assert_eq!(host.project().page("p0002").ok_or("page")?.wires.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_page_undo_does_not_put_a_wire_back_on_a_pin_a_later_update_dropped() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1", "A2"]), coil_with(&["A1"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.open(Some("p0002"))?;
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    wired(&mut page, "A2");
+    host.edit_page(page.clone())?;
+    page.wires.clear();
+    host.edit_page(page)?;
+    let removal = host.history().last().ok_or("recorded")?.id;
+    // A2 is free, so the update without it is taken; taking the wire removal back would put the
+    // wire on a pin the coil no longer has.
+    host.edit_project(update_symbol(&v1, &v2))?;
+    let err = host.revert(removal).err().ok_or("refused")?;
+    assert!(err.to_string().contains("page 2 k1:A2"), "{err}");
+    assert!(host.project().page("p0002").ok_or("page")?.wires.is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn an_update_whose_commit_fails_leaves_the_old_version_saved_and_pinned() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let journal = GitJournal::open(dir)?;
+    journal.git().commit("start")?;
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(journal));
+    let (v1, v2) = (symbol("coil", "Coil"), symbol("coil", "Coil v2"));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    let head = |dir: &std::path::Path| -> std::io::Result<Vec<u8>> {
+        Ok(std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()?
+            .stdout)
+    };
+    let before = head(dir)?;
+    let hook = dir.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(dir.join(".git/hooks"))?;
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n")?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+
+    let updated = host.edit_project(update_symbol(&v1, &v2));
+    assert!(matches!(updated, Err(Refusal::NotRecorded { .. })), "{updated:?}");
+    assert_eq!(head(dir)?, before, "no commit");
+    let saved = store::load(dir)?;
+    assert_eq!(saved.lock.symbols.get("coil").map(|e| e.hash.clone()), Some(v1.hash()));
+    assert_eq!(store::read_vendored_symbol(dir, "coil")?, v1, "the old file is back");
+    assert_eq!(
+        host.project().lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(v1.hash())
+    );
+    Ok(())
+}
+
+#[test]
+fn a_git_journal_puts_vendored_files_back_when_a_change_is_not_recorded() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let mut journal = GitJournal::open(dir)?;
+    let (v1, v2, lamp) = (
+        symbol("coil", "Coil"),
+        symbol("coil", "Coil v2"),
+        symbol("lamp", "Lamp"),
+    );
+    journal.vendor(std::slice::from_ref(&v1), &[])?;
+    let change = Change {
+        by: HOST,
+        author: "Hanna Host <hanna@example.com>".into(),
+        page: None,
+        message: "Add coil".into(),
+    };
+    journal.record(&project, &change)?;
+    // The update's files are written, then its record fails: the caller puts the project back.
+    journal.vendor(&[v2, lamp], &[])?;
+    journal.restore(&project)?;
+    assert_eq!(store::read_vendored_symbol(dir, "coil")?, v1, "the old version is back");
+    assert!(
+        !store::vendor_path(dir, wc_core::lock::ItemKind::Symbol, "lamp")?.exists(),
+        "a file that was not there is gone again"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_page_edit_that_places_a_symbol_the_session_does_not_have_is_refused() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    link_a.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&link_a, &mut a)]);
+    let mut page = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place_symbol(&mut page, "s1", 10.0, "lamp");
+    link_a.send(a.edit_page(page).ok_or("lock")?)?;
+    s.pump(&mut [(&link_a, &mut a)]);
+    let refused: Vec<String> = a.refusals.iter().map(ToString::to_string).collect();
+    let refused = refused.join("\n");
+    assert!(refused.contains("symbol lamp"), "{refused}");
+    assert!(s.host.project().page("p0002").ok_or("page")?.symbols.is_empty());
+    // The guest's copy gets the page as the host has it back.
+    assert_eq!(
+        a.project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .map(|p| p.symbols.len()),
+        Some(0)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_page_that_already_used_an_unlocked_symbol_stays_editable() -> TestResult {
+    // An older project placed `lamp` without a lock entry.
+    let mut project = demo();
+    if let Some(page) = project.page_mut("p0002") {
+        place_symbol(page, "old", 10.0, "lamp");
+    }
+    let mut host = Host::new(
+        project,
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    host.open(Some("p0002"))?;
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    page.title = "Motor control".into();
+    place(&mut page, "s1", 40.0);
+    host.edit_page(page)?;
+    assert_eq!(host.project().page("p0002").ok_or("page")?.title, "Motor control");
+    // A new placement of that symbol is refused, on this page and on another.
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    place_symbol(&mut page, "again", 60.0, "lamp");
+    let err = host.edit_page(page).err().ok_or("refused")?;
+    assert!(err.to_string().contains("symbol lamp"), "{err}");
+    // So is a copy of the old placement under its id.
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    place_symbol(&mut page, "old", 80.0, "lamp");
+    assert!(host.edit_page(page).is_err());
+    host.open(Some("p0003"))?;
+    let mut page = host.project().page("p0003").ok_or("page")?.clone();
+    place_symbol(&mut page, "s1", 10.0, "lamp");
+    assert!(host.edit_page(page).is_err());
+    Ok(())
+}
+
+#[test]
+fn pages_written_by_project_edits_may_not_start_using_a_symbol_the_session_lacks() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let mut new_page = Page::new("p0009", "9", "New");
+    place_symbol(&mut new_page, "s1", 10.0, "lamp");
+    let err = host
+        .edit_project(ProjectEdit::AddPage { page: new_page.clone() })
+        .err()
+        .ok_or("refused")?;
+    assert!(err.to_string().contains("symbol lamp"), "{err}");
+    let before = host.project().page("p0003").ok_or("page")?.clone();
+    let mut after = before.clone();
+    place_symbol(&mut after, "s1", 10.0, "lamp");
+    let set = ProjectEdit::SetPages {
+        pages: vec![after.clone()],
+        before: vec![before.clone()],
+    };
+    assert!(host.edit_project(set).is_err());
+    assert!(host.project().page("p0003").ok_or("page")?.symbols.is_empty());
+    // In a batch too.
+    let batch = ProjectEdit::Batch {
+        edits: vec![
+            ProjectEdit::Renumber {
+                numbers: vec![("p0002".into(), "20".into())],
+            },
+            ProjectEdit::SetPages {
+                pages: vec![after.clone()],
+                before: vec![before.clone()],
+            },
+        ],
+    };
+    assert!(host.edit_project(batch).is_err());
+    // Once the session has the symbol, the page is fine.
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(symbol("lamp", "Lamp"), "starter".into())],
+        parts: vec![],
+    })?;
+    host.edit_project(ProjectEdit::SetPages {
+        pages: vec![after],
+        before: vec![before],
+    })?;
+    assert_eq!(host.project().page("p0003").ok_or("page")?.symbols.len(), 1);
     Ok(())
 }

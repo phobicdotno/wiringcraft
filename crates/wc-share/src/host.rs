@@ -1,6 +1,6 @@
 //! The host's side of a session: approval, page locks, applying changes and telling everyone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::{Page, Project};
 
@@ -57,6 +57,10 @@ pub struct Host {
     /// user shared ([`Host::share_files`]) and what participants added since.
     symbols: BTreeMap<String, wc_core::Symbol>,
     parts: BTreeMap<String, wc_core::Part>,
+    /// Versions an update ([`ProjectEdit::UpdateItems`]) replaced, by id and hash, so an undo
+    /// can lock and store them again.
+    old_symbols: BTreeMap<(String, String), wc_core::Symbol>,
+    old_parts: BTreeMap<(String, String), wc_core::Part>,
     /// The picture files guests get (the logo, page underlays), by project path: what the
     /// host's user shared ([`Host::share_pictures`]) and what participants added since.
     pictures: BTreeMap<String, Vec<u8>>,
@@ -113,6 +117,8 @@ impl Host {
             take_backs_held: None,
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
+            old_symbols: BTreeMap::new(),
+            old_parts: BTreeMap::new(),
             pictures: BTreeMap::new(),
             added_pictures: (0, 0),
         }
@@ -442,7 +448,7 @@ impl Host {
                 Some(_) => Refusal::NoLock { page: page.id },
             });
         }
-        let Some(current) = self.project.page_mut(&page.id) else {
+        let Some(current) = self.project.page(&page.id) else {
             return Err(Refusal::UnknownPage { page: page.id });
         };
         // The display number is project-level: only `Renumber` changes it.
@@ -454,6 +460,28 @@ impl Host {
             }
             return Ok(());
         }
+        unlocked_placements(&self.project, Some(current), &page)?;
+        // A wire may not end on a pin the locked version of its symbol lacks: an update may have
+        // dropped the pin after the author drew the wire. Wires already like that may stay.
+        let on_page = |p: &Page| {
+            let mut probe = Project::new("");
+            probe.lock = self.project.lock.clone();
+            probe.pages = vec![p.clone()];
+            self.dangling_in(&probe)
+        };
+        let was = on_page(current);
+        let dangling: Vec<String> = on_page(&page).difference(&was).cloned().collect();
+        if !dangling.is_empty() {
+            return Err(Refusal::Invalid {
+                reason: format!(
+                    "wires end on pins the project's version of their symbol does not have ({}); the symbol was updated meanwhile",
+                    dangling.join(", ")
+                ),
+            });
+        }
+        let Some(current) = self.project.page_mut(&page.id) else {
+            return Err(Refusal::UnknownPage { page: page.id });
+        };
         let before = std::mem::replace(current, page.clone());
         let message = format!("Edit page {} {}", page.number, page.title);
         if let Err(refusal) = self.record(by, Some(page.id.clone()), message.clone()) {
@@ -515,6 +543,7 @@ impl Host {
             });
         }
         check_edit(&self.project, &self.locks, by, &edit)?;
+        check_placements(&self.project, &edit)?;
         if let ProjectEdit::AddPicture { picture } = edit {
             self.add_picture(picture)?;
             return Ok(false);
@@ -531,6 +560,10 @@ impl Host {
                 symbols.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>(),
                 parts.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             )),
+            ProjectEdit::UpdateItems { symbols, parts } => Some((
+                symbols.iter().map(|(s, _, _)| s.clone()).collect::<Vec<_>>(),
+                parts.iter().map(|(p, _, _)| p.clone()).collect::<Vec<_>>(),
+            )),
             _ => None,
         };
         // The files go in first, so the change's commit holds them with their lock entries. A
@@ -545,8 +578,8 @@ impl Host {
             return Err(refusal);
         }
         if let Some((symbols, parts)) = added {
-            self.symbols.extend(symbols.into_iter().map(|s| (s.id.clone(), s)));
-            self.parts.extend(parts.into_iter().map(|p| (p.id.clone(), p)));
+            let update = matches!(edit, ProjectEdit::UpdateItems { .. });
+            self.take_versions(symbols, parts, update);
         }
         let (was, now) = Parts::delta(&before, &self.project);
         if let ProjectEdit::RemovePage { id } = &edit
@@ -580,14 +613,7 @@ impl Host {
     fn add_picture(&mut self, picture: crate::Picture) -> Result<(), Refusal> {
         match self.pictures.get(&picture.file) {
             Some(have) if *have == picture.data => return Ok(()),
-            Some(_) => {
-                return Err(Refusal::Invalid {
-                    reason: format!(
-                        "the session already has another picture named {}; pick the picture again to give it a new name",
-                        picture.file
-                    ),
-                });
-            }
+            Some(_) => return Err(Refusal::PictureNameTaken { file: picture.file }),
             None => {}
         }
         let (count, bytes) = self.added_pictures;
@@ -602,9 +628,14 @@ impl Host {
                 ),
             });
         }
-        self.journal
-            .picture(&picture)
-            .map_err(|e| Refusal::NotRecorded { reason: e.to_string() })?;
+        // A file of that name in the host's folder that the session does not use (an old logo) is
+        // never written over: the sender renames its picture instead.
+        self.journal.picture(&picture).map_err(|e| match e {
+            crate::Error::PictureNameTaken(_) => Refusal::PictureNameTaken {
+                file: picture.file.clone(),
+            },
+            e => Refusal::NotRecorded { reason: e.to_string() },
+        })?;
         self.added_pictures = (count + 1, bytes + picture.data.len());
         self.pictures.insert(picture.file.clone(), picture.data.clone());
         let ids: Vec<PeerId> = self.joined_guests().collect();
@@ -670,14 +701,14 @@ impl Host {
         let mut missing = Vec::new();
         for (id, e) in &entry.before.lock_symbols {
             if let Some(e) = e
-                && self.symbols.get(id).map(wc_core::Symbol::hash).as_ref() != Some(&e.hash)
+                && self.symbol_version(id, &e.hash).is_none()
             {
                 missing.push(format!("symbol {id}"));
             }
         }
         for (id, e) in &entry.before.lock_parts {
             if let Some(e) = e
-                && self.parts.get(id).map(wc_core::Part::hash).as_ref() != Some(&e.hash)
+                && self.part_version(id, &e.hash).is_none()
             {
                 missing.push(format!("part {id}"));
             }
@@ -695,6 +726,18 @@ impl Host {
         check_edit(&self.project, &self.locks, by, &edit)?;
         let before = self.project.clone();
         apply_edit(&mut self.project, &edit);
+        // Every wire end the undo leaves must be on a pin of its symbol's locked version: a symbol
+        // locked again in an older version, or a wire put back on a pin a later update dropped.
+        let was = self.dangling_in(&before);
+        let dangling: Vec<String> = self.dangling_in(&self.project).difference(&was).cloned().collect();
+        if !dangling.is_empty() {
+            self.project = before;
+            return invalid(format!(
+                "\"{}\" cannot be taken back: wires end on pins the earlier versions do not have ({}); move those wires first",
+                entry.info.message,
+                dangling.join(", ")
+            ));
+        }
         // The message names the edit itself: a redo of "Undo X" is "Redo X".
         let what = match kind {
             ChangeKind::Redo => entry
@@ -714,15 +757,13 @@ impl Host {
             .before
             .lock_symbols
             .iter()
-            .filter(|(_, e)| e.is_some())
-            .filter_map(|(id, _)| self.symbols.get(id).cloned())
+            .filter_map(|(id, e)| self.symbol_version(id, &e.as_ref()?.hash))
             .collect();
         let parts: Vec<wc_core::Part> = entry
             .before
             .lock_parts
             .iter()
-            .filter(|(_, e)| e.is_some())
-            .filter_map(|(id, _)| self.parts.get(id).cloned())
+            .filter_map(|(id, e)| self.part_version(id, &e.as_ref()?.hash))
             .collect();
         let stored = if symbols.is_empty() && parts.is_empty() {
             Ok(())
@@ -752,8 +793,42 @@ impl Host {
             }
             self.broadcast_presence();
         }
+        // Versions the guests may no longer have go out before the change that locks them.
+        let resent: (Vec<_>, Vec<_>) = (
+            symbols
+                .iter()
+                .filter(|s| self.symbols.get(&s.id).is_none_or(|have| have.hash() != s.hash()))
+                .cloned()
+                .collect(),
+            parts
+                .iter()
+                .filter(|p| self.parts.get(&p.id).is_none_or(|have| have.hash() != p.hash()))
+                .cloned()
+                .collect(),
+        );
+        self.take_versions(symbols, parts, true);
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for g in ids {
+            // One file a message: each came in one message, so each fits the line limit, while
+            // several together may not.
+            for s in &resent.0 {
+                self.outbox.push((
+                    g,
+                    HostMsg::Items {
+                        symbols: vec![s.clone()],
+                        parts: Vec::new(),
+                    },
+                ));
+            }
+            for p in &resent.1 {
+                self.outbox.push((
+                    g,
+                    HostMsg::Items {
+                        symbols: Vec::new(),
+                        parts: vec![p.clone()],
+                    },
+                ));
+            }
             self.outbox.push((
                 g,
                 HostMsg::ProjectChanged {
@@ -804,9 +879,70 @@ impl Host {
             let extra = self.history.len() - crate::MAX_HISTORY;
             self.history.drain(..extra);
         }
+        // Replaced versions only an undo or redo in the kept history can lock again stay.
+        let wanted = |e: &Entry, symbols: bool| -> Vec<(String, String)> {
+            [&e.before, &e.after]
+                .into_iter()
+                .flat_map(|p| if symbols { &p.lock_symbols } else { &p.lock_parts })
+                .filter_map(|(id, l)| Some((id.clone(), l.as_ref()?.hash.clone())))
+                .collect()
+        };
+        let symbols: BTreeSet<(String, String)> = self.history.iter().flat_map(|e| wanted(e, true)).collect();
+        let parts: BTreeSet<(String, String)> = self.history.iter().flat_map(|e| wanted(e, false)).collect();
+        self.old_symbols.retain(|k, _| symbols.contains(k));
+        self.old_parts.retain(|k, _| parts.contains(k));
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for g in ids {
             self.outbox.push((g, HostMsg::Recorded { change: info.clone() }));
+        }
+    }
+
+    /// Symbol `id` in the version `hash`: the one guests get, or one an update replaced.
+    /// Wire ends in `project` on pins the locked version of their symbol does not have, for the
+    /// versions the session has.
+    fn dangling_in(&self, project: &Project) -> BTreeSet<String> {
+        project
+            .lock
+            .symbols
+            .iter()
+            .filter_map(|(id, e)| Some((id, self.symbol_version(id, &e.hash)?)))
+            .flat_map(|(id, s)| project.dangling_pins(id, &s))
+            .collect()
+    }
+
+    fn symbol_version(&self, id: &str, hash: &str) -> Option<wc_core::Symbol> {
+        match self.symbols.get(id) {
+            Some(s) if s.hash() == hash => Some(s.clone()),
+            _ => self.old_symbols.get(&(id.to_owned(), hash.to_owned())).cloned(),
+        }
+    }
+
+    /// Part `id` in the version `hash`, as [`Self::symbol_version`].
+    fn part_version(&self, id: &str, hash: &str) -> Option<wc_core::Part> {
+        match self.parts.get(id) {
+            Some(p) if p.hash() == hash => Some(p.clone()),
+            _ => self.old_parts.get(&(id.to_owned(), hash.to_owned())).cloned(),
+        }
+    }
+
+    /// Make these the versions guests get. With `keep`, the versions they replace are kept for
+    /// an undo ([`Self::symbol_version`]).
+    fn take_versions(&mut self, symbols: Vec<wc_core::Symbol>, parts: Vec<wc_core::Part>, keep: bool) {
+        for s in symbols {
+            if let Some(old) = self.symbols.insert(s.id.clone(), s)
+                && keep
+                && self.symbols.get(&old.id).is_some_and(|now| now.hash() != old.hash())
+            {
+                self.old_symbols.insert((old.id.clone(), old.hash()), old);
+            }
+        }
+        for p in parts {
+            if let Some(old) = self.parts.insert(p.id.clone(), p)
+                && keep
+                && self.parts.get(&old.id).is_some_and(|now| now.hash() != old.hash())
+            {
+                self.old_parts.insert((old.id.clone(), old.hash()), old);
+            }
         }
     }
 
@@ -891,5 +1027,55 @@ impl Host {
         let peers = HostMsg::Peers { peers: self.peers() };
         self.send_others(except, locks);
         self.send_others(except, peers);
+    }
+}
+
+/// A page may not start using a symbol the project does not lock: the app sends the item first
+/// (`AddItems`), so only a broken or older guest gets here. Each placement is judged on its own
+/// (by placement and symbol), so placements the page already had stay editable, also of a
+/// symbol the project never locked (older projects), while a new one of that symbol is refused.
+fn unlocked_placements(project: &Project, old: Option<&Page>, new: &Page) -> Result<(), Refusal> {
+    // Counted: one placement the page had keeps one placement editable, so copies of it under
+    // the same id are new uses.
+    let mut had: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for o in old.map(|p| p.symbols.as_slice()).unwrap_or_default() {
+        *had.entry((o.id.as_str(), o.symbol.as_str())).or_default() += 1;
+    }
+    let unlocked: BTreeSet<&str> = new
+        .symbols
+        .iter()
+        .filter(|o| match had.get_mut(&(o.id.as_str(), o.symbol.as_str())) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .map(|o| o.symbol.as_str())
+        .filter(|id| !project.lock.symbols.contains_key(*id))
+        .collect();
+    if unlocked.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = unlocked.into_iter().map(|id| format!("symbol {id}")).collect();
+    Err(Refusal::Invalid {
+        reason: format!(
+            "page {} uses {} that the project's library does not have; add it to the session first",
+            new.number,
+            names.join(", ")
+        ),
+    })
+}
+
+/// [`unlocked_placements`] for every page a project edit writes: a new page, the pages of a
+/// `SetPages`, and those in a batch (which never adds items itself).
+fn check_placements(project: &Project, edit: &ProjectEdit) -> Result<(), Refusal> {
+    match edit {
+        ProjectEdit::AddPage { page } => unlocked_placements(project, project.page(&page.id), page),
+        ProjectEdit::SetPages { pages, .. } => pages
+            .iter()
+            .try_for_each(|p| unlocked_placements(project, project.page(&p.id), p)),
+        ProjectEdit::Batch { edits } => edits.iter().try_for_each(|e| check_placements(project, e)),
+        _ => Ok(()),
     }
 }

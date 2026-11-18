@@ -59,17 +59,16 @@ fn project(dir: &Path) -> std::result::Result<Open, Box<dyn std::error::Error>> 
 /// Share the open project in-process (no network), with a journal the test reads.
 fn host(open: &Open) -> (Share, Log) {
     let log = Log::default();
-    let mut host = Host::new(
-        open.project.clone(),
-        "Hanna",
-        "hanna@example.com",
-        Box::new(log.clone()),
-    );
-    // As `Share::start_host` does.
+    (host_with(open, Box::new(log.clone())), log)
+}
+
+/// A host of `open` that records into `journal`, set up as `Share::start_host` does.
+fn host_with(open: &Open, journal: Box<dyn Journal>) -> Share {
+    let mut host = Host::new(open.project.clone(), "Hanna", "hanna@example.com", journal);
     let files = vendored_files(&open.dir, &open.project);
     host.share_files(files.symbols, files.parts);
     host.share_pictures(wc_pdf::read_pictures(&open.dir, &open.project).files);
-    let share = Share {
+    Share {
         role: Some(Role::Host(Box::new(Hosting {
             host,
             hub: Hub::new(),
@@ -77,11 +76,11 @@ fn host(open: &Open) -> (Share, Log) {
             announcer: None,
             port: 0,
             dir: open.dir.clone(),
+            took_updates: Vec::new(),
         }))),
         base: Some(open.project.clone()),
         ..Default::default()
-    };
-    (share, log)
+    }
 }
 
 /// Connect a guest to the host in-process and ask to join; the copy goes under `folder`.
@@ -1536,7 +1535,7 @@ fn a_page_waits_until_the_session_has_the_symbols_it_draws() -> TestResult {
 }
 
 #[test]
-fn a_page_goes_without_a_symbol_the_session_keeps_refusing() -> TestResult {
+fn a_page_waits_for_its_symbol_while_others_changes_come_in() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
@@ -1546,18 +1545,40 @@ fn a_page_goes_without_a_symbol_the_session_keeps_refusing() -> TestResult {
         frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
         std::thread::sleep(ITEM_WAIT);
     }
+    // The host changes its own page while the guest's page waits.
+    host_open.project.page_mut("p0002").ok_or("no page")?.title = "Motor, renamed".into();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-    assert!(
-        host_open
-            .project
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let has_item = |o: &Open| {
+        o.project
             .page("p0003")
-            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item)),
-        "the change is not held forever"
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
+    assert!(!has_item(&host_open), "the page does not go without its symbol");
+    assert!(has_item(&guest_open), "the guest keeps its waiting change");
+    assert_eq!(
+        guest_open.project.page("p0002").map(|p| p.title.as_str()),
+        Some("Motor, renamed"),
+        "others' changes come in meanwhile"
     );
     let notes = g.take_notes();
     assert!(
-        notes.iter().any(|n| n.contains("did not take symbol wc.contact.no")),
+        notes
+            .iter()
+            .any(|n| n.contains("did not take symbol wc.contact.no") && n.contains("wait until it does")),
         "{notes:?}"
+    );
+
+    // Once the host can store it, the symbol gets in and the page follows.
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(host_open.project.lock.symbols.contains_key("wc.contact.no"));
+    assert!(has_item(&host_open), "{:?} {:?}", g.notes, h.notes);
+    assert_eq!(
+        host_open.project.page("p0002").map(|p| p.title.as_str()),
+        Some("Motor, renamed")
     );
     Ok(())
 }
@@ -1578,6 +1599,10 @@ fn a_symbol_someone_else_used_first_in_another_version_takes_the_sessions_versio
     guest_open.symbols.insert(other.id.clone(), other.clone());
     if let Some(e) = guest_open.project.lock.symbols.get_mut("wc.coil") {
         e.hash = other.hash();
+    }
+    // Taken up here before the session's version came in: not an update of it.
+    if let Some(b) = g.base.as_mut() {
+        b.lock.symbols.remove("wc.coil");
     }
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert_eq!(guest_open.symbols.get("wc.coil"), Some(&session_coil));
@@ -1699,7 +1724,7 @@ fn leaving_a_session_forgets_the_items_sent_to_it() -> TestResult {
 }
 
 #[test]
-fn a_symbol_whose_file_becomes_unreadable_stops_holding_the_session() -> TestResult {
+fn a_symbol_whose_file_becomes_unreadable_holds_only_the_change_that_uses_it() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
@@ -1720,13 +1745,12 @@ fn a_symbol_whose_file_becomes_unreadable_stops_holding_the_session() -> TestRes
         Some("Motor, renamed"),
         "the session's changes come in again"
     );
-    assert!(
-        host_open
-            .project
+    let has_item = |o: &Open| {
+        o.project
             .page("p0003")
-            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item)),
-        "the held change went out"
-    );
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
+    assert!(!has_item(&host_open), "the change that uses it still waits");
     let notes = g.take_notes();
     assert!(notes.iter().any(|n| n.contains("could not be read")), "{notes:?}");
     assert!(
@@ -1742,6 +1766,8 @@ fn a_symbol_whose_file_becomes_unreadable_stops_holding_the_session() -> TestRes
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert_eq!(host_open.symbols.get("wc.contact.no"), Some(&sym), "sent again later");
     assert!(g.items_out.is_empty());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(has_item(&host_open), "the waiting change follows it");
     Ok(())
 }
 
@@ -1756,6 +1782,9 @@ fn an_item_this_copy_no_longer_locks_stops_holding_changes() -> TestResult {
     assert!(!g.items_out.is_empty(), "the refused symbol is still on its way");
     // This copy stops using it, as when an assistant command rewrote the project.
     guest_open.project.lock.symbols.remove("wc.contact.no");
+    for page in &mut guest_open.project.pages {
+        page.symbols.retain(|s| s.symbol != "wc.contact.no");
+    }
     guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves, renamed".into();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert!(g.items_out.is_empty());
@@ -1781,6 +1810,10 @@ fn a_session_version_that_cannot_be_written_is_not_drawn_with_the_old_one() -> T
     guest_open.symbols.insert(other.id.clone(), other.clone());
     if let Some(e) = guest_open.project.lock.symbols.get_mut("wc.coil") {
         e.hash = other.hash();
+    }
+    // Taken up here before the session's version came in: not an update of it.
+    if let Some(b) = g.base.as_mut() {
+        b.lock.symbols.remove("wc.coil");
     }
     // The file cannot be written: a folder stands where it goes.
     let file = store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.coil")?;
@@ -1943,7 +1976,7 @@ fn a_picture_outside_the_picture_folders_is_named_once_and_not_sent() -> TestRes
 }
 
 #[test]
-fn a_picture_picked_here_is_not_written_over_by_the_sessions_picture_of_that_name() -> TestResult {
+fn a_picture_picked_here_under_a_session_name_is_kept_and_shared_under_a_name_of_its_own() -> TestResult {
     let tmp = tempfile::tempdir()?;
     // The session has a picture under a name this copy does not use (yet).
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
@@ -1965,17 +1998,99 @@ fn a_picture_picked_here_is_not_written_over_by_the_sessions_picture_of_that_nam
         file: "pictures/brand.png".into(),
         cover: None,
     });
-    for _ in 0..3 {
+    for _ in 0..5 {
         frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     }
     assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, mine, "kept");
+    // The project names it under a name of its own, and so does the session.
+    let file = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(file, "pictures/brand.png");
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, mine);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    assert_eq!(file_bytes(&host_open.dir, &file)?, mine);
     let notes: Vec<String> = g
         .take_notes()
         .into_iter()
         .filter(|n| n.contains("pictures/brand.png"))
         .collect();
     assert_eq!(notes.len(), 1, "named once: {notes:?}");
-    assert!(notes[0].contains("another picture"), "{}", notes[0]);
+    assert!(notes[0].contains(&format!("renamed {file} here")), "{}", notes[0]);
+    Ok(())
+}
+
+#[test]
+fn a_file_here_under_the_name_of_a_picture_the_session_uses_is_kept_and_not_shared() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // A file of that name is here already, which no change of this copy names.
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    // Then the session's own drawing starts using its picture.
+    let logo = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    host_open.project.meta.logo = logo.clone();
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, mine, "kept");
+    assert_eq!(guest_open.project.meta.logo, logo, "not renamed");
+    assert_eq!(host_open.project.meta.logo, logo);
+    assert_eq!(
+        h.role.as_ref().map(|r| r.pictures().len()),
+        Some(1),
+        "nothing of this copy's was shared"
+    );
+    let notes = g.take_notes();
+    assert!(notes.iter().any(|n| n.contains("differs from your file")), "{notes:?}");
+    Ok(())
+}
+
+#[test]
+fn a_refusal_of_a_picture_this_copy_never_sent_shares_nothing() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
+    let logo = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    host_open.project.meta.logo = logo.clone();
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // A refusal naming a path this copy never sent, though it looked at that path (a read
+    // that failed is remembered the same way, so it is not tried again at once).
+    g.pictures_out
+        .insert("pictures/brand.png".into(), std::time::Instant::now());
+    if let Some(Role::Guest(j)) = g.role.as_mut() {
+        j.guest.refusals.push(wc_share::Refusal::PictureNameTaken {
+            file: "pictures/brand.png".into(),
+        });
+    }
+    for _ in 0..4 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(guest_open.project.meta.logo, logo, "not renamed");
+    assert_eq!(host_open.project.meta.logo, logo);
+    assert_eq!(h.role.as_ref().map(|r| r.pictures().len()), Some(1), "nothing shared");
     Ok(())
 }
 
@@ -2279,6 +2394,869 @@ fn a_symbol_whose_adding_was_undone_is_not_sent_again_and_is_locked_when_placed_
             .project
             .page("p0003")
             .is_some_and(|p| p.symbols.iter().any(|s| s.symbol == id))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_symbol_updated_in_a_session_reaches_the_host_and_an_undo_brings_the_old_one_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    guest_open.place(2, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let v1 = guest_open.symbols.get("wc.coil").cloned().ok_or("coil")?;
+    assert_eq!(
+        host_open.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone()),
+        Some(v1.hash())
+    );
+
+    // The guest updates the coil from the library.
+    let mut v2 = v1.clone();
+    v2.name = "Coil, newer".into();
+    store::write_vendored_symbol(&guest_open.dir, &v2)?;
+    guest_open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = v2.hash();
+    guest_open.symbols.insert("wc.coil".into(), v2.clone());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let hash = |o: &Open| o.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone());
+    assert_eq!(hash(&host_open), Some(v2.hash()), "{:?}", h.notes);
+    assert_eq!(host_open.symbols.get("wc.coil"), Some(&v2));
+    assert_eq!(store::read_vendored_symbol(&host_open.dir, "wc.coil")?, v2);
+    assert_eq!(hash(&guest_open), Some(v2.hash()), "the guest keeps its update");
+    assert!(
+        !g.notes.iter().any(|n| n.contains("first in another version")),
+        "{:?}",
+        g.notes
+    );
+
+    // Undone: both copies draw the old version again.
+    g.undo()?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(hash(&host_open), Some(v1.hash()), "{:?} {:?}", g.notes, h.notes);
+    assert_eq!(host_open.symbols.get("wc.coil"), Some(&v1));
+    assert_eq!(hash(&guest_open), Some(v1.hash()), "{:?}", g.notes);
+    assert_eq!(guest_open.symbols.get("wc.coil"), Some(&v1));
+    assert_eq!(store::read_vendored_symbol(&guest_open.dir, "wc.coil")?, v1);
+    Ok(())
+}
+
+#[test]
+fn an_update_undone_before_its_sender_looked_is_not_sent_again_and_others_see_no_conflict() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    guest_open.place(2, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let v1 = guest_open.symbols.get("wc.coil").cloned().ok_or("coil")?;
+    let mut v2 = v1.clone();
+    v2.name = "Coil, newer".into();
+    store::write_vendored_symbol(&guest_open.dir, &v2)?;
+    guest_open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = v2.hash();
+    guest_open.symbols.insert("wc.coil".into(), v2.clone());
+    // The guest sends the update; the host takes it and takes it back again at once, so the
+    // guest gets both answers in one look.
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    let hash = |o: &Open| o.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone());
+    assert_eq!(hash(&host_open), Some(v2.hash()), "{:?}", h.notes);
+    assert!(
+        !h.notes.iter().any(|n| n.contains("first in another version")),
+        "an update someone else made is no conflict here: {:?}",
+        h.notes
+    );
+    let Some(Role::Host(hosting)) = h.role.as_mut() else {
+        return Err("hosting".into());
+    };
+    let update = hosting.host.history().last().ok_or("recorded")?.id;
+    h.revert(update)?;
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    assert_eq!(hash(&host_open), Some(v1.hash()), "{:?}", h.notes);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // Past the wait for an answer: an update still counted as unanswered would go again now.
+    std::thread::sleep(ITEM_WAIT * 2);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(hash(&host_open), Some(v1.hash()), "the undo stays: {:?}", g.notes);
+    assert_eq!(hash(&guest_open), Some(v1.hash()), "{:?}", g.notes);
+    assert_eq!(
+        guest_open.symbols.get("wc.coil"),
+        Some(&v1),
+        "the old version is loaded"
+    );
+    assert_eq!(
+        store::read_vendored_symbol(&guest_open.dir, "wc.coil")?,
+        v1,
+        "and written back"
+    );
+    assert!(
+        !g.notes.iter().any(|n| n.contains("first in another version")),
+        "{:?}",
+        g.notes
+    );
+    Ok(())
+}
+
+#[test]
+fn a_joined_copy_takes_a_library_symbol_only_in_the_version_the_session_pinned() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let item = |id: &str, name: &str| Symbol {
+        id: id.into(),
+        name: name.into(),
+        category: String::new(),
+        letter_code: String::new(),
+        role: Default::default(),
+        graphics: vec![],
+        pins: vec![],
+        tag_at: Default::default(),
+        description: String::new(),
+    };
+    let (coil_v1, coil_v2, lamp) = (item("coil", "Coil"), item("coil", "Coil v2"), item("lamp", "Lamp"));
+    // The library here has a newer coil than the session pinned, and the lamp it pinned.
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    for s in [&coil_v2, &lamp] {
+        std::fs::write(
+            lib.join("symbols").join(format!("{}.json", s.id)),
+            serde_json::to_string(s)?,
+        )?;
+    }
+    let mut project = Project::new("Demo");
+    project.meta.libraries.push(wc_core::project::LibrarySource {
+        name: "here".into(),
+        kind: "folder".into(),
+        location: lib.to_string_lossy().into_owned(),
+        reference: None,
+    });
+    for s in [&coil_v1, &lamp] {
+        project.lock.symbols.insert(
+            s.id.clone(),
+            wc_core::LockEntry {
+                source: "here".into(),
+                hash: s.hash(),
+            },
+        );
+    }
+    let open = write_copy(&tmp.path().join("copies"), &project, &BTreeMap::new(), &BTreeMap::new())?;
+    assert_eq!(open.symbols.get("lamp"), Some(&lamp));
+    assert!(!open.symbols.contains_key("coil"), "not the library's other version");
+    assert_eq!(
+        open.project.lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(coil_v1.hash())
+    );
+    assert_eq!(
+        store::load(&open.dir)?.lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(coil_v1.hash())
+    );
+    assert!(
+        store::read_vendored_symbol(&open.dir, "coil").is_err(),
+        "no coil file written"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let entry = |hash: &str| wc_core::LockEntry {
+        source: "starter".into(),
+        hash: hash.into(),
+    };
+    // At the last sync the session had coil v1; this copy updated it to v2; the session has
+    // since taken the coil back (an undo of its add).
+    let mut base = Project::new("Demo");
+    base.lock.symbols.insert("coil".into(), entry("v1"));
+    let mut local = base.clone();
+    local.lock.symbols.insert("coil".into(), entry("v2"));
+    let auth = Project::new("Demo");
+    let out = new_items(
+        tmp.path(),
+        &local,
+        &base,
+        &auth,
+        &Default::default(),
+        &Default::default(),
+    );
+    assert!(out.edits.is_empty(), "{:?}", out.edits);
+    assert_eq!(out.stale, ["symbol coil"]);
+    // An item the session never had is still sent as an add (here: unreadable, so tried).
+    let mut fresh = local.clone();
+    fresh.lock.symbols.insert("lamp".into(), entry("l1"));
+    let out = new_items(
+        tmp.path(),
+        &fresh,
+        &base,
+        &auth,
+        &Default::default(),
+        &Default::default(),
+    );
+    assert_eq!(out.unreadable.len(), 1, "{:?}", out.unreadable);
+    assert_eq!(out.unreadable[0].0, "symbol lamp");
+    Ok(())
+}
+
+/// A session where the guest placed `wc.contact.no` on page 3 and the host refuses to store
+/// it, past the first tries: the placement waits. Returns the placement's id too.
+fn waiting_session(tmp: &Path) -> std::result::Result<(Session, String), Box<dyn std::error::Error>> {
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp)?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    let item = guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    for _ in 0..=ITEM_TRIES {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        std::thread::sleep(ITEM_WAIT);
+    }
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    Ok(((h, log, host_open, g, guest_open), item))
+}
+
+fn has_placement(o: &Open, page: &str, item: &str) -> bool {
+    o.project
+        .page(page)
+        .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+}
+
+#[test]
+fn a_waiting_placement_survives_the_session_renumbering_its_page() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(guest_open.project.page("p0003").map(|p| p.number.as_str()), Some("30"));
+    assert!(has_placement(&guest_open, "p0003", &item), "{:?}", g.notes);
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(has_placement(&host_open, "p0003", &item));
+    assert_eq!(host_open.project.page("p0003").map(|p| p.number.as_str()), Some("30"));
+    Ok(())
+}
+
+#[test]
+fn changes_that_do_not_use_the_waiting_symbol_still_go_out() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    guest_open.project.meta.name = "Pump station 2".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(host_open.project.meta.name, "Pump station 2");
+    assert!(!has_placement(&host_open, "p0003", &item));
+    assert!(has_placement(&guest_open, "p0003", &item));
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_waiting_change_takes_it_back_here_and_not_an_older_one_there() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    let history = h.role.as_ref().map(|r| r.history().len());
+    // Saved while it waited: the undo must leave the copy to be saved again.
+    guest_open.dirty = false;
+    g.undo()?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(guest_open.dirty, "the copy on disk still has the placement");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(!has_placement(&guest_open, "p0003", &item), "taken back here");
+    assert_eq!(
+        h.role.as_ref().map(|r| r.history().len()),
+        history,
+        "nothing undone in the session"
+    );
+    let notes = g.take_notes();
+    assert!(
+        notes.iter().any(|n| n.contains("had not reached the session")),
+        "{notes:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    // The guest takes another version of the waiting symbol from its library.
+    let mut v2 = guest_open.symbols.get("wc.contact.no").cloned().ok_or("not loaded")?;
+    v2.name = "Contact, newer".into();
+    store::write_vendored_symbol(&guest_open.dir, &v2)?;
+    guest_open
+        .project
+        .lock
+        .symbols
+        .get_mut("wc.contact.no")
+        .ok_or("pin")?
+        .hash = v2.hash();
+    guest_open.symbols.insert(v2.id.clone(), v2.clone());
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(host_open.symbols.get("wc.contact.no"), Some(&v2), "{:?}", g.notes);
+    assert!(has_placement(&host_open, "p0003", &item));
+    Ok(())
+}
+
+fn waiting(names: &[String]) -> std::collections::BTreeSet<String> {
+    names.iter().cloned().collect()
+}
+
+#[test]
+fn a_new_page_that_waits_for_its_symbol_is_kept_while_others_changes_come_in() -> TestResult {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let mut local = base.clone();
+    let mut new_page = Page::new("p9", "9", "New");
+    new_page.symbols.push(symbol("s1", 10.0));
+    local.pages.push(new_page.clone());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert_eq!(held.items, ["symbol coil"]);
+    // The session renamed the project meanwhile and has no page p9.
+    let mut session = base.clone();
+    session.meta.name = "Renamed".into();
+    let lost = held.put_back(&mut session);
+    assert!(lost.is_empty(), "{lost:?}");
+    assert_eq!(session.page("p9"), Some(&new_page));
+    assert_eq!(session.meta.name, "Renamed");
+    // A page p9 the session made meanwhile is its own: the waiting page is not kept, and said so.
+    let mut session = base.clone();
+    session.pages.push(Page::new("p9", "9", "Theirs"));
+    assert_eq!(held.put_back(&mut session), ["page 9"]);
+    assert_eq!(session.page("p9").map(|p| p.title.as_str()), Some("Theirs"));
+    Ok(())
+}
+
+#[test]
+fn a_rename_to_a_device_with_a_waiting_part_waits_whole() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.pages.push(Page::new("p2", "2", "Two"));
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    local.pages[1].title = "Two, changed".into();
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    assert_eq!(held.items, ["part acme.relay"]);
+    // What goes out meanwhile: the old device and its page as they were, the other page changed.
+    let mut sendable = local.clone();
+    held.drop_from(&mut sendable);
+    assert_eq!(sendable.devices, base.devices);
+    assert_eq!(sendable.pages[0], base.pages[0]);
+    assert_eq!(sendable.pages[1].title, "Two, changed");
+    // Kept here while it waits.
+    let mut session = sendable.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session, local);
+    Ok(())
+}
+
+#[test]
+fn a_device_removed_beside_a_waiting_rename_goes_out_at_once() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let k9 = wc_core::DeviceTag::parse("-K9")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    // -K9 is drawn on the same page, and stays drawn there.
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k9.clone()),
+        ..symbol("s9", 30.0)
+    });
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k9.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    local.devices.remove(&k9);
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    // The rename waits whole; -K9 is not part of it.
+    assert!(held.now.devices.contains_key(&k1));
+    assert!(held.now.devices.contains_key(&k2));
+    assert!(!held.now.devices.contains_key(&k9));
+    let mut sendable = local.clone();
+    held.drop_from(&mut sendable);
+    assert!(sendable.devices.contains_key(&k1));
+    assert!(!sendable.devices.contains_key(&k9));
+    Ok(())
+}
+
+#[test]
+fn a_device_removed_beside_a_waiting_rename_on_a_panel_goes_out_at_once() -> TestResult {
+    use wc_core::panel::{Panel, PanelItem};
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let k9 = wc_core::DeviceTag::parse("-K9")?;
+    let mut base = Project::new("Test");
+    let mut panel = Panel::new("pn1", "Plate", 400.0, 300.0);
+    for (tag, x) in [(&k1, 10.0), (&k9, 60.0)] {
+        panel.items.push(PanelItem::Device {
+            tag: tag.clone(),
+            at: wc_core::geom::Point::new(x, 10.0),
+            width: 20.0,
+            height: 40.0,
+        });
+    }
+    base.panels.push(panel);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k9.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    // -K9 leaves the device list but keeps its footprint on the plate.
+    local.devices.remove(&k9);
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    assert!(held.now.devices.contains_key(&k1));
+    assert!(held.now.devices.contains_key(&k2));
+    assert!(!held.now.devices.contains_key(&k9));
+    Ok(())
+}
+
+#[test]
+fn a_device_removed_beside_a_waiting_rename_with_jumpers_goes_out_at_once() -> TestResult {
+    let x1 = wc_core::DeviceTag::parse("-X1")?;
+    let x2 = wc_core::DeviceTag::parse("-X2")?;
+    let x9 = wc_core::DeviceTag::parse("-X9")?;
+    let mut base = Project::new("Test");
+    for strip in [&x1, &x9] {
+        base.meta.jumpers.push(wc_core::project::Jumper {
+            strip: strip.clone(),
+            terminals: vec!["1".into(), "2".into()],
+            part: None,
+        });
+        base.devices.insert(strip.clone(), wc_core::Device::default());
+    }
+    let mut local = base.clone();
+    local.rename_device(&x1, &x2);
+    local.devices.get_mut(&x2).ok_or("no -X2")?.part = Some("acme.strip".into());
+    local.devices.remove(&x9);
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.strip")]));
+    assert!(held.now.devices.contains_key(&x1));
+    assert!(held.now.devices.contains_key(&x2));
+    assert!(!held.now.devices.contains_key(&x9));
+    Ok(())
+}
+
+#[test]
+fn a_waiting_rename_lost_to_the_session_leaves_another_rename_alone() -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3, k4) = (tag("-K1")?, tag("-K2")?, tag("-K3")?, tag("-K4")?);
+    let mut base = Project::new("Test");
+    for (id, num, sym, t) in [("p1", "1", "s1", &k1), ("p2", "2", "s3", &k3)] {
+        let mut page = Page::new(id, num, "Page");
+        page.symbols.push(wc_core::PlacedSymbol {
+            tag: Some(t.clone()),
+            ..symbol(sym, 10.0)
+        });
+        base.pages.push(page);
+        base.devices.insert(t.clone(), wc_core::Device::default());
+    }
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.rename_device(&k3, &k4);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    local.devices.get_mut(&k4).ok_or("no -K4")?.part = Some("acme.relay".into());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    let mut session = base.clone();
+    session.pages[0].title = "Theirs".into();
+    assert_eq!(
+        held.put_back(&mut session),
+        ["page 1", "the device rename that waited with it"]
+    );
+    // The first rename is lost whole; the second one, on its own page, is put back.
+    assert_eq!(session.pages[0].title, "Theirs");
+    assert!(session.devices.contains_key(&k1) && !session.devices.contains_key(&k2));
+    assert!(!session.devices.contains_key(&k3) && session.devices.contains_key(&k4));
+    assert_eq!(session.pages[1], local.pages[1]);
+    Ok(())
+}
+
+#[test]
+fn a_jumper_removed_beside_a_waiting_strip_rename_is_not_taken_for_its_old_side() -> TestResult {
+    let x1 = wc_core::DeviceTag::parse("-X1")?;
+    let x2 = wc_core::DeviceTag::parse("-X2")?;
+    let x9 = wc_core::DeviceTag::parse("-X9")?;
+    let mut base = Project::new("Test");
+    for strip in [&x1, &x9] {
+        base.meta.jumpers.push(wc_core::project::Jumper {
+            strip: strip.clone(),
+            terminals: vec!["1".into(), "2".into()],
+            part: None,
+        });
+        base.devices.insert(strip.clone(), wc_core::Device::default());
+    }
+    let mut local = base.clone();
+    // -X1 goes with its jumper, which shifts -X9's jumper to the front; -X9 becomes -X2.
+    local.meta.jumpers.remove(0);
+    local.devices.remove(&x1);
+    local.rename_device(&x9, &x2);
+    local.devices.get_mut(&x2).ok_or("no -X2")?.part = Some("acme.strip".into());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.strip")]));
+    assert!(!held.now.devices.contains_key(&x1));
+    assert!(held.now.devices.contains_key(&x2));
+    Ok(())
+}
+
+#[test]
+fn a_waiting_rename_is_dropped_whole_when_the_session_changed_one_of_its_pages() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    // Someone else changed the page meanwhile: the device keeps its old tag too.
+    let mut session = base.clone();
+    session.pages[0].title = "Theirs".into();
+    let before = session.clone();
+    assert_eq!(
+        held.put_back(&mut session),
+        ["page 1", "the device rename that waited with it"]
+    );
+    assert_eq!(session, before);
+    Ok(())
+}
+
+#[test]
+fn a_new_device_waiting_beside_a_lost_rename_is_kept() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let k5 = wc_core::DeviceTag::parse("-K5")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.pages.push(Page::new("p2", "2", "Two"));
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    // An unrelated new device on another page, waiting for a part of its own.
+    local.pages[1].symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k5.clone()),
+        ..symbol("s5", 10.0)
+    });
+    local.devices.insert(
+        k5.clone(),
+        wc_core::Device {
+            part: Some("acme.timer".into()),
+            ..Default::default()
+        },
+    );
+    let held = Held::find(
+        &local,
+        &base,
+        &waiting(&[
+            item_name(ItemKind::Part, "acme.relay"),
+            item_name(ItemKind::Part, "acme.timer"),
+        ]),
+    );
+    let mut session = base.clone();
+    session.pages[0].title = "Theirs".into();
+    assert_eq!(
+        held.put_back(&mut session),
+        ["page 1", "the device rename that waited with it"]
+    );
+    assert_eq!(session.pages[0].title, "Theirs");
+    assert!(session.devices.contains_key(&k1));
+    assert!(!session.devices.contains_key(&k2));
+    assert_eq!(session.devices.get(&k5), local.devices.get(&k5));
+    assert_eq!(session.pages[1], local.pages[1]);
+    Ok(())
+}
+
+#[test]
+fn a_waiting_page_the_session_left_alone_is_kept_when_another_one_is_lost() -> TestResult {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("pa", "1", "A"));
+    base.pages.push(Page::new("pb", "2", "B"));
+    let mut local = base.clone();
+    local.pages[0].symbols.push(symbol("s1", 10.0));
+    local.pages[1].symbols.push(symbol("s2", 10.0));
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    let mut session = base.clone();
+    session.pages[0].title = "Theirs".into();
+    assert_eq!(held.put_back(&mut session), ["page 1"]);
+    assert_eq!(session.pages[0].title, "Theirs");
+    assert_eq!(session.pages[1], local.pages[1]);
+    Ok(())
+}
+
+#[test]
+fn comments_on_a_new_page_held_for_a_renamed_device_wait_with_it() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    // A new page that waits only because it names the renamed device.
+    let mut new_page = Page::new("p9", "9", "New");
+    new_page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k2.clone()),
+        ..symbol("s9", 10.0)
+    });
+    local.pages.push(new_page);
+    let note = Comment {
+        id: "c1".into(),
+        page: "p9".into(),
+        at: None,
+        author: "Ola".into(),
+        time: 0,
+        text: "Check this".into(),
+        resolved: false,
+        replies: Vec::new(),
+    };
+    local.comments.push(note.clone());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    let mut session = base.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session.comments, [note]);
+    Ok(())
+}
+
+#[test]
+fn comments_on_a_waiting_new_page_wait_with_it() -> TestResult {
+    let base = Project::new("Test");
+    let mut local = base.clone();
+    let mut new_page = Page::new("p9", "9", "New");
+    new_page.symbols.push(symbol("s1", 10.0));
+    local.pages.push(new_page);
+    let note = Comment {
+        id: "c1".into(),
+        page: "p9".into(),
+        at: None,
+        author: "Ola".into(),
+        time: 0,
+        text: "Check this".into(),
+        resolved: false,
+        replies: Vec::new(),
+    };
+    local.comments.push(note.clone());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    // Not sent while the page waits: the session has no page to put it on.
+    let mut sendable = local.clone();
+    held.drop_from(&mut sendable);
+    assert!(sendable.comments.is_empty());
+    // Back in the copy after a sync that brought the session's project in.
+    let mut session = base.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session.comments, [note]);
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_waiting_change_whose_symbol_arrives_first_takes_it_back_in_the_session() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    g.undo()?;
+    // The session gets the symbol from someone else before this copy looks at the undo: the
+    // change goes out with the next sync, and the undo then takes it back there.
+    log.fail_vendor(false);
+    host_open.place(1, "wc.contact.no", wc_core::Point::new(60.0, 100.0))?;
+    for _ in 0..4 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&host_open, "p0003", &item), "{:?}", g.notes);
+    assert!(!has_placement(&guest_open, "p0003", &item), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
+fn items_sent_before_and_not_taken_go_each_in_an_edit_of_its_own() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(tmp.path())?;
+    let before = open.project.clone();
+    open.place(1, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
+    open.place(1, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    let added = |edits: &[ProjectEdit]| -> Vec<Vec<String>> {
+        edits
+            .iter()
+            .filter_map(|e| match e {
+                ProjectEdit::AddItems { symbols, .. } => Some(symbols.iter().map(|(s, _)| s.id.clone()).collect()),
+                _ => None,
+            })
+            .collect()
+    };
+    let none = Default::default();
+    let out = new_items(&open.dir, &open.project, &before, &before, &none, &none);
+    assert_eq!(
+        added(&out.edits),
+        [vec!["wc.coil", "wc.contact.no"]],
+        "first time: one edit"
+    );
+    // The contact was sent before and the session did not take it: it goes alone, so the coil
+    // gets in even when the session cannot store the contact.
+    let apart = [item_name(ItemKind::Symbol, "wc.contact.no")].into();
+    let out = new_items(&open.dir, &open.project, &before, &before, &none, &apart);
+    assert_eq!(added(&out.edits), [vec!["wc.contact.no"], vec!["wc.coil"]]);
+    Ok(())
+}
+
+#[test]
+fn undo_is_offered_for_a_waiting_change_when_the_session_has_nothing_of_this_persons() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (_h, _log, _host_open, mut g, _guest_open) = session(tmp.path())?;
+    assert!(!g.can_undo(), "nothing of the guest's anywhere");
+    g.holding = vec![item_name(ItemKind::Symbol, "wc.coil")];
+    assert!(g.can_undo(), "the waiting change is undone here");
+    Ok(())
+}
+
+#[test]
+fn a_guest_logo_named_like_an_unused_file_of_the_host_gets_a_name_of_its_own() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    host_open.save()?;
+    // An old logo the project no longer uses lies in the host's folder.
+    let old_logo = b"\x89PNG\r\n\x1a\nthe old logo";
+    std::fs::create_dir_all(host_open.dir.join(wc_core::Logo::DIR))?;
+    std::fs::write(host_open.dir.join("pictures/logo.png"), old_logo)?;
+    // The host records into git, as a real session does.
+    let mut h = host_with(&host_open, Box::new(GitJournal::open(&host_open.dir)?));
+    let mut join = |name: &str| -> std::result::Result<(Share, Open), Box<dyn std::error::Error>> {
+        let mut g = guest(&mut h, name, &tmp.path().join(name));
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        let ids = pending(&h);
+        approve(&mut h, ids[0], true);
+        let open = g.frame(None, None, false).ok_or("no project")?;
+        Ok((g, open))
+    };
+    let (mut g, mut guest_open) = join("Ola")?;
+    let (mut k, mut kari_open) = join("Kari")?;
+
+    // Ola picks a logo whose file name in Ola's own folder is free.
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    assert_eq!(guest_open.set_logo_from(&src)?, "pictures/logo.png");
+    for _ in 0..4 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        k.frame(Some(&mut kari_open), Some("p0001".into()), false);
+    }
+    let file = host_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(file, "pictures/logo.png", "a name of its own");
+    assert_eq!(guest_open.project.meta.logo, host_open.project.meta.logo);
+    assert_eq!(kari_open.project.meta.logo, host_open.project.meta.logo);
+    for dir in [&host_open.dir, &guest_open.dir, &kari_open.dir] {
+        assert_eq!(file_bytes(dir, &file)?, PNG, "{}", dir.display());
+    }
+    assert_eq!(
+        file_bytes(&host_open.dir, "pictures/logo.png")?,
+        old_logo,
+        "the old file is untouched"
+    );
+    let notes = g.take_notes();
+    assert!(
+        notes.iter().any(|n| n.contains(&format!("renamed {file} here"))),
+        "{notes:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_picture_renamed_for_the_session_keeps_its_name_within_255_bytes() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(&tmp.path().join("p"))?;
+    // A name at the limit already: the mark has to take room from the stem.
+    let stem = "æ".repeat(125);
+    let file = format!("pictures/{stem}.png");
+    assert_eq!(file.rsplit('/').next().map(str::len), Some(254));
+    std::fs::create_dir_all(open.dir.join("pictures"))?;
+    std::fs::write(open.dir.join(&file), PNG)?;
+    open.project.meta.logo = Some(wc_core::Logo {
+        file: file.clone(),
+        cover: None,
+    });
+    let new = rename_picture(&mut open, &file)?;
+    let name = new.rsplit('/').next().ok_or("no name")?;
+    assert!(name.len() <= 255 && name.ends_with(".png"), "{name}");
+    assert_eq!(std::fs::read(open.dir.join(&new))?, PNG);
+    assert_eq!(
+        open.project.meta.logo.as_ref().map(|l| l.file.as_str()),
+        Some(new.as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn a_picture_whose_rename_failed_gets_its_own_name_later_although_the_session_has_the_name() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // The session has a picture logo.png that the host's project does not use.
+    let theirs = b"\x89PNG\r\n\x1a\nthe host's other logo".to_vec();
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/logo.png".to_owned(), theirs.clone())].into_iter().collect(),
+    )?;
+    // The guest's own logo.png cannot be renamed at first (an empty file is no picture).
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/logo.png"), b"")?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let notes = g.take_notes();
+    assert!(
+        notes.iter().any(|n| n.contains("could not be given a new name yet")),
+        "{notes:?}"
+    );
+    // Once it can be, it is: no refusal from the session is needed for that.
+    std::fs::write(guest_open.dir.join("pictures/logo.png"), PNG)?;
+    std::thread::sleep(ITEM_RETRY_LATER);
+    for _ in 0..4 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let file = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(file, "pictures/logo.png", "{:?}", g.notes);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    assert_eq!(
+        file_bytes(&guest_open.dir, "pictures/logo.png")?,
+        PNG,
+        "the guest's file stays"
     );
     Ok(())
 }
