@@ -674,13 +674,17 @@ fn shape_rows(
     let mut shape = drawing.clone();
     set_shape_fields(&mut shape, &draft);
     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-    // Text typed, pasted or deleted this frame (it goes to the field with focus). A field left
+    // Text typed, pasted or deleted, or a value stepped with an arrow key, this frame (it goes
+    // to the field with focus). A field left
     // without any is no entry, even when egui reads its rounded text back as another number.
     let typing = ui.input(|i| {
         i.events.iter().any(|e| match e {
             egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut => true,
             egui::Event::Key { key, pressed: true, .. } => {
-                matches!(key, egui::Key::Backspace | egui::Key::Delete)
+                matches!(
+                    key,
+                    egui::Key::Backspace | egui::Key::Delete | egui::Key::ArrowUp | egui::Key::ArrowDown
+                )
             }
             _ => false,
         })
@@ -2636,6 +2640,28 @@ mod tests {
         assert!(p.ps.shape_error.is_some(), "tabbed through: still shown");
         assert_eq!(p.drawing(0), circle(100.0, 5.0));
         assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_stepped_and_entered_in_one_frame_takes_the_refusal_back() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        p.tab(n);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        p.frame(vec![key(egui::Key::ArrowUp), key(egui::Key::Enter)]);
+        assert_ne!(p.drawing(0), circle(100.0, 5.0), "the arrow key stepped the radius");
+        assert!(p.ps.shape_error.is_none(), "{:?}", p.ps.shape_error);
         Ok(())
     }
 
