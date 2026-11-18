@@ -3189,6 +3189,53 @@ fn a_picture_picked_while_the_sessions_of_that_name_waits_to_be_written_gets_a_n
     Ok(())
 }
 
+#[test]
+fn a_replaced_session_picture_also_picked_here_is_renamed_once_everywhere() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        std::fs::create_dir_all(o.dir.join("pictures"))?;
+        std::fs::write(o.dir.join("pictures/brand.png"), PNG)?;
+        o.project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/brand.png".into(),
+            cover: None,
+        });
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, PNG, "taken");
+    // The guest puts its own file in place of the session's and also picks it under its page.
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    guest_open.project.page_mut("p0003").ok_or("no page")?.underlay = Some(wc_core::Underlay {
+        file: "pictures/brand.png".into(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(100.0, 100.0),
+    });
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // A replaced picture is renamed wherever it is used, once: the logo and the underlay
+    // name the same new file.
+    let file = guest_open
+        .project
+        .page("p0003")
+        .and_then(|p| p.underlay.as_ref())
+        .map(|u| u.file.clone())
+        .ok_or("no underlay")?;
+    assert_ne!(file, "pictures/brand.png", "{:?}", g.notes);
+    assert_eq!(
+        guest_open.project.meta.logo.as_ref().map(|l| l.file.as_str()),
+        Some(file.as_str()),
+        "{:?}",
+        g.notes
+    );
+    let renames = g.take_notes().into_iter().filter(|n| n.contains("is renamed")).count();
+    assert_eq!(renames, 1, "renamed once");
+    assert_eq!(file_bytes(&host_open.dir, &file)?, mine);
+    assert_eq!(file_bytes(&host_open.dir, "pictures/brand.png")?, PNG);
+    Ok(())
+}
+
 /// A guest on its own end of a link, as after "Ask to join" with the status window open.
 fn asking(tmp: &Path) -> (Share, wc_share::transport::HostLink) {
     let (guest_end, host_end) = pair();

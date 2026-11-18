@@ -1554,7 +1554,7 @@ struct Pictures<'a> {
 /// A picture whose file here is the session's again (put back since it was sent) is not
 /// renamed: it is taken as the session's (into `pictures_taken`, no longer `replaced`), and
 /// nothing is sent. A picture this copy picked (in `picks`) is renamed only in the references
-/// it was picked in.
+/// it was picked in, unless its file replaced the session's (`replaced`): then in all.
 fn rename_pictures(
     open: &mut Open,
     taken: Vec<String>,
@@ -1601,7 +1601,14 @@ fn rename_pictures(
                 continue;
             }
         }
-        match rename_picture(open, &file, picks.get(&file)) {
+        // A file replaced here in place of the session's is renamed in every reference: the
+        // person replaced that picture, wherever it is used.
+        let only = if replaced.contains(&file) {
+            None
+        } else {
+            picks.get(&file)
+        };
+        match rename_picture(open, &file, only) {
             Ok(new) => {
                 pictures_out.remove(&file);
                 renames_due.remove(&file);
@@ -1633,6 +1640,8 @@ pub struct TakenPictures {
     pub failed: Vec<(String, String)>,
     /// The pictures this copy has another file under the session's name for.
     pub clashes: Vec<String>,
+    /// The pictures written (or found the same) now: compared with the session's, no clash.
+    pub written: Vec<String>,
 }
 
 /// See [`TakenPictures`].
@@ -1658,6 +1667,7 @@ pub fn take_pictures(
                 open.underlays.remove(&file);
                 open.picture_problems.remove(&file);
                 let version = picture_version(&open.dir, &file).unwrap_or((0, None));
+                out.written.push(file.clone());
                 taken.insert(file, version);
             }
             Err(wc_share::Error::PictureNameTaken(_)) => out.clashes.push(file),
@@ -2227,6 +2237,9 @@ pub struct Share {
     /// once the session refused the change that made them (the reference is the session's
     /// again) or they name another file.
     picks: BTreeMap<String, BTreeSet<PicRef>>,
+    /// Pictures whose last pick was withdrawn ([`withdraw_picks`]), until this copy picks them
+    /// again: a refusal of such a picture renames nothing.
+    withdrawn_picks: BTreeSet<String>,
     /// Files the session lacks ([`repairs_due`]) whose copy here was looked for and could not
     /// be sent (missing, unreadable, or another version), with when and [`repair_stamp`] then:
     /// each is read again only after [`ITEM_WAIT`], or at once once this copy pins or loads
@@ -2874,6 +2887,7 @@ impl Share {
         self.renames_due.clear();
         self.clashes.clear();
         self.picks.clear();
+        self.withdrawn_picks.clear();
         self.repair_reads.clear();
     }
 
@@ -3168,6 +3182,17 @@ impl Share {
         // must not make this copy share a file of its own.
         // A pick whose change the session refused, or that names another file now, is withdrawn:
         // a rename of the picture would retag a reference that is not this copy's.
+        // References this copy's own changes pointed at a picture: a clash with one is a file
+        // picked here. Recorded before anything is sent, and kept until compared, also while
+        // the comparison waits.
+        for (r, file) in pic_refs(&open.project) {
+            if pic_ref_file(base, &r) != Some(file.as_str()) {
+                self.withdrawn_picks.remove(&file);
+                self.picks.entry(file).or_default().insert(r);
+            }
+        }
+        // A withdrawn pick stays withdrawn for a refusal of its picture that comes later: that
+        // must not rename the references that are not this copy's.
         let withdrawn = withdraw_picks(
             &mut self.picks,
             &mut self.renames_due,
@@ -3175,10 +3200,11 @@ impl Share {
             open,
             role.refused_targets(),
         );
+        self.withdrawn_picks.extend(withdrawn);
         let mut taken: Vec<String> = role
             .picture_names_taken()
             .into_iter()
-            .filter(|f| self.pictures_sent.contains(f) && !withdrawn.contains(f))
+            .filter(|f| self.pictures_sent.contains(f) && !self.withdrawn_picks.contains(f))
             .collect();
         taken.append(&mut self.clashes);
         rename_pictures(
@@ -3325,13 +3351,6 @@ impl Share {
             base,
             auth,
         );
-        // References this copy's own changes pointed at a picture: a clash with one is a file
-        // picked here. Kept until compared, also while the comparison waits.
-        for (r, file) in pic_refs(&open.project) {
-            if pic_ref_file(base, &r) != Some(file.as_str()) {
-                self.picks.entry(file).or_default().insert(r);
-            }
-        }
         let before = (!held.is_empty()).then(|| open.project.clone());
         let mut changed = incoming(&mut open.project, auth);
         // What this copy has synced to, with the session's lock; the waiting changes go on top
@@ -3391,24 +3410,19 @@ impl Share {
             )
             .cloned()
             .collect();
-        let TakenPictures { failed, clashes } = take_pictures(open, role.pictures(), &mut self.pictures_taken, &skip);
+        let TakenPictures {
+            failed,
+            clashes,
+            written,
+        } = take_pictures(open, role.pictures(), &mut self.pictures_taken, &skip);
         // A picture picked here under a name the session has for another file gets a name of
         // its own at the next sync, as when the session refuses it. One only the session's
         // drawings name is theirs: the file here is kept, but neither renamed nor shared.
         let (mine, theirs): (Vec<_>, Vec<_>) = clashes.into_iter().partition(|f| self.picks.contains_key(f));
-        // A pick compared without a clash is the session's file or this copy's own: done with.
-        let compared = |f: &String| {
-            self.pictures_taken.contains_key(f)
-                || (role.pictures().contains_key(f) && !skip.contains(f) && !failed.iter().any(|(x, _)| x == f))
-        };
-        let done: Vec<String> = self
-            .picks
-            .keys()
-            .filter(|f| !mine.contains(f) && compared(f))
-            .cloned()
-            .collect();
-        for f in done {
-            self.picks.remove(&f);
+        // A pick compared now without a clash names the session's file: done with. One taken
+        // earlier is kept: the file here may have been replaced since, and goes out again.
+        for f in &written {
+            self.picks.remove(f);
         }
         self.clashes = mine;
         let now = std::time::Instant::now();

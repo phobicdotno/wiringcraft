@@ -435,7 +435,16 @@ impl Guest {
                 whole.extend(own.iter().cloned());
                 self.refused_pages.extend(whole.iter().cloned());
                 if let Some(parts) = &put_back {
-                    self.refused_pages.extend(parts.pages.keys().cloned());
+                    // A page this guest holds keeps its content (only its number comes back),
+                    // unless it is one of `whole`, recorded above.
+                    let me = self.me;
+                    let restored: Vec<String> = parts
+                        .pages
+                        .keys()
+                        .filter(|id| !(me.is_some() && self.locks.get(*id) == me.as_ref()))
+                        .cloned()
+                        .collect();
+                    self.refused_pages.extend(restored);
                     self.refused_meta |= parts.meta.is_some();
                 }
                 if let Some(parts) = put_back {
