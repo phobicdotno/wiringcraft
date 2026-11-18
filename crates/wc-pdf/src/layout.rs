@@ -659,8 +659,12 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     let name_y = cover_name_y(rows.len(), logo, y0, y1);
     let name = &project.meta.name;
     push_text((cx, name_y), fit(name, 9.0), Align::Center, name, Ink::Thin, out);
+    // On a sheet too short for it, the description is left out rather than drawn into the
+    // title block.
     let desc = tb.get("description").map(String::as_str).unwrap_or("");
-    push_text((cx, name_y + 9.0), fit(desc, 4.0), Align::Center, desc, Ink::Thin, out);
+    if name_y + 9.0 <= y1 {
+        push_text((cx, name_y + 9.0), fit(desc, 4.0), Align::Center, desc, Ink::Thin, out);
+    }
 
     // The table fits under the description; rows shrink on small sheets. When they would be
     // too small to read, empty fields are left out first, then the last filled-in ones, with a
