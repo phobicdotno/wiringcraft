@@ -28,6 +28,9 @@ pub enum Error {
     Source { name: String, message: String },
     #[error("{kind:?} {id:?} is not in any library source")]
     NotFound { kind: ItemKind, id: String },
+    /// An update failed and could not put back every file it had changed.
+    #[error("{error}; putting back the files the update changed failed too: {failed}")]
+    NotPutBack { error: Box<Error>, failed: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -478,32 +481,44 @@ pub fn update_items(
         .iter()
         .map(|(kind, id, hash)| fetch(lib, *kind, id, Some(hash)))
         .collect::<Result<Vec<_>>>()?;
-    let lock = project.lock.clone();
-    let mut written: Vec<(PathBuf, Option<String>)> = Vec::new();
-    for ((kind, id, _), item) in items.iter().zip(fetched) {
+    // Every file as it is before any is written, so a failed write can put them all back. A
+    // file that cannot be read stops the update here: it could not be put back.
+    let mut before = Vec::with_capacity(items.len());
+    for (kind, id, _) in items {
         let path = store::vendor_path(project_dir, *kind, id)?;
-        let was = std::fs::read_to_string(&path).ok();
+        let was = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(wc_core::Error::io(&path, e).into()),
+        };
+        before.push((path, was));
+    }
+    let lock = project.lock.clone();
+    for (n, ((_, id, _), item)) in items.iter().zip(fetched).enumerate() {
         if let Err(e) = store_item(project_dir, project, id, item) {
-            written.push((path, was));
-            for (path, was) in written.into_iter().rev() {
-                // Best effort: the update's own error is what the caller sees.
-                let _ = match was {
-                    Some(text) => store::write_if_changed(&path, &text).map(|_| ()),
-                    None => std::fs::remove_file(&path)
-                        .or_else(|e| {
-                            if e.kind() == std::io::ErrorKind::NotFound {
-                                Ok(())
-                            } else {
-                                Err(e)
-                            }
-                        })
-                        .map_err(|e| wc_core::Error::io(&path, e)),
-                };
-            }
             project.lock = lock;
-            return Err(e);
+            let failed: Vec<String> = before[..=n]
+                .iter()
+                .rev()
+                .filter_map(|(path, was)| {
+                    let put = match was {
+                        Some(text) => store::write_if_changed(path, text).map(|_| ()),
+                        None => match std::fs::remove_file(path) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(wc_core::Error::io(path, e)),
+                            _ => Ok(()),
+                        },
+                    };
+                    put.err().map(|e| e.to_string())
+                })
+                .collect();
+            if failed.is_empty() {
+                return Err(e);
+            }
+            return Err(Error::NotPutBack {
+                error: Box::new(e),
+                failed: failed.join("; "),
+            });
         }
-        written.push((path, was));
     }
     Ok(items.iter().map(|(k, id, _)| (*k, id.clone())).collect())
 }

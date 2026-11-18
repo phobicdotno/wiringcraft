@@ -420,6 +420,22 @@ fn an_update_checks_every_item_before_it_writes_any() -> Result<()> {
         5.0
     );
 
+    // A file that cannot be read stops the update before anything is written: it could not
+    // be put back after a later failure.
+    let todo = changed(&status(&f.proj, &f.project, &lib), None);
+    let other = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "other")?;
+    let kept = std::fs::read(&other).map_err(|e| wc_core::Error::io("other", e))?;
+    std::fs::remove_file(&other).map_err(|e| wc_core::Error::io("other", e))?;
+    std::fs::create_dir(&other).map_err(|e| wc_core::Error::io("other", e))?;
+    assert!(update_items(&f.proj, &mut f.project, &lib, &todo).is_err());
+    assert_eq!(f.project.lock, lock);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    std::fs::remove_dir(&other).map_err(|e| wc_core::Error::io("other", e))?;
+    std::fs::write(&other, kept).map_err(|e| wc_core::Error::io("other", e))?;
+
     // A write that fails puts back what was written before it and leaves the lock as it was.
     let todo = changed(&status(&f.proj, &f.project, &lib), None);
     let other = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "other")?;
