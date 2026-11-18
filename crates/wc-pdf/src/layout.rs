@@ -451,18 +451,24 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
 /// page template's first logo box, less 1 mm all round, where pages without a logo show
 /// "WiringCraft". `None` when the template has no logo box.
 pub fn title_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> {
+    title_logo_boxes(project, page).into_iter().next()
+}
+
+/// Every logo box of the page template on `page`, as [`title_logo_box`], in template order.
+pub fn title_logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
     let (w, h) = page.size.mm();
     let (x0, x1, y1) = (MARGIN, w - MARGIN, h - MARGIN);
     let ty = y1 - TITLE_H;
-    let (l, t, r, b) = project
+    project
         .meta
         .template
         .boxes
         .iter()
         .filter(|b| b.logo)
-        .find_map(|b| b.resolve(x0, x1))?;
-    let (a, b) = (Point::new(l + 1.0, ty + t + 1.0), Point::new(r - 1.0, ty + b - 1.0));
-    (a.x < b.x && a.y < b.y).then_some((a, b))
+        .filter_map(|b| b.resolve(x0, x1))
+        .map(|(l, t, r, b)| (Point::new(l + 1.0, ty + t + 1.0), Point::new(r - 1.0, ty + b - 1.0)))
+        .filter(|(a, b)| a.x < b.x && a.y < b.y)
+        .collect()
 }
 
 /// Where the cover page shows the logo until the user moves it: centred above the project's
@@ -501,7 +507,7 @@ pub fn logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
     if project.meta.logo.is_none() {
         return Vec::new();
     }
-    let mut out: Vec<_> = title_logo_box(project, page).into_iter().collect();
+    let mut out = title_logo_boxes(project, page);
     out.extend(cover_logo_box(project, page));
     out
 }
@@ -1320,6 +1326,20 @@ mod template_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_logo_box_gets_the_logo() {
+        let (mut p, page) = demo(PageSize::A3, true);
+        let mut second = TitleBox::new("", (180.0, Side::Right), (150.0, Side::Right), 0.0, 24.0);
+        second.logo = true;
+        p.meta.template.boxes.push(second);
+        let boxes = logo_boxes(&p, &page);
+        assert_eq!(boxes.len(), 2, "{boxes:?}");
+        assert_eq!(title_logo_box(&p, &page), boxes.first().copied());
+        let mut cover = page.clone();
+        cover.cover = true;
+        assert_eq!(logo_boxes(&p, &cover).len(), 3, "both title boxes and the cover");
     }
 
     #[test]

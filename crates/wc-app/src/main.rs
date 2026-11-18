@@ -2623,7 +2623,13 @@ fn file_stem(s: &str) -> String {
 /// Every page as SVG and DXF in `export/drawings`, named by page number.
 fn export_drawings(open: &Open) -> String {
     let dir = open.dir.join("export").join("drawings");
-    let (pages, report) = wc_pdf::page_drawings(&open.project, &open.symbols, &wc_pdf::Options::default());
+    let pictures = wc_pdf::read_pictures(&open.dir, &open.project);
+    let options = wc_pdf::Options {
+        underlays: pictures.files,
+        unreadable: pictures.unreadable,
+        ..Default::default()
+    };
+    let (pages, report) = wc_pdf::page_drawings(&open.project, &open.symbols, &options);
     let mut used = std::collections::BTreeSet::new();
     let written = std::fs::create_dir_all(&dir).and_then(|()| {
         for page in &pages {

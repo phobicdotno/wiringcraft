@@ -220,6 +220,7 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
         title: String::new(),
         size_mm: (100.0, 100.0),
         prims: pen.prims,
+        pictures: Vec::new(),
     };
     assert!(svg(&page).contains("d=\"M60 50 A10 10 0 0 1 50 60\""));
     assert!(dxf(&page).contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"));
@@ -982,4 +983,156 @@ fn fractions_are_measured_at_their_helvetica_width() -> Result<(), String> {
     // The customer box is 80 mm wide, less 1.5 mm padding each side.
     assert!(rendered <= 77.0 + 1e-6, "{rendered} mm");
     Ok(())
+}
+
+#[test]
+fn base64_matches_the_standard_alphabet_and_padding() {
+    assert_eq!(vector::base64(b""), "");
+    assert_eq!(vector::base64(b"f"), "Zg==");
+    assert_eq!(vector::base64(b"fo"), "Zm8=");
+    assert_eq!(vector::base64(b"foo"), "Zm9v");
+    assert_eq!(vector::base64(&[0xFB, 0xFF, 0xBF]), "+/+/");
+}
+
+/// The `<image>` elements of an SVG, as (x, y, width, height, href).
+fn svg_images(s: &str) -> Vec<(f64, f64, f64, f64, String)> {
+    let attr = |e: &str, name: &str| -> String {
+        let key = format!(" {name}=\"");
+        e.find(&key)
+            .map(|i| &e[i + key.len()..])
+            .and_then(|r| r.split('"').next())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let f = |e: &str, name: &str| attr(e, name).parse::<f64>().unwrap_or(f64::NAN);
+    s.split("<image")
+        .skip(1)
+        .map(|e| {
+            let e = e.split("/>").next().unwrap_or_default();
+            (f(e, "x"), f(e, "y"), f(e, "width"), f(e, "height"), attr(e, "href"))
+        })
+        .collect()
+}
+
+#[test]
+fn svg_drawings_show_the_logo_and_the_underlay() {
+    let mut png = Vec::new();
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 2, image::Rgb([200, 30, 30])));
+    assert!(
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+    );
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p0", "0", "Cover");
+    cover.cover = true;
+    let mut scanned = Page::new("p1", "1", "Scanned");
+    scanned.underlay = Some(wc_core::Underlay {
+        file: "underlays/p1.png".into(),
+        min: Point::new(420.0, 297.0),
+        max: Point::new(0.0, 0.0),
+    });
+    scanned.graphics.push(Shape::Line {
+        a: Point::new(10.0, 10.0),
+        b: Point::new(20.0, 10.0),
+    });
+    project.pages = vec![cover, scanned];
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: Some((Point::new(100.0, 40.0), Point::new(140.0, 60.0))),
+    });
+    let mut underlays = BTreeMap::new();
+    underlays.insert("pictures/logo.png".to_string(), png.clone());
+    underlays.insert("underlays/p1.png".to_string(), png.clone());
+    let opts = Options {
+        underlays,
+        ..Default::default()
+    };
+    let (pages, report) = page_drawings(&project, &BTreeMap::new(), &opts);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let href = format!("data:image/png;base64,{}", vector::base64(&png));
+
+    // The cover: the title block's logo and the cover's own, each with the picture's 2:1 shape.
+    let cover = svg(&pages[0]);
+    let images = svg_images(&cover);
+    assert_eq!(images.len(), 2, "{cover}");
+    for (_, _, w, h, link) in &images {
+        assert!((w / h - 2.0).abs() < 1e-3, "{w} x {h}");
+        assert_eq!(link, &href);
+    }
+    assert!(images.iter().any(|i| (i.0, i.1, i.2, i.3) == (100.0, 40.0, 40.0, 20.0)));
+    // The logo is drawn last, on top of the drawing.
+    assert!(cover.find("<image").unwrap_or(0) > cover.find("</g>").unwrap_or(usize::MAX));
+
+    // The scanned page: the underlay over its rectangle, under the drawing, then the logo.
+    let page = svg(&pages[1]);
+    let images = svg_images(&page);
+    assert_eq!(images.len(), 2, "{page}");
+    assert_eq!(
+        (images[0].0, images[0].1, images[0].2, images[0].3),
+        (0.0, 0.0, 420.0, 297.0)
+    );
+    assert!(page.find("<image").unwrap_or(usize::MAX) < page.find("<g ").unwrap_or(0));
+    assert!(page.rfind("<image").unwrap_or(0) > page.find("</g>").unwrap_or(usize::MAX));
+    // DXF has no pictures and stays as it was.
+    assert!(!dxf(&pages[1]).contains("base64"));
+}
+
+#[test]
+fn svg_drawings_leave_out_a_missing_or_damaged_picture() {
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "Scanned");
+    p1.underlay = Some(wc_core::Underlay {
+        file: "underlays/p1.jpg".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(10.0, 10.0),
+    });
+    project.pages = vec![p1];
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/gone.png".into(),
+        cover: None,
+    });
+    let mut underlays = BTreeMap::new();
+    underlays.insert("underlays/p1.jpg".to_string(), vec![0xFF, 0xD8, 0xFF]);
+    let opts = Options {
+        underlays,
+        ..Default::default()
+    };
+    let (pages, report) = page_drawings(&project, &BTreeMap::new(), &opts);
+    assert_eq!(pages.len(), 1);
+    assert!(!svg(&pages[0]).contains("<image"));
+    assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+    assert!(
+        report
+            .warnings
+            .contains(&"logo picture pictures/gone.png is missing".to_string())
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("page 1: underlay underlays/p1.jpg") && w.contains("damaged"))
+    );
+}
+
+#[test]
+fn page_lines_leave_out_pictures_without_warning() {
+    let mut project = Project::new("Lines");
+    let mut p1 = Page::new("p1", "1", "One");
+    p1.underlay = Some(wc_core::Underlay {
+        file: "underlays/p1.png".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(10.0, 10.0),
+    });
+    project.pages = vec![p1];
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    // No picture bytes are given: a DXF export does not read them, so none may be missed.
+    let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(pages.len(), 1);
+    assert!(pages[0].pictures.is_empty());
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(svg_report.warnings.len(), 2, "{:?}", svg_report.warnings);
 }

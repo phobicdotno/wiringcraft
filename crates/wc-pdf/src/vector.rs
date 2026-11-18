@@ -17,6 +17,45 @@ pub struct PageDrawing {
     pub title: String,
     pub size_mm: (f64, f64),
     pub prims: Vec<Prim>,
+    /// Pictures on the page: the underlay first (drawn under everything), then the project
+    /// logo in each of its boxes (drawn on top). Only SVG shows them; DXF has no pictures.
+    pub pictures: Vec<Picture>,
+}
+
+/// A picture file placed on a page, as it is embedded in an SVG.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picture {
+    /// `image/png` or `image/jpeg`.
+    pub mime: &'static str,
+    /// The picture file as it is, shared between the pages that show it.
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    /// Top-left and bottom-right corner on the page, in millimetres.
+    pub min: (f64, f64),
+    pub max: (f64, f64),
+    /// Drawn over the page's drawing (the logo) rather than under it (an underlay).
+    pub on_top: bool,
+}
+
+/// A picture file checked to be one the PDF export can show too, with its size in pixels.
+fn checked(bytes: &[u8]) -> Result<(&'static str, (u32, u32)), String> {
+    let img = crate::picture::decode(bytes)?;
+    let mime = if bytes.starts_with(&[0xFF, 0xD8]) {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
+    Ok((mime, (img.width, img.height)))
+}
+
+/// The bytes of picture `file` from `options`, or why it cannot be shown (`what` names it).
+fn picture_bytes<'a>(options: &'a Options, file: &str, what: &str) -> Result<&'a Vec<u8>, String> {
+    options
+        .underlays
+        .get(file)
+        .ok_or_else(|| match options.unreadable.get(file) {
+            Some(why) => format!("{what} picture {file} cannot be read: {why}"),
+            None => format!("{what} picture {file} is missing"),
+        })
 }
 
 /// The schematic pages chosen by `options.pages` (all when empty), drawn as for the PDF export.
@@ -25,6 +64,25 @@ pub fn page_drawings(
     project: &Project,
     symbols: &BTreeMap<String, Symbol>,
     options: &Options,
+) -> (Vec<PageDrawing>, Report) {
+    drawings(project, symbols, options, true)
+}
+
+/// As [`page_drawings`], but without the logo and underlays: they are neither looked up nor
+/// warned about, for formats that do not show pictures (DXF).
+pub fn page_lines(
+    project: &Project,
+    symbols: &BTreeMap<String, Symbol>,
+    options: &Options,
+) -> (Vec<PageDrawing>, Report) {
+    drawings(project, symbols, options, false)
+}
+
+fn drawings(
+    project: &Project,
+    symbols: &BTreeMap<String, Symbol>,
+    options: &Options,
+    with_pictures: bool,
 ) -> (Vec<PageDrawing>, Report) {
     let pages: Vec<&wc_core::Page> = project
         .pages
@@ -35,6 +93,18 @@ pub fn page_drawings(
         pages: pages.len(),
         warnings: Vec::new(),
     };
+    // The logo is checked once, however many pages show it.
+    let logo = project.meta.logo.as_ref().filter(|_| with_pictures).and_then(|l| {
+        let found = picture_bytes(options, &l.file, "logo").and_then(|b| {
+            checked(b)
+                .map(|c| (c, b))
+                .map_err(|why| format!("logo {}: {why}", l.file))
+        });
+        found
+            .map_err(|w| report.warnings.push(w))
+            .ok()
+            .map(|((mime, size), b)| (mime, size, std::sync::Arc::new(b.clone())))
+    });
     let xref = layout::CrossRefs::build(project, symbols);
     let total = pages.len();
     let out = pages
@@ -42,16 +112,83 @@ pub fn page_drawings(
         .enumerate()
         .map(|(i, page)| {
             let drawn = layout::draw_page(project, page, i, total, symbols, &xref, options, &mut report.warnings);
+            let mut pictures = Vec::new();
+            if let Some(u) = page.underlay.as_ref().filter(|_| with_pictures) {
+                let found = picture_bytes(options, &u.file, "underlay")
+                    .map_err(|w| format!("page {}: {w}", page.number))
+                    .and_then(|b| {
+                        checked(b)
+                            .map(|(mime, _)| (mime, b))
+                            .map_err(|why| format!("page {}: underlay {}: {why}", page.number, u.file))
+                    });
+                match found {
+                    Ok((mime, b)) => pictures.push(Picture {
+                        mime,
+                        bytes: std::sync::Arc::new(b.clone()),
+                        min: (u.min.x.min(u.max.x), u.min.y.min(u.max.y)),
+                        max: (u.min.x.max(u.max.x), u.min.y.max(u.max.y)),
+                        on_top: false,
+                    }),
+                    Err(w) => report.warnings.push(w),
+                }
+            }
+            if let Some((mime, size, bytes)) = &logo {
+                for b in layout::logo_boxes(project, page) {
+                    let (min, max) = layout::fit_picture(b, *size);
+                    pictures.push(Picture {
+                        mime,
+                        bytes: bytes.clone(),
+                        min: (min.x, min.y),
+                        max: (max.x, max.y),
+                        on_top: true,
+                    });
+                }
+            }
             PageDrawing {
                 id: page.id.clone(),
                 number: page.number.clone(),
                 title: page.title.clone(),
                 size_mm: page.size.mm(),
                 prims: drawn.prims,
+                pictures,
             }
         })
         .collect();
     (out, report)
+}
+
+/// Standard base64 with padding.
+pub(crate) fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let sextet = |n: u32| ABC.get(n as usize & 63).map_or('=', |c| char::from(*c));
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let (a, b, c, used) = match *chunk {
+            [a, b, c] => (a, b, c, 4),
+            [a, b] => (a, b, 0, 3),
+            [a] => (a, 0, 0, 2),
+            _ => continue,
+        };
+        let n = (u32::from(a) << 16) | (u32::from(b) << 8) | u32::from(c);
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i < used { sextet(n >> shift) } else { '=' });
+        }
+    }
+    out
+}
+
+/// An SVG `<image>` of a picture, stretched over its rectangle.
+fn svg_image(out: &mut String, p: &Picture) {
+    let _ = writeln!(
+        out,
+        "<image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\" href=\"data:{};base64,{}\"/>",
+        num(p.min.0),
+        num(p.min.1),
+        num(p.max.0 - p.min.0),
+        num(p.max.1 - p.min.1),
+        p.mime,
+        base64(&p.bytes)
+    );
 }
 
 fn num(v: f64) -> String {
@@ -105,6 +242,16 @@ pub fn svg(page: &PageDrawing) -> String {
         w = num(w),
         h = num(h)
     );
+    // The underlay goes under the drawing: out of the group, before it.
+    let mut under = String::new();
+    for p in page.pictures.iter().filter(|p| !p.on_top) {
+        svg_image(&mut under, p);
+    }
+    if !under.is_empty() {
+        // Put them just before the group the header opened.
+        let at = out.rfind("<g ").unwrap_or(out.len());
+        out.insert_str(at, &under);
+    }
     for p in &page.prims {
         match p {
             Prim::Path {
@@ -191,7 +338,11 @@ pub fn svg(page: &PageDrawing) -> String {
             }
         }
     }
-    out.push_str("</g>\n</svg>\n");
+    out.push_str("</g>\n");
+    for p in page.pictures.iter().filter(|p| p.on_top) {
+        svg_image(&mut out, p);
+    }
+    out.push_str("</svg>\n");
     out
 }
 
