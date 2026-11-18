@@ -2649,6 +2649,16 @@ mod tests {
         a.live_check(&ctx);
         assert!(a.ed.live.is_empty(), "{:?}", a.ed.live);
         a.prefs.live_check = true;
+        // On again: the checker checks project A afresh and shows both findings, so the
+        // switch below starts from a checker that holds A's findings.
+        for _ in 0..200 {
+            a.live_check(&ctx);
+            if drawn_twice(&a) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
         // Another project is opened: the first one's findings are not shown on it.
         let (_other, b) = crate::state::tests::project();
         a.open = Some(b);
