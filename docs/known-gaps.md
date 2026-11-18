@@ -72,4 +72,3 @@ people hold as they are and says which. Still open: undo per change (#78). #43 t
 | Gap | Todo |
 |---|---|
 | Full EPLAN / SolidWorks Electrical feature list with triage | #55 ([feature-matrix.md](feature-matrix.md)) |
-| WAGO configurator: import the configured articles back | #123 |
