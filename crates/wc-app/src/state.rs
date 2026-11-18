@@ -138,34 +138,34 @@ pub(crate) struct Mark {
     form_step: Option<u64>,
     dirty: bool,
     terminals_before: Option<wc_core::project::TerminalNumbers>,
-    /// The vendored symbol and part files with their contents, to put back.
-    files: BTreeMap<PathBuf, Vec<u8>>,
+    /// The vendored symbol and part files there were (`None`: not known).
+    files: Option<std::collections::BTreeSet<(ItemKind, String)>>,
 }
 
-/// A vendored item folder of the project, when it lies inside the project folder (a link out
-/// of it is not followed).
-fn vendor_folder(dir: &Path, kind: ItemKind) -> Option<PathBuf> {
-    let folder = dir.join(store::VENDOR_DIR).join(kind.dir());
+/// The vendored symbol and part files by kind and id (plain files only, not links), from folders
+/// inside the project folder. Only names are read. `None` when a folder that is there cannot be
+/// listed: then nothing is known to be new.
+fn vendor_names(dir: &Path) -> Option<std::collections::BTreeSet<(ItemKind, String)>> {
     let root = dir.canonicalize().ok()?;
-    folder.canonicalize().ok().filter(|f| f.starts_with(&root))
-}
-
-/// The vendored symbol and part files (plain files only, not links) with their contents.
-fn vendor_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    let mut out = BTreeMap::new();
+    let mut out = std::collections::BTreeSet::new();
     for kind in [ItemKind::Symbol, ItemKind::Part] {
-        let Some(entries) = vendor_folder(dir, kind).and_then(|f| std::fs::read_dir(f).ok()) else {
+        let folder = dir.join(store::VENDOR_DIR).join(kind.dir());
+        if !folder.exists() {
             continue;
-        };
-        for e in entries.flatten() {
+        }
+        let folder = folder.canonicalize().ok().filter(|f| f.starts_with(&root))?;
+        for e in std::fs::read_dir(folder).ok()? {
+            let e = e.ok()?;
+            let path = e.path();
             if e.file_type().is_ok_and(|t| t.is_file())
-                && let Ok(bytes) = std::fs::read(e.path())
+                && path.extension().is_some_and(|x| x == "json")
+                && let Some(id) = path.file_stem().and_then(|s| s.to_str())
             {
-                out.insert(e.path(), bytes);
+                out.insert((kind, id.to_owned()));
             }
         }
     }
-    out
+    Some(out)
 }
 
 pub struct Open {
@@ -470,11 +470,18 @@ impl Open {
         if self.parts.contains_key(id) {
             return Ok(());
         }
-        // Only go to the library when the project has no copy; a broken copy is reported as is.
+        // Only go to the library when the project has no pinned copy; a broken copy is reported
+        // as is. A copy without its lock entry (left by a change taken back) is taken again, so
+        // it is pinned and the session sends it; when the library no longer has it, it is used
+        // as it is.
         let vendored = store::vendor_path(&self.dir, ItemKind::Part, id).map_err(|e| e.to_string())?;
         if !vendored.exists() {
             let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
             wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
+        } else if !self.project.lock.parts.contains_key(id)
+            && let Ok(lib) = wc_library::Library::open(&self.dir, &self.project)
+        {
+            let _ = wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id);
         }
         let p = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
         self.parts.insert(id.to_owned(), p);
@@ -1266,7 +1273,7 @@ impl Open {
             form_step: self.form_step,
             dirty: self.dirty,
             terminals_before: self.terminals_before.clone(),
-            files: vendor_files(&self.dir),
+            files: vendor_names(&self.dir),
         }
     }
 
@@ -1288,9 +1295,10 @@ impl Open {
 
     /// Take back everything changed since `mark`: the project, the symbols and parts it
     /// loaded, its undo steps, and the change marks; the undo and redo history are as before.
-    /// Symbol and part files are as they were too: one the change wrote is removed, one it
-    /// replaced is written back, and one it only read is left alone. Files that could not be
-    /// put back are reported (the rest is taken back all the same).
+    /// A symbol or part file the change added (there was none, and the project as it was does
+    /// not pin it) is removed; files that were there are never touched, nor rewritten. One that
+    /// cannot be removed is reported, and is harmless: an unpinned file is taken from the
+    /// library again (and pinned) when it is next used.
     pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
         self.project = mark.project;
         self.symbols.retain(|id, _| mark.symbols.contains(id));
@@ -1300,18 +1308,21 @@ impl Open {
         self.undo_dropped = mark.undo_dropped;
         (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
         self.terminals_before = mark.terminals_before;
-        // A file left behind without its lock entry would later load unpinned, and the session
-        // would never send it.
-        let now = vendor_files(&self.dir);
+        let (Some(before), Some(now)) = (mark.files, vendor_names(&self.dir)) else {
+            return Ok(());
+        };
+        let lock = &self.project.lock;
         let mut failed = Vec::new();
-        for path in now.keys().filter(|p| !mark.files.contains_key(*p)) {
-            if let Err(e) = std::fs::remove_file(path) {
-                failed.push(format!("{}: {e}", path.display()));
+        for (kind, id) in now.difference(&before) {
+            let pinned = match kind {
+                ItemKind::Symbol => lock.symbols.contains_key(id),
+                ItemKind::Part => lock.parts.contains_key(id),
+            };
+            if pinned {
+                continue;
             }
-        }
-        for (path, bytes) in &mark.files {
-            if now.get(path) != Some(bytes)
-                && let Err(e) = std::fs::write(path, bytes)
+            if let Ok(path) = store::vendor_path(&self.dir, *kind, id)
+                && let Err(e) = std::fs::remove_file(&path)
             {
                 failed.push(format!("{}: {e}", path.display()));
             }
@@ -1319,7 +1330,10 @@ impl Open {
         if failed.is_empty() {
             Ok(())
         } else {
-            Err(format!("Library files could not be put back: {}", failed.join("; ")))
+            Err(format!(
+                "Library files it added could not be removed: {}",
+                failed.join("; ")
+            ))
         }
     }
 
@@ -2252,16 +2266,20 @@ pub(crate) mod tests {
         // Taken again later, it is pinned (and so sent to the session).
         o.ensure_part(pid).unwrap();
         assert!(o.project.lock.parts.contains_key(pid));
-        // A file the change only read stays; one it replaced is written back.
-        let symbol_file = store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap();
-        let symbol_before = std::fs::read(&symbol_file).unwrap();
+        // A file that was there before stays, even when the change only read it.
         o.parts.remove(pid);
         let mark = o.mark();
         o.ensure_part(pid).unwrap();
-        std::fs::write(&symbol_file, b"{}").unwrap();
         o.back_to(mark).unwrap();
         assert!(part_file.exists(), "a file that was there before stays");
-        assert_eq!(std::fs::read(&symbol_file).unwrap(), symbol_before);
+        // An unpinned copy left behind (a failed removal) is pinned when it is next used.
+        o.project.lock.parts.remove(pid);
+        o.parts.remove(pid);
+        o.ensure_part(pid).unwrap();
+        assert!(
+            o.project.lock.parts.contains_key(pid),
+            "the leftover copy is pinned again"
+        );
         // A mark taken inside a kept change (a form it opened) means the same step afterwards.
         let mark = o.mark();
         let inside = o.start_live_form();
