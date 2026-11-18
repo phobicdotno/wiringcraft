@@ -69,7 +69,7 @@ impl SweDrawings {
     }
 
     /// Read a symbol's block file (DWG bytes) for block `name`. A second file for the same
-    /// name (ignoring case and surrounding spaces, see [`block_key`]) replaces the first.
+    /// name (ignoring case and surrounding spaces) replaces the first.
     pub fn add_block(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         let d = self.read(bytes, &format!("block {name}"))?;
         self.blocks.insert(block_key(name), d);
