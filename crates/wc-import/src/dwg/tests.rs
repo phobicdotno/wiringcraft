@@ -498,7 +498,8 @@ fn a_page_listed_many_times_cannot_make_endless_work() -> TestResult {
         listed_again,
         ..TestSection::default()
     };
-    let budget = 4 * MAX_PAGE_DATA;
+    // Room for the stored bytes of a fifth listing, not for what it decompresses to.
+    let budget = 4 * MAX_PAGE_DATA + 0x1000;
     // Listed four times, the page fits the budget (each copy lands at the same place).
     let read = read_sections_with(&write_dwg(b"AC1024", &[section(3)]), budget)?;
     assert_eq!(
