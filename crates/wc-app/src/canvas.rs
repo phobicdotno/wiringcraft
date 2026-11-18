@@ -333,7 +333,7 @@ pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke)
 /// Text whose baseline sits at `at`, `height` mm tall (the PDF's font size).
 fn text_mm(p: &egui::Painter, xf: &Xf, at: Point, height: f64, align: Align2, text: &str, c: Color32) {
     let size = xf.len(height) * 1.15;
-    if size < 3.0 {
+    if size < MIN_TEXT_PX {
         return; // Too small to read: skip rather than smear.
     }
     // egui places the text box; nudge down so the baseline, not the box bottom, sits on `at`.
@@ -354,7 +354,7 @@ fn turned_text_mm(
     c: Color32,
 ) {
     let size = xf.len(height) * 1.15;
-    if size < 3.0 {
+    if size < MIN_TEXT_PX {
         return;
     }
     let galley = p.layout_no_wrap(text.to_owned(), FontId::proportional(size), c);
@@ -452,6 +452,11 @@ fn paint_frame(p: &egui::Painter, xf: &Xf, open: &Open, page: &Page, c: Color32,
     let total = open.project.pages.len();
     let idx = open.project.pages.iter().position(|q| q.id == page.id).unwrap_or(0);
     for m in wc_pdf::frame_marks(&open.project, page, idx, total, "") {
+        // A title-block value too small to read at this zoom still shows that it is there.
+        if let Some((a, b)) = value_placeholder(&m, page.size.mm(), xf.zoom) {
+            p.rect_filled(Rect::from_two_pos(xf.s(a), xf.s(b)), 0.0, faint.gamma_multiply(0.6));
+            continue;
+        }
         let stroke = match m.ink {
             wc_pdf::Ink::Thick => Stroke::new(xf.len(0.5).max(1.0), c),
             wc_pdf::Ink::Thin => Stroke::new(xf.len(0.25).max(0.6), c),
@@ -459,6 +464,44 @@ fn paint_frame(p: &egui::Painter, xf: &Xf, open: &Open, page: &Page, c: Color32,
         };
         paint_shape(p, xf, &m.shape, stroke);
     }
+}
+
+/// Texts smaller than this on screen (px) are not drawn: they would only smear.
+const MIN_TEXT_PX: f32 = 3.0;
+
+/// The bar (corners in mm) drawn instead of a title-block value that is too small to read at
+/// `zoom` (px per mm) on a sheet of `size` mm: as wide as the text and a little lower than it,
+/// so the user sees a value is there. `None` for every other mark, and for a value big enough
+/// to draw; other small texts (column numbers, labels) are simply left out as before.
+pub(crate) fn value_placeholder(m: &wc_pdf::FrameMark, size: (f64, f64), zoom: f32) -> Option<(Point, Point)> {
+    let Shape::Text {
+        at,
+        text,
+        height,
+        align,
+        ..
+    } = &m.shape
+    else {
+        return None;
+    };
+    if m.ink != wc_pdf::Ink::Thin || text.trim().is_empty() || (*height as f32) * zoom * 1.15 >= MIN_TEXT_PX {
+        return None;
+    }
+    // Values sit in the title block band at the foot of the frame; column numbers and row
+    // letters, drawn in the same ink, sit above it or outside the frame.
+    let margin = wc_core::project::FRAME_MARGIN;
+    let (x0, x1, y1) = (margin, size.0 - margin, size.1 - margin);
+    let band = y1 - wc_core::template::TITLE_HEIGHT;
+    if at.x < x0 || at.x > x1 || at.y <= band || at.y > y1 {
+        return None;
+    }
+    let w = wc_pdf::text_width_mm(text, *height);
+    let left = match align {
+        Align::Left => at.x,
+        Align::Center => at.x - w / 2.0,
+        Align::Right => at.x - w,
+    };
+    Some((Point::new(left, at.y - height * 0.7), Point::new(left + w, at.y)))
 }
 
 /// Show the canvas for the current page and handle the tools. Returns true when the project
@@ -1471,6 +1514,51 @@ fn jumper_points(
 mod tests {
     use super::*;
     use crate::state::tests::project;
+
+    #[test]
+    fn a_long_title_block_value_shows_as_a_bar_when_too_small_to_read() {
+        let mut p = wc_core::Project::new("Pump station");
+        let long =
+            "Customer with a name of sixty characters that has to shrink, and a department and a site after it as well";
+        p.meta.title_block.insert("customer".into(), long.into());
+        let page = wc_core::Page::new("p1", "1", "Main");
+        p.pages.push(page.clone());
+        let size = page.size.mm();
+        let marks = wc_pdf::frame_marks(&p, &page, 0, 1, "");
+        let customer = marks
+            .iter()
+            .find(|m| matches!(&m.shape, Shape::Text { text, .. } if text.contains("sixty")))
+            .unwrap();
+        let Shape::Text { at, height, .. } = &customer.shape else {
+            unreachable!()
+        };
+        assert!(*height < 1.25, "the value is shrunk: {height}");
+        // At zoom 2 the text is under 3 px: a bar as wide as the text, ending on its baseline.
+        let (a, b) = value_placeholder(customer, size, 2.0).unwrap();
+        let w = wc_pdf::text_width_mm(long, *height);
+        assert!((b.x - a.x - w).abs() < 1e-9 && b.y == at.y && a.y < b.y, "{a:?} {b:?}");
+        // Zoomed in far enough the text itself is drawn.
+        assert_eq!(value_placeholder(customer, size, 4.0), None);
+        // Column numbers (along the top) and row letters (outside the frame), as small at zoom
+        // 0.5, are left out as before.
+        let mut checked = 0;
+        for m in &marks {
+            if let Shape::Text { text, at, .. } = &m.shape
+                && ((text == "1" && at.y < size.1 / 2.0) || text == "A")
+            {
+                assert_eq!(value_placeholder(m, size, 0.5), None, "{text}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 3, "column 1 and row A on both sides");
+        // So are labels and lines.
+        assert!(
+            marks
+                .iter()
+                .filter(|m| m.ink != wc_pdf::Ink::Thin || !matches!(m.shape, Shape::Text { .. }))
+                .all(|m| value_placeholder(m, size, 0.5).is_none())
+        );
+    }
 
     #[test]
     fn the_cover_logo_moves_and_sizes_by_whole_millimetres_and_stays_usable() {

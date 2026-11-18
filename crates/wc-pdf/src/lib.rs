@@ -20,7 +20,7 @@ pub use layout::{
 };
 pub use picture::{Pictures, read_picture, read_pictures};
 pub use vector::{PageDrawing, Picture, dxf, page_drawings, page_lines, svg};
-pub use writer::{Layer, Prim, Stroke};
+pub use writer::{Layer, Prim, Stroke, text_width_mm};
 
 #[derive(Debug, Clone)]
 pub struct Options {
