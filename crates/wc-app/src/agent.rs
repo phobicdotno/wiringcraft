@@ -2238,9 +2238,12 @@ impl App {
                     Some(l) => Some(
                         // The terminal plan's range: a level it cannot read would be stored
                         // and then shown as none.
-                        l.as_u64()
-                            .and_then(|l| wc_report::parse_level(&l.to_string()).ok())
-                            .ok_or(format!("`level` must be 1 to {}, or null to clear it.", u32::MAX))?,
+                        wc_report::parse_level(
+                            &l.as_u64()
+                                .ok_or("`level` must be a whole number, or null to clear it.")?
+                                .to_string(),
+                        )
+                        .map_err(|e| format!("`level` cannot be {l}: {e}."))?,
                     ),
                     None => return Err("`level` is missing: give 1 or more, or null to clear it.".into()),
                 };
@@ -2997,6 +3000,9 @@ mod tests {
         }
         assert_eq!(rail(&mut a), ["1", "2", "3"]);
         assert_eq!(undo_mark(&a), before);
+        let zero = json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 0});
+        let why = call(&mut a, "strips", zero).unwrap_err();
+        assert!(why.contains("levels start at 1"), "{why}");
 
         // Move: one undo step, and the state shows the rail.
         call(
