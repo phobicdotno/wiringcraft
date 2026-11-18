@@ -453,23 +453,11 @@ fn number_of(p: &Project, page: &str) -> String {
 /// Make `local` the session's project `auth`, changing only what differs. The symbol lock stays
 /// local, except for items the session has: this copy takes their entries, so an item it lacks
 /// is added and one it has in another version (someone else used it first) takes the session's
-/// version. Their files come with the session, see [`take_files`]. An item the session locked
-/// at the last sync (`was`) and no longer locks was taken back (an undo): this copy drops its
-/// entry too, unless it locks another version, so it is not sent again. Returns whether anything
-/// changed.
-pub fn incoming(local: &mut Project, was: &wc_core::Lockfile, auth: &Project) -> bool {
+/// version. Their files come with the session, see [`take_files`]; items the session took back
+/// are dropped by [`taken_back`] first. Returns whether anything changed.
+pub fn incoming(local: &mut Project, auth: &Project) -> bool {
     let mut changed = false;
     for kind in [ItemKind::Symbol, ItemKind::Part] {
-        let gone: Vec<String> = was
-            .map(kind)
-            .iter()
-            .filter(|(id, e)| !auth.lock.map(kind).contains_key(*id) && local.lock.map(kind).get(*id) == Some(*e))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in gone {
-            local.lock.map_mut(kind).remove(&id);
-            changed = true;
-        }
         for (id, entry) in auth.lock.map(kind) {
             if local.lock.map(kind).get(id).is_none_or(|e| e.hash != entry.hash) {
                 local.lock.map_mut(kind).insert(id.clone(), entry.clone());
@@ -506,6 +494,59 @@ pub fn incoming(local: &mut Project, was: &wc_core::Lockfile, auth: &Project) ->
         local.comments = auth.comments.clone();
     }
     changed
+}
+
+/// Items the session locked at the last sync (`was`) and no longer locks were taken back (an
+/// undo): drop them from `local`'s lock too, so they are not sent again as new items. Kept are
+/// items this copy locks in another version, and items it uses (placed here since and not sent
+/// yet): those go out again with the change that uses them. Returns the items dropped.
+pub fn taken_back(local: &mut Project, was: &wc_core::Lockfile, auth: &Project) -> Vec<(ItemKind, String)> {
+    let (symbols, parts) = (local.used_symbols(), local.used_parts());
+    let mut dropped = Vec::new();
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        let used = match kind {
+            ItemKind::Symbol => &symbols,
+            ItemKind::Part => &parts,
+        };
+        let gone: Vec<String> = was
+            .map(kind)
+            .iter()
+            .filter(|(id, e)| {
+                !auth.lock.map(kind).contains_key(*id)
+                    && !used.contains(*id)
+                    && local.lock.map(kind).get(*id).is_some_and(|l| l.hash == e.hash)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            local.lock.map_mut(kind).remove(&id);
+            dropped.push((kind, id));
+        }
+    }
+    dropped
+}
+
+/// Drop from `open` what the session took back since the last look (`seen`, the session's lock
+/// then, updated to `auth`'s): the lock entries ([`taken_back`]) and the loaded copies, so placing
+/// the item again takes it afresh and locks it, instead of drawing a loaded copy without a pin.
+fn follow_take_backs(seen: &mut Option<wc_core::Lockfile>, open: &mut Open, auth: &Project) {
+    let was = seen.take().unwrap_or_else(|| auth.lock.clone());
+    let dropped = taken_back(&mut open.project, &was, auth);
+    for (kind, id) in &dropped {
+        match kind {
+            ItemKind::Symbol => {
+                open.symbols.remove(id);
+            }
+            ItemKind::Part => {
+                open.parts.remove(id);
+            }
+        }
+    }
+    if !dropped.is_empty() {
+        // The lock changed, not yet in this copy's files.
+        open.dirty = true;
+    }
+    *seen = Some(auth.lock.clone());
 }
 
 /// The items `local` locks in another version than the session `auth`: someone else used them
@@ -1521,6 +1562,7 @@ impl Share {
                     self.notes
                         .push(format!("Joined the session. Your copy is in {}.", o.dir.display()));
                     self.base = Some(o.project.clone());
+                    self.session_lock = Some(project.lock.clone());
                     self.opened = None;
                     Some(o)
                 }
@@ -1575,6 +1617,8 @@ impl Share {
         // the changes that may draw them wait in the window: a page must not reach the session
         // without its symbols, and an item the session refused is sent again a few times.
         let auth = role.project()?;
+        // Items the session took back are dropped here first, or they would look new below.
+        follow_take_backs(&mut self.session_lock, open, auth);
         // An item the session took is done; one this copy no longer locks (an undo, or an
         // assistant command that rewrote the project) is not sent again, so nothing waits for it.
         self.items_out
@@ -1684,9 +1728,8 @@ impl Share {
                 conflicting.join(", ")
             ));
         }
-        let was = self.session_lock.take().unwrap_or_else(|| auth.lock.clone());
-        let changed = incoming(&mut open.project, &was, auth);
-        self.session_lock = Some(auth.lock.clone());
+        follow_take_backs(&mut self.session_lock, open, auth);
+        let changed = incoming(&mut open.project, auth);
         let (symbols, parts) = role.files();
         let failed: Vec<String> = take_files(open, symbols, parts)
             .into_iter()

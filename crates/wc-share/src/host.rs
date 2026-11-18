@@ -660,12 +660,36 @@ impl Host {
                 entry.info.message
             ));
         }
-        let used = entry.before.unlocks_used(&self.project);
+        let used = entry.before.unlocked_uses(&self.project);
         if !used.is_empty() {
             return invalid(format!(
-                "\"{}\" cannot be taken back: a page or device uses {} since; remove that first",
+                "\"{}\" cannot be taken back: the project would use {} without it being in the project's library; remove that use or add it again first",
                 entry.info.message,
                 used.join(", ")
+            ));
+        }
+        // A lock entry is put back only for a version whose file the session still has: someone
+        // may have used the id in another version meanwhile.
+        let mut missing = Vec::new();
+        for (id, e) in &entry.before.lock_symbols {
+            if let Some(e) = e
+                && self.symbols.get(id).map(wc_core::Symbol::hash).as_ref() != Some(&e.hash)
+            {
+                missing.push(format!("symbol {id}"));
+            }
+        }
+        for (id, e) in &entry.before.lock_parts {
+            if let Some(e) = e
+                && self.parts.get(id).map(wc_core::Part::hash).as_ref() != Some(&e.hash)
+            {
+                missing.push(format!("part {id}"));
+            }
+        }
+        if !missing.is_empty() {
+            return invalid(format!(
+                "\"{}\" cannot be taken back: the session no longer has that version of {}",
+                entry.info.message,
+                missing.join(", ")
             ));
         }
         let edit = ProjectEdit::Restore {

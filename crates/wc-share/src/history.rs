@@ -228,30 +228,28 @@ impl Parts {
         }
     }
 
-    /// Items these parts take out of the lock that `project` still uses (`symbol id` or `part
-    /// id`): putting these parts back into it would leave them without their lock entry.
-    pub fn unlocks_used(&self, project: &Project) -> Vec<String> {
+    /// Items that putting these parts into `project` would leave used without a lock entry
+    /// (`symbol id` or `part id`): a lock entry taken out while a page, device or jumper still
+    /// uses the item, or a page or device brought back that uses an item no longer locked.
+    /// Items already used without a lock before are not counted.
+    pub fn unlocked_uses(&self, project: &Project) -> Vec<String> {
         let mut after = project.clone();
         self.apply(&mut after);
-        let (symbols, parts) = (after.used_symbols(), after.used_parts());
-        let gone = |kind: ItemKind| {
-            self.lock(kind)
-                .iter()
-                .filter(|(_, e)| e.is_none())
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>()
+        let unlocked = |p: &Project| -> BTreeSet<String> {
+            p.used_symbols()
+                .into_iter()
+                .filter(|id| !p.lock.symbols.contains_key(id))
+                .map(|id| format!("symbol {id}"))
+                .chain(
+                    p.used_parts()
+                        .into_iter()
+                        .filter(|id| !p.lock.parts.contains_key(id))
+                        .map(|id| format!("part {id}")),
+                )
+                .collect()
         };
-        gone(ItemKind::Symbol)
-            .into_iter()
-            .filter(|id| symbols.contains(id))
-            .map(|id| format!("symbol {id}"))
-            .chain(
-                gone(ItemKind::Part)
-                    .into_iter()
-                    .filter(|id| parts.contains(id))
-                    .map(|id| format!("part {id}")),
-            )
-            .collect()
+        let had = unlocked(project);
+        unlocked(&after).into_iter().filter(|i| !had.contains(i)).collect()
     }
 }
 

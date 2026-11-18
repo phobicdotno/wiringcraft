@@ -434,8 +434,7 @@ fn coming_in_changes_only_what_differs_and_keeps_the_local_symbol_lock() {
     let mut auth = Project::new("Demo");
     auth.pages.push(Page::new("p0001", "1", "One"));
     let mut local = auth.clone();
-    let was = auth.lock.clone();
-    assert!(!incoming(&mut local, &was, &auth));
+    assert!(!incoming(&mut local, &auth));
     local.lock.symbols.insert(
         "wc.coil".into(),
         wc_core::LockEntry {
@@ -444,13 +443,13 @@ fn coming_in_changes_only_what_differs_and_keeps_the_local_symbol_lock() {
         },
     );
     auth.pages[0].title = "Changed".into();
-    assert!(incoming(&mut local, &was, &auth));
+    assert!(incoming(&mut local, &auth));
     assert_eq!(local.pages, auth.pages);
     assert!(local.lock.symbols.contains_key("wc.coil"));
 }
 
 #[test]
-fn an_item_the_session_took_back_leaves_the_local_lock() {
+fn an_item_the_session_took_back_leaves_the_local_lock() -> TestResult {
     let entry = |hash: &str| wc_core::LockEntry {
         hash: hash.into(),
         source: "starter".into(),
@@ -458,16 +457,40 @@ fn an_item_the_session_took_back_leaves_the_local_lock() {
     let mut session = Project::new("Demo");
     session.lock.symbols.insert("wc.coil".into(), entry("abc"));
     session.lock.parts.insert("acme.relay".into(), entry("p1"));
-    let was = session.lock.clone();
     let mut local = session.clone();
     // Used here and not sent yet: the session never had it, so it still has to go out.
     local.lock.symbols.insert("wc.lamp".into(), entry("def"));
-    // The session undid the change that added the coil and the relay.
+    // Taken back in the session, but placed here since: it goes out again with that change.
+    local.lock.symbols.insert("wc.placed".into(), entry("ghi"));
+    session.lock.symbols.insert("wc.placed".into(), entry("ghi"));
+    let was = session.lock.clone();
+    let mut page = Page::new("p0001", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        id: "s1".into(),
+        symbol: "wc.placed".into(),
+        at: Default::default(),
+        rotation: Default::default(),
+        mirror: false,
+        tag: None,
+    });
+    local.pages.push(page);
+    // Same hash from another source counts as the same version.
+    local.lock.parts.get_mut("acme.relay").ok_or("relay")?.source = "other".into();
+    // The session undid the changes that added the coil, the relay and the placed symbol.
     let auth = Project::new("Demo");
-    assert!(incoming(&mut local, &was, &auth));
+    let dropped = taken_back(&mut local, &was, &auth);
+    assert_eq!(
+        dropped,
+        [
+            (ItemKind::Symbol, "wc.coil".to_owned()),
+            (ItemKind::Part, "acme.relay".to_owned())
+        ]
+    );
     assert!(!local.lock.symbols.contains_key("wc.coil"));
     assert!(!local.lock.parts.contains_key("acme.relay"));
     assert!(local.lock.symbols.contains_key("wc.lamp"));
+    assert!(local.lock.symbols.contains_key("wc.placed"));
+    Ok(())
 }
 
 /// Run frames of both windows until `done` or a few seconds have passed.
@@ -1953,5 +1976,41 @@ fn a_folder_error_stays_until_the_folder_changes() -> TestResult {
     form.folder = "C:\\shared".into();
     form.forget_error_unless("192.168.1.21:47812", "C:shared");
     assert!(form.error.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_symbol_whose_adding_was_undone_is_not_sent_again_and_is_locked_when_placed_again() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let id = "wc.contact.no";
+    assert!(!host_open.project.lock.symbols.contains_key(id), "new to the session");
+    guest_open.place(2, id, wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(host_open.project.lock.symbols.contains_key(id), "added");
+    // Undo the placement and its new device, then the change that added the symbol.
+    for _ in 0..3 {
+        g.undo()?;
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for open in [&host_open, &guest_open] {
+        assert!(
+            !open.project.lock.symbols.contains_key(id),
+            "taken back, and not sent again"
+        );
+    }
+    // Placed again: locked again, and the session gets it with the page.
+    guest_open.place(2, id, wc_core::Point::new(60.0, 100.0))?;
+    assert!(guest_open.project.lock.symbols.contains_key(id), "pinned when placed");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(host_open.project.lock.symbols.contains_key(id));
+    assert!(
+        host_open
+            .project
+            .page("p0003")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.symbol == id))
+    );
     Ok(())
 }

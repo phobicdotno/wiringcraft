@@ -2292,8 +2292,40 @@ fn undoing_an_added_item_takes_back_its_lock_entry() -> TestResult {
     s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
     assert_eq!(s.log.0.borrow().len(), changes);
     let refused = a.refusals.last().map(ToString::to_string).unwrap_or_default();
-    assert!(refused.contains("uses symbol coil"), "{refused}");
+    assert!(refused.contains("would use symbol coil"), "{refused}");
     assert!(s.host.project().lock.symbols.contains_key("coil"));
+    Ok(())
+}
+
+#[test]
+fn a_redo_is_refused_once_the_session_has_another_version_of_the_item() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    let (_b, link_b, mut b) = s.join("Kari")?;
+    let add = |name: &str| ProjectEdit::AddItems {
+        symbols: vec![(symbol("coil", name), "starter".into())],
+        parts: vec![],
+    };
+    // Ola adds coil and undoes it; Kari then uses coil in another version and undoes that.
+    link_a.send(a.edit_project(add("Coil")))?;
+    link_a.send(GuestMsg::Undo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    link_b.send(b.edit_project(add("Other coil")))?;
+    link_b.send(GuestMsg::Undo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(b.refusals.is_empty(), "{:?}", b.refusals);
+    assert_eq!(s.host.files().0.get("coil"), Some(&symbol("coil", "Other coil")));
+    // Ola's redo would lock the first version, whose file the session no longer has.
+    let changes = s.log.0.borrow().len();
+    link_a.send(GuestMsg::Redo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let refused = a.refusals.last().map(ToString::to_string).unwrap_or_default();
+    assert!(
+        refused.contains("no longer has that version of symbol coil"),
+        "{refused}"
+    );
+    assert_eq!(s.log.0.borrow().len(), changes);
+    assert!(!s.host.project().lock.symbols.contains_key("coil"));
     Ok(())
 }
 
