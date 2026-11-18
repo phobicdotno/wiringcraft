@@ -192,6 +192,11 @@ pub fn menu_bar(ui: &mut egui::Ui, status: &dyn Status, out: &mut Vec<Action>) {
 
 /// A square icon button. Returns true when clicked.
 fn icon_button(ui: &mut egui::Ui, a: Action, size: f32, status: &dyn Status, t: &Theme) -> bool {
+    icon_button_rect(ui, a, size, status, t).0
+}
+
+/// [`icon_button`], also returning where the button is.
+fn icon_button_rect(ui: &mut egui::Ui, a: Action, size: f32, status: &dyn Status, t: &Theme) -> (bool, Rect) {
     let info = a.info();
     let enabled = status.enabled(a);
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), if enabled { Sense::click() } else { Sense::hover() });
@@ -224,7 +229,7 @@ fn icon_button(ui: &mut egui::Ui, a: Action, size: f32, status: &dyn Status, t: 
     } else {
         format!("{} ({})\n{}", info.label, info.shortcut, info.tip)
     };
-    resp.on_hover_text(tip).clicked()
+    (resp.on_hover_text(tip).clicked(), rect)
 }
 
 fn divider(ui: &mut egui::Ui, t: &Theme, height: f32) {
@@ -287,6 +292,12 @@ fn classic_toolbar_rects(ui: &mut egui::Ui, status: &dyn Status, out: &mut Vec<A
 }
 
 pub fn ribbon(ui: &mut egui::Ui, state: &mut ChromeState, status: &dyn Status, out: &mut Vec<Action>) {
+    ribbon_rects(ui, state, status, out);
+}
+
+/// Lay out the ribbon: its tabs and the open tab's groups; returns the rectangles of the open
+/// tab's button icons.
+fn ribbon_rects(ui: &mut egui::Ui, state: &mut ChromeState, status: &dyn Status, out: &mut Vec<Action>) -> Vec<Rect> {
     let t = Theme::of(ui.ctx());
     // Tabs: plain words with an accent underline under the open one.
     ui.horizontal(|ui| {
@@ -325,51 +336,104 @@ pub fn ribbon(ui: &mut egui::Ui, state: &mut ChromeState, status: &dyn Status, o
     });
     ui.add_space(6.0);
     let Some((_, groups)) = RIBBON.get(state.ribbon_tab) else {
-        return;
+        return Vec::new();
     };
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for (gi, (gname, actions)) in groups.iter().enumerate() {
-            if gi > 0 {
-                divider(ui, &t, 62.0);
+    ribbon_groups(ui, groups, status, out)
+}
+
+/// A ribbon button's width, its icon and label.
+const RIBBON_BUTTON: f32 = 66.0;
+/// The room a divider takes between two ribbon groups.
+const RIBBON_DIVIDER: f32 = 9.0;
+
+/// Lay out one ribbon tab's groups; returns the rectangles of its buttons. Groups go side by
+/// side and start a new row when the next one would not fit, so every button stays on screen in
+/// a narrow window; a group wider than the window wraps its own buttons. Each button's id comes
+/// from its group and command, not its place, so a press stays with its button when the window
+/// is resized and the groups move between rows.
+fn ribbon_groups(
+    ui: &mut egui::Ui,
+    groups: &[crate::actions::RibbonGroup],
+    status: &dyn Status,
+    out: &mut Vec<Action>,
+) -> Vec<Rect> {
+    let t = Theme::of(ui.ctx());
+    let avail = ui.available_width().max(RIBBON_BUTTON);
+    let per_row = ((avail / RIBBON_BUTTON).floor() as usize).max(1);
+    let width_of = |n: usize| n.min(per_row) as f32 * RIBBON_BUTTON;
+    // Which groups share a row.
+    let mut rows: Vec<Vec<&crate::actions::RibbonGroup>> = Vec::new();
+    let mut x = 0.0;
+    for group in groups {
+        let w = width_of(group.1.len());
+        match rows.last_mut() {
+            Some(row) if x + RIBBON_DIVIDER + w <= avail => {
+                row.push(group);
+                x += RIBBON_DIVIDER + w;
             }
-            let width = actions.len() as f32 * 66.0;
-            ui.allocate_ui_with_layout(
-                Vec2::new(width, 70.0),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    ui.set_width(width);
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        for a in *actions {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(66.0, 52.0),
-                                egui::Layout::top_down(egui::Align::Center),
-                                |ui| {
-                                    ui.set_width(66.0);
-                                    ui.spacing_mut().item_spacing.y = 1.0;
-                                    if icon_button(ui, *a, 34.0, status, &t) {
-                                        out.push(*a);
-                                    }
-                                    let c = if status.enabled(*a) {
-                                        t.text
-                                    } else {
-                                        t.muted.gamma_multiply(0.6)
-                                    };
-                                    ui.add(
-                                        egui::Label::new(egui::RichText::new(a.info().label).size(11.0).color(c))
-                                            .wrap_mode(egui::TextWrapMode::Truncate),
-                                    );
-                                },
-                            );
-                        }
-                    });
-                    ui.label(egui::RichText::new(gname.to_uppercase()).size(9.5).color(t.muted));
-                },
-            );
+            _ => {
+                rows.push(vec![group]);
+                x = w;
+            }
         }
-    });
+    }
+    let mut rects = Vec::new();
+    for row in rows {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (k, &(gname, actions)) in row.into_iter().enumerate() {
+                if k > 0 {
+                    divider(ui, &t, 62.0);
+                }
+                let width = width_of(actions.len());
+                ui.allocate_ui_with_layout(
+                    Vec2::new(width, 70.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for line in actions.chunks(per_row) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for a in line {
+                                    let r = ui.push_id((gname, *a), |ui| {
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(RIBBON_BUTTON, 52.0),
+                                            egui::Layout::top_down(egui::Align::Center),
+                                            |ui| {
+                                                ui.set_width(RIBBON_BUTTON);
+                                                ui.spacing_mut().item_spacing.y = 1.0;
+                                                let (clicked, icon) = icon_button_rect(ui, *a, 34.0, status, &t);
+                                                if clicked {
+                                                    out.push(*a);
+                                                }
+                                                let c = if status.enabled(*a) {
+                                                    t.text
+                                                } else {
+                                                    t.muted.gamma_multiply(0.6)
+                                                };
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(a.info().label).size(11.0).color(c),
+                                                    )
+                                                    .wrap_mode(egui::TextWrapMode::Truncate),
+                                                );
+                                                icon
+                                            },
+                                        )
+                                        .inner
+                                    });
+                                    rects.push(r.inner);
+                                }
+                            });
+                        }
+                        ui.label(egui::RichText::new(gname.to_uppercase()).size(9.5).color(t.muted));
+                    },
+                );
+            }
+        });
+    }
+    rects
 }
 
 /// The whole command area under the window title, in the chosen layout.
@@ -438,6 +502,111 @@ mod tests {
             });
         });
         rects
+    }
+
+    /// Run the ribbon with tab `tab` open for one frame per `(width, events)`, in a window
+    /// `width` points wide; returns the icon rectangles of the last frame and every command
+    /// clicked.
+    fn ribbon_frames(tab: usize, frames: &[(f32, Vec<egui::Event>)]) -> (Vec<Rect>, Vec<Action>) {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = ChromeState { ribbon_tab: tab };
+        let (mut rects, mut out) = (Vec::new(), Vec::new());
+        let input = |width: f32, events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 600.0))),
+            events,
+            ..Default::default()
+        };
+        // The first frame loads the fonts.
+        let _ = ctx.run(input(frames[0].0, Vec::new()), |_| {});
+        for (width, events) in frames {
+            let _ = ctx.run(input(*width, events.clone()), |ctx| {
+                egui::TopBottomPanel::top("menus")
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 4)))
+                    .show(ctx, |ui| {
+                        rects = ribbon_rects(ui, &mut state, &AllOn, &mut out);
+                    });
+            });
+        }
+        (rects, out)
+    }
+
+    /// The icon rectangles of ribbon tab `tab` in a window `width` points wide.
+    fn ribbon_icons(tab: usize, width: f32) -> Vec<Rect> {
+        ribbon_frames(tab, &[(width, Vec::new())]).0
+    }
+
+    #[test]
+    fn a_ribbon_press_stays_with_its_button_when_the_groups_move() {
+        let start = RIBBON[0].1;
+        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
+        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
+        let (narrow, wide) = (1210.0, 1220.0);
+        let at = ribbon_icons(0, narrow)[undo].center();
+        // In the wider window another button sits where Undo was.
+        let moved = ribbon_icons(0, wide);
+        let there = moved.iter().position(|r| r.contains(at)).map(|i| order[i]);
+        assert!(there.is_some_and(|a| a != Action::Undo), "{there:?} at {at:?}");
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (_, out) = ribbon_frames(
+            0,
+            &[
+                (narrow, Vec::new()),
+                (narrow, vec![egui::Event::PointerMoved(at)]),
+                (narrow, vec![button(true)]),
+                (wide, vec![button(false)]),
+            ],
+        );
+        assert!(out.is_empty(), "{out:?}");
+        // Released where it was pressed, the press is a click on Undo.
+        let (_, out) = ribbon_frames(
+            0,
+            &[
+                (narrow, Vec::new()),
+                (narrow, vec![egui::Event::PointerMoved(at)]),
+                (narrow, vec![button(true)]),
+                (narrow, vec![button(false)]),
+            ],
+        );
+        assert_eq!(out, [Action::Undo]);
+    }
+
+    #[test]
+    fn every_ribbon_button_fits_the_smallest_window() {
+        // 900 points is the window's minimum width: every button of every tab stays on screen.
+        for (tab, (name, groups)) in RIBBON.iter().enumerate() {
+            let rects = ribbon_icons(tab, 900.0);
+            let buttons: usize = groups.iter().map(|(_, a)| a.len()).sum();
+            assert_eq!(rects.len(), buttons, "{name}");
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.left() >= 0.0 && r.right() <= 900.0, "{name}: button {i} at {r:?}");
+                for (j, o) in rects.iter().enumerate().skip(i + 1) {
+                    assert!(
+                        !r.shrink(0.5).intersects(o.shrink(0.5)),
+                        "{name}: buttons {i} and {j} overlap: {r:?} {o:?}"
+                    );
+                }
+            }
+        }
+        // The Start tab takes more than one row at that width, and one row in a wide window.
+        let start = ribbon_icons(0, 900.0);
+        assert!(start.iter().any(|r| r.top() > start[0].bottom()), "wraps at 900");
+        let wide = ribbon_icons(0, 2400.0);
+        assert!(
+            wide.iter().all(|r| (r.center().y - wide[0].center().y).abs() < 1.0),
+            "one row"
+        );
+        // Even a window narrower than the widest group keeps that group's buttons on screen.
+        let narrow = ribbon_icons(0, 400.0);
+        assert_eq!(narrow.len(), RIBBON[0].1.iter().map(|(_, a)| a.len()).sum::<usize>());
+        for r in narrow {
+            assert!(r.left() >= 0.0 && r.right() <= 400.0, "{r:?}");
+        }
     }
 
     #[test]
