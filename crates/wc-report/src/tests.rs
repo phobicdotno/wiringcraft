@@ -1855,14 +1855,15 @@ fn csv_cells_a_spreadsheet_would_run_are_written_as_text() {
         ("-cmd|' /C calc'!A0", "'-cmd|' /C calc'!A0"),
         ("=A+C1-K1", "'=A+C1-K1"),
         ("+C1-K1", "'+C1-K1"),
-        // Kept: ordinary text, plain numbers and product-aspect tags.
+        // Excel reads -K1 as =-K1: product-aspect tags are guarded too.
+        ("-K1", "'-K1"),
+        ("-X12", "'-X12"),
+        // Kept: ordinary text and plain numbers.
         ("Motor 3", "Motor 3"),
         ("", ""),
         ("-5", "-5"),
         ("-0.75", "-0.75"),
         ("-2,5", "-2,5"),
-        ("-K1", "-K1"),
-        ("-X12", "-X12"),
         ("a=b", "a=b"),
     ] {
         assert_eq!(formula_safe(cell), out, "{cell:?}");
@@ -1875,7 +1876,7 @@ fn every_csv_report_goes_through_the_guard_but_the_marker_list_keeps_its_text() 
     t.rows.push(vec!["-K1".into(), "=HYPERLINK(\"x\")".into()]);
     t.rows.push(vec!["-5".into(), "@x".into()]);
     let csv = t.to_csv();
-    assert_eq!(csv, "Tag,Text\r\n-K1,\"'=HYPERLINK(\"\"x\"\")\"\r\n-5,'@x\r\n");
+    assert_eq!(csv, "Tag,Text\r\n'-K1,\"'=HYPERLINK(\"\"x\"\")\"\r\n-5,'@x\r\n");
     assert_eq!(t.to_csv_with(';'), csv.replace(',', ";"));
     // smartScript prints the text on the marker: it is written as it is.
     let raw = t.to_csv_raw_with(';');

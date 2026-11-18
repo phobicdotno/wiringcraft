@@ -120,14 +120,15 @@ impl Table {
 /// when the CSV is opened (CWE-1236) gets a leading `'`, which makes it plain text there.
 ///
 /// Guarded: cells starting with `=`, `+`, `@`, a tab or a carriage return, and cells starting
-/// with `-` unless they are a plain number (`-5`, `-0.75`, a value a column means as a number)
-/// or written exactly as a device tag with only a product aspect (`-K1`, `-X12`): such tags
-/// begin every device list, and a `'` in front of each would spoil them for the reader and for
-/// a later import. A tag with a function or location aspect (`=A-K1`, `+C1-K1`) is guarded.
+/// with `-` unless they are a plain number (`-5`, `-0.75`, a value a column means as a number).
+/// Device tags with only a product aspect (`-K1`, `-X12`) are guarded too: Excel reads `-K1` as
+/// the formula `=-K1` and shows the negated cell K1 instead of the tag. WiringCraft's own CSV
+/// import (`wc_import::csv::records`) takes the `'` off again, so such a file reads back
+/// with the same tags.
 pub fn formula_safe(cell: &str) -> Cow<'_, str> {
     let guard = match cell.chars().next() {
         Some('=' | '+' | '@' | '\t' | '\r') => true,
-        Some('-') => !plain_number(&cell[1..]) && !marking::is_tag(cell),
+        Some('-') => !plain_number(&cell[1..]),
         _ => false,
     };
     if guard {
