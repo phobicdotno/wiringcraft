@@ -368,7 +368,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "edit_page_json",
             "Replace a whole page with new content in the page file format (as get_page returns it, without the extra pin and point fields). For bulk edits the other tools cannot do. The page id stays.",
-            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), cover (true for the cover page; leaving it out keeps the page's current value), symbols, wires, graphics, underlay."}}),
+            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), cover (true for the cover page; leaving it out keeps the page's current value), title_block (the page's own title-block fields such as revision and date, which win over the project's; leaving it out keeps the page's current ones), symbols, wires, graphics, underlay."}}),
             &["content"],
         ),
         tool(
@@ -726,6 +726,7 @@ impl Open {
         json!({
             "id": p.id, "number": p.number, "title": p.title, "size": p.size,
             "overview": p.overview, "cover": p.cover,
+            "title_block": p.title_block,
             "size_mm": [w, h],
             "symbols": symbols, "wires": wires, "graphics": graphics,
             "underlay": p.underlay, "comments": comments,
@@ -1153,6 +1154,17 @@ impl App {
                 let was_cover = open.project.pages.get(page).is_some_and(|p| p.cover);
                 if content.get("cover").is_none_or(Value::is_null) {
                     content["cover"] = json!(was_cover);
+                }
+                // Nor does one without `title_block` drop the page's own fields (its revision,
+                // date, ...): they are kept.
+                if content.get("title_block").is_none_or(Value::is_null) {
+                    let own = open
+                        .project
+                        .pages
+                        .get(page)
+                        .map(|p| p.title_block.clone())
+                        .unwrap_or_default();
+                    content["title_block"] = json!(own);
                 }
                 let new: Page = serde_json::from_value(content).map_err(|e| format!("Not a page: {e}"))?;
                 open.ensure_page_symbols(&new)?;
@@ -2858,6 +2870,31 @@ mod tests {
                 .iter()
                 .all(|s| s.tag.as_ref().unwrap().to_string() == "=PUMP-K7")
         );
+    }
+
+    #[test]
+    fn page_content_without_title_block_keeps_the_pages_own_fields() {
+        let (_tmp, mut a) = app(vec![]);
+        if let Some(p) = a.open.as_mut().unwrap().project.page_mut("p0002") {
+            p.title_block.insert("revision".into(), "B".into());
+        }
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        assert_eq!(content["title_block"]["revision"], json!("B"), "get_page lists them");
+        content.as_object_mut().unwrap().remove("title_block");
+        content["title"] = json!("Changed");
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).title, "Changed");
+        assert_eq!(page2(&a).title_block["revision"], "B", "kept");
+        // Given, they are used: an empty map clears them.
+        content["title_block"] = json!({});
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert!(page2(&a).title_block.is_empty());
     }
 
     #[test]
