@@ -57,11 +57,31 @@ pub enum GuestMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProjectEdit {
     /// Add or change a device, or remove it with `None`.
-    SetDevice { tag: DeviceTag, device: Option<Device> },
+    SetDevice {
+        tag: DeviceTag,
+        device: Option<Device>,
+        /// What the record was when the author last had it (see [`ProjectEdit::stamped`]): the
+        /// host refuses the edit when the record has changed since. `None` is not checked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+    },
     /// Replace every review comment on one page.
-    SetComments { page: String, comments: Vec<Comment> },
+    SetComments {
+        page: String,
+        comments: Vec<Comment>,
+        /// What the record was when the author last had it (see [`ProjectEdit::stamped`]): the
+        /// host refuses the edit when the record has changed since. `None` is not checked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+    },
     /// Add or replace a cabinet panel layout.
-    SetPanel { panel: Panel },
+    SetPanel {
+        panel: Panel,
+        /// What the record was when the author last had it (see [`ProjectEdit::stamped`]): the
+        /// host refuses the edit when the record has changed since. `None` is not checked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+    },
     /// Remove a cabinet panel layout.
     RemovePanel { id: String },
     /// Add a new page. Its id must be unused.
@@ -71,7 +91,13 @@ pub enum ProjectEdit {
     /// Give pages new display numbers: `(page id, number)`.
     Renumber { numbers: Vec<(String, String)> },
     /// Replace the project's properties (name, title block, locations, jumpers, settings).
-    SetMeta { meta: Box<ProjectMeta> },
+    SetMeta {
+        meta: Box<ProjectMeta>,
+        /// What the record was when the author last had it (see [`ProjectEdit::stamped`]): the
+        /// host refuses the edit when the record has changed since. `None` is not checked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+    },
     /// Replace the content of several existing pages at once, for a tool that changes pages
     /// other than the one the author has open (wire numbering, a device tag renamed on every
     /// page). Display numbers are kept: only `Renumber` changes them. `before` holds each page
@@ -96,13 +122,71 @@ pub enum ProjectEdit {
 }
 
 impl ProjectEdit {
+    /// What the record a whole-record edit replaces (a device, one page's comments, a panel,
+    /// the project properties) is in `project`, as a short content hash; `None` for other
+    /// edits.
+    pub fn record(&self, project: &Project) -> Option<String> {
+        use wc_core::hash::content_hash;
+        match self {
+            Self::SetDevice { tag, .. } => Some(content_hash(&project.devices.get(tag))),
+            Self::SetComments { page, .. } => {
+                // By id, so the order the comments are kept in does not count.
+                let mut of: Vec<&Comment> = project.comments.iter().filter(|c| &c.page == page).collect();
+                of.sort_by(|a, b| a.id.cmp(&b.id));
+                Some(content_hash(&of))
+            }
+            Self::SetPanel { panel, .. } => Some(content_hash(&project.panels.iter().find(|p| p.id == panel.id))),
+            Self::SetMeta { .. } => Some(content_hash(&project.meta)),
+            _ => None,
+        }
+    }
+
+    /// This edit, carrying what its record was in `base`, the author's copy as it was before
+    /// the change: the host then refuses it when someone else changed the record meanwhile,
+    /// instead of letting a copy that had not seen that change overwrite it.
+    pub fn stamped(mut self, base: &Project) -> Self {
+        let was = self.record(base);
+        match &mut self {
+            Self::SetDevice { before, .. }
+            | Self::SetComments { before, .. }
+            | Self::SetPanel { before, .. }
+            | Self::SetMeta { before, .. } => *before = was,
+            _ => {}
+        }
+        self
+    }
+
+    /// The record as the author last had it, for an edit that carries it.
+    fn before(&self) -> Option<&str> {
+        match self {
+            Self::SetDevice { before, .. }
+            | Self::SetComments { before, .. }
+            | Self::SetPanel { before, .. }
+            | Self::SetMeta { before, .. } => before.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The record this edit replaces, in words, for a refusal.
+    fn record_name(&self, project: &Project) -> String {
+        match self {
+            Self::SetDevice { tag, .. } => format!("device {tag}"),
+            Self::SetComments { page, .. } => format!("the comments on page {}", now_number(project, page)),
+            Self::SetPanel { panel, .. } => format!("panel {}", panel.id),
+            Self::SetMeta { .. } => "the project properties".to_owned(),
+            _ => String::new(),
+        }
+    }
+
     /// A one-line description for the commit message.
     pub fn describe(&self) -> String {
         match self {
-            Self::SetDevice { tag, device: Some(_) } => format!("Change device {tag}"),
-            Self::SetDevice { tag, device: None } => format!("Remove device {tag}"),
+            Self::SetDevice {
+                tag, device: Some(_), ..
+            } => format!("Change device {tag}"),
+            Self::SetDevice { tag, device: None, .. } => format!("Remove device {tag}"),
             Self::SetComments { page, .. } => format!("Comments on page {page}"),
-            Self::SetPanel { panel } => format!("Change panel {}", panel.id),
+            Self::SetPanel { panel, .. } => format!("Change panel {}", panel.id),
             Self::RemovePanel { id } => format!("Remove panel {id}"),
             Self::AddPage { page } => format!("Add page {} {}", page.number, page.title),
             Self::RemovePage { id } => format!("Remove page {id}"),
@@ -137,7 +221,7 @@ impl ProjectEdit {
             Self::SetComments { page, .. } => {
                 keys.comments.insert(page.clone(), Vec::new());
             }
-            Self::SetPanel { panel } => {
+            Self::SetPanel { panel, .. } => {
                 keys.panels.insert(panel.id.clone(), None);
             }
             Self::RemovePanel { id } => {
@@ -316,7 +400,7 @@ pub enum HostMsg {
 /// the host sends, so every copy ends up the same.
 pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
     match edit {
-        ProjectEdit::SetDevice { tag, device } => match device {
+        ProjectEdit::SetDevice { tag, device, .. } => match device {
             Some(d) => {
                 project.devices.insert(tag.clone(), d.clone());
             }
@@ -324,7 +408,7 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
                 project.devices.remove(tag);
             }
         },
-        ProjectEdit::SetComments { page, comments } => {
+        ProjectEdit::SetComments { page, comments, .. } => {
             project.comments.retain(|c| &c.page != page);
             project.comments.extend(comments.iter().cloned().map(|mut c| {
                 c.page = page.clone();
@@ -332,7 +416,7 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
             }));
             project.sort_comments();
         }
-        ProjectEdit::SetPanel { panel } => match project.panels.iter_mut().find(|p| p.id == panel.id) {
+        ProjectEdit::SetPanel { panel, .. } => match project.panels.iter_mut().find(|p| p.id == panel.id) {
             Some(p) => *p = panel.clone(),
             None => {
                 project.panels.push(panel.clone());
@@ -358,7 +442,7 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
             }
             project.sort_pages();
         }
-        ProjectEdit::SetMeta { meta } => project.meta = (**meta).clone(),
+        ProjectEdit::SetMeta { meta, .. } => project.meta = (**meta).clone(),
         ProjectEdit::Restore { parts } => parts.apply(project),
         ProjectEdit::AddItems { symbols, parts } => {
             for (s, source) in symbols {
@@ -418,9 +502,17 @@ pub(crate) fn check_edit(
         }
     };
     let invalid = |reason: String| Err(Refusal::Invalid { reason });
+    if let Some(was) = edit.before()
+        && edit.record(project).as_deref() != Some(was)
+    {
+        return invalid(format!(
+            "{} was changed by someone else meanwhile; your change was not made, do it again on the new version",
+            edit.record_name(project)
+        ));
+    }
     match edit {
         ProjectEdit::SetDevice { .. } => Ok(()),
-        ProjectEdit::SetComments { page, comments } => {
+        ProjectEdit::SetComments { page, comments, .. } => {
             known(page)?;
             let mut ids = std::collections::BTreeSet::new();
             for c in comments {
@@ -431,7 +523,7 @@ pub(crate) fn check_edit(
             }
             Ok(())
         }
-        ProjectEdit::SetPanel { panel } => match wc_core::store::check_id(&panel.id) {
+        ProjectEdit::SetPanel { panel, .. } => match wc_core::store::check_id(&panel.id) {
             Ok(()) => Ok(()),
             Err(e) => invalid(e.to_string()),
         },

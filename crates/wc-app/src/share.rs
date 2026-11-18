@@ -62,9 +62,13 @@ pub fn outgoing(
 ) -> Outgoing {
     let mut out = Outgoing::default();
     if local.meta != base.meta {
-        out.edits.push(ProjectEdit::SetMeta {
-            meta: Box::new(local.meta.clone()),
-        });
+        out.edits.push(
+            ProjectEdit::SetMeta {
+                meta: Box::new(local.meta.clone()),
+                before: None,
+            }
+            .stamped(base),
+        );
     }
 
     // Pages: removed, added, renumbered, edited.
@@ -110,18 +114,26 @@ pub fn outgoing(
     // Devices, one edit per changed tag.
     for (tag, d) in &local.devices {
         if base.devices.get(tag) != Some(d) {
-            out.edits.push(ProjectEdit::SetDevice {
-                tag: tag.clone(),
-                device: Some(d.clone()),
-            });
+            out.edits.push(
+                ProjectEdit::SetDevice {
+                    tag: tag.clone(),
+                    device: Some(d.clone()),
+                    before: None,
+                }
+                .stamped(base),
+            );
         }
     }
     for tag in base.devices.keys() {
         if !local.devices.contains_key(tag) {
-            out.edits.push(ProjectEdit::SetDevice {
-                tag: tag.clone(),
-                device: None,
-            });
+            out.edits.push(
+                ProjectEdit::SetDevice {
+                    tag: tag.clone(),
+                    device: None,
+                    before: None,
+                }
+                .stamped(base),
+            );
         }
     }
 
@@ -145,17 +157,27 @@ pub fn outgoing(
         };
         let now = of(local);
         if now != of(base) {
-            out.edits.push(ProjectEdit::SetComments {
-                page: page.to_owned(),
-                comments: now,
-            });
+            out.edits.push(
+                ProjectEdit::SetComments {
+                    page: page.to_owned(),
+                    comments: now,
+                    before: None,
+                }
+                .stamped(base),
+            );
         }
     }
 
     // Panels.
     for p in &local.panels {
         if base.panels.iter().find(|b| b.id == p.id) != Some(p) {
-            out.edits.push(ProjectEdit::SetPanel { panel: p.clone() });
+            out.edits.push(
+                ProjectEdit::SetPanel {
+                    panel: p.clone(),
+                    before: None,
+                }
+                .stamped(base),
+            );
         }
     }
     for b in &base.panels {
