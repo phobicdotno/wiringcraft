@@ -55,13 +55,35 @@ pub(crate) struct Drawing {
     pub(crate) blocks: BTreeMap<String, Vec<Entity>>,
 }
 
+/// The most entities one import draws, block references expanded: a few nested blocks that
+/// each insert the next many times would otherwise fill the memory.
+pub const MAX_DRAWN: usize = 2_000_000;
+
+/// The key under which entities left out over [`MAX_DRAWN`] are counted.
+pub(crate) const OVER_LIMIT: &str = "over the limit";
+
+/// Shapes and POINT positions, each with its layer.
+pub(crate) type Drawn = (Vec<(String, Shape)>, Vec<(String, Point)>);
+
 /// Draw `ents` of `d` as page shapes with their layers (y flipped, unscaled), block references
-/// expanded. Entities not drawn are counted in `skipped`.
-pub(crate) fn draw(d: &Drawing, ents: &[Entity], skipped: &mut BTreeMap<String, usize>) -> Vec<(String, Shape)> {
+/// expanded, and the POINT positions. Entities not drawn are counted in `skipped`. Each entity
+/// visited takes one from `budget`; when it runs out the rest is left out (and counted).
+pub(crate) fn draw(d: &Drawing, ents: &[Entity], skipped: &mut BTreeMap<String, usize>, budget: &mut usize) -> Drawn {
     let mut out = Vec::new();
     let mut points = Vec::new();
-    shapes(d, ents, Xf::ID, 1.0, 0, &|_| false, &mut out, &mut points, skipped);
-    out
+    shapes(
+        d,
+        ents,
+        Xf::ID,
+        1.0,
+        0,
+        &|_| false,
+        &mut out,
+        &mut points,
+        skipped,
+        budget,
+    );
+    (out, points)
 }
 
 fn pairs(text: &str) -> Result<Vec<(i32, String)>> {
@@ -204,6 +226,7 @@ fn shapes(
     out: &mut Vec<(String, Shape)>,
     points: &mut Vec<(String, Point)>,
     skipped: &mut BTreeMap<String, usize>,
+    budget: &mut usize,
 ) {
     if depth > 8 {
         return; // block nesting this deep is either a cycle or not worth drawing
@@ -214,6 +237,11 @@ fn shapes(
     };
     let r_scale = xf.sx.abs() * scale;
     for e in ents {
+        if *budget == 0 {
+            *skipped.entry(OVER_LIMIT.to_owned()).or_default() += 1;
+            return;
+        }
+        *budget -= 1;
         let layer = e.layer();
         if skip_layer(&layer) {
             continue;
@@ -322,8 +350,8 @@ fn shapes(
                     text,
                     height: (e.f_or(40, 2.5) * r_scale).max(0.5),
                     align,
-                    // Code 50: rotation in degrees, counter-clockwise.
-                    angle: normal_angle(e.f(50)),
+                    // Code 50: rotation in degrees, counter-clockwise; a turned block turns it too.
+                    angle: normal_angle(e.f(50) + xf.rot),
                 })
             }
             "SOLID" | "TRACE" => {
@@ -348,7 +376,18 @@ fn shapes(
                         rot: e.f(50),
                     }
                     .then(&xf);
-                    shapes(d, inner, ixf, scale, depth + 1, skip_layer, out, points, skipped);
+                    shapes(
+                        d,
+                        inner,
+                        ixf,
+                        scale,
+                        depth + 1,
+                        skip_layer,
+                        out,
+                        points,
+                        skipped,
+                        budget,
+                    );
                 }
                 None
             }
@@ -892,7 +931,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
     skipped
         .into_iter()
         .map(|(kind, n)| {
-            if kind == HATCH_UNFILLED {
+            if kind == OVER_LIMIT {
+                format!("{n} entities not drawn: the drawing expands to more than {MAX_DRAWN} entities")
+            } else if kind == HATCH_UNFILLED {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
             } else {
@@ -957,6 +998,7 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
         &mut raw,
         &mut points,
         &mut skipped,
+        &mut { MAX_DRAWN },
     );
     let mut pins: Vec<(Option<String>, Point)> = points.into_iter().map(|(_, p)| (None, p)).collect();
     let mut labels = Vec::new();
@@ -1064,6 +1106,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         &mut raw,
         &mut points,
         &mut skipped,
+        &mut { MAX_DRAWN },
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped);
@@ -1197,6 +1240,7 @@ mod tests {
             &mut raw,
             &mut points,
             &mut skipped,
+            &mut { MAX_DRAWN },
         );
         Ok((raw.into_iter().map(|(_, s)| s).collect(), skipped))
     }
@@ -1330,6 +1374,20 @@ mod tests {
         let ents = "0\n3DFACE\n8\n0\n0\n3DFACE\n8\n0\n0\nMLINE\n8\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
         let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
         assert_eq!(p.warnings, ["2 3DFACE entities not read", "1 MLINE entity not read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_in_a_turned_block_turns_with_it() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nB\n0\nTEXT\n10\n0\n20\n0\n40\n2\n1\nK1\n0\nENDBLK\n";
+        let turned = "0\nINSERT\n2\nB\n10\n0\n20\n0\n50\n90\n";
+        let (g, _) = drawn(turned, blocks)?;
+        assert!(
+            matches!(&g[..], [Shape::Text { angle, .. }] if (*angle - 90.0).abs() < 1e-9),
+            "{g:?}"
+        );
+        let (g, _) = drawn("0\nINSERT\n2\nB\n10\n0\n20\n0\n", blocks)?;
+        assert!(matches!(&g[..], [Shape::Text { angle, .. }] if *angle == 0.0), "{g:?}");
         Ok(())
     }
 

@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use wc_core::geom::Shape;
+use wc_core::geom::{Point, Shape};
 
 use super::bits::{Bits, modular_char, modular_short};
 use super::{Sections, Version, bad, read_sections};
@@ -43,9 +43,19 @@ pub struct Drawing {
     pub blocks: BTreeMap<String, Vec<Shape>>,
     /// The shapes of model space.
     pub model: Vec<Shape>,
+    /// The POINT positions of each block (connection points in symbol drawings).
+    pub block_points: BTreeMap<String, Vec<Point>>,
+    /// The POINT positions of model space.
+    pub model_points: Vec<Point>,
     /// How many of each kind of entity or object were not read, by type name.
     pub skipped: BTreeMap<String, usize>,
+    /// Why objects counted under [`DAMAGED`] could not be decoded: handle, offset and reason,
+    /// for the first [`MAX_REASONS`] of them.
+    pub damaged: Vec<String>,
 }
+
+/// The most reasons [`Drawing::damaged`] keeps.
+pub const MAX_REASONS: usize = 100;
 
 /// Read the drawing of a DWG file of a supported version.
 pub fn read_drawing(bytes: &[u8]) -> Result<Drawing> {
@@ -54,25 +64,50 @@ pub fn read_drawing(bytes: &[u8]) -> Result<Drawing> {
 
 /// The drawing held by the sections of a DWG file.
 pub fn drawing(sections: &Sections) -> Result<Drawing> {
-    let (d, mut skipped) = dxf_drawing(sections)?;
-    let draw = |ents: &[Entity], skipped: &mut BTreeMap<String, usize>| {
-        dxf::draw(&d, ents, skipped)
-            .into_iter()
-            .map(|(_, s)| s)
-            .collect::<Vec<_>>()
+    let Read {
+        drawing: d,
+        mut skipped,
+        damaged,
+    } = dxf_drawing(sections)?;
+    // One budget for model space and every block, so nested blocks cannot multiply the work.
+    let mut budget = dxf::MAX_DRAWN;
+    let mut draw = |ents: &[Entity], skipped: &mut BTreeMap<String, usize>| {
+        let (shapes, points) = dxf::draw(&d, ents, skipped, &mut budget);
+        (
+            shapes.into_iter().map(|(_, s)| s).collect::<Vec<_>>(),
+            points.into_iter().map(|(_, p)| p).collect::<Vec<_>>(),
+        )
     };
-    let model = draw(&d.entities, &mut skipped);
-    let blocks = d
-        .blocks
-        .iter()
-        .map(|(name, ents)| (name.clone(), draw(ents, &mut skipped)))
-        .collect();
-    Ok(Drawing { blocks, model, skipped })
+    let (model, model_points) = draw(&d.entities, &mut skipped);
+    let mut blocks = BTreeMap::new();
+    let mut block_points = BTreeMap::new();
+    for (name, ents) in &d.blocks {
+        let (shapes, points) = draw(ents, &mut skipped);
+        blocks.insert(name.clone(), shapes);
+        if !points.is_empty() {
+            block_points.insert(name.clone(), points);
+        }
+    }
+    Ok(Drawing {
+        blocks,
+        model,
+        block_points,
+        model_points,
+        skipped,
+        damaged,
+    })
+}
+
+/// What [`dxf_drawing`] reads from a file.
+pub(crate) struct Read {
+    pub(crate) drawing: dxf::Drawing,
+    pub(crate) skipped: BTreeMap<String, usize>,
+    pub(crate) damaged: Vec<String>,
 }
 
 /// The entities of a DWG file as the DXF reader's entities, by block and model space, with a
 /// count of what was not read.
-pub(crate) fn dxf_drawing(sections: &Sections) -> Result<(dxf::Drawing, BTreeMap<String, usize>)> {
+pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     let map = sections
         .get("AcDb:Handles")
         .ok_or_else(|| bad("the drawing has no object map"))?;
@@ -82,28 +117,41 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<(dxf::Drawing, BTreeMap
     let map = object_map(map)?;
     let mut skipped = BTreeMap::new();
     let mut decoded = Decoded::default();
+    let mut damaged = Vec::new();
     for (handle, at) in map {
-        if let Err(_e) = decode(objects, at, handle, sections.version, &mut decoded, &mut skipped) {
+        if let Err(e) = decode(objects, at, handle, sections.version, &mut decoded, &mut skipped) {
             *skipped.entry(DAMAGED.to_owned()).or_default() += 1;
+            if damaged.len() < MAX_REASONS {
+                damaged.push(format!("object {handle:X} at {at}: {e}"));
+            }
         }
     }
-    Ok((decoded.assemble(&mut skipped), skipped))
+    Ok(Read {
+        drawing: decoded.assemble(&mut skipped),
+        skipped,
+        damaged,
+    })
 }
 
 /// Read the object map: each object's handle and its offset in `AcDb:AcDbObjects`, in order.
 pub(crate) fn object_map(data: &[u8]) -> Result<Vec<(u64, usize)>> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     let mut pos = 0usize;
+    let cut = || bad("the object map is cut off");
     // Each part is a big-endian size (counting the size itself), pairs of handle and offset
-    // changes, and a CRC. A part of size 2 ends the map.
-    while let Some(head) = data.get(pos..pos + 2) {
+    // changes, and a two-byte CRC. A part of size 2 ends the map.
+    loop {
+        let head = data.get(pos..pos + 2).ok_or_else(cut)?;
         let size = usize::from(u16::from_be_bytes([head[0], head[1]]));
-        if size == 0 || size == 2 {
+        if size == 2 {
             break;
         }
-        let body = data
-            .get(pos + 2..pos + size)
-            .ok_or_else(|| bad("the object map is cut off"))?;
+        if size < 2 {
+            return Err(bad(format!("the object map has a part of size {size}")));
+        }
+        let body = data.get(pos + 2..pos + size).ok_or_else(cut)?;
+        data.get(pos + size..pos + size + 2).ok_or_else(cut)?;
         let (mut handle, mut at) = (0u64, 0i64);
         let mut i = 0;
         while i < body.len() {
@@ -118,6 +166,10 @@ pub(crate) fn object_map(data: &[u8]) -> Result<Vec<(u64, usize)>> {
                 .checked_add(da)
                 .ok_or_else(|| bad("an object offset in the object map is out of range"))?;
             let at = usize::try_from(at).map_err(|_| bad("an object offset in the object map is negative"))?;
+            // A handle listed twice would decode (and keep) the same object twice.
+            if !seen.insert(handle) {
+                return Err(bad(format!("handle {handle:X} is listed twice in the object map")));
+            }
             out.push((handle, at));
             if out.len() > MAX_OBJECTS {
                 return Err(bad("the object map lists too many objects"));
@@ -259,6 +311,8 @@ struct Item {
     entity: Entity,
     /// The block an INSERT shows.
     block: Option<u64>,
+    /// The vertices a POLYLINE owns, in their order.
+    vertices: Vec<u64>,
 }
 
 /// What the objects of a file hold, before the entities are put in their blocks.
@@ -371,6 +425,7 @@ fn decode(
     }
     let mut e = Codes::default();
     let mut block = None;
+    let mut vertices = Vec::new();
     match o.kind {
         1..=3 => text(&mut o, &mut e)?,
         7 => block = Some(insert(&mut o, &mut e)?),
@@ -392,11 +447,13 @@ fn decode(
             o.data.bd()?;
             let (_, _, z) = o.data.be()?;
             e.i(70, i64::from(flags & 1)).f(230, z);
+            vertices = owned(&mut o)?;
         }
         16 => {
             o.data.rc()?;
             let flags = o.data.rc()?;
             e.i(70, i64::from(flags & 1));
+            vertices = owned(&mut o)?;
         }
         17 | 18 => {
             let (x, y, _) = o.data.bd3()?;
@@ -449,8 +506,21 @@ fn decode(
             codes: e.0,
         },
         block,
+        vertices,
     });
     Ok(())
+}
+
+/// The objects a POLYLINE owns (its vertices), in order: a count in the data, their handles in
+/// the handle stream.
+fn owned(o: &mut Object) -> Result<Vec<u64>> {
+    let n = o.data.bl()?;
+    let mut out = Vec::new();
+    for _ in 0..n {
+        // Each handle takes at least a byte, so a damaged count ends with the stream.
+        out.push(o.handle_ref()?);
+    }
+    Ok(out)
 }
 
 /// Group codes of an entity being built.
@@ -524,6 +594,10 @@ fn entity_common(o: &mut Object) -> Result<Common> {
     if !no_xdict {
         o.handles.h()?;
     }
+    // A colour from a colour book is a reference to its AcDbColor object.
+    if color & 0x4000 != 0 {
+        o.handles.h()?;
+    }
     let layer = o.handle_ref()?;
     if linetype == 3 {
         o.handles.h()?;
@@ -575,6 +649,9 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
         d.bs()?;
     }
     let align = if flags & 0x40 == 0 { d.bs()? } else { 0 };
+    if flags & 0x80 == 0 {
+        d.bs()?;
+    }
     // An aligned text sits on its alignment point.
     let (px, py) = if matches!(align, 1 | 2 | 4) { (ax, ay) } else { (x, y) };
     e.f(10, px).f(20, py).f(11, ax).f(21, ay).f(40, height);
@@ -720,7 +797,8 @@ impl Decoded {
             hidden,
         } = self;
         let kinds: HashMap<u64, &str> = items.iter().map(|i| (i.handle, i.entity.kind.as_str())).collect();
-        // Vertices by polyline and attributes by INSERT, in handle order.
+        // Vertices by polyline and attributes by INSERT, in handle order (a polyline then puts
+        // its vertices in its own order).
         let mut children: HashMap<u64, Vec<&Item>> = HashMap::new();
         for item in &items {
             if let Owner::Object(owner) = item.owner
@@ -761,7 +839,15 @@ impl Decoded {
             match kind {
                 "POLYLINE" => {
                     entity.kind = "LWPOLYLINE".into();
-                    for v in own.iter().filter(|c| c.entity.kind == "VERTEX") {
+                    let vertices: Vec<&Item> = own.iter().copied().filter(|c| c.entity.kind == "VERTEX").collect();
+                    // In the order the polyline lists them; handle order when it lists none.
+                    let ordered: Vec<&Item> = if item.vertices.is_empty() {
+                        vertices
+                    } else {
+                        let by_handle: HashMap<u64, &Item> = vertices.iter().map(|v| (v.handle, *v)).collect();
+                        item.vertices.iter().filter_map(|h| by_handle.get(h).copied()).collect()
+                    };
+                    for v in ordered {
                         entity.codes.extend(v.entity.codes.iter().cloned());
                     }
                     list.push(entity);

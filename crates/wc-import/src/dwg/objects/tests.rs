@@ -317,7 +317,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
     d.bb(if h.owner.is_some() { 0 } else { 2 });
     d.bl(u32::from(h.extras)).b(!h.extras);
     if h.extras {
-        d.bs(0x8000 | 0x2000 | 7).bl(0x00FF_0000).bl(0x0200_0080);
+        d.bs(0x8000 | 0x4000 | 0x2000 | 7).bl(0x00FF_0000).bl(0x0200_0080);
     } else {
         d.bs(256);
     }
@@ -333,7 +333,8 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
         hs.h(4, owner);
     }
     if h.extras {
-        hs.h(4, 0x77).h(3, 0x78);
+        // A reactor, the extension dictionary and the colour-book colour.
+        hs.h(4, 0x77).h(3, 0x78).h(5, 0x79);
         // The layer as an offset back from the entity's own handle.
         hs.h(0xC, handle - h.layer);
         hs.h(5, 0x14).h(5, 0x15);
@@ -366,8 +367,16 @@ fn line(v: Version, handle: u64, h: Head, a: (f64, f64), b: (f64, f64)) -> Obj {
 }
 
 fn text_data(o: &mut Obj, at: (f64, f64), value: &str, height: f64, rotation: f64) {
+    text_data_with(o, at, value, height, rotation, None);
+}
+
+/// [`text_data`], with a vertical alignment written out when given.
+fn text_data_with(o: &mut Obj, at: (f64, f64), value: &str, height: f64, rotation: f64, valign: Option<u16>) {
     // Elevation, alignment point, oblique, width factor, generation and alignments left out.
-    let mut flags = 0x01 | 0x02 | 0x04 | 0x10 | 0x20 | 0x40 | 0x80;
+    let mut flags = 0x01 | 0x02 | 0x04 | 0x10 | 0x20 | 0x40;
+    if valign.is_none() {
+        flags |= 0x80;
+    }
     if rotation == 0.0 {
         flags |= 0x08;
     }
@@ -377,12 +386,16 @@ fn text_data(o: &mut Obj, at: (f64, f64), value: &str, height: f64, rotation: f6
     }
     o.data.rd(height);
     o.text(value);
+    if let Some(v) = valign {
+        o.data.bs(v);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn attrib(v: Version, kind: u16, handle: u64, h: Head, at: (f64, f64), value: &str, tag: &str, flags: u8) -> Obj {
     let mut o = entity(v, kind, handle, h);
-    text_data(&mut o, at, value, 2.5, 0.0);
+    // Attributes carry a vertical alignment, so the field after the text is read too.
+    text_data_with(&mut o, at, value, 2.5, 0.0, Some(1));
     if v == Version::R2010 {
         o.data.rc(0);
     }
@@ -467,6 +480,14 @@ fn sample(v: Version) -> Vec<Obj> {
         .rd(1.0);
     s.data.be((0.0, 0.0, 1.0));
     objs.push(s);
+    // A TRACE, read like a SOLID: a triangle (third and fourth corner the same).
+    let mut tr = entity(v, 32, 0x47, relay);
+    tr.data.bt(0.0).bd(0.0);
+    for (x, y) in [(5.0, 5.0), (8.0, 5.0), (5.0, 8.0), (5.0, 8.0)] {
+        tr.data.rd(x).rd(y);
+    }
+    tr.data.be((0.0, 0.0, 1.0));
+    objs.push(tr);
     // Model space: RELAY with a visible and a hidden attribute, a 2D polyline of three
     // vertices, an MTEXT, a point, an invisible line, an ellipse and a custom object.
     let mut i = entity(v, 7, 0x50, model);
@@ -482,7 +503,17 @@ fn sample(v: Version) -> Vec<Obj> {
     objs.push(attrib(v, 2, 0x51, head(Some(0x50)), (100.0, 58.0), "-K1", "TAG", 0));
     objs.push(attrib(v, 2, 0x52, head(Some(0x50)), (100.0, 60.0), "secret", "NOTE", 1));
     let mut pl = entity(v, 15, 0x53, model);
-    pl.data.bs(0).bs(0).bd(0.0).bd(0.0).bt(0.0).bd(0.0).be((0.0, 0.0, 1.0));
+    pl.data
+        .bs(0)
+        .bs(0)
+        .bd(0.0)
+        .bd(0.0)
+        .bt(0.0)
+        .bd(0.0)
+        .be((0.0, 0.0, 1.0))
+        .bl(3);
+    // The polyline lists its vertices in another order than their handles.
+    pl.handles.h(4, 0x54).h(4, 0x56).h(4, 0x55).h(3, 0x57);
     objs.push(pl);
     for (n, (x, y)) in [(0.0, 0.0), (0.0, 10.0), (10.0, 10.0)].into_iter().enumerate() {
         let mut vx = entity(v, 10, 0x54 + n as u64, head(Some(0x53)));
@@ -490,6 +521,17 @@ fn sample(v: Version) -> Vec<Obj> {
         objs.push(vx);
     }
     objs.push(entity(v, 6, 0x57, head(Some(0x53))));
+    // A closed 3D polyline of three vertices, listed in handle order.
+    let mut p3 = entity(v, 16, 0x60, model);
+    p3.data.rc(0).rc(1).bl(3);
+    p3.handles.h(4, 0x61).h(4, 0x62).h(4, 0x63).h(3, 0x64);
+    objs.push(p3);
+    for (n, (x, y)) in [(50.0, 0.0), (60.0, 0.0), (60.0, 5.0)].into_iter().enumerate() {
+        let mut vx = entity(v, 11, 0x61 + n as u64, head(Some(0x60)));
+        vx.data.rc(0).bd3((x, y, 2.0));
+        objs.push(vx);
+    }
+    objs.push(entity(v, 6, 0x64, head(Some(0x60))));
     let mut m = entity(v, 44, 0x58, model);
     m.data
         .bd3((30.0, 40.0, 0.0))
@@ -633,6 +675,12 @@ fn check_sample(d: &Drawing) {
     assert!(relay.iter().any(|s| matches!(s,
         Shape::Polyline { points, closed: true, filled: true }
             if points.len() == 4 && near(points[2], Point::new(1.0, -1.0)))));
+    assert!(
+        relay.iter().any(|s| matches!(s,
+        Shape::Polyline { points, closed: true, filled: true }
+            if points.len() == 3 && near(points[1], Point::new(8.0, -5.0)))),
+        "a TRACE"
+    );
     assert!(!texts(relay).contains(&"?"), "an attribute definition draws nothing");
 
     let model = &d.model;
@@ -651,7 +699,19 @@ fn check_sample(d: &Drawing) {
         Shape::Text { text, align: Align::Center, .. } if text == "Pump start")));
     assert!(model.iter().any(|s| matches!(s,
         Shape::Polyline { points, closed: false, .. }
-            if points.len() == 3 && near(points[1], Point::new(0.0, -10.0)) && near(points[2], Point::new(10.0, -10.0)))));
+            if points.len() == 3 && near(points[1], Point::new(10.0, -10.0)) && near(points[2], Point::new(0.0, -10.0)))),
+        "the vertices in the polyline's order, not their handles'");
+    assert!(
+        model.iter().any(|s| matches!(s,
+        Shape::Polyline { points, closed: true, .. }
+            if points.len() == 3 && near(points[0], Point::new(50.0, 0.0)) && near(points[2], Point::new(60.0, -5.0)))),
+        "a 3D polyline"
+    );
+    assert_eq!(d.model_points.len(), 1);
+    assert!(
+        near(d.model_points[0], Point::new(7.0, -8.0)),
+        "POINT positions are kept"
+    );
     assert!(
         !has_line(model, Point::new(0.0, 0.0), Point::new(1.0, -1.0)),
         "an invisible line is left out"
@@ -702,7 +762,7 @@ fn a_whole_file_is_read() -> TestResult {
 #[test]
 fn layers_go_with_the_entities() -> TestResult {
     let v = Version::R2010;
-    let (d, _) = dxf_drawing(&sections(v, &sample(v), &[]))?;
+    let d = dxf_drawing(&sections(v, &sample(v), &[]))?.drawing;
     let relay = &d.blocks["RELAY"];
     assert!(
         relay.iter().all(|e| e.codes.contains(&(8, "SYMBOL".into()))),
@@ -793,6 +853,17 @@ fn a_damaged_object_is_counted_and_the_rest_read() -> TestResult {
     let d = drawing(&sections(v, &objs, &[(0x900, objects.len() + 10), (0x901, 4)]))?;
     assert_eq!(d.skipped.get(DAMAGED), Some(&2));
     assert_eq!(d.blocks.len(), 2);
+    assert_eq!(d.damaged.len(), 2, "with their reasons: {:?}", d.damaged);
+    assert!(
+        d.damaged
+            .iter()
+            .any(|r| r.starts_with("object 900 at") && r.contains("past the end"))
+    );
+    assert!(
+        d.damaged
+            .iter()
+            .any(|r| r.starts_with("object 901 at 4") && r.contains("differs"))
+    );
     Ok(())
 }
 
@@ -856,4 +927,68 @@ fn flipped_and_cut_objects_give_no_panic() {
             let _ = drawing(&s2);
         }
     }
+}
+
+#[test]
+fn an_object_map_needs_its_crc_and_its_end() -> TestResult {
+    let entry = [0u8, 4, 1, 4];
+    for cut in [
+        &[][..],
+        &[0],
+        &entry,
+        &[0, 4, 1, 4, 0],
+        &[0, 4, 1, 4, 0, 0],
+        &[0, 4, 1, 4, 0, 0, 0],
+    ] {
+        assert!(object_map(cut).is_err(), "{cut:?}");
+    }
+    assert!(object_map(&[0, 1]).is_err(), "a part too short to hold its size");
+    assert_eq!(object_map(&[0, 4, 1, 4, 0, 0, 0, 2])?, [(1, 4)]);
+    assert!(object_map(&[0, 2])?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_handle_listed_twice_is_refused_even_across_parts() {
+    // Handle 1 at 4, then in a second part handle 1 again.
+    let map = [0u8, 4, 1, 4, 0, 0, 0, 4, 1, 8, 0, 0, 0, 2];
+    assert!(object_map(&map).is_err_and(|e| e.to_string().contains("listed twice")));
+    // The same within one part: a handle step of zero.
+    let map = [0u8, 6, 1, 4, 0, 4, 0, 0, 0, 2];
+    assert!(object_map(&map).is_err());
+    // Different handles across parts are fine.
+    let map = [0u8, 4, 1, 4, 0, 0, 0, 4, 2, 8, 0, 0, 0, 2];
+    assert_eq!(object_map(&map).ok(), Some(vec![(1, 4), (2, 8)]));
+}
+
+#[test]
+fn blocks_inserting_blocks_many_times_stop_at_the_limit() -> TestResult {
+    let v = Version::R2010;
+    // B0 to B6 each insert the next block 16 times; B7 holds a line: 16^7 lines in all.
+    let mut objs = vec![entry(v, LAYER, LAYER_H, "0")];
+    let mut next = 0x1000u64;
+    for b in 0..8u64 {
+        objs.push(entry(v, BLOCK_HEADER, 0x100 + b, &format!("B{b}")));
+        if b == 7 {
+            objs.push(line(v, next, head(Some(0x107)), (0.0, 0.0), (1.0, 0.0)));
+            next += 1;
+            continue;
+        }
+        for _ in 0..16 {
+            let mut i = entity(v, 7, next, head(Some(0x100 + b)));
+            i.data.bd3((1.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+            i.handles.h(5, 0x101 + b);
+            objs.push(i);
+            next += 1;
+        }
+    }
+    let mut i = entity(v, 7, next, head(None));
+    i.data.bd3((0.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+    i.handles.h(5, 0x100);
+    objs.push(i);
+    let d = drawing(&sections(v, &objs, &[]))?;
+    let drawn = d.model.len() + d.blocks.values().map(Vec::len).sum::<usize>();
+    assert!(drawn <= dxf::MAX_DRAWN, "{drawn}");
+    assert!(d.skipped.contains_key(dxf::OVER_LIMIT), "{:?}", d.skipped);
+    Ok(())
 }
