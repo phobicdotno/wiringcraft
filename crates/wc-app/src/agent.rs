@@ -2644,6 +2644,11 @@ mod tests {
         a.ed = crate::canvas::Editor::default();
         a.live_check(&ctx);
         assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // Turned off while markers are shown: they go.
+        a.prefs.live_check = false;
+        a.live_check(&ctx);
+        assert!(a.ed.live.is_empty(), "{:?}", a.ed.live);
+        a.prefs.live_check = true;
         // Another project is opened: the first one's findings are not shown on it.
         let (_other, b) = crate::state::tests::project();
         a.open = Some(b);
@@ -2655,10 +2660,6 @@ mod tests {
             "Check: checking",
             "no counts of the first project"
         );
-        // Turned off: nothing is shown.
-        a.prefs.live_check = false;
-        a.live_check(&ctx);
-        assert!(a.ed.live.is_empty());
     }
 
     #[test]
