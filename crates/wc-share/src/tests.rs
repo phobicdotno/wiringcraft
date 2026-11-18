@@ -2354,7 +2354,8 @@ fn a_batch_is_one_change_applied_all_or_nothing() -> TestResult {
     assert_eq!(a.project.as_ref(), Some(s.host.project()), "Ola's copy is put right");
     assert_eq!(b.project.as_ref(), Some(s.host.project()));
 
-    // A batch holds two batchable edits or more.
+    // A batch holds two batchable edits or more. One that does not is refused whole and not
+    // applied in Ola's copy either (an added page would stay there, as nothing puts it back).
     a_link.send(a.edit_project(ProjectEdit::Batch {
         edits: vec![
             ProjectEdit::AddPage {
@@ -2363,6 +2364,7 @@ fn a_batch_is_one_change_applied_all_or_nothing() -> TestResult {
             ProjectEdit::RemovePanel { id: "cab1".into() },
         ],
     }))?;
+    assert!(a.project.as_ref().is_some_and(|p| p.page("p0009").is_none()));
     a_link.send(a.edit_project(ProjectEdit::Batch {
         edits: vec![ProjectEdit::RemovePanel { id: "cab1".into() }],
     }))?;
@@ -2372,6 +2374,42 @@ fn a_batch_is_one_change_applied_all_or_nothing() -> TestResult {
         [Refusal::Invalid { .. }, Refusal::Invalid { .. }]
     ));
     assert_eq!(s.host.project(), &after_kari);
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    Ok(())
+}
+
+#[test]
+fn each_edit_of_a_batch_is_checked_against_what_the_ones_before_it_did() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let tag = wc_core::DeviceTag::parse("-K1")?;
+    let set = |description: &str, seen: &wc_core::Project| {
+        ProjectEdit::SetDevice {
+            tag: tag.clone(),
+            device: Some(Device {
+                description: description.into(),
+                ..Device::default()
+            }),
+            before: None,
+        }
+        .stamped(seen)
+    };
+    // -K1 described twice in one action: the second edit is stamped from the project as the
+    // first leaves it, so it only matches if the batch is checked in order.
+    let seen = s.host.project().clone();
+    let first = set("Pump", &seen);
+    let mut after_first = seen.clone();
+    crate::protocol::apply_edit(&mut after_first, &first);
+    let second = set("Pump contactor", &after_first);
+    a_link.send(a.edit_project(ProjectEdit::Batch {
+        edits: vec![first, second],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert_eq!(
+        s.host.project().devices.get(&tag).map(|d| d.description.as_str()),
+        Some("Pump contactor")
+    );
     Ok(())
 }
 

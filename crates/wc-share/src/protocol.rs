@@ -278,15 +278,22 @@ impl ProjectEdit {
     /// Whether any of this change is applied at once (for a batch: any of its edits).
     pub fn partly_applied_at_once(&self) -> bool {
         match self {
-            Self::Batch { edits } => edits.iter().any(Self::applied_at_once),
+            Self::Batch { edits } => Self::well_formed(edits) && edits.iter().any(Self::applied_at_once),
             e => e.applied_at_once(),
         }
+    }
+
+    /// Whether these edits make a batch the host can accept: two or more, each batchable.
+    fn well_formed(edits: &[ProjectEdit]) -> bool {
+        edits.len() >= 2 && edits.iter().all(Self::batchable)
     }
 
     /// Apply to a participant's own copy what of this change is applied at once.
     pub fn apply_at_once(&self, project: &mut Project) {
         match self {
-            Self::Batch { edits } => {
+            // A batch the host will refuse whole (one that holds an edit that cannot be batched)
+            // is not applied here either, so this copy stays as the host's.
+            Self::Batch { edits } if Self::well_formed(edits) => {
                 for e in edits.iter().filter(|e| e.applied_at_once()) {
                     apply_edit(project, e);
                 }
