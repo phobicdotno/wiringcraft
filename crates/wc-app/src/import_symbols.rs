@@ -126,8 +126,9 @@ fn read(file: &Path) -> Result<FileSymbols, String> {
 /// Import symbol files into the library folder `lib`, each by its extension. Ids are
 /// `dxf.<file name>`, `svg.<file name>`, `kicad.<file name>.<symbol>` and `qet.<file name>`.
 /// A file that fails is listed and the others still go in; a symbol whose id an earlier file in
-/// the same import already wrote is refused instead of overwriting it.
-pub fn import(files: &[PathBuf], lib: &Path) -> Outcome {
+/// the same import already wrote is refused instead of overwriting it. A symbol already in the
+/// library is left as it is unless `replace` is set, since other projects may use it.
+pub fn import(files: &[PathBuf], lib: &Path, replace: bool) -> Outcome {
     let mut out = Outcome::default();
     let mut ids: BTreeMap<String, PathBuf> = BTreeMap::new();
     for file in files {
@@ -147,6 +148,15 @@ pub fn import(files: &[PathBuf], lib: &Path) -> Outcome {
                     "{shown}: {name} gives the same id {} as {}, skipped",
                     symbol.id,
                     first.display()
+                ));
+                continue;
+            }
+            let existing = lib.join("symbols").join(format!("{}.json", symbol.id));
+            if !replace && existing.exists() {
+                out.failed.push(format!(
+                    "{shown}: {name}: {} is already in the library, kept (tick \"Replace symbols already in \
+                     the library\" to overwrite it)",
+                    symbol.id
                 ));
                 continue;
             }
@@ -219,7 +229,7 @@ mod tests {
             // Same id as Coil.svg: refused, the first one stays.
             write("coil.svg", SVG),
         ];
-        let out = import(&files, lib.path());
+        let out = import(&files, lib.path(), false);
         let symbols = lib.path().join("symbols");
         for id in ["svg.coil", "kicad.relays.k", "qet.lamp_red", "dxf.line"] {
             assert!(symbols.join(format!("{id}.json")).is_file(), "{id}: {out:?}");
@@ -257,5 +267,23 @@ mod tests {
         assert_eq!(extension(Path::new("X.DXF")), Some("dxf"));
         assert_eq!(extension(Path::new("x.kicad_sym")), Some("kicad_sym"));
         assert_eq!(extension(Path::new("x.sym")), None);
+    }
+
+    #[test]
+    fn a_symbol_already_in_the_library_is_kept_unless_replace_is_ticked() {
+        let src = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let file = src.path().join("Coil.svg");
+        std::fs::write(&file, SVG).unwrap();
+        let path = lib.path().join("symbols").join("svg.coil.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"mine\": true}").unwrap();
+        let out = import(std::slice::from_ref(&file), lib.path(), false);
+        assert!(out.written.is_empty(), "{out:?}");
+        assert!(out.failed[0].contains("already in the library"), "{out:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"mine\": true}");
+        let out = import(&[file], lib.path(), true);
+        assert_eq!(out.written.len(), 1, "{out:?}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("svg.coil"));
     }
 }

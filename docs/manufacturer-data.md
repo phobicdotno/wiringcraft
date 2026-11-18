@@ -32,6 +32,7 @@ each read by its extension, and writes them into one of the project's library fo
 project's own first). Ids are `dxf.<file name>`, `svg.<file name>`, `kicad.<file name>.<symbol>` and
 `qet.<file name>`; QElectroTech uses the default 5 mm grid and KiCad scale 1. The result lists every
 symbol written, every warning and every file that failed; a failing file does not stop the others.
+A symbol already in the folder is kept unless "Replace symbols already in the library" is ticked.
 
 Not read today: the drawings of EPLAN macros inside EDZ files (listed only, #144), **DWG**, **STEP** (3D), ECLASS data
 outside a BMEcat catalogue.

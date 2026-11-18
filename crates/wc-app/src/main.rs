@@ -120,6 +120,8 @@ enum Dialog {
     ImportSymbols {
         targets: Vec<symbol_editor::Target>,
         chosen: usize,
+        /// Overwrite symbols already in the library folder (off: they are kept and listed).
+        replace: bool,
     },
     /// WAGO smartScript marker export: which markers, the text lines of each, the language of
     /// the header row, and optionally one terminal strip.
@@ -788,7 +790,11 @@ impl App {
                                 .into(),
                         )
                     } else {
-                        Dialog::ImportSymbols { targets, chosen: 0 }
+                        Dialog::ImportSymbols {
+                            targets,
+                            chosen: 0,
+                            replace: false,
+                        }
                     });
                 }
                 Err(e) => self.dialog = Some(Dialog::Message(format!("The library could not be opened:\n{e}"))),
@@ -1820,7 +1826,11 @@ impl App {
                         }
                     });
                 }
-                Dialog::ImportSymbols { targets, chosen } => {
+                Dialog::ImportSymbols {
+                    targets,
+                    chosen,
+                    replace,
+                } => {
                     ui.label(
                         "Pick DXF, SVG, KiCad (.kicad_sym) or QElectroTech (.elmt) files. Each is read by its \
                          extension and its symbols are written into the library folder below.",
@@ -1836,6 +1846,8 @@ impl App {
                                 }
                             });
                     });
+                    ui.checkbox(replace, "Replace symbols already in the library")
+                        .on_hover_text("Off: a symbol with the same id stays as it is, and the result lists it");
                     ui.horizontal(|ui| {
                         if ui.button("Choose files and import…").clicked()
                             && let Some((_, root)) = targets.get(*chosen)
@@ -1845,8 +1857,9 @@ impl App {
                                 .pick_files()
                         {
                             let root = root.clone();
+                            let replace = *replace;
                             then = Some(Box::new(move |app: &mut App| {
-                                let out = import_symbols::import(&files, &root);
+                                let out = import_symbols::import(&files, &root, replace);
                                 if let Some(open) = app.open.as_mut() {
                                     open.refresh_library();
                                 }
