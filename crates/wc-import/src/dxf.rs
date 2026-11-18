@@ -61,20 +61,17 @@ pub(crate) struct Drawing {
 impl Drawing {
     /// The entities of block `name`: its own spelling first, else any spelling (block names are
     /// not case-sensitive).
-    fn block(&self, name: &str) -> Option<&Vec<Entity>> {
-        self.blocks.get(name).or_else(|| {
-            self.blocks
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(_, ents)| ents)
-        })
+    fn block(&self, name: &str) -> Option<(&String, &Vec<Entity>)> {
+        self.blocks
+            .get_key_value(name)
+            .or_else(|| self.blocks.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)))
     }
 }
 
 /// How deep block references (and dimensions) are followed inside each other.
 const MAX_NESTING: usize = 8;
 
-/// The skipped-count key for entities in blocks nested deeper than [`MAX_NESTING`].
+/// The skipped-count key for entities in blocks nested deeper than the nesting limit (8).
 pub const TOO_DEEP: &str = "entities in blocks nested too deep (or inserting themselves)";
 
 /// The most entities one import draws, block references expanded: a few nested blocks that
@@ -480,8 +477,22 @@ fn shapes(
             }
             // A dimension is drawn by its (anonymous) block, placed as it is.
             "DIMENSION" if e.get(2).and_then(|n| d.block(n)).is_some() => {
-                if let Some(inner) = e.get(2).and_then(|n| d.block(n)) {
-                    shapes(d, inner, xf, scale, depth + 1, skip_layer, out, points, skipped, budget);
+                if let Some((name, inner)) = e.get(2).and_then(|n| d.block(n)) {
+                    // Placed by its base point like any block (normally (0, 0) for a dimension).
+                    let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
+                    let dxf = Xf::shift((-bx, -by)).then(&xf);
+                    shapes(
+                        d,
+                        inner,
+                        dxf,
+                        scale,
+                        depth + 1,
+                        skip_layer,
+                        out,
+                        points,
+                        skipped,
+                        budget,
+                    );
                 }
                 None
             }
@@ -1945,6 +1956,20 @@ mod tests {
         assert_eq!(
             warnings,
             ["1 entity not drawn: in blocks nested more than 8 deep (or inserting themselves)"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimension_block_is_placed_by_its_base_point() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\n*D2\n10\n5\n20\n5\n0\nLINE\n10\n5\n20\n5\n11\n10\n21\n5\n0\nENDBLK\n";
+        let (g, _) = drawn("0\nDIMENSION\n2\n*D2\n", blocks)?;
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(5.0, 0.0)
+            }]
         );
         Ok(())
     }
