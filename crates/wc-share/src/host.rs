@@ -536,10 +536,7 @@ impl Host {
         // The files go in first, so the change's commit holds them with their lock entries. A
         // file left behind by a change that is not recorded is harmless: nothing locks it.
         let stored = match &added {
-            Some((symbols, parts)) => self
-                .journal
-                .vendor(symbols, parts)
-                .map_err(|e| Refusal::NotRecorded { reason: e.to_string() }),
+            Some((symbols, parts)) => self.store_files(by, page.clone(), &message, symbols, parts),
             None => Ok(()),
         };
         if let Err(refusal) = stored.and_then(|()| self.record(by, page.clone(), message.clone())) {
@@ -730,9 +727,7 @@ impl Host {
         let stored = if symbols.is_empty() && parts.is_empty() {
             Ok(())
         } else {
-            self.journal
-                .vendor(&symbols, &parts)
-                .map_err(|e| Refusal::NotRecorded { reason: e.to_string() })
+            self.store_files(by, entry.info.page.clone(), &message, &symbols, &parts)
         };
         if let Err(refusal) = stored.and_then(|()| self.record(by, entry.info.page.clone(), message.clone())) {
             self.project = before;
@@ -813,6 +808,30 @@ impl Host {
         for g in ids {
             self.outbox.push((g, HostMsg::Recorded { change: info.clone() }));
         }
+    }
+
+    /// Store the files of the symbols and parts a change locks, before it is recorded. A
+    /// failure is kept for the host like a failed record ([`Self::take_journal_errors`]).
+    fn store_files(
+        &mut self,
+        by: PeerId,
+        page: Option<String>,
+        message: &str,
+        symbols: &[wc_core::Symbol],
+        parts: &[wc_core::Part],
+    ) -> Result<(), Refusal> {
+        if let Err(e) = self.journal.vendor(symbols, parts) {
+            let reason = e.to_string();
+            let change = Change {
+                by,
+                author: self.peers.get(&by).map(Participant::author).unwrap_or_default(),
+                page,
+                message: message.to_owned(),
+            };
+            self.journal_errors.push((change, reason.clone()));
+            return Err(Refusal::NotRecorded { reason });
+        }
+        Ok(())
     }
 
     /// Record an applied change. When that fails the caller undoes the change, so a later

@@ -2359,6 +2359,59 @@ fn bringing_back_a_page_that_uses_a_symbol_taken_back_since_is_refused() -> Test
     Ok(())
 }
 
+/// Records everything; storing item files fails while `fail` is set.
+struct NoVendor {
+    fail: Rc<RefCell<bool>>,
+    log: Shared,
+}
+
+impl Journal for NoVendor {
+    fn record(&mut self, project: &Project, change: &Change) -> Result<()> {
+        self.log.record(project, change)
+    }
+
+    fn vendor(&mut self, _symbols: &[wc_core::Symbol], _parts: &[wc_core::Part]) -> Result<()> {
+        if *self.fail.borrow() {
+            Err(Error::Closed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn an_item_file_that_cannot_be_stored_is_reported_to_the_host() -> TestResult {
+    let fail = Rc::new(RefCell::new(false));
+    let journal = NoVendor {
+        fail: fail.clone(),
+        log: Shared::default(),
+    };
+    let mut host = Host::new(demo(), "Hanna Host", "h@x.no", Box::new(journal));
+    let add = ProjectEdit::AddItems {
+        symbols: vec![(symbol("coil", "Coil"), "starter".into())],
+        parts: vec![],
+    };
+    *fail.borrow_mut() = true;
+    assert!(matches!(
+        host.edit_project(add.clone()),
+        Err(Refusal::NotRecorded { .. })
+    ));
+    let errors = host.take_journal_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].0.message, "Add coil to the project");
+    // The same for a redo that has to store the file again.
+    *fail.borrow_mut() = false;
+    host.edit_project(add)?;
+    host.undo()?;
+    *fail.borrow_mut() = true;
+    assert!(matches!(host.redo(), Err(Refusal::NotRecorded { .. })));
+    let errors = host.take_journal_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].0.message.starts_with("Redo"), "{errors:?}");
+    assert!(!host.project().lock.symbols.contains_key("coil"));
+    Ok(())
+}
+
 #[test]
 fn a_redo_writes_the_item_file_as_the_session_has_it() -> TestResult {
     let tmp = tempfile::tempdir()?;

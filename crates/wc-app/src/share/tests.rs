@@ -471,6 +471,8 @@ fn an_item_the_session_took_back_leaves_the_local_lock() -> TestResult {
     session.pages.push(stale);
     let base = session.clone();
     let mut local = session.clone();
+    // Renumbering that page here is no new use of the coil on it.
+    local.pages.iter_mut().find(|p| p.id == "p0002").ok_or("p0002")?.number = "20".into();
     // Used here and not sent yet: the session never had it, so it still has to go out.
     local.lock.symbols.insert("wc.lamp".into(), entry("def"));
     // Taken back in the session, but placed here since: it goes out again with that change.
