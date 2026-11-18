@@ -1115,6 +1115,30 @@ struct Form {
     error: Option<String>,
 }
 
+impl Form {
+    /// A refusal is about the address it was for: once another address is picked or typed,
+    /// it no longer applies.
+    fn forget_error_unless(&mut self, addr: &str) {
+        if self.addr != addr {
+            self.error = None;
+        }
+    }
+}
+
+/// How a discovered session is listed in the Join dialog, and whether it can be joined.
+fn session_row(s: &wc_share::discovery::Session) -> (String, bool) {
+    let mut label = format!("{}  ·  {}  ({})", s.project, s.host, s.addr);
+    let joinable = s.protocol == wc_share::PROTOCOL_VERSION;
+    if !joinable {
+        label.push_str(&format!(
+            "  ·  WiringCraft session version {}, this one uses {}; cannot be joined",
+            s.protocol,
+            wc_share::PROTOCOL_VERSION
+        ));
+    }
+    (label, joinable)
+}
+
 impl Default for Form {
     fn default() -> Self {
         Self {
@@ -1785,12 +1809,12 @@ impl Share {
                         None => "None found yet. Over a VPN, type the host's address below.".into(),
                     });
                 }
+                let typed = form.addr.clone();
                 for s in &form.sessions {
-                    let mut label = format!("{}  ·  {}  ({})", s.project, s.host, s.addr);
-                    if s.protocol != wc_share::PROTOCOL_VERSION {
-                        label.push_str("  ·  another WiringCraft version, cannot be joined");
-                    }
-                    if ui.selectable_label(form.addr == s.addr.to_string(), label).clicked() {
+                    let (label, joinable) = session_row(s);
+                    // A session on another version cannot be joined, so it cannot be picked either.
+                    let row = egui::SelectableLabel::new(form.addr == s.addr.to_string(), label);
+                    if ui.add_enabled(joinable, row).clicked() {
                         form.addr = s.addr.to_string();
                     }
                 }
@@ -1809,6 +1833,7 @@ impl Share {
                     ui.text_edit_singleline(&mut form.folder);
                     ui.end_row();
                 });
+                form.forget_error_unless(&typed);
                 if let Some(e) = &form.error {
                     ui.colored_label(ui.visuals().error_fg_color, e);
                 }

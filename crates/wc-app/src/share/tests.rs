@@ -1794,3 +1794,60 @@ fn the_join_dialog_forgets_sessions_heard_by_an_earlier_browser() -> TestResult 
     assert!(form.sessions.is_empty(), "{:?}", form.sessions);
     Ok(())
 }
+
+#[test]
+fn another_version_goes_back_to_the_join_dialog_even_when_the_status_window_was_closed() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let open = project(&tmp.path().join("host"))?;
+    let (mut g, host_end) = asking(tmp.path());
+    g.view = View::Closed;
+    let old = wc_share::PROTOCOL_VERSION + 1;
+    host_end.send(wc_share::HostMsg::Welcome {
+        you: 1,
+        project: Box::new(wc_share::Snapshot::from(&open.project)),
+        locks: Default::default(),
+        peers: Vec::new(),
+        history: Vec::new(),
+        protocol: old,
+    })?;
+    assert!(g.frame(None, None, false).is_none());
+    assert!(g.view == View::Join, "reopened: the person has to update one side");
+    let error = g.form.as_ref().and_then(|f| f.error.clone()).ok_or("no form error")?;
+    assert!(error.contains(&format!("version {old} and")), "{error}");
+    assert!(
+        error.contains(&format!("guest's uses version {};", wc_share::PROTOCOL_VERSION)),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_session_on_another_version_is_listed_as_such_and_cannot_be_picked() {
+    let row = |protocol| wc_share::discovery::Session {
+        project: "Pump station".into(),
+        host: "Ola".into(),
+        addr: ([192, 168, 1, 20], 47812).into(),
+        protocol,
+    };
+    let (label, joinable) = session_row(&row(wc_share::PROTOCOL_VERSION));
+    assert!(joinable);
+    assert_eq!(label, "Pump station  ·  Ola  (192.168.1.20:47812)");
+    let (label, joinable) = session_row(&row(0));
+    assert!(!joinable);
+    assert!(label.contains("version 0, this one uses"), "{label}");
+    assert!(label.contains("cannot be joined"), "{label}");
+}
+
+#[test]
+fn a_refusal_is_forgotten_once_another_address_is_chosen() {
+    let mut form = Form {
+        addr: "192.168.1.20:47812".into(),
+        error: Some("The host declined your request to join.".into()),
+        ..Form::default()
+    };
+    form.forget_error_unless("192.168.1.20:47812");
+    assert!(form.error.is_some(), "same address: still shown");
+    form.addr = "192.168.1.21:47812".into();
+    form.forget_error_unless("192.168.1.20:47812");
+    assert!(form.error.is_none());
+}
