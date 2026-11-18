@@ -315,7 +315,15 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
                 continue;
             }
             // An accessory's index holds its terminal's position, which moves when a terminal
-            // is added before it: the terminal it belongs to must still be the same.
+            // is added before it: the terminal it belongs to must still be the same, and a file
+            // without the Connects column cannot show that.
+            if kind == "Accessory" && !connects.is_empty() && row.connects.is_none() {
+                miss(
+                    "the file has no Connects column, so the terminal this accessory belongs to cannot be checked; export the list again"
+                        .into(),
+                );
+                continue;
+            }
             if kind == "Accessory"
                 && let Some(file) = &row.connects
                 && file != connects
@@ -897,5 +905,14 @@ mod tests {
         let plan = super::plan(&inputs, &library(&parts), &rows);
         assert_eq!(plan.assignments.len(), 1, "{plan:#?}");
         assert_eq!(plan.assignments[0].qty, 5);
+        // Without the Connects column a terminal's accessory is not taken; the strip's is.
+        let rows = read_configured(b"Index;Article;Quantity\n-X1/T2/A1;793-501;5\n-X1/A1;2002-1291;2\n")
+            .unwrap()
+            .0;
+        let plan = super::plan(&inputs, &library(&parts), &rows);
+        assert_eq!(plan.unmatched.len(), 1, "{plan:#?}");
+        assert!(plan.unmatched[0].contains("no Connects column"), "{plan:#?}");
+        assert_eq!(plan.assignments.len(), 1, "{plan:#?}");
+        assert_eq!(plan.assignments[0].slot, Slot::Accessory(0));
     }
 }

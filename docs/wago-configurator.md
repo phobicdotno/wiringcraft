@@ -49,10 +49,11 @@ the list after the configurator has filled in the articles, and writes them onto
   `Connects`, `Manufacturer` and `Quantity` are read when present. The leading `'` the export puts on some
   cells is dropped. Rows without an article are passed over.
 - Each article is looked up by part id (as the export writes a part without a copy) or by order
-  number (ignoring case), among the project's own parts first; the libraries' parts count only
-  when none of the project's match. When several parts have the order number, the row's
+  number (ignoring case), among the project's own parts first (parts made for the project, not
+  taken from a library); the libraries' parts, and those the project took from them, count only
+  when none of the project's own match. When several parts have the order number, the row's
   Manufacturer chooses. A part the project locks but whose copy cannot be read is never given to
-  a device. A library part that is used is taken
+  a device. A library part that is used is taken from the library it was found in
   into the project and locked, as when a part is chosen by hand.
 - A Terminal row's article becomes the part of the terminal device (`-X1.3`, or the strip device
   for terminals tagged only with the strip). An accessory row's article and quantity replace that
@@ -63,10 +64,10 @@ the list after the configurator has filled in the articles, and writes them onto
 
 Every row with an article that is not taken is listed with the reason: an index the project no
 longer has, or whose type, terminal number or (for an accessory) terminal in Connects changed
-(export again), a jumper (jumpers have no
+(export again), a terminal's accessory in a file without the Connects column, a jumper (jumpers have no
 part yet), a plate or rail, an article no part has (import the maker's catalogue into a library
 first, e.g. `import parts-bmecat`), an article several parts have, or two rows that give one
-device part different articles or quantities (neither is taken). Importing the same list twice changes nothing the
+device part different articles or quantities (neither is taken, and both are listed). Importing the same list twice changes nothing the
 second time.
 
 ## Limits
