@@ -53,24 +53,32 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
     let mut strings = None;
     let data_end;
     if r2010 {
-        if maint > 3 {
+        // From maintenance release 4 a second size follows, and everything after moves 4 bytes.
+        let second = maint > 3;
+        if second {
             head.rl().map_err(|e| damaged(&e.to_string()))?;
         }
         let bits = head.rl().map_err(|e| damaged(&e.to_string()))? as usize;
-        // The flag bit of the string stream lies `bits` after bit 191 (159 before release 3).
+        // The declared class data must fit in the section.
+        if (head.pos() / 8).checked_add(size).is_none_or(|e| e > data.len()) {
+            return Err(damaged("its size is past its end"));
+        }
+        // The flag bit of the string stream lies `bits` after bit 191 (159 without the second
+        // size).
         let flag_at = bits
-            .checked_add(if maint < 3 { 159 } else { 191 })
+            .checked_add(if second { 191 } else { 159 })
             .filter(|f| *f < data.len() * 8)
             .ok_or_else(|| damaged("its texts lie past its end"))?;
         let s = string_stream(data, flag_at + 1).map_err(|e| damaged(&e.to_string()))?;
         data_end = s.as_ref().map_or(flag_at, Bits::pos);
         strings = s;
     } else {
-        data_end = (SENTINEL.len() + 4)
+        // The data, then a CRC (RS) and the closing sentinel (16 bytes) must fit in the section.
+        let end = (SENTINEL.len() + 4)
             .checked_add(size)
-            .map(|e| e * 8)
-            .filter(|e| *e <= data.len() * 8)
-            .ok_or_else(|| damaged("its size is past its end"))?;
+            .filter(|e| e.saturating_add(2 + SENTINEL.len()) <= data.len())
+            .ok_or_else(|| damaged("its size is past its end, or its closing sentinel is missing"))?;
+        data_end = end * 8;
     }
     let mut d = Bits::new(data, head.pos(), data_end);
     let mut read = || -> Result<HashMap<u16, Class>> {
@@ -105,13 +113,13 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
             for _ in 0..5 {
                 d.bl()?;
             }
-            classes.insert(
-                number,
-                Class {
-                    dxf_name,
-                    entity: id == ENTITY,
-                },
-            );
+            let class = Class {
+                dxf_name,
+                entity: id == ENTITY,
+            };
+            if classes.insert(number, class).is_some() {
+                return Err(bad(format!("class {number} is listed twice")));
+            }
         }
         Ok(classes)
     };

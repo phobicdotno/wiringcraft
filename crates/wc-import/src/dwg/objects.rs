@@ -495,7 +495,19 @@ fn decode(
         if let Some(class) = classes.get(&o.kind)
             && class.entity
         {
-            *skipped.entry(class.dxf_name.clone()).or_default() += 1;
+            // A DXF name is upper-case letters, digits and _ or $; anything else (which could
+            // look like one of the reader's own counters) is named by its type number.
+            let plain = !class.dxf_name.is_empty()
+                && class
+                    .dxf_name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '$');
+            let name = if plain {
+                class.dxf_name.clone()
+            } else {
+                format!("custom entity type {}", o.kind)
+            };
+            *skipped.entry(name).or_default() += 1;
         }
         return Ok(());
     }

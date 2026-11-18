@@ -1258,7 +1258,13 @@ fn classes_section(v: Version, classes: &[(u16, &str, bool)]) -> Vec<u8> {
     const SENTINEL: [u8; 16] = [
         0x8D, 0xA1, 0xC4, 0xB8, 0xC4, 0xA9, 0xF8, 0xC5, 0xC0, 0xDC, 0xF4, 0x5F, 0xE7, 0xCF, 0xB6, 0x8A,
     ];
-    let max = classes.iter().map(|c| c.0).max().unwrap_or(499);
+    // One class per entry, so an entry listed twice is read twice.
+    let max = classes
+        .iter()
+        .map(|c| c.0)
+        .max()
+        .unwrap_or(499)
+        .max(499 + classes.len() as u16);
     let mut data = W::default();
     let mut strings = W::default();
     data.bs(max).rc(0).rc(0).b(true);
@@ -1282,6 +1288,11 @@ fn classes_section(v: Version, classes: &[(u16, &str, bool)]) -> Vec<u8> {
     match v {
         Version::R2004 => {
             out.rl(data.bytes().len() as u32).append(&data);
+            // A CRC and the closing sentinel.
+            let mut bytes = out.bytes();
+            bytes.extend([0, 0]);
+            bytes.extend(SENTINEL.iter().map(|b| !b));
+            return bytes;
         }
         Version::R2010 => {
             // Data, texts, their size and the flag; the flag sits `bitsize` after bit 191.
@@ -1359,5 +1370,62 @@ fn a_damaged_class_section_is_named_and_the_rest_read() -> TestResult {
         let d = drawing(&sections_with_classes(v, &objs, classes_section(v, &[])))?;
         assert!(d.damaged.is_empty(), "{v:?}: {:?}", d.damaged);
     }
+    Ok(())
+}
+
+#[test]
+fn twice_listed_classes_and_odd_names_are_handled() -> TestResult {
+    let v = Version::R2010;
+    let objs = |kind: u16| {
+        let mut e = entity(v, kind, 0x300, head(None));
+        e.data.bd(0.0);
+        vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            e,
+        ]
+    };
+    // Class 500 listed twice: the section is damaged.
+    let twice = classes_section(v, &[(500, "WIPEOUT", true), (500, "IMAGE", false)]);
+    let d = drawing(&sections_with_classes(v, &objs(500), twice))?;
+    assert!(d.damaged.iter().any(|r| r.contains("listed twice")), "{:?}", d.damaged);
+    // A name that is no DXF name (it could pass for a counter) is counted by type number.
+    let odd = classes_section(v, &[(500, "damaged objects", true)]);
+    let d = drawing(&sections_with_classes(v, &objs(500), odd))?;
+    assert_eq!(d.skipped.get("custom entity type 500"), Some(&1), "{:?}", d.skipped);
+    assert!(!d.skipped.contains_key(DAMAGED), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn the_maintenance_release_comes_from_the_file_header() -> TestResult {
+    // A whole 2010 file whose header says release 6, so the class section has its second size.
+    let v = Version::R2010;
+    let mut wipeout = entity(v, 500, 0x300, head(None));
+    wipeout.data.bd(0.0);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        wipeout,
+    ];
+    let (map, objects) = sections_bytes(&objs, &[]);
+    let section = |name: &'static str, data: Vec<u8>| TestSection {
+        name,
+        data,
+        ..Default::default()
+    };
+    let mut file = write_dwg(
+        b"AC1024",
+        &[
+            section("AcDb:Handles", map),
+            section("AcDb:AcDbObjects", objects),
+            section("AcDb:Classes", classes_section(v, &[(500, "WIPEOUT", true)])),
+        ],
+    );
+    file[0x0B] = 6;
+    let read = read_sections(&file)?;
+    assert_eq!(read.maint, 6);
+    let d = drawing(&read)?;
+    assert_eq!(d.skipped.get("WIPEOUT"), Some(&1), "{:?} {:?}", d.skipped, d.damaged);
     Ok(())
 }
