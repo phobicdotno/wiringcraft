@@ -95,6 +95,7 @@ For the other areas, the chapter to read in each help is:
 | Dimensions in the editor | yes | yes | partly: kept from imports (drawn by their block), not drawn by hand | later |
 | Find and replace texts, tags and wire numbers across the project | yes | yes | yes: Edit → Find (Ctrl+F), `wiringcraft find` | done (#109) |
 | Macros / window macros (save and insert groups) | yes | yes | yes | done |
+| Open, Save as and export with the system file dialogs | yes | yes | yes: Open (Ctrl+O) and Save as (Ctrl+Shift+S, a copy in a new folder, history included) use the system pickers, and every export from the menus asks where to save, starting in `export/` (or the nearest folder of it that exists). The assistant's export tool writes to `export/` without asking, and when no file dialog can open an export goes there too and says so | done (#338) |
 | Macro placeholders and value sets (one macro, several variants) | yes | partly | no | later |
 | Auto-connect pins that line up | yes | yes | yes | done (#51) |
 | Scanned drawing as underlay to trace over | partly | partly | yes | done |

@@ -1622,9 +1622,18 @@ impl App {
                     ));
                 }
                 let before = self.dialog.is_some();
+                let waiting = self.pending.is_some();
                 self.run(a);
                 if let Some(m) = self.take_message() {
                     return Ok(m);
+                }
+                // Only a picker this action asked for: one already waiting is another action's
+                // (and makes this one's refused, which its message says).
+                if !waiting && self.pending.is_some() {
+                    return Ok(format!(
+                        "{} queued a file dialog on the user's screen for them to pick in; it has not been answered yet.",
+                        a.info().label
+                    ));
                 }
                 if !before && self.dialog.is_some() {
                     return Ok(format!(
@@ -2617,9 +2626,34 @@ mod tests {
             share: Default::default(),
             symbol_editor: None,
             find: None,
+            pending: None,
+            pending_for: None,
             strip_editor: None,
         };
         (tmp, app)
+    }
+
+    #[test]
+    fn a_picker_waits_for_its_own_project_and_a_second_one_is_not_taken() {
+        let (_tmp, mut a) = app(vec![]);
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportPdf.name()})).unwrap();
+        assert!(r.contains("queued a file dialog"), "{r}");
+        // A second picker in the same reply does not replace the first, and says so.
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportAml.name()})).unwrap();
+        assert!(r.contains("was not done"), "{r}");
+        assert!(matches!(a.pending, Some(crate::Pending::Export(crate::Export::Pdf))));
+        // An action without a picker is not taken for one while a picker waits (the status
+        // line still holds the refusal, as the frame would show it, so it is cleared first).
+        a.ed.message.clear();
+        let r = call(&mut a, "run_action", json!({"action": "ZoomFit"})).unwrap();
+        assert!(r.starts_with("Ran"), "{r}");
+        assert!(a.pending.is_some());
+        // Another project opened before the picker could show: it is not shown for that one.
+        let (_other_tmp, other) = crate::state::tests::project();
+        a.open = Some(other);
+        a.ask_pending();
+        assert!(a.pending.is_none());
+        assert!(a.ed.message.contains("another project"), "{}", a.ed.message);
     }
 
     #[test]
