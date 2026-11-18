@@ -3029,8 +3029,21 @@ fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
     );
     // The same picture again is fine; another under that name is refused and changes nothing.
     write_picture(dir, &logo)?;
-    assert!(write_picture(dir, &picture("pictures/logo.png", b"other")).is_err());
+    assert!(matches!(
+        write_picture(dir, &picture("pictures/logo.png", b"other")),
+        Err(Error::PictureNameTaken(_))
+    ));
     assert_eq!(std::fs::read(pictures.join("logo.png"))?, logo.data);
+    Ok(())
+}
+
+#[test]
+fn a_file_in_the_way_of_a_pictures_folder_is_a_storage_failure_and_not_a_taken_name() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // `create_dir_all` fails with `AlreadyExists` here, which is no other picture's name.
+    std::fs::write(tmp.path().join("pictures"), b"not a folder")?;
+    let r = write_picture(tmp.path(), &picture("pictures/logo.png", b"png"));
+    assert!(matches!(r, Err(Error::Io(_))), "{r:?}");
     Ok(())
 }
 

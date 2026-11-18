@@ -629,7 +629,7 @@ impl Host {
         // A file of that name in the host's folder that the session does not use (an old logo) is
         // never written over: the sender renames its picture instead.
         self.journal.picture(&picture).map_err(|e| match e {
-            crate::Error::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => Refusal::PictureNameTaken {
+            crate::Error::PictureNameTaken(_) => Refusal::PictureNameTaken {
                 file: picture.file.clone(),
             },
             e => Refusal::NotRecorded { reason: e.to_string() },

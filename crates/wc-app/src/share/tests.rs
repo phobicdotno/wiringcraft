@@ -59,17 +59,16 @@ fn project(dir: &Path) -> std::result::Result<Open, Box<dyn std::error::Error>> 
 /// Share the open project in-process (no network), with a journal the test reads.
 fn host(open: &Open) -> (Share, Log) {
     let log = Log::default();
-    let mut host = Host::new(
-        open.project.clone(),
-        "Hanna",
-        "hanna@example.com",
-        Box::new(log.clone()),
-    );
-    // As `Share::start_host` does.
+    (host_with(open, Box::new(log.clone())), log)
+}
+
+/// A host of `open` that records into `journal`, set up as `Share::start_host` does.
+fn host_with(open: &Open, journal: Box<dyn Journal>) -> Share {
+    let mut host = Host::new(open.project.clone(), "Hanna", "hanna@example.com", journal);
     let files = vendored_files(&open.dir, &open.project);
     host.share_files(files.symbols, files.parts);
     host.share_pictures(wc_pdf::read_pictures(&open.dir, &open.project).files);
-    let share = Share {
+    Share {
         role: Some(Role::Host(Box::new(Hosting {
             host,
             hub: Hub::new(),
@@ -81,8 +80,7 @@ fn host(open: &Open) -> (Share, Log) {
         }))),
         base: Some(open.project.clone()),
         ..Default::default()
-    };
-    (share, log)
+    }
 }
 
 /// Connect a guest to the host in-process and ask to join; the copy goes under `folder`.
@@ -2481,28 +2479,7 @@ fn a_guest_logo_named_like_an_unused_file_of_the_host_gets_a_name_of_its_own() -
     std::fs::create_dir_all(host_open.dir.join(wc_core::Logo::DIR))?;
     std::fs::write(host_open.dir.join("pictures/logo.png"), old_logo)?;
     // The host records into git, as a real session does.
-    let journal = GitJournal::open(&host_open.dir)?;
-    let mut host = Host::new(
-        host_open.project.clone(),
-        "Hanna",
-        "hanna@example.com",
-        Box::new(journal),
-    );
-    let files = vendored_files(&host_open.dir, &host_open.project);
-    host.share_files(files.symbols, files.parts);
-    let mut h = Share {
-        role: Some(Role::Host(Box::new(Hosting {
-            host,
-            hub: Hub::new(),
-            listener: None,
-            announcer: None,
-            port: 0,
-            dir: host_open.dir.clone(),
-            took_updates: Vec::new(),
-        }))),
-        base: Some(host_open.project.clone()),
-        ..Default::default()
-    };
+    let mut h = host_with(&host_open, Box::new(GitJournal::open(&host_open.dir)?));
     let mut join = |name: &str| -> std::result::Result<(Share, Open), Box<dyn std::error::Error>> {
         let mut g = guest(&mut h, name, &tmp.path().join(name));
         h.frame(Some(&mut host_open), Some("p0002".into()), false);
@@ -2542,8 +2519,33 @@ fn a_guest_logo_named_like_an_unused_file_of_the_host_gets_a_name_of_its_own() -
     );
     let notes = g.take_notes();
     assert!(
-        notes.iter().any(|n| n.contains(&format!("shared as {file}"))),
+        notes.iter().any(|n| n.contains(&format!("renamed {file} here"))),
         "{notes:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_picture_renamed_for_the_session_keeps_its_name_within_255_bytes() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(&tmp.path().join("p"))?;
+    // A name at the limit already: the mark has to take room from the stem.
+    let stem = "æ".repeat(125);
+    let file = format!("pictures/{stem}.png");
+    assert_eq!(file.rsplit('/').next().map(str::len), Some(254));
+    std::fs::create_dir_all(open.dir.join("pictures"))?;
+    std::fs::write(open.dir.join(&file), PNG)?;
+    open.project.meta.logo = Some(wc_core::Logo {
+        file: file.clone(),
+        cover: None,
+    });
+    let new = rename_picture(&mut open, &file)?;
+    let name = new.rsplit('/').next().ok_or("no name")?;
+    assert!(name.len() <= 255 && name.ends_with(".png"), "{name}");
+    assert_eq!(std::fs::read(open.dir.join(&new))?, PNG);
+    assert_eq!(
+        open.project.meta.logo.as_ref().map(|l| l.file.as_str()),
+        Some(new.as_str())
     );
     Ok(())
 }

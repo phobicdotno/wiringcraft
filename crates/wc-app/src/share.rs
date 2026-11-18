@@ -1129,9 +1129,22 @@ pub fn new_pictures(
 /// likely to have (the name with a mark of the moment), and make the project name it instead.
 /// The old file stays. Returns the new name.
 fn rename_picture(open: &mut Open, file: &str) -> Result<String, String> {
-    let data = std::fs::read(open.dir.join(file)).map_err(|e| format!("cannot read {file}: {e}"))?;
+    // Read as an export reads it: never through a link out of the project folder.
+    let data = match wc_pdf::read_picture(&open.dir, file) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Err(format!("cannot read {file}: the file is gone")),
+        Err(why) => return Err(format!("cannot read {file}: {why}")),
+    };
     let (folder, name) = file.rsplit_once('/').unwrap_or(("", file));
     let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    // Most file systems take names of up to 255 bytes: the stem gives way to the mark (a dash
+    // and up to ten hex digits), a count (up to "-15") and the extension.
+    let room = 255usize.saturating_sub(14 + if ext.is_empty() { 0 } else { ext.len() + 1 });
+    let mut cut = stem.len().min(room);
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = &stem[..cut];
     let mark = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos())
@@ -2162,11 +2175,15 @@ impl Share {
             if !used_pictures(&open.project).contains(&file) {
                 continue;
             }
-            self.pictures_out.remove(&file);
+            // On a failed rename the picture stays in `pictures_out`, so it is not sent again
+            // under the taken name until the retry wait is over.
             match rename_picture(open, &file) {
-                Ok(new) => self.notes.push(format!(
-                    "The session already has another file named {file}; your picture is shared as {new}."
-                )),
+                Ok(new) => {
+                    self.pictures_out.remove(&file);
+                    self.notes.push(format!(
+                        "The session already has another file named {file}; your picture is renamed {new} here and sent again under that name."
+                    ));
+                }
                 Err(why) => self.notes.push(format!(
                     "The session already has another file named {file}, and your picture could not be given a new name: {why}"
                 )),
