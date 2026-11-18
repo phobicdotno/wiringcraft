@@ -2292,12 +2292,30 @@ fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
         })
         .collect();
     let parts = vendored_parts(dir, &p);
+    // A part that is used but could not be read is written by its id; say why.
+    let used: std::collections::BTreeSet<&str> = p
+        .devices
+        .values()
+        .flat_map(|d| d.all_parts())
+        .map(|(id, _)| id)
+        .collect();
+    for id in used.into_iter().filter(|id| !parts.contains_key(*id)) {
+        if let Err(err) = store::read_vendored_part(dir, id) {
+            warnings.push(format!(
+                "part {id} could not be read ({err}); its article number is written as the part id"
+            ));
+        }
+    }
     let inputs = wc_report::Inputs {
         project: &p,
         symbols: &symbols,
         parts: &parts,
     };
-    let t = wc_report::configurator_list(&inputs);
+    let wc_report::Configurator {
+        table: t,
+        warnings: more,
+    } = wc_report::configurator_list(&inputs);
+    warnings.extend(more);
     if t.rows.is_empty() {
         warnings.push("the project has no numbered terminals on its schematic pages".into());
     }
@@ -3754,6 +3772,26 @@ mod tests {
         assert!(csv.contains("\r\n-X1/T2;Terminal;-X1;2;2;"), "{csv}");
         assert!(csv.contains("\r\n-X1/J1;Jumper;-X1;"), "{csv}");
         assert!(done.warnings.iter().any(|w| w.contains("no.such.symbol")));
+
+        // A part that is used but cannot be read is named, with the reason.
+        p.devices.insert(
+            wc_core::DeviceTag::parse("-X1.1").unwrap(),
+            wc_core::Device {
+                part: Some("broken.part".into()),
+                ..Default::default()
+            },
+        );
+        store::save(&dir, &p).unwrap();
+        let path = store::vendor_path(&dir, wc_core::lock::ItemKind::Part, "broken.part").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        let done = export_wago_configurator(&dir, &out).unwrap();
+        let w = done.warnings.iter().find(|w| w.contains("broken.part"));
+        assert!(
+            w.is_some_and(|w| w.contains("could not be read (")),
+            "{:?}",
+            done.warnings
+        );
     }
 
     #[test]

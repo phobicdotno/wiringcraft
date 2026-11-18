@@ -1157,11 +1157,13 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
     });
     p.panels.push(plate);
 
-    let t = configurator_list(&Inputs {
+    let out = configurator_list(&Inputs {
         project: &p,
         symbols: &s,
         parts: &parts,
     });
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let t = out.table;
     assert_eq!(t.columns, CONFIGURATOR_COLUMNS);
     let x1: Vec<(&str, &str)> = t
         .rows
@@ -1208,4 +1210,77 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
     assert_eq!(x2.len(), 1);
     assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T1", ""));
     assert!(to_smartscript_csv(&t).starts_with("\u{feff}Index;Type;Strip;"));
+}
+
+#[test]
+fn a_terminal_tagged_with_only_its_strip_takes_the_strip_devices_part() {
+    use wc_core::DevicePart;
+    // -X2 in the fixture is drawn with the tag of the strip itself.
+    let (mut p, s, mut parts) = fixture();
+    let term = Part {
+        id: "wago.2002-1201".into(),
+        order_number: "2002-1201".into(),
+        ..Default::default()
+    };
+    parts.insert(term.id.clone(), term.clone());
+    p.devices.insert(
+        DeviceTag::parse("-X2").unwrap(),
+        Device {
+            part: Some(term.id.clone()),
+            accessories: vec![DevicePart {
+                part: "acme.marker".into(),
+                qty: 3,
+            }],
+            ..Default::default()
+        },
+    );
+    let t = configurator_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .table;
+    let x2: Vec<&Vec<String>> = t.rows.iter().filter(|r| r[2] == "-X2").collect();
+    assert_eq!(x2.len(), 2, "{x2:?}");
+    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T1", "2002-1201"));
+    // Its accessory belongs to terminal 1, and the part is not listed again as an accessory.
+    assert_eq!(
+        (
+            x2[1][0].as_str(),
+            x2[1][6].as_str(),
+            x2[1][9].as_str(),
+            x2[1][14].as_str()
+        ),
+        ("-X2/A1", "acme.marker", "3", "1")
+    );
+}
+
+#[test]
+fn configurator_free_texts_that_look_like_formulas_are_written_as_text() {
+    let (mut p, s, mut parts) = fixture();
+    let odd = Part {
+        id: "odd".into(),
+        order_number: "=1+1".into(),
+        manufacturer: "@cme".into(),
+        description: "plain".into(),
+        ..Default::default()
+    };
+    parts.insert(odd.id.clone(), odd.clone());
+    p.devices.insert(
+        DeviceTag::parse("-X1.1").unwrap(),
+        Device {
+            part: Some(odd.id.clone()),
+            ..Default::default()
+        },
+    );
+    let out = configurator_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let row = out.table.rows.iter().find(|r| r[0] == "-X1/T1").unwrap();
+    assert_eq!(&row[6..9], ["'=1+1", "'@cme", "plain"]);
+    assert_eq!(row[2], "-X1", "tags stay as they are");
+    assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
+    assert!(out.warnings[0].contains("-X1/T1") && out.warnings[0].contains("=1+1"));
 }

@@ -2361,7 +2361,7 @@ fn export_wago_configurator(open: &Open) -> String {
         symbols: &open.symbols,
         parts: &open.parts,
     };
-    let t = wc_report::configurator_list(&inputs);
+    let wc_report::Configurator { table: t, warnings } = wc_report::configurator_list(&inputs);
     if t.rows.is_empty() {
         return "Nothing exported: the project has no numbered terminals on its schematic pages (terminals drawn \
                 only on an overview page are not listed)."
@@ -2369,7 +2369,8 @@ fn export_wago_configurator(open: &Open) -> String {
     }
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, wc_report::to_smartscript_csv(&t))) {
         Ok(()) => {
-            let strips: std::collections::BTreeSet<&str> = t.rows.iter().map(|r| r[2].as_str()).collect();
+            let strips: std::collections::BTreeSet<&str> =
+                t.rows.iter().filter_map(|r| r.get(2)).map(String::as_str).collect();
             let mut msg = format!(
                 "Exported {} terminal strips ({} rows) to\n{}\n\nIn the WAGO configurator, import it as an \
                  Excel/CSV article list and map the Article and Quantity columns.",
@@ -2377,7 +2378,7 @@ fn export_wago_configurator(open: &Open) -> String {
                 t.rows.len(),
                 path.display()
             );
-            for w in wc_report::level_warnings(inputs.project) {
+            for w in warnings.into_iter().chain(wc_report::level_warnings(inputs.project)) {
                 msg.push_str("\n\nWarning: ");
                 msg.push_str(&w);
             }

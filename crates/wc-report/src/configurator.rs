@@ -60,10 +60,13 @@ pub const CONFIGURATOR_COLUMNS: [&str; 19] = [
 ///
 /// The `Index` column is `<strip>/T<position>` for a terminal, `/J<n>` for a jumper, `/A<n>` for
 /// an accessory, `/P<n>` for a plate and `/R<n>` for a rail (`-X1/T3`).
-pub fn configurator_list(i: &Inputs<'_>) -> Table {
-    let mut t = Table::new("WAGO configurator", &CONFIGURATOR_COLUMNS);
-    let sides = wire_sides(i);
-    // (strip, number, level) in strip order, each terminal once.
+pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
+    let mut out = Configurator {
+        table: Table::new("WAGO configurator", &CONFIGURATOR_COLUMNS),
+        warnings: Vec::new(),
+    };
+    let info = terminal_info(i);
+    // (number, level) of each terminal in strip order, each terminal once, by strip.
     let mut strips: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for r in terminal_plan(i).rows {
         let (Some(strip), Some(number)) = (r.first(), r.get(1)) else {
@@ -77,71 +80,79 @@ pub fn configurator_list(i: &Inputs<'_>) -> Table {
             list.push((number.clone(), r.get(7).cloned().unwrap_or_default()));
         }
     }
-    let mut order: Vec<&String> = strips.keys().collect();
-    order.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
-    for strip in order {
-        let terminals = &strips[strip];
-        let Ok(strip_tag) = DeviceTag::parse(strip) else {
-            continue;
-        };
-        let row = |index: String, kind: &str| {
-            let mut r = vec![String::new(); CONFIGURATOR_COLUMNS.len()];
-            r[0] = index;
-            r[1] = kind.to_owned();
-            r[2] = strip.clone();
-            r
-        };
-        let part_cells = |r: &mut Vec<String>, part: &str| {
-            match i.parts.get(part) {
-                Some(p) => {
-                    r[6] = p.order_number.clone();
-                    r[7] = p.manufacturer.clone();
-                    r[8] = p.description.clone();
-                }
-                // A part without a vendored copy: its id is all there is.
-                None => r[6] = part.to_owned(),
+    let mut order: Vec<(String, Vec<(String, String)>)> = strips.into_iter().collect();
+    order.sort_by(|(a, _), (b, _)| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
+    let mut rows: Vec<Row> = Vec::new();
+    for (strip, terminals) in &order {
+        // The terminal plan writes strips from parsed tags, so this only fails for a tag that
+        // does not survive being written and read back; such a strip is reported, not dropped.
+        let strip_tag = match DeviceTag::parse(strip) {
+            Ok(t) => t,
+            Err(e) => {
+                out.warnings.push(format!(
+                    "terminal strip {strip:?} is left out: its tag cannot be read ({e})"
+                ));
+                continue;
             }
+        };
+        let row = |index: String, kind: &'static str| Row {
+            index,
+            kind,
+            strip: strip.clone(),
+            ..Row::default()
+        };
+        // The device each terminal is drawn as: `-X1.3`, or the strip itself for a terminal
+        // tagged only with its strip (numbered in drawing order).
+        let device_of = |number: &str| -> Option<(&DeviceTag, &wc_core::Device)> {
+            let tag = info
+                .get(&(strip.clone(), number.to_owned()))
+                .and_then(|t| t.tag.as_ref())?;
+            i.project.devices.get_key_value(tag)
         };
 
         let (mut plates, mut rails) = (0, 0);
         for (plate, rail) in mounting(i, &strip_tag) {
             if let Some((name, w, h)) = plate {
                 plates += 1;
-                let mut r = row(format!("{strip}/P{plates}"), "Plate");
-                r[8] = format!("Mounting plate {} x {} mm", mm(w), mm(h));
-                r[9] = "1".into();
-                r[15] = name;
-                t.rows.push(r);
+                rows.push(Row {
+                    description: format!("Mounting plate {} x {} mm", mm(w), mm(h)),
+                    quantity: "1".into(),
+                    plate: name,
+                    ..row(format!("{strip}/P{plates}"), "Plate")
+                });
             }
             if let Some((name, number, length)) = rail {
                 rails += 1;
-                let mut r = row(format!("{strip}/R{rails}"), "Rail");
-                r[8] = "DIN rail 35 mm".into();
-                r[9] = "1".into();
-                r[15] = name;
-                r[16] = number.to_string();
-                r[17] = mm(length);
-                r[18] = "0".into();
-                t.rows.push(r);
+                rows.push(Row {
+                    description: "DIN rail 35 mm".into(),
+                    quantity: "1".into(),
+                    plate: name,
+                    rail: number.to_string(),
+                    rail_length: mm(length),
+                    rail_rotation: "0".into(),
+                    ..row(format!("{strip}/R{rails}"), "Rail")
+                });
             }
         }
 
         for (pos, (number, level)) in terminals.iter().enumerate() {
-            let mut r = row(format!("{strip}/T{}", pos + 1), "Terminal");
-            r[3] = (pos + 1).to_string();
-            r[4] = number.clone();
-            r[5] = level.clone();
-            r[9] = "1".into();
-            if let Some(part) = terminal_device(i, strip, number).and_then(|d| d.part.as_deref()) {
-                part_cells(&mut r, part);
+            let mut r = Row {
+                position: (pos + 1).to_string(),
+                terminal: number.clone(),
+                level: level.clone(),
+                quantity: "1".into(),
+                ..row(format!("{strip}/T{}", pos + 1), "Terminal")
+            };
+            if let Some(part) = device_of(number).and_then(|(_, d)| d.part.as_deref()) {
+                r.set_part(i, part);
             }
-            if let Some(s) = sides.get(&(strip.clone(), number.clone())) {
-                r[10] = join(&s[0].0);
-                r[11] = join(&s[0].1);
-                r[12] = join(&s[1].0);
-                r[13] = join(&s[1].1);
+            if let Some([(us, uc), (ls, lc)]) = info.get(&(strip.clone(), number.clone())).map(|t| &t.sides) {
+                r.upper_section = join(us);
+                r.upper_colour = join(uc);
+                r.lower_section = join(ls);
+                r.lower_colour = join(lc);
             }
-            t.rows.push(r);
+            rows.push(r);
         }
 
         for (n, j) in i
@@ -152,53 +163,168 @@ pub fn configurator_list(i: &Inputs<'_>) -> Table {
             .filter(|j| j.strip == strip_tag)
             .enumerate()
         {
-            let mut r = row(format!("{strip}/J{}", n + 1), "Jumper");
-            r[8] = format!("{}-way jumper", j.terminals.len());
-            r[9] = "1".into();
-            r[14] = j.terminals.join(", ");
-            t.rows.push(r);
+            rows.push(Row {
+                description: format!("{}-way jumper", j.terminals.len()),
+                quantity: "1".into(),
+                connects: j.terminals.join(", "),
+                ..row(format!("{strip}/J{}", n + 1), "Jumper")
+            });
         }
 
-        // The strip's own parts first, then each terminal's accessories in strip order.
+        // The strip device's own parts first (unless terminals are drawn as the strip device
+        // itself: then its part is theirs), then each terminal device's accessories in strip
+        // order, once per device.
         let mut accessories: Vec<(String, u32, String)> = Vec::new();
-        if let Some(d) = i.project.devices.get(&strip_tag) {
+        let strip_is_a_terminal = terminals
+            .iter()
+            .any(|(n, _)| device_of(n).is_some_and(|(t, _)| *t == strip_tag));
+        if !strip_is_a_terminal && let Some(d) = i.project.devices.get(&strip_tag) {
             accessories.extend(d.part.iter().map(|p| (p.clone(), 1, String::new())));
             accessories.extend(d.accessories.iter().map(|a| (a.part.clone(), a.qty, String::new())));
         }
+        let mut seen: BTreeSet<&DeviceTag> = BTreeSet::new();
         for (number, _) in terminals {
-            if let Some(d) = terminal_device(i, strip, number) {
+            if let Some((tag, d)) = device_of(number)
+                && seen.insert(tag)
+            {
                 accessories.extend(d.accessories.iter().map(|a| (a.part.clone(), a.qty, number.clone())));
             }
         }
         for (n, (part, qty, number)) in accessories.into_iter().enumerate() {
-            let mut r = row(format!("{strip}/A{}", n + 1), "Accessory");
-            part_cells(&mut r, &part);
-            r[9] = qty.to_string();
-            r[14] = number;
-            t.rows.push(r);
+            let mut r = Row {
+                quantity: qty.to_string(),
+                connects: number,
+                ..row(format!("{strip}/A{}", n + 1), "Accessory")
+            };
+            r.set_part(i, &part);
+            rows.push(r);
         }
     }
-    t
+    for r in rows {
+        let cells = r.into_cells(&mut out.warnings);
+        out.table.rows.push(cells);
+    }
+    out
 }
 
-/// The device of terminal `number` of `strip` (`-X1.3`), if the project lists it.
-fn terminal_device<'p>(i: &Inputs<'p>, strip: &str, number: &str) -> Option<&'p wc_core::Device> {
-    let tag = DeviceTag::parse(&format!("{strip}.{number}")).ok()?;
-    i.project.devices.get(&tag)
+/// What [`configurator_list`] made: the table, and what was changed or left out on the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Configurator {
+    pub table: Table,
+    pub warnings: Vec<String>,
+}
+
+/// One row of the list, by column (see [`CONFIGURATOR_COLUMNS`]).
+#[derive(Debug, Default)]
+struct Row {
+    index: String,
+    kind: &'static str,
+    strip: String,
+    position: String,
+    terminal: String,
+    level: String,
+    article: String,
+    manufacturer: String,
+    description: String,
+    quantity: String,
+    upper_section: String,
+    upper_colour: String,
+    lower_section: String,
+    lower_colour: String,
+    connects: String,
+    plate: String,
+    rail: String,
+    rail_length: String,
+    rail_rotation: String,
+}
+
+impl Row {
+    /// Article, manufacturer and description from `part`; a part without a vendored copy is
+    /// written by its id.
+    fn set_part(&mut self, i: &Inputs<'_>, part: &str) {
+        match i.parts.get(part) {
+            Some(p) => {
+                self.article = p.order_number.clone();
+                self.manufacturer = p.manufacturer.clone();
+                self.description = p.description.clone();
+            }
+            None => self.article = part.to_owned(),
+        }
+    }
+
+    /// The cells in column order. Free texts (part data, wire specs, plate names) that a
+    /// spreadsheet would take for a formula get a leading `'`, with a warning; the tag-derived
+    /// columns (index, strip, terminal numbers) start with `-` by design and stay as they are.
+    fn into_cells(self, warnings: &mut Vec<String>) -> Vec<String> {
+        let index = self.index.clone();
+        let mut safe = |column: &str, text: String| -> String {
+            match text.chars().next() {
+                Some(c @ ('=' | '+' | '-' | '@' | '\t' | '\r')) => {
+                    warnings.push(format!(
+                        "{index}: {column} {text:?} starts with {c:?}, which a spreadsheet may run as a formula; \
+                         it is written with a leading '"
+                    ));
+                    format!("'{text}")
+                }
+                _ => text,
+            }
+        };
+        vec![
+            self.index.clone(),
+            self.kind.to_owned(),
+            self.strip,
+            self.position,
+            self.terminal,
+            self.level,
+            safe("Article", self.article),
+            safe("Manufacturer", self.manufacturer),
+            safe("Description", self.description),
+            self.quantity,
+            safe("Upper section", self.upper_section),
+            safe("Upper colour", self.upper_colour),
+            safe("Lower section", self.lower_section),
+            safe("Lower colour", self.lower_colour),
+            self.connects,
+            safe("Plate", self.plate),
+            self.rail,
+            self.rail_length,
+            self.rail_rotation,
+        ]
+    }
 }
 
 /// Cross-sections and colours of the wires on each side of a terminal.
 type Sides = [(BTreeSet<String>, BTreeSet<String>); 2];
 
-/// For each terminal (strip, number): the sections and colours of the wires ending on its first
-/// pin (upper side) and second pin (lower side), on every schematic page it is drawn on.
-fn wire_sides(i: &Inputs<'_>) -> BTreeMap<(String, String), Sides> {
+/// What the drawing says about one terminal.
+#[derive(Default)]
+struct Terminal {
+    /// The tag it is drawn with: `-X1.3`, or just the strip (`-X1`).
+    tag: Option<DeviceTag>,
+    /// The sections and colours of the wires on its first pin (upper side) and second pin
+    /// (lower side), on every schematic page it is drawn on.
+    sides: Sides,
+}
+
+/// Every terminal on the schematic pages by (strip, number), numbered as the terminal plan
+/// numbers them.
+fn terminal_info(i: &Inputs<'_>) -> BTreeMap<(String, String), Terminal> {
     let numbers = wc_core::project::terminal_numbers(i.project, |id| i.symbols.get(id).map(|s| s.role));
-    let mut out: BTreeMap<(String, String), Sides> = BTreeMap::new();
+    let mut out: BTreeMap<(String, String), Terminal> = BTreeMap::new();
     for page in i.project.pages.iter().filter(|pg| !pg.overview) {
+        for s in &page.symbols {
+            if let Some((strip, number)) = numbers.get(&(page.id.clone(), s.id.clone())) {
+                let t = out.entry((strip.to_string(), number.clone())).or_default();
+                if t.tag.is_none() {
+                    t.tag = s.tag.clone();
+                }
+            }
+        }
         for w in &page.wires {
             for end in [&w.from, &w.to] {
-                let Endpoint::Pin { item, pin } = end else { continue };
+                let Endpoint::Pin { item, pin } = end else {
+                    continue;
+                };
                 let Some((strip, number)) = numbers.get(&(page.id.clone(), item.clone())) else {
                     continue;
                 };
@@ -209,12 +335,12 @@ fn wire_sides(i: &Inputs<'_>) -> BTreeMap<(String, String), Sides> {
                 else {
                     continue;
                 };
-                let Some(side) = sym.pins.iter().position(|p| p.name == *pin).filter(|s| *s < 2) else {
-                    continue;
-                };
+                let side = sym.pins.iter().position(|p| p.name == *pin);
                 let entry = out.entry((strip.to_string(), number.clone())).or_default();
-                entry[side].0.extend(w.spec.section.clone());
-                entry[side].1.extend(w.spec.colour.clone());
+                if let Some((sections, colours)) = side.and_then(|k| entry.sides.get_mut(k)) {
+                    sections.extend(w.spec.section.clone());
+                    colours.extend(w.spec.colour.clone());
+                }
             }
         }
     }
