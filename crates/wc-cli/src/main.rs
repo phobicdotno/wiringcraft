@@ -3139,8 +3139,18 @@ fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, sourc
         .map(|name| dir.join(name))
         .collect();
     for folder in [store::PAGES_DIR, store::PANELS_DIR, store::COMMENTS_DIR] {
-        if let Ok(entries) = std::fs::read_dir(dir.join(folder)) {
-            paths.extend(entries.flatten().map(|e| e.path()).filter(|path| path.is_file()));
+        let folder = dir.join(folder);
+        // A folder that cannot be listed would leave files the save may change without a copy.
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(x) if x.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(x) => return Err(format!("{}: {x}", folder.display())),
+        };
+        for entry in entries {
+            let path = entry.map_err(|x| format!("{}: {x}", folder.display()))?.path();
+            if path.is_file() {
+                paths.push(path);
+            }
         }
     }
     for page in &built.pages {
@@ -3181,6 +3191,29 @@ fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, sourc
     Ok(())
 }
 
+/// Wire ends in `p` on pins of the symbol `symbol.id` that `symbol` does not have:
+/// `page 3 -K1:13` each.
+fn wired_pins_lost(p: &Project, symbol: &wc_core::Symbol) -> Vec<String> {
+    let mut out = Vec::new();
+    for page in &p.pages {
+        for w in &page.wires {
+            for end in [&w.from, &w.to] {
+                let wc_core::Endpoint::Pin { item, pin } = end else {
+                    continue;
+                };
+                let Some(placed) = page.symbol(item) else { continue };
+                if placed.symbol == symbol.id && symbol.pin(pin).is_none() {
+                    let name = placed.tag.as_ref().map_or_else(|| item.clone(), ToString::to_string);
+                    out.push(format!("page {} {name}:{pin}", page.number));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Put each file back as it was ([`put_file_back`]), the last written first. Returns why each
 /// one that could not be put back failed.
 fn put_files_back(files: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
@@ -3217,6 +3250,19 @@ fn add_built(
             "page number {} is taken; import with --first-page to number the pages from a free number",
             page.number
         ));
+    }
+    // A new version of a symbol must keep every pin a wire in the project ends on.
+    for symbol in &built.symbols {
+        if p.lock.symbols.get(&symbol.id).is_some_and(|e| e.hash != symbol.hash()) {
+            let lost = wired_pins_lost(p, symbol);
+            if !lost.is_empty() {
+                return Err(format!(
+                    "symbol {}: wires end on pins the new version no longer has ({}); move those wires first",
+                    symbol.id,
+                    lost.join(", ")
+                ));
+            }
+        }
     }
     // A library item already in the project may come again unchanged (same content hash), or
     // in a new version when the project's copy is still the one its lock pinned: nobody changed
@@ -4180,6 +4226,96 @@ mod tests {
     }
 
     #[test]
+    fn a_library_import_keeps_every_wired_pin_of_a_symbol_it_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let coil = |pins: &[&str]| wc_core::Symbol {
+            id: "swe.lib.coil".into(),
+            name: "Coil".into(),
+            category: String::new(),
+            letter_code: "K".into(),
+            role: Default::default(),
+            graphics: vec![],
+            pins: pins
+                .iter()
+                .map(|n| wc_core::Pin {
+                    name: (*n).into(),
+                    at: Default::default(),
+                    dir: Default::default(),
+                })
+                .collect(),
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let built = |pins: &[&str]| wc_import::aml::Built {
+            symbols: vec![coil(pins)],
+            ..Default::default()
+        };
+        let mut p = load(&dir).unwrap();
+        add_and_save(
+            &dir,
+            &mut p,
+            built(&["A1", "A2"]),
+            "import:a.tewzip",
+            Replace::Unchanged,
+        )
+        .unwrap();
+        // Two coils on the first page, wired A2 to A2.
+        let mut p = load(&dir).unwrap();
+        let page = &mut p.pages[0];
+        for (id, x) in [("k1", 10.0), ("k2", 50.0)] {
+            page.symbols.push(wc_core::PlacedSymbol {
+                id: id.into(),
+                symbol: "swe.lib.coil".into(),
+                at: wc_core::geom::Point::new(x, 50.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: None,
+            });
+        }
+        let end = |item: &str| wc_core::Endpoint::Pin {
+            item: item.into(),
+            pin: "A2".into(),
+        };
+        page.wires.push(wc_core::Wire {
+            id: "w1".into(),
+            from: end("k1"),
+            to: end("k2"),
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        let number = page.number.clone();
+        save(&dir, &p).unwrap();
+
+        let mut p = load(&dir).unwrap();
+        let err = add_and_save(&dir, &mut p, built(&["A1"]), "import:a.tewzip", Replace::Unchanged).unwrap_err();
+        assert!(err.contains(&format!("page {number} k1:A2")), "{err}");
+        assert_eq!(
+            store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap(),
+            coil(&["A1", "A2"])
+        );
+        // A version that keeps the wired pins replaces it.
+        let mut p = load(&dir).unwrap();
+        add_and_save(
+            &dir,
+            &mut p,
+            built(&["A1", "A2", "X1"]),
+            "import:a.tewzip",
+            Replace::Unchanged,
+        )
+        .unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap(),
+            coil(&["A1", "A2", "X1"])
+        );
+    }
+
+    #[test]
     fn an_import_replaces_an_item_the_project_has_not_changed_and_refuses_one_it_has() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -4589,18 +4725,19 @@ mod tests {
         )
         .unwrap();
         let file = tmp.path().join("plant.tewzip");
-        {
+        let write_archive = |app: &rusqlite::Connection| {
             let mut z = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
             let opt = zip::write::SimpleFileOptions::default();
             for (name, c) in [
                 ("Database/tew_catalog.sqlite", &catalog),
-                ("Database/tew_app_data.sqlite", &app),
+                ("Database/tew_app_data.sqlite", app),
             ] {
                 z.start_file(name, opt).unwrap();
                 z.write_all(&c.serialize(rusqlite::MAIN_DB).unwrap()).unwrap();
             }
             z.finish().unwrap();
-        }
+        };
+        write_archive(&app);
         let lib = tmp.path().join("lib");
         let args = [
             "import",
@@ -4621,6 +4758,15 @@ mod tests {
         assert_eq!(p.lock.parts["maker-a.rly-24"].source, "import:plant.tewzip");
         assert!(p.lock.symbols.contains_key("swe.lib.coil"));
         assert!(store::read_vendored_part(&dir, "maker-a.rly-24").is_ok());
+
+        // A newer archive with another version of the coil replaces the untouched copy.
+        app.execute_batch("INSERT INTO tew_blockpt VALUES (1, 'X1', 5, 0);")
+            .unwrap();
+        write_archive(&app);
+        cli(&dir, &["import", "swe-library", file.to_str().unwrap()]).unwrap();
+        let coil = store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap();
+        assert!(coil.pin("X1").is_some(), "{:?}", coil.pins);
+        assert_eq!(load(&dir).unwrap().lock.symbols["swe.lib.coil"].hash, coil.hash());
 
         std::fs::write(&file, "not an archive").unwrap();
         assert!(cli(&dir, &["import", "swe-library", file.to_str().unwrap()]).is_err());
