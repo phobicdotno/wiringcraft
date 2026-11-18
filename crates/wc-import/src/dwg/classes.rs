@@ -3,7 +3,7 @@
 //! custom entities it does not draw (WIPEOUT, IMAGE, proxy entities), and to tell them from
 //! custom non-graphic objects, which are not counted.
 //!
-//! Layout as LibreDWG's `read_2004_section_classes` reads it: a 16-byte sentinel, the size of
+//! Layout as AutoCAD writes it (the Open Design Alliance specification): a 16-byte sentinel, the size of
 //! the class data (RL), for 2010 drawings of maintenance release 4 and later a second size (RL),
 //! from 2007 the data's size in bits (RL); then the highest class number (BS), two bytes and a
 //! bit, and for each class its number (BS), proxy flags (BS), application, C++ and DXF names,
@@ -25,6 +25,9 @@ const SENTINEL: [u8; 16] = [
 
 /// The item class id of a class whose objects are entities.
 const ENTITY: u16 = 0x1F2;
+
+/// The item class id of a class whose objects are non-graphic objects.
+const OBJECT: u16 = 0x1F3;
 
 /// The most classes a drawing may define.
 const MAX_CLASSES: usize = 10_000;
@@ -83,7 +86,9 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
             .checked_add(if second { 191 } else { 159 })
             .filter(|f| *f < data.len() * 8)
             .ok_or_else(|| damaged("its texts lie past its end"))?;
-        // A CRC and the closing sentinel follow the area, as in 2004.
+        // A CRC and the closing sentinel follow the area, as in 2004. A section that puts them
+        // anywhere else (4 bytes earlier, say) fails this check and is reported as damaged
+        // rather than read at a wrong offset.
         closing_sentinel(data, area_end).map_err(&damaged)?;
         // The streams lie in that area.
         if flag_at / 8 >= area_end {
@@ -134,10 +139,16 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
             for _ in 0..5 {
                 d.bl()?;
             }
-            let class = Class {
-                dxf_name,
-                entity: id == ENTITY,
+            let entity = match id {
+                ENTITY => true,
+                OBJECT => false,
+                _ => {
+                    return Err(bad(format!(
+                        "class {number} has item class ID {id:#X}, not 0x1F2 or 0x1F3"
+                    )));
+                }
             };
+            let class = Class { dxf_name, entity };
             if number < 500 || number > max {
                 return Err(bad(format!("class {number} is outside 500 to {max}")));
             }

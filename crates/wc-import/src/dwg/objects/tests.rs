@@ -1983,13 +1983,22 @@ fn classes_section(v: Version, classes: &[(u16, &str, bool)]) -> Vec<u8> {
 
 /// [`classes_section`] declaring `max` as the highest class number.
 fn classes_section_max(v: Version, max: u16, classes: &[(u16, &str, bool)]) -> Vec<u8> {
+    let classes: Vec<_> = classes
+        .iter()
+        .map(|&(number, name, entity)| (number, name, if entity { 0x1F2 } else { 0x1F3 }))
+        .collect();
+    classes_section_ids(v, max, &classes)
+}
+
+/// [`classes_section_max`] with each class's item class id given as written.
+fn classes_section_ids(v: Version, max: u16, classes: &[(u16, &str, u16)]) -> Vec<u8> {
     const SENTINEL: [u8; 16] = [
         0x8D, 0xA1, 0xC4, 0xB8, 0xC4, 0xA9, 0xF8, 0xC5, 0xC0, 0xDC, 0xF4, 0x5F, 0xE7, 0xCF, 0xB6, 0x8A,
     ];
     let mut data = W::default();
     let mut strings = W::default();
     data.bs(max).rc(0).rc(0).b(true);
-    for &(number, name, entity) in classes {
+    for &(number, name, id) in classes {
         data.bs(number).bs(0);
         match v {
             Version::R2004 => {
@@ -1999,7 +2008,7 @@ fn classes_section_max(v: Version, max: u16, classes: &[(u16, &str, bool)]) -> V
                 strings.tu("ObjectDBX Classes").tu("AcDbThing").tu(name);
             }
         }
-        data.b(false).bs(if entity { 0x1F2 } else { 0x1F3 });
+        data.b(false).bs(id);
         data.bl(1).bl(0).bl(0).bl(0).bl(0);
     }
     let mut out = W::default();
@@ -2239,6 +2248,61 @@ fn a_2010_class_record_that_cannot_be_read_and_a_cut_trailer_are_damage() -> Tes
             d.skipped,
             d.damaged
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_class_with_an_unknown_item_class_id_is_damage() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+        ];
+        let zero = classes_section_ids(v, 500, &[(500, "WIPEOUT", 0)]);
+        let d = drawing(&sections_with_classes(v, &objs, zero))?;
+        assert_eq!(d.model.len(), 1, "{v:?}: the drawing is still read");
+        assert!(
+            d.damaged
+                .iter()
+                .any(|r| r.contains("class 500 has item class ID 0x0, not 0x1F2 or 0x1F3")),
+            "{v:?}: {:?}",
+            d.damaged
+        );
+        assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{v:?}: {:?}", d.skipped);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_2010_class_section_with_its_closing_sentinel_4_bytes_early_is_refused() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+    ];
+    // Release 6: the CRC (2 bytes) and the closing sentinel (16) end the section. Move them 4
+    // bytes earlier, over the end of the class data area, once with the section 4 bytes shorter
+    // and once padded back to its length.
+    let whole = classes_section(v, &[(500, "WIPEOUT", true)]);
+    let trailer_at = whole.len() - 18;
+    let mut short = whole[..trailer_at - 4].to_vec();
+    short.extend(&whole[trailer_at..]);
+    let mut padded = short.clone();
+    padded.extend([0; 4]);
+    for bad in [short, padded] {
+        let d = drawing(&sections_with_classes(v, &objs, bad))?;
+        assert_eq!(d.model.len(), 1, "the drawing is still read");
+        assert!(
+            d.damaged
+                .iter()
+                .any(|r| r.contains("AcDb:Classes") && r.contains("closing sentinel")),
+            "{:?}",
+            d.damaged
+        );
+        assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{:?}", d.skipped);
     }
     Ok(())
 }
