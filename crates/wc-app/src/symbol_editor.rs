@@ -480,7 +480,8 @@ impl SymbolEditor {
         self.drag.is_some()
     }
 
-    /// Whether `p` is on `item` (the same reach as [`Self::pick`]).
+    /// Whether `p` is on `item`: within 1.3 mm of a pin, or inside a shape's box made 1 mm
+    /// wider. [`Self::pick`] and dragging both use it.
     fn under(&self, item: Item, p: Point) -> bool {
         match item {
             Item::Pin(i) => self
@@ -512,18 +513,9 @@ impl SymbolEditor {
 
     /// The pin at `p`, else the last drawn shape whose box (1 mm wider) holds `p`.
     fn pick(&self, p: Point) -> Option<Item> {
-        if let Some(i) = self
-            .symbol
-            .pins
-            .iter()
-            .position(|q| (q.at.x - p.x).abs() < 1.3 && (q.at.y - p.y).abs() < 1.3)
-        {
-            return Some(Item::Pin(i));
-        }
-        self.symbol.graphics.iter().enumerate().rev().find_map(|(i, g)| {
-            let (a, b) = g.bounds();
-            (p.x >= a.x - 1.0 && p.x <= b.x + 1.0 && p.y >= a.y - 1.0 && p.y <= b.y + 1.0).then_some(Item::Shape(i))
-        })
+        let pins = (0..self.symbol.pins.len()).map(Item::Pin);
+        let shapes = (0..self.symbol.graphics.len()).rev().map(Item::Shape);
+        pins.chain(shapes).find(|&item| self.under(item, p))
     }
 
     pub fn delete_selected(&mut self) {
@@ -914,10 +906,18 @@ impl SymbolEditor {
 /// The properties box of the selected shape: what can be changed after drawing it.
 fn shape_properties(ui: &mut egui::Ui, shape: &mut Shape) {
     fn mm(v: &mut f64, min: f64) -> egui::DragValue<'_> {
-        egui::DragValue::new(v).speed(0.1).range(min..=1000.0).suffix(" mm")
+        egui::DragValue::new(v)
+            .speed(0.1)
+            .range(min..=1000.0)
+            .clamp_existing_to_range(false)
+            .suffix(" mm")
     }
     fn deg(v: &mut f64) -> egui::DragValue<'_> {
-        egui::DragValue::new(v).speed(1.0).range(0.0..=360.0).suffix("°")
+        egui::DragValue::new(v)
+            .speed(1.0)
+            .range(0.0..=360.0)
+            .clamp_existing_to_range(false)
+            .suffix("°")
     }
     match shape {
         Shape::Line { a, b } => {
@@ -1352,6 +1352,81 @@ mod tests {
         e.selected = Some(Item::Pin(0));
         assert!(e.selected_shape_mut().is_none());
         Ok(())
+    }
+
+    #[test]
+    fn an_arc_and_a_text_alignment_and_angle_can_be_changed() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Arc);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(5.0, 0.0));
+        e.click(Point::new(0.0, 5.0));
+        e.text = "A".into();
+        e.set_tool(Tool::Text);
+        e.click(Point::new(10.0, 10.0));
+        let drawn = e.symbol.clone();
+
+        e.set_tool(Tool::Select);
+        e.click(Point::new(2.5, 2.5));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        let before = e.symbol.clone();
+        if let Some(Shape::Arc { radius, start, end, .. }) = e.selected_shape_mut() {
+            (*radius, *start, *end) = (7.5, 180.0, 270.0);
+        }
+        e.note_property_edit(before);
+        let arc = e.symbol.graphics[0].clone();
+        assert!(matches!(arc, Shape::Arc { radius, start, end, .. } if (radius, start, end) == (7.5, 180.0, 270.0)));
+
+        // Another item: its edit is a step of its own.
+        e.click(Point::new(10.5, 10.0));
+        assert_eq!(e.selected, Some(Item::Shape(1)));
+        let before = e.symbol.clone();
+        if let Some(Shape::Text { align, angle, .. }) = e.selected_shape_mut() {
+            (*align, *angle) = (Align::Center, 90.0);
+        }
+        e.note_property_edit(before);
+        assert!(matches!(e.symbol.graphics[1], Shape::Text { align: Align::Center, angle, .. } if angle == 90.0));
+
+        e.undo();
+        assert_eq!(e.symbol.graphics[1], drawn.graphics[1], "the text is back");
+        assert_eq!(e.symbol.graphics[0], arc, "the arc edit stays");
+        e.undo();
+        assert_eq!(e.symbol, drawn);
+    }
+
+    #[test]
+    fn showing_the_properties_leaves_odd_values_alone() {
+        // Loaded symbols can hold values the boxes would not let you type.
+        let shapes = [
+            Shape::Text {
+                at: Point::new(0.0, 0.0),
+                text: "x".into(),
+                height: 0.25,
+                align: Align::Left,
+                angle: 0.0,
+            },
+            Shape::Circle {
+                center: Point::new(0.0, 0.0),
+                radius: 0.05,
+                filled: false,
+            },
+            Shape::Arc {
+                center: Point::new(0.0, 0.0),
+                radius: 2000.0,
+                start: -90.0,
+                end: 450.0,
+            },
+        ];
+        let ctx = egui::Context::default();
+        for shape in shapes {
+            let mut shown = shape.clone();
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| shape_properties(ui, &mut shown));
+                });
+            }
+            assert_eq!(shown, shape);
+        }
     }
 
     #[test]
