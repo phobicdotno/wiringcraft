@@ -142,14 +142,12 @@ impl Layers {
             Selection::Graphic(_) => Layer::Drawings,
             Selection::Symbol(_) | Selection::Wire(_) => return None,
         };
-        let state = if !self.shown(layer) {
-            "hidden"
-        } else if self.locked(layer) {
-            "locked"
-        } else {
-            return None;
+        let (state, fix) = match (self.shown(layer), self.locked(layer)) {
+            (true, false) => return None,
+            (false, true) => ("hidden and locked", "Show and unlock"),
+            (false, false) => ("hidden", "Show"),
+            (true, true) => ("locked", "Unlock"),
         };
-        let fix = if state == "hidden" { "Show" } else { "Unlock" };
         Some(format!(
             "The hit is on the {state} layer {}: {fix} it in View → Layers to select it.",
             layer.title()
@@ -250,8 +248,12 @@ mod tests {
         assert!(note.contains("Unlock"), "{note}");
         l.set_shown(Layer::Drawings, false);
         let note = l.unselectable_note(&text).unwrap();
-        assert!(note.contains("hidden layer Drawings and notes"), "{note}");
-        assert!(note.contains("Show"), "{note}");
+        assert!(note.contains("hidden and locked layer Drawings and notes"), "{note}");
+        assert!(note.contains("Show and unlock"), "{note}");
+        l.set_locked(Layer::Drawings, false);
+        let note = l.unselectable_note(&text).unwrap();
+        assert!(note.contains("the hidden layer Drawings and notes"), "{note}");
+        assert!(note.contains(": Show it"), "{note}");
         // Symbols and wires are on no layer.
         assert_eq!(l.unselectable_note(&Selection::Symbol("d1".into())), None);
         assert_eq!(l.unselectable_note(&Selection::Wire("w1".into())), None);

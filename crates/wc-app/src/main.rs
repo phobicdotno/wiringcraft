@@ -3128,12 +3128,12 @@ impl App {
         // frame without a word: say why instead.
         let note = select.as_ref().and_then(|s| self.prefs.layers.unselectable_note(s));
         self.ed.selection = self.prefs.layers.keep(select.into_iter().collect());
-        if let Some(note) = note {
-            if let Some(find) = self.find.as_mut() {
-                find.message = note.clone();
-            }
-            self.ed.message = note;
+        // Each go-to shows only its own note: a note from an earlier hit is cleared.
+        let note = note.unwrap_or_default();
+        if let Some(find) = self.find.as_mut() {
+            find.message = note.clone();
         }
+        self.ed.message = note;
     }
 
     /// Replace in the ticked find hits, as one undo step.
