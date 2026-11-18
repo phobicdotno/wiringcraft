@@ -1582,8 +1582,17 @@ mod discovery {
             ..beacon(&project, "Ola", 1)
         };
         assert!(b.encode().len() <= MAX_BEACON, "{}", b.encode().len());
-        let to: SocketAddr = "127.0.0.1:9".parse()?;
-        Announcer::start_to(b, to, EVERY)?.stop();
+        // It is sent, and a browser reads it whole.
+        let mut browser = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let to = browser.local_addr()?;
+        let announcer = Announcer::start_to(b, to, EVERY)?;
+        let list = poll_until(&mut browser, |l| !l.is_empty())?;
+        announcer.stop();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].project, project);
+        assert_eq!(list[0].host, "Ola");
+        assert_eq!(list[0].addr.port(), 65535);
+        assert_eq!(list[0].protocol, u32::MAX);
         Ok(())
     }
 
