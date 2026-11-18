@@ -1,8 +1,8 @@
 //! ASCII DXF reading: symbols and whole drawings.
 //!
 //! Supported entities: LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, SOLID/TRACE, LWPOLYLINE,
-//! POLYLINE/VERTEX, TEXT, MTEXT, POINT and INSERT (block references, exploded or turned into
-//! library symbols). Ellipses and splines become polylines through sampled points; a solid hatch
+//! POLYLINE/VERTEX, TEXT, MTEXT, POINT, INSERT (block references, exploded or turned into
+//! library symbols) and DIMENSION (drawn by its block). Ellipses and splines become polylines through sampled points; a solid hatch
 //! and a SOLID become filled outlines, a patterned hatch its outline. Other entities are counted
 //! in one warning per kind.
 //! DXF has y pointing up; WiringCraft pages have y pointing down, so y is flipped on the way in.
@@ -57,6 +57,22 @@ pub(crate) struct Drawing {
     /// INSERT puts on its insertion point.
     pub(crate) bases: BTreeMap<String, (f64, f64)>,
 }
+
+impl Drawing {
+    /// The entities of block `name`: its own spelling first, else any spelling (block names are
+    /// not case-sensitive).
+    fn block(&self, name: &str) -> Option<(&String, &Vec<Entity>)> {
+        self.blocks
+            .get_key_value(name)
+            .or_else(|| self.blocks.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)))
+    }
+}
+
+/// How deep block references (and dimensions) are followed inside each other.
+const MAX_NESTING: usize = 8;
+
+/// The skipped-count key for entities in blocks nested deeper than the nesting limit (8).
+pub const TOO_DEEP: &str = "entities in blocks nested too deep (or inserting themselves)";
 
 /// The most entities one import draws, block references expanded: a few nested blocks that
 /// each insert the next many times would otherwise fill the memory.
@@ -281,8 +297,12 @@ fn shapes(
     skipped: &mut BTreeMap<String, usize>,
     budget: &mut usize,
 ) {
-    if depth > 8 {
-        return; // block nesting this deep is either a cycle or not worth drawing
+    if depth > MAX_NESTING {
+        // Block nesting this deep is either a cycle or not worth drawing; say what is left out.
+        if !ents.is_empty() {
+            *skipped.entry(TOO_DEEP.to_owned()).or_default() += ents.len();
+        }
+        return;
     }
     let p = |x: f64, y: f64| {
         let (x, y) = xf.apply(x, y);
@@ -444,6 +464,27 @@ fn shapes(
                         d,
                         inner,
                         ixf,
+                        scale,
+                        depth + 1,
+                        skip_layer,
+                        out,
+                        points,
+                        skipped,
+                        budget,
+                    );
+                }
+                None
+            }
+            // A dimension is drawn by its (anonymous) block, placed as it is.
+            "DIMENSION" if e.get(2).and_then(|n| d.block(n)).is_some() => {
+                if let Some((name, inner)) = e.get(2).and_then(|n| d.block(n)) {
+                    // Placed by its base point like any block (normally (0, 0) for a dimension).
+                    let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
+                    let dxf = Xf::shift((-bx, -by)).then(&xf);
+                    shapes(
+                        d,
+                        inner,
+                        dxf,
                         scale,
                         depth + 1,
                         skip_layer,
@@ -997,6 +1038,11 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
         .map(|(kind, n)| {
             if kind == OVER_LIMIT {
                 format!("{n} entities not drawn: the drawing expands to more than {MAX_DRAWN} entities")
+            } else if kind == TOO_DEEP {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!(
+                    "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
+                )
             } else if kind == HATCH_UNFILLED {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
@@ -1871,6 +1917,60 @@ mod tests {
             _ => false,
         };
         assert!(g.len() == 1 && g.iter().all(placed), "{g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimension_is_drawn_by_its_block() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\n*D1\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
+        // The second refers to the block in other letters; the third to a missing one.
+        let (g, skipped) = drawn(
+            "0\nDIMENSION\n2\n*D1\n10\n7\n20\n7\n0\nDIMENSION\n2\n*d1\n0\nDIMENSION\n2\n*D9\n",
+            blocks,
+        )?;
+        let line = Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(0.0, -5.0),
+        };
+        assert_eq!(g, [line.clone(), line]);
+        assert_eq!(skipped.get("DIMENSION"), Some(&1));
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimension_past_the_nesting_limit_is_counted() -> Result<()> {
+        // B0 .. B6 each insert the next; B7, at the deepest level drawn, holds a dimension whose
+        // block would be one level deeper. An empty block at the limit counts nothing.
+        let mut blocks = String::new();
+        for b in 0..7 {
+            blocks += &format!("0\nBLOCK\n2\nB{b}\n0\nINSERT\n2\nB{}\n0\nENDBLK\n", b + 1);
+        }
+        blocks += "0\nBLOCK\n2\nB7\n0\nDIMENSION\n2\n*D1\n0\nINSERT\n2\nEMPTY\n0\nENDBLK\n";
+        blocks += "0\nBLOCK\n2\n*D1\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
+        blocks += "0\nBLOCK\n2\nEMPTY\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nB0\n", &blocks)?;
+        assert!(g.is_empty(), "{g:?}");
+        assert_eq!(skipped.get(TOO_DEEP), Some(&1), "{skipped:?}");
+        assert!(!skipped.contains_key("DIMENSION"), "{skipped:?}");
+        let warnings = skipped_warnings(skipped);
+        assert_eq!(
+            warnings,
+            ["1 entity not drawn: in blocks nested more than 8 deep (or inserting themselves)"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimension_block_is_placed_by_its_base_point() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\n*D2\n10\n5\n20\n5\n0\nLINE\n10\n5\n20\n5\n11\n10\n21\n5\n0\nENDBLK\n";
+        let (g, _) = drawn("0\nDIMENSION\n2\n*D2\n", blocks)?;
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(5.0, 0.0)
+            }]
+        );
         Ok(())
     }
 }

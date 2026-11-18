@@ -1207,3 +1207,46 @@ fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn a_dimension_is_drawn_by_its_block() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        let d1 = head(Some(0x100));
+        let mut objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            entry(v, BLOCK_HEADER, 0x100, "*D1"),
+            line(v, 0x200, d1, (0.0, 0.0), (0.0, 5.0)),
+            line(v, 0x201, d1, (20.0, 0.0), (20.0, 5.0)),
+        ];
+        let mut t = entity(v, 1, 0x202, d1);
+        text_data(&mut t, (10.0, 6.0), "20", 2.5, 0.0);
+        objs.push(t);
+        // A linear dimension (type 21) in model space, then one whose block is missing. Its data
+        // is not read: the block comes after the dimension style in the handle stream.
+        for (h, block) in [(0x300, 0x100), (0x301, 0x999)] {
+            let mut dim = entity(v, 21, h, head(None));
+            dim.handles.h(5, 0x50).h(5, block);
+            objs.push(dim);
+        }
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(
+            has_line(&d.model, Point::new(0.0, 0.0), Point::new(0.0, -5.0)),
+            "{v:?}: {:?}",
+            d.model
+        );
+        assert!(
+            has_line(&d.model, Point::new(20.0, 0.0), Point::new(20.0, -5.0)),
+            "{:?}",
+            d.model
+        );
+        assert_eq!(texts(&d.model), ["20"]);
+        assert_eq!(
+            d.skipped.get("DIMENSION"),
+            Some(&1),
+            "only the one without its block: {:?}",
+            d.skipped
+        );
+    }
+    Ok(())
+}
