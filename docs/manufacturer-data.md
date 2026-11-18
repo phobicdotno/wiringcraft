@@ -32,8 +32,10 @@ In the app, **File → Import** (and the ribbon's Import tab) runs the same proj
 imports as `wiringcraft import`, through the same code: EPLAN project (`.elk` or a zip of it),
 SolidWorks Electrical project (`.tewzip`) and libraries, AutomationML, a DWG drawing onto the
 current page, PDF pages, a project archive, and parts from EDZ, BMEcat and CSV. Each opens the
-system file picker filtered to the format's extensions; parts imports then ask for the library
-folder to write into. Changes not saved yet are saved first, the imported pages and devices come
+system file picker filtered to the format's extensions. Parts imports first ask for the library
+folder, like Import symbols: the project's own `library/` (added to the project's libraries
+once parts are in it), one of its other library folders, or another folder picked with the
+folder picker. Messages that name a command line option are worded for the app. Changes not saved yet are saved first, the imported pages and devices come
 in as one undo step, and the import's report and warnings are shown when it is done. New pages
 are numbered from the CLI's default first page, or after the project's highest page number when
 that is higher. The app imports the first project of a SolidWorks archive with its own page

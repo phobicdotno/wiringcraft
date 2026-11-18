@@ -104,8 +104,9 @@ pub fn first_free_page(open: &Open, default: usize) -> usize {
 /// Import `file` as `kind`: parts into the library folder `lib`, everything else into the open
 /// project (a DWG drawing onto page `page`). Changes not saved yet are saved first, since the
 /// import works on the project folder; what it added comes back as one Undo step. Returns the
-/// text for the message dialog: the import's report and warnings, or why it failed.
-pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page: usize) -> String {
+/// text for the message dialog (the import's report and warnings, or why it failed), and
+/// whether it was done.
+pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page: usize) -> (bool, String) {
     let name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -162,6 +163,7 @@ pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page
         }
     };
     let said = log.text();
+    let done = r.is_ok();
     let head = match r {
         Ok(()) => format!("Imported {name}."),
         Err(e) => format!("{name} was not imported: {e}"),
@@ -174,7 +176,33 @@ pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page
         msg.push_str("\n\n");
         msg.push_str(&said);
     }
-    msg
+    (done, app_wording(&msg))
+}
+
+/// The shared import code words some advice for the command line (its options); in the app
+/// the same advice is given in terms of what can be done here.
+fn app_wording(text: &str) -> String {
+    const SAID: &[(&str, &str)] = &[
+        (
+            "import with --first-page to number the pages from a free number",
+            "renumber or remove the project's pages in the way, then import again",
+        ),
+        (
+            "pick another --first-page",
+            "renumber or remove that page, then import again",
+        ),
+        (" (use --pick)", ""),
+        (
+            "pass --lib <folder>",
+            "the app does not import these from an archive yet",
+        ),
+        ("; run `wiringcraft inspect` to see what is there", ""),
+    ];
+    let mut out = text.to_owned();
+    for (cli, app) in SAID {
+        out = out.replace(cli, app);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -214,7 +242,7 @@ mod tests {
         let csv = tmp.path().join("parts.csv");
         let lib = tmp.path().join("lib");
         assert!(std::fs::write(&csv, "order number;manufacturer;description\nX-1;Acme;Relay\n").is_ok());
-        let msg = import(&mut open, Kind::PartsCsv, &csv, Some(&lib), 0);
+        let (_, msg) = import(&mut open, Kind::PartsCsv, &csv, Some(&lib), 0);
         assert!(msg.starts_with("Imported parts.csv."), "{msg}");
         assert!(msg.contains("imported 1 part(s)"), "{msg}");
         assert!(!open.dirty);
@@ -224,7 +252,7 @@ mod tests {
     fn a_file_that_cannot_be_read_says_why_and_changes_nothing() {
         let (tmp, mut open) = project();
         let before = open.project.clone();
-        let msg = import(&mut open, Kind::Aml, &tmp.path().join("missing.aml"), None, 0);
+        let (_, msg) = import(&mut open, Kind::Aml, &tmp.path().join("missing.aml"), None, 0);
         assert!(msg.starts_with("missing.aml was not imported"), "{msg}");
         assert_eq!(open.project, before);
         assert!(!open.can_undo());
@@ -237,7 +265,7 @@ mod tests {
         assert!(open.dirty);
         let aml = tmp.path().join("plant.aml");
         assert!(std::fs::write(&aml, AML).is_ok());
-        let msg = import(&mut open, Kind::Aml, &aml, None, 0);
+        let (_, msg) = import(&mut open, Kind::Aml, &aml, None, 0);
         assert!(msg.contains("saved first"), "{msg}");
         assert!(msg.contains("Imported plant.aml."), "{msg}");
         assert!(open.project.pages.len() > 1, "{msg}");
@@ -260,6 +288,20 @@ mod tests {
         }
         assert_eq!(first_free_page(&open, 100), 251);
         assert_eq!(first_free_page(&open, 400), 400);
+    }
+
+    #[test]
+    fn advice_names_no_command_line_option() {
+        for said in [
+            "page number 5 is taken; import with --first-page to number the pages from a free number",
+            "page pdf-200 exists; pick another --first-page",
+            "no project 2 in the archive (use --pick)",
+            "warning: a.kicad_sym: KiCad symbols, not imported: pass --lib <folder>",
+            "no importable PDF, DXF, AutomationML, KiCad symbols or CSV lists inside; run `wiringcraft inspect` to see what is there",
+        ] {
+            let app = app_wording(said);
+            assert!(!app.contains("--") && !app.contains("wiringcraft"), "{app}");
+        }
     }
 
     const AML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
