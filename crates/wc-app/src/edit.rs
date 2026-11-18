@@ -401,7 +401,13 @@ impl Open {
                 if moved.1 {
                     *end = turn(*end);
                 }
-                if (moved.0 || moved.1) && turn(*start) == turn(*end) {
+                // The sweep as the canvas draws it (`canvas::arc_points`): one that rounds to
+                // nothing (370.1° to 10.1°) leaves no arc either.
+                let drawn = {
+                    let sweep = *end - *start;
+                    if sweep <= 0.0 { sweep + 360.0 } else { sweep }
+                };
+                if (moved.0 || moved.1) && (turn(*start) == turn(*end) || drawn <= 1e-9) {
                     return Err("The start and end angles must differ.");
                 }
             }
@@ -1030,6 +1036,26 @@ mod tests {
                 start: 0.0,
                 end: 90.0,
             }
+        );
+        // Only the end changed, but the sweep drawn from the stored start rounds to nothing.
+        o.project.pages[page].graphics[n] = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 370.1,
+            end: 90.0,
+        };
+        assert!(
+            o.set_shape(
+                page,
+                n,
+                Shape::Arc {
+                    center: Point::new(150.0, 100.0),
+                    radius: 9.0,
+                    start: 370.1,
+                    end: 10.1,
+                }
+            )
+            .is_err()
         );
     }
 
