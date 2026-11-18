@@ -2051,14 +2051,21 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                         p.sort_pages();
                         save(dir, &p)?;
                         next += 1;
-                        import_cmd(
+                        let r = import_cmd(
                             dir,
                             ImportCmd::PageDxf {
                                 file: path.clone(),
-                                page: id,
+                                page: id.clone(),
                                 scale: 1.0,
                             },
-                        )
+                        );
+                        // A drawing that could not be imported leaves no blank page behind.
+                        if r.is_err() {
+                            let mut p = load(dir)?;
+                            p.pages.retain(|pg| pg.id != id);
+                            save(dir, &p)?;
+                        }
+                        r
                     }
                     _ => {
                         let r = import_cmd(
@@ -4104,6 +4111,32 @@ mod tests {
 
         std::fs::write(&file, "not an archive").unwrap();
         assert!(cli(&dir, &["import", "swe-library", file.to_str().unwrap()]).is_err());
+    }
+
+    #[test]
+    fn a_dxf_in_an_archive_that_cannot_be_imported_leaves_no_blank_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let pages = load(&dir).unwrap().pages.len();
+        use std::io::Write;
+        let file = tmp.path().join("drawings.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            z.start_file("broken.dxf", opt).unwrap();
+            z.write_all(b"this is not a drawing").unwrap();
+            z.finish().unwrap();
+        }
+        let _ = cli(&dir, &["import", "archive", file.to_str().unwrap()]);
+        let p = load(&dir).unwrap();
+        assert_eq!(
+            p.pages.len(),
+            pages,
+            "{:?}",
+            p.pages.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        assert!(p.pages.iter().all(|p| !p.id.starts_with("dxf-")));
     }
 
     #[test]

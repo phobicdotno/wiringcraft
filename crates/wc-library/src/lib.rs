@@ -420,6 +420,22 @@ pub fn update(
     Ok(todo)
 }
 
+/// Take the library versions of exactly these items, in order, whatever their state is now: what
+/// a caller that looked at [`status`] first and kept copies of what it is about to replace uses,
+/// so nothing is written that it has not seen. Stops at the first item that cannot be taken
+/// (items before it are taken already). Returns the items.
+pub fn update_items(
+    project_dir: &Path,
+    project: &mut Project,
+    lib: &Library,
+    items: &[(ItemKind, String)],
+) -> Result<Vec<(ItemKind, String)>> {
+    for (kind, id) in items {
+        take(project_dir, project, lib, *kind, id)?;
+    }
+    Ok(items.to_vec())
+}
+
 /// Propose a project's vendored version of an item back to a library source. The file goes to
 /// `<source>/proposed/<kind>/<id>.json` so a librarian (or a git pull request) can review it
 /// before it replaces the real item.

@@ -176,6 +176,10 @@ pub struct Open {
     /// Tests: a file whose backup read fails, though the file is a plain readable one.
     #[cfg(test)]
     unreadable: Option<PathBuf>,
+    /// Tests: a library file rewritten once the update's backups are taken, as if someone
+    /// saved it in between.
+    #[cfg(test)]
+    rewrite_after_snapshot: Option<(PathBuf, String)>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
     /// Parts the last Undo or Redo could not load, with the reason, though the step was done.
@@ -212,6 +216,8 @@ impl Open {
             block_after_snapshot: None,
             #[cfg(test)]
             unreadable: None,
+            #[cfg(test)]
+            rewrite_after_snapshot: None,
             undo_error: None,
             step_warning: None,
         };
@@ -781,7 +787,21 @@ impl Open {
         lib: &wc_library::Library,
         only: Option<&[String]>,
     ) -> Result<Vec<(ItemKind, String)>, String> {
-        let todo: Vec<(ItemKind, String)> = wc_library::status(&self.dir, &self.project, lib)
+        let all = wc_library::status(&self.dir, &self.project, lib);
+        // An item named on purpose whose library file is wrong stops the update, as in
+        // `wc_library::update`.
+        if let Some(ids) = only
+            && let Some(bad) = all
+                .iter()
+                .find(|s| s.state == wc_library::State::WrongId && ids.contains(&s.id))
+        {
+            return Err(format!(
+                "nothing was updated: library source {}: {}",
+                bad.library_source.clone().unwrap_or_default(),
+                bad.changes.join("; ")
+            ));
+        }
+        let todo: Vec<(ItemKind, String)> = all
             .into_iter()
             .filter(|s| s.state == wc_library::State::Changed)
             .filter(|s| only.is_none_or(|ids| ids.contains(&s.id)))
@@ -822,9 +842,15 @@ impl Open {
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::create_dir(&path);
         }
+        #[cfg(test)]
+        if let Some((path, text)) = self.rewrite_after_snapshot.take() {
+            let _ = std::fs::write(&path, text);
+        }
         self.archive_symbols();
         self.checkpoint();
-        let done = match wc_library::update(&self.dir, &mut self.project, lib, only) {
+        // Exactly the items looked at and snapshotted above: one whose library file changed
+        // since (from a wrong id to a new version, say) waits for the next update.
+        let done = match wc_library::update_items(&self.dir, &mut self.project, lib, &todo) {
             Ok(done) => done,
             Err(e) => {
                 // Some items may have been taken already: take them back too.
@@ -2009,6 +2035,34 @@ pub(crate) mod tests {
             "the part file is untouched"
         );
         assert_eq!(o.project.lock, lock);
+    }
+
+    #[test]
+    fn an_update_takes_only_the_items_it_looked_at() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        // The library's coil file names another id: not an update when the update looks.
+        let mut wrong = old.clone();
+        wrong.id = "wc.other".into();
+        let lib = library_first(&mut o, tmp.path(), &wrong);
+        let file = tmp.path().join("mine/symbols/wc.coil.json");
+        std::fs::write(&file, serde_json::to_string(&wrong).unwrap()).unwrap();
+        // Fixed and changed right after the backups are taken.
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        o.rewrite_after_snapshot = Some((file, serde_json::to_string(&new).unwrap()));
+        let done = o.update_library(&lib, None).unwrap();
+        assert_eq!(done, vec![(ItemKind::Part, pid.to_owned())]);
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "the coil it did not look at is not taken"
+        );
+        assert_eq!(o.project.lock.symbols["wc.coil"].hash, old.hash());
     }
 
     #[test]
