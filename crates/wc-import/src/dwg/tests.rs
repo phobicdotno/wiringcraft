@@ -127,16 +127,16 @@ fn noise(n: usize, mut seed: u32) -> Vec<u8> {
 // ---- A DWG writer for the tests ----
 
 #[derive(Default)]
-struct TestSection {
-    name: &'static str,
-    data: Vec<u8>,
-    encrypted: bool,
+pub(super) struct TestSection {
+    pub(super) name: &'static str,
+    pub(super) data: Vec<u8>,
+    pub(super) encrypted: bool,
     /// Pages stored without compression.
-    stored: bool,
+    pub(super) stored: bool,
     /// How many more times the section map lists each page (a hostile file).
-    listed_again: usize,
+    pub(super) listed_again: usize,
     /// Added to each page's decompressed size in its header (a damaged file).
-    claimed_extra: u32,
+    pub(super) claimed_extra: u32,
 }
 
 const MAX_PAGE_DATA: usize = 0x7400;
@@ -162,7 +162,7 @@ fn system_page_bytes(kind: u32, data: &[u8]) -> Vec<u8> {
 
 /// Write a DWG file of `version` holding `sections`, each split into pages of at most 0x7400
 /// bytes, followed by the section map and the page map.
-fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> {
+pub(super) fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> {
     let mut file = vec![0u8; 0x100];
     file[..6].copy_from_slice(version);
     let mut page_sizes: Vec<(i32, i32)> = Vec::new();

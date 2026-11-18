@@ -1,9 +1,10 @@
 //! ASCII DXF reading: symbols and whole drawings.
 //!
-//! Supported entities: LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, LWPOLYLINE, POLYLINE/VERTEX,
-//! TEXT, MTEXT, POINT and INSERT (block references, exploded or turned into library symbols).
-//! Ellipses and splines become polylines through sampled points; a solid hatch becomes a filled
-//! outline, a patterned one its outline. Other entities are counted in one warning per kind.
+//! Supported entities: LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, SOLID/TRACE, LWPOLYLINE,
+//! POLYLINE/VERTEX, TEXT, MTEXT, POINT and INSERT (block references, exploded or turned into
+//! library symbols). Ellipses and splines become polylines through sampled points; a solid hatch
+//! and a SOLID become filled outlines, a patterned hatch its outline. Other entities are counted
+//! in one warning per kind.
 //! DXF has y pointing up; WiringCraft pages have y pointing down, so y is flipped on the way in.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,16 +16,16 @@ use crate::{Error, Result, make_symbol};
 
 /// One entity as group-code/value pairs.
 #[derive(Debug, Clone, Default)]
-struct Entity {
-    kind: String,
-    codes: Vec<(i32, String)>,
+pub(crate) struct Entity {
+    pub(crate) kind: String,
+    pub(crate) codes: Vec<(i32, String)>,
 }
 
 impl Entity {
     fn get(&self, code: i32) -> Option<&str> {
         self.codes.iter().find(|(c, _)| *c == code).map(|(_, v)| v.as_str())
     }
-    fn f(&self, code: i32) -> f64 {
+    pub(crate) fn f(&self, code: i32) -> f64 {
         self.get(code)
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
@@ -49,9 +50,18 @@ impl Entity {
 }
 
 #[derive(Debug, Default)]
-struct Drawing {
-    entities: Vec<Entity>,
-    blocks: BTreeMap<String, Vec<Entity>>,
+pub(crate) struct Drawing {
+    pub(crate) entities: Vec<Entity>,
+    pub(crate) blocks: BTreeMap<String, Vec<Entity>>,
+}
+
+/// Draw `ents` of `d` as page shapes with their layers (y flipped, unscaled), block references
+/// expanded. Entities not drawn are counted in `skipped`.
+pub(crate) fn draw(d: &Drawing, ents: &[Entity], skipped: &mut BTreeMap<String, usize>) -> Vec<(String, Shape)> {
+    let mut out = Vec::new();
+    let mut points = Vec::new();
+    shapes(d, ents, Xf::ID, 1.0, 0, &|_| false, &mut out, &mut points, skipped);
+    out
 }
 
 fn pairs(text: &str) -> Result<Vec<(i32, String)>> {
@@ -315,6 +325,15 @@ fn shapes(
                     // Code 50: rotation in degrees, counter-clockwise.
                     angle: normal_angle(e.f(50)),
                 })
+            }
+            "SOLID" | "TRACE" => {
+                // Corners in the order 1, 2, 4, 3: the third and fourth make a "Z".
+                let mut pts = vec![q(e.f(10), e.f(20)), q(e.f(11), e.f(21)), q(e.f(13), e.f(23))];
+                let third = q(e.f(12), e.f(22));
+                if pts.last().is_none_or(|l| l.distance(third) > 1e-9) {
+                    pts.push(third);
+                }
+                polyline(pts, true, true)
             }
             "POINT" => {
                 points.push((layer.clone(), p(e.f(10), e.f(20))));
@@ -1308,9 +1327,23 @@ mod tests {
 
     #[test]
     fn entities_not_read_are_counted_per_kind() -> Result<()> {
-        let ents = "0\n3DFACE\n8\n0\n0\n3DFACE\n8\n0\n0\nSOLID\n8\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
+        let ents = "0\n3DFACE\n8\n0\n0\n3DFACE\n8\n0\n0\nMLINE\n8\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
         let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
-        assert_eq!(p.warnings, ["2 3DFACE entities not read", "1 SOLID entity not read"]);
+        assert_eq!(p.warnings, ["2 3DFACE entities not read", "1 MLINE entity not read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_solid_is_a_filled_outline() -> Result<()> {
+        // A triangle (third and fourth corner the same) and a square, corners in "Z" order.
+        let ents = "0\nSOLID\n10\n0\n20\n0\n11\n4\n21\n0\n12\n0\n22\n3\n13\n0\n23\n3\n\
+            0\nSOLID\n10\n0\n20\n0\n11\n1\n21\n0\n12\n0\n22\n1\n13\n1\n23\n1\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert!(skipped.is_empty());
+        assert_eq!(poly(&g[0]).0.len(), 3);
+        let (square, closed, filled) = poly(&g[1]);
+        assert!(closed && filled);
+        assert_eq!(square[2], Point::new(1.0, -1.0), "the fourth corner comes third");
         Ok(())
     }
 
