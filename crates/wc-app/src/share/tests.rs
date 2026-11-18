@@ -3832,6 +3832,58 @@ fn undo_of_a_renumbering_here_before_the_sessions_gives_the_page_the_sessions_nu
 }
 
 #[test]
+fn a_renumbering_here_the_session_repeats_leaves_no_empty_undo_step() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    let original = number(&guest_open).ok_or("no page")?;
+    let host_renumber = |o: &mut Open, to: &str| -> TestResult {
+        o.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        o.project.sort_pages();
+        Ok(())
+    };
+    // The session renumbers the waiting page to 30.
+    host_renumber(&mut host_open, "30")?;
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The guest places a second waiting symbol, then numbers the page back, then to 40.
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for to in [original.as_str(), "40"] {
+        guest_open.checkpoint();
+        guest_open.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        guest_open.project.sort_pages();
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The session numbers it back too.
+    host_renumber(&mut host_open, &original)?;
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // Undo takes back the 40; the next Undo has nothing of the guest's renumbering left to
+    // take back, and takes back the second placement only.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open), Some(original.clone()), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(
+        has_placement(&guest_open, "p0003", &first),
+        "the first still waits: {:?}",
+        g.notes
+    );
+    assert_eq!(number(&guest_open), Some(original), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
 fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
