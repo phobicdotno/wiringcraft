@@ -1253,12 +1253,23 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
 
 /// A HATCH in model space: no gradient, pattern `name`, the paths written by `paths`.
 fn hatch_obj(v: Version, handle: u64, name: &str, solid: bool, count: u32, paths: impl Fn(&mut W)) -> Obj {
-    hatch_with(v, handle, name, solid, count, 1.0, paths)
+    hatch_with(v, handle, name, solid, count, 1.0, 0, paths)
 }
 
-/// [`hatch_obj`] with an extrusion of (0, 0, `z`) and a gradient of two colours, the second
-/// with a colour name and a book name.
-fn hatch_with(v: Version, handle: u64, name: &str, solid: bool, count: u32, z: f64, paths: impl Fn(&mut W)) -> Obj {
+/// [`hatch_obj`] with an extrusion of (0, 0, `z`), a gradient of two colours (the second with a
+/// colour name and a book name) and `boundary` boundary object handles. Written whole: after
+/// the style and pattern type, a pattern's angle, scale and (no) lines, then (no) seed points.
+#[allow(clippy::too_many_arguments)]
+fn hatch_with(
+    v: Version,
+    handle: u64,
+    name: &str,
+    solid: bool,
+    count: u32,
+    z: f64,
+    boundary: u64,
+    paths: impl Fn(&mut W),
+) -> Obj {
     let mut o = entity(v, 78, handle, head(None));
     o.data.bl(1).bl(0).bd(0.0).bd(0.0).bl(0).bd(0.0).bl(2);
     o.data.bd(0.0).bs(5).bl(0xC300_0005).rc(0);
@@ -1271,14 +1282,22 @@ fn hatch_with(v: Version, handle: u64, name: &str, solid: bool, count: u32, z: f
     o.data.b(solid).b(false).bl(count);
     paths(&mut o.data);
     o.data.bs(0).bs(1);
+    if !solid {
+        o.data.bd(0.0).bd(1.0).b(false).bs(0);
+    }
+    o.data.bl(0);
+    for b in 0..boundary {
+        o.handles.h(4, 0x700 + b);
+    }
     o
 }
 
 #[test]
 fn hatches_become_filled_and_unfilled_outlines() -> TestResult {
     for v in [Version::R2004, Version::R2010] {
-        // A solid square: a polyline path without bulges.
-        let solid = hatch_obj(v, 0x300, "SOLID", true, 1, |d| {
+        // A solid square: a polyline path without bulges, filled by its solid flag (its name
+        // is not SOLID).
+        let solid = hatch_obj(v, 0x300, "_USER", true, 1, |d| {
             d.bl(2).b(false).b(true).bl(4);
             for p in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)] {
                 d.rd(p.0).rd(p.1);
@@ -1333,9 +1352,38 @@ fn a_hatch_listing_too_much_is_a_damaged_object() -> TestResult {
             // An edge of unknown type.
             d.bl(1).bl(1).rc(9);
         }),
+        hatch_obj(v, 0x302, "SOLID", true, 1, |d| {
+            // A point that is not a number.
+            d.bl(2)
+                .b(false)
+                .b(true)
+                .bl(3)
+                .rd(f64::NAN)
+                .rd(0.0)
+                .rd(1.0)
+                .rd(0.0)
+                .rd(0.0)
+                .rd(1.0)
+                .bl(0);
+        }),
+        hatch_obj(v, 0x303, "SOLID", true, 1, |d| {
+            // One boundary object declared, its handle missing.
+            d.bl(2)
+                .b(false)
+                .b(true)
+                .bl(3)
+                .rd(0.0)
+                .rd(0.0)
+                .rd(1.0)
+                .rd(0.0)
+                .rd(0.0)
+                .rd(1.0)
+                .bl(1);
+        }),
     ];
     let d = drawing(&sections(v, &objs, &[]))?;
-    assert_eq!(d.skipped.get(DAMAGED), Some(&2), "{:?}", d.skipped);
+    assert_eq!(d.skipped.get(DAMAGED), Some(&4), "{:?}", d.skipped);
+    assert!(d.damaged.iter().any(|r| r.contains("not a number")), "{:?}", d.damaged);
     assert!(
         d.damaged.iter().any(|r| r.contains("50000 boundary paths")),
         "{:?}",
@@ -1363,7 +1411,7 @@ fn hatch_edges_of_every_kind_and_a_mirrored_hatch_are_read() -> TestResult {
         });
         // An edge path: half an ellipse over (40, 0)..(60, 0), closed by a spline below it,
         // with fit points (and tangents) in 2010.
-        let edges = hatch_obj(v, 0x301, "ANSI31", false, 1, |d| {
+        let edges = hatch_with(v, 0x301, "ANSI31", false, 1, 1.0, 2, |d| {
             d.bl(1).bl(2);
             d.rc(3).rd(50.0).rd(0.0).rd(10.0).rd(0.0).bd(0.5).bd(0.0).bd(PI).b(true);
             d.rc(4).bl(2).b(false).b(false).bl(6).bl(3);
@@ -1388,7 +1436,7 @@ fn hatch_edges_of_every_kind_and_a_mirrored_hatch_are_read() -> TestResult {
             d.bl(2);
         });
         // A solid triangle with a downward extrusion: mirrored in x.
-        let mirrored = hatch_with(v, 0x302, "SOLID", true, 1, -1.0, |d| {
+        let mirrored = hatch_with(v, 0x302, "SOLID", true, 1, -1.0, 0, |d| {
             d.bl(2).b(false).b(true).bl(3);
             for p in [(100.0, 0.0), (110.0, 0.0), (100.0, 10.0)] {
                 d.rd(p.0).rd(p.1);

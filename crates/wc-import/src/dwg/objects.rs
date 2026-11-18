@@ -458,6 +458,24 @@ fn skip_color(o: &mut Object) -> Result<()> {
     Ok(())
 }
 
+/// A point of a HATCH boundary: both coordinates numbers.
+fn hatch_point(o: &mut Object) -> Result<(f64, f64)> {
+    let (x, y) = o.data.rd2()?;
+    if !(x.is_finite() && y.is_finite()) {
+        return Err(bad("a hatch boundary point is not a number"));
+    }
+    Ok((x, y))
+}
+
+/// A value of a HATCH boundary (radius, angle, ratio, knot, weight): a number.
+fn hatch_value(o: &mut Object) -> Result<f64> {
+    let v = o.data.bd()?;
+    if !v.is_finite() {
+        return Err(bad("a hatch boundary value is not a number"));
+    }
+    Ok(v)
+}
+
 /// HATCH: the pattern name, the solid-fill flag, the boundary paths and the style, as the DXF
 /// codes the DXF reader draws a hatch from (2, 70, 91, 92, 72, 73, 93, 10/20, 42, ..., 75).
 /// Angles are radians in DWG and degrees in DXF. The pattern lines and seed points after the
@@ -482,6 +500,7 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
     let solid = o.data.b()?;
     o.data.b()?;
     let paths = hatch_count(o, "boundary paths")?;
+    let mut boundary = 0u32;
     e.f(230, z).s(2, name).i(70, i64::from(solid)).i(91, i64::from(paths));
     for _ in 0..paths {
         let flags = o.data.bl()?;
@@ -494,21 +513,21 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
                 e.i(72, i64::from(kind));
                 match kind {
                     1 => {
-                        let (a, b) = (o.data.rd2()?, o.data.rd2()?);
+                        let (a, b) = (hatch_point(o)?, hatch_point(o)?);
                         e.f(10, a.0).f(20, a.1).f(11, b.0).f(21, b.1);
                     }
                     2 => {
-                        let c = o.data.rd2()?;
-                        let r = o.data.bd()?;
-                        let (a0, a1) = (o.data.bd()?, o.data.bd()?);
+                        let c = hatch_point(o)?;
+                        let r = hatch_value(o)?;
+                        let (a0, a1) = (hatch_value(o)?, hatch_value(o)?);
                         let ccw = o.data.b()?;
                         e.f(10, c.0).f(20, c.1).f(40, r);
                         e.f(50, a0.to_degrees()).f(51, a1.to_degrees()).i(73, i64::from(ccw));
                     }
                     3 => {
-                        let (c, m) = (o.data.rd2()?, o.data.rd2()?);
-                        let ratio = o.data.bd()?;
-                        let (a0, a1) = (o.data.bd()?, o.data.bd()?);
+                        let (c, m) = (hatch_point(o)?, hatch_point(o)?);
+                        let ratio = hatch_value(o)?;
+                        let (a0, a1) = (hatch_value(o)?, hatch_value(o)?);
                         let ccw = o.data.b()?;
                         e.f(10, c.0).f(20, c.1).f(11, m.0).f(21, m.1).f(40, ratio);
                         e.f(50, a0.to_degrees()).f(51, a1.to_degrees()).i(73, i64::from(ccw));
@@ -524,13 +543,13 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
                             .i(74, i64::from(periodic));
                         e.i(95, i64::from(knots)).i(96, i64::from(points));
                         for _ in 0..knots {
-                            e.f(40, o.data.bd()?);
+                            e.f(40, hatch_value(o)?);
                         }
                         for _ in 0..points {
-                            let p = o.data.rd2()?;
+                            let p = hatch_point(o)?;
                             e.f(10, p.0).f(20, p.1);
                             if rational {
-                                e.f(42, o.data.bd()?);
+                                e.f(42, hatch_value(o)?);
                             }
                         }
                         // Fit points and their end tangents, from 2010.
@@ -538,11 +557,11 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
                             let fit = hatch_count(o, "fit points")?;
                             e.i(97, i64::from(fit));
                             for _ in 0..fit {
-                                let p = o.data.rd2()?;
+                                let p = hatch_point(o)?;
                                 e.f(11, p.0).f(21, p.1);
                             }
                             if fit > 0 {
-                                let (s, t) = (o.data.rd2()?, o.data.rd2()?);
+                                let (s, t) = (hatch_point(o)?, hatch_point(o)?);
                                 e.f(12, s.0).f(22, s.1).f(13, t.0).f(23, t.1);
                             }
                         }
@@ -556,18 +575,22 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
             let n = hatch_count(o, "polyline points")?;
             e.i(72, i64::from(bulges)).i(73, i64::from(closed)).i(93, i64::from(n));
             for _ in 0..n {
-                let p = o.data.rd2()?;
+                let p = hatch_point(o)?;
                 e.f(10, p.0).f(20, p.1);
                 if bulges {
-                    e.f(42, o.data.bd()?);
+                    e.f(42, hatch_value(o)?);
                 }
             }
         }
-        // The boundary objects: a count here, their handles in the handle stream.
-        hatch_count(o, "boundary objects")?;
+        // The boundary objects: a count here, their handles in the handle stream (read after
+        // the data, so a hatch missing them is damaged).
+        boundary += hatch_count(o, "boundary objects")?;
         e.i(97, 0);
     }
     e.i(75, i64::from(o.data.bs()?));
+    for _ in 0..boundary {
+        o.handle_ref()?;
+    }
     Ok(())
 }
 
