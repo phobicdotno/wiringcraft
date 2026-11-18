@@ -3639,6 +3639,60 @@ fn undo_of_a_rename_of_a_waiting_placements_new_device_brings_the_device_back() 
 }
 
 #[test]
+fn undo_of_a_waiting_placement_keeps_a_session_change_to_a_synced_device_on_its_page() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let k9 = DeviceTag::parse("-K9")?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        let coil = o.place(2, "wc.coil", wc_core::Point::new(40.0, 160.0))?;
+        if let Some(s) = o.project.pages[2].symbols.iter_mut().find(|s| s.id == coil) {
+            s.tag = Some(k9.clone());
+        }
+        o.project.devices.insert(k9.clone(), Device::default());
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    let first = guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    for _ in 0..=ITEM_TRIES {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        std::thread::sleep(ITEM_WAIT);
+    }
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // After the second placement, the host changes -K9, which the waiting page names.
+    host_open.project.devices.insert(
+        k9.clone(),
+        Device {
+            description: "From the host".into(),
+            ..Default::default()
+        },
+    );
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let description = |o: &Open| o.project.devices.get(&k9).map(|d| d.description.clone());
+    assert_eq!(
+        description(&guest_open).as_deref(),
+        Some("From the host"),
+        "{:?}",
+        g.notes
+    );
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    assert_eq!(
+        description(&guest_open).as_deref(),
+        Some("From the host"),
+        "the session's -K9 stays"
+    );
+    assert_eq!(description(&host_open).as_deref(), Some("From the host"));
+    Ok(())
+}
+
+#[test]
 fn undo_of_a_waiting_placement_keeps_the_sessions_page_number() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;

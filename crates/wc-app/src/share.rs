@@ -2515,15 +2515,21 @@ impl Held {
 /// latest action changed nothing that waits. A page the session renumbered since that action
 /// (`renumbered`: page id to its number before) keeps the session's number, as when the
 /// waiting changes are put back; a number this copy changed is taken back like the rest.
-fn latest_waiting_step(open: &Open, held: &Held, renumbered: &BTreeMap<String, String>) -> Option<wc_share::Parts> {
+fn latest_waiting_step(
+    open: &Open,
+    base: &Project,
+    held: &Held,
+    renumbered: &BTreeMap<String, String>,
+) -> Option<wc_share::Parts> {
     let prev = open.before_last_change()?;
-    // A device a waiting page named before the action comes back with it, even when it was new
-    // here and the action renamed it away, so no page names it now.
+    // A new device a waiting page named before the action comes back with it, even when the
+    // action renamed it away, so no page names it now. Only one the session never had
+    // (`base`): a synced device is the session's, and may have changed there since.
     let mut keys = held.now.clone();
     let named_before: Vec<_> = prev
         .devices
         .iter()
-        .filter(|(tag, _)| !keys.devices.contains_key(*tag))
+        .filter(|(tag, _)| !keys.devices.contains_key(*tag) && !base.devices.contains_key(*tag))
         .filter(|(tag, _)| {
             keys.pages
                 .keys()
@@ -3206,7 +3212,7 @@ impl Share {
             // Undo of a change that never reached the session: taken back here only, and only
             // the latest action. What waited before it waits still.
             let before = open.project.clone();
-            match latest_waiting_step(open, &held, &self.renumbered) {
+            match latest_waiting_step(open, self.base.as_ref()?, &held, &self.renumbered) {
                 Some(step) => {
                     step.apply(&mut open.project);
                     open.forget_last_change();
