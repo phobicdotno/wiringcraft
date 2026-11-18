@@ -155,7 +155,62 @@ fn a_macro_is_placed_with_the_chosen_value_set() -> TestResult {
     std::fs::create_dir_all(dir.join("macros"))?;
     std::fs::copy(lib.join("macros/starter.json"), dir.join("macros/starter.json"))?;
     std::fs::remove_dir_all(&lib)?;
-    let ids = wiringcraft(&dir, &["macro", "place", "p1", "starter", "--at", "0,0", "--set", "3 kW"])?;
+    // A source of a kind it does not know makes the library fail to open.
+    let mut p = wc_core::store::load(&dir)?;
+    p.meta.libraries[0].kind = "zip".into();
+    wc_core::store::save(&dir, &p)?;
+    assert!(
+        wiringcraft(&dir, &["lib", "status"]).is_err(),
+        "the library cannot be opened"
+    );
+    let ids = wiringcraft(
+        &dir,
+        &["macro", "place", "p1", "starter", "--at", "0,0", "--set", "3 kW"],
+    )?;
     assert_eq!(ids.trim(), "s4 w4");
+    Ok(())
+}
+
+#[test]
+fn a_retry_after_a_failed_placement_pins_every_symbol() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::copy(&coil, lib.join("symbols/wc.coil.json"))?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    // Two symbols: the coil, then one the library does not have yet.
+    std::fs::create_dir_all(dir.join("macros"))?;
+    std::fs::write(
+        dir.join("macros/pair.json"),
+        r#"{"name": "Pair", "anchor": {"x": 0.0, "y": 0.0}, "symbols": [
+            {"id": "s1", "symbol": "wc.coil", "at": {"x": 10.0, "y": 10.0}, "tag": "-K1"},
+            {"id": "s2", "symbol": "wc.zcoil", "at": {"x": 30.0, "y": 10.0}, "tag": "-K2"}]}"#,
+    )?;
+    assert!(wiringcraft(&dir, &["macro", "place", "p1", "pair", "--at", "0,0"]).is_err());
+    let copy = wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Symbol, "wc.coil")?;
+    assert!(copy.exists(), "the coil was copied before the failure");
+    assert!(
+        !wc_core::store::load(&dir)?.lock.symbols.contains_key("wc.coil"),
+        "but not pinned"
+    );
+
+    let mut second: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&coil)?)?;
+    second["id"] = "wc.zcoil".into();
+    std::fs::write(lib.join("symbols/wc.zcoil.json"), second.to_string())?;
+    wiringcraft(&dir, &["macro", "place", "p1", "pair", "--at", "0,0"])?;
+    let lock = wc_core::store::load(&dir)?.lock.symbols;
+    assert!(
+        lock.contains_key("wc.coil") && lock.contains_key("wc.zcoil"),
+        "both are pinned: {lock:?}"
+    );
     Ok(())
 }
