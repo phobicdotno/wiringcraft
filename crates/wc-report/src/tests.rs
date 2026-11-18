@@ -1184,11 +1184,11 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
         [
             ("-X1/P1", "Plate"),
             ("-X1/R1", "Rail"),
-            ("-X1/T1", "Terminal"),
-            ("-X1/T2", "Terminal"),
+            ("-X1/T:1", "Terminal"),
+            ("-X1/T:2", "Terminal"),
             ("-X1/J1", "Jumper"),
             ("-X1/A1", "Accessory"),
-            ("-X1/T2/A1", "Accessory"),
+            ("-X1/T:2/A1", "Accessory"),
         ]
     );
     let row = |index: &str| t.rows.iter().find(|r| r[0] == index).unwrap().clone();
@@ -1198,7 +1198,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
         ("Main plate", "1")
     );
     assert_eq!(row("-X1/R1")[18], "0");
-    let t1 = row("-X1/T1");
+    let t1 = row("-X1/T:1");
     assert_eq!((t1[3].as_str(), t1[4].as_str()), ("1", "1"));
     assert_eq!((t1[6].as_str(), t1[7].as_str()), ("2002-1201", "WAGO"));
     assert_eq!(&t1[10..14], ["1.5 mm²", "BU", "2.5 mm²", ""]);
@@ -1208,7 +1208,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
         (row("-X1/A1")[6].as_str(), row("-X1/A1")[9].as_str()),
         ("2002-1291", "1")
     );
-    let a2 = row("-X1/T2/A1");
+    let a2 = row("-X1/T:2/A1");
     assert_eq!(
         (a2[6].as_str(), a2[9].as_str(), a2[14].as_str()),
         ("acme.marker", "2", "2")
@@ -1216,7 +1216,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
     // -X2 is on no plate and has no part: one bare terminal row.
     let x2: Vec<&Vec<String>> = t.rows.iter().filter(|r| r[2] == "-X2").collect();
     assert_eq!(x2.len(), 1);
-    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T1", ""));
+    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T:1", ""));
     assert!(to_smartscript_csv(&t).starts_with("\u{feff}Index;Type;Strip;"));
 }
 
@@ -1250,7 +1250,7 @@ fn a_terminal_tagged_with_only_its_strip_takes_the_strip_devices_part() {
     .table;
     let x2: Vec<&Vec<String>> = t.rows.iter().filter(|r| r[2] == "-X2").collect();
     assert_eq!(x2.len(), 2, "{x2:?}");
-    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T1", "2002-1201"));
+    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T:1", "2002-1201"));
     // Its accessory belongs to terminal 1, and the part is not listed again as an accessory.
     assert_eq!(
         (
@@ -1259,7 +1259,7 @@ fn a_terminal_tagged_with_only_its_strip_takes_the_strip_devices_part() {
             x2[1][9].as_str(),
             x2[1][14].as_str()
         ),
-        ("-X2/T1/A1", "acme.marker", "3", "1")
+        ("-X2/T:1/A1", "acme.marker", "3", "1")
     );
 }
 
@@ -1273,15 +1273,15 @@ fn configurator_tags_with_a_function_or_location_aspect_are_written_as_text() {
         parts: &parts,
     });
     let row = out.table.rows.iter().find(|r| r[2].contains("X9")).unwrap();
-    assert_eq!(row[0], "'=A+C1-X9/T1");
+    assert_eq!(row[0], "'=A+C1-X9/T:1");
     assert_eq!(row[2], "'=A+C1-X9");
     assert!(
         out.warnings.iter().any(|w| w.contains("Strip \"=A+C1-X9\"")),
         "{:?}",
         out.warnings
     );
-    assert!(out.warnings.iter().any(|w| w.contains("Index \"=A+C1-X9/T1\"")));
-    let plain = out.table.rows.iter().find(|r| r[0] == "-X1/T1").unwrap();
+    assert!(out.warnings.iter().any(|w| w.contains("Index \"=A+C1-X9/T:1\"")));
+    let plain = out.table.rows.iter().find(|r| r[0] == "-X1/T:1").unwrap();
     assert_eq!(plain[2], "-X1", "a plain tag stays as it is");
 }
 
@@ -1308,11 +1308,11 @@ fn configurator_free_texts_that_look_like_formulas_are_written_as_text() {
         symbols: &s,
         parts: &parts,
     });
-    let row = out.table.rows.iter().find(|r| r[0] == "-X1/T1").unwrap();
+    let row = out.table.rows.iter().find(|r| r[0] == "-X1/T:1").unwrap();
     assert_eq!(&row[6..9], ["'=1+1", "'@cme", "plain"]);
     assert_eq!(row[2], "-X1", "tags stay as they are");
     assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
-    assert!(out.warnings[0].contains("-X1/T1") && out.warnings[0].contains("=1+1"));
+    assert!(out.warnings[0].contains("-X1/T:1") && out.warnings[0].contains("=1+1"));
 }
 
 #[test]
@@ -1437,19 +1437,20 @@ fn the_terminal_strip_editors_order_and_spares_show_in_the_plan_and_the_configur
     assert_eq!(
         terminals,
         [
-            ("1", "2", "", "-X1/T1"),
-            ("2", "S1", "2002-1201", "-X1/T2"),
-            ("3", "1", "", "-X1/T3"),
+            ("1", "2", "", "-X1/T:2"),
+            ("2", "S1", "2002-1201", "-X1/T:S1"),
+            ("3", "1", "", "-X1/T:1"),
         ]
     );
-    // The spare's row imports back onto its own device.
+    // The spare's row imports back onto its own device; the index names the terminal, the
+    // position its place on the rail.
     assert!(matches!(
-        out.targets.get("-X1/T2"),
+        out.targets.get("-X1/T:S1"),
         Some(configurator::Target::Part(t)) if t.to_string() == "-X1.S1"
     ));
     // A spare without a device entry still names its own device for the import back.
     assert!(matches!(
-        out.targets.get("-X9/T1"),
+        out.targets.get("-X9/T:1"),
         Some(configurator::Target::Part(t)) if t.to_string() == "-X9.1"
     ));
 }
@@ -1604,7 +1605,7 @@ fn a_terminal_whose_symbol_is_missing_is_counted_the_same_everywhere() {
     );
     let out = configurator_list(&i);
     assert!(
-        out.table.rows.iter().any(|r| r.iter().any(|c| c == "-X1/T3")),
+        out.table.rows.iter().any(|r| r.iter().any(|c| c == "-X1/T:3")),
         "{:?}",
         out.table.rows
     );

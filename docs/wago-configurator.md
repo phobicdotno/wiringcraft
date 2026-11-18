@@ -31,14 +31,20 @@ separate rows with their level number, as in the terminal plan.
 
 ## Index
 
-The first column identifies each row: `<strip>/T<position>` for a terminal, `/J<n>` for a
-jumper, `/P<n>` for a plate and `/R<n>` for a rail, e.g. `-X1/T3`. An accessory row names the
+The first column identifies each row: `<strip>/T:<terminal number>` for a terminal, `/J<n>` for
+a jumper, `/P<n>` for a plate and `/R<n>` for a rail, e.g. `-X1/T:3`. An accessory row names the
 device slot it is: `<strip>/S` for the strip device's own part, `<strip>/A<n>` for the strip
-device's n-th accessory, and `<strip>/T<position>/A<n>` for the n-th accessory of the terminal
-device first at that position (`-X1/T2/A1`). It stays the same as long as the strip does not
-change (adding an accessory to one device leaves the other rows' indexes as they are), so a list
-that comes back from the configurator with articles chosen can be matched to the project's
-devices row by row.
+device's n-th accessory, and `<strip>/T:<terminal number>/A<n>` for the n-th accessory of the
+terminal device first at that terminal (`-X1/T:2/A1`). A terminal's index goes with the terminal,
+so reordering the strip or adding a terminal before it leaves it as it is; the `Position` column
+is its place on the rail. Adding an accessory to one device leaves the other rows' indexes as
+they are, so a list that comes back from the configurator with articles chosen can be matched to
+the project's devices row by row.
+
+Lists written by earlier versions have the terminal's place on the rail in its index (`-X1/T3`,
+`-X1/T2/A1`). Such a row is taken only when its `Terminal` number (for an accessory, its
+`Connects`) is the terminal at that place now; without one it is not taken, as nothing tells
+which terminal it was. Export the list again to get the new indexes.
 
 ## Import back
 

@@ -6554,12 +6554,12 @@ mod tests {
         let csv = std::fs::read_to_string(out)
             .unwrap()
             .replace(
-                "-X1/T1;Terminal;-X1;1;1;;;",
-                &format!("-X1/T1;Terminal;-X1;1;1;;{first};"),
+                "-X1/T:1;Terminal;-X1;1;1;;;",
+                &format!("-X1/T:1;Terminal;-X1;1;1;;{first};"),
             )
             .replace(
-                "-X1/T2;Terminal;-X1;2;2;;;",
-                &format!("-X1/T2;Terminal;-X1;2;2;;{second};"),
+                "-X1/T:2;Terminal;-X1;2;2;;;",
+                &format!("-X1/T:2;Terminal;-X1;2;2;;{second};"),
             );
         std::fs::write(out, csv).unwrap();
     }
@@ -6804,13 +6804,13 @@ mod tests {
         assert!(
             std::fs::read_to_string(&out)
                 .unwrap()
-                .contains("\r\n-X1/T3;Terminal;-X1;3;3;"),
+                .contains("\r\n-X1/T:3;Terminal;-X1;3;3;"),
             "{:?}",
             std::fs::read_to_string(&out)
         );
         let csv = std::fs::read_to_string(&out).unwrap();
         assert!(csv.starts_with("\u{feff}Index;Type;Strip;Position;Terminal;"), "{csv}");
-        assert!(csv.contains("\r\n-X1/T2;Terminal;-X1;2;2;"), "{csv}");
+        assert!(csv.contains("\r\n-X1/T:2;Terminal;-X1;2;2;"), "{csv}");
         assert!(csv.contains("\r\n-X1/J1;Jumper;-X1;"), "{csv}");
         assert!(done.warnings.iter().any(|w| w.contains("no.such.symbol")));
         // Its terminal is listed now, so no warning may say it is left out.
