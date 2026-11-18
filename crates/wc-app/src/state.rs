@@ -1109,6 +1109,33 @@ impl Open {
             .map(|name| format!("{name} has this page open; it is read-only here until they leave it."))
     }
 
+    /// The pages someone else holds, as they are now: what [`Open::restore_pages`] puts back.
+    pub fn held_pages(&self) -> Vec<Page> {
+        self.project
+            .pages
+            .iter()
+            .filter(|p| self.held_by_others.contains_key(&p.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Put back pages someone else holds that were changed since [`Open::held_pages`] took
+    /// `before`. Returns one line per page put back, naming who holds it.
+    pub fn restore_pages(&mut self, before: Vec<Page>) -> Vec<String> {
+        let mut put_back = Vec::new();
+        for old in before {
+            let Some(i) = self.project.pages.iter().position(|p| p.id == old.id) else {
+                continue;
+            };
+            if self.project.pages[i] != old {
+                let why = self.held_reason(i).unwrap_or_default();
+                put_back.push(format!("Page {} was not changed: {why}", old.number));
+                self.project.pages[i] = old;
+            }
+        }
+        put_back
+    }
+
     /// Delete a page. The last page of a project cannot be deleted. Returns the page to show next.
     pub fn delete_page(&mut self, page: usize) -> Result<usize, String> {
         if self.project.pages.len() <= 1 {

@@ -823,6 +823,17 @@ impl Open {
 /// The app as the assistant's toolbox.
 pub struct AppTools<'a>(pub &'a mut App);
 
+/// Whether tool `name` with input `v` changes the page its `page` field names (the shown page
+/// without one). Tools that only read, select, show or comment do not.
+fn edits_page(name: &str, v: &Value) -> bool {
+    match name {
+        "place_symbol" | "add_wire" | "update_symbol" | "update_wire" | "add_graphic" | "update_graphic"
+        | "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "delete_page" | "edit_page_json" => true,
+        "macros" => s(v, "action") == Some("insert"),
+        _ => false,
+    }
+}
+
 impl wc_agent::Tools for AppTools<'_> {
     fn specs(&self) -> Vec<Value> {
         self.0.assistant.specs().to_vec()
@@ -833,7 +844,14 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
+        let held = self.0.open.as_ref().map(Open::held_pages).unwrap_or_default();
         let r = self.0.agent_tool(name, input);
+        // A page someone else holds is read-only here, whatever the tool did: the host would
+        // refuse the change, so it is put back now and the result says so.
+        let r = match self.0.open.as_mut().map(|o| o.restore_pages(held)) {
+            Some(put_back) if !put_back.is_empty() => r.map(|text| format!("{text}\n{}", put_back.join("\n"))),
+            _ => r,
+        };
         // Items the assistant removed must not stay selected.
         self.0.prune_selection();
         r
@@ -1008,6 +1026,14 @@ impl App {
 
     /// Run one assistant tool.
     pub(crate) fn agent_tool(&mut self, name: &str, v: &Value) -> Result<String, String> {
+        // In a shared session a page someone else has open is read-only here: an editing tool
+        // aimed at it is refused before it runs (an unknown page gets the tool's own error).
+        if edits_page(name, v)
+            && let (Ok(page), Some(open)) = (self.page_of(v, "page"), self.open.as_ref())
+            && let Some(why) = open.held_reason(page)
+        {
+            return Err(why);
+        }
         match name {
             "get_state" => self.tool_state(),
             "get_page" => {
@@ -4017,5 +4043,78 @@ mod tests {
             a.agent_start("todo", &json!({"action": "file"})),
             Started::Done(Err(_))
         ));
+    }
+
+    #[test]
+    fn the_assistant_cannot_change_a_page_someone_else_holds_but_can_read_and_comment_there() {
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let before = page2(&a).clone();
+        let line = json!({"kind": "line", "a": {"x": 0, "y": 0}, "b": {"x": 5, "y": 0}});
+        let edits = [
+            (
+                "place_symbol",
+                json!({"page": "p0002", "symbol": "wc.coil", "x": 50, "y": 50}),
+            ),
+            (
+                "add_wire",
+                json!({"page": "p0002", "points": [{"x": 0, "y": 0}, {"x": 9, "y": 0}]}),
+            ),
+            ("update_symbol", json!({"page": "p0002", "id": "s0", "tag": "-K9"})),
+            ("update_wire", json!({"page": "p0002", "id": "w0", "label": "1"})),
+            ("add_graphic", json!({"page": "p0002", "shape": line})),
+            ("update_graphic", json!({"page": "p0002", "id": "g0", "shape": line})),
+            ("delete_items", json!({"page": "p0002", "ids": ["g0"]})),
+            ("move_items", json!({"page": "p0002", "ids": ["g0"], "dx": 5, "dy": 5})),
+            ("rotate_items", json!({"page": "p0002", "ids": ["g0"]})),
+            ("mirror_items", json!({"page": "p0002", "ids": ["g0"]})),
+            ("delete_page", json!({"page": "p0002"})),
+            ("edit_page_json", json!({"page": "p0002", "json": "{}"})),
+            ("macros", json!({"action": "insert", "page": "p0002", "name": "any"})),
+        ];
+        for (tool, input) in edits {
+            let r = call(&mut a, tool, input);
+            assert!(
+                r.as_ref().is_err_and(|e| e.contains("Ola has this page open")),
+                "{tool}: {r:?}"
+            );
+            assert_eq!(page2(&a), &before, "{tool} changed the held page");
+        }
+
+        // A tool that would change it some other way (an undo of the text) is put back, and the
+        // result says who holds the page.
+        let r = call(&mut a, "undo", json!({})).unwrap();
+        assert!(r.contains("was not changed: Ola has this page open"), "{r}");
+        assert_eq!(page2(&a), &before);
+
+        // Reading, selecting and commenting still work there.
+        assert!(
+            call(&mut a, "get_page", json!({"page": "p0002"}))
+                .unwrap()
+                .contains("Hello")
+        );
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        call(
+            &mut a,
+            "comments",
+            json!({"action": "add", "page": "p0002", "text": "Check this", "x": 10, "y": 10}),
+        )
+        .unwrap();
+        assert_eq!(a.open.as_ref().unwrap().project.comments.len(), 1);
+
+        // Once Ola leaves, the same tools work again.
+        a.open.as_mut().unwrap().held_by_others.clear();
+        call(&mut a, "delete_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        assert!(page2(&a).graphics.is_empty());
     }
 }
