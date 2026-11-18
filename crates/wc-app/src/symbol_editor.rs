@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, Pos2, RichText, Sense, Stroke, Vec2};
 use wc_core::Symbol;
-use wc_core::geom::{Point, Shape};
+use wc_core::geom::{Align, Point, Shape};
 use wc_core::symbol::{Pin, PinDir, SymbolRole};
 
 use crate::canvas::{Xf, paint_shape};
@@ -57,7 +57,7 @@ impl Tool {
     /// What to do next, for the status line.
     fn hint(self, clicks: usize) -> &'static str {
         match (self, clicks) {
-            (Tool::Select, _) => "Click a shape or pin to select it.",
+            (Tool::Select, _) => "Click a shape or pin to select it; drag it, or nudge it with the arrow keys.",
             (Tool::Line, 0) => "Click the start of the line.",
             (Tool::Line, _) => "Click the end of the line.",
             (Tool::Rect, 0) => "Click one corner.",
@@ -111,8 +111,18 @@ pub struct SymbolEditor {
     pub pin_name: String,
     pub message: String,
     undo: Vec<Symbol>,
+    /// A drag of the selected item under way.
+    drag: Option<Drag>,
     /// Library symbols that can be opened: `(id, name)`.
     pub choices: Vec<(String, String)>,
+}
+
+/// A drag in progress: where it started and the item as it was then.
+#[derive(Debug, Clone)]
+struct Drag {
+    from: Point,
+    item: Item,
+    before: Symbol,
 }
 
 /// What a save did, for the window around the editor.
@@ -207,6 +217,7 @@ impl SymbolEditor {
             pin_name: "1".into(),
             message: String::new(),
             undo: Vec::new(),
+            drag: None,
             choices: Vec::new(),
         }
     }
@@ -243,6 +254,7 @@ impl SymbolEditor {
             self.symbol = s;
             self.selected = None;
             self.clicks.clear();
+            self.drag = None;
         }
     }
 
@@ -369,6 +381,130 @@ impl SymbolEditor {
         }
     }
 
+    /// Move `item` of `self.symbol` by `d` (mm). A pin stays on the grid.
+    fn shift(&mut self, item: Item, d: Point) {
+        match item {
+            Item::Shape(i) => {
+                if let Some(g) = self.symbol.graphics.get_mut(i) {
+                    *g = g.translate(d);
+                }
+            }
+            Item::Pin(i) => {
+                let others: Vec<Point> = self
+                    .symbol
+                    .pins
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != i)
+                    .map(|(_, q)| q.at)
+                    .collect();
+                if let Some(pin) = self.symbol.pins.get_mut(i) {
+                    let at = snap(pin.at + d);
+                    // Two pins on one point would connect each other's wires.
+                    if !others.contains(&at) {
+                        pin.at = at;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move the selected shape or pin by `d` (mm), as one undo step: the arrow keys.
+    pub fn nudge(&mut self, d: Point) {
+        let Some(item) = self.selected else { return };
+        if self.drag.is_some() {
+            return;
+        }
+        let before = self.symbol.clone();
+        self.shift(item, d);
+        if self.symbol != before {
+            self.symbol = before.clone();
+            self.checkpoint();
+            self.shift(item, d);
+        }
+    }
+
+    /// The mouse went down on the drawing at `p` (mm) and started dragging. With the Select
+    /// tool, the item under it is selected (the selected one wins when it is under it too) and
+    /// follows the mouse until [`Self::end_drag`].
+    pub fn start_drag(&mut self, p: Point) {
+        self.drag = None;
+        if self.tool != Tool::Select {
+            return;
+        }
+        self.message.clear();
+        let hit = self.pick(p);
+        let item = match self.selected {
+            Some(sel) if self.under(sel, p) => sel,
+            _ => {
+                if hit != self.selected {
+                    self.props_dirty = false;
+                }
+                self.selected = hit;
+                match hit {
+                    Some(h) => h,
+                    None => return,
+                }
+            }
+        };
+        self.drag = Some(Drag {
+            from: p,
+            item,
+            before: self.symbol.clone(),
+        });
+    }
+
+    /// The mouse moved to `p` during a drag: the item moves by whole grid steps.
+    pub fn drag_to(&mut self, p: Point) {
+        let Some(drag) = self.drag.as_ref() else { return };
+        let d = snap(Point::new(p.x - drag.from.x, p.y - drag.from.y));
+        let item = drag.item;
+        self.symbol = drag.before.clone();
+        self.shift(item, d);
+    }
+
+    /// The drag ended: a move is one undo step; a drag that moved nothing leaves none.
+    pub fn end_drag(&mut self) {
+        let Some(drag) = self.drag.take() else { return };
+        if self.symbol != drag.before {
+            self.props_dirty = false;
+            self.undo.push(drag.before);
+            if self.undo.len() > 100 {
+                self.undo.remove(0);
+            }
+        }
+    }
+
+    /// True while a drag is under way.
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Whether `p` is on `item`: within 1.3 mm of a pin, or inside a shape's box made 1 mm
+    /// wider. [`Self::pick`] and dragging both use it.
+    fn under(&self, item: Item, p: Point) -> bool {
+        match item {
+            Item::Pin(i) => self
+                .symbol
+                .pins
+                .get(i)
+                .is_some_and(|q| (q.at.x - p.x).abs() < 1.3 && (q.at.y - p.y).abs() < 1.3),
+            Item::Shape(i) => self.symbol.graphics.get(i).is_some_and(|g| {
+                let (a, b) = g.bounds();
+                p.x >= a.x - 1.0 && p.x <= b.x + 1.0 && p.y >= a.y - 1.0 && p.y <= b.y + 1.0
+            }),
+        }
+    }
+
+    /// The selected shape, to change it from the properties box. Call
+    /// [`Self::note_property_edit`] with the symbol from before the change, so it can be undone.
+    pub fn selected_shape_mut(&mut self) -> Option<&mut Shape> {
+        match self.selected {
+            Some(Item::Shape(i)) => self.symbol.graphics.get_mut(i),
+            _ => None,
+        }
+    }
+
     fn add_shape(&mut self, shape: Shape) {
         self.checkpoint();
         self.symbol.graphics.push(shape);
@@ -377,21 +513,13 @@ impl SymbolEditor {
 
     /// The pin at `p`, else the last drawn shape whose box (1 mm wider) holds `p`.
     fn pick(&self, p: Point) -> Option<Item> {
-        if let Some(i) = self
-            .symbol
-            .pins
-            .iter()
-            .position(|q| (q.at.x - p.x).abs() < 1.3 && (q.at.y - p.y).abs() < 1.3)
-        {
-            return Some(Item::Pin(i));
-        }
-        self.symbol.graphics.iter().enumerate().rev().find_map(|(i, g)| {
-            let (a, b) = g.bounds();
-            (p.x >= a.x - 1.0 && p.x <= b.x + 1.0 && p.y >= a.y - 1.0 && p.y <= b.y + 1.0).then_some(Item::Shape(i))
-        })
+        let pins = (0..self.symbol.pins.len()).map(Item::Pin);
+        let shapes = (0..self.symbol.graphics.len()).rev().map(Item::Shape);
+        pins.chain(shapes).find(|&item| self.under(item, p))
     }
 
     pub fn delete_selected(&mut self) {
+        self.end_drag();
         let Some(item) = self.selected.take() else { return };
         self.checkpoint();
         match item {
@@ -499,6 +627,26 @@ impl SymbolEditor {
                     }
                 });
                 ui.separator();
+                // Arrow keys nudge the selection by one grid step, unless a field is being typed in.
+                if self.selected.is_some() && ctx.memory(|m| m.focused().is_none()) {
+                    let d = ui.input(|i| {
+                        let mut d = Point::new(0.0, 0.0);
+                        for (k, x, y) in [
+                            (egui::Key::ArrowLeft, -SNAP, 0.0),
+                            (egui::Key::ArrowRight, SNAP, 0.0),
+                            (egui::Key::ArrowUp, 0.0, -SNAP),
+                            (egui::Key::ArrowDown, 0.0, SNAP),
+                        ] {
+                            if i.key_pressed(k) {
+                                d = d + Point::new(x, y);
+                            }
+                        }
+                        d
+                    });
+                    if d != Point::new(0.0, 0.0) {
+                        self.nudge(d);
+                    }
+                }
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
                         ui.set_width(260.0);
@@ -630,12 +778,16 @@ impl SymbolEditor {
                 }
             });
         }
+        if let Some(shape) = self.selected_shape_mut() {
+            ui.separator();
+            shape_properties(ui, shape);
+        }
         self.note_property_edit(before);
     }
 
     fn drawing(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size().max(Vec2::new(320.0, 320.0)) - Vec2::new(0.0, 24.0);
-        let (resp, painter) = ui.allocate_painter(size, Sense::click());
+        let (resp, painter) = ui.allocate_painter(size, Sense::click_and_drag());
         let rect = resp.rect;
         let visuals = ui.visuals();
         painter.rect_filled(rect, 4.0, visuals.extreme_bg_color);
@@ -734,6 +886,119 @@ impl SymbolEditor {
         }
         if resp.secondary_clicked() {
             self.clicks.clear();
+        }
+        if resp.drag_started_by(egui::PointerButton::Primary)
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin())
+        {
+            self.start_drag(xf.mm(pos));
+        }
+        if self.dragging()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            self.drag_to(xf.mm(pos));
+        }
+        if resp.drag_stopped() {
+            self.end_drag();
+        }
+    }
+}
+
+/// The properties box of the selected shape: what can be changed after drawing it.
+fn shape_properties(ui: &mut egui::Ui, shape: &mut Shape) {
+    fn mm(v: &mut f64, min: f64) -> egui::DragValue<'_> {
+        egui::DragValue::new(v)
+            .speed(0.1)
+            .range(min..=1000.0)
+            .clamp_existing_to_range(false)
+            .suffix(" mm")
+    }
+    fn deg(v: &mut f64) -> egui::DragValue<'_> {
+        egui::DragValue::new(v)
+            .speed(1.0)
+            .range(0.0..=360.0)
+            .clamp_existing_to_range(false)
+            .suffix("°")
+    }
+    match shape {
+        Shape::Line { a, b } => {
+            ui.label(RichText::new("Line").strong());
+            ui.label(format!("From {:.1}, {:.1} to {:.1}, {:.1}", a.x, a.y, b.x, b.y));
+        }
+        Shape::Polyline { points, .. } => {
+            ui.label(RichText::new("Polyline").strong());
+            ui.label(format!("{} points", points.len()));
+        }
+        Shape::Rect { min, max } => {
+            ui.label(RichText::new("Rectangle").strong());
+            ui.label(format!(
+                "{:.1} × {:.1} mm at {:.1}, {:.1}",
+                max.x - min.x,
+                max.y - min.y,
+                min.x,
+                min.y
+            ));
+        }
+        Shape::Circle { radius, filled, .. } => {
+            ui.label(RichText::new("Circle").strong());
+            egui::Grid::new("symbol_editor_shape").num_columns(2).show(ui, |ui| {
+                ui.label("Radius");
+                ui.add(mm(radius, 0.1));
+                ui.end_row();
+                ui.label("Filled");
+                ui.checkbox(filled, "");
+                ui.end_row();
+            });
+        }
+        Shape::Arc { radius, start, end, .. } => {
+            ui.label(RichText::new("Arc").strong());
+            egui::Grid::new("symbol_editor_shape").num_columns(2).show(ui, |ui| {
+                ui.label("Radius");
+                ui.add(mm(radius, 0.1));
+                ui.end_row();
+                ui.label("Starts at");
+                ui.add(deg(start));
+                ui.end_row();
+                ui.label("Ends at");
+                ui.add(deg(end));
+                ui.end_row();
+            });
+        }
+        Shape::Text {
+            text,
+            height,
+            align,
+            angle,
+            ..
+        } => {
+            ui.label(RichText::new("Text").strong());
+            egui::Grid::new("symbol_editor_shape").num_columns(2).show(ui, |ui| {
+                ui.label("Text");
+                ui.text_edit_singleline(text);
+                ui.end_row();
+                ui.label("Height");
+                ui.add(mm(height, 0.5));
+                ui.end_row();
+                ui.label("Align");
+                ui.horizontal(|ui| {
+                    for (a, l) in [
+                        (Align::Left, "left"),
+                        (Align::Center, "centre"),
+                        (Align::Right, "right"),
+                    ] {
+                        ui.selectable_value(align, a, l);
+                    }
+                });
+                ui.end_row();
+                ui.label("Angle");
+                egui::ComboBox::from_id_salt("symbol_editor_text_angle")
+                    .selected_text(format!("{angle}°"))
+                    .show_ui(ui, |ui| {
+                        for a in [0.0, 90.0, 180.0, 270.0] {
+                            ui.selectable_value(angle, a, format!("{a}°"));
+                        }
+                    });
+                ui.end_row();
+            });
         }
     }
 }
@@ -927,6 +1192,241 @@ mod tests {
         draw_coil(&mut dup);
         assert!(dup.save().is_err_and(|m| m.contains("already has")));
         Ok(())
+    }
+
+    #[test]
+    fn a_dragged_shape_moves_by_grid_steps_and_is_one_undo_step() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        let drawn = e.symbol.clone();
+        let undo_steps = e.undo.len();
+        e.set_tool(Tool::Select);
+        // Grab the rectangle's left side and move the mouse around before letting go.
+        e.start_drag(Point::new(-5.0, 0.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        assert!(e.dragging());
+        e.drag_to(Point::new(-4.0, 0.4));
+        e.drag_to(Point::new(-1.9, 1.2));
+        e.end_drag();
+        assert!(!e.dragging());
+        assert_eq!(
+            e.symbol.graphics[0],
+            Shape::Rect {
+                min: Point::new(-2.5, -2.5),
+                max: Point::new(7.5, 2.5)
+            },
+            "moved 2.5 mm right; the 1.2 mm down is less than half a step"
+        );
+        assert_eq!(e.symbol.graphics[1..], drawn.graphics[1..], "nothing else moved");
+        assert_eq!(e.undo.len(), undo_steps + 1, "the whole drag is one step");
+        e.undo();
+        assert_eq!(e.symbol, drawn);
+
+        // A drag that ends where it started leaves no undo step.
+        e.start_drag(Point::new(-5.0, 0.0));
+        e.drag_to(Point::new(-3.0, 0.0));
+        e.drag_to(Point::new(-5.2, 0.3));
+        e.end_drag();
+        assert_eq!(e.symbol, drawn);
+        assert_eq!(e.undo.len(), undo_steps);
+
+        // Dragging needs the Select tool, and empty paper selects nothing.
+        e.set_tool(Tool::Line);
+        e.start_drag(Point::new(-5.0, 0.0));
+        assert!(!e.dragging());
+        e.set_tool(Tool::Select);
+        e.start_drag(Point::new(15.0, 15.0));
+        assert!(!e.dragging());
+        assert_eq!(e.selected, None);
+    }
+
+    #[test]
+    fn a_dragged_pin_stays_on_the_grid_and_off_other_pins() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        e.set_tool(Tool::Select);
+        e.start_drag(Point::new(0.0, 5.0));
+        assert_eq!(e.selected, Some(Item::Pin(1)), "the pin wins over the line under it");
+        e.drag_to(Point::new(3.0, 6.0));
+        e.end_drag();
+        assert_eq!(e.symbol.pins[1].at, Point::new(2.5, 5.0));
+        // Onto the other pin: it stays where it was.
+        e.start_drag(Point::new(2.5, 5.0));
+        e.drag_to(Point::new(0.0, -5.0));
+        assert_eq!(e.symbol.pins[1].at, Point::new(2.5, 5.0));
+        e.end_drag();
+    }
+
+    #[test]
+    fn arrow_keys_nudge_the_selection_one_step_each() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        let drawn = e.symbol.clone();
+        e.set_tool(Tool::Select);
+        e.click(Point::new(0.0, -3.5));
+        assert_eq!(e.selected, Some(Item::Shape(1)));
+        e.nudge(Point::new(SNAP, 0.0));
+        e.nudge(Point::new(0.0, -SNAP));
+        assert_eq!(
+            e.symbol.graphics[1],
+            Shape::Line {
+                a: Point::new(2.5, -5.0),
+                b: Point::new(2.5, -7.5)
+            }
+        );
+        e.undo();
+        assert_eq!(
+            e.symbol.graphics[1],
+            Shape::Line {
+                a: Point::new(2.5, -2.5),
+                b: Point::new(2.5, -5.0)
+            },
+            "each nudge is its own step"
+        );
+        e.undo();
+        assert_eq!(e.symbol, drawn);
+        // Nothing selected: nothing moves.
+        e.selected = None;
+        e.nudge(Point::new(SNAP, 0.0));
+        assert_eq!(e.symbol, drawn);
+    }
+
+    #[test]
+    fn a_drawn_text_and_circle_can_be_changed() -> TestResult {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.text = "K1".into();
+        e.set_tool(Tool::Text);
+        e.click(Point::new(5.0, 5.0));
+        e.set_tool(Tool::Circle);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(5.0, 0.0));
+        let drawn = e.symbol.clone();
+
+        // The circle is selected after drawing it: fill it and make it smaller.
+        let before = e.symbol.clone();
+        if let Some(Shape::Circle { radius, filled, .. }) = e.selected_shape_mut() {
+            *radius = 2.5;
+            *filled = true;
+        } else {
+            return Err("the circle should be selected".into());
+        }
+        e.note_property_edit(before);
+        assert_eq!(
+            e.symbol.graphics[1],
+            Shape::Circle {
+                center: Point::new(0.0, 0.0),
+                radius: 2.5,
+                filled: true
+            }
+        );
+
+        // Select the text and change its words and height.
+        e.set_tool(Tool::Select);
+        e.click(Point::new(5.5, 5.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        for (words, height) in [("K", 2.5), ("K10", 2.5), ("K10", 3.5)] {
+            let before = e.symbol.clone();
+            if let Some(Shape::Text { text, height: h, .. }) = e.selected_shape_mut() {
+                *text = words.into();
+                *h = height;
+            }
+            e.note_property_edit(before);
+        }
+        let Shape::Text { text, height, .. } = &e.symbol.graphics[0] else {
+            return Err("still a text".into());
+        };
+        assert_eq!((text.as_str(), *height), ("K10", 3.5));
+        e.undo();
+        assert!(
+            matches!(&e.symbol.graphics[0], Shape::Text { text, .. } if text == "K1"),
+            "the typing is one step"
+        );
+        assert!(
+            matches!(e.symbol.graphics[1], Shape::Circle { filled: true, .. }),
+            "the fill stays"
+        );
+        e.undo();
+        assert_eq!(e.symbol, drawn);
+
+        // A pin has no shape properties.
+        e.selected = Some(Item::Pin(0));
+        assert!(e.selected_shape_mut().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn an_arc_and_a_text_alignment_and_angle_can_be_changed() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Arc);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(5.0, 0.0));
+        e.click(Point::new(0.0, 5.0));
+        e.text = "A".into();
+        e.set_tool(Tool::Text);
+        e.click(Point::new(10.0, 10.0));
+        let drawn = e.symbol.clone();
+
+        e.set_tool(Tool::Select);
+        e.click(Point::new(2.5, 2.5));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        let before = e.symbol.clone();
+        if let Some(Shape::Arc { radius, start, end, .. }) = e.selected_shape_mut() {
+            (*radius, *start, *end) = (7.5, 180.0, 270.0);
+        }
+        e.note_property_edit(before);
+        let arc = e.symbol.graphics[0].clone();
+        assert!(matches!(arc, Shape::Arc { radius, start, end, .. } if (radius, start, end) == (7.5, 180.0, 270.0)));
+
+        // Another item: its edit is a step of its own.
+        e.click(Point::new(10.5, 10.0));
+        assert_eq!(e.selected, Some(Item::Shape(1)));
+        let before = e.symbol.clone();
+        if let Some(Shape::Text { align, angle, .. }) = e.selected_shape_mut() {
+            (*align, *angle) = (Align::Center, 90.0);
+        }
+        e.note_property_edit(before);
+        assert!(matches!(e.symbol.graphics[1], Shape::Text { align: Align::Center, angle, .. } if angle == 90.0));
+
+        e.undo();
+        assert_eq!(e.symbol.graphics[1], drawn.graphics[1], "the text is back");
+        assert_eq!(e.symbol.graphics[0], arc, "the arc edit stays");
+        e.undo();
+        assert_eq!(e.symbol, drawn);
+    }
+
+    #[test]
+    fn showing_the_properties_leaves_odd_values_alone() {
+        // Loaded symbols can hold values the boxes would not let you type.
+        let shapes = [
+            Shape::Text {
+                at: Point::new(0.0, 0.0),
+                text: "x".into(),
+                height: 0.25,
+                align: Align::Left,
+                angle: 0.0,
+            },
+            Shape::Circle {
+                center: Point::new(0.0, 0.0),
+                radius: 0.05,
+                filled: false,
+            },
+            Shape::Arc {
+                center: Point::new(0.0, 0.0),
+                radius: 2000.0,
+                start: -90.0,
+                end: 450.0,
+            },
+        ];
+        let ctx = egui::Context::default();
+        for shape in shapes {
+            let mut shown = shape.clone();
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| shape_properties(ui, &mut shown));
+                });
+            }
+            assert_eq!(shown, shape);
+        }
     }
 
     #[test]
