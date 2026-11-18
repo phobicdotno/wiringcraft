@@ -505,9 +505,12 @@ fn a_page_listed_many_times_cannot_make_endless_work() -> TestResult {
         read.get("AcDb:AcDbObjects").map(<[u8]>::len),
         Some(section(0).data.len())
     );
-    // Listed five times, the fifth decompression is refused before it starts.
+    // Listed five times, what the fifth decompresses to is over the budget.
     let message = read_sections_with(&write_dwg(b"AC1024", &[section(4)]), budget).map_err(|e| e.to_string());
-    assert!(message.as_ref().is_err_and(|m| m.contains("too much")), "{message:?}");
+    assert!(
+        message.as_ref().is_err_and(|m| m.contains("decompress to too much")),
+        "{message:?}"
+    );
     Ok(())
 }
 
@@ -516,6 +519,9 @@ fn the_checksums_match_known_values() {
     // zlib's CRC-32 of "123456789", and Adler-32 (seed 1) of "Wikipedia".
     assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     assert_eq!(page_checksum(1, b"Wikipedia"), 0x11E6_0398);
+    // Carried on from another seed: "A" from 0, then "BC" from its sum.
+    assert_eq!(page_checksum(0, b"A"), 0x0041_0041);
+    assert_eq!(page_checksum(page_checksum(0, b"A"), b"BC"), 0x018A_00C6);
     // Long enough to wrap the sums several times.
     let long = vec![0xFFu8; 100_000];
     assert_eq!(page_checksum(1, &long), adler(&long));
@@ -642,8 +648,14 @@ fn a_stored_page_listed_many_times_is_bounded_too() -> TestResult {
     };
     let budget = 3 * 4000;
     assert!(read_sections_with(&write_dwg(b"AC1024", &[section(2)]), budget).is_ok());
+    // The fourth listing's stored bytes are over the budget before they are read.
     let message = read_sections_with(&write_dwg(b"AC1024", &[section(3)]), budget).map_err(|e| e.to_string());
-    assert!(message.as_ref().is_err_and(|m| m.contains("too much")), "{message:?}");
+    assert!(
+        message
+            .as_ref()
+            .is_err_and(|m| m.contains("pages hold too much to read")),
+        "{message:?}"
+    );
     Ok(())
 }
 
@@ -704,5 +716,37 @@ fn a_section_with_pages_of_size_0_is_refused() -> TestResult {
     };
     let m = read_sections(&write_dwg(b"AC1024", &[section])).map_err(|e| e.to_string());
     assert!(m.as_ref().is_err_and(|m| m.contains("pages of size 0")), "{m:?}");
+    Ok(())
+}
+
+#[test]
+fn a_changed_byte_in_a_compressed_page_that_still_decompresses_is_caught() -> TestResult {
+    let section = TestSection {
+        name: "AcDb:Classes",
+        data: noise(300, 11),
+        ..TestSection::default()
+    };
+    let file = write_dwg(b"AC1024", &[section]);
+    assert!(read_sections(&file).is_ok());
+    // The first page's compressed data, at 0x100 after its 0x20-byte header.
+    let head = unscramble_page_header(&file[0x100..0x120], 0x100);
+    let size = u32::from_le_bytes(head[8..12].try_into()?) as usize;
+    let packed = &file[0x120..0x120 + size];
+    let good = decompress_at_most(packed, MAX_PAGE_DATA)?;
+    // A byte whose change still decompresses (a literal), to something else.
+    let at = (1..size)
+        .find(|&i| {
+            let mut p = packed.to_vec();
+            p[i] ^= 0x01;
+            decompress_at_most(&p, MAX_PAGE_DATA).is_ok_and(|d| d != good)
+        })
+        .ok_or("no literal byte")?;
+    let mut damaged = file.clone();
+    damaged[0x120 + at] ^= 0x01;
+    let m = error_of(&damaged);
+    assert!(
+        m.contains("AcDb:Classes") && m.contains("page 1") && m.contains("page's data is damaged (wrong checksum)"),
+        "{m}"
+    );
     Ok(())
 }
