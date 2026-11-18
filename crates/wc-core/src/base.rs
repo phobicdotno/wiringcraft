@@ -187,6 +187,10 @@ fn resolved(dir: &Path) -> Result<PathBuf> {
             Component::CurDir => {}
             Component::ParentDir => {
                 if missing.pop().is_none() {
+                    // `file/..` is no path: only a folder has a folder above it.
+                    if !real.is_dir() {
+                        return Err(Error::Invalid(format!("{} is not a folder", real.display())));
+                    }
                     real.pop();
                 }
             }
@@ -518,6 +522,8 @@ mod tests {
         fs::write(tmp.path().join("file"), "not a folder").unwrap();
         let through = tmp.path().join("file").join("child").join("..").join("..").join("new");
         assert!(create_from(&b, &through, "X", "2026-11-18").is_err());
+        let up = tmp.path().join("file").join("..").join("new");
+        assert!(create_from(&b, &up, "X", "2026-11-18").is_err());
         assert!(!tmp.path().join("new").exists());
     }
 
