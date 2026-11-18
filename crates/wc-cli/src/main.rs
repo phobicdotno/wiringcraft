@@ -3516,9 +3516,16 @@ mod tests {
         let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
         let p: wc_core::Part = serde_json::from_str(&json).unwrap();
         assert_eq!(p.symbol.as_deref(), Some("wc.coil"));
-        // A bad map is refused.
+        // A bad map is refused before anything is written: the library keeps what it had, and a
+        // new library is not created.
         std::fs::write(&map, "no equals sign\n").unwrap();
+        let part_file = lib.join("parts").join("sie.3rt2015.json");
+        let before = std::fs::read(&part_file).unwrap();
         assert!(import_edz(&file, &lib, Some(&map)).unwrap_err().contains("line 1"));
+        assert_eq!(std::fs::read(&part_file).unwrap(), before);
+        let fresh = tmp.path().join("fresh");
+        assert!(import_edz(&file, &fresh, Some(&map)).is_err());
+        assert!(!fresh.exists());
 
         std::fs::write(&file, "not an archive").unwrap();
         assert!(import_edz(&file, &lib, None).is_err());

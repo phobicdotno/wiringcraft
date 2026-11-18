@@ -363,3 +363,29 @@ fn a_symbol_map_gives_parts_with_a_mapped_macro_their_symbol() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn control_characters_in_macro_names_print_as_plain_text() -> TestResult {
+    let edz = zip(&[
+        ("parts.xml", PARTS_WITH_MACROS.as_bytes()),
+        ("macros/evil\u{1b}[2J.ema", b"m"),
+        ("macros/two\nlines.ema", b"m"),
+    ])?;
+    let (_, report, _) = read(&edz)?;
+    let lines = report.lines();
+    assert!(lines.iter().all(|l| !l.chars().any(char::is_control)), "{lines:?}");
+    assert!(
+        lines.contains(&"macro file: macros/evil\\u{1b}[2J.ema".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"macro file: macros/two\\u{a}lines.ema".to_owned()),
+        "{lines:?}"
+    );
+    // EPLAN's backslash paths are left as they are.
+    assert!(
+        lines.iter().any(|l| l.contains("macro SIE\\SIE_3SU1.ema (")),
+        "{lines:?}"
+    );
+    Ok(())
+}

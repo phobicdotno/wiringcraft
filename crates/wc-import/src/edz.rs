@@ -125,7 +125,8 @@ fn macro_keys(name: &str) -> [String; 3] {
 /// many parts got a symbol.
 pub fn apply_symbol_map(parts: &mut [Part], map: &BTreeMap<String, String>, report: &mut Report) -> usize {
     let map: BTreeMap<String, &String> = map.iter().map(|(k, v)| (k.trim().to_lowercase(), v)).collect();
-    let mut mapped = 0;
+    // (part id, macro name) to the symbol it got, so the report is updated in one pass.
+    let mut chosen: BTreeMap<(String, String), String> = BTreeMap::new();
     for part in parts.iter_mut() {
         let hit = MACRO_PROPERTIES
             .iter()
@@ -136,16 +137,28 @@ pub fn apply_symbol_map(parts: &mut [Part], map: &BTreeMap<String, String>, repo
             });
         let Some((name, symbol)) = hit else { continue };
         part.symbol = Some(symbol.clone());
-        mapped += 1;
-        for m in report
-            .part_macros
-            .iter_mut()
-            .filter(|m| m.part == part.id && m.name == name)
-        {
+        chosen.insert((part.id.clone(), name), symbol);
+    }
+    for m in &mut report.part_macros {
+        if let Some(symbol) = chosen.get(&(m.part.clone(), m.name.clone())) {
             m.symbol = Some(symbol.clone());
         }
     }
-    mapped
+    chosen.len()
+}
+
+/// `s` with control characters (escape, line breaks, ...) written as `\u{1b}`, so a name from an
+/// archive prints as one line of plain text. Backslashes in EPLAN paths are kept as they are.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 impl Report {
@@ -165,17 +178,21 @@ impl Report {
             out.push(format!("{} XML file(s) over the size limit: skipped", self.too_large));
         }
         for f in &self.macro_files {
-            out.push(format!("macro file: {f}"));
+            out.push(format!("macro file: {}", printable(f)));
         }
         for m in &self.part_macros {
+            let (part, name) = (printable(&m.part), printable(&m.name));
             let place = if m.in_archive {
                 "in the archive"
             } else {
                 "not in the archive"
             };
             out.push(match &m.symbol {
-                Some(s) => format!("part {}: macro {} ({place}), drawn with symbol {s}", m.part, m.name),
-                None => format!("part {}: macro {} ({place}), pick a symbol by hand", m.part, m.name),
+                Some(s) => format!(
+                    "part {part}: macro {name} ({place}), drawn with symbol {}",
+                    printable(s)
+                ),
+                None => format!("part {part}: macro {name} ({place}), pick a symbol by hand"),
             });
         }
         out
