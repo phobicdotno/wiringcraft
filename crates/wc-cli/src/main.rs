@@ -3131,32 +3131,42 @@ enum Replace {
 /// [`add_built`], then save: when the save fails, the vendored files and every project file
 /// the save may have written go back as they were, so the project on disk is the one before.
 fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str, replace: Replace) -> Res<()> {
-    let written = add_built(dir, p, built, source, replace)?;
+    // Every file the save may write or remove, read before anything is written: the project's
+    // own files, every file in its page, panel and comment folders, and the files the new pages
+    // and panels will get.
+    let mut paths: Vec<PathBuf> = [store::PROJECT_FILE, store::DEVICES_FILE, store::LOCK_FILE]
+        .iter()
+        .map(|name| dir.join(name))
+        .collect();
+    for folder in [store::PAGES_DIR, store::PANELS_DIR, store::COMMENTS_DIR] {
+        if let Ok(entries) = std::fs::read_dir(dir.join(folder)) {
+            paths.extend(entries.flatten().map(|e| e.path()).filter(|path| path.is_file()));
+        }
+    }
+    for page in &built.pages {
+        paths.push(
+            dir.join(store::PAGES_DIR)
+                .join(format!("{}{}", page.id, store::PAGE_SUFFIX)),
+        );
+    }
+    for panel in &built.panels {
+        paths.push(
+            dir.join(store::PANELS_DIR)
+                .join(format!("{}{}", panel.id, store::PANEL_SUFFIX)),
+        );
+    }
+    paths.sort();
+    paths.dedup();
     let mut project_files: Written = Vec::new();
-    let mut keep = |path: PathBuf| -> Res<()> {
+    for path in paths {
         let before = match std::fs::read(&path) {
             Ok(bytes) => Some(bytes),
             Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
             Err(x) => return Err(format!("{}: {x}", path.display())),
         };
         project_files.push((path, before));
-        Ok(())
-    };
-    for name in [store::PROJECT_FILE, store::DEVICES_FILE, store::LOCK_FILE] {
-        keep(dir.join(name))?;
     }
-    for page in &p.pages {
-        keep(
-            dir.join(store::PAGES_DIR)
-                .join(format!("{}{}", page.id, store::PAGE_SUFFIX)),
-        )?;
-    }
-    for panel in &p.panels {
-        keep(
-            dir.join(store::PANELS_DIR)
-                .join(format!("{}{}", panel.id, store::PANEL_SUFFIX)),
-        )?;
-    }
+    let written = add_built(dir, p, built, source, replace)?;
     if let Err(err) = save(dir, p) {
         let mut failed = put_files_back(&project_files);
         failed.extend(put_files_back(&written));
