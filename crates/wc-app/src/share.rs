@@ -975,7 +975,10 @@ impl Role {
                         Err(_) => {
                             // A host that declined or ended the session closes the connection
                             // after saying so; only an unexplained close is news.
-                            if !matches!(j.guest.status, GuestStatus::Declined | GuestStatus::Closed) {
+                            if !matches!(
+                                j.guest.status,
+                                GuestStatus::Declined | GuestStatus::WrongVersion(_) | GuestStatus::Closed
+                            ) {
                                 notes.push(closed_note(&j.link));
                                 j.guest.status = GuestStatus::Closed;
                             }
@@ -989,6 +992,10 @@ impl Role {
                 match j.guest.status {
                     GuestStatus::Declined => {
                         notes.push("The host declined your request to join.".into());
+                        false
+                    }
+                    GuestStatus::WrongVersion(v) => {
+                        notes.push(format!("You cannot join this session: {v}."));
                         false
                     }
                     GuestStatus::Closed => {
@@ -1298,6 +1305,7 @@ impl Share {
             project: open.project.meta.name.clone(),
             host: name.to_owned(),
             port,
+            protocol: wc_share::PROTOCOL_VERSION,
         }) {
             Ok(a) => Some(a),
             Err(e) => {
@@ -1750,7 +1758,10 @@ impl Share {
                     });
                 }
                 for s in &form.sessions {
-                    let label = format!("{}  ·  {}  ({})", s.project, s.host, s.addr);
+                    let mut label = format!("{}  ·  {}  ({})", s.project, s.host, s.addr);
+                    if s.protocol != wc_share::PROTOCOL_VERSION {
+                        label.push_str("  ·  another WiringCraft version, cannot be joined");
+                    }
                     if ui.selectable_label(form.addr == s.addr.to_string(), label).clicked() {
                         form.addr = s.addr.to_string();
                     }

@@ -51,6 +51,10 @@ pub struct Beacon {
     pub host: String,
     /// The TCP port the session listens on.
     pub port: u16,
+    /// The host's session protocol version ([`crate::PROTOCOL_VERSION`]); 0 from a build that
+    /// did not announce one.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,6 +86,9 @@ pub struct Session {
     pub host: String,
     /// Where to connect to join: the sender's IP address with the announced port.
     pub addr: SocketAddr,
+    /// The host's session protocol version, as announced: a session on another version than
+    /// [`crate::PROTOCOL_VERSION`] cannot be joined.
+    pub protocol: u32,
 }
 
 /// A running announcement. Stops on [`Announcer::stop`] or when dropped.
@@ -219,6 +226,7 @@ impl Browser {
                             project: b.project,
                             host: b.host,
                             addr,
+                            protocol: b.protocol,
                         };
                         self.heard.insert(addr, (s, Instant::now()));
                     }

@@ -43,8 +43,8 @@ pub use history::{ChangeInfo, ChangeKind, MAX_HISTORY, Parts, note, redo_target,
 pub use host::{HOST, Host};
 pub use journal::{Change, GitJournal, Journal, MemoryJournal, write_picture};
 pub use protocol::{
-    GuestMsg, HostMsg, MAX_ADDED_PICTURE_BYTES, MAX_ADDED_PICTURES, MAX_PICTURE, Peer, PeerId, Picture, ProjectEdit,
-    Refusal, Snapshot, apply_edit, same_but_number,
+    GuestMsg, HostMsg, MAX_ADDED_PICTURE_BYTES, MAX_ADDED_PICTURES, MAX_PICTURE, PROTOCOL_VERSION, Peer, PeerId,
+    Picture, ProjectEdit, Refusal, Snapshot, VersionMismatch, apply_edit, same_but_number,
 };
 
 #[derive(Debug, thiserror::Error)]

@@ -187,6 +187,52 @@ fn a_joined_guest_gets_its_own_copy_on_disk() -> TestResult {
 }
 
 #[test]
+fn a_guest_on_another_version_is_told_both_versions_instead_of_a_dropped_connection() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    let (mut h, log) = host(&host_open);
+    let (guest_end, host_end) = pair();
+    if let Some(Role::Host(hosting)) = h.role.as_mut() {
+        hosting.hub.add(&mut hosting.host, host_end);
+    }
+    let other = wc_share::PROTOCOL_VERSION + 1;
+    let mut g = Share {
+        role: Some(Role::Guest(Box::new(Joining {
+            guest: Guest::new(),
+            link: guest_end,
+            addr: "in-process".into(),
+            folder: tmp.path().join("guest"),
+            dir: None,
+        }))),
+        ..Default::default()
+    };
+    if let Some(Role::Guest(j)) = g.role.as_mut() {
+        let _ = j.guest.join("Kari", "kari@example.com");
+        let join = wc_share::GuestMsg::Join {
+            name: "Kari".into(),
+            email: "kari@example.com".into(),
+            protocol: other,
+        };
+        assert!(j.link.send(join).is_ok());
+    }
+    let before = host_open.project.clone();
+    h.frame(Some(&mut host_open), None, false);
+    assert!(pending(&h).is_empty(), "the host is not asked");
+    assert!(g.frame(None, None, false).is_none());
+    assert!(!g.active());
+    let notes = g.take_notes();
+    let told = notes.iter().find(|n| n.contains("cannot join")).ok_or("no note")?;
+    assert!(
+        told.contains(&format!("version {}", wc_share::PROTOCOL_VERSION)) && told.contains(&format!("version {other}")),
+        "{told}"
+    );
+    assert!(!notes.iter().any(|n| n.contains("connection")), "{notes:?}");
+    assert_eq!(host_open.project, before);
+    assert!(log.messages().is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_declined_guest_is_told_and_the_session_ends_for_them() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut host_open = project(&tmp.path().join("host"))?;

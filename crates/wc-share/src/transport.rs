@@ -221,7 +221,7 @@ impl Hub {
     /// Send what the host has queued. Connections that were declined or closed are dropped.
     pub fn flush(&mut self, host: &mut Host) {
         for (to, msg) in host.take_outbox() {
-            let last = matches!(msg, HostMsg::Declined | HostMsg::Closed);
+            let last = matches!(msg, HostMsg::Declined { .. } | HostMsg::Closed);
             let failed = self.links.get(&to).is_some_and(|link| link.send(msg).is_err());
             if last || failed {
                 if let Some(link) = self.links.remove(&to)
