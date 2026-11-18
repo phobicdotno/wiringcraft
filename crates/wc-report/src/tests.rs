@@ -1659,7 +1659,7 @@ fn check_warns_about_a_revision_letter_the_pdf_cannot_print() {
         };
         check(&i)
             .into_iter()
-            .filter(|f| f.message.contains("PDF prints as ?"))
+            .filter(|f| f.message.contains("cannot print apart"))
             .collect()
     };
     assert!(found(&p).is_empty());

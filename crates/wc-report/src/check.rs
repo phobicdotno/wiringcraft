@@ -78,7 +78,9 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
             severity: Severity::Warning,
             page_id: None,
             item: None,
-            message: format!("revision {letter} has characters the PDF prints as ?; give it a Latin-1 letter"),
+            message: format!(
+                "revision {letter} has characters the PDF cannot print apart from others; give it plain Latin-1 letters"
+            ),
         });
     }
 

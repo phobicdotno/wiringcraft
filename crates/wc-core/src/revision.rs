@@ -220,6 +220,15 @@ impl RevisionCloud {
     }
 }
 
+/// Whether the PDF prints a revision letter so that it reads apart from every other letter:
+/// only characters it prints as themselves, and no no-break space or soft hyphen, which print
+/// like a space and a hyphen.
+pub fn letter_prints(letter: &str) -> bool {
+    letter
+        .chars()
+        .all(|c| crate::font::pdf_prints(c) && c != '\u{a0}' && c != '\u{ad}')
+}
+
 /// How a side of `len` millimetres is split into scallops: their count and radius. At most 500
 /// scallops a side, so a huge cloud stays cheap to draw.
 fn side_scallops(len: f64) -> (usize, f64) {
@@ -325,11 +334,21 @@ impl Project {
 
     /// Add a revision after the others. Refused when the letter is empty or already used.
     pub fn add_revision(&mut self, letter: &str, date: &str, text: &str, author: &str) -> Result<()> {
-        let letter = field(letter, MAX_LETTER);
+        // The PDF prints a no-break space and a soft hyphen like a space and a hyphen, so the
+        // letter keeps the plain ones and two letters never read alike.
+        let plain: String = letter
+            .chars()
+            .map(|c| match c {
+                '\u{a0}' => ' ',
+                '\u{ad}' => '-',
+                c => c,
+            })
+            .collect();
+        let letter = field(&plain, MAX_LETTER);
         if letter.is_empty() {
             return Err(Error::Invalid("a revision needs a letter".into()));
         }
-        if !letter.chars().all(crate::font::pdf_prints) {
+        if !letter_prints(&letter) {
             return Err(Error::Invalid(format!(
                 "revision letter {letter} has characters the PDF cannot print; use letters and digits from Latin-1"
             )));
@@ -438,7 +457,7 @@ impl Project {
         self.meta
             .revisions
             .iter()
-            .filter(|r| !r.letter.chars().all(crate::font::pdf_prints))
+            .filter(|r| !letter_prints(&r.letter))
             .map(|r| r.letter.clone())
             .collect()
     }
@@ -781,5 +800,27 @@ mod tests {
             author: String::new(),
         });
         assert_eq!(p.unprintable_revisions(), ["Ж"]);
+    }
+
+    #[test]
+    fn a_soft_hyphen_or_no_break_space_reads_like_its_plain_twin() {
+        let mut p = project();
+        p.add_revision("A-B", "", "", "").unwrap();
+        assert!(
+            p.add_revision("A\u{ad}B", "", "", "").is_err(),
+            "a soft hyphen is a hyphen"
+        );
+        p.add_revision("C D", "", "", "").unwrap();
+        assert!(
+            p.add_revision("C\u{a0}D", "", "", "").is_err(),
+            "a no-break space is a space"
+        );
+        p.add_revision("E\u{a0}F", "", "", "").unwrap();
+        assert_eq!(p.meta.revisions[2].letter, "E F");
+        assert!(p.unprintable_revisions().is_empty());
+        // Saved by hand, they are reported.
+        p.meta.revisions[0].letter = "A\u{ad}B".into();
+        p.meta.revisions[1].letter = "C\u{a0}D".into();
+        assert_eq!(p.unprintable_revisions().len(), 2);
     }
 }
