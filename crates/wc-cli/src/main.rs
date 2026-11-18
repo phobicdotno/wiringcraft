@@ -434,6 +434,12 @@ enum ImportCmd {
     /// PLC addresses from a CSV list (device and address columns, description optional), as a
     /// PLC tool or spreadsheet writes it. `report plc --format csv` writes one that reads back.
     PlcCsv { file: PathBuf },
+    /// The WAGO configurator list back: a list written by `export wago-configurator`, with the
+    /// articles and accessories chosen in the configurator. Each row is matched by its Index to
+    /// the terminal or strip device it stands for, and its article to a part of the project or
+    /// its libraries (by order number, or part id); matched articles become the devices' parts
+    /// and accessories. Rows that cannot be matched are listed with the reason.
+    Wago { file: PathBuf },
     /// Every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later). Ids are
     /// `<prefix>.<symbol name>`; the first pin becomes the origin.
     SymbolKicad {
@@ -1507,6 +1513,21 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 ));
             }
         }
+        ImportCmd::Wago { file } => {
+            let done = import_wago(dir, &file)?;
+            for w in &done.warnings {
+                eprintln!("warning: {w}");
+            }
+            println!(
+                "WAGO configurator: {} device(s) changed, {} row(s) already up to date, {} not matched",
+                done.changed,
+                done.unchanged,
+                done.unmatched.len()
+            );
+            for u in &done.unmatched {
+                println!("not matched: {u}");
+            }
+        }
         ImportCmd::PlcCsv { file } => {
             let mut p = load(dir)?;
             let bytes = std::fs::read(&file).map_err(e)?;
@@ -2321,6 +2342,7 @@ fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
     let wc_report::Configurator {
         table: t,
         warnings: more,
+        ..
     } = wc_report::configurator_list(&inputs);
     warnings.extend(more);
     if t.rows.is_empty() {
@@ -2330,6 +2352,88 @@ fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
     warnings.extend(wc_report::level_warnings(inputs.project));
     Ok(Exported {
         markers: t.rows.len(),
+        warnings,
+    })
+}
+
+/// What [`import_wago`] did.
+struct WagoImported {
+    changed: usize,
+    unchanged: usize,
+    unmatched: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// Write the articles of a configured WAGO configurator list onto the project in `dir` (see
+/// [`wc_import::wago`]). Articles are looked up among the project's own parts first, then its
+/// libraries; a library part that is used is taken into the project. Nothing is saved when
+/// nothing changes.
+fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
+    let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
+    let (rows, mut warnings) = wc_import::wago::read_configured(&bytes).map_err(e)?;
+    let mut p = load(dir)?;
+    let (symbols, missing) = store::vendored_symbols(dir, &p);
+    warnings.extend(missing.iter().map(|m| {
+        format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals cannot be matched")
+    }));
+    // The project's own parts, then the libraries' (a project copy wins over a library's).
+    let mut candidates: std::collections::BTreeMap<String, wc_core::Part> = std::collections::BTreeMap::new();
+    let lib = readable_libraries(dir, &p);
+    if let Some(lib) = &lib {
+        for id in lib.index(ItemKind::Part).into_keys() {
+            match lib.part(&id) {
+                Ok((part, _)) => {
+                    candidates.insert(id, part);
+                }
+                Err(x) => warnings.push(format!("library part {id} cannot be read: {x}")),
+            }
+        }
+    }
+    for id in p.lock.parts.keys() {
+        match store::read_vendored_part(dir, id) {
+            Ok(part) => {
+                candidates.insert(id.clone(), part);
+            }
+            Err(x) => warnings.push(format!("the project's copy of part {id} cannot be read: {x}")),
+        }
+    }
+    let plan = {
+        let inputs = wc_report::Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &candidates,
+        };
+        wc_import::wago::plan(&inputs, &candidates, &rows)
+    };
+    let mut unmatched = plan.unmatched.clone();
+    let mut taken = plan.clone();
+    for id in plan.parts() {
+        if p.lock.parts.contains_key(id) {
+            continue;
+        }
+        let r = match &lib {
+            Some(lib) => wc_library::take(dir, &mut p, lib, ItemKind::Part, id).map_err(e),
+            None => Err("the libraries cannot be read".to_owned()),
+        };
+        if let Err(why) = r {
+            // Its rows are listed, not written with a part the project cannot hold.
+            for a in plan.assignments.iter().filter(|a| a.part == id) {
+                unmatched.push(format!(
+                    "line {}: part {id} cannot be taken into the project: {why}",
+                    a.line
+                ));
+            }
+            taken.assignments.retain(|a| a.part != id);
+        }
+    }
+    let changed = wc_import::wago::apply(&mut p, &taken);
+    if changed > 0 {
+        save(dir, &p)?;
+    }
+    Ok(WagoImported {
+        changed,
+        unchanged: plan.unchanged,
+        unmatched,
         warnings,
     })
 }
@@ -3717,6 +3821,89 @@ mod tests {
             lang: "en".into(),
             ..MarkingArgs::default()
         }
+    }
+
+    #[test]
+    fn wago_configurator_list_comes_back_onto_the_devices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        let mut p = store::create(&dir, "Test").unwrap();
+        // A folder library with the terminal the configurator will choose.
+        let lib = tmp.path().join("lib");
+        let term_part = wc_core::Part {
+            id: "wago.2002-1201".into(),
+            manufacturer: "WAGO".into(),
+            order_number: "2002-1201".into(),
+            ..Default::default()
+        };
+        wc_library::write_part(&lib, &term_part).unwrap();
+        p.meta.libraries.push(LibrarySource {
+            name: "wago".into(),
+            kind: "folder".into(),
+            location: lib.to_string_lossy().into_owned(),
+            reference: None,
+        });
+        let term = wc_core::Symbol {
+            id: "test.term".into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: ["1", "2"]
+                .iter()
+                .enumerate()
+                .map(|(k, n)| wc_core::symbol::Pin {
+                    name: (*n).into(),
+                    at: wc_core::geom::Point::new(0.0, 10.0 * k as f64),
+                    dir: wc_core::symbol::PinDir::Down,
+                })
+                .collect(),
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        store::write_vendored_symbol(&dir, &term).unwrap();
+        for n in ["1", "2"] {
+            p.pages[0].symbols.push(wc_core::PlacedSymbol {
+                id: format!("s{n}"),
+                symbol: "test.term".into(),
+                at: wc_core::geom::Point::new(50.0, 50.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(wc_core::DeviceTag::parse(&format!("-X1.{n}")).unwrap()),
+            });
+        }
+        store::save(&dir, &p).unwrap();
+        let out = tmp.path().join("c.csv");
+        export_wago_configurator(&dir, &out).unwrap();
+        // The configurator fills in the articles: one it knows, one no library has.
+        let csv = std::fs::read_to_string(&out)
+            .unwrap()
+            .replace("-X1/T1;Terminal;-X1;1;1;;;", "-X1/T1;Terminal;-X1;1;1;;2002-1201;")
+            .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;2002-9999;");
+        std::fs::write(&out, csv).unwrap();
+        let done = run_import_wago(&dir, &out);
+        assert_eq!((done.changed, done.unchanged), (1, 0), "{:?}", done.unmatched);
+        assert_eq!(done.unmatched.len(), 1);
+        assert!(done.unmatched[0].contains("2002-9999"), "{:?}", done.unmatched);
+        let p = load(&dir).unwrap();
+        let x11 = wc_core::DeviceTag::parse("-X1.1").unwrap();
+        assert_eq!(
+            p.devices.get(&x11).and_then(|d| d.part.as_deref()),
+            Some("wago.2002-1201")
+        );
+        assert!(p.lock.parts.contains_key("wago.2002-1201"), "taken into the project");
+        assert!(store::read_vendored_part(&dir, "wago.2002-1201").is_ok());
+        // Again: nothing to change.
+        let again = run_import_wago(&dir, &out);
+        assert_eq!((again.changed, again.unchanged), (0, 1));
+        assert!(import_wago(&dir, &tmp.path().join("missing.csv")).is_err());
+    }
+
+    fn run_import_wago(dir: &Path, file: &Path) -> WagoImported {
+        let cli = Cli::try_parse_from(["wiringcraft", "import", "wago", file.to_str().unwrap()]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Import(ImportCmd::Wago { .. })));
+        import_wago(dir, file).unwrap()
     }
 
     #[test]

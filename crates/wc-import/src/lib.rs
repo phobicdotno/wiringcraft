@@ -15,6 +15,7 @@ pub mod qet;
 pub mod raster;
 pub mod svg;
 pub mod swe;
+pub mod wago;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

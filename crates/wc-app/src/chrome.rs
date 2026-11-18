@@ -37,6 +37,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::ExportAml),
             Some(Action::ExportWagoMarking),
             Some(Action::ExportWagoConfigurator),
+            Some(Action::ImportWagoConfigurator),
         ],
     ),
     (

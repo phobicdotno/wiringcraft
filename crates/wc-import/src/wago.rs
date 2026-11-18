@@ -1,0 +1,598 @@
+//! The WAGO configurator list back: the articles and accessories chosen in the configurator
+//! (smartDESIGNER), written onto the project's terminal and strip devices (#123).
+//!
+//! `wiringcraft export wago-configurator` writes one row per item with an `Index` that stays the
+//! same as long as the strip does not change (`-X1/T3`, `-X1/A2`). The list comes back with the
+//! Article (and Quantity) columns filled in; [`read_configured`] reads it, [`plan`] matches each
+//! row to the device part it stands for by that index and the article to a part of the project
+//! or its libraries, and [`apply`] writes the result. Everything that cannot be matched is listed
+//! with the reason, never guessed. See `docs/wago-configurator.md`.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use wc_core::{DevicePart, DeviceTag, Part, Project};
+use wc_report::{Inputs, Target};
+
+use crate::csv::{decode, records};
+use crate::{Error, Result};
+
+/// One row of a configured list, as far as the import reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfiguredRow {
+    /// The row's line in the file, from 1 (the header is line 1).
+    pub line: usize,
+    pub index: String,
+    /// `Terminal`, `Accessory`, ... or empty when the file has no Type column.
+    pub kind: String,
+    pub strip: String,
+    pub terminal: String,
+    pub article: String,
+    pub manufacturer: String,
+    /// `None` when the file has no Quantity column or the cell is empty.
+    pub quantity: Option<u32>,
+}
+
+/// Read a configured list (bytes as saved: UTF-8 with or without BOM, or Latin-1). The header
+/// must name an Index and an Article column; Type, Strip, Terminal, Manufacturer and Quantity
+/// are read when present. Rows whose quantity is not a whole number are read without one, with
+/// a warning.
+pub fn read_configured(bytes: &[u8]) -> Result<(Vec<ConfiguredRow>, Vec<String>)> {
+    let text = decode(bytes);
+    let first_line = text.lines().next().unwrap_or("");
+    let delim = [';', '\t', ',']
+        .into_iter()
+        .max_by_key(|d| first_line.matches(*d).count())
+        .unwrap_or(';');
+    let rows = records(&text, delim);
+    let Some((header, body)) = rows.split_first() else {
+        return Err(Error::Format("the file is empty".into()));
+    };
+    let key = |h: &str| -> String { h.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect() };
+    let find = |names: &[&str]| header.iter().position(|h| names.contains(&key(h).as_str()));
+    let (Some(index), Some(article)) = (
+        find(&["index"]),
+        find(&[
+            "article",
+            "articleno",
+            "articlenumber",
+            "itemnumber",
+            "ordernumber",
+            "artikelnummer",
+            "bestellnummer",
+            "artikel",
+        ]),
+    ) else {
+        return Err(Error::Format(format!(
+            "need an Index and an Article column (as `export wago-configurator` writes them) among {header:?}"
+        )));
+    };
+    let kind = find(&["type", "typ"]);
+    let strip = find(&["strip", "terminalstrip", "leiste", "klemmenleiste"]);
+    let terminal = find(&["terminal", "klemme"]);
+    let manufacturer = find(&["manufacturer", "hersteller"]);
+    let quantity = find(&["quantity", "qty", "menge", "anzahl"]);
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    for (n, row) in body.iter().enumerate() {
+        let line = n + 2;
+        let cell = |c: Option<usize>| -> String {
+            let v = c.and_then(|c| row.get(c)).map(|v| v.trim()).unwrap_or("");
+            // The export guards cells a spreadsheet would run as a formula with a leading `'`.
+            v.strip_prefix('\'').unwrap_or(v).trim().to_owned()
+        };
+        let q = cell(quantity);
+        let quantity = if q.is_empty() {
+            None
+        } else {
+            match q.parse::<u32>() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    warnings.push(format!(
+                        "line {line}: quantity {q:?} is not a whole number; the quantity is left as it is"
+                    ));
+                    None
+                }
+            }
+        };
+        out.push(ConfiguredRow {
+            line,
+            index: cell(Some(index)),
+            kind: cell(kind),
+            strip: cell(strip),
+            terminal: cell(terminal),
+            article: cell(Some(article)),
+            manufacturer: cell(manufacturer),
+            quantity,
+        });
+    }
+    Ok((out, warnings))
+}
+
+/// Where an article goes on a device.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Slot {
+    /// The device's main part.
+    Part,
+    /// Its accessory at this position (from 0).
+    Accessory(usize),
+    /// A new accessory at the end of its list (a row the configurator added, without an index).
+    NewAccessory,
+}
+
+/// One change [`plan`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    /// The row's line in the file.
+    pub line: usize,
+    pub tag: DeviceTag,
+    pub slot: Slot,
+    /// The part id.
+    pub part: String,
+    pub qty: u32,
+}
+
+/// What a configured list would change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub assignments: Vec<Assignment>,
+    /// Rows with an article that already is the device's part.
+    pub unchanged: usize,
+    /// Rows with an article that could not be matched, each with the line and the reason.
+    pub unmatched: Vec<String>,
+}
+
+impl Plan {
+    /// The part ids the changes use, each once.
+    pub fn parts(&self) -> BTreeSet<&str> {
+        self.assignments.iter().map(|a| a.part.as_str()).collect()
+    }
+}
+
+/// Match the rows of a configured list to the project in `i`. `candidates` are the parts an
+/// article may be (the project's own and its libraries', by id): a part matches when its order
+/// number is the article (ignoring case) or its id is (the export writes a part without a copy
+/// by its id); when several do, the row's manufacturer chooses. Rows without an article are
+/// passed over. A row without an index that names a strip of the project becomes a new
+/// accessory of the strip device, unless the device has that part already.
+pub fn plan(i: &Inputs<'_>, candidates: &BTreeMap<String, Part>, rows: &[ConfiguredRow]) -> Plan {
+    let now = wc_report::configurator_list(i);
+    // Index (unguarded) → (type, terminal) of the list the project gives now.
+    let unguard = |s: &str| s.strip_prefix('\'').unwrap_or(s).to_owned();
+    let current: BTreeMap<String, (String, String)> = now
+        .table
+        .rows
+        .iter()
+        .map(|r| {
+            let cell = |k: usize| r.get(k).cloned().unwrap_or_default();
+            (unguard(&cell(0)), (cell(1), cell(4)))
+        })
+        .collect();
+    let strips: BTreeSet<String> = now
+        .table
+        .rows
+        .iter()
+        .filter_map(|r| r.get(2))
+        .map(|s| unguard(s))
+        .collect();
+
+    let mut out = Plan::default();
+    // (tag, slot) → (part, line) already planned, to catch two rows that disagree.
+    let mut taken: BTreeMap<(DeviceTag, Slot), (String, usize)> = BTreeMap::new();
+    let mut conflicted: BTreeSet<(DeviceTag, Slot)> = BTreeSet::new();
+    for row in rows {
+        if row.article.is_empty() {
+            continue;
+        }
+        let at = if row.index.is_empty() {
+            format!("line {}", row.line)
+        } else {
+            format!("line {} ({})", row.line, row.index)
+        };
+        let mut miss = |why: String| out.unmatched.push(format!("{at}: {} — {why}", row.article));
+        let (tag, slot) = if row.index.is_empty() {
+            match DeviceTag::parse(&row.strip) {
+                Ok(t) if strips.contains(&row.strip) => (t, Slot::NewAccessory),
+                _ if row.strip.is_empty() => {
+                    miss("the row has no index and no strip; export again and add it to a strip's rows".into());
+                    continue;
+                }
+                _ => {
+                    miss(format!(
+                        "the row has no index and the project has no strip {:?}",
+                        row.strip
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            let Some((kind, terminal)) = current.get(&row.index) else {
+                miss("the project has no such row now (the strip changed?); export the list again".into());
+                continue;
+            };
+            if !row.kind.is_empty() && !row.kind.eq_ignore_ascii_case(kind) {
+                miss(format!(
+                    "the row's type is {} in the file but {kind} in the project now; export the list again",
+                    row.kind
+                ));
+                continue;
+            }
+            if kind == "Terminal" && !row.terminal.is_empty() && row.terminal != *terminal {
+                miss(format!(
+                    "the row is terminal {} in the file but terminal {terminal} in the project now; export the list again",
+                    row.terminal
+                ));
+                continue;
+            }
+            match now.targets.get(&row.index) {
+                Some(Target::Part(t)) => (t.clone(), Slot::Part),
+                Some(Target::Accessory(t, k)) => (t.clone(), Slot::Accessory(*k)),
+                None => {
+                    miss(match &**kind {
+                        "Jumper" => "jumpers have no part of their own yet".into(),
+                        "Plate" | "Rail" => format!("a {} is not a device of the project", kind.to_lowercase()),
+                        _ => "the terminal has no device tag".into(),
+                    });
+                    continue;
+                }
+            }
+        };
+        let part = match find_part(candidates, &row.article, &row.manufacturer) {
+            Ok(p) => p,
+            Err(why) => {
+                miss(why);
+                continue;
+            }
+        };
+        let device = i.project.devices.get(&tag);
+        let (now_part, now_qty) = match &slot {
+            Slot::Part => (device.and_then(|d| d.part.clone()), 1),
+            Slot::Accessory(k) => device
+                .and_then(|d| d.accessories.get(*k))
+                .map_or((None, 1), |a| (Some(a.part.clone()), a.qty)),
+            Slot::NewAccessory => {
+                if device.is_some_and(|d| d.all_parts().iter().any(|(p, _)| *p == part)) {
+                    out.unchanged += 1;
+                    continue;
+                }
+                (None, 1)
+            }
+        };
+        let qty = match slot {
+            Slot::Part => 1,
+            _ => row.quantity.unwrap_or(now_qty).max(1),
+        };
+        if slot != Slot::NewAccessory {
+            if let Some((other, line)) = taken.get(&(tag.clone(), slot.clone())) {
+                if *other != part {
+                    miss(format!(
+                        "line {line} gives {tag} part {other}; neither is taken, choose one in the configurator"
+                    ));
+                    conflicted.insert((tag.clone(), slot.clone()));
+                }
+                continue;
+            }
+            taken.insert((tag.clone(), slot.clone()), (part.clone(), row.line));
+        }
+        if now_part.as_deref() == Some(part.as_str()) && qty == now_qty {
+            out.unchanged += 1;
+            continue;
+        }
+        out.assignments.push(Assignment {
+            line: row.line,
+            tag,
+            slot,
+            part,
+            qty,
+        });
+    }
+    // A device part two rows disagree on gets neither article.
+    out.assignments
+        .retain(|a| !conflicted.contains(&(a.tag.clone(), a.slot.clone())));
+    out
+}
+
+/// The part `article` names among `candidates`: by order number (ignoring case and spaces at the
+/// ends), or by id; when several match, the one by `manufacturer`. The reason when none or more
+/// than one does.
+fn find_part(
+    candidates: &BTreeMap<String, Part>,
+    article: &str,
+    manufacturer: &str,
+) -> std::result::Result<String, String> {
+    if candidates.contains_key(article) {
+        return Ok(article.to_owned());
+    }
+    let hits: Vec<&Part> = candidates
+        .values()
+        .filter(|p| p.order_number.trim().eq_ignore_ascii_case(article))
+        .collect();
+    let chosen: Vec<&Part> = if hits.len() > 1 && !manufacturer.is_empty() {
+        hits.iter()
+            .copied()
+            .filter(|p| p.manufacturer.trim().eq_ignore_ascii_case(manufacturer))
+            .collect()
+    } else {
+        hits.clone()
+    };
+    match chosen.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] if hits.is_empty() => Err(
+            "no part of the project or its libraries has this article number; import the maker's catalogue (BMEcat, EDZ or CSV) into a library first"
+                .into(),
+        ),
+        _ => {
+            let ids: Vec<&str> = if chosen.is_empty() { &hits } else { &chosen }
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect();
+            Err(format!("several parts have this article number ({})", ids.join(", ")))
+        }
+    }
+}
+
+/// Write `plan` onto the project's devices (a drawn device without an entry gets one). Returns
+/// how many devices changed. `plan` must come from this project as it is: accessory positions
+/// are those it had then.
+pub fn apply(project: &mut Project, plan: &Plan) -> usize {
+    let mut changed: BTreeSet<&DeviceTag> = BTreeSet::new();
+    for a in &plan.assignments {
+        let d = project.devices.entry(a.tag.clone()).or_default();
+        let part = DevicePart {
+            part: a.part.clone(),
+            qty: a.qty,
+        };
+        match a.slot {
+            Slot::Part => d.part = Some(a.part.clone()),
+            Slot::Accessory(k) => match d.accessories.get_mut(k) {
+                Some(slot) => *slot = part,
+                None => d.accessories.push(part),
+            },
+            Slot::NewAccessory => d.accessories.push(part),
+        }
+        changed.insert(&a.tag);
+    }
+    changed.len()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use wc_core::geom::{Point, Rotation};
+    use wc_core::symbol::{Pin, PinDir, SymbolRole};
+    use wc_core::{Device, Page, PlacedSymbol, Symbol};
+
+    fn tag(t: &str) -> DeviceTag {
+        DeviceTag::parse(t).unwrap()
+    }
+
+    fn part(id: &str, maker: &str, number: &str) -> (String, Part) {
+        (
+            id.to_owned(),
+            Part {
+                id: id.into(),
+                manufacturer: maker.into(),
+                order_number: number.into(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Terminals -X1.1 to -X1.3 and two terminals tagged only -X2; -X1.1 has a part, -X1.2 a
+    /// marker (2), the strip -X1 an end plate, and -X1.1 and -X1.2 are jumpered.
+    fn project() -> (Project, BTreeMap<String, Symbol>) {
+        let mut p = Project::new("x");
+        let mut page = Page::new("p1", "1", "Terminals");
+        for (n, (id, t)) in [
+            ("a", "-X1.1"),
+            ("b", "-X1.2"),
+            ("c", "-X1.3"),
+            ("d", "-X2"),
+            ("e", "-X2"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "term".into(),
+                at: Point::new(20.0 + 10.0 * n as f64, 50.0),
+                rotation: Rotation::R0,
+                mirror: false,
+                tag: Some(tag(t)),
+            });
+        }
+        p.pages.push(page);
+        p.devices.insert(
+            tag("-X1.1"),
+            Device {
+                part: Some("wago.2002-1201".into()),
+                ..Default::default()
+            },
+        );
+        p.devices.insert(
+            tag("-X1.2"),
+            Device {
+                accessories: vec![DevicePart {
+                    part: "wago.marker".into(),
+                    qty: 2,
+                }],
+                ..Default::default()
+            },
+        );
+        p.devices.insert(
+            tag("-X1"),
+            Device {
+                accessories: vec![DevicePart {
+                    part: "wago.2002-1291".into(),
+                    qty: 1,
+                }],
+                ..Default::default()
+            },
+        );
+        p.meta
+            .add_jumper(&tag("-X1"), &["1".to_owned(), "2".to_owned()])
+            .unwrap();
+        let term = Symbol {
+            id: "term".into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: SymbolRole::Terminal,
+            graphics: vec![],
+            pins: ["1", "2"]
+                .iter()
+                .enumerate()
+                .map(|(n, name)| Pin {
+                    name: (*name).into(),
+                    at: Point::new(0.0, 10.0 * n as f64),
+                    dir: PinDir::Down,
+                })
+                .collect(),
+            tag_at: Point::default(),
+            description: String::new(),
+        };
+        (p, [("term".to_owned(), term)].into_iter().collect())
+    }
+
+    fn candidates() -> BTreeMap<String, Part> {
+        [
+            part("wago.2002-1201", "WAGO", "2002-1201"),
+            part("wago.2002-1301", "WAGO", "2002-1301"),
+            part("wago.2002-1291", "WAGO", "2002-1291"),
+            part("wago.249-116", "WAGO", "249-116"),
+            part("wago.marker", "WAGO", "793-501"),
+            part("acme.dup", "Acme", "DUP-1"),
+            part("phoenix.dup", "Phoenix", "dup-1 "),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn a_configured_list_puts_its_articles_on_the_devices_and_lists_the_rest() {
+        let (mut p, symbols) = project();
+        let parts = candidates();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        // The export, with articles chosen as the configurator would.
+        let mut t = wc_report::configurator_list(&inputs).table;
+        let indexes: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(
+            indexes,
+            [
+                "-X1/T1",
+                "-X1/T2",
+                "-X1/T3",
+                "-X1/J1",
+                "-X1/A1",
+                "-X1/T2/A1",
+                "-X2/T1",
+                "-X2/T2"
+            ]
+        );
+        let choose = |t: &mut wc_report::Table, index: &str, article: &str, maker: &str, qty: &str| {
+            let r = t.rows.iter_mut().find(|r| r[0] == index).unwrap();
+            r[6] = article.into();
+            r[7] = maker.into();
+            if !qty.is_empty() {
+                r[9] = qty.into();
+            }
+        };
+        choose(&mut t, "-X1/T1", "2002-1301", "WAGO", "");
+        choose(&mut t, "-X1/T2", "2002-1201", "WAGO", "");
+        choose(&mut t, "-X1/T3", "DUP-1", "Phoenix", "");
+        choose(&mut t, "-X1/J1", "2002-402", "WAGO", "");
+        choose(&mut t, "-X1/A1", "2002-1291", "WAGO", "2");
+        choose(&mut t, "-X2/T1", "2002-1201", "WAGO", "");
+        choose(&mut t, "-X2/T2", "2002-1301", "WAGO", "");
+        // Rows the configurator added, and one whose strip is gone.
+        let extra = |index: &str, strip: &str, article: &str, qty: &str| {
+            let mut r = vec![String::new(); wc_report::CONFIGURATOR_COLUMNS.len()];
+            (r[0], r[1], r[2], r[6], r[9]) = (
+                index.into(),
+                "Accessory".into(),
+                strip.into(),
+                article.into(),
+                qty.into(),
+            );
+            r
+        };
+        t.rows.push(extra("", "-X1", "249-116", "2"));
+        t.rows.push(extra("", "-X1", "999-999", "1"));
+        t.rows.push(extra("-X9/A1", "-X9", "249-116", "x"));
+        let bytes = wc_report::to_smartscript_csv(&t);
+
+        let (rows, warnings) = read_configured(bytes.as_bytes()).unwrap();
+        assert_eq!(rows.len(), 11);
+        assert_eq!(warnings.len(), 1, "the quantity x: {warnings:?}");
+        let plan = plan(&inputs, &parts, &rows);
+        assert_eq!(plan.unchanged, 1, "the marker: {plan:?}");
+        assert_eq!(plan.unmatched.len(), 4, "{:#?}", plan.unmatched);
+        for (n, why) in [
+            "jumpers have no part",
+            "neither is taken",
+            "no part of the project or its libraries",
+            "the project has no such row",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                plan.unmatched.iter().any(|u| u.contains(why)),
+                "{n}: {why} in {:#?}",
+                plan.unmatched
+            );
+        }
+        assert_eq!(apply(&mut p, &plan), 4);
+        let device = |t: &str| p.devices.get(&tag(t)).cloned().unwrap_or_default();
+        assert_eq!(device("-X1.1").part.as_deref(), Some("wago.2002-1301"));
+        assert_eq!(device("-X1.2").part.as_deref(), Some("wago.2002-1201"));
+        assert_eq!(device("-X1.2").accessories.len(), 1, "the marker stays");
+        assert_eq!(device("-X1.3").part.as_deref(), Some("phoenix.dup"), "by maker");
+        let acc: Vec<(String, u32)> = device("-X1").accessories.into_iter().map(|a| (a.part, a.qty)).collect();
+        assert_eq!(acc, [("wago.2002-1291".to_owned(), 2), ("wago.249-116".to_owned(), 2)]);
+        assert!(!p.devices.contains_key(&tag("-X2")), "its rows disagree");
+
+        // The same file again changes nothing.
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let again = super::plan(&inputs, &parts, &rows);
+        assert!(again.assignments.is_empty(), "{again:#?}");
+    }
+
+    #[test]
+    fn a_row_that_no_longer_matches_the_project_is_not_taken() {
+        let (p, symbols) = project();
+        let parts = candidates();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let text = "Index;Type;Terminal;Article\n\
+                    -X1/T2;Terminal;7;2002-1201\n\
+                    -X1/A1;Terminal;;2002-1201\n\
+                    -X1/T1;;;DUP-1\n\
+                    '-X1/T3;Terminal;3;wago.2002-1301\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        let plan = plan(&inputs, &parts, &rows);
+        assert_eq!(plan.unmatched.len(), 3, "{:#?}", plan.unmatched);
+        assert!(plan.unmatched[0].contains("terminal 7 in the file but terminal 2"));
+        assert!(plan.unmatched[1].contains("type is Terminal in the file but Accessory"));
+        assert!(plan.unmatched[2].contains("several parts") && plan.unmatched[2].contains("acme.dup"));
+        // A part id is taken as it is, and the guard quote is dropped.
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].tag, tag("-X1.3"));
+        assert_eq!(plan.assignments[0].part, "wago.2002-1301");
+        assert!(read_configured(b"Article;Quantity\n1;2\n").is_err());
+        assert!(read_configured(b"").is_err());
+    }
+}

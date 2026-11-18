@@ -734,6 +734,24 @@ impl App {
             Action::ExportWagoConfigurator => {
                 self.dialog = Some(Dialog::Message(export_wago_configurator(open)));
             }
+            Action::ImportWagoConfigurator => {
+                let mut picker = rfd::FileDialog::new()
+                    .set_title("WAGO configurator list with articles")
+                    .add_filter("CSV list", &["csv", "txt"]);
+                let export = open.dir.join("export");
+                if export.is_dir() {
+                    picker = picker.set_directory(export);
+                }
+                if let Some(file) = picker.pick_file() {
+                    let msg = match std::fs::read(&file) {
+                        Ok(bytes) => open
+                            .import_wago_configured(&bytes)
+                            .unwrap_or_else(|e| format!("Nothing imported: {e}")),
+                        Err(e) => format!("{}: {e}", file.display()),
+                    };
+                    self.dialog = Some(Dialog::Message(msg));
+                }
+            }
             Action::NumberWires => {
                 let done = open.number_wires(wc_core::numbering::Rule::PageColumn);
                 self.dialog = Some(Dialog::Message(done.report()));
@@ -2458,7 +2476,7 @@ fn export_wago_configurator(open: &Open) -> String {
         symbols: &open.symbols,
         parts: &open.parts,
     };
-    let wc_report::Configurator { table: t, warnings } = wc_report::configurator_list(&inputs);
+    let wc_report::Configurator { table: t, warnings, .. } = wc_report::configurator_list(&inputs);
     if t.rows.is_empty() {
         return "Nothing exported: the project has no numbered terminals on its schematic pages (terminals drawn \
                 only on an overview page are not listed)."
@@ -3344,6 +3362,38 @@ mod marking_tests {
         let rows: Vec<&str> = csv.lines().map(|l| l.split(';').next().unwrap()).collect();
         assert_eq!(rows, ["\u{feff}Index", "-X1/T1", "-X1/T2", "-X2/T1"]);
         assert!(csv.contains("-X1/T1;Terminal;-X1;1;1;"), "{csv}");
+    }
+
+    #[test]
+    fn articles_chosen_in_the_wago_configurator_come_back_as_one_undo_step() {
+        let (_tmp, mut o) = state::tests::project();
+        for (x, tag) in [(20.0, "-X1.1"), (40.0, "-X1.2")] {
+            let id = o.place(1, "wc.terminal", wc_core::geom::Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse(tag).unwrap());
+        }
+        export_wago_configurator(&o);
+        let csv = std::fs::read_to_string(o.dir.join("export").join("wago-configurator.csv"))
+            .unwrap()
+            .replace("-X1/T1;Terminal;-X1;1;1;;;", "-X1/T1;Terminal;-X1;1;1;;EX-TB-2.5;")
+            .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;NO-SUCH;");
+        let before = o.undo_mark();
+        let msg = o.import_wago_configured(csv.as_bytes()).unwrap();
+        assert!(
+            msg.starts_with("WAGO configurator: 1 device(s) changed, 0 row(s) already up to date, 1 not matched."),
+            "{msg}"
+        );
+        assert!(msg.contains("NO-SUCH"), "{msg}");
+        let x11 = wc_core::DeviceTag::parse("-X1.1").unwrap();
+        assert_eq!(
+            o.project.devices.get(&x11).and_then(|d| d.part.as_deref()),
+            Some("example.ex-tb-2-5")
+        );
+        assert!(o.parts.contains_key("example.ex-tb-2-5"), "loaded");
+        assert_eq!(o.undo_mark(), before + 1);
+        assert!(o.undo());
+        assert!(o.project.devices.get(&x11).and_then(|d| d.part.as_deref()).is_none());
+        assert!(o.import_wago_configured(b"Article\n1\n").is_err());
     }
 
     #[test]

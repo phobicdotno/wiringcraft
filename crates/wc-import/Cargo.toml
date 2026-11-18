@@ -1,6 +1,6 @@
 [package]
 name = "wc-import"
-description = "WiringCraft importers: DXF, SVG, CSV, EPLAN, AutomationML, KiCad, QElectroTech, BMEcat, SolidWorks Electrical"
+description = "WiringCraft importers: DXF, SVG, CSV, EPLAN, AutomationML, KiCad, QElectroTech, BMEcat, SolidWorks Electrical, WAGO configurator lists"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,11 +14,12 @@ image.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 sevenz-rust2.workspace = true
+# The WAGO configurator list back matches its rows to the export's.
+wc-report.workspace = true
 
 [dev-dependencies]
 # Tests write 7-Zip archives.
 sevenz-rust2 = { workspace = true, features = ["compress"] }
-wc-report.workspace = true
 
 [lints]
 workspace = true

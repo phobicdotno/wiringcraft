@@ -1180,7 +1180,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
             ("-X1/T2", "Terminal"),
             ("-X1/J1", "Jumper"),
             ("-X1/A1", "Accessory"),
-            ("-X1/A2", "Accessory"),
+            ("-X1/T2/A1", "Accessory"),
         ]
     );
     let row = |index: &str| t.rows.iter().find(|r| r[0] == index).unwrap().clone();
@@ -1200,7 +1200,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
         (row("-X1/A1")[6].as_str(), row("-X1/A1")[9].as_str()),
         ("2002-1291", "1")
     );
-    let a2 = row("-X1/A2");
+    let a2 = row("-X1/T2/A1");
     assert_eq!(
         (a2[6].as_str(), a2[9].as_str(), a2[14].as_str()),
         ("acme.marker", "2", "2")
@@ -1251,7 +1251,7 @@ fn a_terminal_tagged_with_only_its_strip_takes_the_strip_devices_part() {
             x2[1][9].as_str(),
             x2[1][14].as_str()
         ),
-        ("-X2/A1", "acme.marker", "3", "1")
+        ("-X2/T1/A1", "acme.marker", "3", "1")
     );
 }
 
