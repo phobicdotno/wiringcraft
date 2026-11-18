@@ -1561,10 +1561,13 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
         }
         LibCmd::Lock => {
             let lib = wc_library::Library::open(dir, &p).map_err(e)?;
-            let missing = wc_library::lock_missing(dir, &mut p, &lib).map_err(e)?;
+            let left = wc_library::lock_missing(dir, &mut p, &lib).map_err(e)?;
             save(dir, &p)?;
-            for (k, id) in missing {
+            for (k, id) in left.missing {
                 eprintln!("warning: {k:?} {id} is in no library source");
+            }
+            for (k, id, why) in left.wrong_id {
+                eprintln!("warning: {k:?} {id} is not pinned: {why}");
             }
         }
         LibCmd::Search { query } => {
@@ -2117,10 +2120,22 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             for w in &imported.warnings {
                 eprintln!("warning: {w}");
             }
-            for s in &imported.symbols {
-                if store::read_vendored_symbol(dir, &s.symbol).is_err() {
-                    wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, &s.symbol).map_err(e)?;
+            let needed: std::collections::BTreeSet<&str> = imported
+                .symbols
+                .iter()
+                .map(|s| s.symbol.as_str())
+                .filter(|id| store::read_vendored_symbol(dir, id).is_err())
+                .collect();
+            // Check every symbol before taking any, so a refused import leaves no copy behind
+            // without its pin (a retry would take that copy for a pinned one).
+            for id in &needed {
+                let (s, source) = lib.symbol(id).map_err(e)?;
+                if s.id != *id {
+                    return Err(format!("{source}: the symbol file for {id:?} declares id {:?}", s.id));
                 }
+            }
+            for id in needed {
+                wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(e)?;
             }
             let pg = page_mut(&mut p, &page)?;
             let n_g = imported.graphics.len();
@@ -3380,6 +3395,60 @@ mod tests {
         p.meta.libraries.clear();
         let (choice, _, _) = swe_symbol_choice(&dir, &p, None).unwrap();
         assert_eq!(choice.library["wc.coil"].name, "Pinned coil");
+    }
+
+    #[test]
+    fn a_dxf_import_refused_for_a_wrong_library_file_takes_nothing_and_a_retry_pins_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        let mut p = load(&dir).unwrap();
+        p.meta.libraries.push(LibrarySource {
+            name: "starter".into(),
+            kind: "folder".into(),
+            location: starter.to_string_lossy().into_owned(),
+            reference: None,
+        });
+        let (coil, _) = wc_library::Library::open(&dir, &p).unwrap().symbol("wc.coil").unwrap();
+        // A library whose `aa.good` is fine and whose `zz.bad.json` declares another id.
+        let lib = tmp.path().join("lib");
+        let with_id = |id: &str| wc_core::Symbol {
+            id: id.into(),
+            ..coil.clone()
+        };
+        wc_library::write_symbol(&lib, &with_id("aa.good")).unwrap();
+        let bad = wc_library::write_symbol(&lib, &with_id("other")).unwrap();
+        std::fs::rename(&bad, lib.join("symbols").join("zz.bad.json")).unwrap();
+        p.meta.libraries = vec![LibrarySource {
+            name: "lib".into(),
+            kind: "folder".into(),
+            location: lib.to_string_lossy().into_owned(),
+            reference: None,
+        }];
+        save(&dir, &p).unwrap();
+        let page = p.pages[0].id.clone();
+        let drawing = tmp.path().join("plan.dxf");
+        std::fs::write(
+            &drawing,
+            "0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nAA.GOOD\n10\n0\n20\n0\n\
+             0\nINSERT\n2\nZZ.BAD\n10\n50\n20\n0\n0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+        let args = ["import", "page-dxf", drawing.to_str().unwrap(), "--page", page.as_str()];
+        let err = cli(&dir, &args).unwrap_err();
+        assert!(err.contains("declares id \"other\""), "{err}");
+        assert!(
+            store::read_vendored_symbol(&dir, "aa.good").is_err(),
+            "no copy left behind without its pin"
+        );
+
+        // With the library file fixed, the retry pins both.
+        wc_library::write_symbol(&lib, &with_id("zz.bad")).unwrap();
+        cli(&dir, &args).unwrap();
+        let p = load(&dir).unwrap();
+        assert!(p.lock.symbols.contains_key("aa.good"));
+        assert!(p.lock.symbols.contains_key("zz.bad"));
     }
 
     #[test]

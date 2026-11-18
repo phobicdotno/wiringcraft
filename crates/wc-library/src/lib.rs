@@ -328,22 +328,41 @@ fn same_id(source: &str, kind: &str, wanted: &str, inside: &str) -> Result<()> {
     })
 }
 
-/// Pin every used item that is not pinned yet. Items missing from the library are returned.
-pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) -> Result<Vec<(ItemKind, String)>> {
-    let mut missing = Vec::new();
-    let todo: Vec<(ItemKind, String)> = status(project_dir, project, lib)
-        .into_iter()
-        .filter(|s| s.state == State::NotLocked)
-        .map(|s| (s.kind, s.id))
-        .collect();
+/// What [`lock_missing`] could not pin.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Unpinned {
+    /// Used items that no library source holds.
+    pub missing: Vec<(ItemKind, String)>,
+    /// Used items whose library file declares another id, with the reason (see [`State::WrongId`]).
+    pub wrong_id: Vec<(ItemKind, String, String)>,
+}
+
+impl Unpinned {
+    pub fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.wrong_id.is_empty()
+    }
+}
+
+/// Pin every used item that is not pinned yet. Items it cannot pin are returned.
+pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) -> Result<Unpinned> {
+    let mut left = Unpinned::default();
+    let mut todo = Vec::new();
+    for s in status(project_dir, project, lib) {
+        match s.state {
+            State::NotLocked => todo.push((s.kind, s.id)),
+            // Used but not pinned, and its library file cannot be taken.
+            State::WrongId if s.locked.is_none() => left.wrong_id.push((s.kind, s.id, s.changes.join("; "))),
+            _ => {}
+        }
+    }
     for (kind, id) in todo {
         match take(project_dir, project, lib, kind, &id) {
             Ok(_) => {}
-            Err(Error::NotFound { .. }) => missing.push((kind, id)),
+            Err(Error::NotFound { .. }) => left.missing.push((kind, id)),
             Err(e) => return Err(e),
         }
     }
-    Ok(missing)
+    Ok(left)
 }
 
 /// Take newer library versions. `only` limits it to the given ids; `None` updates everything

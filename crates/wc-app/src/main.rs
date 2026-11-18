@@ -1993,7 +1993,12 @@ impl App {
                                     };
                                     chrome::dot(ui, c);
                                     ui.label(RichText::new(&it.id).monospace());
-                                    ui.label(s);
+                                    if it.state == wc_library::State::WrongId {
+                                        // Names the source and the id its file declares.
+                                        ui.label(format!("{s}: {}", it.changes.join("; ")));
+                                    } else {
+                                        ui.label(s);
+                                    }
                                     ui.end_row();
                                 }
                             });

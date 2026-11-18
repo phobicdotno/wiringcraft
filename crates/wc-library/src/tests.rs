@@ -268,10 +268,16 @@ fn a_library_file_declaring_another_id_is_no_update_and_nothing_to_pin()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut f = fixture()?;
     let personal = f.proj.parent().ok_or("no parent")?.join("personal");
+    // `amp` sorts before `coil`, is pinned, and gets a valid newer version below.
+    write_symbol(&f.company, &sym("amp", 3.0))?;
     let lib = Library::open(&f.proj, &f.project)?;
     lock_missing(&f.proj, &mut f.project, &lib)?;
+    take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "amp")?;
     let pinned = f.project.lock.symbols.get("coil").cloned().ok_or("not pinned")?;
+    let amp_pinned = f.project.lock.symbols.get("amp").cloned().ok_or("amp not pinned")?;
     let kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?)?;
+    let amp_kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "amp")?)?;
+    write_symbol(&f.company, &sym("amp", 4.0))?;
 
     // Both sources' `coil.json` now hold a symbol declaring `other`, with other contents.
     for root in [&f.company, &personal] {
@@ -286,12 +292,27 @@ fn a_library_file_declaring_another_id_is_no_update_and_nothing_to_pin()
     assert!(coil.changes[0].contains("declares id \"other\""), "{:?}", coil.changes);
     assert!(coil.library_hash.is_none());
 
-    // Updating everything skips it; naming it is an error; neither touches the pin or the copy.
-    assert!(update(&f.proj, &mut f.project, &lib, None)?.is_empty());
-    let err = update(&f.proj, &mut f.project, &lib, Some(&["coil".to_owned()]))
-        .err()
-        .ok_or("updated")?;
+    // Naming it beside a valid update is an error before anything is taken.
+    let err = update(
+        &f.proj,
+        &mut f.project,
+        &lib,
+        Some(&["amp".to_owned(), "coil".to_owned()]),
+    )
+    .err()
+    .ok_or("updated")?;
     assert!(err.to_string().contains("declares id \"other\""), "{err}");
+    assert_eq!(f.project.lock.symbols.get("amp"), Some(&amp_pinned));
+    assert_eq!(
+        std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "amp")?)?,
+        amp_kept
+    );
+    // Updating everything takes the valid one and skips it.
+    assert_eq!(
+        update(&f.proj, &mut f.project, &lib, None)?,
+        vec![(ItemKind::Symbol, "amp".to_owned())]
+    );
+    assert_ne!(f.project.lock.symbols.get("amp"), Some(&amp_pinned));
     assert_eq!(f.project.lock.symbols.get("coil"), Some(&pinned));
     assert_eq!(
         std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?)?,
@@ -305,7 +326,14 @@ fn a_library_file_declaring_another_id_is_no_update_and_nothing_to_pin()
         st.iter().find(|s| s.id == "coil").map(|s| s.state),
         Some(State::WrongId)
     );
-    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
     assert!(!f.project.lock.symbols.contains_key("coil"));
+    assert!(left.missing.is_empty(), "{left:?}");
+    assert_eq!(left.wrong_id.len(), 1, "{left:?}");
+    assert_eq!(
+        (left.wrong_id[0].0, left.wrong_id[0].1.as_str()),
+        (ItemKind::Symbol, "coil")
+    );
+    assert!(left.wrong_id[0].2.contains("declares id \"other\""), "{left:?}");
     Ok(())
 }
