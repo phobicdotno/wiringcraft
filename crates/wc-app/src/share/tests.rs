@@ -2612,13 +2612,8 @@ fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
     Ok(())
 }
 
-fn waiting(names: &[String]) -> BTreeMap<String, ItemOut> {
-    let out = ItemOut {
-        at: std::time::Instant::now(),
-        tries: ITEM_TRIES,
-        gave_up: true,
-    };
-    names.iter().map(|n| (n.clone(), out)).collect()
+fn waiting(names: &[String]) -> std::collections::BTreeSet<String> {
+    names.iter().cloned().collect()
 }
 
 #[test]
@@ -2675,6 +2670,91 @@ fn a_rename_to_a_device_with_a_waiting_part_waits_whole() -> TestResult {
     let mut session = sendable.clone();
     assert!(held.put_back(&mut session).is_empty());
     assert_eq!(session, local);
+    Ok(())
+}
+
+#[test]
+fn a_device_removed_beside_a_waiting_rename_goes_out_at_once() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let k9 = wc_core::DeviceTag::parse("-K9")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k9.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    local.devices.remove(&k9);
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    // The rename waits whole; -K9 is not part of it.
+    assert!(held.now.devices.contains_key(&k1));
+    assert!(held.now.devices.contains_key(&k2));
+    assert!(!held.now.devices.contains_key(&k9));
+    let mut sendable = local.clone();
+    held.drop_from(&mut sendable);
+    assert!(sendable.devices.contains_key(&k1));
+    assert!(!sendable.devices.contains_key(&k9));
+    Ok(())
+}
+
+#[test]
+fn a_waiting_rename_is_dropped_whole_when_the_session_changed_one_of_its_pages() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    // Someone else changed the page meanwhile: the device keeps its old tag too.
+    let mut session = base.clone();
+    session.pages[0].title = "Theirs".into();
+    let before = session.clone();
+    assert_eq!(held.put_back(&mut session), ["page 1"]);
+    assert_eq!(session, before);
+    Ok(())
+}
+
+#[test]
+fn comments_on_a_waiting_new_page_wait_with_it() -> TestResult {
+    let base = Project::new("Test");
+    let mut local = base.clone();
+    let mut new_page = Page::new("p9", "9", "New");
+    new_page.symbols.push(symbol("s1", 10.0));
+    local.pages.push(new_page);
+    let note = Comment {
+        id: "c1".into(),
+        page: "p9".into(),
+        at: None,
+        author: "Ola".into(),
+        time: 0,
+        text: "Check this".into(),
+        resolved: false,
+        replies: Vec::new(),
+    };
+    local.comments.push(note.clone());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    // Not sent while the page waits: the session has no page to put it on.
+    let mut sendable = local.clone();
+    held.drop_from(&mut sendable);
+    assert!(sendable.comments.is_empty());
+    // Back in the copy after a sync that brought the session's project in.
+    let mut session = base.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session.comments, [note]);
     Ok(())
 }
 

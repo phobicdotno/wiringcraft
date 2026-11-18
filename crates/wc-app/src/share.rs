@@ -18,7 +18,7 @@
 //! and a picture someone starts using goes out as an `AddPicture` edit before the change that
 //! names it, so every copy shows it and the host's folder keeps it with that change's commit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 
@@ -1723,8 +1723,8 @@ struct Held {
 impl Held {
     /// The targets of `local` that use, for the first time since `base`, an item named in
     /// `waiting`.
-    fn find(local: &Project, base: &Project, waiting: &BTreeMap<String, ItemOut>) -> Held {
-        let waits = |kind: ItemKind, id: &str| waiting.contains_key(&item_name(kind, id));
+    fn find(local: &Project, base: &Project, waiting: &BTreeSet<String>) -> Held {
+        let waits = |kind: ItemKind, id: &str| waiting.contains(&item_name(kind, id));
         let fresh = FreshUses::find(local, base);
         let mut held = Held::default();
         let mut items = std::collections::BTreeSet::new();
@@ -1733,6 +1733,11 @@ impl Held {
             if !new.is_empty() {
                 items.extend(new.iter().map(|id| item_name(ItemKind::Symbol, id)));
                 held.now.pages.insert((*id).to_owned(), local.page(id).cloned());
+                // A new page's comments wait with it: the session has no page to put them on.
+                if base.page(id).is_none() {
+                    let on: Vec<_> = local.comments.iter().filter(|c| c.page == **id).cloned().collect();
+                    held.now.comments.insert((*id).to_owned(), on);
+                }
             }
         }
         for (tag, parts) in &fresh.devices {
@@ -1769,25 +1774,39 @@ impl Held {
         if new_tags.is_empty() {
             return;
         }
-        for tag in base.devices.keys().filter(|t| !local.devices.contains_key(*t)) {
+        let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
+        // Only a device gone since `base` whose drawings now name a new tag instead is the old
+        // side of a rename; other devices removed here go out as usual.
+        let renamed_from = |old: &wc_core::DeviceTag| {
+            let was = |t: &wc_core::DeviceTag| t == old;
+            base.pages
+                .iter()
+                .any(|b| page_mentions(b, &was) && local.page(&b.id).is_some_and(|l| page_mentions(l, &named)))
+                || base.panels.iter().any(|b| {
+                    panel_mentions(b, &was)
+                        && local
+                            .panels
+                            .iter()
+                            .find(|l| l.id == b.id)
+                            .is_some_and(|l| panel_mentions(l, &named))
+                })
+                || (base.meta.jumpers.iter().any(|j| was(&j.strip))
+                    && local.meta.jumpers.iter().any(|j| named(&j.strip)))
+        };
+        for tag in base
+            .devices
+            .keys()
+            .filter(|t| !local.devices.contains_key(*t) && renamed_from(t))
+        {
             self.now.devices.insert(tag.clone(), None);
         }
-        let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
         for p in &local.pages {
-            let mentions = p.symbols.iter().any(|s| s.tag.as_ref().is_some_and(named))
-                || p.wires
-                    .iter()
-                    .any(|w| w.cable.as_ref().is_some_and(|c| named(&c.cable)));
-            if mentions && base.page(&p.id) != Some(p) {
+            if page_mentions(p, &named) && base.page(&p.id) != Some(p) {
                 self.now.pages.insert(p.id.clone(), Some(p.clone()));
             }
         }
         for panel in &local.panels {
-            let mentions = panel
-                .items
-                .iter()
-                .any(|i| matches!(i, wc_core::panel::PanelItem::Device { tag, .. } if named(tag)));
-            if mentions && base.panels.iter().find(|b| b.id == panel.id) != Some(panel) {
+            if panel_mentions(panel, &named) && base.panels.iter().find(|b| b.id == panel.id) != Some(panel) {
                 self.now.panels.insert(panel.id.clone(), Some(panel.clone()));
             }
         }
@@ -1800,8 +1819,9 @@ impl Held {
         self.now.is_empty()
     }
 
-    /// Put the held changes back into `project`, which now holds the session's project. A target
-    /// the session changed meanwhile keeps the session's version; those are returned. A page
+    /// Put the held changes back into `project`, which now holds the session's project. When the
+    /// session changed any target meanwhile, every target keeps the session's version and the
+    /// changed ones are returned. A page
     /// counts as unchanged when only its number changed, and keeps the session's number unless
     /// this copy renumbered it.
     fn put_back(&self, project: &mut Project) -> Vec<String> {
@@ -1841,6 +1861,15 @@ impl Held {
                 lost.push(format!("panel {id}"));
             }
         }
+        for (page, now) in &self.now.comments {
+            let was = self.was.comments.get(page).cloned().unwrap_or_default();
+            let session: Vec<_> = project.comments.iter().filter(|c| &c.page == page).cloned().collect();
+            if session == was {
+                keep.comments.insert(page.clone(), now.clone());
+            } else {
+                lost.push(format!("the comments on page {page}"));
+            }
+        }
         if let (Some(now), Some(was)) = (&self.now.meta, &self.was.meta) {
             if project.meta == **was {
                 keep.meta = Some(now.clone());
@@ -1848,7 +1877,11 @@ impl Held {
                 lost.push("the project properties".into());
             }
         }
-        keep.apply(project);
+        // Kept whole or not at all: a rename whose page the session changed must not leave the
+        // new tag here without the page that uses it, nor the page without its device.
+        if lost.is_empty() {
+            keep.apply(project);
+        }
         // The items they use stay locked here: `incoming` keeps entries the session lacks.
         lost
     }
@@ -1857,6 +1890,23 @@ impl Held {
     fn drop_from(&self, project: &mut Project) {
         self.was.apply(project);
     }
+}
+
+/// Whether a symbol or cable on `page` names a device `tag` picks.
+fn page_mentions(page: &Page, tag: &dyn Fn(&wc_core::DeviceTag) -> bool) -> bool {
+    page.symbols.iter().any(|s| s.tag.as_ref().is_some_and(tag))
+        || page
+            .wires
+            .iter()
+            .any(|w| w.cable.as_ref().is_some_and(|c| tag(&c.cable)))
+}
+
+/// Whether `panel` places a device `tag` picks.
+fn panel_mentions(panel: &wc_core::panel::Panel, tag: &dyn Fn(&wc_core::DeviceTag) -> bool) -> bool {
+    panel
+        .items
+        .iter()
+        .any(|i| matches!(i, wc_core::panel::PanelItem::Device { tag: t, .. } if tag(t)))
 }
 
 /// One symbol or part sent to the session and not taken yet.
@@ -2349,8 +2399,14 @@ impl Share {
         // After that, only a change that uses an item the session has not taken waits, however
         // long: the session refuses a page that draws a symbol it does not have. Others' changes
         // come in meanwhile; the session never had the item, so nothing replaces its entry here.
-        let held = Held::find(&open.project, self.base.as_ref()?, &self.items_out);
         let undo = std::mem::take(&mut self.drop_held);
+        // For an Undo, what waited when it was asked waits still, also when its item has come
+        // in since: it never reached the session, so it is taken back here, not there.
+        let mut waiting: BTreeSet<String> = self.items_out.keys().cloned().collect();
+        if undo {
+            waiting.extend(self.holding.iter().cloned());
+        }
+        let held = Held::find(&open.project, self.base.as_ref()?, &waiting);
         if undo && !held.is_empty() {
             // Undo of a change that never reached the session: taken back here only.
             held.drop_from(&mut open.project);
@@ -2398,13 +2454,6 @@ impl Share {
         if sent {
             // The host answers what was sent this frame at once; the reply goes out now.
             role.pump(&mut self.notes);
-        }
-        if undo {
-            // What waited when Undo was asked for has gone out meanwhile (its item arrived):
-            // the session takes it back, after it.
-            if role.take_back(false, None, &mut self.notes).is_ok() {
-                self.took_back = true;
-            }
         }
         let base = self.base.get_or_insert_with(|| open.project.clone());
         take_updates(role, base, &mut self.items_out);
@@ -2493,6 +2542,9 @@ impl Share {
             open.dirty = true;
         }
         if let Some(synced) = synced {
+            if changed || sent || !out.dropped.is_empty() {
+                open.forget_terminal_change();
+            }
             self.base = Some(synced);
         } else if changed || sent || !out.dropped.is_empty() {
             open.forget_terminal_change();
