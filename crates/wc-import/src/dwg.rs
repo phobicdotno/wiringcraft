@@ -22,7 +22,9 @@
 //! Written from the published Open Design Specification for .dwg files and LibreDWG's reading
 //! of it, tested with files the tests write themselves and checked against 1666 real AutoCAD
 //! 2004 and 2010 files of a SolidWorks Electrical symbol library. The 2007 container is written
-//! from the specification only (see [`r2007`]) and checked against a real AutoCAD 2007 drawing.
+//! from the specification only (see [`r2007`]) and checked against a real AutoCAD 2007 drawing;
+//! 2013 and 2018 support is written from the specification only and checked against 33 real
+//! AutoCAD 2013 and 110 real AutoCAD 2018 drawings.
 //! Input is treated as hostile: every size and offset is checked, and a damaged file gives an
 //! error naming what is wrong, never a panic.
 

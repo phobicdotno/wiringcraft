@@ -305,6 +305,10 @@ fn entry(v: Version, kind: u16, handle: u64, name: &str) -> Obj {
 fn named(v: Version, kind: u16, handle: u64, name: &str) -> Obj {
     let mut o = Obj::new(v, kind, handle);
     o.data.bs(0).bl(0).b(true);
+    // Data in the data store, from 2013 on.
+    if v >= Version::R2013 {
+        o.data.b(false);
+    }
     o.text(name);
     o
 }
@@ -350,6 +354,10 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
     }
     d.bb(if h.owner.is_some() { 0 } else { 2 });
     d.bl(u32::from(h.extras)).b(!h.extras);
+    // Data in the data store, from 2013 on: set with the extras.
+    if v >= Version::R2013 {
+        d.b(h.extras);
+    }
     if h.extras {
         let book = if h.book { 0x4000 } else { 0 };
         d.bs(0x8000 | book | 0x2000 | 7).bl(0x00FF_0000).bl(0x0200_0080);
@@ -445,6 +453,10 @@ fn attrib(v: Version, kind: u16, handle: u64, h: Head, at: (f64, f64), value: &s
     text_data_with(&mut o, at, value, 2.5, 0.0, Some(1));
     if v >= Version::R2010 {
         o.data.rc(0);
+    }
+    // A single-line attribute, from 2018 on.
+    if v >= Version::R2018 {
+        o.data.rc(1);
     }
     o.text(tag);
     o.data.bs(0).rc(flags);
@@ -816,8 +828,89 @@ fn a_2004_drawing_gives_its_blocks_and_model_space() -> TestResult {
 }
 
 #[test]
+fn a_2013_drawing_gives_its_blocks_and_model_space() -> TestResult {
+    let v = Version::R2013;
+    check_sample(&drawing(&sections(v, &sample(v), &[]))?);
+    Ok(())
+}
+
+#[test]
+fn a_2018_drawing_gives_its_blocks_and_model_space() -> TestResult {
+    let v = Version::R2018;
+    check_sample(&drawing(&sections(v, &sample(v), &[]))?);
+    Ok(())
+}
+
+#[test]
+fn the_2013_data_store_flag_is_read() -> TestResult {
+    // 2010 objects (without the flag) read as 2013 ones come out wrong: the flag is needed.
+    let s = sections(Version::R2013, &sample(Version::R2010), &[]);
+    let d = drawing(&s)?;
+    assert!(d.skipped.get(DAMAGED).is_some_and(|n| *n > 0), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn a_2018_multi_line_attribute_is_counted_and_skipped() -> TestResult {
+    let v = Version::R2018;
+    let mut objs = sample(v);
+    // A second attribute of the RELAY insert in model space, of type 2 (multi-line): its
+    // embedded MTEXT is not read, so nothing after the type is written.
+    let mut a = entity(v, 2, 0x5D, head(Some(0x50)));
+    text_data_with(&mut a, (100.0, 62.0), "two lines", 2.5, 0.0, Some(1));
+    a.data.rc(0).rc(2);
+    objs.push(a);
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get("ATTRIB (multi-line)"), Some(&1), "{:?}", d.skipped);
+    assert!(!texts(&d.model).contains(&"two lines"));
+    assert!(!d.skipped.contains_key(DAMAGED), "{:?}", d.damaged);
+    assert!(texts(&d.model).contains(&"-K1"), "the single-line one is still drawn");
+    Ok(())
+}
+
+#[test]
+fn cut_or_flipped_2013_and_2018_files_give_errors_not_panics() -> TestResult {
+    for (tag, v) in [(b"AC1027", Version::R2013), (b"AC1032", Version::R2018)] {
+        let (map, objects) = sections_bytes(&sample(v), &[]);
+        let file = write_dwg(
+            tag,
+            &[
+                TestSection {
+                    name: "AcDb:AcDbObjects",
+                    data: objects,
+                    ..Default::default()
+                },
+                TestSection {
+                    name: "AcDb:Handles",
+                    data: map,
+                    ..Default::default()
+                },
+            ],
+        );
+        check_sample(&read_drawing(&file)?);
+        for len in (0..file.len()).step_by(5) {
+            let _ = read_drawing(&file[..len]);
+        }
+        let mut seed = 9u32;
+        for i in 0..1000 {
+            let mut damaged = file.clone();
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let at = (seed as usize >> 4) % damaged.len();
+            damaged[at] ^= 1 << (i % 8);
+            let _ = read_drawing(&damaged);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn a_whole_file_is_read() -> TestResult {
-    for (tag, v) in [(b"AC1024", Version::R2010), (b"AC1018", Version::R2004)] {
+    for (tag, v) in [
+        (b"AC1032", Version::R2018),
+        (b"AC1027", Version::R2013),
+        (b"AC1024", Version::R2010),
+        (b"AC1018", Version::R2004),
+    ] {
         let (map, objects) = sections_bytes(&sample(v), &[]);
         let file = write_dwg(
             tag,
@@ -1002,7 +1095,13 @@ fn a_block_inserting_itself_ends() -> TestResult {
 
 #[test]
 fn flipped_and_cut_objects_give_no_panic() {
-    for v in [Version::R2004, Version::R2007, Version::R2010] {
+    for v in [
+        Version::R2004,
+        Version::R2007,
+        Version::R2010,
+        Version::R2013,
+        Version::R2018,
+    ] {
         let s = sections(v, &sample(v), &[]);
         let objects = s.sections[1].data.clone();
         let map = s.sections[0].data.clone();
@@ -1199,7 +1298,13 @@ fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: boo
 
 #[test]
 fn a_block_is_placed_by_its_base_point() -> TestResult {
-    for v in [Version::R2004, Version::R2007, Version::R2010] {
+    for v in [
+        Version::R2004,
+        Version::R2007,
+        Version::R2010,
+        Version::R2013,
+        Version::R2018,
+    ] {
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -1268,7 +1373,13 @@ fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
 
 #[test]
 fn a_dimension_is_drawn_by_its_block() -> TestResult {
-    for v in [Version::R2004, Version::R2007, Version::R2010] {
+    for v in [
+        Version::R2004,
+        Version::R2007,
+        Version::R2010,
+        Version::R2013,
+        Version::R2018,
+    ] {
         let d1 = head(Some(0x100));
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),

@@ -4,10 +4,13 @@
 //! `AcDb:Handles` is the object map: each object's handle and where it starts in
 //! `AcDb:AcDbObjects`. Each object there is a size, then bit-packed data:
 //! its type, its own handle and fields, and at the end a stream of references to other objects
-//! by handle (its owner, its layer, the block an INSERT shows). In AutoCAD 2007 and 2010
-//! drawings the texts of an object are in a third stream at the end of its data. 2007 objects
-//! are otherwise written like 2004 ones (type as a bit short, data size in bits), with the
-//! entity fields added in 2007 (material, shadow, attribute lock, MTEXT rectangle height).
+//! by handle (its owner, its layer, the block an INSERT shows). From AutoCAD 2007 on the texts
+//! of an object are in a third stream at the end of its data. 2007 objects are otherwise written
+//! like 2004 ones (type as a bit short, data size in bits), with the entity fields added in 2007
+//! (material, shadow, attribute lock, MTEXT rectangle height). 2013 and 2018 objects are written
+//! like 2010 ones, with a flag for data in the data store after the extension dictionary flag
+//! (2013, #292) and an attribute type in ATTRIB and ATTDEF (2018). Multi-line attributes (2018)
+//! are counted and skipped.
 //!
 //! The entities read are LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE (2D and 3D) with their
 //! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), SOLID,
@@ -206,7 +209,7 @@ struct Object<'a> {
 }
 
 impl Object<'_> {
-    /// TV: a text, from the data stream (2004) or the string stream (2007 and 2010).
+    /// TV: a text, from the data stream (2004) or the string stream (2007 on).
     fn text(&mut self) -> Result<String> {
         match self.version {
             Version::R2004 => self.data.t8(),
@@ -448,10 +451,14 @@ fn decode(
         return Err(bad("an object's handle differs from the object map"));
     }
     if o.kind == BLOCK_HEADER || o.kind == LAYER {
-        // A table entry: common object data, then its name.
+        // A table entry: common object data (reactors, no extension dictionary, from 2013 on
+        // has data in the data store), then its name.
         o.skip_eed()?;
         o.data.bl()?;
         o.data.b()?;
+        if o.version >= Version::R2013 {
+            o.data.b()?;
+        }
         let name = o.text()?;
         if o.kind == LAYER {
             out.layers.insert(handle, name);
@@ -487,7 +494,12 @@ fn decode(
     let mut block = None;
     let mut vertices = Vec::new();
     match o.kind {
-        1..=3 => text(&mut o, &mut e)?,
+        1..=3 => {
+            if !text(&mut o, &mut e)? {
+                *skipped.entry(format!("{dxf_kind} (multi-line)")).or_default() += 1;
+                return Ok(());
+            }
+        }
         7 => block = Some(insert(&mut o, &mut e)?),
         // Drawn by its anonymous block, which comes after the dimension style in the handles.
         20..=26 => {
@@ -628,6 +640,10 @@ fn entity_common(o: &mut Object) -> Result<Common> {
     let mode = o.data.bb()?;
     let reactors = o.data.bl()?;
     let no_xdict = o.data.b()?;
+    // Whether the entity has data in the data store, from 2013 on.
+    if o.version >= Version::R2013 {
+        o.data.b()?;
+    }
     let color = o.data.bs()?;
     if color & 0x8000 != 0 {
         o.data.bl()?;
@@ -689,8 +705,9 @@ fn entity_common(o: &mut Object) -> Result<Common> {
     })
 }
 
-/// TEXT, and the text part of ATTRIB and ATTDEF.
-fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
+/// TEXT, and the text part of ATTRIB and ATTDEF. False for a multi-line attribute (2018 on),
+/// which is not read.
+fn text(o: &mut Object, e: &mut Codes) -> Result<bool> {
     let d = &mut o.data;
     let flags = d.rc()?;
     if flags & 0x01 == 0 {
@@ -727,12 +744,18 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
     e.f(50, rotation.to_degrees()).i(72, i64::from(align)).f(230, z);
     if o.kind == 1 {
         e.s(1, value);
-        return Ok(());
+        return Ok(true);
     }
     // ATTRIB and ATTDEF: the tag and flags, and for ATTDEF the prompt. A version byte from
     // 2010 on, a lock position flag from 2007 on.
     if o.version >= Version::R2010 {
         o.data.rc()?;
+    }
+    // From 2018 on, the attribute type: 1 a single line, 2 and 4 multi-line. A multi-line one
+    // holds a whole MTEXT before its tag and flags, which the specification does not lay out
+    // clearly enough to read; without its flags it could be a hidden one, so it is left out.
+    if o.version >= Version::R2018 && o.data.rc()? != 1 {
+        return Ok(false);
     }
     let tag = o.text()?;
     o.data.bs()?;
@@ -748,7 +771,7 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
         let prompt = o.text()?;
         e.s(3, prompt);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// INSERT; returns the handle of the block it shows.
