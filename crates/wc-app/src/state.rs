@@ -313,17 +313,9 @@ impl Open {
 
         self.parts = self
             .project
-            .devices
-            .values()
-            .flat_map(|d| d.all_parts())
-            .map(|(id, _)| id)
-            .collect::<std::collections::BTreeSet<&str>>()
+            .used_parts()
             .into_iter()
-            .filter_map(|id| {
-                store::read_vendored_part(&self.dir, id)
-                    .ok()
-                    .map(|p| (id.to_owned(), p))
-            })
+            .filter_map(|id| store::read_vendored_part(&self.dir, &id).ok().map(|p| (id, p)))
             .collect();
         let mut parts: BTreeMap<String, String> = self.parts.iter().map(|(k, p)| (k.clone(), part_label(p))).collect();
         if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
@@ -608,12 +600,9 @@ impl Open {
         }
         let missing: Vec<String> = self
             .project
-            .devices
-            .values()
-            .flat_map(|d| d.all_parts())
-            .map(|(id, _)| id)
-            .filter(|id| !self.parts.contains_key(*id))
-            .map(str::to_owned)
+            .used_parts()
+            .into_iter()
+            .filter(|id| !self.parts.contains_key(id))
             .collect();
         let mut failed = Vec::new();
         for id in missing {
@@ -1606,6 +1595,21 @@ impl Open {
             self.checkpoint();
             self.project.meta = meta;
         }
+        Ok(())
+    }
+
+    /// Give the jumper that holds `terminal` of `strip` a part (taken from the library into
+    /// the project when needed), or none, as one undo step.
+    pub fn set_jumper_part(&mut self, strip: &DeviceTag, terminal: &str, part: Option<&str>) -> Result<(), String> {
+        let mut meta = self.project.meta.clone();
+        if !meta.set_jumper_part(strip, terminal, part)? {
+            return Ok(());
+        }
+        if let Some(id) = part {
+            self.ensure_part(id)?;
+        }
+        self.checkpoint();
+        self.project.meta.jumpers = meta.jumpers;
         Ok(())
     }
 
@@ -2994,6 +2998,26 @@ pub(crate) mod tests {
         assert!(o.project.pages[page].wires.iter().all(|w| w.spec.section.is_none()));
         assert!(o.undo() && o.undo() && o.undo());
         assert!(o.project.pages[page].wires.iter().all(|w| w.spec.is_empty()));
+    }
+
+    #[test]
+    fn a_jumper_gets_a_part_from_the_library_as_one_undo_step() {
+        let (_tmp, mut o) = project();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        assert!(o.set_jumper_part(&x1, "9", Some("example.ex-tb-2-5")).is_err());
+        assert!(o.set_jumper_part(&x1, "1", Some("no.such.part")).is_err());
+        assert_eq!(o.project.meta.jumpers[0].part, None);
+        o.set_jumper_part(&x1, "2", Some("example.ex-tb-2-5")).unwrap();
+        assert_eq!(o.project.meta.jumpers[0].part.as_deref(), Some("example.ex-tb-2-5"));
+        assert!(o.parts.contains_key("example.ex-tb-2-5"), "loaded for the reports");
+        o.save().unwrap();
+        let back = Open::load(&o.dir).unwrap();
+        assert!(back.parts.contains_key("example.ex-tb-2-5"), "loaded again on opening");
+        o.set_jumper_part(&x1, "1", None).unwrap();
+        assert_eq!(o.project.meta.jumpers[0].part, None);
+        assert!(o.undo());
+        assert_eq!(o.project.meta.jumpers[0].part.as_deref(), Some("example.ex-tb-2-5"));
     }
 
     #[test]

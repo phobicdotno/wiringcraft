@@ -172,6 +172,7 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
                     open.remove_from_jumper(&strip, &number);
                 }
             });
+            jumper_part(ui, open, &strip, &number, &tag);
         }
     } else {
         let numbers: Vec<String> = terms.into_iter().map(|(_, n, _)| n).collect();
@@ -191,6 +192,62 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
                 ui.weak(format!("No jumper: {why}"));
             }
         }
+    }
+}
+
+/// The part of the jumper that holds terminal `number` of `strip`: pick one from the project's
+/// and the libraries' parts, or none.
+fn jumper_part(ui: &mut egui::Ui, open: &mut Open, strip: &DeviceTag, number: &str, tag: &DeviceTag) {
+    let current = open.project.meta.jumper_of(tag).and_then(|j| j.part.clone());
+    let label = current.as_ref().map_or_else(
+        || "none".to_owned(),
+        |id| {
+            open.part_library
+                .iter()
+                .find(|(p, _)| p == id)
+                .map_or(id.clone(), |(_, l)| l.clone())
+        },
+    );
+    let search_id = ui.id().with("jumper part search");
+    let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
+    let mut pick: Option<Option<String>> = None;
+    ui.horizontal(|ui| {
+        ui.label("Jumper part");
+        egui::ComboBox::from_id_salt("jumper part")
+            .width(ui.available_width().min(200.0))
+            .selected_text(label)
+            .height(320.0)
+            .show_ui(ui, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut search).hint_text("Search parts"));
+                if ui
+                    .selectable_label(current.is_none(), RichText::new("none").italics())
+                    .clicked()
+                {
+                    pick = Some(None);
+                }
+                let q = search.to_lowercase();
+                for (id, l) in &open.part_library {
+                    if !q.is_empty() && !id.to_lowercase().contains(&q) && !l.to_lowercase().contains(&q) {
+                        continue;
+                    }
+                    if ui
+                        .selectable_label(current.as_deref() == Some(id.as_str()), l)
+                        .on_hover_text(id)
+                        .clicked()
+                    {
+                        pick = Some(Some(id.clone()));
+                    }
+                }
+            });
+    });
+    ui.data_mut(|d| d.insert_temp(search_id, search));
+    let error_id = ui.id().with("jumper part error");
+    if let Some(choice) = pick {
+        let result = open.set_jumper_part(strip, number, choice.as_deref()).err();
+        ui.data_mut(|d| d.insert_temp(error_id, result));
+    }
+    if let Some(Some(e)) = ui.data(|d| d.get_temp::<Option<String>>(error_id)) {
+        ui.label(RichText::new(e).color(Theme::of(ui.ctx()).error).small());
     }
 }
 

@@ -54,7 +54,7 @@ pub const CONFIGURATOR_COLUMNS: [&str; 19] = [
 /// - `Terminal` rows in strip order (natural order of the terminal numbers), with the
 ///   terminal's part, its level on a multi-level terminal, and the cross-section and colour of
 ///   the wires on its upper (pin 1) and lower (pin 2) side.
-/// - `Jumper` rows: the terminals each jumper joins.
+/// - `Jumper` rows: the terminals each jumper joins, with the jumper's part when it has one.
 /// - `Accessory` rows: the strip device's own part and accessories (end plates, end stops,
 ///   marker carriers) and each terminal's accessories, with their quantities.
 ///
@@ -173,12 +173,20 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
             .filter(|j| j.strip == strip_tag)
             .enumerate()
         {
-            rows.push(Row {
+            let mut r = Row {
                 description: format!("{}-way jumper", j.terminals.len()),
                 quantity: "1".into(),
                 connects: j.terminals.join(", "),
                 ..row(format!("{strip}/J{}", n + 1), "Jumper")
-            });
+            };
+            if let Some(part) = &j.part {
+                let way = std::mem::take(&mut r.description);
+                r.set_part(i, part);
+                if r.description.is_empty() {
+                    r.description = way;
+                }
+            }
+            rows.push(r);
         }
 
         // The strip device's own parts first (unless terminals are drawn as the strip device

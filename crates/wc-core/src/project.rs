@@ -172,6 +172,10 @@ pub struct Jumper {
     pub strip: DeviceTag,
     /// Terminal numbers on the strip, in strip order, e.g. `["3", "4", "5"]`. At least two.
     pub terminals: Vec<String>,
+    /// The jumper's part (article), e.g. a WAGO 2002-402 2-way jumper: counted in the parts
+    /// list and written in the WAGO configurator export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
 }
 
 /// The next automatic terminal number after `last`, which it advances; `None` past the largest.
@@ -483,6 +487,17 @@ impl ProjectMeta {
     /// them become one. Refused when fewer than two different terminals result, or when a
     /// terminal cannot be the last level of a tag of the strip (`1.2` would be two levels).
     pub fn add_jumper(&mut self, strip: &DeviceTag, terminals: &[String]) -> Result<(), String> {
+        self.add_jumper_with(strip, terminals, None)
+    }
+
+    /// Like [`ProjectMeta::add_jumper`], with the jumper's part. Without one, a jumper it takes
+    /// in gives its part (the first that has one, in strip order).
+    fn add_jumper_with(
+        &mut self,
+        strip: &DeviceTag,
+        terminals: &[String],
+        mut part: Option<String>,
+    ) -> Result<(), String> {
         let mut set: Vec<String> = Vec::new();
         for t in terminals.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
             let mut tag = strip.clone();
@@ -503,6 +518,9 @@ impl ProjectMeta {
         let mut kept = Vec::new();
         for j in std::mem::take(&mut self.jumpers) {
             if &j.strip == strip && j.terminals.iter().any(|t| set.contains(t)) {
+                if part.is_none() {
+                    part = j.part;
+                }
                 for t in j.terminals {
                     if !set.contains(&t) {
                         set.push(t);
@@ -518,6 +536,7 @@ impl ProjectMeta {
         kept.push(Jumper {
             strip: strip.clone(),
             terminals: set,
+            part,
         });
         kept.sort_by(|a, b| {
             a.strip.to_string().cmp(&b.strip.to_string()).then_with(|| {
@@ -613,11 +632,27 @@ impl ProjectMeta {
             }
             // Jumpers that now share a terminal become one. A number that cannot be a terminal
             // of the strip is refused there; the jumper is then kept as it was, not dropped.
-            if self.add_jumper(&strip, &terminals).is_err() {
+            if self.add_jumper_with(&strip, &terminals, j.part.clone()).is_err() {
                 self.jumpers.push(j.clone());
             }
         }
         self.jumpers != old
+    }
+
+    /// Give the jumper that holds `terminal` of `strip` a part, or none. Returns whether that
+    /// changed anything; `Err` when the terminal is in no jumper.
+    pub fn set_jumper_part(&mut self, strip: &DeviceTag, terminal: &str, part: Option<&str>) -> Result<bool, String> {
+        let j = self
+            .jumpers
+            .iter_mut()
+            .find(|j| &j.strip == strip && j.terminals.iter().any(|t| t == terminal))
+            .ok_or_else(|| format!("no jumper of {strip} has terminal {terminal}"))?;
+        let part = part.map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned);
+        if j.part == part {
+            return Ok(false);
+        }
+        j.part = part;
+        Ok(true)
     }
 
     /// The jumper a terminal (`-X1.4`) is in, if any.
@@ -1042,11 +1077,12 @@ impl Project {
             .collect()
     }
 
-    /// Every part id used by any device.
+    /// Every part id used by any device or jumper.
     pub fn used_parts(&self) -> std::collections::BTreeSet<String> {
         self.devices
             .values()
             .flat_map(|d| d.all_parts().into_iter().map(|(p, _)| p.to_owned()))
+            .chain(self.meta.jumpers.iter().filter_map(|j| j.part.clone()))
             .collect()
     }
 
@@ -1327,6 +1363,50 @@ mod tests {
         assert!(!m.remove_from_jumper(&x2, "1"));
         let plain = toml::to_string(&ProjectMeta::new("t"))?;
         assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
+    fn a_jumper_keeps_its_part_through_merges_renames_and_saving() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&["1", "2"]))?;
+        assert!(
+            m.set_jumper_part(&x1, "9", Some("wago.2002-402")).is_err(),
+            "no jumper there"
+        );
+        assert!(m.set_jumper_part(&x1, "2", Some("wago.2002-402"))?);
+        assert!(!m.set_jumper_part(&x1, "1", Some("wago.2002-402"))?, "already so");
+        // Saved with the part; a file without one still reads.
+        let text = toml::to_string(&m)?;
+        assert!(text.contains("part = \"wago.2002-402\""), "{text}");
+        assert_eq!(toml::from_str::<ProjectMeta>(&text)?.jumpers, m.jumpers);
+        let old: ProjectMeta =
+            toml::from_str("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = [\"1\", \"2\"]\n")?;
+        assert_eq!(old.jumpers[0].part, None);
+        // Extended by another jumper: the part stays.
+        m.add_jumper(&x1, &s(&["2", "3"]))?;
+        assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-402"));
+        // Its terminal renumbered: the part stays.
+        let key = |id: &str| ("p".to_owned(), id.to_owned());
+        let before: TerminalNumbers = [("a", "1"), ("b", "2"), ("c", "3")]
+            .iter()
+            .map(|(id, n)| (key(id), (x1.clone(), (*n).to_owned())))
+            .collect();
+        let after: TerminalNumbers = [("a", "7"), ("b", "2"), ("c", "3")]
+            .iter()
+            .map(|(id, n)| (key(id), (x1.clone(), (*n).to_owned())))
+            .collect();
+        assert!(m.follow_terminals(&before, &after));
+        assert_eq!(m.jumpers[0].terminals, s(&["2", "3", "7"]));
+        assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-402"));
+        let mut p = Project::new("t");
+        p.meta = m.clone();
+        assert!(p.used_parts().contains("wago.2002-402"));
+        // Cleared with none (or an empty text).
+        assert!(m.set_jumper_part(&x1, "3", Some(" "))?);
+        assert_eq!(m.jumpers[0].part, None);
         Ok(())
     }
 
