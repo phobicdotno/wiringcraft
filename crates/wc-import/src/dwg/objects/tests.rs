@@ -242,27 +242,14 @@ impl Obj {
     fn encode(&self) -> Vec<u8> {
         let mut w = W::default();
         match self.version {
-            Version::R2007 => {
-                // As 2004, with the texts at the end of the data, before the size in bits says
-                // it ends.
+            Version::R2004 | Version::R2007 => {
                 w.bs(self.kind);
                 let rl_at = w.0.len();
                 w.rl(0).h(0, self.handle).append(&self.data);
-                self.string_stream(&mut w);
-                let size = w.0.len() as u32;
-                let mut rl = W::default();
-                rl.rl(size);
-                w.0.splice(rl_at..rl_at + 32, rl.0);
-                w.append(&self.handles);
-                let bytes = w.bytes();
-                let mut out = ms(bytes.len());
-                out.extend(bytes);
-                out
-            }
-            Version::R2004 => {
-                w.bs(self.kind);
-                let rl_at = w.0.len();
-                w.rl(0).h(0, self.handle).append(&self.data);
+                // 2007 ends the data with the texts, inside the size in bits.
+                if self.version == Version::R2007 {
+                    self.string_stream(&mut w);
+                }
                 let size = w.0.len() as u32;
                 let mut rl = W::default();
                 rl.rl(size);
@@ -322,6 +309,8 @@ struct Head {
     /// With `extras`, the true colour also names a colour-book colour (0x4000), whose handle
     /// comes before the layer's.
     book: bool,
+    /// The shadow flags (2007 on), which have no handle.
+    shadow: u8,
 }
 
 fn head(owner: Option<u64>) -> Head {
@@ -331,6 +320,7 @@ fn head(owner: Option<u64>) -> Head {
         invisible: false,
         extras: false,
         book: false,
+        shadow: 0,
     }
 }
 
@@ -361,7 +351,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
         .bb(if h.extras { 3 } else { 0 });
     // Material and shadow flags from 2007 on, visual styles from 2010 on.
     if v != Version::R2004 {
-        d.bb(if h.extras { 3 } else { 0 }).rc(0);
+        d.bb(if h.extras { 3 } else { 0 }).rc(h.shadow);
     }
     if v == Version::R2010 {
         d.b(false).b(h.extras).b(false);
@@ -1304,6 +1294,66 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
             Some(&1),
             "only the one without its block: {:?}",
             d.skipped
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn shadow_flags_have_no_handle() -> TestResult {
+    // The specification gives entities shadow flags (an RC, 2007 on) but no shadow handle: with
+    // every flag set, the material and plot style handles and an INSERT's block still line up.
+    for v in [Version::R2007, Version::R2010] {
+        let mut objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            entry(v, BLOCK_HEADER, 0x100, "B"),
+            line(v, 0x200, head(Some(0x100)), (0.0, 0.0), (5.0, 0.0)),
+        ];
+        let shadowed = Head {
+            extras: true,
+            shadow: 3,
+            ..head(None)
+        };
+        let mut i = entity(v, 7, 0x201, shadowed);
+        i.data.bd3((0.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+        i.handles.h(5, 0x100);
+        objs.push(i);
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(
+            has_line(&d.model, Point::new(0.0, 0.0), Point::new(5.0, 0.0)),
+            "{v:?}: {:?} {:?}",
+            d.model,
+            d.damaged
+        );
+        assert!(d.damaged.is_empty(), "{v:?}: {:?}", d.damaged);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_field_missing_before_the_texts_does_not_read_into_them() -> TestResult {
+    for v in [Version::R2007, Version::R2010] {
+        let mut objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        ];
+        // An ATTRIB without its last field, the lock position flag: the data ends where the
+        // texts start, so the flag is missing rather than taken from the texts.
+        let mut a = entity(v, 2, 0x300, head(None));
+        text_data_with(&mut a, (0.0, 0.0), "value", 2.5, 0.0, Some(1));
+        if v == Version::R2010 {
+            a.data.rc(0);
+        }
+        a.text("TAG");
+        a.data.bs(0).rc(0);
+        objs.push(a);
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{v:?}: {:?}", d.skipped);
+        assert!(
+            d.damaged.iter().any(|m| m.contains("ends too early")),
+            "{v:?}: {:?}",
+            d.damaged
         );
     }
     Ok(())

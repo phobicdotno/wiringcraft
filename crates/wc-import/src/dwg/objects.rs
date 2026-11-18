@@ -274,12 +274,17 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     if end > total || end < head.pos() {
         return Err(bad("an object's data size is out of range"));
     }
-    let mut data = Bits::new(bytes, head.pos(), end);
-    let handle = data.h()?.1;
-    let strings = match version {
-        Version::R2004 => None,
+    // From 2007 on the texts and their size and flag end the data: the other fields stop
+    // where they start.
+    let (data_end, strings) = match version {
+        Version::R2004 => (end, None),
         Version::R2007 | Version::R2010 => string_stream(bytes, end)?,
     };
+    if data_end < head.pos() {
+        return Err(bad("an object's texts overlap its type"));
+    }
+    let mut data = Bits::new(bytes, head.pos(), data_end);
+    let handle = data.h()?.1;
     Ok(Object {
         version,
         kind,
@@ -291,14 +296,15 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
 }
 
 /// The string stream of a 2007 or 2010 object whose data ends at bit `end`: a flag in the last
-/// bit, a size before it (in one or two 16-bit parts), and the texts before that.
-fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>> {
+/// bit, a size before it (in one or two 16-bit parts), and the texts before that. Also returns
+/// where the other fields end: where the texts start, or at the flag when there are none.
+fn string_stream(bytes: &[u8], end: usize) -> Result<(usize, Option<Bits<'_>>)> {
     let all = Bits::new(bytes, 0, end);
     let Some(flag_at) = end.checked_sub(1) else {
-        return Ok(None);
+        return Ok((0, None));
     };
     if !all.bit_at(flag_at)? {
-        return Ok(None);
+        return Ok((flag_at, None));
     }
     let cut = || bad("an object's texts are cut off");
     let mut at = flag_at.checked_sub(16).ok_or_else(cut)?;
@@ -309,7 +315,7 @@ fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>> {
         size = (size & 0x7FFF) | (hi << 15);
     }
     let start = at.checked_sub(size).ok_or_else(cut)?;
-    Ok(Some(Bits::new(bytes, start, at)))
+    Ok((start, Some(Bits::new(bytes, start, at))))
 }
 
 /// Where an entity belongs.
