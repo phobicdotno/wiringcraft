@@ -28,6 +28,20 @@ From `crates/wc-import`:
 | SolidWorks Electrical archives (`.tewzip`) | `swe` | Projects. Content Portal parts also arrive as `.tewzip`; `import swe-library` reads their parts, cable types and symbol blocks (blocks drawn from their DWG files in the archive, #230; a block without one is a box with its connection points). |
 | Plain zip | `archive` | Opens the container and imports PDF, DXF and AutomationML entries inside; `.kicad_sym` entries go through the KiCad importer into the folder given with `--lib` (listed with a warning without it). CSV entries are told apart by their header, like the single-file commands: a device and an address column make a PLC address list, applied to the project's devices after the pages (as `import plc-csv`); an order/part number column makes a parts list, imported into `--lib` (as `import parts-csv`; listed with a warning without it). A CSV that is neither is listed with a warning. Other entries are listed, not imported. |
 
+In the app, **File → Import** (and the ribbon's Import tab) runs the same project and parts
+imports as `wiringcraft import`, through the same code: EPLAN project (`.elk` or a zip of it),
+SolidWorks Electrical project (`.tewzip`) and libraries, AutomationML, a DWG drawing onto the
+current page, PDF pages, a project archive, and parts from EDZ, BMEcat and CSV. Each opens the
+system file picker filtered to the format's extensions. Parts imports first ask for the library
+folder, like Import symbols: the project's own `library/` (added to the project's libraries
+once parts are in it), one of its other library folders, or another folder picked with the
+folder picker. Messages that name a command line option are worded for the app. Changes not saved yet are saved first, the imported pages and devices come
+in as one undo step, and the import's report and warnings are shown when it is done. New pages
+are numbered from the CLI's default first page, or after the project's highest page number when
+that is higher. The app imports the first project of a SolidWorks archive with its own page
+numbers and no symbol map, and an archive's KiCad libraries and parts lists are listed, not
+imported; use the CLI for `--pick`, `--symbol-map`, `--first-page` and `--lib` there.
+
 In the app, **Library → Import symbols…** takes DXF, SVG, `.kicad_sym` and `.elmt` files together,
 each read by its extension, and writes them into one of the project's library folders. The
 project's own folder, `library/` in the project, comes first and is added to the project's

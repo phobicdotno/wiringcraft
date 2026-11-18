@@ -14,6 +14,7 @@ pub mod kicad;
 pub mod pdf;
 pub mod qet;
 pub mod raster;
+pub mod run;
 pub mod svg;
 pub mod swe;
 pub mod wago;

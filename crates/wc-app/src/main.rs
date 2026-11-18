@@ -13,6 +13,7 @@ mod feedback;
 mod find_window;
 mod icons;
 mod import_symbols;
+mod imports;
 mod panel_view;
 mod panels;
 mod prefs;
@@ -125,6 +126,13 @@ enum Dialog {
     /// Macros to insert.
     Macros(Vec<state::MacroEntry>),
     /// Library, Import symbols: the library folders to import into and the one chosen.
+    /// Parts import: the library folder to write into, then the file.
+    ImportParts {
+        kind: imports::Kind,
+        targets: Vec<import_symbols::ImportTarget>,
+        /// An index into `targets`; one past the end is another folder, picked after the file.
+        chosen: usize,
+    },
     ImportSymbols {
         targets: Vec<import_symbols::ImportTarget>,
         chosen: usize,
@@ -188,6 +196,9 @@ enum Pending {
     Export(Export),
     Marking(wc_report::MarkingOptions),
     ReportCsv(wc_report::Kind),
+    /// File > Import; for parts, the library folder picked in the dialog (none: ask with the
+    /// folder picker).
+    Import(imports::Kind, Option<import_symbols::ImportTarget>),
     /// The WAGO configurator's article list to read back.
     WagoList,
 }
@@ -470,9 +481,13 @@ impl App {
             }
             return;
         }
+        if let Pending::Import(kind, target) = p {
+            self.import(kind, target);
+            return;
+        }
         let Some(open) = self.open.as_mut() else { return };
         match p {
-            Pending::Open => {}
+            Pending::Open | Pending::Import(..) => {}
             Pending::SaveAs => {
                 let parent = open
                     .dir
@@ -598,6 +613,58 @@ impl App {
                 };
             }
         }
+    }
+
+    /// File > Import: pick the file (and, for parts, the library folder), then run the import
+    /// the CLI runs and show what it said.
+    fn import(&mut self, kind: imports::Kind, target: Option<import_symbols::ImportTarget>) {
+        if self.share.active() {
+            self.dialog = Some(Dialog::Message(
+                "Imports are not available in a shared session: leave the session, import, and share again.".to_owned(),
+            ));
+            return;
+        }
+        if self.assistant.command_running() {
+            self.dialog = Some(Dialog::Message(
+                "The assistant is running a command on the project; import when it is done.".to_owned(),
+            ));
+            return;
+        }
+        let Some(open) = self.open.as_mut() else { return };
+        let file = match pick_open(kind.title(), &open.dir, kind.filter()) {
+            Picked::Path(f) => f,
+            Picked::Failed(e) => {
+                self.dialog = Some(Dialog::Message(format!("{e}\n\nNothing was imported.")));
+                return;
+            }
+            Picked::Cancelled => return,
+        };
+        let lib = if let Some(t) = target.as_ref().filter(|_| kind.needs_library()) {
+            Some(t.root.clone())
+        } else if kind.needs_library() {
+            let start = open.dir.display().to_string();
+            match pick_folder("Library folder for the imported parts", &start) {
+                Picked::Path(d) => Some(d),
+                Picked::Failed(e) => {
+                    self.dialog = Some(Dialog::Message(format!("{e}\n\nNothing was imported.")));
+                    return;
+                }
+                Picked::Cancelled => return,
+            }
+        } else {
+            None
+        };
+        let (done, msg) = imports::import(open, kind, &file, lib.as_deref(), self.ed.page);
+        // The project's own folder is listed first once parts are in it, as for symbols.
+        if done && let Some(source) = target.and_then(|t| t.declare) {
+            open.checkpoint();
+            open.project.meta.libraries.insert(0, source);
+            open.dirty = true;
+            open.refresh_library();
+        }
+        applog::info(&format!("import {kind:?} {}", file.display()));
+        self.prune_selection();
+        self.dialog = Some(Dialog::Message(msg));
     }
 
     fn run(&mut self, a: Action) {
@@ -985,6 +1052,22 @@ impl App {
             }
             Action::InsertMacro => self.dialog = Some(Dialog::Macros(open.macros())),
             Action::ExportDrawings => self.pending = Some(Pending::Export(Export::Drawings)),
+            a if imports::Kind::of(a).is_some() => {
+                if let Some(kind) = imports::Kind::of(a) {
+                    if kind.needs_library()
+                        && let Ok(lib) = wc_library::Library::open(&open.dir, &open.project)
+                    {
+                        self.dialog = Some(Dialog::ImportParts {
+                            kind,
+                            targets: library_targets(&lib, open),
+                            chosen: 0,
+                        });
+                    } else {
+                        // Without the project's library list the folder picker asks instead.
+                        self.pending = Some(Pending::Import(kind, None));
+                    }
+                }
+            }
             Action::ExportAml => self.pending = Some(Pending::Export(Export::Aml)),
             Action::ExportWagoMarking => {
                 let strip = self.ed.marking_strip.take();
@@ -1047,17 +1130,7 @@ impl App {
             Action::ImportSymbols => match wc_library::Library::open(&open.dir, &open.project) {
                 Ok(lib) => {
                     self.dialog = Some(Dialog::ImportSymbols {
-                        targets: import_symbols::targets(
-                            &open.dir,
-                            folder_targets(&lib, open),
-                            &open
-                                .project
-                                .meta
-                                .libraries
-                                .iter()
-                                .map(|l| l.name.clone())
-                                .collect::<Vec<_>>(),
-                        ),
+                        targets: library_targets(&lib, open),
                         chosen: 0,
                         replace: false,
                     });
@@ -1183,6 +1256,7 @@ impl App {
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
             Dialog::ImportSymbols { .. } => "Import symbols",
+            Dialog::ImportParts { .. } => "Import parts",
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
@@ -2153,6 +2227,31 @@ impl App {
                         }
                     });
                 }
+                Dialog::ImportParts { kind, targets, chosen } => {
+                    ui.label(kind.title());
+                    ui.horizontal(|ui| {
+                        ui.label("Library folder");
+                        let other = "Another folder…".to_owned();
+                        let shown = |k: usize| targets.get(k).map_or_else(|| other.clone(), |t| t.label());
+                        egui::ComboBox::from_id_salt("import_parts_lib")
+                            .selected_text(shown(*chosen))
+                            .show_ui(ui, |ui| {
+                                for k in 0..=targets.len() {
+                                    ui.selectable_value(chosen, k, shown(k));
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Choose the file and import…").clicked() {
+                            let pending = Pending::Import(*kind, targets.get(*chosen).cloned());
+                            then = Some(Box::new(move |app: &mut App| app.pending = Some(pending)));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::ImportSymbols {
                     targets,
                     chosen,
@@ -2535,6 +2634,13 @@ fn main_viewport() -> egui::ViewportBuilder {
 /// first is its own). Only folders: a git source is a cache that the next sync overwrites. Each
 /// source is paired with its declaration by position (`Library::open` keeps the order), so a git
 /// source sharing a folder's name is never offered.
+/// Where imported symbols or parts can go: the project's own library folder first, then its
+/// other library folders ([`import_symbols::targets`]).
+fn library_targets(lib: &wc_library::Library, open: &Open) -> Vec<import_symbols::ImportTarget> {
+    let taken: Vec<String> = open.project.meta.libraries.iter().map(|l| l.name.clone()).collect();
+    import_symbols::targets(&open.dir, folder_targets(lib, open), &taken)
+}
+
 fn folder_targets(lib: &wc_library::Library, open: &Open) -> Vec<symbol_editor::Target> {
     lib.sources
         .iter()
