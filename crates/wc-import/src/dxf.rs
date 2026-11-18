@@ -302,7 +302,9 @@ fn shapes(
 ) {
     if depth > MAX_NESTING {
         // Block nesting this deep is either a cycle or not worth drawing; say what is left out.
-        *skipped.entry(TOO_DEEP.to_owned()).or_default() += ents.len();
+        if !ents.is_empty() {
+            *skipped.entry(TOO_DEEP.to_owned()).or_default() += ents.len();
+        }
         return;
     }
     let p = |x: f64, y: f64| {
@@ -1025,6 +1027,11 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
         .map(|(kind, n)| {
             if kind == OVER_LIMIT {
                 format!("{n} entities not drawn: the drawing expands to more than {MAX_DRAWN} entities")
+            } else if kind == TOO_DEEP {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!(
+                    "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
+                )
             } else if kind == HATCH_UNFILLED {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
@@ -1921,16 +1928,24 @@ mod tests {
 
     #[test]
     fn a_dimension_past_the_nesting_limit_is_counted() -> Result<()> {
-        // Blocks B0 .. B8 each insert the next; B9 holds a dimension of *D1.
+        // B0 .. B6 each insert the next; B7, at the deepest level drawn, holds a dimension whose
+        // block would be one level deeper. An empty block at the limit counts nothing.
         let mut blocks = String::new();
-        for b in 0..9 {
+        for b in 0..7 {
             blocks += &format!("0\nBLOCK\n2\nB{b}\n0\nINSERT\n2\nB{}\n0\nENDBLK\n", b + 1);
         }
-        blocks += "0\nBLOCK\n2\nB9\n0\nDIMENSION\n2\n*D1\n0\nENDBLK\n";
+        blocks += "0\nBLOCK\n2\nB7\n0\nDIMENSION\n2\n*D1\n0\nINSERT\n2\nEMPTY\n0\nENDBLK\n";
         blocks += "0\nBLOCK\n2\n*D1\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
+        blocks += "0\nBLOCK\n2\nEMPTY\n0\nENDBLK\n";
         let (g, skipped) = drawn("0\nINSERT\n2\nB0\n", &blocks)?;
         assert!(g.is_empty(), "{g:?}");
-        assert!(skipped.get(TOO_DEEP).is_some_and(|n| *n > 0), "{skipped:?}");
+        assert_eq!(skipped.get(TOO_DEEP), Some(&1), "{skipped:?}");
+        assert!(!skipped.contains_key("DIMENSION"), "{skipped:?}");
+        let warnings = skipped_warnings(skipped);
+        assert_eq!(
+            warnings,
+            ["1 entity not drawn: in blocks nested more than 8 deep (or inserting themselves)"]
+        );
         Ok(())
     }
 }
