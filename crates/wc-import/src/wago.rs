@@ -188,21 +188,28 @@ impl Candidates {
         (out, warnings)
     }
 
-    /// Make sure the project in `dir` holds part `id`: a library part is taken (copied and
-    /// locked) from the one library it was read from.
+    /// Make sure the project in `dir` holds part `id`: a library part is copied into the
+    /// project and locked as it was read here, the copy its article was matched on (not a
+    /// fresh read, which may have changed since).
     pub fn take(&self, dir: &Path, project: &mut Project, id: &str) -> std::result::Result<(), String> {
         if self.project.contains_key(id) || project.lock.parts.contains_key(id) {
             return Ok(());
         }
-        let Some(source) = self.sources.get(id).and_then(|&n| project.meta.libraries.get(n)) else {
+        let (Some(part), Some(source)) = (
+            self.library.get(id),
+            self.sources.get(id).and_then(|&n| project.meta.libraries.get(n)),
+        ) else {
             return Err(format!("no library has part {id}"));
         };
-        let mut one = project.clone();
-        one.meta.libraries = vec![source.clone()];
-        let lib = wc_library::Library::open(dir, &one).map_err(|e| e.to_string())?;
-        wc_library::take(dir, project, &lib, ItemKind::Part, id)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        store::write_vendored_part(dir, part).map_err(|e| e.to_string())?;
+        project.lock.parts.insert(
+            id.to_owned(),
+            wc_core::lock::LockEntry {
+                source: source.name.clone(),
+                hash: part.hash(),
+            },
+        );
+        Ok(())
     }
 
     /// Every part, the project's copy first for an id both have.
@@ -968,6 +975,36 @@ mod tests {
             "{warnings:?}"
         );
         assert!(c.library.contains_key("wago.2002-1201"), "{c:?}");
+    }
+
+    #[test]
+    fn a_part_is_taken_as_it_was_matched_even_when_the_library_changed_since() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        let mut p = store::create(&dir, "Test").unwrap();
+        let lib = tmp.path().join("lib");
+        let (_, matched) = part("wago.2002-1201", "WAGO", "2002-1201");
+        wc_library::write_part(&lib, &matched).unwrap();
+        p.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "wago".into(),
+            kind: "folder".into(),
+            location: lib.to_string_lossy().into_owned(),
+            reference: None,
+        });
+        let (c, warnings) = Candidates::load(&dir, &p);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // The library file changes after the article was matched.
+        let (_, changed) = part("wago.2002-1201", "WAGO", "9999-0000");
+        wc_library::write_part(&lib, &changed).unwrap();
+        c.take(&dir, &mut p, "wago.2002-1201").unwrap();
+        let taken = store::read_vendored_part(&dir, "wago.2002-1201").unwrap();
+        assert_eq!(taken.order_number, "2002-1201");
+        let entry = &p.lock.parts["wago.2002-1201"];
+        assert_eq!(
+            (entry.source.as_str(), entry.hash.as_str()),
+            ("wago", matched.hash().as_str())
+        );
+        assert!(c.take(&dir, &mut p, "no.such").is_err());
     }
 
     #[test]
