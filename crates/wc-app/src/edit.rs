@@ -341,46 +341,73 @@ impl Open {
 
     /// Replace free drawing `index` on `page` with `new`, a shape of the same kind with other
     /// values (a circle's centre and radius, an arc's radius and angles, a polyline closed or
-    /// open), as one undo step. Refused (false) for another kind, a value that is not a number,
-    /// a radius that is not above zero, a polyline closed with fewer than three points, or no
-    /// change. Arc angles are kept between 0 and 360 degrees; an opened polyline is no longer
-    /// filled (only a closed one can be).
-    pub fn set_shape(&mut self, page: usize, index: usize, new: Shape) -> bool {
+    /// open), as one undo step: `Ok(true)`. `Ok(false)` when nothing changes. Refused with the
+    /// reason for another kind, a value that is not a number, a radius that is not above zero,
+    /// an arc with no sweep, or a polyline closed with fewer than three points. An arc angle
+    /// that is changed is kept between 0 and 360 degrees (one left as it was is kept as stored);
+    /// an opened polyline is no longer filled (only a closed one can be).
+    pub fn set_shape(&mut self, page: usize, index: usize, new: Shape) -> Result<bool, &'static str> {
         let Some(old) = self.project.pages.get(page).and_then(|p| p.graphics.get(index)) else {
-            return false;
+            return Err("The drawing is no longer there.");
         };
         if std::mem::discriminant(old) != std::mem::discriminant(&new) {
-            return false;
+            return Err("The drawing is no longer of this kind.");
         }
         let mut new = new;
-        match &mut new {
-            Shape::Circle { center, radius, .. } => {
-                if !(center.x.is_finite() && center.y.is_finite() && radius.is_finite() && *radius > 0.0) {
-                    return false;
+        match (&mut new, old) {
+            (Shape::Circle { center, radius, .. }, _) => {
+                if !(center.x.is_finite() && center.y.is_finite() && radius.is_finite()) {
+                    return Err("Enter a number.");
+                }
+                if *radius <= 0.0 {
+                    return Err("The radius must be above zero.");
                 }
             }
-            Shape::Arc {
-                center,
-                radius,
-                start,
-                end,
-            } => {
+            (
+                Shape::Arc {
+                    center,
+                    radius,
+                    start,
+                    end,
+                },
+                old,
+            ) => {
                 if ![center.x, center.y, *radius, *start, *end]
                     .iter()
                     .all(|v| v.is_finite())
-                    || *radius <= 0.0
                 {
-                    return false;
+                    return Err("Enter a number.");
                 }
-                *start = start.rem_euclid(360.0);
-                *end = end.rem_euclid(360.0);
-                if start == end {
-                    return false;
+                if *radius <= 0.0 {
+                    return Err("The radius must be above zero.");
+                }
+                let Shape::Arc {
+                    start: old_start,
+                    end: old_end,
+                    ..
+                } = *old
+                else {
+                    return Err("The drawing is no longer of this kind.");
+                };
+                // Within a full turn; a remainder rounded up to 360 is 0 (as -1e-14 is).
+                let turn = |a: f64| {
+                    let a = a.rem_euclid(360.0);
+                    if a >= 360.0 { 0.0 } else { a }
+                };
+                let moved = (*start != old_start, *end != old_end);
+                if moved.0 {
+                    *start = turn(*start);
+                }
+                if moved.1 {
+                    *end = turn(*end);
+                }
+                if (moved.0 || moved.1) && turn(*start) == turn(*end) {
+                    return Err("The start and end angles must differ.");
                 }
             }
-            Shape::Polyline { points, closed, filled } => {
+            (Shape::Polyline { points, closed, filled }, _) => {
                 if *closed && points.len() < 3 {
-                    return false;
+                    return Err("A polyline needs three points or more to close.");
                 }
                 if !*closed {
                     *filled = false;
@@ -389,13 +416,13 @@ impl Open {
             _ => {}
         }
         if *old == new {
-            return false;
+            return Ok(false);
         }
         self.checkpoint();
         if let Some(g) = self.project.pages.get_mut(page).and_then(|p| p.graphics.get_mut(index)) {
             *g = new;
         }
-        true
+        Ok(true)
     }
 
     /// Move the selection by `d`. The caller takes the undo checkpoint (once per drag).
@@ -839,9 +866,10 @@ mod tests {
             radius: 7.5,
             filled: false,
         };
-        assert!(o.set_shape(page, n, bigger.clone()));
+        assert_eq!(o.set_shape(page, n, bigger.clone()), Ok(true));
         assert_eq!(at(&o, 0), bigger);
-        // No radius at all, another kind, or the same values: refused, nothing changes.
+        // No radius at all or another kind: refused with a reason; the same values: no change.
+        assert_eq!(o.set_shape(page, n, bigger.clone()), Ok(false));
         for bad in [
             Shape::Circle {
                 center: Point::new(110.0, 105.0),
@@ -854,23 +882,25 @@ mod tests {
                 filled: false,
             },
             arc.clone(),
-            bigger.clone(),
         ] {
-            assert!(!o.set_shape(page, n, bad));
+            assert!(o.set_shape(page, n, bad).is_err());
         }
         assert_eq!(at(&o, 0), bigger);
 
         // An arc: angles past a full turn are kept between 0 and 360.
-        assert!(o.set_shape(
-            page,
-            n + 1,
-            Shape::Arc {
-                center: Point::new(150.0, 100.0),
-                radius: 12.0,
-                start: -90.0,
-                end: 450.0,
-            }
-        ));
+        assert_eq!(
+            o.set_shape(
+                page,
+                n + 1,
+                Shape::Arc {
+                    center: Point::new(150.0, 100.0),
+                    radius: 12.0,
+                    start: -90.0,
+                    end: 450.0,
+                }
+            ),
+            Ok(true)
+        );
         assert_eq!(
             at(&o, 1),
             Shape::Arc {
@@ -885,15 +915,18 @@ mod tests {
         let Shape::Polyline { points, .. } = line.clone() else {
             unreachable!()
         };
-        assert!(o.set_shape(
-            page,
-            n + 2,
-            Shape::Polyline {
-                points: points.clone(),
-                closed: false,
-                filled: true,
-            }
-        ));
+        assert_eq!(
+            o.set_shape(
+                page,
+                n + 2,
+                Shape::Polyline {
+                    points: points.clone(),
+                    closed: false,
+                    filled: true,
+                }
+            ),
+            Ok(true)
+        );
         assert_eq!(
             at(&o, 2),
             Shape::Polyline {
@@ -902,15 +935,18 @@ mod tests {
                 filled: false,
             }
         );
-        assert!(!o.set_shape(
-            page,
-            n + 2,
-            Shape::Polyline {
-                points: points[..2].to_vec(),
-                closed: true,
-                filled: false,
-            }
-        ));
+        assert!(
+            o.set_shape(
+                page,
+                n + 2,
+                Shape::Polyline {
+                    points: points[..2].to_vec(),
+                    closed: true,
+                    filled: false,
+                }
+            )
+            .is_err()
+        );
 
         // Each change is one undo step, newest first.
         assert!(o.undo());
@@ -919,6 +955,82 @@ mod tests {
         assert_eq!(at(&o, 1), arc);
         assert!(o.undo());
         assert_eq!(at(&o, 0), circle);
+    }
+
+    #[test]
+    fn an_arc_keeps_the_angles_left_alone_and_refuses_a_sweep_rounded_to_nothing() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let n = o.project.pages[page].graphics.len();
+        // Stored past a full turn (read from a file): drawn sweeping more than 360 degrees.
+        let wide = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 8.0,
+            start: 0.0,
+            end: 450.0,
+        };
+        o.add_graphic(page, wide).unwrap();
+        // Only the radius changes: the angles stay as stored.
+        assert_eq!(
+            o.set_shape(
+                page,
+                n,
+                Shape::Arc {
+                    center: Point::new(150.0, 100.0),
+                    radius: 9.0,
+                    start: 0.0,
+                    end: 450.0,
+                }
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            o.project.pages[page].graphics[n],
+            Shape::Arc {
+                center: Point::new(150.0, 100.0),
+                radius: 9.0,
+                start: 0.0,
+                end: 450.0,
+            }
+        );
+        // A start a hair below 0 rounds to a full turn: the same as an end of 0, no sweep.
+        let before = o.project.clone();
+        assert!(
+            o.set_shape(
+                page,
+                n,
+                Shape::Arc {
+                    center: Point::new(150.0, 100.0),
+                    radius: 9.0,
+                    start: -1e-14,
+                    end: 0.0,
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(o.project, before);
+        // Rounded to a full turn with a sweep left: kept as 0, not 360.
+        assert_eq!(
+            o.set_shape(
+                page,
+                n,
+                Shape::Arc {
+                    center: Point::new(150.0, 100.0),
+                    radius: 9.0,
+                    start: -1e-14,
+                    end: 90.0,
+                }
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            o.project.pages[page].graphics[n],
+            Shape::Arc {
+                center: Point::new(150.0, 100.0),
+                radius: 9.0,
+                start: 0.0,
+                end: 90.0,
+            }
+        );
     }
 
     #[test]
