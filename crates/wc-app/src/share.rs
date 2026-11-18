@@ -196,12 +196,99 @@ pub fn outgoing(
     out
 }
 
+/// Page `base` as both this window (`local`) and the session (`auth`) changed it: the session's
+/// page with the local changes on top, or `None` when the two touched the same thing. Symbols
+/// and wires are matched by id, title-block fields by name; the title, size, underlay, the
+/// overview and cover marks, and the free graphics (which carry no id) each count as one thing.
+/// A wire that ends at a symbol the other side took away is a clash too. The page number is
+/// left as the session's.
+fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
+    let mut page = auth.clone();
+    page.title = pick(&base.title, &auth.title, &local.title)?;
+    page.size = pick(&base.size, &auth.size, &local.size)?;
+    page.underlay = pick(&base.underlay, &auth.underlay, &local.underlay)?;
+    page.overview = pick(&base.overview, &auth.overview, &local.overview)?;
+    page.cover = pick(&base.cover, &auth.cover, &local.cover)?;
+    page.graphics = pick(&base.graphics, &auth.graphics, &local.graphics)?;
+    let names: std::collections::BTreeSet<&String> =
+        [base, auth, local].iter().flat_map(|p| p.title_block.keys()).collect();
+    let mut title_block = BTreeMap::new();
+    for name in names {
+        let field = |p: &Page| p.title_block.get(name).cloned();
+        if let Some(value) = pick(&field(base), &field(auth), &field(local))? {
+            title_block.insert(name.clone(), value);
+        }
+    }
+    page.title_block = title_block;
+    page.symbols = merge_by_id(&base.symbols, &auth.symbols, &local.symbols, |s| &s.id)?;
+    page.wires = merge_by_id(&base.wires, &auth.wires, &local.wires, |w| &w.id)?;
+    let symbols: std::collections::BTreeSet<&str> = page.symbols.iter().map(|s| s.id.as_str()).collect();
+    let dangling = page
+        .wires
+        .iter()
+        .flat_map(|w| [&w.from, &w.to])
+        .any(|end| matches!(end, wc_core::Endpoint::Pin { item, .. } if !symbols.contains(item.as_str())));
+    (!dangling).then_some(page)
+}
+
+/// One thing in a three-way merge: the side that changed it, or `None` when both changed it
+/// differently.
+fn pick<T: PartialEq + Clone>(base: &T, auth: &T, local: &T) -> Option<T> {
+    if local == base || local == auth {
+        Some(auth.clone())
+    } else if auth == base {
+        Some(local.clone())
+    } else {
+        None
+    }
+}
+
+/// A three-way merge of items with ids: the session's items in its order, each with this
+/// window's change when only this window changed it, then the items only this window added.
+/// `None` when an item was changed on both sides differently, removed on one side and changed
+/// on the other, or added on both with different content.
+fn merge_by_id<T: PartialEq + Clone>(
+    base: &[T],
+    auth: &[T],
+    local: &[T],
+    id: impl Fn(&T) -> &String,
+) -> Option<Vec<T>> {
+    let find = |items: &[T], key: &String| items.iter().find(|x| id(x) == key).cloned();
+    let mut out = Vec::new();
+    for a in auth {
+        match (find(base, id(a)), find(local, id(a))) {
+            (Some(b), Some(l)) => out.push(pick(&b, a, &l)?),
+            // Removed here: gone, unless the session changed it.
+            (Some(b), None) if b == *a => {}
+            (Some(_), None) => return None,
+            // Added on both sides.
+            (None, Some(l)) if l == *a => out.push(a.clone()),
+            (None, Some(_)) => return None,
+            (None, None) => out.push(a.clone()),
+        }
+    }
+    for l in local {
+        if find(auth, id(l)).is_some() {
+            continue;
+        }
+        match find(base, id(l)) {
+            // Added here.
+            None => out.push(l.clone()),
+            // The session removed it; changed here too is a clash.
+            Some(b) if b != *l => return None,
+            Some(_) => {}
+        }
+    }
+    Some(out)
+}
+
 /// Parts changed both in this window and in the session since the last sync (`base`): the
 /// session's version wins on them, in `local` and in `base`, so what is sent next is not built
 /// on content an undo has just put back. A part is a page (also one removed on either side),
 /// the project properties, one device, the comments of one page, or one panel; a change to a
-/// part the session did not touch is kept and sent as usual. Returns the parts whose local
-/// change was dropped, named for the person.
+/// part the session did not touch is kept and sent as usual. On a page both changed, the local
+/// change is put on top of the session's page when the two touched different things
+/// ([`merge_page`]). Returns the parts whose local change was dropped, named for the person.
 pub fn yield_to_session(local: &mut Project, base: &mut Project, auth: &Project) -> Vec<String> {
     let mut dropped = Vec::new();
 
@@ -237,6 +324,22 @@ pub fn yield_to_session(local: &mut Project, base: &mut Project, auth: &Project)
             None => a != Some(b),
         };
         if !session_changed || !differs(l) {
+            continue;
+        }
+        if let (Some(a), Some(l)) = (a, l)
+            && let Some(mut merged) = merge_page(b, a, l)
+        {
+            // A number only this window changed goes out on its own, as a renumbering.
+            merged.number = if l.number != b.number {
+                l.number.clone()
+            } else {
+                a.number.clone()
+            };
+            let a = a.clone();
+            if let Some(p) = local.page_mut(&id) {
+                *p = merged;
+            }
+            base.pages[pos] = a;
             continue;
         }
         dropped.push(format!("page {}", b.number));

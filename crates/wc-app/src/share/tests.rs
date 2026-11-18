@@ -7,7 +7,7 @@ use wc_share::{Change, Journal};
 
 use super::*;
 
-type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// A journal the test can look at.
 #[derive(Clone, Default)]
@@ -643,6 +643,140 @@ fn a_page_changed_on_both_sides_takes_the_sessions_version() {
     assert_eq!(local.pages[1].title, "Mine", "kept");
 }
 
+fn symbol(id: &str, x: f64) -> wc_core::PlacedSymbol {
+    wc_core::PlacedSymbol {
+        id: id.into(),
+        symbol: "coil".into(),
+        at: wc_core::geom::Point::new(x, 0.0),
+        rotation: Default::default(),
+        mirror: false,
+        tag: None,
+    }
+}
+
+fn wire(id: &str, from: &str, to: &str) -> Result<wc_core::Wire, serde_json::Error> {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "from": { "item": from, "pin": "A1" },
+        "to": { "item": to, "pin": "A2" },
+    }))
+}
+
+/// A page with symbols s1 and s2 and a wire between them, as base, session and window copies.
+fn three_copies() -> TestResult<(Project, Project, Project)> {
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols = vec![symbol("s1", 0.0), symbol("s2", 50.0)];
+    page.wires = vec![wire("w1", "s1", "s2")?];
+    base.pages.push(page);
+    Ok((base.clone(), base.clone(), base))
+}
+
+#[test]
+fn an_edit_on_a_page_the_undo_restored_is_kept_where_they_do_not_overlap() -> TestResult {
+    let (mut base, mut auth, mut local) = three_copies()?;
+    // The undo moved s1 back and took the title back.
+    auth.pages[0].symbols[0].at.x = -10.0;
+    auth.pages[0].title = "Restored".into();
+    // Meanwhile this window added s3 with a wire to s2, moved s2, removed w1, added a text and
+    // a title-block field.
+    let page = &mut local.pages[0];
+    page.symbols[1].at.x = 60.0;
+    page.symbols.push(symbol("s3", 100.0));
+    page.wires = vec![wire("w2", "s2", "s3")?];
+    page.graphics.push(wc_core::geom::Shape::Line {
+        a: wc_core::geom::Point::new(0.0, 0.0),
+        b: wc_core::geom::Point::new(1.0, 1.0),
+    });
+    page.title_block.insert("revision".into(), "B".into());
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert!(lost.is_empty(), "{lost:?}");
+    let page = &local.pages[0];
+    assert_eq!(page.title, "Restored", "the undo's own parts are restored");
+    let xs: Vec<(&str, f64)> = page.symbols.iter().map(|s| (s.id.as_str(), s.at.x)).collect();
+    assert_eq!(xs, [("s1", -10.0), ("s2", 60.0), ("s3", 100.0)]);
+    assert_eq!(page.wires.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["w2"]);
+    assert_eq!(page.graphics.len(), 1);
+    assert_eq!(page.title_block.get("revision").map(String::as_str), Some("B"));
+    assert_eq!(base.pages[0], auth.pages[0], "the kept edit still goes out");
+    Ok(())
+}
+
+#[test]
+fn an_element_changed_on_both_sides_takes_the_sessions_page() -> TestResult {
+    let (mut base, mut auth, mut local) = three_copies()?;
+    auth.pages[0].symbols[0].at.x = -10.0;
+    local.pages[0].symbols[0].at.x = 20.0;
+    local.pages[0].symbols.push(symbol("s3", 100.0));
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert_eq!(lost, ["page 1"]);
+    assert_eq!(local.pages[0], auth.pages[0]);
+    assert_eq!(base.pages[0], auth.pages[0]);
+    Ok(())
+}
+
+#[test]
+fn removed_on_one_side_and_changed_on_the_other_is_a_clash() -> TestResult {
+    // The session removed s2; this window moved it.
+    let (mut base, mut auth, mut local) = three_copies()?;
+    auth.pages[0].symbols.retain(|s| s.id != "s2");
+    local.pages[0].symbols[1].at.x = 70.0;
+    assert_eq!(yield_to_session(&mut local, &mut base, &auth), ["page 1"]);
+    assert_eq!(local.pages[0], auth.pages[0]);
+    // The session moved s2; this window removed it.
+    let (mut base, mut auth, mut local) = three_copies()?;
+    auth.pages[0].symbols[1].at.x = 70.0;
+    local.pages[0].symbols.retain(|s| s.id != "s2");
+    assert_eq!(yield_to_session(&mut local, &mut base, &auth), ["page 1"]);
+    // Removed on both sides is no clash.
+    let (mut base, mut auth, mut local) = three_copies()?;
+    auth.pages[0].wires.clear();
+    local.pages[0].wires.clear();
+    local.pages[0].symbols.push(symbol("s3", 100.0));
+    assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
+    assert!(local.pages[0].wires.is_empty());
+    assert_eq!(local.pages[0].symbols.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn a_new_wire_to_a_symbol_the_session_removed_is_a_clash() -> TestResult {
+    let (mut base, mut auth, mut local) = three_copies()?;
+    // The undo took s2 and its wire away; this window drew a new wire to s2.
+    auth.pages[0].symbols.retain(|s| s.id != "s2");
+    auth.pages[0].wires.clear();
+    local.pages[0].wires.push(wire("w2", "s1", "s2")?);
+    assert_eq!(yield_to_session(&mut local, &mut base, &auth), ["page 1"]);
+    assert_eq!(local.pages[0], auth.pages[0], "no wire left hanging");
+    Ok(())
+}
+
+#[test]
+fn a_session_wire_to_a_symbol_removed_here_is_a_clash() -> TestResult {
+    let (mut base, mut auth, mut local) = three_copies()?;
+    // This window removed s2 and its wire; the session drew a new wire to s2.
+    local.pages[0].symbols.retain(|s| s.id != "s2");
+    local.pages[0].wires.clear();
+    auth.pages[0].wires.push(wire("w2", "s1", "s2")?);
+    assert_eq!(yield_to_session(&mut local, &mut base, &auth), ["page 1"]);
+    assert_eq!(local.pages[0], auth.pages[0], "no wire left hanging");
+    Ok(())
+}
+
+#[test]
+fn a_kept_edit_keeps_a_number_only_this_window_changed() -> TestResult {
+    let (mut base, mut auth, mut local) = three_copies()?;
+    auth.pages[0].title = "Restored".into();
+    local.pages[0].number = "9".into();
+    local.pages[0].symbols.push(symbol("s3", 100.0));
+    assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
+    assert_eq!(local.pages[0].number, "9", "the renumbering made here stays");
+    assert_eq!(base.pages[0].number, "1", "and still goes out on its own");
+    assert_eq!(local.pages[0].symbols.len(), 3);
+    assert_eq!(local.pages[0].title, "Restored");
+    Ok(())
+}
+
 #[test]
 fn every_part_changed_on_both_sides_takes_the_sessions_version() -> TestResult {
     let k1 = wc_core::DeviceTag::parse("-K1")?;
@@ -887,6 +1021,37 @@ fn a_guest_sends_nothing_until_its_undo_has_come_back() -> TestResult {
         "the stale page never went out"
     );
     assert!(g.take_notes().iter().any(|n| n.contains("was not kept")));
+    Ok(())
+}
+
+#[test]
+fn a_guest_edit_right_after_its_undo_is_kept_when_the_undo_did_not_touch_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "First".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    // Before the undo's result is in, a text is added to the same page.
+    let text = wc_core::geom::Shape::Line {
+        a: wc_core::geom::Point::new(5.0, 5.0),
+        b: wc_core::geom::Point::new(9.0, 9.0),
+    };
+    guest_open
+        .project
+        .page_mut("p0003")
+        .ok_or("no page")?
+        .graphics
+        .push(text.clone());
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    for open in [&host_open, &guest_open] {
+        let page = open.project.page("p0003").ok_or("no page")?;
+        assert_eq!(page.title, "Valves", "the undo is kept");
+        assert!(page.graphics.contains(&text), "and so is the new line");
+    }
+    assert!(!g.take_notes().iter().any(|n| n.contains("was not kept")));
     Ok(())
 }
 
