@@ -23,6 +23,13 @@ pub struct PanelState {
     potential: String,
     text: String,
     text_height: f64,
+    /// Edit buffer for a free drawing's own values (a circle's centre and radius, an arc's
+    /// radius and angles, a polyline closed or open).
+    shape: Option<Shape>,
+    /// A field of `shape` is being typed in or dragged: the buffer is not read again from the
+    /// drawing meanwhile. Otherwise it is, each frame, so a drawing moved on the canvas is not
+    /// put back by the next value set here.
+    shape_busy: bool,
     cable: String,
     core: String,
     cable_error: Option<String>,
@@ -589,9 +596,62 @@ fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
                 ps.text = text.clone();
                 ps.text_height = *height;
             }
+            ps.shape_busy = false;
         }
         None => {}
     }
+}
+
+/// The fields of a circle, an arc or a polyline (`drawing`, read into the edit buffer unless a
+/// field is in use): true when a value was
+/// committed (a drag ended, a typed value left its field, the closed box was ticked).
+fn shape_rows(ui: &mut egui::Ui, ps: &mut PanelState, drawing: &Shape) -> bool {
+    if !ps.shape_busy {
+        ps.shape = Some(drawing.clone());
+    }
+    let mut done = false;
+    let mut busy = false;
+    let mut num = |ui: &mut egui::Ui, label: &str, v: &mut f64, suffix: &str| {
+        ui.label(label);
+        let r = ui.add(egui::DragValue::new(v).speed(0.1).max_decimals(2).suffix(suffix));
+        ui.end_row();
+        done |= r.drag_stopped() || r.lost_focus();
+        busy |= r.has_focus() || r.dragged();
+    };
+    match ps.shape.as_mut() {
+        Some(Shape::Circle { center, radius, .. }) => {
+            num(ui, "Centre X", &mut center.x, " mm");
+            num(ui, "Centre Y", &mut center.y, " mm");
+            num(ui, "Radius", radius, " mm");
+        }
+        Some(Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        }) => {
+            num(ui, "Centre X", &mut center.x, " mm");
+            num(ui, "Centre Y", &mut center.y, " mm");
+            num(ui, "Radius", radius, " mm");
+            num(ui, "Start angle", start, "°");
+            num(ui, "End angle", end, "°");
+        }
+        Some(Shape::Polyline { points, closed, .. }) => {
+            ui.label("Points");
+            ui.label(points.len().to_string());
+            ui.end_row();
+            ui.label("Closed");
+            let can = *closed || points.len() >= 3;
+            let r = ui
+                .add_enabled(can, egui::Checkbox::without_text(closed))
+                .on_disabled_hover_text("A polyline needs three points or more to close.");
+            ui.end_row();
+            done |= r.changed();
+        }
+        _ => {}
+    }
+    ps.shape_busy = busy && !done;
+    done
 }
 
 fn committed(r: &egui::Response) -> bool {
@@ -839,7 +899,15 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                         ui.label("Position");
                         ui.label(format!("{:.1}, {:.1} mm", at.x, at.y));
                         ui.end_row();
-                    } else {
+                    } else if shape_rows(ui, ps, &g) {
+                        if let Some(new) = ps.shape.clone()
+                            && !open.set_shape(page_idx, i, new)
+                        {
+                            // Refused (no radius, too few points to close): show the drawing's
+                            // own values again.
+                            ps.loaded_for = None;
+                        }
+                    } else if !matches!(g, Shape::Circle { .. } | Shape::Arc { .. } | Shape::Polyline { .. }) {
                         let (a, b) = g.bounds();
                         ui.label("From");
                         ui.label(format!("{:.1}, {:.1} mm", a.x, a.y));

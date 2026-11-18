@@ -339,6 +339,65 @@ impl Open {
         true
     }
 
+    /// Replace free drawing `index` on `page` with `new`, a shape of the same kind with other
+    /// values (a circle's centre and radius, an arc's radius and angles, a polyline closed or
+    /// open), as one undo step. Refused (false) for another kind, a value that is not a number,
+    /// a radius that is not above zero, a polyline closed with fewer than three points, or no
+    /// change. Arc angles are kept between 0 and 360 degrees; an opened polyline is no longer
+    /// filled (only a closed one can be).
+    pub fn set_shape(&mut self, page: usize, index: usize, new: Shape) -> bool {
+        let Some(old) = self.project.pages.get(page).and_then(|p| p.graphics.get(index)) else {
+            return false;
+        };
+        if std::mem::discriminant(old) != std::mem::discriminant(&new) {
+            return false;
+        }
+        let mut new = new;
+        match &mut new {
+            Shape::Circle { center, radius, .. } => {
+                if !(center.x.is_finite() && center.y.is_finite() && radius.is_finite() && *radius > 0.0) {
+                    return false;
+                }
+            }
+            Shape::Arc {
+                center,
+                radius,
+                start,
+                end,
+            } => {
+                if ![center.x, center.y, *radius, *start, *end]
+                    .iter()
+                    .all(|v| v.is_finite())
+                    || *radius <= 0.0
+                {
+                    return false;
+                }
+                *start = start.rem_euclid(360.0);
+                *end = end.rem_euclid(360.0);
+                if start == end {
+                    return false;
+                }
+            }
+            Shape::Polyline { points, closed, filled } => {
+                if *closed && points.len() < 3 {
+                    return false;
+                }
+                if !*closed {
+                    *filled = false;
+                }
+            }
+            _ => {}
+        }
+        if *old == new {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(g) = self.project.pages.get_mut(page).and_then(|p| p.graphics.get_mut(index)) {
+            *g = new;
+        }
+        true
+    }
+
     /// Move the selection by `d`. The caller takes the undo checkpoint (once per drag).
     pub fn move_by(&mut self, page: usize, sel: &[Selection], d: Point) {
         let (syms, wires) = ids(sel);
@@ -747,6 +806,119 @@ mod tests {
         let found = o.macros();
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|m| m.error.is_some()));
+    }
+
+    #[test]
+    fn a_circle_an_arc_and_a_polyline_take_new_values_as_one_undo_step_each() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let n = o.project.pages[page].graphics.len();
+        let circle = Shape::Circle {
+            center: Point::new(100.0, 100.0),
+            radius: 5.0,
+            filled: false,
+        };
+        let arc = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 8.0,
+            start: 0.0,
+            end: 90.0,
+        };
+        let line = Shape::Polyline {
+            points: vec![Point::new(0.0, 0.0), Point::new(10.0, 0.0), Point::new(10.0, 10.0)],
+            closed: true,
+            filled: true,
+        };
+        for g in [&circle, &arc, &line] {
+            o.add_graphic(page, g.clone()).unwrap();
+        }
+        let at = |o: &Open, i: usize| o.project.pages[page].graphics[n + i].clone();
+
+        // A circle: a new centre and radius.
+        let bigger = Shape::Circle {
+            center: Point::new(110.0, 105.0),
+            radius: 7.5,
+            filled: false,
+        };
+        assert!(o.set_shape(page, n, bigger.clone()));
+        assert_eq!(at(&o, 0), bigger);
+        // No radius at all, another kind, or the same values: refused, nothing changes.
+        for bad in [
+            Shape::Circle {
+                center: Point::new(110.0, 105.0),
+                radius: 0.0,
+                filled: false,
+            },
+            Shape::Circle {
+                center: Point::new(f64::NAN, 105.0),
+                radius: 3.0,
+                filled: false,
+            },
+            arc.clone(),
+            bigger.clone(),
+        ] {
+            assert!(!o.set_shape(page, n, bad));
+        }
+        assert_eq!(at(&o, 0), bigger);
+
+        // An arc: angles past a full turn are kept between 0 and 360.
+        assert!(o.set_shape(
+            page,
+            n + 1,
+            Shape::Arc {
+                center: Point::new(150.0, 100.0),
+                radius: 12.0,
+                start: -90.0,
+                end: 450.0,
+            }
+        ));
+        assert_eq!(
+            at(&o, 1),
+            Shape::Arc {
+                center: Point::new(150.0, 100.0),
+                radius: 12.0,
+                start: 270.0,
+                end: 90.0,
+            }
+        );
+
+        // A polyline opened is no longer filled; two points cannot be closed.
+        let Shape::Polyline { points, .. } = line.clone() else {
+            unreachable!()
+        };
+        assert!(o.set_shape(
+            page,
+            n + 2,
+            Shape::Polyline {
+                points: points.clone(),
+                closed: false,
+                filled: true,
+            }
+        ));
+        assert_eq!(
+            at(&o, 2),
+            Shape::Polyline {
+                points: points.clone(),
+                closed: false,
+                filled: false,
+            }
+        );
+        assert!(!o.set_shape(
+            page,
+            n + 2,
+            Shape::Polyline {
+                points: points[..2].to_vec(),
+                closed: true,
+                filled: false,
+            }
+        ));
+
+        // Each change is one undo step, newest first.
+        assert!(o.undo());
+        assert_eq!(at(&o, 2), line);
+        assert!(o.undo());
+        assert_eq!(at(&o, 1), arc);
+        assert!(o.undo());
+        assert_eq!(at(&o, 0), circle);
     }
 
     #[test]
