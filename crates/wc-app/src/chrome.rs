@@ -27,6 +27,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::NewProject),
             Some(Action::Open),
             Some(Action::Save),
+            Some(Action::SaveAs),
             None,
             Some(Action::ProjectProps),
             None,
@@ -541,11 +542,20 @@ mod tests {
         let start = RIBBON[0].1;
         let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
         let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
-        let (narrow, wide) = (1210.0, 1220.0);
-        let at = ribbon_icons(0, narrow)[undo].center();
-        // In the wider window another button sits where Undo was.
-        let moved = ribbon_icons(0, wide);
-        let there = moved.iter().position(|r| r.contains(at)).map(|i| order[i]);
+        // Two window widths 10 points apart where the groups wrap differently, so that in the
+        // wider window another button sits where Undo was (found, so new buttons do not break
+        // the test).
+        let other_at = |narrow: f32| {
+            let at = ribbon_icons(0, narrow).get(undo)?.center();
+            let moved = ribbon_icons(0, narrow + 10.0);
+            let there = moved.iter().position(|r| r.contains(at)).map(|i| order[i])?;
+            (there != Action::Undo).then_some((narrow, at, there))
+        };
+        let found = (100..250).map(|k| k as f32 * 10.0).find_map(other_at);
+        assert!(found.is_some(), "no width moves the Undo button");
+        let Some((narrow, at, there)) = found else { return };
+        let wide = narrow + 10.0;
+        let there = Some(there);
         assert!(there.is_some_and(|a| a != Action::Undo), "{there:?} at {at:?}");
         let button = |pressed| egui::Event::PointerButton {
             pos: at,

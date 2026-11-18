@@ -1146,6 +1146,44 @@ impl Open {
         Ok(n)
     }
 
+    /// Save the project as a copy in `target`, which must not exist yet or be an empty folder,
+    /// and go on working in the copy. Everything in the project folder is copied (its history
+    /// included), then the changes not saved yet are saved in the copy only, so the original
+    /// stays as it was last saved. Library folders given relative to the project are pointed
+    /// at the same folders from the new place. Returns the folder the copy is in.
+    pub fn save_as(&mut self, target: &Path) -> Result<PathBuf, String> {
+        let target = crate::prefs::absolute(target)?;
+        let from = self.dir.clone();
+        if target.starts_with(&from) {
+            return Err(format!(
+                "{} is inside the project folder; pick a place outside it.",
+                target.display()
+            ));
+        }
+        if target.exists() {
+            let empty = std::fs::read_dir(&target)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false);
+            if !target.is_dir() || !empty {
+                return Err(format!(
+                    "{} already exists; pick a new name or an empty folder.",
+                    target.display()
+                ));
+            }
+        }
+        copy_dir(&from, &target).map_err(|e| format!("Copying to {} failed: {e}", target.display()))?;
+        for lib in &mut self.project.meta.libraries {
+            if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
+                let at = from.join(&lib.location);
+                lib.location = relative_to(&at, &target).unwrap_or(at).display().to_string();
+                self.dirty = true;
+            }
+        }
+        self.dir = target.clone();
+        self.save()?;
+        Ok(target)
+    }
+
     /// Make sure a library symbol is vendored and pinned before it is placed.
     pub fn ensure_symbol(&mut self, id: &str) -> Result<(), String> {
         if self.symbols.contains_key(id) {
@@ -2189,10 +2227,101 @@ fn restore_file(path: &Path, was: Option<&[u8]>) -> std::io::Result<()> {
     }
 }
 
+/// Copy a folder and everything in it. Links are not followed: a link is left out, so a copy
+/// never reaches outside the folder.
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let dest = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_dir(&entry.path(), &dest)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// `path` as seen from the folder `base`, both full paths: `../library` and the like. `None`
+/// when they share no root (another drive).
+fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    fn normal(p: &Path) -> Vec<Component<'_>> {
+        let mut out: Vec<Component<'_>> = Vec::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir if matches!(out.last(), Some(Component::Normal(_))) => {
+                    out.pop();
+                }
+                c => out.push(c),
+            }
+        }
+        out
+    }
+    let (p, b) = (normal(path), normal(base));
+    let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    if common == 0 {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for _ in common..b.len() {
+        out.push("..");
+    }
+    for c in &p[common..] {
+        out.push(c.as_os_str());
+    }
+    Some(if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_is_made_relative_to_another_folder() {
+        let r = |a: &str, b: &str| relative_to(Path::new(a), Path::new(b));
+        assert_eq!(r("/w/lib", "/w/copy"), Some(PathBuf::from("../lib")));
+        assert_eq!(r("/w/old/../lib", "/w/x/copy"), Some(PathBuf::from("../../lib")));
+        assert_eq!(r("/w/copy/sub", "/w/copy"), Some(PathBuf::from("sub")));
+    }
+
+    #[test]
+    fn save_as_copies_the_project_keeps_the_original_and_points_libraries_at_the_same_folder() {
+        let (tmp, mut o) = project();
+        let from = o.dir.clone();
+        let before = std::fs::read(from.join(store::PROJECT_FILE)).unwrap();
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "shared".into(),
+            kind: "folder".into(),
+            location: "../library".into(),
+            reference: None,
+        });
+        o.project.meta.name = "Changed".into();
+        o.dirty = true;
+        let to = tmp.path().join("copies").join("plant 2");
+        assert_eq!(o.save_as(&to).unwrap(), to);
+        assert_eq!(o.dir, to);
+        assert!(!o.dirty);
+        // The original is as it was last saved; the copy has the change and its library is
+        // the same folder seen from the new place.
+        assert_eq!(std::fs::read(from.join(store::PROJECT_FILE)).unwrap(), before);
+        let copy = Open::load(&to).unwrap();
+        assert_eq!(copy.project.meta.name, "Changed");
+        let lib = copy.project.meta.libraries.iter().find(|l| l.name == "shared").unwrap();
+        assert_eq!(Path::new(&lib.location), Path::new("../../library"));
+        assert_eq!(copy.project.pages.len(), o.project.pages.len());
+        // Not over a folder with something in it, and not inside the project itself.
+        assert!(o.save_as(&from).unwrap_err().contains("already exists"));
+        assert!(o.save_as(&to.join("inner")).unwrap_err().contains("inside the project"));
+    }
     use wc_core::project::LibrarySource;
 
     pub(crate) fn project() -> (tempfile::TempDir, Open) {

@@ -51,7 +51,9 @@ sits on the same block as the terminal before it in the strip. So with `-X1.2` a
 The terminal plan lists each level in its Level column. A `Level` that is not a whole number
 from 1 up is ignored, and the export warns about it with the device, the value and the reason.
 
-The app writes `export/wago-marking.csv`, or `export/wago-marking-<strip>.csv` for one strip.
+The app asks where to save the list, starting at `export/wago-marking.csv`, or
+`export/wago-marking-<strip>.csv` for one strip. When the save dialog cannot open (Linux without a
+desktop portal or zenity) it writes there directly and says so.
 
 ## Not written
 

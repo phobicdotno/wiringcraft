@@ -1626,7 +1626,7 @@ impl App {
                 if let Some(m) = self.take_message() {
                     return Ok(m);
                 }
-                if !before && self.dialog.is_some() {
+                if !before && (self.dialog.is_some() || self.pending.is_some()) {
                     return Ok(format!(
                         "{} opened a dialog on the user's screen for them to fill in.",
                         a.info().label
@@ -2617,6 +2617,7 @@ mod tests {
             share: Default::default(),
             symbol_editor: None,
             find: None,
+            pending: None,
         };
         (tmp, app)
     }
