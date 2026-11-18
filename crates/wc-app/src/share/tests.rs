@@ -1999,6 +1999,41 @@ fn a_picture_picked_here_under_a_session_name_is_kept_and_shared_under_a_name_of
 }
 
 #[test]
+fn a_file_here_under_the_name_of_a_picture_the_session_uses_is_kept_and_not_shared() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // A file of that name is here already, which no change of this copy names.
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    // Then the session's own drawing starts using its picture.
+    let logo = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    host_open.project.meta.logo = logo.clone();
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, mine, "kept");
+    assert_eq!(guest_open.project.meta.logo, logo, "not renamed");
+    assert_eq!(host_open.project.meta.logo, logo);
+    assert_eq!(
+        h.role.as_ref().map(|r| r.pictures().len()),
+        Some(1),
+        "nothing of this copy's was shared"
+    );
+    let notes = g.take_notes();
+    assert!(notes.iter().any(|n| n.contains("differs from your file")), "{notes:?}");
+    Ok(())
+}
+
+#[test]
 fn a_picture_that_could_not_be_written_is_tried_again_only_after_a_while() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {

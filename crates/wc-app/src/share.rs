@@ -2310,6 +2310,12 @@ impl Share {
             base,
             auth,
         );
+        // Pictures this copy's own changes name: a clash among them is a file picked here.
+        let base_uses = used_pictures(base);
+        let named_here: std::collections::BTreeSet<String> = used_pictures(&open.project)
+            .into_iter()
+            .filter(|f| !base_uses.contains(f))
+            .collect();
         let changed = incoming(&mut open.project, auth);
         // The session's versions are what this copy has synced to: an item updated here later
         // differs from them ([`updated_here`]).
@@ -2339,11 +2345,31 @@ impl Share {
             ));
         }
         self.pictures_failed.retain(|_, at| at.elapsed() < ITEM_RETRY_LATER);
-        let skip = self.pictures_failed.keys().cloned().collect();
+        // A clash whose rename waits to be tried again is not compared again meanwhile.
+        let skip = self
+            .pictures_failed
+            .keys()
+            .chain(
+                self.renames_due
+                    .iter()
+                    .filter(|(_, at)| at.elapsed() < ITEM_RETRY_LATER)
+                    .map(|(f, _)| f),
+            )
+            .cloned()
+            .collect();
         let TakenPictures { failed, clashes } = take_pictures(open, role.pictures(), &mut self.pictures_taken, &skip);
         // A picture picked here under a name the session has for another file gets a name of
-        // its own at the next sync, as when the session refuses it.
-        self.clashes = clashes;
+        // its own at the next sync, as when the session refuses it. One only the session's
+        // drawings name is theirs: the file here is kept, but neither renamed nor shared.
+        let (mine, theirs): (Vec<_>, Vec<_>) = clashes.into_iter().partition(|f| named_here.contains(f));
+        self.clashes = mine;
+        for file in theirs {
+            if self.unreadable.insert(format!("clash {file}")) {
+                self.notes.push(format!(
+                    "The session's picture {file} differs from your file of that name; your copy keeps showing your file."
+                ));
+            }
+        }
         let now = std::time::Instant::now();
         for (file, _) in &failed {
             self.pictures_failed.insert(file.clone(), now);
