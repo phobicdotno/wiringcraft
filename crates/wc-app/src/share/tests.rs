@@ -544,8 +544,12 @@ fn pages_nobody_has_open_go_out_together_as_one_change() -> TestResult {
     guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves -K1".into();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
 
-    // The device, the two pages nobody holds and the guest's own page are one change.
-    assert_eq!(log.messages()[before..], ["Change device -K1; Edit 3 pages"]);
+    // The device and the two pages nobody holds are one change; the guest's own page is its
+    // page edit.
+    assert_eq!(
+        log.messages()[before..],
+        ["Change device -K1; Edit 2 pages", "Edit page 3 Valves -K1"]
+    );
     assert!(host_open.project.devices.contains_key(&k1));
     assert_eq!(host_open.project.pages, guest_open.project.pages);
     assert_eq!(
@@ -576,75 +580,6 @@ fn a_change_to_a_free_page_made_before_someone_elses_change_arrived_is_not_kept(
         assert_eq!(cover.title, "Revised", "{who}: the earlier change is kept");
         assert!(cover.cover, "the stale change is not");
     }
-    Ok(())
-}
-
-#[test]
-fn a_tag_renamed_on_your_own_page_and_in_the_device_list_is_one_change() -> TestResult {
-    let tmp = tempfile::tempdir()?;
-    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
-        // A coil on page 3, the page the guest will have open.
-        o.place(2, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
-        Ok(())
-    })?;
-    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-    let before = log.messages().len();
-    let old = guest_open
-        .project
-        .page("p0003")
-        .and_then(|p| p.symbols.first())
-        .and_then(|s| s.tag.clone())
-        .ok_or("the coil has no tag")?;
-    let new = DeviceTag::parse("-K7")?;
-
-    // The guest renames the coil's tag: the device list and its own open page change together.
-    assert!(guest_open.project.rename_device(&old, &new) > 0);
-    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-
-    assert_eq!(log.messages().len(), before + 1, "{:?}", &log.messages()[before..]);
-    assert!(host_open.project.devices.contains_key(&new));
-    assert!(!host_open.project.devices.contains_key(&old));
-    assert_eq!(
-        host_open
-            .project
-            .page("p0003")
-            .and_then(|p| p.symbols.first())
-            .and_then(|s| s.tag.clone()),
-        Some(new)
-    );
-    assert_eq!(host_open.project.pages, guest_open.project.pages);
-    Ok(())
-}
-
-#[test]
-fn a_change_to_your_own_page_and_a_device_is_refused_whole() -> TestResult {
-    let tmp = tempfile::tempdir()?;
-    let k1 = DeviceTag::parse("-K1")?;
-    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
-        o.project.devices.insert(k1.clone(), Device::default());
-        Ok(())
-    })?;
-    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-    let before = log.messages().len();
-
-    // The host describes -K1; before that reaches the guest, the guest changes -K1 too and,
-    // in the same action, the title of the page it has open.
-    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Main contactor".into();
-    h.frame(Some(&mut host_open), Some("p0002".into()), false);
-    guest_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
-    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves -K1".into();
-    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-
-    // The device was stale, so the page change was not made either.
-    assert_eq!(log.messages()[before..], ["Change device -K1"]);
-    assert_eq!(
-        host_open.project.devices.get(&k1).map(|d| d.description.as_str()),
-        Some("Main contactor")
-    );
-    assert_eq!(
-        host_open.project.page("p0003").map(|p| p.title.as_str()),
-        Some("Valves")
-    );
     Ok(())
 }
 
@@ -684,8 +619,7 @@ fn wire_numbering_in_a_session_leaves_pages_others_hold_and_says_so() -> TestRes
     assert!(numbered(&guest_open, "p0002"));
     assert!(!numbered(&host_open, "p0003"), "the guest's page was not touched");
     assert_eq!(host_open.project.pages, guest_open.project.pages);
-    // One numbering run, one change: the cover and the host's own page together.
-    assert_eq!(log.messages()[before..], ["Edit 2 pages"]);
+    assert_eq!(log.messages()[before..], ["Edit page 1 Cover", "Edit page 2 Motor"]);
     Ok(())
 }
 
@@ -1052,8 +986,7 @@ fn a_page_waits_until_the_session_has_the_symbols_it_draws() -> TestResult {
     assert!(host_open.project.lock.symbols.contains_key("wc.contact.no"));
     let messages = log.messages();
     let add = messages.iter().position(|m| m == "Add wc.contact.no to the project");
-    // The placed symbol's device and the page are one change.
-    let edit = messages.iter().position(|m| m.ends_with("Edit page 3 Valves"));
+    let edit = messages.iter().position(|m| m.starts_with("Edit page 3"));
     assert!(add.is_some() && add < edit, "{messages:?}");
     Ok(())
 }

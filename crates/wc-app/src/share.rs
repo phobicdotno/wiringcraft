@@ -186,17 +186,6 @@ pub fn outgoing(
         }
     }
 
-    // The page you have open, changed by the same action as other parts (a tag renamed on it
-    // and in the device list): it goes with them, so the host records the whole action as one
-    // change or refuses all of it. Alone, it stays a page edit.
-    let with_others = !others.is_empty() || out.edits.iter().any(ProjectEdit::batchable);
-    if with_others
-        && let Some(b) = out.page.as_ref().and_then(|p| base.page(&p.id))
-        && let Some(p) = out.page.take()
-    {
-        others_before.push(b.clone());
-        others.push(p);
-    }
     // Last, so the devices the pages name are there before them.
     if !others.is_empty() {
         out.edits.push(ProjectEdit::SetPages {
