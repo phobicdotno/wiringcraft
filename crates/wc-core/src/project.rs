@@ -425,9 +425,18 @@ pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolR
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.page.cmp(&b.page).then(a.x.total_cmp(&b.x)),
         });
+        // Terminals tagged with just the strip are numbered after the largest number, spares
+        // included: a spare's number is taken even though nothing draws it.
+        let spares = project
+            .meta
+            .strip_layout(&strip)
+            .map(|l| l.spares.as_slice())
+            .unwrap_or(&[]);
         let mut next = list
             .iter()
-            .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
+            .filter_map(|t| t.number.as_deref())
+            .chain(spares.iter().map(String::as_str))
+            .filter_map(|n| n.parse::<u64>().ok())
             .max()
             .unwrap_or(0);
         for t in list {
@@ -2415,6 +2424,30 @@ mod tests {
         let current = vec![("1".to_owned(), false), ("S2".to_owned(), false)];
         assert!(p.remove_spare(&x1, "S2", &current));
         assert!(p.devices.contains_key(&s2));
+        Ok(())
+    }
+
+    #[test]
+    fn a_terminal_tagged_with_just_the_strip_never_takes_a_spares_number() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        for (id, tag) in [("t1", "-X1.1"), ("t", "-X1")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "term".into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        p.pages.push(page);
+        p.meta.add_spare(&x1, "2", None, &[("1".to_owned(), false)])?;
+        let role = |id: &str| (id == "term").then_some(SymbolRole::Terminal);
+        let numbers: Vec<String> = terminal_numbers(&p, role).into_values().map(|(_, n)| n).collect();
+        assert!(numbers.contains(&"3".to_owned()), "{numbers:?}");
+        assert!(!numbers.contains(&"2".to_owned()), "{numbers:?}");
         Ok(())
     }
 

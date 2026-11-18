@@ -544,7 +544,9 @@ pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
 ///
 /// Levels are inferred in that order, so moving terminals on the rail never changes a terminal's
 /// level or which block it is in. The strip's spares count only when they have a valid level of
-/// their own, so adding one never splits a block. This is what the terminal plan's Level column
+/// their own, so adding a spare without one never splits a block; a spare with a valid level
+/// joins the number order and can change the blocks (and their markers) like a drawn terminal
+/// with that level would. This is what the terminal plan's Level column
 /// shows; the terminal strip editor shows it too.
 pub fn strip_levels(project: &wc_core::Project, strip: &str, drawn: Vec<String>) -> BTreeMap<String, u32> {
     let mut usual = drawn;
@@ -723,9 +725,20 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
                     .then(a.x.total_cmp(&b.x)),
             }
         });
+        // As wc_core::project::terminal_numbers: a spare's number is taken.
+        let spares = i
+            .project
+            .meta
+            .strips
+            .iter()
+            .find(|l| l.strip.to_string() == strip)
+            .map(|l| l.spares.as_slice())
+            .unwrap_or(&[]);
         let mut next = list
             .iter()
-            .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
+            .filter_map(|t| t.number.as_deref())
+            .chain(spares.iter().map(String::as_str))
+            .filter_map(|n| n.parse::<u64>().ok())
             .max()
             .unwrap_or(0);
         let numbered: Vec<(Term, String)> = list

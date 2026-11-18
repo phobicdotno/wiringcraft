@@ -24,6 +24,9 @@ pub struct StripEditor {
     pub strip: Option<DeviceTag>,
     /// The strip tag typed for a first spare, when the project has no strips yet.
     pub new_strip: String,
+    /// The number typed for that first spare: a draft of its own, so a cancelled new strip
+    /// never ends up in the Add spare field of the strip shown.
+    pub new_spare: String,
     /// True while the user starts another strip with its first spare ("New strip…").
     pub starting: bool,
     /// The number typed for a new spare terminal.
@@ -288,18 +291,20 @@ impl StripEditor {
             );
             ui.label("Spare terminal");
             ui.add(
-                egui::TextEdit::singleline(&mut self.spare)
+                egui::TextEdit::singleline(&mut self.new_spare)
                     .hint_text("number, e.g. 1")
                     .desired_width(80.0),
             );
             add = ui
                 .add_enabled(
-                    !self.new_strip.trim().is_empty() && !self.spare.trim().is_empty(),
+                    !self.new_strip.trim().is_empty() && !self.new_spare.trim().is_empty(),
                     egui::Button::new("Add spare"),
                 )
                 .clicked();
             if another && ui.button("Cancel").clicked() {
                 self.starting = false;
+                self.new_strip.clear();
+                self.new_spare.clear();
                 self.message.clear();
             }
         });
@@ -309,15 +314,23 @@ impl StripEditor {
         self.show_message(ui);
     }
 
-    /// What Add spare does with no strip in the project: start the typed strip with the typed
-    /// spare, and show that strip from the next frame on.
+    /// What Add spare does in the new-strip form: start the typed strip with the typed spare,
+    /// and show that strip from the next frame on. A strip the project has already is refused:
+    /// its spares are added on its own rail.
     fn add_first_spare(&mut self, open: &mut Open) {
         match DeviceTag::parse(self.new_strip.trim()) {
+            Ok(strip) if open.strip_terminals().contains_key(&strip) => {
+                self.message = format!("{strip} is a strip already; pick it in the list to add spares to it");
+            }
             Ok(strip) => {
-                let spare = self.spare.trim().to_owned();
+                let spare = self.new_spare.trim().to_owned();
+                // apply clears the rail's Add spare field on success; this form has its own.
+                let kept = std::mem::take(&mut self.spare);
                 self.apply(open, &strip, Change::AddSpare(spare, None));
+                self.spare = kept;
                 if self.message.is_empty() {
                     self.new_strip.clear();
+                    self.new_spare.clear();
                     self.starting = false;
                     self.pick(strip);
                 }
@@ -452,7 +465,9 @@ fn level_picker(ui: &mut egui::Ui, open: &Open, strip: &DeviceTag, number: &str,
 /// infers for it, marked as such, else – for none.
 fn level_text(own: &str, shown: Option<u32>) -> String {
     match (own.is_empty(), shown) {
-        (false, _) => own.to_owned(),
+        // A value the terminal plan ignores (see wc_report::level_warnings) says so.
+        (false, Some(l)) if own.trim() == l.to_string() => own.to_owned(),
+        (false, _) => format!("{own} (ignored)"),
         (true, Some(l)) => format!("{l} (inferred)"),
         (true, None) => "–".to_owned(),
     }
@@ -592,7 +607,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
         ed.new_strip = "-X5".into();
-        ed.spare = "1".into();
+        ed.new_spare = "1".into();
         let texts = |ed: &mut StripEditor, o: &mut Open| -> Vec<String> {
             ctx.run(egui::RawInput::default(), |ctx| {
                 ed.show(ctx, o);
@@ -707,6 +722,8 @@ mod tests {
         let shown = texts(&mut ed, &mut o);
         assert!(!shown.iter().any(|t| t.contains("(inferred)")), "{shown:?}");
         assert_eq!(level_text("", None), "–");
+        assert_eq!(level_text("2", Some(2)), "2");
+        assert_eq!(level_text("0", None), "0 (ignored)");
 
         // New strip… in the picker opens the first-spare form beside the existing strip.
         ed.starting = true;
@@ -716,9 +733,23 @@ mod tests {
             "{shown:?}"
         );
         assert!(shown.iter().any(|t| t == "Cancel"), "{shown:?}");
-        ed.new_strip = "-X5".into();
-        ed.spare = "50".into();
+        // An existing strip is refused here; the form stays open.
+        ed.new_strip = "-X1".into();
+        ed.new_spare = "9".into();
         ed.add_first_spare(&mut o);
+        assert!(ed.message.contains("already"), "{}", ed.message);
+        assert!(ed.starting);
+        assert!(
+            !o.strip_terminals()
+                .get(&x1)
+                .is_some_and(|r| r.iter().any(|(t, _)| t == "9"))
+        );
+        // The new strip's spare is a draft of its own: the rail's Add spare field keeps its text.
+        ed.spare = "7".into();
+        ed.new_strip = "-X5".into();
+        ed.new_spare = "50".into();
+        ed.add_first_spare(&mut o);
+        assert_eq!(ed.spare, "7");
         assert!(ed.message.is_empty(), "{}", ed.message);
         assert!(!ed.starting);
         let x5 = DeviceTag::parse("-X5")?;
