@@ -137,27 +137,27 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
     let Some(p) = open.project.pages.get(page) else {
         return;
     };
-    let mut terms: Vec<(DeviceTag, String, DeviceTag)> = Vec::new();
+    // Each terminal's strip and number as the terminal plan has them, so a terminal tagged
+    // with only its strip (numbered automatically) is offered the same as a numbered one.
+    let numbers = open.terminal_numbers();
+    let mut terms: Vec<(DeviceTag, String)> = Vec::new();
     for id in ids {
-        let Some(s) = p.symbol(id) else { return };
-        let is_terminal = open
-            .symbols
-            .get(&s.symbol)
-            .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal);
-        let Some(tag) = s.tag.clone().filter(|_| is_terminal) else {
+        if p.symbol(id).is_none() {
+            return;
+        }
+        let Some(term) = numbers.get(&(p.id.clone(), id.clone())) else {
             return;
         };
-        let (strip, Some(n)) = tag.terminal_parts() else { return };
-        terms.push((strip, n, tag));
+        terms.push(term.clone());
     }
-    let Some((strip, number, tag)) = terms.first().cloned() else {
+    let Some((strip, number)) = terms.first().cloned() else {
         return;
     };
-    if terms.iter().any(|(s, _, _)| *s != strip) {
+    if terms.iter().any(|(s, _)| *s != strip) {
         return;
     }
     if terms.len() == 1 {
-        let others = open.project.meta.jumper_of(&tag).map(|j| {
+        let others = jumper_with(open, &strip, &number).map(|j| {
             j.terminals
                 .iter()
                 .filter(|t| **t != number)
@@ -172,10 +172,10 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
                     open.remove_from_jumper(&strip, &number);
                 }
             });
-            jumper_part(ui, open, &strip, &number, &tag);
+            jumper_part(ui, open, &strip, &number);
         }
     } else {
-        let numbers: Vec<String> = terms.into_iter().map(|(_, n, _)| n).collect();
+        let numbers: Vec<String> = terms.into_iter().map(|(_, n)| n).collect();
         // Only offered when it changes something; when it cannot be done, say why.
         match open.jumper_offer(&strip, &numbers) {
             Ok(true) => {
@@ -195,10 +195,19 @@ fn jumper_controls(ui: &mut egui::Ui, open: &mut Open, page: usize, ids: &[Strin
     }
 }
 
+/// The jumper that holds terminal `number` of `strip`.
+fn jumper_with<'a>(open: &'a Open, strip: &DeviceTag, number: &str) -> Option<&'a wc_core::project::Jumper> {
+    open.project
+        .meta
+        .jumpers
+        .iter()
+        .find(|j| j.strip == *strip && j.terminals.iter().any(|t| t == number))
+}
+
 /// The part of the jumper that holds terminal `number` of `strip`: pick one from the project's
 /// and the libraries' parts, or none.
-fn jumper_part(ui: &mut egui::Ui, open: &mut Open, strip: &DeviceTag, number: &str, tag: &DeviceTag) {
-    let current = open.project.meta.jumper_of(tag).and_then(|j| j.part.clone());
+fn jumper_part(ui: &mut egui::Ui, open: &mut Open, strip: &DeviceTag, number: &str) {
+    let current = jumper_with(open, strip, number).and_then(|j| j.part.clone());
     let label = current.as_ref().map_or_else(
         || "none".to_owned(),
         |id| {
@@ -1410,6 +1419,61 @@ fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The texts drawn by one frame of `jumper_controls` for `ids` on page `page`.
+    fn jumper_texts(o: &mut Open, page: usize, ids: &[String]) -> Vec<String> {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| jumper_controls(ui, o, page, ids));
+        });
+        let mut texts = Vec::new();
+        for clipped in out.shapes {
+            if let egui::Shape::Text(t) = clipped.shape {
+                texts.push(t.galley.text().to_owned());
+            }
+        }
+        texts
+    }
+
+    #[test]
+    fn a_terminal_numbered_automatically_has_its_jumper_and_part_controls() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let page = o
+            .project
+            .pages
+            .iter()
+            .position(|p| p.id == "p0002")
+            .ok_or("no page p0002")?;
+        let x1 = DeviceTag::parse("-X1")?;
+        let mut ids = Vec::new();
+        for at in [10.0, 20.0] {
+            let id = o.place(page, "wc.terminal", wc_core::geom::Point::new(at, 20.0))?;
+            let s = o.project.pages[page]
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or("not placed")?;
+            s.tag = Some(x1.clone());
+            ids.push(id);
+        }
+        // Both tagged with only the strip: numbered 1 and 2 by the terminal plan.
+        let texts = jumper_texts(&mut o, page, &ids);
+        assert!(
+            texts.iter().any(|t| t.contains("Jumper these 2 terminals")),
+            "{texts:?}"
+        );
+        o.add_jumper(&x1, &["1".into(), "2".into()])?;
+        o.set_jumper_part(&x1, "2", Some("example.ex-tb-2-5"))?;
+        let texts = jumper_texts(&mut o, page, &ids[..1]);
+        assert!(texts.iter().any(|t| t == "Jumpered with 2"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Jumper part"), "{texts:?}");
+        assert!(
+            texts.iter().all(|t| t != "none"),
+            "the jumper's part is shown: {texts:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn a_half_typed_value_is_dropped_when_the_page_becomes_held() -> Result<(), Box<dyn std::error::Error>> {

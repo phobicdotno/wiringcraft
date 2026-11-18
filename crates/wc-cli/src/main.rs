@@ -2439,21 +2439,15 @@ fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
         })
         .collect();
     let mut parts = vendored_parts(dir, &p);
-    // Accessories are read here too; a part that is used but could not be read is written by
-    // its id, and the warning says why.
-    let used: std::collections::BTreeSet<&str> = p
-        .devices
-        .values()
-        .flat_map(|d| d.all_parts())
-        .map(|(id, _)| id)
-        .collect();
-    for id in used {
-        if parts.contains_key(id) {
+    // Every used part (devices, their accessories and jumpers) that could not be read is
+    // written by its id, and the warning says why.
+    for id in p.used_parts() {
+        if parts.contains_key(&id) {
             continue;
         }
-        match store::read_vendored_part(dir, id) {
+        match store::read_vendored_part(dir, &id) {
             Ok(part) => {
-                parts.insert(id.to_owned(), part);
+                parts.insert(id, part);
             }
             Err(err) => warnings.push(format!(
                 "part {id} could not be read ({err}); its article number is written as the part id"
@@ -4376,6 +4370,20 @@ mod tests {
         let w = done.warnings.iter().find(|w| w.contains("broken.part"));
         assert!(
             w.is_some_and(|w| w.contains("could not be read (")),
+            "{:?}",
+            done.warnings
+        );
+
+        // The same for a jumper's part.
+        p.meta.set_jumper_part(&x1, "1", Some("broken.jumper")).unwrap();
+        store::save(&dir, &p).unwrap();
+        let path = store::vendor_path(&dir, wc_core::lock::ItemKind::Part, "broken.jumper").unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        let done = export_wago_configurator(&dir, &out).unwrap();
+        assert!(
+            done.warnings
+                .iter()
+                .any(|w| w.starts_with("part broken.jumper could not be read (")),
             "{:?}",
             done.warnings
         );

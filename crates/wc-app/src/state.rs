@@ -1601,6 +1601,7 @@ impl Open {
     /// Give the jumper that holds `terminal` of `strip` a part (taken from the library into
     /// the project when needed), or none, as one undo step.
     pub fn set_jumper_part(&mut self, strip: &DeviceTag, terminal: &str, part: Option<&str>) -> Result<(), String> {
+        self.follow_terminals();
         let mut meta = self.project.meta.clone();
         if !meta.set_jumper_part(strip, terminal, part)? {
             return Ok(());
@@ -3248,6 +3249,28 @@ pub(crate) mod tests {
         o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(5.0, 20.0);
         assert!(o.remove_from_jumper(&x1, "4"));
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
+    fn a_jumper_part_set_after_a_move_keeps_the_followed_jumper() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        let (a, _b, _c) = (put(10.0), put(20.0), put(30.0));
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        // Move a past c (b 1, c 2, a 3): the jumper of a and b is now 1-3.
+        o.checkpoint();
+        o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(40.0, 20.0);
+        o.set_jumper_part(&x1, "1", Some("example.ex-tb-2-5")).unwrap();
+        assert_eq!(o.project.meta.jumpers.len(), 1);
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "3"]);
+        assert_eq!(o.project.meta.jumpers[0].part.as_deref(), Some("example.ex-tb-2-5"));
     }
 
     #[test]
