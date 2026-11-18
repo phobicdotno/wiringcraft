@@ -360,8 +360,9 @@ struct Styles {
 }
 
 impl Styles {
+    /// The number format of the cell style `xf`; a cell without a style has style 0.
     fn shown(&self, xf: Option<usize>) -> Shown {
-        xf.and_then(|i| self.by_xf.get(i).copied()).unwrap_or_default()
+        self.by_xf.get(xf.unwrap_or(0)).copied().unwrap_or_default()
     }
 }
 
@@ -378,16 +379,33 @@ fn builtin_format(id: u32) -> Shown {
     }
 }
 
+/// Longest zero-only format padded: Excel's own limit on a format code's length.
+const MAX_PADDING: usize = 255;
+
 /// What a custom format code shows, from its first section (the one for positive numbers).
-/// Quoted text, escaped characters, spacing and fill characters and bracketed colours,
-/// conditions and locales are passed over; an elapsed time such as `[h]:mm` stays a number.
+/// Quoted text, escaped characters, spacing and fill characters and bracketed colours and
+/// locales are passed over. A format with a condition (`[>=1000]…`) picks its section by the
+/// value, which is not followed here: it stays a number, like an elapsed time such as `[h]:mm`.
+/// `m` is a month unless the section also shows hours or seconds, as Excel reads it.
 fn custom_format(code: &str) -> Shown {
     let mut section = String::new();
-    let mut letters = String::new();
+    // The section's own characters, lower case, without quoted or escaped text.
+    let mut bare = String::new();
+    let mut sections = 1;
     let mut chars = code.chars();
     while let Some(c) = chars.next() {
         match c {
-            ';' => break,
+            ';' => {
+                sections += 1;
+                // Later sections only matter for a condition or a zero-only format, both
+                // decided below from the count and the first section.
+                for c in chars.by_ref() {
+                    if c == ';' {
+                        sections += 1;
+                    }
+                }
+                break;
+            }
             '"' => {
                 section.push(c);
                 for q in chars.by_ref() {
@@ -404,7 +422,9 @@ fn custom_format(code: &str) -> Shown {
             '[' => {
                 let inner: String = chars.by_ref().take_while(|&b| b != ']').collect();
                 let lower = inner.to_ascii_lowercase();
-                if !lower.is_empty() && lower.chars().all(|b| matches!(b, 'h' | 'm' | 's')) {
+                let elapsed = !lower.is_empty() && lower.chars().all(|b| matches!(b, 'h' | 'm' | 's'));
+                let condition = lower.starts_with(['<', '>', '=']);
+                if elapsed || condition {
                     return Shown::Plain;
                 }
                 section.push('[');
@@ -413,35 +433,52 @@ fn custom_format(code: &str) -> Shown {
             }
             c => {
                 section.push(c);
-                if c.is_ascii_alphabetic() {
-                    letters.push(c.to_ascii_lowercase());
-                }
+                bare.push(c.to_ascii_lowercase());
             }
         }
     }
-    let date = letters.contains(['y', 'd']);
-    let time = letters.contains(['h', 's']);
-    let seconds = letters.contains('s');
+    let bare = bare.replace("am/pm", "").replace("a/p", "");
+    let time = bare.contains(['h', 's']);
+    let date = bare.contains(['y', 'd']) || (!time && bare.contains('m'));
+    let seconds = bare.contains('s');
     match (date, time) {
         (true, true) => Shown::DateTime { seconds },
         (true, false) => Shown::Date,
         (false, true) => Shown::Time { seconds },
-        _ if !section.is_empty() && section.chars().all(|c| c == '0') => Shown::Padded(section.len()),
+        _ if sections == 1 && (1..=MAX_PADDING).contains(&section.len()) && section.chars().all(|c| c == '0') => {
+            Shown::Padded(section.len())
+        }
         _ => Shown::Plain,
     }
 }
 
-/// The number format of each cell style in `xl/styles.xml`.
+/// A whole-number attribute such as a style or format id: `None` when the element has none,
+/// an error naming the attribute and the parser's reason when it is not a number.
+fn index_attr<T: std::str::FromStr<Err = std::num::ParseIntError>>(e: &BytesStart, name: &[u8]) -> Result<Option<T>> {
+    let Some(v) = attr(e, name)? else { return Ok(None) };
+    v.trim().parse::<T>().map(Some).map_err(|err| {
+        Error::Format(format!(
+            "xlsx: {} {:?} is not a number: {err}",
+            String::from_utf8_lossy(name),
+            crate::printable(&v)
+        ))
+    })
+}
+
+/// The number format of each cell style in `xl/styles.xml`. Custom codes are read from the
+/// style sheet's `numFmts` only: differential formats (`dxfs`, for conditional formatting)
+/// can reuse an id for another code that cell styles never mean.
 fn styles(xml: &str) -> Result<Styles> {
     let mut r = Reader::from_str(xml);
     let mut custom: std::collections::HashMap<u32, Shown> = std::collections::HashMap::new();
     let mut xf_formats: Vec<Option<u32>> = Vec::new();
-    let mut in_cell_xfs = false;
+    let (mut in_num_fmts, mut in_cell_xfs) = (false, false);
     loop {
         match r.read_event().map_err(xml_error)? {
-            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"numFmt" => {
-                let id = attr(&e, b"numFmtId")?.and_then(|v| v.trim().parse::<u32>().ok());
-                if let (Some(id), Some(code)) = (id, attr(&e, b"formatCode")?) {
+            Event::Start(e) if e.local_name().as_ref() == b"numFmts" => in_num_fmts = true,
+            Event::End(e) if e.local_name().as_ref() == b"numFmts" => in_num_fmts = false,
+            Event::Start(e) | Event::Empty(e) if in_num_fmts && e.local_name().as_ref() == b"numFmt" => {
+                if let (Some(id), Some(code)) = (index_attr::<u32>(&e, b"numFmtId")?, attr(&e, b"formatCode")?) {
                     custom.insert(id, custom_format(&code));
                 }
             }
@@ -452,7 +489,7 @@ fn styles(xml: &str) -> Result<Styles> {
                     // Excel allows about 64,000 cell styles; the rest are read as plain numbers.
                     continue;
                 }
-                xf_formats.push(attr(&e, b"numFmtId")?.and_then(|v| v.trim().parse::<u32>().ok()));
+                xf_formats.push(index_attr::<u32>(&e, b"numFmtId")?);
             }
             Event::Eof => break,
             _ => {}
@@ -504,6 +541,9 @@ const MAX_SERIAL: f64 = 2_958_465.0;
 /// numbers the format cannot show (a negative date, a fraction with zero padding), read as
 /// [`number`] gives them.
 fn formatted(v: &str, shown: Shown, date1904: bool) -> String {
+    if shown == Shown::Plain {
+        return number(v);
+    }
     let x = match v.trim().parse::<f64>() {
         Ok(x) if x.is_finite() => x,
         _ => return number(v),
@@ -513,9 +553,10 @@ fn formatted(v: &str, shown: Shown, date1904: bool) -> String {
             return None;
         }
         let mut days = x.floor() as i64;
-        // Excel rounds a time to the nearest second before showing it.
+        // Excel rounds a time to the nearest second before showing it; a date without a time
+        // shows its own day even when the time would round up to midnight.
         let mut secs = ((x - x.floor()) * 86_400.0).round() as i64;
-        if secs >= 86_400 {
+        if secs >= 86_400 && with_time {
             days += 1;
             secs -= 86_400;
         }
@@ -556,9 +597,10 @@ fn formatted(v: &str, shown: Shown, date1904: bool) -> String {
         Shown::Date => date_and_time(false, true, false),
         Shown::DateTime { seconds } => date_and_time(seconds, true, true),
         Shown::Time { seconds } => date_and_time(seconds, false, true),
-        Shown::Padded(width) => (x.fract() == 0.0 && x.abs() < 1e15).then(|| {
-            let digits = format!("{:0width$}", x.abs() as u64);
-            if x < 0.0 { format!("-{digits}") } else { digits }
+        // Whole numbers up to 2^53 convert to an integer without losing a digit.
+        Shown::Padded(width) => (x.fract() == 0.0 && x.abs() <= 9_007_199_254_740_992.0).then(|| {
+            let sign = if x < 0.0 { "-" } else { "" };
+            format!("{sign}{:0width$}", x.abs() as u64)
         }),
     };
     shown.unwrap_or_else(|| number(v))
@@ -741,7 +783,7 @@ fn start_cell(e: &BytesStart, next_column: &mut usize) -> Result<Cell> {
         reference,
         column,
         kind: attr(e, b"t")?.unwrap_or_default(),
-        style: attr(e, b"s")?.and_then(|v| v.trim().parse().ok()),
+        style: index_attr::<usize>(e, b"s")?,
         ..Cell::default()
     })
 }
@@ -1296,6 +1338,12 @@ mod tests {
         assert_eq!(padded("42"), "00042");
         assert_eq!(padded("-42"), "-00042");
         assert_eq!(padded("1234567"), "1234567");
+        assert_eq!(
+            formatted("1000000000000000", Shown::Padded(17), false),
+            "01000000000000000"
+        );
+        // A date without a time keeps its day when the time would round to midnight.
+        assert_eq!(date("45614.999999"), "2024-11-18");
         assert_eq!(padded("4.5"), "4.5");
     }
 
@@ -1310,9 +1358,57 @@ mod tests {
         assert_eq!(custom_format("\"y\"0"), Shown::Plain);
         assert_eq!(custom_format("#,##0.00;[Red]-#,##0.00"), Shown::Plain);
         assert_eq!(custom_format("General"), Shown::Plain);
+        assert_eq!(custom_format("mmm yyyy"), Shown::Date);
+        assert_eq!(custom_format("mmm"), Shown::Date);
+        assert_eq!(custom_format("mm:ss"), Shown::Time { seconds: true });
+        assert_eq!(custom_format("h:mm AM/PM"), Shown::Time { seconds: false });
+        assert_eq!(custom_format("[>=1000]yyyy-mm-dd;0.00"), Shown::Plain);
+        assert_eq!(custom_format("00000;-00000"), Shown::Plain);
+        assert_eq!(custom_format(&"0".repeat(MAX_PADDING)), Shown::Padded(MAX_PADDING));
+        assert_eq!(custom_format(&"0".repeat(MAX_PADDING + 1)), Shown::Plain);
         assert_eq!(custom_format("0.00E+00"), Shown::Plain);
         assert_eq!(builtin_format(14), Shown::Date);
         assert_eq!(builtin_format(22), Shown::DateTime { seconds: false });
         assert_eq!(builtin_format(46), Shown::Plain);
+    }
+
+    #[test]
+    fn cell_styles_use_only_numfmts_and_style_0_by_default() -> Result<()> {
+        let styles_xml = r#"<styleSheet>
+            <numFmts count="1"><numFmt numFmtId="164" formatCode="00000"/></numFmts>
+            <cellXfs count="1"><xf numFmtId="164"/></cellXfs>
+            <dxfs count="1"><dxf><numFmt numFmtId="164" formatCode="yyyy-mm-dd"/></dxf></dxfs>
+        </styleSheet>"#;
+        let bytes = workbook(&[
+            ("xl/workbook.xml", SHEET_WORKBOOK),
+            ("xl/_rels/workbook.xml.rels", STYLE_RELS),
+            ("xl/styles.xml", styles_xml),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<worksheet><sheetData><row><c r="A1"><v>42</v></c><c r="B1" s="0"><v>42</v></c></row></sheetData></worksheet>"#,
+            ),
+        ]);
+        assert_eq!(rows(&bytes)?, vec![vec!["00042".to_owned(), "00042".into()]]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_style_id_is_an_error_with_its_reason() {
+        let bad_cell = styled_workbook(
+            SHEET_WORKBOOK,
+            r#"<worksheet><sheetData><row><c r="A1" s="abc"><v>42</v></c></row></sheetData></worksheet>"#,
+        );
+        let err = rows(&bad_cell).map(|_| ()).map_err(|e| e.to_string());
+        assert!(
+            matches!(&err, Err(m) if m.contains("s \"abc\" is not a number")),
+            "{err:?}"
+        );
+        let bad_format = styles(r#"<styleSheet><cellXfs><xf numFmtId="x1"/></cellXfs></styleSheet>"#)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert!(
+            matches!(&bad_format, Err(m) if m.contains("numFmtId \"x1\" is not a number")),
+            "{bad_format:?}"
+        );
     }
 }
