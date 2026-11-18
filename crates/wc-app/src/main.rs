@@ -2870,7 +2870,7 @@ fn marking_strip_listed(open: &Open, options: &wc_report::MarkingOptions) -> boo
         .is_none_or(|s| wc_report::terminal_strips(&inputs).contains(s))
 }
 
-/// [`export_wago_configurator`] to the file `path`.
+/// The configurator list (as `export_wago_configurator` writes it) to the file `path`.
 fn export_wago_configurator_to(open: &Open, path: &Path) -> String {
     let inputs = wc_report::Inputs {
         project: &open.project,
@@ -2921,7 +2921,7 @@ fn wago_marking_file(open: &Open, options: &wc_report::MarkingOptions) -> PathBu
     open.dir.join("export").join(name)
 }
 
-/// [`export_wago_marking`] to the file `path`.
+/// The marker list (as `export_wago_marking` writes it) to the file `path`.
 fn export_wago_marking_to(open: &Open, options: &wc_report::MarkingOptions, path: &Path) -> String {
     let inputs = wc_report::Inputs {
         project: &open.project,
