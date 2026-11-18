@@ -362,10 +362,11 @@ pub fn follow_terminals_in(
     }
     let was = project.meta.clone();
     let mut after = numbers_after(project, before, &role);
-    // A spare can only go with its strip to a tag no other device is drawn with there: it would
-    // take over that device (its part, its panel place), as Project::add_spare refuses.
-    // Judged by what is drawn with the tag, not by the numbers terminals tagged with just the
-    // strip happen to get, which change as spares move.
+    // A spare can only go with its strip to a tag no other device is drawn with there, nor has
+    // device data of its own: it would take over that device (its part, its panel place), as
+    // Project::add_spare refuses, and leave its own data behind. Judged by what is drawn with
+    // the tag, not by the numbers terminals tagged with just the strip happen to get, which
+    // change as spares move.
     let drawn: std::collections::BTreeSet<DeviceTag> = project
         .pages
         .iter()
@@ -381,7 +382,7 @@ pub fn follow_terminals_in(
             layout.spares.iter().any(|n| {
                 let mut tag = to.clone();
                 tag.product.push(n.clone());
-                drawn.contains(&tag)
+                drawn.contains(&tag) || project.devices.contains_key(&tag)
             })
         };
         // Layouts first: a jumper on a spare that went with its strip goes along too.
@@ -406,7 +407,7 @@ pub fn follow_terminals_in(
         after = again;
     }
     // The device data of a spare (its part, its level, its panel place) goes with it to the
-    // strip's new name, unless that name has data of its own already.
+    // strip's new name, which has none of its own (a layout is not moved onto such a name).
     for (from, to) in &moves {
         let spares = was.strip_layout(from).map(|l| l.spares.clone()).unwrap_or_default();
         for n in spares {
@@ -2779,6 +2780,33 @@ mod tests {
         assert!(p.meta.strip_layout(&DeviceTag::parse("-X2")?).is_none());
         assert_eq!(p.devices.get(&DeviceTag::parse("-X1.S1")?), Some(&spare));
         assert!(!p.devices.contains_key(&DeviceTag::parse("-X2.S1")?));
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_renamed_onto_a_name_whose_spare_tag_has_its_own_part_keeps_its_layout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // -X1.S1 and -X2.S1 (nothing drawn there) each have a part of their own.
+        let mut p = strips_project(&[("a", "-X1.1")], &[("-X1", &["S1", "1"], &["S1"])])?;
+        let mine = Device {
+            part: Some("WAGO 2002-1201".into()),
+            ..Device::default()
+        };
+        let theirs = Device {
+            part: Some("Phoenix PT 2,5".into()),
+            ..Device::default()
+        };
+        p.devices.insert(DeviceTag::parse("-X1.S1")?, mine.clone());
+        p.devices.insert(DeviceTag::parse("-X2.S1")?, theirs.clone());
+        let role = |_: &str| Some(crate::symbol::SymbolRole::Terminal);
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        follow_terminals_in(&mut p, &before, role);
+        let x1 = p.meta.strip_layout(&DeviceTag::parse("-X1")?).ok_or("x1 kept")?;
+        assert_eq!(x1.spares, ["S1"]);
+        assert!(p.meta.strip_layout(&DeviceTag::parse("-X2")?).is_none());
+        assert_eq!(p.devices.get(&DeviceTag::parse("-X1.S1")?), Some(&mine));
+        assert_eq!(p.devices.get(&DeviceTag::parse("-X2.S1")?), Some(&theirs));
         Ok(())
     }
 
