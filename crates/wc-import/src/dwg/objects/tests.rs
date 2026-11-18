@@ -1438,3 +1438,44 @@ fn a_weighted_closed_spline_a_flipped_ellipse_and_an_unknown_scenario() -> TestR
     }
     Ok(())
 }
+
+#[test]
+fn an_ellipse_not_a_number_and_a_spline_short_of_knots_are_damaged() -> TestResult {
+    let v = Version::R2010;
+    let model = head(None);
+    let mut el = entity(v, 35, 0x300, model);
+    el.data
+        .bd3((0.0, 0.0, 0.0))
+        .bd3((10.0, 0.0, 0.0))
+        .bd3((0.0, 0.0, 1.0))
+        .bd(f64::NAN)
+        .bd(0.0)
+        .bd(1.0);
+    let mut sp = entity(v, 36, 0x301, model);
+    sp.data
+        .bl(1)
+        .bl(2)
+        .b(false)
+        .b(false)
+        .b(false)
+        .bd(0.0)
+        .bd(0.0)
+        .bl(3)
+        .bl(3)
+        .b(false);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        el,
+        sp,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&2), "{:?}", d.skipped);
+    assert!(d.damaged.iter().any(|r| r.contains("not a number")), "{:?}", d.damaged);
+    assert!(
+        d.damaged.iter().any(|r| r.contains("3 knots for 3 control points")),
+        "{:?}",
+        d.damaged
+    );
+    Ok(())
+}

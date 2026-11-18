@@ -437,6 +437,9 @@ fn ellipse(o: &mut Object, e: &mut Codes) -> Result<()> {
     let (_, _, z) = d.bd3()?;
     let ratio = d.bd()?;
     let (start, end) = (d.bd()?, d.bd()?);
+    if ![cx, cy, mx, my, z, ratio, start, end].iter().all(|v| v.is_finite()) {
+        return Err(bad("an ellipse has a value that is not a number"));
+    }
     e.f(10, cx).f(20, cy).f(11, mx).f(21, my).f(230, z);
     e.f(40, ratio).f(41, start).f(42, end);
     Ok(())
@@ -472,6 +475,11 @@ fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
         let knots = spline_count(o, "knots")?;
         let points = spline_count(o, "control points")?;
         let weighted = o.data.b()?;
+        // A curve of degree d over n control points needs n + d + 1 knots; fewer than n + 1
+        // fits no encoding (a periodic one may list fewer than n + d + 1).
+        if knots < points.saturating_add(1) {
+            return Err(bad(format!("a spline lists {knots} knots for {points} control points")));
+        }
         e.i(70, i64::from(closed)).i(71, i64::from(degree));
         for _ in 0..knots {
             e.f(40, o.data.bd()?);

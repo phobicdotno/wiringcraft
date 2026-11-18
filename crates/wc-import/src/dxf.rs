@@ -573,10 +573,9 @@ fn de_boor(ctrl: &[(f64, f64, f64)], knots: &[f64], p: usize, u: f64) -> Option<
     if n <= p || knots.len() != n + p + 1 {
         return None;
     }
-    let mut k = p;
-    while k + 1 < n && knots.get(k + 1).is_some_and(|&t| t <= u) {
-        k += 1;
-    }
+    // The knot span holding u, by binary search (the knots are sorted): a long spline sampled
+    // many times would cost samples x knots with a scan.
+    let k = p + knots.get(p + 1..n)?.partition_point(|&t| t <= u);
     let mut d: Vec<(f64, f64, f64)> = ctrl.get(k - p..=k)?.to_vec();
     for r in 1..=p {
         for j in (r..=p).rev() {
