@@ -127,10 +127,26 @@ mod tests {
     #[test]
     fn the_clone_folder_is_private_to_its_owner() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = private_temp_dir().unwrap();
-        let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
-        // The umask can only take bits away, so no group or other bit is ever set.
-        assert_eq!(mode & 0o077, 0, "mode {mode:o}");
-        assert_eq!(mode & 0o700, 0o700, "mode {mode:o}");
+        const CHILD: &str = "WC_PRIVATE_TEMP_DIR_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Run under umask 022, where a plain temporary folder would be 0755.
+            let tmp = private_temp_dir().unwrap();
+            let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "mode {mode:o}");
+            let plain = tempfile::tempdir().unwrap();
+            let open = std::fs::metadata(plain.path()).unwrap().permissions().mode();
+            assert_eq!(open & 0o777, 0o755, "the umask is in force: mode {open:o}");
+            return;
+        }
+        // The umask belongs to the whole process, so set it in a child of its own.
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("umask 022 && exec \"$0\" --exact --test-threads 1 base::tests::the_clone_folder_is_private_to_its_owner")
+            .arg(&exe)
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }
