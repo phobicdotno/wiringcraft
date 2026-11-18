@@ -834,6 +834,37 @@ fn edits_page(name: &str, v: &Value) -> bool {
     }
 }
 
+impl AppTools<'_> {
+    /// In a shared session, what a tool's change is checked against: the pages someone else
+    /// holds, and the state to go back to. `None` when nobody holds a page, and for `undo`,
+    /// which the session's host carries out and checks itself.
+    fn held_guard(&self, name: &str) -> Option<(Vec<Page>, crate::state::Mark)> {
+        let open = self.0.open.as_ref()?;
+        let held = open.held_pages();
+        (!held.is_empty() && name != "undo").then(|| (held, open.mark()))
+    }
+
+    /// A page someone else holds is read-only here, whatever the tool did: a change that
+    /// reached one (a rename that also renames symbols there, a cover flag moved off it) is
+    /// taken back as a whole and refused with who holds the page, as the host would refuse it.
+    fn held_check(
+        &mut self,
+        guard: Option<(Vec<Page>, crate::state::Mark)>,
+        r: Result<String, String>,
+    ) -> Result<String, String> {
+        let (Some((held, mark)), Some(open)) = (guard, self.0.open.as_mut()) else {
+            return r;
+        };
+        match open.held_change(&held) {
+            Some(why) => {
+                open.back_to(mark);
+                Err(format!("Not done: {why}"))
+            }
+            None => r,
+        }
+    }
+}
+
 impl wc_agent::Tools for AppTools<'_> {
     fn specs(&self) -> Vec<Value> {
         self.0.assistant.specs().to_vec()
@@ -844,14 +875,9 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
-        let held = self.0.open.as_ref().map(Open::held_pages).unwrap_or_default();
+        let guard = self.held_guard(name);
         let r = self.0.agent_tool(name, input);
-        // A page someone else holds is read-only here, whatever the tool did: the host would
-        // refuse the change, so it is put back now and the result says so.
-        let r = match self.0.open.as_mut().map(|o| o.restore_pages(held)) {
-            Some(put_back) if !put_back.is_empty() => r.map(|text| format!("{text}\n{}", put_back.join("\n"))),
-            _ => r,
-        };
+        let r = self.held_check(guard, r);
         // Items the assistant removed must not stay selected.
         self.0.prune_selection();
         r
@@ -862,11 +888,15 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
-        let r = self.0.agent_start(name, input);
-        if matches!(r, Started::Done(_)) {
-            self.0.prune_selection();
+        let guard = self.held_guard(name);
+        match self.0.agent_start(name, input) {
+            Started::Done(r) => {
+                let r = self.held_check(guard, r);
+                self.0.prune_selection();
+                Started::Done(r)
+            }
+            running => running,
         }
-        r
     }
 
     fn finish(&mut self, name: &str, input: &Value, result: Result<String, String>) -> Result<String, String> {
@@ -4091,11 +4121,43 @@ mod tests {
             assert_eq!(page2(&a), &before, "{tool} changed the held page");
         }
 
-        // A tool that would change it some other way (an undo of the text) is put back, and the
-        // result says who holds the page.
-        let r = call(&mut a, "undo", json!({})).unwrap();
-        assert!(r.contains("was not changed: Ola has this page open"), "{r}");
+        // A change that reaches the held page from elsewhere is refused as a whole: moving
+        // the cover flag off it, or renaming a device drawn on it and on a free page.
+        for p in &mut a.open.as_mut().unwrap().project.pages {
+            p.cover = p.id == "p0002";
+        }
+        let project = a.open.as_ref().unwrap().project.clone();
+        let r = call(&mut a, "update_page", json!({"page": "1", "cover": true}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola has open")), "{r:?}");
+        assert_eq!(a.open.as_ref().unwrap().project, project, "nothing of it stays");
+        let tag = wc_core::DeviceTag::parse("-K1").unwrap();
+        let held = std::mem::take(&mut a.open.as_mut().unwrap().held_by_others);
+        for page in ["1", "2"] {
+            call(
+                &mut a,
+                "place_symbol",
+                json!({"symbol": "wc.coil", "x": 60, "y": 120, "page": page, "tag": "-K1"}),
+            )
+            .unwrap();
+        }
+        a.open.as_mut().unwrap().held_by_others = held;
+        let (before, project) = (page2(&a).clone(), a.open.as_ref().unwrap().project.clone());
+        let r = call(&mut a, "set_device", json!({"tag": "-K1", "rename_to": "-K2"}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola has open")), "{r:?}");
         assert_eq!(page2(&a), &before);
+        assert_eq!(a.open.as_ref().unwrap().project, project, "the free page keeps -K1 too");
+        assert!(a.open.as_ref().unwrap().project.tag_index().contains_key(&tag));
+        // The live path (start) refuses the same way.
+        let started = wc_agent::Tools::start(
+            &mut AppTools(&mut a),
+            "set_device",
+            &json!({"tag": "-K1", "rename_to": "-K2"}),
+        );
+        assert!(
+            matches!(&started, Started::Done(Err(e)) if e.contains("Ola has open")),
+            "set_device runs at once and is refused"
+        );
+        assert_eq!(a.open.as_ref().unwrap().project, project);
 
         // Reading, selecting and commenting still work there.
         assert!(

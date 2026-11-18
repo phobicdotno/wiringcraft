@@ -126,6 +126,17 @@ impl WireNumbering {
     }
 }
 
+/// What [`Open::back_to`] goes back to.
+pub(crate) struct Mark {
+    project: Project,
+    undo_len: usize,
+    undo_dropped: usize,
+    history: u64,
+    form_step: Option<u64>,
+    dirty: bool,
+    terminals_before: Option<wc_core::project::TerminalNumbers>,
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
@@ -1109,7 +1120,7 @@ impl Open {
             .map(|name| format!("{name} has this page open; it is read-only here until they leave it."))
     }
 
-    /// The pages someone else holds, as they are now: what [`Open::restore_pages`] puts back.
+    /// The pages someone else holds, as they are now: what [`Open::held_change`] compares with.
     pub fn held_pages(&self) -> Vec<Page> {
         self.project
             .pages
@@ -1119,21 +1130,51 @@ impl Open {
             .collect()
     }
 
-    /// Put back pages someone else holds that were changed since [`Open::held_pages`] took
-    /// `before`. Returns one line per page put back, naming who holds it.
-    pub fn restore_pages(&mut self, before: Vec<Page>) -> Vec<String> {
-        let mut put_back = Vec::new();
-        for old in before {
-            let Some(i) = self.project.pages.iter().position(|p| p.id == old.id) else {
-                continue;
-            };
-            if self.project.pages[i] != old {
-                let why = self.held_reason(i).unwrap_or_default();
-                put_back.push(format!("Page {} was not changed: {why}", old.number));
-                self.project.pages[i] = old;
+    /// Why a change is refused: it changed or removed one of the pages someone else held when
+    /// [`Open::held_pages`] gave `before`.
+    pub fn held_change(&self, before: &[Page]) -> Option<String> {
+        before.iter().find_map(|old| {
+            let who = self.held_by_others.get(&old.id).map_or("Someone", String::as_str);
+            match self.project.pages.iter().position(|p| p.id == old.id) {
+                None => Some(format!(
+                    "it would remove page {}, which {who} has open; it is read-only here until they leave it.",
+                    old.number
+                )),
+                Some(i) if self.project.pages[i] != *old => Some(format!(
+                    "it would change page {}, which {who} has open; it is read-only here until they leave it.",
+                    old.number
+                )),
+                Some(_) => None,
             }
+        })
+    }
+
+    /// Where the project and its undo history are now, for taking a refused change back with
+    /// [`Open::back_to`]. Redo is not kept: the change in between must not undo or redo.
+    pub(crate) fn mark(&self) -> Mark {
+        Mark {
+            project: self.project.clone(),
+            undo_len: self.undo.len(),
+            undo_dropped: self.undo_dropped,
+            history: self.history,
+            form_step: self.form_step,
+            dirty: self.dirty,
+            terminals_before: self.terminals_before.clone(),
         }
-        put_back
+    }
+
+    /// Take back everything changed since `mark`: the project, the undo step the change added
+    /// and the change marks.
+    pub(crate) fn back_to(&mut self, mark: Mark) {
+        self.project = mark.project;
+        if self.undo_dropped == mark.undo_dropped {
+            self.undo.truncate(mark.undo_len);
+        } else {
+            // A full history dropped its oldest step to make room; only the new one goes.
+            self.undo.pop();
+        }
+        (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
+        self.terminals_before = mark.terminals_before;
     }
 
     /// Delete a page. The last page of a project cannot be deleted. Returns the page to show next.
