@@ -1919,11 +1919,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
         }
         ImportCmd::PageDwg { file, page, scale } => {
-            // The converter writes into a private folder of its own, removed with everything
-            // in it when this ends, also on failure.
-            let tmp = staging_dir("wiringcraft-dwg-").map_err(e)?;
-            let dxf = dwg_to_dxf(&file, tmp.path(), std::env::var("WIRINGCRAFT_DWG2DXF").ok())?;
-            import_cmd(dir, ImportCmd::PageDxf { file: dxf, page, scale })?;
+            import_page_dwg(dir, &file, page, scale, std::env::var("WIRINGCRAFT_DWG2DXF").ok())?;
         }
         ImportCmd::PageDxf { file, page, scale } => {
             let mut p = load(dir)?;
@@ -1952,6 +1948,15 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// `import page-dwg`: convert `file` with the converter (`template`, see [`dwg_to_dxf`]) and
+/// import the DXF onto `page`. The converter writes into a private folder of its own, removed
+/// with everything in it when this ends, also on failure.
+fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: Option<String>) -> Res<()> {
+    let tmp = staging_dir("wiringcraft-dwg-").map_err(e)?;
+    let dxf = dwg_to_dxf(file, tmp.path(), template)?;
+    import_cmd(dir, ImportCmd::PageDxf { file: dxf, page, scale })
 }
 
 /// Convert DWG to a DXF in `tmp` (a private folder, see [`staging_dir`]) with whatever
@@ -2922,6 +2927,56 @@ mod tests {
         assert!(err.contains("did not produce a DXF"), "{err}");
         drop(tmp);
         assert!(!folder.exists(), "removed with everything in it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_page_dwg_leaves_no_folder_behind_when_it_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        store::create(&dir, "Test").unwrap();
+        let dwg = tmp.path().join("plan.dwg");
+        std::fs::write(
+            &dwg,
+            "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n10\n0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+        // A stand-in converter that notes where it was told to write, then copies or fails.
+        let record = tmp.path().join("out.txt");
+        let converter = |name: &str, last: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho \"$2\" > {}\n{last}\n", record.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            format!("{} {{in}} {{out}}", path.display())
+        };
+        let folder = || {
+            PathBuf::from(std::fs::read_to_string(&record).unwrap().trim())
+                .parent()
+                .unwrap()
+                .to_owned()
+        };
+
+        // The conversion fails.
+        let err = import_page_dwg(&dir, &dwg, "1".into(), 1.0, Some(converter("fail.sh", "exit 1")));
+        assert!(err.is_err());
+        assert!(folder().starts_with(std::env::temp_dir()), "{:?}", folder());
+        assert!(!folder().exists(), "removed after a failed conversion");
+
+        // The conversion works, the DXF import fails (no such page).
+        let copy = converter("copy.sh", "cp \"$1\" \"$2\"");
+        let err = import_page_dwg(&dir, &dwg, "no-such-page".into(), 1.0, Some(copy.clone()));
+        assert!(err.as_ref().is_err_and(|e| e.contains("no-such-page")), "{err:?}");
+        assert!(!folder().exists(), "removed after a failed import");
+
+        // And when it works.
+        let pages = load(&dir).unwrap().pages;
+        import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(copy)).unwrap();
+        assert!(!folder().exists(), "removed after the import");
     }
 
     fn cli(dir: &Path, args: &[&str]) -> Res<()> {
