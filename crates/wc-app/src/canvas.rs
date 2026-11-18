@@ -1423,7 +1423,8 @@ fn shape_tool(
         ed,
         cur,
         resp.clicked_by(egui::PointerButton::Primary),
-        resp.double_clicked_by(egui::PointerButton::Primary),
+        // A quick repeat on the last point may count as a triple-click: it ends a polyline too.
+        resp.double_clicked_by(egui::PointerButton::Primary) || resp.triple_clicked_by(egui::PointerButton::Primary),
     );
 }
 
@@ -1464,7 +1465,12 @@ pub(crate) fn shape_click(open: &mut Open, ed: &mut Editor, at: Point) {
         Some(k) => n >= k,
         None => n >= 4 && ed.shape_points.first() == Some(&at),
     };
-    if done {
+    if done && drawn_shape(ed.tool, &ed.shape_points).is_none() {
+        // The last click makes no shape (an arc that ends on its centre): keep the others and
+        // ask for another point.
+        ed.shape_points.pop();
+        ed.message = "That point makes no shape; click another one (Esc cancels).".into();
+    } else if done {
         finish_shape(open, ed);
     } else {
         ed.message = shape_hint(ed.tool, n).into();
@@ -1686,6 +1692,24 @@ mod tests {
     }
 
     #[test]
+    fn an_arc_ending_on_its_centre_keeps_its_first_clicks() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Arc,
+            ..Default::default()
+        };
+        let c = Point::new(10.0, 10.0);
+        shape_click(&mut open, &mut ed, c);
+        shape_click(&mut open, &mut ed, Point::new(20.0, 10.0));
+        shape_click(&mut open, &mut ed, c);
+        assert_eq!(ed.shape_points.len(), 2, "centre and start stay");
+        assert!(ed.message.contains("no shape"), "{}", ed.message);
+        assert!(open.project.pages[0].graphics.is_empty());
+        shape_click(&mut open, &mut ed, Point::new(10.0, 20.0));
+        assert!(matches!(open.project.pages[0].graphics[..], [Shape::Arc { .. }]));
+    }
+
+    #[test]
     fn a_drawing_started_on_one_page_is_dropped_on_another() {
         let (_tmp, mut open) = project();
         let mut ed = Editor {
@@ -1831,7 +1855,11 @@ mod tests {
             svg.contains("<circle") && svg.contains(" A10 10 "),
             "circle and arc in the SVG"
         );
-        for kind in ["CIRCLE", "ARC"] {
+        assert!(
+            svg.contains("<polygon points=\"150,50 170,50 170,70\""),
+            "the closed polyline in the SVG"
+        );
+        for kind in ["CIRCLE", "ARC", "POLYLINE"] {
             assert!(
                 dxf.contains(&format!("\n{kind}\n")) || dxf.contains(&format!("\r\n{kind}\r\n")),
                 "{kind} in the DXF"
