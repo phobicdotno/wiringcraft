@@ -1253,6 +1253,15 @@ impl Open {
                 crate::applog::warn(&format!("could not clear the failed copy in {}: {e}", target.display()));
             }
         };
+        // A new folder is made here, once: another save to the same place that got there first
+        // makes this one fail before anything is copied, and nothing of that one is taken away.
+        if !existed {
+            target
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::create_dir(&target))
+                .map_err(|e| format!("Could not make {}: {e}", target.display()))?;
+        }
         let links = copy_dir(&from, &target).map_err(|e| {
             discard();
             format!("Copying to {} failed: {e}", target.display())
@@ -1267,9 +1276,13 @@ impl Open {
                         Ok(real) => (real, resolved(&from), resolved(&target)),
                         Err(_) => (lexical(&from.join(&lib.location)), lexical(&from), target.clone()),
                     };
-                    if !at.starts_with(&project) {
-                        lib.location = relative_to(&at, &base).unwrap_or(at).display().to_string();
-                    }
+                    lib.location = match at.strip_prefix(&project) {
+                        // Inside the project (`library`, or `../design/library` from `design`):
+                        // copied along, so the copy's own, written from the copy's root.
+                        Ok(inside) if inside.as_os_str().is_empty() => ".".into(),
+                        Ok(inside) => inside.display().to_string(),
+                        Err(_) => relative_to(&at, &base).unwrap_or(at).display().to_string(),
+                    };
                 }
             }
         };
@@ -2433,6 +2446,15 @@ pub(crate) mod tests {
             location: "library".into(),
             reference: None,
         });
+        // The same library written through the folder above: still the project's own.
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "own, the long way".into(),
+            kind: "folder".into(),
+            location: "../p/library".into(),
+            reference: None,
+        });
+        std::fs::create_dir_all(from.join("library").join("symbols")).unwrap();
+        std::fs::write(from.join("library").join("symbols").join("own.json"), "{}").unwrap();
         o.checkpoint();
         o.project.meta.name = "Changed".into();
         o.dirty = true;
@@ -2449,6 +2471,16 @@ pub(crate) mod tests {
         assert_eq!(Path::new(&lib.location), Path::new("../../library"));
         let own = copy.project.meta.libraries.iter().find(|l| l.name == "own").unwrap();
         assert_eq!(own.location, "library");
+        let long = copy
+            .project
+            .meta
+            .libraries
+            .iter()
+            .find(|l| l.name == "own, the long way")
+            .unwrap();
+        assert_eq!(Path::new(&long.location), Path::new("library"));
+        // The copy holds the library's files itself, where its libraries point.
+        assert!(to.join(&long.location).join("symbols").join("own.json").is_file());
         assert_eq!(copy.project.pages.len(), o.project.pages.len());
         // Undo goes back to the name before, not to the library folders seen from the original.
         assert!(o.undo());

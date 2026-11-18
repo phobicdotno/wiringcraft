@@ -3192,7 +3192,7 @@ impl Share {
                         if ui.button("Browse…").clicked() {
                             match crate::pick_folder("Keep my copy in", &form.folder) {
                                 crate::Picked::Path(d) => form.folder = d.display().to_string(),
-                                crate::Picked::Failed(e) => form.error = Some(e),
+                                crate::Picked::Failed(e) => form.fail(ErrorAbout::Folder, e),
                                 crate::Picked::Cancelled => {}
                             }
                         }

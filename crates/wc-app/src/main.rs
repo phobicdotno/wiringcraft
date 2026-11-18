@@ -1443,12 +1443,17 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         let go = ui.button("Save as").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
-                        if go {
+                        if go && path.is_empty() {
+                            // A blank field would mean the projects folder itself.
+                            *error = Some("Type the folder for the copy.".into());
+                        } else if go {
                             match path.path() {
                                 Ok(p) => {
+                                    let field = path.clone();
+                                    // Refused: the form comes back with the path, to edit and retry.
                                     then = Some(Box::new(move |app: &mut App| {
                                         if let Err(e) = app.save_as_to(&p) {
-                                            app.dialog = Some(Dialog::Message(e));
+                                            app.dialog = Some(Dialog::SaveAsPath(field, Some(e)));
                                         }
                                     }));
                                     keep = false;
@@ -2439,7 +2444,7 @@ fn pick_folder(title: &str, start: &str) -> Picked {
 /// only files of one kind shown. Blocks the window while open, like any modal dialog.
 fn pick_save(title: &str, dir: &Path, name: &str, filter: Option<(&str, &[&str])>) -> Picked {
     let mut dialog = rfd::FileDialog::new().set_title(title).set_file_name(name);
-    if let Some(d) = dir.ancestors().find(|d| !d.as_os_str().is_empty() && d.is_dir()) {
+    if let Some(d) = nearest_dir(dir) {
         dialog = dialog.set_directory(d);
     }
     if let Some((label, extensions)) = filter {
@@ -2455,7 +2460,7 @@ fn pick_save(title: &str, dir: &Path, name: &str, filter: Option<(&str, &[&str])
 /// Blocks the window while open, like any modal dialog.
 fn pick_open(title: &str, dir: &Path, filter: (&str, &[&str])) -> Picked {
     let mut dialog = rfd::FileDialog::new().set_title(title).add_filter(filter.0, filter.1);
-    if let Some(d) = dir.ancestors().find(|d| !d.as_os_str().is_empty() && d.is_dir()) {
+    if let Some(d) = nearest_dir(dir) {
         dialog = dialog.set_directory(d);
     }
     applog::take_picker_errors();
@@ -2573,8 +2578,12 @@ fn picker_start(typed: &str) -> Option<PathBuf> {
     } else {
         prefs::project_path(typed).unwrap_or_else(|_| prefs::projects_dir())
     };
-    start
-        .ancestors()
+    nearest_dir(&start)
+}
+
+/// The folder a picker opens in for `p`: `p` or its nearest folder that exists.
+fn nearest_dir(p: &Path) -> Option<PathBuf> {
+    p.ancestors()
         .find(|d| !d.as_os_str().is_empty() && d.is_dir())
         .map(Path::to_path_buf)
 }
