@@ -33,10 +33,14 @@ pub struct PanelState {
     /// The drawing's values when each field was read: a field is applied only when it differs
     /// from these, to the drawing as it is then (moved meanwhile, it stays where it went).
     shape_base: Option<Shape>,
-    /// Why the last value set for the drawing was refused.
+    /// Why values set for the drawing were refused, as shown: those of `shape_refused`.
     shape_error: Option<String>,
-    /// The fields whose values were refused: the reason stays until one of them is entered again.
-    shape_refused: Vec<usize>,
+    /// The fields whose values were refused, each with its reason: a reason stays until a
+    /// value is entered in its own field again, and is taken (or changes nothing).
+    shape_refused: std::collections::BTreeMap<usize, String>,
+    /// Which of `shape`'s fields have been typed in or dragged since they took the focus: a
+    /// field only tabbed through enters nothing.
+    shape_touched: Vec<bool>,
     /// The page, index and [`PanelState::drawing_gen`] of the drawing `shape` was read for.
     shape_slot: Option<(usize, usize, u64)>,
     /// The drawing whose properties are shown: its page and index, a hash of the drawings
@@ -611,6 +615,7 @@ fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
                 ps.text_height = *height;
             }
             ps.shape_in_use.clear();
+            ps.shape_touched.clear();
             ps.shape_error = None;
             ps.shape_refused.clear();
         }
@@ -618,11 +623,22 @@ fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
     }
 }
 
-/// What [`shape_rows`] commits: the fields whose edit ended, and the drawing with those of them
-/// that changed set (`None` when none did).
+/// What [`shape_rows`] commits: each field whose edit ended with another value, with that
+/// value (each is set on its own), and the fields a value was entered in (typed or dragged,
+/// changed or not).
 struct ShapeCommit {
-    fields: Vec<usize>,
-    new: Option<Shape>,
+    changes: Vec<(usize, f64)>,
+    entered: Vec<(usize, f64)>,
+}
+
+/// A number typed in a drawing's field, read as egui reads one: spaces ignored, and the minus
+/// sign taken for a hyphen.
+fn parse_number(text: &str) -> Option<f64> {
+    text.split_whitespace()
+        .collect::<String>()
+        .replace('\u{2212}', "-")
+        .parse()
+        .ok()
 }
 
 /// The fields of a circle, an arc or a polyline (`drawing`, read into the edit buffer except
@@ -642,6 +658,9 @@ fn shape_rows(
         ps.shape_in_use = vec![false; now.len()];
         ps.shape_slot = Some(slot);
     }
+    if ps.shape_touched.len() != now.len() {
+        ps.shape_touched = vec![false; now.len()];
+    }
     let mut draft = ps.shape.as_ref().map(shape_fields).unwrap_or_default();
     let mut base = ps.shape_base.as_ref().map(shape_fields).unwrap_or_default();
     if draft.len() != now.len() || base.len() != now.len() {
@@ -655,24 +674,65 @@ fn shape_rows(
     let mut shape = drawing.clone();
     set_shape_fields(&mut shape, &draft);
     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    // Text typed, pasted or deleted, or a value stepped with an arrow key, this frame (it goes
+    // to the field with focus; egui steps a value only for an arrow with no modifier). A field
+    // left without any is no entry, even when egui reads its rounded text back as another number.
+    let typing = ui.input(|i| {
+        i.events.iter().any(|e| match e {
+            egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut => true,
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => match key {
+                egui::Key::Backspace | egui::Key::Delete => true,
+                egui::Key::ArrowUp | egui::Key::ArrowDown => modifiers.is_none(),
+                _ => false,
+            },
+            _ => false,
+        })
+    });
     let mut ended = vec![false; now.len()];
     let mut in_use = vec![false; now.len()];
+    let mut entered = vec![false; now.len()];
+    let touched = &mut ps.shape_touched;
     let mut field = 0;
     let mut num = |ui: &mut egui::Ui, label: &str, v: &mut f64, suffix: &str| {
         ui.label(label);
         // Typed text is read when it leaves the field, not as it is typed: a number typed and
         // then spoiled ("7x") is no value, rather than its last good prefix.
+        let read = std::cell::Cell::new(None);
         let r = ui.add(
             egui::DragValue::new(v)
                 .speed(0.1)
                 .max_decimals(SHAPE_DECIMALS)
                 .update_while_editing(false)
+                .custom_parser(|text| {
+                    let v = parse_number(text);
+                    read.set(Some(v.is_some()));
+                    v
+                })
                 .suffix(suffix),
         );
         ui.end_row();
         let done = r.drag_stopped() || r.lost_focus();
         if let Some(e) = ended.get_mut(field) {
             *e = done;
+        }
+        // A value is entered when the field was typed in or dragged and what it holds is a
+        // number; tabbing through it, or text that is no number, enters none.
+        if let Some(t) = touched.get_mut(field) {
+            // Text typed and entered in one frame is applied as the field loses focus.
+            if r.changed() && (r.has_focus() || r.dragged() || (r.lost_focus() && !escape && typing)) {
+                *t = true;
+            }
+            if done {
+                if let Some(en) = entered.get_mut(field) {
+                    *en = *t && read.get() != Some(false);
+                }
+                *t = false;
+            }
         }
         // A field still in use, also one focus just moved to as another one ended.
         if let Some(u) = in_use.get_mut(field) {
@@ -711,6 +771,9 @@ fn shape_rows(
             if let Some(e) = ended.first_mut() {
                 *e = r.changed();
             }
+            if let Some(en) = entered.first_mut() {
+                *en = r.changed();
+            }
         }
         _ => {}
     }
@@ -734,27 +797,28 @@ fn shape_rows(
         ps.shape_base = Some(with_fields(drawing, &base));
         return None;
     }
-    let mut new = now.clone();
-    let mut any = false;
-    for (((d, b), n), e) in draft.iter().zip(base.iter_mut()).zip(new.iter_mut()).zip(&ended) {
+    let mut changes = Vec::new();
+    for (k, ((d, b), e)) in draft.iter().zip(base.iter_mut()).zip(&ended).enumerate() {
         if !e {
             continue;
         }
         // Not within reach of the shown value (a number that is not finite included).
         let shown = (d - *b).abs() <= SAME_VALUE;
         if !shown {
-            *n = *d;
-            any = true;
+            changes.push((k, *d));
         }
         // What was entered is the baseline now.
         *b = *d;
     }
     ps.shape = Some(with_fields(drawing, &draft));
     ps.shape_base = Some(with_fields(drawing, &base));
-    Some(ShapeCommit {
-        fields,
-        new: any.then(|| with_fields(drawing, &new)),
-    })
+    let entered = fields
+        .iter()
+        .copied()
+        .filter(|&k| entered.get(k).copied().unwrap_or(false))
+        .filter_map(|k| Some((k, *draft.get(k)?)))
+        .collect();
+    Some(ShapeCommit { changes, entered })
 }
 
 /// Decimals shown in a drawing's fields (egui may show fewer for a large value): the text
@@ -1055,6 +1119,7 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 ps.shape = None;
                 ps.shape_base = None;
                 ps.shape_in_use.clear();
+                ps.shape_touched.clear();
                 ps.shape_error = None;
                 ps.shape_refused.clear();
             }
@@ -1093,22 +1158,51 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                             ui.end_row();
                         } else if matches!(g, Shape::Circle { .. } | Shape::Arc { .. } | Shape::Polyline { .. }) {
                             if let Some(c) = shape_rows(ui, ps, &g, (page_idx, i, shown)) {
-                                let set = c.new.map_or(Ok(false), |new| open.set_shape(page_idx, i, new));
-                                match set {
-                                    // Refused (no radius, too few points to close): the reason is
-                                    // shown and the fields read the drawing's own values again.
-                                    Err(why) => {
-                                        ps.shape_error = Some(why.to_owned());
-                                        ps.shape_refused = c.fields;
+                                // Each field is set on its own (one undo step each): a field
+                                // refused (no radius, an arc of no angle) keeps its reason and
+                                // reads the drawing's own value again, and does not take a good
+                                // value entered in another field with it.
+                                let mut cur = g.clone();
+                                let mut refused = Vec::new();
+                                for (k, v) in c.changes {
+                                    let mut values = shape_fields(&cur);
+                                    if let Some(f) = values.get_mut(k) {
+                                        *f = v;
                                     }
-                                    // A refused field entered again with a value that is taken (or
-                                    // changes nothing) takes the reason back; another field doesn't.
-                                    Ok(_) if c.fields.iter().any(|f| ps.shape_refused.contains(f)) => {
-                                        ps.shape_error = None;
-                                        ps.shape_refused.clear();
+                                    let next = with_fields(&cur, &values);
+                                    match open.set_shape(page_idx, i, next.clone()) {
+                                        Ok(_) => cur = next,
+                                        Err(why) => {
+                                            ps.shape_refused.insert(k, why.to_owned());
+                                            refused.push(k);
+                                        }
                                     }
-                                    Ok(_) => {}
                                 }
+                                // A refused field entered again with a value that is taken (or
+                                // changes nothing and would be taken) takes its reason back;
+                                // another field doesn't. A value too near the stored one to be a
+                                // change is still checked: 0 for a radius of 0.00005 is no radius.
+                                for (k, v) in c.entered.iter().filter(|(k, _)| !refused.contains(k)) {
+                                    let mut values = shape_fields(&cur);
+                                    if let Some(f) = values.get_mut(*k) {
+                                        *f = *v;
+                                    }
+                                    match open.shape_checked(page_idx, i, with_fields(&cur, &values)) {
+                                        Ok(_) => {
+                                            ps.shape_refused.remove(k);
+                                        }
+                                        Err(why) => {
+                                            ps.shape_refused.insert(*k, why.to_owned());
+                                        }
+                                    }
+                                }
+                                let mut why: Vec<&str> = Vec::new();
+                                for w in ps.shape_refused.values() {
+                                    if !why.contains(&w.as_str()) {
+                                        why.push(w);
+                                    }
+                                }
+                                ps.shape_error = (!why.is_empty()).then(|| why.join(" "));
                             }
                             if let Some(err) = &ps.shape_error {
                                 ui.label("");
@@ -2051,15 +2145,45 @@ mod tests {
             ]);
         }
 
+        /// Replace the focused field's text with `text` and press Enter, all in one frame.
+        fn typed_and_entered(&mut self, text: &str) {
+            self.frame(vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text(text.into()),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ]);
+        }
+
         fn drawing(&self, k: usize) -> Shape {
             self.o.project.pages[0].graphics[self.at[k]].clone()
         }
 
         /// A frame in which `f` runs first, before the panel is drawn.
         fn frame_with(&mut self, f: impl FnOnce(&egui::Context)) {
+            self.frame_events_with(Vec::new(), f);
+        }
+
+        /// A frame of `events` in which `f` runs first, before the panel is drawn.
+        fn frame_events_with(&mut self, events: Vec<egui::Event>, f: impl FnOnce(&egui::Context)) {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
             let (o, ed, ps) = (&mut self.o, &mut self.ed, &mut self.ps);
             let mut f = Some(f);
-            let _ = self.ctx.run(egui::RawInput::default(), |ctx| {
+            let _ = self.ctx.run(input, |ctx| {
                 if let Some(f) = f.take() {
                     f(ctx);
                 }
@@ -2377,6 +2501,221 @@ mod tests {
         };
         assert_eq!((center.y, r), (60.0, 5.0), "the drag is undone in one step");
         p.o.undo();
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_good_value_ended_with_a_refused_one_is_kept() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let radius = {
+            let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+            p.tab(n);
+            p.ctx.memory(|m| m.focused()).ok_or("the radius field has the focus")?
+        };
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        let rect = p.ctx.read_response(radius).ok_or("the radius field is shown")?.rect;
+        let y = {
+            p.tab(n - 1);
+            let y = p.ctx.memory(|m| m.focused()).ok_or("Centre Y has the focus")?;
+            p.key(egui::Key::Escape);
+            p.frame(Vec::new());
+            y
+        };
+        let at = rect.center();
+        let pointer = |x: f32, pressed: Option<bool>| {
+            let mut ev = vec![egui::Event::PointerMoved(egui::pos2(at.x + x, at.y))];
+            if let Some(pressed) = pressed {
+                ev.push(egui::Event::PointerButton {
+                    pos: egui::pos2(at.x + x, at.y),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            ev
+        };
+        // The radius is dragged below nothing while Centre Y is typed in; both end in one frame.
+        p.frame(pointer(0.0, Some(true)));
+        p.frame(pointer(-20.0, None));
+        p.frame_with(|ctx| ctx.memory_mut(|m| m.request_focus(y)));
+        p.typed("60");
+        p.frame(pointer(-90.0, None));
+        p.frame_events_with(pointer(-90.0, Some(false)), |ctx| {
+            ctx.memory_mut(|m| m.surrender_focus(y))
+        });
+        p.frame(Vec::new());
+        let i = p.at[0];
+        assert_eq!(
+            p.o.project.pages[0].graphics[i],
+            circle(100.0, 5.0).moved_y(60.0),
+            "Centre Y is kept"
+        );
+        assert!(p.ps.shape_error.is_some(), "the radius's refusal is shown");
+        assert_eq!(p.ps.shape_refused.keys().copied().collect::<Vec<_>>(), [2]);
+        Ok(())
+    }
+
+    fn arc(radius: f64, start: f64, end: f64) -> Shape {
+        Shape::Arc {
+            center: wc_core::geom::Point::new(100.0, 50.0),
+            radius,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn each_refused_field_keeps_its_reason_until_it_is_entered_again() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[arc(5.0, 0.0, 90.0)]);
+        // Radius 0, then an end angle at the start angle: both refused.
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        p.tab(n + 2);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert_eq!(p.drawing(0), arc(5.0, 0.0, 90.0));
+        assert_eq!(p.ps.shape_refused.keys().copied().collect::<Vec<_>>(), [2, 4]);
+        // The end angle entered again: its reason goes, the radius's stays.
+        p.tab(n + 2);
+        p.typed("90");
+        p.key(egui::Key::Enter);
+        assert_eq!(p.ps.shape_refused.keys().copied().collect::<Vec<_>>(), [2]);
+        assert!(p.ps.shape_error.is_some(), "the radius's refusal is still shown");
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_typed_and_entered_in_one_frame_takes_the_refusal_back() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        p.tab(n);
+        p.typed_and_entered("4");
+        assert_eq!(p.drawing(0), circle(100.0, 4.0));
+        assert!(p.ps.shape_error.is_none(), "{:?}", p.ps.shape_error);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_value_entered_again_too_near_the_stored_one_to_change_it_is_still_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 0.00005)]);
+        p.tab(n);
+        p.typed("-1");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        let mark = p.o.undo_mark();
+        // 0 is within reach of the stored 0.00005, so nothing is set, but it is no radius.
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some(), "0 is no radius: the refusal stays");
+        assert_eq!(p.drawing(0), circle(100.0, 0.00005));
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_stays_when_its_field_is_spoiled_or_tabbed_through() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        let mark = p.o.undo_mark();
+        // Text that is no number.
+        p.tab(n);
+        p.typed("7");
+        p.frame(vec![egui::Event::Text("x".into())]);
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some(), "spoiled: still shown");
+        // Tabbed through.
+        p.tab(n);
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert!(p.ps.shape_error.is_some(), "tabbed through: still shown");
+        assert_eq!(p.drawing(0), circle(100.0, 5.0));
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_stepped_and_entered_in_one_frame_takes_the_refusal_back() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        p.tab(n);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        p.frame(vec![key(egui::Key::ArrowUp), key(egui::Key::Enter)]);
+        assert_ne!(p.drawing(0), circle(100.0, 5.0), "the arrow key stepped the radius");
+        assert!(p.ps.shape_error.is_none(), "{:?}", p.ps.shape_error);
+        Ok(())
+    }
+
+    #[test]
+    fn a_modified_arrow_key_as_a_field_is_left_is_no_entry() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 7.123456789)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        p.tab(n);
+        // Ctrl+ArrowUp steps nothing; egui reads the shown 7.123457 back as Enter ends the field.
+        p.frame(vec![
+            egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            },
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+        ]);
+        assert!(p.ps.shape_error.is_some(), "no value was entered: still shown");
+        assert_eq!(p.drawing(0), circle(100.0, 7.123456789));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_stays_when_a_field_with_more_decimals_than_shown_is_tabbed_through()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 7.123456789)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        let mark = p.o.undo_mark();
+        // egui reads the shown 7.123457 back as the field loses focus: no text was entered.
+        p.tab(n);
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert!(p.ps.shape_error.is_some(), "tabbed through: still shown");
+        assert_eq!(p.drawing(0), circle(100.0, 7.123456789));
         assert_eq!(p.o.undo_mark(), mark);
         Ok(())
     }
