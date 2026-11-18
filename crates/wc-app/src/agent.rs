@@ -2451,13 +2451,18 @@ mod tests {
             "the editor deleted"
         );
         assert_eq!(
-            a.route_to_symbol_editor(vec![Action::Undo, Action::Redo]),
+            a.route_to_symbol_editor(vec![Action::Undo, Action::Copy]),
             Vec::<Action>::new()
         );
         assert_eq!(
             a.symbol_editor.as_ref().unwrap().symbol.graphics.len(),
             1,
             "the editor undid"
+        );
+        assert_eq!(a.route_to_symbol_editor(vec![Action::Redo]), Vec::<Action>::new());
+        assert!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.is_empty(),
+            "the editor redid the delete"
         );
         assert_eq!(a.open.as_ref().unwrap().project, before, "the project was not touched");
     }
