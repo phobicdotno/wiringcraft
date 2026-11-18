@@ -1045,3 +1045,37 @@ fn strips_with_equal_natural_keys_keep_their_levels_together() {
         "-X01, -X09 and -X9 each give one block"
     );
 }
+
+#[test]
+fn a_bottom_level_is_inferred_in_the_marking_order_and_never_over_a_bad_value() {
+    let set = |p: &mut wc_core::Project, tag: &str, level: &str| {
+        p.devices
+            .entry(DeviceTag::parse(tag).unwrap())
+            .or_default()
+            .properties
+            .insert(LEVEL_PROPERTY.into(), level.into());
+    };
+    let marked = |p: &wc_core::Project, s, parts| -> Vec<String> {
+        let i = Inputs {
+            project: p,
+            symbols: s,
+            parts,
+        };
+        let o = MarkingOptions {
+            strip: Some("-X1".into()),
+            ..MarkingOptions::default()
+        };
+        marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect()
+    };
+    // `1`, `01` and `2` in drawing order, only `2` at level 2: `1` is its bottom level.
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("t01", "term", 105.0, Some("-X1.01")));
+    set(&mut p, "-X1.2", "2");
+    assert_eq!(marked(&p, &s, &parts), ["01", "1 / 2"]);
+    // A bad value below level 2 is not taken as level 1.
+    let (mut p, s, parts) = fixture();
+    set(&mut p, "-X1.1", "two");
+    set(&mut p, "-X1.2", "2");
+    assert_eq!(marked(&p, &s, &parts), ["1", "2"]);
+    assert_eq!(level_warnings(&p).len(), 1);
+}

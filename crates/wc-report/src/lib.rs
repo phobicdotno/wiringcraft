@@ -492,11 +492,21 @@ fn parse_level(value: &str) -> Result<u32, String> {
     }
 }
 
+/// A terminal's [`LEVEL_PROPERTY`] value, `None` when it has none.
+fn level_value<'p>(project: &'p wc_core::Project, strip: &str, number: &str) -> Option<&'p str> {
+    let tag = DeviceTag::parse(&format!("{strip}.{number}")).ok()?;
+    project
+        .devices
+        .get(&tag)?
+        .properties
+        .get(LEVEL_PROPERTY)
+        .map(String::as_str)
+}
+
 /// A terminal's level from its [`LEVEL_PROPERTY`]; `None` when it has none or the value is not a
 /// level ([`level_warnings`] says which and why).
 fn terminal_level(project: &wc_core::Project, strip: &str, number: &str) -> Option<u32> {
-    let tag = DeviceTag::parse(&format!("{strip}.{number}")).ok()?;
-    parse_level(project.devices.get(&tag)?.properties.get(LEVEL_PROPERTY)?).ok()
+    parse_level(level_value(project, strip, number)?).ok()
 }
 
 /// One warning for each device whose [`LEVEL_PROPERTY`] is set but is not a level, naming the
@@ -636,7 +646,8 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             let ka = a.number.as_deref().map(natural_key);
             let kb = b.number.as_deref().map(natural_key);
             match (ka, kb) {
-                (Some(x), Some(y)) => x.cmp(&y),
+                // `1` and `01` have equal keys: order them exactly too, as the marking export does.
+                (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.number.cmp(&b.number)),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => page_order(&a.page_id)
@@ -667,11 +678,13 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
         for (k, n) in distinct.iter().enumerate() {
             let own = terminal_level(i.project, &strip, n);
             // The bottom level of a block needs no property of its own: the level above says so.
+            // A bad value is not missing: that terminal stays single-level, as its warning says.
+            let missing = level_value(i.project, &strip, n).is_none();
             let below = || {
                 distinct
                     .get(k + 1)
                     .and_then(|up| terminal_level(i.project, &strip, up))
-                    .filter(|l| *l >= 2)
+                    .filter(|l| missing && *l >= 2)
                     .map(|_| 1)
             };
             if let Some(l) = own.or_else(below) {
