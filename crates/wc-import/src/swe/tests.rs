@@ -1506,7 +1506,9 @@ fn wire_records_without_a_drawn_line_are_counted_with_their_reason() {
         .find(|c| c.what == "wire ends (from/to terminals)")
         .unwrap();
     assert!(
-        ends.note.contains("1 are jumpers between terminals of one strip"),
+        ends.note.contains(
+            "1 are jumpers between terminals of one strip that no drawn line carries, made into the strip's jumpers"
+        ),
         "{}",
         ends.note
     );
@@ -2466,4 +2468,35 @@ fn a_symbol_at_the_join_boundary_is_drawn_and_sized_alike_by_both_checks() {
     );
     let (w, h) = page(&built, "01").size.mm();
     assert!(w >= 350.0 && h >= 350.0, "the sheet has room for the block: {w} x {h}");
+}
+
+#[test]
+fn jumpers_from_the_terminal_strip_editor_become_the_strips_jumper() {
+    let c = sample_with_strip();
+    // A third terminal, and two records no line carries: 1 to 2 and 2 to 3, chained.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (203, '3', '-X1 3', 4, 200, 3);
+         INSERT INTO tew_symbol VALUES (22, 10, 203, 'Terminal', 190, 200, 0, 1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (22, 0, 0, 0, 5), (22, 0, 1, 0, -5);
+         INSERT INTO tew_componentelement VALUES (62, 22, 0, 203, 0);
+         INSERT INTO tew_componentterminal VALUES (62, 0, NULL), (62, 1, NULL);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 60, 0, 61, 1), (92, NULL, -1, '', 61, 0, 62, 1);",
+    )
+    .unwrap();
+    let (built, _, report) = build(&read(&c).unwrap(), None);
+    assert_eq!(built.jumpers.len(), 1, "{:?}", built.jumpers);
+    let j = &built.jumpers[0];
+    assert_eq!(j.strip, DeviceTag::parse("-X1").unwrap());
+    let mut terminals = j.terminals.clone();
+    terminals.sort();
+    assert_eq!(terminals, ["1", "2", "3"]);
+    let jumpers = report.iter().find(|c| c.what == "terminal jumpers").unwrap();
+    assert_eq!((jumpers.source, jumpers.imported), (1, 1));
+    assert!(jumpers.note.contains("2 wire record(s)"), "{}", jumpers.note);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(!ends.note.contains("WiringCraft has no jumpers"), "{}", ends.note);
 }

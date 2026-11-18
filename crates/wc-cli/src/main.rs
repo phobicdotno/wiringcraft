@@ -3098,6 +3098,14 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
             "device {tag} exists with other data; rename it or import into a fresh project"
         ));
     }
+    // Jumpers join the project's own: one that shares a terminal with a jumper of the same
+    // strip becomes one jumper with it.
+    let mut jumpers = p.meta.clone();
+    for j in &built.jumpers {
+        jumpers
+            .add_jumper(&j.strip, &j.terminals)
+            .map_err(|why| format!("jumper on {}: {why}", j.strip))?;
+    }
     fill_cover(p, cover_fields);
     for s in &built.symbols {
         store::write_vendored_symbol(dir, s).map_err(e)?;
@@ -3135,6 +3143,7 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
     for loc in built.locations {
         p.meta.merge_location(loc);
     }
+    p.meta.jumpers = jumpers.jumpers;
     p.panels.extend(built.panels);
     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
@@ -3899,6 +3908,29 @@ mod tests {
 
         std::fs::write(&file, "<catalog/>").unwrap();
         assert!(import_bmecat(&file, &lib).is_err());
+    }
+
+    #[test]
+    fn imported_jumpers_join_the_projects_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+        let mut p = load(&dir).unwrap();
+        p.meta.add_jumper(&x1, &["3".to_owned(), "4".to_owned()]).unwrap();
+        let jumper = |terminals: &[&str]| wc_core::project::Jumper {
+            strip: x1.clone(),
+            terminals: terminals.iter().map(|t| (*t).to_owned()).collect(),
+            part: None,
+        };
+        let built = wc_import::aml::Built {
+            jumpers: vec![jumper(&["4", "5"]), jumper(&["7", "8"])],
+            ..Default::default()
+        };
+        add_built(&dir, &mut p, built, "import:a.tewzip").unwrap();
+        let mut sets: Vec<Vec<String>> = p.meta.jumpers.iter().map(|j| j.terminals.clone()).collect();
+        sets.sort();
+        assert_eq!(sets, [vec!["3", "4", "5"], vec!["7", "8"]]);
     }
 
     #[test]

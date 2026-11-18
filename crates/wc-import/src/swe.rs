@@ -1649,6 +1649,7 @@ pub fn build_with(
         locations: Vec::new(),
         title_block: p.info.as_ref().map(SweProjectInfo::title_block).unwrap_or_default(),
         panels: Vec::new(),
+        jumpers: Vec::new(),
     };
     for (k, v) in &p.revision {
         built.title_block.entry(k.clone()).or_insert_with(|| v.clone());
@@ -2306,7 +2307,11 @@ pub fn build_with(
     let mut ends_not_drawn = 0usize;
     let mut ends_apart: Vec<String> = Vec::new();
     // Wire records no drawn line carries: the source has the connection but not the drawing.
-    let mut jumpers_undrawn = 0usize;
+    // Between two numbered terminals of one strip they are jumpers made in the terminal strip
+    // editor, and become WiringCraft jumpers (chained records merge into one).
+    let mut jumper_meta = wc_core::Project::new("").meta;
+    let mut jumper_records = 0usize;
+    let mut jumpers_unusable = 0usize;
     // Judged on the source, not on what was imported: a wire whose line collapsed to zero length
     // or sits on a page left out is still drawn there, and stays a mismatch.
     let carried = &p.wires_on_lines;
@@ -2336,7 +2341,25 @@ pub fn build_with(
                 // Not on any drawn line: a jumper made in the terminal strip editor, or a
                 // connection the source keeps only in its wire list.
                 match (strip_of_element(a.0), strip_of_element(b.0)) {
-                    (Some(x), Some(y)) if x == y => jumpers_undrawn += 1,
+                    (Some(x), Some(y)) if x == y => {
+                        // Both terminals tagged as the strip's own, one level below it.
+                        let terminal = |el: i64| {
+                            let t = tags.get(element_component.get(&el)?)?;
+                            let strip = tags.get(&x)?;
+                            let (number, above) = t.product.split_last()?;
+                            (t.function == strip.function && t.location == strip.location && above == strip.product)
+                                .then(|| number.clone())
+                        };
+                        let added = match (terminal(a.0), terminal(b.0), tags.get(&x)) {
+                            (Some(ta), Some(tb), Some(strip)) => jumper_meta.add_jumper(strip, &[ta, tb]).is_ok(),
+                            _ => false,
+                        };
+                        if added {
+                            jumper_records += 1;
+                        } else {
+                            jumpers_unusable += 1;
+                        }
+                    }
                     _ => records_undrawn += 1,
                 }
             }
@@ -2350,6 +2373,7 @@ pub fn build_with(
             }
         }
     }
+    built.jumpers = jumper_meta.jumpers;
     if !ends_apart.is_empty() {
         let shown: Vec<&str> = ends_apart.iter().take(5).map(String::as_str).collect();
         let more = ends_apart.len().saturating_sub(shown.len());
@@ -2641,12 +2665,25 @@ pub fn build_with(
                 ),
                 (ends_not_drawn, "with a terminal that is not drawn on a schematic page"),
                 (
-                    jumpers_undrawn,
-                    "are jumpers between terminals of one strip that no drawn line carries (WiringCraft has no jumpers yet, #108)",
+                    jumper_records,
+                    "are jumpers between terminals of one strip that no drawn line carries, made into the strip's jumpers",
+                ),
+                (
+                    jumpers_unusable,
+                    "are jumpers between terminals of one strip that no drawn line carries, not imported: a terminal has no number on the strip",
                 ),
                 (records_undrawn, "are in the source's wire list but on no drawn line"),
                 (one_end_named, "more name only one terminal (not checked)"),
             ]),
+        },
+        Count {
+            what: "terminal jumpers",
+            source: built.jumpers.len(),
+            imported: built.jumpers.len(),
+            note: note(vec![(
+                jumper_records,
+                "wire record(s) between terminals of one strip that no drawn line carries",
+            )]),
         },
         Count {
             what: "locations",
