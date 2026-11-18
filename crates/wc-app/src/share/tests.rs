@@ -1950,7 +1950,7 @@ fn a_picture_outside_the_picture_folders_is_named_once_and_not_sent() -> TestRes
 }
 
 #[test]
-fn a_picture_picked_here_is_not_written_over_by_the_sessions_picture_of_that_name() -> TestResult {
+fn a_picture_picked_here_under_a_session_name_is_kept_and_shared_under_a_name_of_its_own() -> TestResult {
     let tmp = tempfile::tempdir()?;
     // The session has a picture under a name this copy does not use (yet).
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
@@ -1972,17 +1972,29 @@ fn a_picture_picked_here_is_not_written_over_by_the_sessions_picture_of_that_nam
         file: "pictures/brand.png".into(),
         cover: None,
     });
-    for _ in 0..3 {
+    for _ in 0..5 {
         frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     }
     assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, mine, "kept");
+    // The project names it under a name of its own, and so does the session.
+    let file = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(file, "pictures/brand.png");
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, mine);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    assert_eq!(file_bytes(&host_open.dir, &file)?, mine);
     let notes: Vec<String> = g
         .take_notes()
         .into_iter()
         .filter(|n| n.contains("pictures/brand.png"))
         .collect();
     assert_eq!(notes.len(), 1, "named once: {notes:?}");
-    assert!(notes[0].contains("another picture"), "{}", notes[0]);
+    assert!(notes[0].contains(&format!("renamed {file} here")), "{}", notes[0]);
     Ok(())
 }
 
@@ -2546,6 +2558,55 @@ fn a_picture_renamed_for_the_session_keeps_its_name_within_255_bytes() -> TestRe
     assert_eq!(
         open.project.meta.logo.as_ref().map(|l| l.file.as_str()),
         Some(new.as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn a_picture_whose_rename_failed_gets_its_own_name_later_although_the_session_has_the_name() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // The session has a picture logo.png that the host's project does not use.
+    let theirs = b"\x89PNG\r\n\x1a\nthe host's other logo".to_vec();
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/logo.png".to_owned(), theirs.clone())].into_iter().collect(),
+    )?;
+    // The guest's own logo.png cannot be renamed at first (an empty file is no picture).
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/logo.png"), b"")?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let notes = g.take_notes();
+    assert!(
+        notes.iter().any(|n| n.contains("could not be given a new name yet")),
+        "{notes:?}"
+    );
+    // Once it can be, it is: no refusal from the session is needed for that.
+    std::fs::write(guest_open.dir.join("pictures/logo.png"), PNG)?;
+    std::thread::sleep(ITEM_RETRY_LATER);
+    for _ in 0..4 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let file = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(file, "pictures/logo.png", "{:?}", g.notes);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    assert_eq!(
+        file_bytes(&guest_open.dir, "pictures/logo.png")?,
+        PNG,
+        "the guest's file stays"
     );
     Ok(())
 }

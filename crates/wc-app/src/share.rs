@@ -1191,19 +1191,74 @@ fn rename_picture(open: &mut Open, file: &str) -> Result<String, String> {
     Ok(new)
 }
 
-/// Write the session's pictures that `open` uses and has not taken yet (`taken`, by project
-/// path) into its folder, and forget what the window showed for them. A file of the same name
-/// with other content is never written over: a guest's copy starts in an empty folder, so such
-/// a file is one this person picked here, and it is kept (and named in the result). Pictures
-/// in `skip` (failed a moment ago) are left for later. Returns the pictures that could not be
-/// written, with the reason.
+/// Give the pictures in `taken`, whose names the session has for other files, a name of
+/// their own here, together with those whose rename failed a while ago. A failed rename is
+/// kept and tried again after [`ITEM_RETRY_LATER`] while the project still uses the picture,
+/// whether or not the session has the name: nothing else would bring it back. Meanwhile the
+/// picture stays in `pictures_out` (of [`Share`]), so it is not sent again under the taken name.
+fn rename_pictures(
+    open: &mut Open,
+    taken: Vec<String>,
+    renames_due: &mut BTreeMap<String, std::time::Instant>,
+    pictures_out: &mut BTreeMap<String, std::time::Instant>,
+    notes: &mut Vec<String>,
+) {
+    let used = used_pictures(&open.project);
+    renames_due.retain(|file, _| used.contains(file));
+    let due = renames_due
+        .iter()
+        .filter(|(_, at)| at.elapsed() >= ITEM_RETRY_LATER)
+        .map(|(file, _)| file.clone())
+        .collect::<Vec<_>>();
+    // A name met again before its wait is over is left for then.
+    let waiting = |f: &String| renames_due.get(f).is_some_and(|at| at.elapsed() < ITEM_RETRY_LATER);
+    let files: std::collections::BTreeSet<String> = taken
+        .into_iter()
+        .filter(|f| used.contains(f) && !waiting(f))
+        .chain(due)
+        .collect();
+    for file in files {
+        match rename_picture(open, &file) {
+            Ok(new) => {
+                pictures_out.remove(&file);
+                renames_due.remove(&file);
+                notes.push(format!(
+                    "The session already has another file named {file}; your picture is renamed {new} here and sent again under that name."
+                ));
+            }
+            Err(why) => {
+                if renames_due.insert(file.clone(), std::time::Instant::now()).is_none() {
+                    notes.push(format!(
+                        "The session already has another file named {file}, and your picture could not be given a new name yet: {why}. It is tried again now and then."
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// What [`take_pictures`] did: it writes the session's pictures that `open` uses and has not
+/// taken yet (`taken`, by project path) into its folder, and forgets what the window showed for
+/// them. A file of the same name with other content is never written over: a guest's copy
+/// starts in an empty folder, so such a file is one this person picked here, and it is kept
+/// (and named in the result, to get a name of its own). Pictures in `skip` (failed a moment
+/// ago) are left for later.
+#[derive(Debug, Default)]
+pub struct TakenPictures {
+    /// The pictures that could not be written, with the reason.
+    pub failed: Vec<(String, String)>,
+    /// The pictures this copy has another file under the session's name for.
+    pub clashes: Vec<String>,
+}
+
+/// See [`TakenPictures`].
 pub fn take_pictures(
     open: &mut Open,
     session: &BTreeMap<String, Vec<u8>>,
     taken: &mut std::collections::BTreeSet<String>,
     skip: &std::collections::BTreeSet<String>,
-) -> Vec<(String, String)> {
-    let mut failed = Vec::new();
+) -> TakenPictures {
+    let mut out = TakenPictures::default();
     for file in used_pictures(&open.project) {
         if taken.contains(&file) || skip.contains(&file) {
             continue;
@@ -1219,10 +1274,11 @@ pub fn take_pictures(
                 open.picture_problems.remove(&file);
                 taken.insert(file);
             }
-            Err(e) => failed.push((file, e.to_string())),
+            Err(wc_share::Error::PictureNameTaken(_)) => out.clashes.push(file),
+            Err(e) => out.failed.push((file, e.to_string())),
         }
     }
-    failed
+    out
 }
 
 /// The project's vendored files in `dir`, as read for a session.
@@ -1721,6 +1777,13 @@ pub struct Share {
     /// Session pictures that could not be written into this copy, with when: each is tried
     /// again only after [`ITEM_RETRY_LATER`].
     pictures_failed: BTreeMap<String, std::time::Instant>,
+    /// Pictures whose name the session has for another file and that could not be given a new
+    /// name here, with when: tried again after [`ITEM_RETRY_LATER`] while the project uses them.
+    renames_due: BTreeMap<String, std::time::Instant>,
+    /// Pictures picked here under a name the session has for another file, found while taking
+    /// the session's pictures: they get a name of their own at the next sync, before what goes
+    /// out is worked out.
+    clashes: Vec<String>,
 }
 
 /// One symbol or part sent to the session and not taken yet.
@@ -1959,6 +2022,8 @@ impl Share {
         self.pictures_out.clear();
         self.pictures_taken.clear();
         self.pictures_failed.clear();
+        self.renames_due.clear();
+        self.clashes.clear();
     }
 
     /// Leave or end the session.
@@ -2171,24 +2236,15 @@ impl Share {
         }
         // A picture whose name the session (or the host's folder) has for another file gets a
         // new name here; the picture and the changes naming it go out again under that name.
-        for file in role.picture_names_taken() {
-            if !used_pictures(&open.project).contains(&file) {
-                continue;
-            }
-            // On a failed rename the picture stays in `pictures_out`, so it is not sent again
-            // under the taken name until the retry wait is over.
-            match rename_picture(open, &file) {
-                Ok(new) => {
-                    self.pictures_out.remove(&file);
-                    self.notes.push(format!(
-                        "The session already has another file named {file}; your picture is renamed {new} here and sent again under that name."
-                    ));
-                }
-                Err(why) => self.notes.push(format!(
-                    "The session already has another file named {file}, and your picture could not be given a new name: {why}"
-                )),
-            }
-        }
+        let mut taken = role.picture_names_taken();
+        taken.append(&mut self.clashes);
+        rename_pictures(
+            open,
+            taken,
+            &mut self.renames_due,
+            &mut self.pictures_out,
+            &mut self.notes,
+        );
         // Pictures used for the first time go out before the change that names them. Changes do
         // not wait for them: without its picture a page still works, it just shows a gap.
         let session_pictures = role.pictures();
@@ -2284,7 +2340,10 @@ impl Share {
         }
         self.pictures_failed.retain(|_, at| at.elapsed() < ITEM_RETRY_LATER);
         let skip = self.pictures_failed.keys().cloned().collect();
-        let failed = take_pictures(open, role.pictures(), &mut self.pictures_taken, &skip);
+        let TakenPictures { failed, clashes } = take_pictures(open, role.pictures(), &mut self.pictures_taken, &skip);
+        // A picture picked here under a name the session has for another file gets a name of
+        // its own at the next sync, as when the session refuses it.
+        self.clashes = clashes;
         let now = std::time::Instant::now();
         for (file, _) in &failed {
             self.pictures_failed.insert(file.clone(), now);
