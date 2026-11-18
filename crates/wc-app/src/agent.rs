@@ -420,6 +420,19 @@ pub fn specs() -> Vec<Value> {
             &["action"],
         ),
         tool(
+            "strips",
+            "Terminal strips as the terminal strip editor arranges them: list them (each strip's terminals in rail order, with spares and levels marked), move a terminal to another place on the rail (1 is first), add a spare terminal (after a terminal, or at the end), remove a spare, set a terminal's level (1 is the bottom level of a multi-level terminal; null clears it), or reset a strip to the order by number. Each change is one undo step.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "move", "spare", "unspare", "level", "reset"]},
+                "strip": {"type": "string", "description": "The strip's tag, e.g. -X1 (optional for list)."},
+                "terminal": {"type": "string", "description": "A terminal number on the strip, e.g. 3 or S1 (move, spare, unspare, level)."},
+                "to": {"type": "integer", "minimum": 1, "description": "The place on the rail to move the terminal to, 1 is first (move)."},
+                "after": {"type": "string", "description": "The terminal the new spare goes right after; at the end when left out (spare)."},
+                "level": {"type": ["integer", "null"], "minimum": 1, "description": "The terminal's level, or null to clear it (level)."}
+            }),
+            &["action"],
+        ),
+        tool(
             "comments",
             "Review comments: list (open ones, or all), add (pinned at x, y on a page, or about the whole page), reply, resolve, reopen or delete.",
             json!({
@@ -558,6 +571,23 @@ fn jumper_list(jumpers: &[wc_core::project::Jumper]) -> Vec<Value> {
     jumpers
         .iter()
         .map(|j| json!({"strip": j.strip.to_string(), "terminals": j.terminals, "part": j.part}))
+        .collect()
+}
+
+/// Terminal strips as the assistant sees them: each strip (only `only`, when given) with its
+/// terminals in rail order, a spare marked, and the level the terminal plan shows if any.
+fn strip_list(open: &Open, only: Option<&DeviceTag>) -> Vec<Value> {
+    open.strip_terminals()
+        .into_iter()
+        .filter(|(strip, _)| only.is_none_or(|o| o == strip))
+        .map(|(strip, rail)| {
+            let levels = crate::strip_editor::rail_levels(open, &strip, &rail);
+            let terminals: Vec<Value> = rail
+                .iter()
+                .map(|(n, spare)| json!({"terminal": n, "spare": spare, "level": levels.get(n)}))
+                .collect();
+            json!({"strip": strip.to_string(), "terminals": terminals})
+        })
         .collect()
 }
 
@@ -977,7 +1007,7 @@ impl wc_agent::Tools for AppTools<'_> {
             "set_device" => format!("Set device {}", s(input, "tag").unwrap_or_default()),
             "run_action" => format!("Ran {}", s(input, "action").unwrap_or_default()),
             "run_command" => format!("wiringcraft {}", strings(input, "args").join(" ")),
-            "comments" | "macros" | "panels" | "library" | "versions" | "jumpers" => {
+            "comments" | "macros" | "panels" | "library" | "versions" | "jumpers" | "strips" => {
                 format!("{name}: {}", s(input, "action").unwrap_or_default())
             }
             "export" => format!("Exported {}", s(input, "format").unwrap_or_default()),
@@ -1453,6 +1483,7 @@ impl App {
             "set_template" => self.tool_set_template(v),
             "comments" => self.tool_comments(v),
             "jumpers" => self.tool_jumpers(v),
+            "strips" => self.tool_strips(v),
             "macros" => self.tool_macros(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
@@ -1689,6 +1720,7 @@ impl App {
             "panels": panels,
             "devices": open.project.devices.len(),
             "jumpers": jumper_list(&open.project.meta.jumpers),
+            "strips": strip_list(open, None),
             "open_comments": open.project.comments.iter().filter(|c| !c.resolved).count(),
             "shown": shown,
             "selection": self.ed.selection.iter().map(selection_id).collect::<Vec<_>>(),
@@ -2143,6 +2175,84 @@ impl App {
                 })
             }
             other => Err(format!("Unknown jumpers action {other}.")),
+        }
+    }
+
+    fn tool_strips(&mut self, v: &Value) -> Result<String, String> {
+        let action = need_s(v, "action")?;
+        let open = need_open(self.open.as_mut())?;
+        if action == "list" {
+            let only = s(v, "strip").map(tag).transpose()?;
+            return Ok(pretty(&json!(strip_list(open, only.as_ref()))));
+        }
+        if !["move", "spare", "unspare", "level", "reset"].contains(&action) {
+            return Err(format!("Unknown strips action {action}."));
+        }
+        let strip = tag(need_s(v, "strip")?)?;
+        if action == "reset" {
+            open.reset_terminal_order(&strip);
+            return Ok(format!("{strip} is in the order by terminal number now."));
+        }
+        let terminal = need_s(v, "terminal")?.trim().to_owned();
+        let rail = open.strip_terminals().remove(&strip).unwrap_or_default();
+        let on_rail = |t: &str| rail.iter().find(|(n, _)| n == t).map(|(_, spare)| *spare);
+        match action {
+            "move" => {
+                let to = v
+                    .get("to")
+                    .and_then(Value::as_u64)
+                    .filter(|t| *t >= 1)
+                    .ok_or("`to` must be a place on the rail, 1 or more.")?;
+                let to = usize::try_from(to - 1).map_err(|e| e.to_string())?;
+                if to >= rail.len() {
+                    return Err(format!("{strip} has {} places on the rail.", rail.len()));
+                }
+                open.move_terminal(&strip, &terminal, to)?;
+                Ok(format!("Moved {strip} {terminal} to place {} on the rail.", to + 1))
+            }
+            "spare" => {
+                let after = s(v, "after").map(str::trim);
+                if let Some(a) = after
+                    && on_rail(a).is_none()
+                {
+                    return Err(format!("{strip} has no terminal {a}."));
+                }
+                open.add_spare(&strip, &terminal, after)?;
+                Ok(match after {
+                    Some(a) => format!("Added spare {strip} {terminal} after {a}."),
+                    None => format!("Added spare {strip} {terminal} at the end."),
+                })
+            }
+            "unspare" => {
+                if on_rail(&terminal) != Some(true) {
+                    return Err(format!("{strip} has no spare terminal {terminal}."));
+                }
+                open.remove_spare(&strip, &terminal);
+                Ok(format!("Took spare {strip} {terminal} off the rail."))
+            }
+            "level" => {
+                // A number, or null to clear it: a missing or other value is a mistake, not a
+                // request to clear the level.
+                let level = match v.get("level") {
+                    Some(Value::Null) => None,
+                    Some(l) => Some(
+                        l.as_u64()
+                            .filter(|l| *l >= 1)
+                            .ok_or("`level` must be 1 or more, or null to clear it.")?,
+                    ),
+                    None => return Err("`level` is missing: give 1 or more, or null to clear it.".into()),
+                };
+                if on_rail(&terminal).is_none() {
+                    return Err(format!("{strip} has no terminal {terminal}."));
+                }
+                let text = level.map(|l| l.to_string()).unwrap_or_default();
+                crate::strip_editor::set_level(open, &strip, &terminal, &text)?;
+                Ok(match level {
+                    Some(l) => format!("{strip} {terminal} is on level {l}."),
+                    None => format!("{strip} {terminal} has no level of its own now."),
+                })
+            }
+            other => Err(format!("Unknown strips action {other}.")),
         }
     }
 
@@ -2819,6 +2929,132 @@ mod tests {
             list(&mut a),
             json!([{"strip": "-X1", "terminals": ["1", "2", "4"], "part": null}])
         );
+    }
+
+    #[test]
+    fn the_assistant_lists_moves_spares_and_levels_terminal_strips() {
+        let (_tmp, mut a) = app(vec![]);
+        {
+            let o = a.open.as_mut().unwrap();
+            for (k, t) in ["-X1.1", "-X1.2", "-X1.3"].into_iter().enumerate() {
+                let id = o
+                    .place(
+                        1,
+                        "wc.terminal",
+                        wc_core::geom::Point::new(20.0 + 20.0 * k as f64, 20.0),
+                    )
+                    .unwrap();
+                let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+                s.tag = Some(DeviceTag::parse(t).unwrap());
+            }
+        }
+        // The rail as "number" with "*" for a spare and "@level" for a level.
+        let rail = |a: &mut App| -> Vec<String> {
+            let v: Value =
+                serde_json::from_str(&call(a, "strips", json!({"action": "list", "strip": "-X1"})).unwrap()).unwrap();
+            assert_eq!(v.as_array().map(Vec::len), Some(1), "{v}");
+            v[0]["terminals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| {
+                    let mut out = t["terminal"].as_str().unwrap().to_owned();
+                    if t["spare"] == json!(true) {
+                        out.push('*');
+                    }
+                    if let Some(l) = t["level"].as_u64() {
+                        out.push_str(&format!("@{l}"));
+                    }
+                    out
+                })
+                .collect()
+        };
+        let undo_mark = |a: &App| a.open.as_ref().unwrap().undo_mark();
+        assert_eq!(rail(&mut a), ["1", "2", "3"]);
+        let before = undo_mark(&a);
+
+        // Refusals change nothing and take no undo step.
+        for bad in [
+            json!({"action": "move", "strip": "-X1", "terminal": "3", "to": 0}),
+            json!({"action": "move", "strip": "-X1", "terminal": "3", "to": 4}),
+            json!({"action": "move", "strip": "-X1", "terminal": "9", "to": 1}),
+            json!({"action": "move", "strip": "-X1", "terminal": "3"}),
+            json!({"action": "spare", "strip": "-X1", "terminal": "2"}),
+            json!({"action": "spare", "strip": "-X1", "terminal": "S1", "after": "9"}),
+            json!({"action": "unspare", "strip": "-X1", "terminal": "2"}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 0}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": "2"}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2"}),
+            json!({"action": "level", "strip": "-X1", "terminal": "9", "level": 2}),
+            json!({"action": "move", "terminal": "3", "to": 1}),
+            json!({"action": "explode", "strip": "-X1"}),
+        ] {
+            assert!(call(&mut a, "strips", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(rail(&mut a), ["1", "2", "3"]);
+        assert_eq!(undo_mark(&a), before);
+
+        // Move: one undo step, and the state shows the rail.
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "move", "strip": "-X1", "terminal": "3", "to": 1}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 1);
+        assert_eq!(rail(&mut a), ["3", "1", "2"]);
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["strips"][0]["strip"], json!("-X1"));
+        assert_eq!(state["strips"][0]["terminals"][0]["terminal"], json!("3"));
+
+        // A spare after a terminal, and one at the end.
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "spare", "strip": "-X1", "terminal": "S1", "after": "3"}),
+        )
+        .unwrap();
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "spare", "strip": "-X1", "terminal": "S2"}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 3);
+        assert_eq!(rail(&mut a), ["3", "S1*", "1", "2", "S2*"]);
+
+        // A level, shown on the terminal; the one above is taken as its upper level.
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 2}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 4);
+        assert_eq!(rail(&mut a), ["3", "S1*", "1@1", "2@2", "S2*"]);
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": null}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 5);
+        assert_eq!(rail(&mut a), ["3", "S1*", "1", "2", "S2*"]);
+
+        // Unspare, then reset: each one undo step.
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "unspare", "strip": "-X1", "terminal": "S1"}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 6);
+        assert_eq!(rail(&mut a), ["3", "1", "2", "S2*"]);
+        call(&mut a, "strips", json!({"action": "reset", "strip": "-X1"})).unwrap();
+        assert_eq!(undo_mark(&a), before + 7);
+        assert_eq!(rail(&mut a), ["1", "2", "3", "S2*"]);
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(rail(&mut a), ["3", "1", "2", "S2*"]);
     }
 
     #[test]
