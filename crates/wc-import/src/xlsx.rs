@@ -831,7 +831,16 @@ mod tests {
                 r#"<?xml version="1.0" encoding="UTF-16"?><worksheet><sheetData><row><c t="s"><v>0</v></c></row><row><c t="s"><v>1</v></c><c t="inlineStr"><is><t>µ</t></is></c></row></sheetData></worksheet>"#,
             ),
         ];
-        let utf8 = workbook(&parts);
+        // The UTF-8 copy declares its own encoding.
+        let utf8: Vec<(&str, Vec<u8>)> = parts
+            .iter()
+            .map(|(n, b)| {
+                (
+                    *n,
+                    b.replace(r#"encoding="UTF-16""#, r#"encoding="UTF-8""#).into_bytes(),
+                )
+            })
+            .collect();
         let utf16: Vec<(&str, Vec<u8>)> = parts
             .iter()
             .map(|(n, b)| {
@@ -844,7 +853,8 @@ mod tests {
             vec!["Order number".to_owned()],
             vec!["Kontaktør Ø".to_owned(), "µ".into()],
         ];
-        assert_eq!(rows(&utf8)?, expected);
+        assert!(utf8.iter().all(|(_, b)| !String::from_utf8_lossy(b).contains("UTF-16")));
+        assert_eq!(rows(&workbook_bytes(&utf8))?, expected);
         assert_eq!(rows(&workbook_bytes(&utf16))?, expected);
         Ok(())
     }
