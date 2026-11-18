@@ -2638,7 +2638,7 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         };
         // A frame (focusing a text field first when asked), then one with Enter pressed.
-        let mut press = |a: &mut App, field: bool| -> bool {
+        let press = |a: &mut App, field: bool| -> bool {
             a.ed.finish_shape = false;
             let id = egui::Id::new("field");
             for events in [vec![], vec![enter()]] {
