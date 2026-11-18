@@ -570,7 +570,8 @@ impl Pen {
             ink: self.ink,
             layer: self.layer,
         });
-        let segs = ((sweep / 90.0).ceil() as usize).max(1);
+        // A negative sweep (an arc stored past a full turn) is drawn backwards, as long as it is.
+        let segs = ((sweep.abs() / 90.0).ceil() as usize).max(1);
         let step = sweep / segs as f64;
         let k = 4.0 / 3.0 * (step.to_radians() / 4.0).tan();
         let at = |deg: f64| {

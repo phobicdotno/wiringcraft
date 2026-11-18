@@ -2134,6 +2134,35 @@ mod tests {
             String::from_utf8_lossy(&pdf).matches(" m\n").count()
         };
         assert_eq!(paths(&again.project), paths(&bare) + 3, "three more paths in the PDF");
+
+        // An arc stored past a full turn (720° to 100°) is exported along the path the canvas
+        // draws: 260° back round, through 180° and not through 50°.
+        let mut back = bare.clone();
+        back.pages[0].graphics = vec![Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 100.0,
+        }];
+        let (back_pages, _) = wc_pdf::page_drawings(&back, &again.symbols, &wc_pdf::Options::default());
+        let svg = wc_pdf::svg(&back_pages[0]);
+        // From 100° clockwise to 0° (360°): the large arc.
+        assert!(svg.contains(" A9 9 0 1 1 "), "the 260° arc in the SVG: {svg}");
+        let dxf = wc_pdf::dxf(&back_pages[0]);
+        let arc: Vec<&str> = dxf.lines().map(str::trim).skip_while(|l| *l != "ARC").collect();
+        let value = |code: &str| {
+            arc.iter()
+                .position(|l| *l == code)
+                .and_then(|k| arc.get(k + 1))
+                .copied()
+        };
+        // Counter-clockwise with y up from 0° to 260°: page angles 100° to 360°.
+        assert_eq!((value("50"), value("51")), (Some("0"), Some("260")), "{dxf}");
+        let curves = |p: &wc_core::Project| {
+            let (pdf, _) = wc_pdf::export(p, &again.symbols, &wc_pdf::Options::default());
+            String::from_utf8_lossy(&pdf).matches(" c\n").count()
+        };
+        assert_eq!(curves(&back), curves(&bare) + 3, "260° in three curves in the PDF");
     }
 
     #[test]
