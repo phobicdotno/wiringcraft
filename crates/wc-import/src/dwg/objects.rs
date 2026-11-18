@@ -32,6 +32,10 @@ pub const MAX_OBJECTS: usize = 4_000_000;
 
 /// The key under which objects that could not be decoded are counted in [`Drawing::skipped`].
 pub const DAMAGED: &str = "damaged objects";
+
+/// The skipped-count key for blocks whose base point could not be read: they are kept, placed
+/// as if their base point were (0, 0).
+pub const BASE_UNREAD: &str = "block base points not read (placed from 0, 0)";
 /// The key under which entities whose owner is not in the drawing are counted.
 pub const ORPHANS: &str = "entities without an owner";
 
@@ -49,8 +53,9 @@ pub struct Drawing {
     pub model_points: Vec<Point>,
     /// How many of each kind of entity or object were not read, by type name.
     pub skipped: BTreeMap<String, usize>,
-    /// Why objects counted under [`DAMAGED`] could not be decoded: handle, offset and reason,
-    /// for the first [`MAX_REASONS`] of them.
+    /// Why objects counted under [`DAMAGED`] could not be decoded (handle, offset and reason),
+    /// then why base points counted under [`BASE_UNREAD`] could not be read, for the first
+    /// [`MAX_REASONS`] of them.
     pub damaged: Vec<String>,
 }
 
@@ -124,6 +129,12 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
             if damaged.len() < MAX_REASONS {
                 damaged.push(format!("object {handle:X} at {at}: {e}"));
             }
+        }
+    }
+    for reason in std::mem::take(&mut decoded.base_errors) {
+        *skipped.entry(BASE_UNREAD.to_owned()).or_default() += 1;
+        if damaged.len() < MAX_REASONS {
+            damaged.push(reason);
         }
     }
     Ok(Read {
@@ -324,6 +335,8 @@ struct Decoded {
     blocks: HashMap<u64, String>,
     /// Block base points other than (0, 0), by the handle of their BLOCK_HEADER.
     bases: HashMap<u64, (f64, f64)>,
+    /// Why a block's base point could not be read, per block.
+    base_errors: Vec<String>,
     /// Layer names by handle.
     layers: HashMap<u64, String>,
     /// Invisible entities, whose vertices and attributes are left out with them.
@@ -437,10 +450,14 @@ fn decode(
             out.layers.insert(handle, name);
         } else {
             // A base point that cannot be read leaves the block at (0, 0) rather than unnamed.
-            if let Ok(base) = block_base(&mut o)
-                && base != (0.0, 0.0)
-            {
-                out.bases.insert(handle, base);
+            match block_base(&mut o) {
+                Ok(base) if base != (0.0, 0.0) => {
+                    out.bases.insert(handle, base);
+                }
+                Ok(_) => {}
+                Err(e) => out
+                    .base_errors
+                    .push(format!("base point of block {name} (object {handle:X}): {e}")),
             }
             out.blocks.insert(handle, name);
         }
@@ -830,6 +847,7 @@ impl Decoded {
             items,
             blocks,
             bases,
+            base_errors: _,
             layers,
             hidden,
         } = self;

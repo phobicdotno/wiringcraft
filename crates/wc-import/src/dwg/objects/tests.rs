@@ -273,6 +273,14 @@ impl Obj {
 
 /// A table entry (BLOCK_HEADER, LAYER) with a name.
 fn entry(v: Version, kind: u16, handle: u64, name: &str) -> Obj {
+    if kind == BLOCK_HEADER {
+        return block_header(v, handle, name, (0.0, 0.0), false);
+    }
+    named(v, kind, handle, name)
+}
+
+/// A table entry's common data and name, nothing after it.
+fn named(v: Version, kind: u16, handle: u64, name: &str) -> Obj {
     let mut o = Obj::new(v, kind, handle);
     o.data.bs(0).bl(0).b(true);
     o.text(name);
@@ -1118,7 +1126,7 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
 
 /// A BLOCK_HEADER with every field up to its base point; an xref has no owned-object count.
 fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: bool) -> Obj {
-    let mut o = entry(v, BLOCK_HEADER, handle, name);
+    let mut o = named(v, BLOCK_HEADER, handle, name);
     match v {
         Version::R2004 => o.data.b(true).bs(0).b(false),
         Version::R2010 => o.data.bs(0),
@@ -1171,5 +1179,31 @@ fn a_block_is_placed_by_its_base_point() -> TestResult {
             d.blocks["B"]
         );
     }
+    Ok(())
+}
+
+#[test]
+fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
+    // A 2004 BLOCK_HEADER whose data ends after its name.
+    let v = Version::R2004;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        named(v, BLOCK_HEADER, 0x100, "CUT"),
+        line(v, 0x200, head(Some(0x100)), (5.0, 5.0), (10.0, 5.0)),
+    ];
+    let read = dxf_drawing(&sections(v, &objs, &[]))?;
+    assert!(
+        read.drawing.blocks.contains_key("CUT"),
+        "{:?}",
+        read.drawing.blocks.keys()
+    );
+    assert_eq!(read.skipped.get(BASE_UNREAD), Some(&1), "{:?}", read.skipped);
+    assert!(!read.skipped.contains_key(DAMAGED), "{:?}", read.skipped);
+    assert!(
+        read.damaged.iter().any(|r| r.contains("base point of block CUT")),
+        "{:?}",
+        read.damaged
+    );
     Ok(())
 }
