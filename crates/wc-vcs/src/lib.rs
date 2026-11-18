@@ -10,6 +10,7 @@
 //!   not in lines of JSON;
 //! - [`page_history`]: who changed one page, when, and what they changed.
 
+pub mod base;
 pub mod changes;
 mod git;
 pub mod subway;
