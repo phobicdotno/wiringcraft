@@ -2210,6 +2210,17 @@ impl Held {
             held.now.meta = Some(Box::new(local.meta.clone()));
         }
         held.hold_renames(local, base);
+        // A device new since `base` that a waiting page names waits with it: placing the symbol
+        // made its record, and Undo of the placement takes both back here alone.
+        let pages: Vec<&Page> = held.now.pages.values().flatten().collect();
+        let new_devices: Vec<(wc_core::DeviceTag, Option<wc_core::Device>)> = local
+            .devices
+            .iter()
+            .filter(|(tag, _)| !base.devices.contains_key(*tag) && !held.now.devices.contains_key(*tag))
+            .filter(|(tag, _)| pages.iter().any(|p| page_mentions(p, &|t| t == *tag)))
+            .map(|(tag, d)| (tag.clone(), Some(d.clone())))
+            .collect();
+        held.now.devices.extend(new_devices);
         // A new page's comments wait with it, however it came to wait: the session has no page
         // to put them on.
         let new_pages: Vec<String> = held
@@ -2493,6 +2504,15 @@ impl Held {
     fn drop_from(&self, project: &mut Project) {
         self.was.apply(project);
     }
+}
+
+/// What takes back the latest action here, when it changed what waits (`held`): those
+/// targets as they were before that action, from the copy's own undo history. `None` when the
+/// latest action changed nothing that waits.
+fn latest_waiting_step(open: &Open, held: &Held) -> Option<wc_share::Parts> {
+    let prev = open.before_last_change()?;
+    let step = wc_share::Parts::read(prev, &held.now);
+    (step != wc_share::Parts::read(&open.project, &held.now)).then_some(step)
 }
 
 /// Whether a symbol or cable on `page` names a device `tag` picks.
@@ -3152,9 +3172,16 @@ impl Share {
         }
         let held = Held::find(&open.project, self.base.as_ref()?, &waiting);
         if undo && !held.is_empty() {
-            // Undo of a change that never reached the session: taken back here only.
+            // Undo of a change that never reached the session: taken back here only, and only
+            // the latest action. What waited before it waits still.
             let before = open.project.clone();
-            held.drop_from(&mut open.project);
+            match latest_waiting_step(open, &held) {
+                Some(step) => {
+                    step.apply(&mut open.project);
+                    open.forget_last_change();
+                }
+                None => held.drop_from(&mut open.project),
+            }
             if open.project != before {
                 // Also after a save: the copy on disk still has the change.
                 open.dirty = true;

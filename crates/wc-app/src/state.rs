@@ -720,6 +720,20 @@ impl Open {
         self.terminals_before = None;
     }
 
+    /// The project as it was before the latest change, from the undo history: for taking back
+    /// only part of that change (in a shared session, the part that waits here).
+    pub fn before_last_change(&self) -> Option<&Project> {
+        self.undo.last()
+    }
+
+    /// Forget the latest undo step, once its change was taken back another way.
+    pub fn forget_last_change(&mut self) {
+        if self.undo.pop().is_some() {
+            self.redo.clear();
+            self.history += 1;
+        }
+    }
+
     /// A mark in the undo history, for [`Open::squash_undo`].
     pub fn undo_mark(&self) -> usize {
         self.undo_dropped + self.undo.len()

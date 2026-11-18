@@ -1860,9 +1860,9 @@ fn a_pinned_copy_the_host_puts_back_during_a_session_reaches_the_guests() -> Tes
     match h.role.as_ref() {
         Some(Role::Host(hosting)) => {
             assert_eq!(hosting.host.files().0.get("wc.coil").cloned(), coil);
-            // The device the placement made (it does not wait for the file) and the page
-            // edit; the file alone is no step to undo.
-            assert_eq!(hosting.host.history().len(), steps + 2, "{:?}", log.messages());
+            // The page edit, with the device the placement made (it waited with the page); the
+            // file alone is no step to undo.
+            assert_eq!(hosting.host.history().len(), steps + 1, "{:?}", log.messages());
             assert!(
                 hosting
                     .host
@@ -3542,6 +3542,60 @@ fn undo_of_a_waiting_change_takes_it_back_here_and_not_an_older_one_there() -> T
         notes.iter().any(|n| n.contains("had not reached the session")),
         "{notes:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_second_waiting_placement_takes_back_only_that_one() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let tag_of = |o: &Open, item: &str| -> Option<wc_core::DeviceTag> {
+        o.project
+            .page("p0003")?
+            .symbols
+            .iter()
+            .find(|s| s.id == item)?
+            .tag
+            .clone()
+    };
+    // The same waiting symbol placed again: its new device record waits with the page.
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    let second_tag = tag_of(&guest_open, &second).ok_or("no tag")?;
+    let first_tag = tag_of(&guest_open, &first).ok_or("no tag")?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(has_placement(&guest_open, "p0003", &second));
+    assert!(!has_placement(&host_open, "p0003", &second));
+    assert!(!host_open.project.devices.contains_key(&second_tag), "{:?}", g.notes);
+
+    let history = h.role.as_ref().map(|r| r.history().len());
+    // One Undo takes back the second placement and its device, here only; the first placement
+    // still waits.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    assert!(!guest_open.project.devices.contains_key(&second_tag));
+    assert!(!host_open.project.devices.contains_key(&second_tag));
+    assert_eq!(
+        h.role.as_ref().map(|r| r.history().len()),
+        history,
+        "nothing in the session"
+    );
+    assert!(g.can_undo(), "the first placement still waits");
+
+    // Once the symbol gets in, the first placement goes out, and only that one.
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(has_placement(&host_open, "p0003", &first), "{:?}", g.notes);
+    assert!(host_open.project.devices.contains_key(&first_tag));
+    assert!(!has_placement(&host_open, "p0003", &second));
+    assert!(!host_open.project.devices.contains_key(&second_tag));
     Ok(())
 }
 
