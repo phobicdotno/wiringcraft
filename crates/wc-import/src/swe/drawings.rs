@@ -438,11 +438,20 @@ pub(crate) fn drawings_within<R: Read + std::io::Seek>(
             continue;
         }
         // Every byte read counts against the total, also of a file then refused.
-        let (got, read) = read_entry(&mut zip, i, &name, lim, lim.total - total);
+        let left = lim.total - total;
+        let (got, read) = read_entry(&mut zip, i, &name, lim, left);
         total += read;
         let bytes = match got {
             Ok(b) => b,
             Err(e) => {
+                // Refused for what was left of the total, not for its own size: a limit, like
+                // the files left out above.
+                if left < lim.file
+                    && read > left
+                    && let Kind::Block(block, _) = &kind
+                {
+                    left_blocks.insert(block_key(block));
+                }
                 failed.push(e.to_string());
                 continue;
             }
@@ -468,16 +477,22 @@ pub(crate) fn drawings_within<R: Read + std::io::Seek>(
         }
         out.warnings.push(w);
     }
+    // Imported blocks a limit left without any drawing.
+    let boxes = left_blocks.iter().filter(|b| !out.blocks.contains_key(*b)).count();
     if left_out > 0 {
         let mut w = format!(
             "{left_out} drawing file(s) were not read: the archive has more than {MAX_DRAWING_FILES} files or {} MB of drawings",
             lim.total >> 20
         );
         if only.is_some() {
-            let boxes = left_blocks.iter().filter(|b| !out.blocks.contains_key(*b)).count();
             w.push_str(&format!("; {boxes} block(s) stay boxes"));
         }
         out.warnings.push(w);
+    } else if only.is_some() && boxes > 0 {
+        out.warnings.push(format!(
+            "{boxes} block(s) stay boxes: their drawings would take the archive past {} MB of drawings",
+            lim.total >> 20
+        ));
     }
     Ok(out)
 }

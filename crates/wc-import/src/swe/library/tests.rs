@@ -675,3 +675,58 @@ INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (2, 1, 'X1', 0, 5);
         lib.warnings
     );
 }
+
+#[test]
+fn a_block_the_total_refuses_is_counted_as_a_box() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Lamp', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (2, 1, 'X1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let file = drawing.len() as u64;
+    // The coil is read; one byte is left, so the lamp's drawing is refused for the total.
+    let lim = super::super::drawings::Limits { file, total: file + 1 };
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/Coil.dwg", &drawing),
+        ("Library/Block/Lamp.dwg", &drawing),
+    ]);
+    let lib = from_archive_within(buf, true, lim).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.warnings.iter().any(|w| w.contains("1 block(s) stay boxes")),
+        "{:?}",
+        lib.warnings
+    );
+}
+
+#[test]
+fn a_block_without_a_name_finds_its_drawing() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    use wc_core::geom::Shape;
+    // The block's name is empty in the source; its drawing's file name is only a space.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, '', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/ .dwg", &drawing),
+    ]);
+    let lib = from_archive(buf).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.symbols[0]
+            .graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Circle { radius, .. } if *radius == 4.0)),
+        "{:?}",
+        lib.symbols[0].graphics
+    );
+}
