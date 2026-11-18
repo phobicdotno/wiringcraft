@@ -3119,6 +3119,95 @@ fn a_picture_refused_while_a_symbol_waits_is_renamed_only_where_it_was_picked() 
 }
 
 #[test]
+fn a_late_refusal_of_a_withdrawn_picks_picture_is_told_from_a_later_attempts() {
+    let (a, b) = ("pictures/a.png".to_owned(), "pictures/b.png".to_owned());
+    // a.png went out with edit 3, its pick was withdrawn, and a replacement went out with 5.
+    let sent: BTreeMap<String, Option<u64>> = [(a.clone(), Some(5)), (b.clone(), Some(2))].into();
+    let withdrawn: BTreeMap<String, Option<u64>> = [(a.clone(), Some(3))].into();
+    // The refusal of edit 3 comes after the replacement went out: it renames nothing.
+    assert!(names_to_rename(vec![(a.clone(), Some(3))], &sent, &withdrawn).is_empty());
+    // The replacement's own refusal does; one of a picture not withdrawn does too.
+    assert_eq!(
+        names_to_rename(vec![(a.clone(), Some(5)), (b.clone(), Some(2))], &sent, &withdrawn),
+        vec![a.clone(), b.clone()]
+    );
+    // Withdrawn before anything of it went out: any refusal is of a later attempt.
+    let early: BTreeMap<String, Option<u64>> = [(a.clone(), None)].into();
+    assert_eq!(
+        names_to_rename(vec![(a.clone(), Some(5))], &sent, &early),
+        vec![a.clone()]
+    );
+    // The host's refusals carry no edit: a withdrawn pick's picture is not renamed.
+    assert!(names_to_rename(vec![(a.clone(), None)], &sent, &withdrawn).is_empty());
+    // Never sent from here: nothing.
+    assert!(names_to_rename(vec![("pictures/c.png".into(), Some(9))], &sent, &BTreeMap::new()).is_empty());
+}
+
+#[test]
+fn the_same_pick_made_again_after_its_refusal_put_the_logo_back_is_kept() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // The session has a picture brand.png that its drawings do not use.
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let file = "pictures/brand.png";
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join(file), &mine)?;
+    let logo = Some(wc_core::Logo {
+        file: file.into(),
+        cover: None,
+    });
+    // The guest's pick of its own brand.png as the logo goes out, and the session refuses it.
+    // (The session's picture of that name is compared with the guest's only after a while.)
+    g.pictures_failed.insert(file.into(), std::time::Instant::now());
+    log.fail_guests(true);
+    guest_open.project.meta.logo = logo.clone();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    log.fail_guests(false);
+    // The refusal comes with the last answer of the guest's next frame, after the pictures
+    // were looked at: that frame puts the logo back, and what was refused is gone through at
+    // the frame after.
+    let role = g.role.as_mut().ok_or("no role")?;
+    role.pump(&mut g.notes);
+    let Role::Guest(j) = role else {
+        return Err("not a guest".into());
+    };
+    let refused = std::mem::take(&mut j.guest.refused_meta);
+    assert!(refused, "the logo's change was refused");
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert_eq!(guest_open.project.meta.logo, None, "put back: {:?}", g.notes);
+    if let Some(Role::Guest(j)) = g.role.as_mut() {
+        j.guest.refused_meta = refused;
+    }
+    // Before that frame, the guest picks the same picture again: that pick is kept, and the
+    // picture gets a name of its own once compared.
+    guest_open.project.meta.logo = logo;
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    std::thread::sleep(ITEM_RETRY_LATER + std::time::Duration::from_millis(50));
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&guest_open.dir, file)?, mine, "kept");
+    let renamed = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(renamed, file, "{:?}", g.notes);
+    assert_eq!(file_bytes(&guest_open.dir, &renamed)?, mine);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    assert_eq!(file_bytes(&host_open.dir, &renamed)?, mine);
+    Ok(())
+}
+
+#[test]
 fn a_picture_renamed_for_some_references_leaves_the_others() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut open = project(tmp.path())?;
@@ -3256,9 +3345,7 @@ fn a_refusal_of_a_picture_this_copy_never_sent_shares_nothing() -> TestResult {
     g.pictures_out
         .insert("pictures/brand.png".into(), std::time::Instant::now());
     if let Some(Role::Guest(j)) = g.role.as_mut() {
-        j.guest.refusals.push(wc_share::Refusal::PictureNameTaken {
-            file: "pictures/brand.png".into(),
-        });
+        j.guest.names_taken.push(("pictures/brand.png".into(), Some(1)));
     }
     for _ in 0..4 {
         frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));

@@ -36,6 +36,10 @@ pub struct Guest {
     pub history: Vec<ChangeInfo>,
     /// Refusals from the host not yet shown to the user.
     pub refusals: Vec<Refusal>,
+    /// The picture names the session refused ([`Refusal::PictureNameTaken`], also in
+    /// `refusals`), each with the `seq` of the project edit that sent the picture: a refusal
+    /// is told from one of a later attempt at that name.
+    pub names_taken: Vec<(String, Option<u64>)>,
     /// A page switch the host has not answered yet: the page asked for.
     switching: Option<Option<String>>,
     /// Page edits sent and not answered yet, by page. The host answers each with the page as
@@ -114,6 +118,7 @@ impl Guest {
             peers: Vec::new(),
             history: Vec::new(),
             refusals: Vec::new(),
+            names_taken: Vec::new(),
             switching: None,
             in_flight: BTreeMap::new(),
             taking_back: 0,
@@ -247,6 +252,11 @@ impl Guest {
             edit,
             seq: self.last_edit,
         }
+    }
+
+    /// The `seq` of the latest project edit this guest sent (0 before the first).
+    pub fn last_edit(&self) -> u64 {
+        self.last_edit
     }
 
     /// Whether a change that set a page this guest holds is unanswered: edits of that page wait
@@ -472,6 +482,9 @@ impl Guest {
                         self.answered(page);
                     }
                     _ => {}
+                }
+                if let Refusal::PictureNameTaken { file } = &refusal {
+                    self.names_taken.push((file.clone(), edit));
                 }
                 self.refusals.push(refusal);
             }
