@@ -19,7 +19,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use wc_core::Part;
 
-use crate::{Error, Result};
+use crate::{Error, Result, printable};
 
 /// The largest entry read, in bytes; a larger one is skipped and counted.
 pub const MAX_ENTRY: u64 = 64 * 1024 * 1024;
@@ -145,20 +145,6 @@ pub fn apply_symbol_map(parts: &mut [Part], map: &BTreeMap<String, String>, repo
         }
     }
     chosen.len()
-}
-
-/// `s` with control characters (escape, line breaks, ...) written as `\u{1b}`, so a name from an
-/// archive prints as one line of plain text. Backslashes in EPLAN paths are kept as they are.
-fn printable(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() {
-                c.escape_unicode().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
 }
 
 impl Report {
