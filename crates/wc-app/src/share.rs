@@ -199,25 +199,27 @@ pub fn outgoing(
     out
 }
 
-/// Pages `ids` of this person's whose change the session refused, as the session has them, in
-/// the window (and in `base`, what it last synced to), dropping what was changed on them since.
+/// Put back in the window (and in `base`, the last state synced) what a refused change of this
+/// person's own page touched: the pages `ids` as the session has them (also one deleted here
+/// meanwhile, or one the session no longer has) and the project `records` it touched (as the
+/// session has them now), so the action is not left half kept.
 fn take_back_pages(
     open: &mut Open,
     base: Option<&mut Project>,
     auth: &Project,
     ids: &[String],
+    records: wc_share::Parts,
     notes: &mut Vec<String>,
 ) {
-    let mut base = base;
+    // The records it touched as the session has them now: a later change to one may have come
+    // in with the refusal.
+    let mut parts = wc_share::Parts::read(auth, &records);
     for id in ids {
-        if let Some(page) = auth.page(id) {
-            if let Some(p) = open.project.page_mut(id) {
-                *p = page.clone();
-            }
-            if let Some(p) = base.as_deref_mut().and_then(|b| b.page_mut(id)) {
-                *p = page.clone();
-            }
-        }
+        parts.pages.insert(id.clone(), auth.page(id).cloned());
+    }
+    parts.apply(&mut open.project);
+    if let Some(base) = base {
+        parts.apply(base);
     }
     open.dirty = true;
     notes.push(format!(
@@ -226,9 +228,21 @@ fn take_back_pages(
     ));
 }
 
-/// The most a folded batch may take as JSON: well under a session message's limit
-/// ([`net::MAX_LINE`]), leaving room for the message around it.
-const FOLD_LIMIT: usize = net::MAX_LINE / 2;
+/// Take back in the window what the session refused since the last look ([`Role::retaken`]).
+fn drain_retaken(role: &mut Role, open: &mut Open, base: Option<&mut Project>, notes: &mut Vec<String>) {
+    let (ids, records) = role.retaken();
+    if ids.is_empty() {
+        return;
+    }
+    if let Some(auth) = role.project() {
+        take_back_pages(open, base, auth, &ids, records, notes);
+    }
+}
+
+/// The most a folded batch may take as JSON: a session message's limit ([`net::MAX_LINE`])
+/// less room for the message around it (its kind, number and author, a few hundred bytes; the
+/// edits are carried as they are, not quoted again).
+const FOLD_LIMIT: usize = net::MAX_LINE - 64 * 1024;
 
 /// How long `v` is as JSON (what a session message carries).
 fn json_len<T: serde::Serialize>(v: &T) -> usize {
@@ -248,25 +262,27 @@ fn fold_own_page(out: &mut Outgoing, base: &Project) {
         return;
     };
     // The batch goes as one message, which carries the page twice (as it is and as it was): one
-    // that would not fit a session message goes as before, the page edit apart.
-    let total = out.edits.iter().map(json_len).sum::<usize>() + json_len(&page) + json_len(&was);
-    if total > FOLD_LIMIT {
-        out.page = Some(page);
-        return;
-    }
-    match out.edits.iter_mut().find_map(|e| match e {
+    // that would not fit a session message goes as before, the page edit apart. Measured as it
+    // would go, separators and all.
+    let mut edits = out.edits.clone();
+    match edits.iter_mut().find_map(|e| match e {
         ProjectEdit::SetPages { pages, before } => Some((pages, before)),
         _ => None,
     }) {
         Some((pages, before)) => {
-            pages.push(page);
+            pages.push(page.clone());
             before.push(was);
         }
-        None => out.edits.push(ProjectEdit::SetPages {
-            pages: vec![page],
+        None => edits.push(ProjectEdit::SetPages {
+            pages: vec![page.clone()],
             before: vec![was],
         }),
     }
+    if json_len(&edits) > FOLD_LIMIT {
+        out.page = Some(page);
+        return;
+    }
+    out.edits = edits;
 }
 
 /// Page `base` as both this window (`local`) and the session (`auth`) changed it: the session's
@@ -1004,6 +1020,23 @@ pub struct NewItems {
     /// Items this copy updated whose earlier version the session took back since the last sync
     /// (`base` has them, the session no longer does): not sent, as an add would undo that.
     pub stale: Vec<String>,
+    /// Files the session lacks whose copy here is back but cannot be sent (another version than
+    /// the pin, or unreadable), with the reason. Nothing waits for them.
+    pub unsent_repairs: Vec<(String, String)>,
+}
+
+/// The items the host's session locks but has no file of ([`wc_share::Host::files_missing`]),
+/// as [`item_name`] names them; none for a guest.
+fn repairs_due(role: &Role) -> std::collections::BTreeSet<String> {
+    match role {
+        Role::Host(h) => h
+            .host
+            .files_missing()
+            .into_iter()
+            .map(|(kind, id)| item_name(kind, &id))
+            .collect(),
+        Role::Guest(_) => Default::default(),
+    }
 }
 
 /// The symbols and parts locked in `local` and not in the session's project `auth`, with their
@@ -1012,7 +1045,9 @@ pub struct NewItems {
 /// names the version the session has. Items named in `skip` (sent and not answered yet) are
 /// left out. Items named in `apart` (sent before and not taken) go each in an edit of its own,
 /// so one the session cannot store does not keep the others out. An item whose file cannot be
-/// read is not sent; it is returned with the reason and tried again next time.
+/// read is not sent; it is returned with the reason and tried again next time. Items named in
+/// `repair` the session locks in the same version but has no file of (a host that started the
+/// session with the copy missing): they are sent again as an add, so guests get the file.
 pub fn new_items(
     dir: &Path,
     local: &Project,
@@ -1020,6 +1055,7 @@ pub fn new_items(
     auth: &Project,
     skip: &std::collections::BTreeSet<String>,
     apart: &std::collections::BTreeSet<String>,
+    repair: &std::collections::BTreeSet<String>,
 ) -> NewItems {
     let mut out = NewItems::default();
     // (id, source, hash here, the session's hash when it is an update)
@@ -1035,6 +1071,10 @@ pub fn new_items(
                 None => Some((id.clone(), e.source.clone(), e.hash.clone(), None)),
                 Some(a) if updated_here(local, base, auth, kind, id) => {
                     Some((id.clone(), e.source.clone(), e.hash.clone(), Some(a.hash.clone())))
+                }
+                // The session's entry as it is (its source too): only the file is missing.
+                Some(a) if a.hash == e.hash && repair.contains(&item_name(kind, id)) => {
+                    Some((id.clone(), a.source.clone(), e.hash.clone(), None))
                 }
                 Some(_) => None,
             })
@@ -1063,6 +1103,14 @@ pub fn new_items(
                     Some(before) => new_symbols.push((s, source, before)),
                 }
             }
+            // A repair whose file is not back here yet waits quietly: the session works as is.
+            // One that is back but cannot be sent says why, and so does one whose file cannot
+            // be looked for (no access, or an id that makes no file name).
+            Err(e) if before.is_none() && auth.lock.symbols.contains_key(&id) => {
+                if !store::vendor_path(dir, ItemKind::Symbol, &id).is_ok_and(|p| matches!(p.try_exists(), Ok(false))) {
+                    out.unsent_repairs.push((item_name(ItemKind::Symbol, &id), e));
+                }
+            }
             Err(e) => out.unreadable.push((item_name(ItemKind::Symbol, &id), e)),
         }
     }
@@ -1074,6 +1122,11 @@ pub fn new_items(
                 match before {
                     None => parts.push((p, source)),
                     Some(before) => new_parts.push((p, source, before)),
+                }
+            }
+            Err(e) if before.is_none() && auth.lock.parts.contains_key(&id) => {
+                if !store::vendor_path(dir, ItemKind::Part, &id).is_ok_and(|p| matches!(p.try_exists(), Ok(false))) {
+                    out.unsent_repairs.push((item_name(ItemKind::Part, &id), e));
                 }
             }
             Err(e) => out.unreadable.push((item_name(ItemKind::Part, &id), e)),
@@ -1533,10 +1586,13 @@ impl Role {
 
     /// This person's pages whose change the session refused, taken back whole since the last
     /// call ([`Guest::retaken`]).
-    fn retaken(&mut self) -> Vec<String> {
+    fn retaken(&mut self) -> (Vec<String>, wc_share::Parts) {
         match self {
-            Role::Host(_) => Vec::new(),
-            Role::Guest(j) => std::mem::take(&mut j.guest.retaken),
+            Role::Host(_) => Default::default(),
+            Role::Guest(j) => (
+                std::mem::take(&mut j.guest.retaken),
+                std::mem::take(&mut j.guest.retaken_records),
+            ),
         }
     }
 
@@ -2316,13 +2372,21 @@ fn panel_mentions(panel: &wc_core::panel::Panel, tag: &dyn Fn(&wc_core::DeviceTa
 }
 
 /// One symbol or part sent to the session and not taken yet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ItemOut {
     at: std::time::Instant,
     tries: u32,
     /// Not taken after [`ITEM_TRIES`] tries: changes no longer wait for it, and it is sent again
     /// only every [`ITEM_RETRY_LATER`].
     gave_up: bool,
+    /// The version (lock hash here) it was sent in: a later version of the item is another
+    /// send, not held back by this one's wait.
+    hash: Option<String>,
+}
+
+/// The hash this copy locks the item [`item_name`] names in.
+fn local_hash(local: &Project, name: &str) -> Option<String> {
+    named(name).and_then(|(kind, id)| local.lock.map(kind).get(id).map(|e| e.hash.clone()))
 }
 
 /// How long an item sent to the session may take to be answered before it is sent again.
@@ -2593,12 +2657,10 @@ impl Share {
         if !role.pump(&mut self.notes) {
             // A refusal that came with the end of the session still takes its page back: the
             // action is not left half kept in this copy.
-            let retaken = role.retaken();
-            if let (Some(open), Some(auth)) = (open.as_deref_mut(), role.project())
-                && !retaken.is_empty()
+            if let Some(open) = open.as_deref_mut()
                 && role.dir().is_some_and(|d| d == open.dir)
             {
-                take_back_pages(open, None, auth, &retaken, &mut self.notes);
+                drain_retaken(role, open, None, &mut self.notes);
             }
             // A join that was turned away goes back to the Join dialog, which says why: always
             // for another version (the person has to update one side), for a plain decline only
@@ -2665,13 +2727,8 @@ impl Share {
         // The session refused an action that changed this person's own page with project
         // records: the page takes the session's version, also over what was changed on it while
         // the answer was on its way, so the action is not half kept.
-        let retaken = role.retaken();
-        if !retaken.is_empty()
-            && let Some(auth) = role.project()
-        {
-            let base = self.base.get_or_insert_with(|| open.project.clone());
-            take_back_pages(open, Some(base), auth, &retaken, &mut self.notes);
-        }
+        let base = self.base.get_or_insert_with(|| open.project.clone());
+        drain_retaken(role, open, Some(base), &mut self.notes);
         // While such a change is on its way, later changes wait in the window: sent now, they
         // could not be taken back with it.
         if role.own_page_waits() {
@@ -2720,14 +2777,20 @@ impl Share {
         );
         // An item the session took is done; one this copy no longer locks (an undo, or an
         // assistant command that rewrote the project) is not sent again, so nothing waits for it.
-        self.items_out
-            .retain(|name, _| !session_took(auth, &open.project, base, name) && session_has(&open.project, name));
+        // A file the session still lacks is not taken, though its pin is there.
+        let repair = repairs_due(role);
+        self.items_out.retain(|name, _| {
+            (!session_took(auth, &open.project, base, name) || repair.contains(name))
+                && session_has(&open.project, name)
+        });
         for (name, out) in self.items_out.iter_mut() {
             if !out.gave_up && out.tries >= ITEM_TRIES && out.at.elapsed() >= ITEM_WAIT {
                 out.gave_up = true;
                 // An update is not kept apart from the project: the copy takes the session's
                 // version again below, as everyone else works on that one.
-                self.notes.push(if session_has(auth, name) {
+                self.notes.push(if repair.contains(name) {
+                    format!("The session could not store the file of {name}; others without the library cannot draw it until it can.")
+                } else if session_has(auth, name) {
                     format!(
                         "The session did not take your update of {name}; your copy takes the session's version again."
                     )
@@ -2743,22 +2806,45 @@ impl Share {
             .iter()
             // One given up is still sent now and then, so it gets in once its file can be read
             // or the session can store it; changes no longer wait for it.
-            .filter(|(_, o)| o.at.elapsed() < if o.gave_up { ITEM_RETRY_LATER } else { ITEM_WAIT })
+            // A version changed here since is sent at once.
+            .filter(|(n, o)| {
+                o.at.elapsed() < if o.gave_up { ITEM_RETRY_LATER } else { ITEM_WAIT }
+                    && o.hash == local_hash(&open.project, n)
+            })
             .map(|(n, _)| n.clone())
             .collect();
         // An item sent before and not taken goes alone, so one the session cannot store does
         // not keep out the others it was sent with.
         let apart = self.items_out.keys().cloned().collect();
-        let items = new_items(&open.dir, &open.project, base, auth, &skip, &apart);
+        // The host's session files: one it locks but has no file of goes out again from here.
+        let items = new_items(&open.dir, &open.project, base, auth, &skip, &apart, &repair);
+        for (name, why) in &items.unsent_repairs {
+            if self.unreadable.insert(format!("repair {name}")) {
+                self.notes.push(format!(
+                    "The file of {name} is back but cannot be shared ({why}); others without the library cannot draw it."
+                ));
+            }
+        }
         let now = std::time::Instant::now();
         for (name, why) in &items.unreadable {
             // A file that cannot be read counts as a try: the changes that may draw the item
             // wait for it as for a sent one, and go once the tries are used up.
+            let hash = local_hash(&open.project, name);
             let out = self.items_out.entry(name.clone()).or_insert(ItemOut {
                 at: now,
                 tries: 0,
                 gave_up: false,
+                hash: hash.clone(),
             });
+            // Another version starts its tries afresh.
+            if out.hash != hash {
+                *out = ItemOut {
+                    at: now,
+                    tries: 0,
+                    gave_up: false,
+                    hash,
+                };
+            }
             out.at = now;
             out.tries += 1;
             if self.unreadable.insert(name.clone()) {
@@ -2776,11 +2862,22 @@ impl Share {
         }
         for name in &items.sent {
             self.unreadable.remove(name);
+            let hash = local_hash(&open.project, name);
             let out = self.items_out.entry(name.clone()).or_insert(ItemOut {
                 at: now,
                 tries: 0,
                 gave_up: false,
+                hash: hash.clone(),
             });
+            // Another version starts its tries afresh.
+            if out.hash != hash {
+                *out = ItemOut {
+                    at: now,
+                    tries: 0,
+                    gave_up: false,
+                    hash,
+                };
+            }
             out.at = now;
             out.tries += 1;
         }
@@ -2790,9 +2887,10 @@ impl Share {
             }
             role.pump(&mut self.notes);
             take_updates(role, base, &mut self.items_out);
+            let repair = repairs_due(role);
             let auth = role.project()?;
             self.items_out
-                .retain(|name, _| !session_took(auth, &open.project, base, name));
+                .retain(|name, _| !session_took(auth, &open.project, base, name) || repair.contains(name));
             // What the session took in is the baseline now, so a take-back before the last
             // look of this frame is still seen.
             follow_take_backs(
@@ -2915,6 +3013,8 @@ impl Share {
             role.pump(&mut self.notes);
         }
         let base = self.base.get_or_insert_with(|| open.project.clone());
+        // A refusal in that answer takes its pages back now, before anything is done on them.
+        drain_retaken(role, open, Some(base), &mut self.notes);
         take_updates(role, base, &mut self.items_out);
         let auth = role.project()?;
         let conflicting = conflicts(&open.project, base, auth);

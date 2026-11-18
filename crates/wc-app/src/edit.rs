@@ -588,17 +588,16 @@ impl Open {
     }
 
     /// Paste so the clipboard's anchor lands on `at`. Pasted symbols get fresh ids and the next
-    /// free device tags (one new device per copied device). Returns the pasted items.
-    pub fn paste(&mut self, page: usize, clip: &Clipboard, at: Point) -> Vec<Selection> {
+    /// free device tags (one new device per copied device). Returns the pasted items, or why
+    /// nothing was pasted when a symbol it needs can't be loaded (nothing is added then).
+    pub fn paste(&mut self, page: usize, clip: &Clipboard, at: Point) -> Result<Vec<Selection>, String> {
         if clip.is_empty() || self.project.pages.get(page).is_none() || self.held_reason(page).is_some() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        for s in &clip.symbols {
-            // Symbols copied from another project are taken from the library when possible.
-            if !self.symbols.contains_key(&s.symbol) {
-                let _ = self.ensure_symbol(&s.symbol);
-            }
-        }
+        // Every symbol it uses, checked against its pin (a loaded copy may be another version);
+        // those copied from another project are taken from the library when possible.
+        let ids: std::collections::BTreeSet<&str> = clip.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        self.ensure_symbols(ids)?;
         self.checkpoint();
         let d = Point::new(at.x - clip.anchor.x, at.y - clip.anchor.y);
         let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
@@ -633,7 +632,7 @@ impl Open {
             out.push(Selection::Symbol(id));
         }
         let Some(p) = self.project.pages.get_mut(page) else {
-            return out;
+            return Ok(out);
         };
         for w in &clip.wires {
             let mut w = w.clone();
@@ -659,7 +658,7 @@ impl Open {
             p.graphics.push(g.translate(d));
             out.push(Selection::Graphic(p.graphics.len() - 1));
         }
-        out
+        Ok(out)
     }
 }
 
@@ -790,7 +789,7 @@ mod tests {
         let sel = o.select_all(page);
         let clip = o.copy(page, &sel);
         assert_eq!((clip.symbols.len(), clip.wires.len()), (2, 1));
-        let pasted = o.paste(page, &clip, Point::new(150.0, 100.0));
+        let pasted = o.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
         assert_eq!(pasted.len(), 3);
         let p = &o.project.pages[page];
         assert_eq!(p.symbols.len(), 4);
@@ -1101,7 +1100,7 @@ mod tests {
         );
         let clip = o.copy(page, &boxed);
         assert_eq!(clip.graphics.len(), 2);
-        let pasted = o.paste(page, &clip, Point::new(10.0, 10.0));
+        let pasted = o.paste(page, &clip, Point::new(10.0, 10.0)).unwrap();
         assert_eq!(pasted, vec![Selection::Graphic(2), Selection::Graphic(3)]);
         o.delete_many(page, &[line]);
         let left = &o.project.pages[page].graphics;
