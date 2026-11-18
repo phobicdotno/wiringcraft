@@ -1212,6 +1212,15 @@ impl Open {
                 from.display()
             ));
         }
+        // A repository whose git config names its own work tree would go on recording the
+        // original's files from the copy.
+        if git_worktree_set(&from.join(".git").join("config")) {
+            return Err(format!(
+                "{}'s git history names its own work tree (core.worktree), so a copy would record \
+                 the original's files. Copy the folder by hand and start a new history.",
+                from.display()
+            ));
+        }
         let existed = target.exists();
         if existed && !target.is_dir() {
             return Err(format!(
@@ -1283,7 +1292,13 @@ impl Open {
                         // copied along, so the copy's own, written from the copy's root.
                         Ok(inside) if inside.as_os_str().is_empty() => ".".into(),
                         Ok(inside) => inside.display().to_string(),
-                        Err(_) => relative_to(&at, &base).unwrap_or(at).display().to_string(),
+                        // A route the saved text can hold: the relative one when it is valid
+                        // text, otherwise the original's own route (through any link) as a
+                        // full path, which stays text.
+                        Err(_) => match relative_to(&at, &base).as_deref().and_then(Path::to_str) {
+                            Some(t) => t.to_owned(),
+                            None => from.join(&lib.location).display().to_string(),
+                        },
                     };
                 }
             }
@@ -2378,6 +2393,30 @@ fn lexical_parts(p: &Path) -> Vec<std::path::Component<'_>> {
     out
 }
 
+/// Whether a git config file sets `core.worktree` (a work tree elsewhere than its folder).
+fn git_worktree_set(config: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return false;
+    };
+    let mut in_core = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_core = line
+                .trim_start_matches('[')
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("core")
+                && !line.contains('"');
+        } else if in_core {
+            let key = line.split('=').next().unwrap_or_default().trim();
+            if key.eq_ignore_ascii_case("worktree") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// A full path as the file system walks it: its longest existing part (with any `..` in it)
 /// resolved, links and all, then the rest added, a `..` in the rest going up from the folder
 /// reached so far. `/w/link/../copy` with `link` pointing at `/w/a/b` is `/w/a/copy`.
@@ -2587,6 +2626,44 @@ pub(crate) mod tests {
         o.save().unwrap();
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), coil);
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.lamp").unwrap(), lamp);
+    }
+
+    #[test]
+    fn save_as_refuses_a_history_that_names_its_own_work_tree() {
+        let (tmp, mut o) = project();
+        std::fs::create_dir_all(o.dir.join(".git")).unwrap();
+        std::fs::write(
+            o.dir.join(".git").join("config"),
+            "[core]\n\tbare = false\n\tworktree = /elsewhere\n",
+        )
+        .unwrap();
+        let to = tmp.path().join("copy");
+        assert!(o.save_as(&to).unwrap_err().contains("core.worktree"));
+        assert!(!to.exists());
+        // Without it the history is the copy's own.
+        std::fs::write(o.dir.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
+        o.save_as(&to).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_library_reached_through_a_link_to_a_name_that_is_not_text_keeps_a_text_route() {
+        use std::os::unix::ffi::OsStrExt;
+        let (tmp, mut o) = project();
+        let odd = tmp.path().join(std::ffi::OsStr::from_bytes(b"shop-\xff"));
+        std::fs::create_dir_all(&odd).unwrap();
+        std::os::unix::fs::symlink(&odd, tmp.path().join("shop-link")).unwrap();
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "shop".into(),
+            kind: "folder".into(),
+            location: "../shop-link".into(),
+            reference: None,
+        });
+        let from = o.dir.clone();
+        o.save_as(&tmp.path().join("copies").join("copy")).unwrap();
+        let lib = o.project.meta.libraries.iter().find(|l| l.name == "shop").unwrap();
+        assert_eq!(Path::new(&lib.location), from.join("../shop-link"));
+        assert!(Path::new(&lib.location).is_dir());
     }
 
     #[test]

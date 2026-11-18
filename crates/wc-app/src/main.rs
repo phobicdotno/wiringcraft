@@ -536,6 +536,8 @@ impl App {
                 {
                     Picked::Path(d) => (d, String::new()),
                     Picked::Failed(e) => {
+                        // No folder field here: the picker's "type the folder" hint does not apply.
+                        let e = e.strip_suffix(TYPE_INSTEAD).unwrap_or(&e);
                         let note = format!("{e} So they go to the usual place, {}.\n\n", default.display());
                         (default, note)
                     }
@@ -561,17 +563,7 @@ impl App {
                     self.dialog = Some(Dialog::Message(msg));
                 }
             }
-            Pending::Marking(options) => {
-                let default = wago_marking_file(open, &options);
-                let Some((path, note)) =
-                    export_target("Export WAGO markers", &default, ("CSV list", &["csv"]), &pick_save)
-                else {
-                    // Cancelled: the options come back as they were set, to try again.
-                    self.dialog = Some(wago_marking_dialog_with(open, &options));
-                    return;
-                };
-                self.dialog = Some(Dialog::Message(note + &export_wago_marking_to(open, &options, &path)));
-            }
+            Pending::Marking(options) => self.dialog = Some(export_markers(open, &options, &pick_save)),
             Pending::WagoList => {
                 let file = match pick_open(
                     "WAGO configurator list with articles",
@@ -2435,7 +2427,7 @@ fn pick_folder(title: &str, start: &str) -> Picked {
     let shown = std::time::Instant::now();
     let r = dialog.pick_folder();
     match picker_outcome(r, shown.elapsed(), &applog::take_picker_errors()) {
-        Picked::Failed(e) => Picked::Failed(format!("{e} Type the folder instead.")),
+        Picked::Failed(e) => Picked::Failed(format!("{e}{TYPE_INSTEAD}")),
         p => p,
     }
 }
@@ -2495,6 +2487,16 @@ fn export_target(
     }
 }
 
+/// The WAGO marker export to the file asked for with the save dialog `pick`: the message it
+/// leaves, or on Cancel the options dialog again, as it was set, to try again.
+fn export_markers(open: &Open, options: &wc_report::MarkingOptions, pick: PickSave<'_>) -> Dialog {
+    let default = wago_marking_file(open, options);
+    match export_target("Export WAGO markers", &default, ("CSV list", &["csv"]), pick) {
+        Some((path, note)) => Dialog::Message(note + &export_wago_marking_to(open, options, &path)),
+        None => wago_marking_dialog_with(open, options),
+    }
+}
+
 /// A whole-project export to the file asked for with the save dialog `pick`: what it says, or
 /// `None` when the person cancelled (nothing is written then).
 fn export_whole(open: &Open, kind: Export, pick: PickSave<'_>) -> Option<String> {
@@ -2527,6 +2529,9 @@ fn write_creating(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     }
     std::fs::write(path, bytes)
 }
+
+/// What [`pick_folder`] adds to its failure: callers with a folder field can take it.
+const TYPE_INSTEAD: &str = " Type the folder instead.";
 
 /// The usual place for a whole-project export: `export/<project name>.<extension>`.
 fn export_file(open: &Open, extension: &str) -> PathBuf {
@@ -3117,7 +3122,8 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
                 .chars()
                 .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
                 .collect();
-            while !used.insert(stem.clone()) {
+            // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
+            while !used.insert(stem.to_lowercase()) {
                 stem.push('_');
             }
             (stem, page)
@@ -3153,13 +3159,38 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
                 .and_then(|mut f| f.write_all(bytes.as_bytes()))
         }
     };
+    // In another folder, what a failed export made is taken away again, so it can be retried;
+    // a file that was there before is never touched (it was refused above or by create_new).
+    let mut made: Vec<PathBuf> = Vec::new();
     let written = std::fs::create_dir_all(dir).and_then(|()| {
         for (stem, page) in &files {
-            write(dir.join(format!("{stem}.svg")), wc_pdf::svg(page))?;
-            write(dir.join(format!("{stem}.dxf")), wc_pdf::dxf(page))?;
+            for (path, bytes) in [
+                (dir.join(format!("{stem}.svg")), wc_pdf::svg(page)),
+                (dir.join(format!("{stem}.dxf")), wc_pdf::dxf(page)),
+            ] {
+                let r = write(path.clone(), bytes);
+                // create_new made the file even when writing it then failed.
+                if !own
+                    && (r.is_ok() || path.exists())
+                    && !matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists)
+                {
+                    made.push(path);
+                }
+                r?;
+            }
         }
         Ok(())
     });
+    if written.is_err() {
+        for path in &made {
+            if let Err(e) = std::fs::remove_file(path) {
+                applog::warn(&format!(
+                    "could not remove {} after the failed export: {e}",
+                    path.display()
+                ));
+            }
+        }
+    }
     match written {
         Ok(()) => {
             let mut m = format!("Exported {} pages as SVG and DXF to\n{}", pages.len(), dir.display());
@@ -4085,16 +4116,19 @@ mod marking_tests {
             kinds: vec![wc_report::MarkerKind::Terminals],
             lines: vec![wc_report::LineField::Marker, wc_report::LineField::Description],
             language: wc_report::Language::De,
-            strip: None,
+            strip: Some("-X1".into()),
             level_separator: "/".into(),
         };
+        // Through the export itself, with its save dialog cancelled.
+        let cancel = |_: &str, _: &Path, _: &str, _: Option<(&str, &[&str])>| Picked::Cancelled;
         let Dialog::WagoMarking {
             kinds,
             lines,
             language,
+            strip,
             level_separator,
             ..
-        } = wago_marking_dialog_with(&o, &options)
+        } = export_markers(&o, &options, &cancel)
         else {
             unreachable!("not the marking dialog");
         };
@@ -4109,6 +4143,23 @@ mod marking_tests {
         );
         assert_eq!(language, wc_report::Language::De);
         assert_eq!(level_separator, "/");
+        assert_eq!(strip.as_deref(), Some("-X1"));
+        assert!(!o.dir.join("export").exists(), "nothing written");
+    }
+
+    #[test]
+    fn pages_whose_numbers_differ_only_in_case_get_their_own_drawing_files() {
+        let (_tmp, mut o) = state::tests::project();
+        o.project.pages[0].number = "A1".into();
+        o.project.pages[1].number = "a1".into();
+        let own = o.dir.join("export").join("drawings");
+        assert!(export_drawings_to(&o, &own).starts_with("Exported 2 pages"));
+        let mut names: Vec<String> = std::fs::read_dir(&own)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_lowercase())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a1.dxf", "a1.svg", "a1_.dxf", "a1_.svg"]);
     }
 
     #[test]
