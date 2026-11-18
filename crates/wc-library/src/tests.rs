@@ -211,3 +211,24 @@ fn a_jumper_part_is_listed_as_used_by_its_jumper() -> std::result::Result<(), Bo
     assert_eq!(jumper.used_by, vec!["-X1 jumper 1-2"]);
     Ok(())
 }
+
+#[test]
+fn a_library_file_declaring_another_id_is_not_taken() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut f = fixture()?;
+    // `fake.json` in the library holds the symbol `other`.
+    let other = f.company.join("symbols").join("other.json");
+    std::fs::copy(&other, f.company.join("symbols").join("fake.json"))?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "other")?;
+    let kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "other")?)?;
+    let err = take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "fake")
+        .err()
+        .ok_or("taken")?;
+    assert!(err.to_string().contains("declares id \"other\""), "{err}");
+    assert!(!f.project.lock.symbols.contains_key("fake"), "not pinned");
+    assert_eq!(
+        std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "other")?)?,
+        kept
+    );
+    Ok(())
+}

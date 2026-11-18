@@ -290,17 +290,32 @@ pub fn take(project_dir: &Path, project: &mut Project, lib: &Library, kind: Item
     let entry = match kind {
         ItemKind::Symbol => {
             let (s, source) = lib.symbol(id)?;
+            same_id(&source, "symbol", id, &s.id)?;
             store::write_vendored_symbol(project_dir, &s)?;
             LockEntry { source, hash: s.hash() }
         }
         ItemKind::Part => {
             let (p, source) = lib.part(id)?;
+            same_id(&source, "part", id, &p.id)?;
             store::write_vendored_part(project_dir, &p)?;
             LockEntry { source, hash: p.hash() }
         }
     };
     project.lock.map_mut(kind).insert(id.to_owned(), entry.clone());
     Ok(entry)
+}
+
+/// A library file must hold the item it is named after: the project stores the copy under the
+/// id inside it, so another id would write over that item's copy and pin a file that is not
+/// there.
+fn same_id(source: &str, kind: &str, wanted: &str, inside: &str) -> Result<()> {
+    if wanted == inside {
+        return Ok(());
+    }
+    Err(Error::Source {
+        name: source.to_owned(),
+        message: format!("the {kind} file for {wanted:?} declares id {inside:?}"),
+    })
 }
 
 /// Pin every used item that is not pinned yet. Items missing from the library are returned.

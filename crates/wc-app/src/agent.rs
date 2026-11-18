@@ -1949,7 +1949,7 @@ impl App {
         if action == "list" {
             return Ok(pretty(&json!(jumper_list(&open.project.meta.jumpers))));
         }
-        let strip = DeviceTag::parse(need_s(v, "strip")?.trim()).map_err(|e| e.to_string())?;
+        let strip = tag(need_s(v, "strip")?)?;
         match action {
             "add" => {
                 let terminals = strings(v, "terminals");
@@ -1967,6 +1967,17 @@ impl App {
                 if terminals.is_empty() {
                     return Err("`terminals` is missing.".into());
                 }
+                // A terminal is one tag level, as `add` checks: refuse the whole request
+                // before anything changes.
+                for t in &terminals {
+                    let mut one = strip.clone();
+                    one.product.push(t.trim().to_owned());
+                    if DeviceTag::parse(&one.to_string()).ok().as_ref() != Some(&one) {
+                        return Err(format!(
+                            "{t:?} cannot be a terminal of {strip}: a terminal is one tag level."
+                        ));
+                    }
+                }
                 if !open.remove_from_jumpers(&strip, &terminals) {
                     return Err(format!("No jumper of {strip} has terminal {}.", terminals.join(", ")));
                 }
@@ -1974,6 +1985,11 @@ impl App {
             }
             "part" => {
                 let terminal = need_s(v, "terminal")?.trim();
+                // Only a text (empty clears it) or nothing at all: another value is a mistake,
+                // not a request to clear the part.
+                if v.get("part").is_some_and(|p| !p.is_string() && !p.is_null()) {
+                    return Err("`part` must be a part id, or an empty text to clear it.".into());
+                }
                 let part = s(v, "part").map(str::trim).filter(|p| !p.is_empty());
                 open.set_jumper_part(&strip, terminal, part)?;
                 Ok(match part {
@@ -2580,16 +2596,31 @@ mod tests {
         assert_eq!(undo_mark(&a), before + 3);
         assert_eq!(list(&mut a), json!([]));
         assert!(a.open.as_mut().unwrap().undo());
-        assert_eq!(list(&mut a)[0]["terminals"], json!(["1", "2", "4"]));
+        let with_part = json!([{"strip": "-X1", "terminals": ["1", "2", "4"], "part": "example.ex-tb-2-5"}]);
+        assert_eq!(list(&mut a), with_part);
 
-        // Clearing the part.
+        // A two-level terminal or a part that is not a text is refused whole.
+        let mark = undo_mark(&a);
+        for bad in [
+            json!({"action": "remove", "strip": "-X1", "terminals": ["1", "2.1"]}),
+            json!({"action": "part", "strip": "-X1", "terminal": "4", "part": 42}),
+        ] {
+            assert!(call(&mut a, "jumpers", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(list(&mut a), with_part);
+        assert_eq!(undo_mark(&a), mark);
+
+        // Clearing the part keeps the jumper.
         call(
             &mut a,
             "jumpers",
             json!({"action": "part", "strip": "-X1", "terminal": "4", "part": ""}),
         )
         .unwrap();
-        assert_eq!(list(&mut a)[0]["part"], json!(null));
+        assert_eq!(
+            list(&mut a),
+            json!([{"strip": "-X1", "terminals": ["1", "2", "4"], "part": null}])
+        );
     }
 
     #[test]
