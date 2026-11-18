@@ -6,11 +6,15 @@
 //! properties (`P_ARTICLE_PARTNR`, `P_ARTICLE_MANUFACTURER`, `P_ARTICLE_ORDERNR`,
 //! `P_ARTICLE_DESCR1`, ...). A `variant` inside a part fills in what the part leaves empty.
 //! Texts in several languages are written `de_DE@Schütz;en_US@Contactor;`; English is taken
-//! when there is one. Macros (`.ema`) are a closed binary format and are not read: the report lists them, and
-//! which macro each part names (`P_ARTICLE_MACRO`), so a symbol can be picked for it by hand or
-//! with a symbol map ([`apply_symbol_map`]). Pictures and other entries are counted, not imported.
+//! when there is one. Macros (`.ema`) are EPLAN's XML: each one's multi-line representation,
+//! variant A, is read as a library symbol with its connection points as pins ([`macros`]), and
+//! each part is linked to the symbol made from the macro it names (`P_ARTICLE_MACRO`, else
+//! `P_ARTICLE_GROUPSYMBOLMACRO`). A part whose macro is not in the archive, or could not be read,
+//! can get a symbol by hand or with a symbol map ([`apply_symbol_map`]). Pictures and other
+//! entries are counted, not imported.
 //!
-//! Written from public descriptions of the format and checked with synthetic archives only.
+//! Part data was written from public descriptions of the format, the macro reader from real
+//! maker macros; both are tested with synthetic files.
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -20,6 +24,19 @@ use quick_xml::reader::Reader;
 use wc_core::Part;
 
 use crate::{Error, Result, printable};
+
+pub mod macros;
+
+/// Everything read from an EDZ archive.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Edz {
+    /// Parts, sorted by id; each linked to the symbol made from its macro, when there is one.
+    pub parts: Vec<Part>,
+    /// Symbols made from the archive's macros, sorted by id.
+    pub symbols: Vec<wc_core::Symbol>,
+    pub report: Report,
+    pub warnings: Vec<String>,
+}
 
 /// The largest entry read, in bytes; a larger one is skipped and counted.
 pub const MAX_ENTRY: u64 = 64 * 1024 * 1024;
@@ -69,13 +86,19 @@ pub struct Report {
     pub parts: usize,
     /// XML files that held part data.
     pub part_files: usize,
-    /// EPLAN macros (`.ema`), not imported.
+    /// EPLAN macros (`.ema`).
     pub macros: usize,
+    /// Macros read as library symbols.
+    pub macro_symbols: usize,
+    /// Macros that could not be read as symbols; a warning for each says why.
+    pub macros_unread: usize,
+    /// What the macros read as symbols leave out, counted by what it is.
+    pub left_out: BTreeMap<String, usize>,
     /// Pictures, not imported.
     pub pictures: usize,
     /// Everything else (other XML, documents, folders' contents), not imported.
     pub other: usize,
-    /// Part XML entries over the size limits, skipped.
+    /// Part XML and macro entries over the size limits, skipped.
     pub too_large: usize,
     /// The macro files' paths in the archive, sorted.
     pub macro_files: Vec<String>,
@@ -92,7 +115,8 @@ pub struct PartMacro {
     pub name: String,
     /// Whether the archive holds a macro file of that name.
     pub in_archive: bool,
-    /// The library symbol a symbol map gave the part for it ([`apply_symbol_map`]).
+    /// The library symbol the part got for it: the one made from the macro, or the one a
+    /// symbol map gave ([`apply_symbol_map`]).
     pub symbol: Option<String>,
 }
 
@@ -152,7 +176,13 @@ impl Report {
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![format!("{} part(s) from {} part file(s)", self.parts, self.part_files)];
         if self.macros > 0 {
-            out.push(format!("{} macro(s) (.ema): not imported", self.macros));
+            out.push(format!(
+                "{} macro(s) (.ema): {} read as symbols, {} not readable as symbols",
+                self.macros, self.macro_symbols, self.macros_unread
+            ));
+        }
+        for (what, n) in &self.left_out {
+            out.push(format!("left out of the macros' symbols: {n} {what}"));
         }
         if self.pictures > 0 {
             out.push(format!("{} picture(s): not imported", self.pictures));
@@ -161,7 +191,10 @@ impl Report {
             out.push(format!("{} other file(s): not imported", self.other));
         }
         if self.too_large > 0 {
-            out.push(format!("{} XML file(s) over the size limit: skipped", self.too_large));
+            out.push(format!(
+                "{} XML or macro file(s) over the size limit: skipped",
+                self.too_large
+            ));
         }
         for f in &self.macro_files {
             out.push(format!("macro file: {}", printable(f)));
@@ -211,20 +244,36 @@ pub fn read(bytes: &[u8]) -> Result<(Vec<Part>, Report, Vec<String>)> {
 
 /// [`read`] with other limits.
 pub fn read_with(bytes: &[u8], limits: Limits) -> Result<(Vec<Part>, Report, Vec<String>)> {
+    let edz = read_all_with(bytes, limits)?;
+    Ok((edz.parts, edz.report, edz.warnings))
+}
+
+/// Read an EDZ archive's parts and its macros as symbols. A damaged archive or part file is an
+/// error, never a panic; a macro that cannot be read is a warning.
+pub fn read_all(bytes: &[u8]) -> Result<Edz> {
+    read_all_with(bytes, LIMITS)
+}
+
+/// [`read_all`] with other limits. Macros count towards [`Limits::total`] like part XML.
+pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
     let too_many = || Error::Format(format!("the archive holds more than {} files", limits.entries));
     let mut report = Report::default();
     let mut xml: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut macro_data: Vec<(String, Vec<u8>)> = Vec::new();
     let mut total = 0u64;
     let mut take = |name: &str, size: u64, data: &mut dyn Read, report: &mut Report| -> Result<bool> {
-        match entry_kind(name) {
-            Entry::Macro => {
-                report.macros += 1;
-                report.macro_files.push(name.to_owned());
-            }
+        let kind = entry_kind(name);
+        if kind == Entry::Macro {
+            report.macros += 1;
+            report.macro_files.push(name.to_owned());
+        }
+        match kind {
             Entry::Picture => report.pictures += 1,
             Entry::Other => report.other += 1,
-            Entry::Xml if size > limits.entry || total.saturating_add(size) > limits.total => report.too_large += 1,
-            Entry::Xml => {
+            Entry::Xml | Entry::Macro if size > limits.entry || total.saturating_add(size) > limits.total => {
+                report.too_large += 1;
+            }
+            Entry::Xml | Entry::Macro => {
                 let mut buf = Vec::new();
                 data.take(limits.entry.saturating_add(1))
                     .read_to_end(&mut buf)
@@ -233,7 +282,11 @@ pub fn read_with(bytes: &[u8], limits: Limits) -> Result<(Vec<Part>, Report, Vec
                     report.too_large += 1;
                 } else {
                     total += buf.len() as u64;
-                    xml.push((name.to_owned(), buf));
+                    if kind == Entry::Macro {
+                        macro_data.push((name.to_owned(), buf));
+                    } else {
+                        xml.push((name.to_owned(), buf));
+                    }
                 }
             }
         }
@@ -322,16 +375,60 @@ pub fn read_with(bytes: &[u8], limits: Limits) -> Result<(Vec<Part>, Report, Vec
     }
     report.parts = parts.len();
     report.macro_files.sort();
+
+    // Each macro read as a symbol, by its file name in lower case.
+    macro_data.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut symbols: BTreeMap<String, wc_core::Symbol> = BTreeMap::new();
+    let mut by_file: BTreeMap<String, String> = BTreeMap::new();
+    for (name, data) in macro_data {
+        let text = crate::csv::decode(&data);
+        match macros::read(&name, &text) {
+            Ok(mut m) => {
+                let base = m.symbol.id.clone();
+                let mut n = 1;
+                while symbols.contains_key(&m.symbol.id) {
+                    n += 1;
+                    m.symbol.id = format!("{base}_{n}");
+                }
+                if n > 1 {
+                    warnings.push(format!(
+                        "macro {}: another macro has the same name; its symbol is {}",
+                        printable(&name),
+                        m.symbol.id
+                    ));
+                }
+                for (what, k) in m.left_out {
+                    *report.left_out.entry(what).or_default() += k;
+                }
+                by_file
+                    .entry(macro_file_name(&name))
+                    .or_insert_with(|| m.symbol.id.clone());
+                report.macro_symbols += 1;
+                symbols.insert(m.symbol.id.clone(), m.symbol);
+            }
+            Err(e) => {
+                report.macros_unread += 1;
+                warnings.push(format!("macro {} not imported: it {e}", printable(&name)));
+            }
+        }
+    }
+
     let in_archive: std::collections::BTreeSet<String> =
         report.macro_files.iter().map(|f| macro_file_name(f)).collect();
-    for p in parts.values() {
+    for p in parts.values_mut() {
         for k in MACRO_PROPERTIES {
             if let Some(name) = p.properties.get(k) {
+                let symbol = by_file.get(&macro_file_name(name)).cloned();
+                if p.symbol.is_none()
+                    && let Some(s) = &symbol
+                {
+                    p.symbol = Some(s.clone());
+                }
                 report.part_macros.push(PartMacro {
                     part: p.id.clone(),
                     name: name.clone(),
                     in_archive: in_archive.contains(&macro_file_name(name)),
-                    symbol: None,
+                    symbol,
                 });
             }
         }
@@ -339,7 +436,12 @@ pub fn read_with(bytes: &[u8], limits: Limits) -> Result<(Vec<Part>, Report, Vec
     if report.parts == 0 {
         warnings.push("the archive holds no part data".into());
     }
-    Ok((parts.into_values().collect(), report, warnings))
+    Ok(Edz {
+        parts: parts.into_values().collect(),
+        symbols: symbols.into_values().collect(),
+        report,
+        warnings,
+    })
 }
 
 /// One part's EPLAN properties, by name, and the first variant's for what the part leaves empty.

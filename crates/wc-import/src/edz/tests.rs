@@ -45,7 +45,10 @@ fn parts_come_with_number_maker_description_and_properties() -> TestResult {
         ("items/readme.txt", b"hello"),
     ])?;
     let (parts, report, warnings) = read(&edz)?;
-    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        warnings,
+        ["macro items/macros/SIE_3RT2015.ema not imported: it is not an EPLAN macro (no EplanPxfRoot)"]
+    );
     assert_eq!(parts.len(), 2);
     let c = parts
         .iter()
@@ -76,6 +79,9 @@ fn parts_come_with_number_maker_description_and_properties() -> TestResult {
             parts: 2,
             part_files: 1,
             macros: 1,
+            macro_symbols: 0,
+            macros_unread: 1,
+            left_out: BTreeMap::new(),
             pictures: 1,
             other: 1,
             too_large: 0,
@@ -87,7 +93,7 @@ fn parts_come_with_number_maker_description_and_properties() -> TestResult {
         report.lines(),
         [
             "2 part(s) from 1 part file(s)",
-            "1 macro(s) (.ema): not imported",
+            "1 macro(s) (.ema): 0 read as symbols, 1 not readable as symbols",
             "1 picture(s): not imported",
             "1 other file(s): not imported",
             "macro file: items/macros/SIE_3RT2015.ema",
@@ -133,7 +139,10 @@ fn an_archive_without_parts_says_so() -> TestResult {
     let (parts, report, warnings) = read(&edz)?;
     assert!(parts.is_empty());
     assert_eq!(report.macros, 1);
-    assert_eq!(warnings, ["the archive holds no part data"]);
+    assert_eq!(
+        warnings.last().map(String::as_str),
+        Some("the archive holds no part data")
+    );
     Ok(())
 }
 
@@ -186,7 +195,7 @@ fn an_xml_file_over_the_entry_limit_is_skipped_and_reported() -> TestResult {
         assert!(
             report
                 .lines()
-                .contains(&"1 XML file(s) over the size limit: skipped".to_owned())
+                .contains(&"1 XML or macro file(s) over the size limit: skipped".to_owned())
         );
     }
     Ok(())
@@ -387,5 +396,73 @@ fn control_characters_in_macro_names_print_as_plain_text() -> TestResult {
         lines.iter().any(|l| l.contains("macro SIE\\SIE_3SU1.ema (")),
         "{lines:?}"
     );
+    Ok(())
+}
+
+/// A macro as EPLAN writes one, cut down: a black box with two connection points.
+const CONTACTOR_MACRO: &str = r#"<EplanPxfRoot Name="SIE_3RT2015">
+ <MacroVariant VariantId="0" ReferencePoint="0/40" MacroFuncType="1" DocumentType="1">
+  <ESymLib Name="SPECIAL" ID="0"/>
+  <O17 A1261="0" A1262="1" A1381="301"><S89x5 A1651="0/-20" A1652="20/0"/><S40x1201 A762="0/40"/><P144 P20013="Q"/></O17>
+  <O17 A1261="0" A1262="40" A1263="0" A1381="300" A185="1"><S40x1201 A762="4/40"/></O17>
+  <O17 A1261="0" A1262="40" A1263="2" A1381="300" A185="2"><S40x1201 A762="4/20"/></O17>
+ </MacroVariant>
+</EplanPxfRoot>"#;
+
+#[test]
+fn macros_become_symbols_and_parts_get_the_symbol_of_the_macro_they_name() -> TestResult {
+    let edz = seven_zip(&[
+        ("items/parts.xml", PARTS_WITH_MACROS.as_bytes()),
+        ("items/macros/sie_3rt2015.EMA", CONTACTOR_MACRO.as_bytes()),
+        ("items/macros/OTHER.ema", b"binary macro"),
+    ])?;
+    let got = read_all(&edz)?;
+    assert_eq!(got.symbols.len(), 1);
+    let s = &got.symbols[0];
+    assert_eq!(s.id, "eplan.sie_3rt2015");
+    assert_eq!(s.letter_code, "Q");
+    assert_eq!(s.pins.len(), 2);
+    assert_eq!(
+        (got.report.macros, got.report.macro_symbols, got.report.macros_unread),
+        (2, 1, 1)
+    );
+    assert!(
+        got.warnings
+            .iter()
+            .any(|w| w.starts_with("macro items/macros/OTHER.ema not imported: it is not an EPLAN macro")),
+        "{:?}",
+        got.warnings
+    );
+    let contactor = got
+        .parts
+        .iter()
+        .find(|p| p.id == Part::make_id("SIE", "3RT2015-1BB41"))
+        .ok_or("no contactor")?;
+    assert_eq!(contactor.symbol.as_deref(), Some("eplan.sie_3rt2015"));
+    let lines = got.report.lines();
+    assert!(
+        lines.contains(&"2 macro(s) (.ema): 1 read as symbols, 1 not readable as symbols".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("drawn with symbol eplan.sie_3rt2015")),
+        "{lines:?}"
+    );
+    // A symbol map still decides over the macro's own symbol.
+    let mut parts = got.parts.clone();
+    let mut report = got.report.clone();
+    let map: BTreeMap<String, String> = [("sie_3rt2015".to_owned(), "wc.coil".to_owned())].into();
+    apply_symbol_map(&mut parts, &map, &mut report);
+    assert!(parts.iter().any(|p| p.symbol.as_deref() == Some("wc.coil")));
+    Ok(())
+}
+
+#[test]
+fn a_macro_counts_towards_the_total_limit() -> TestResult {
+    let edz = zip(&[("m.ema", CONTACTOR_MACRO.as_bytes())])?;
+    let limits = Limits { total: 10, ..LIMITS };
+    let got = read_all_with(&edz, limits)?;
+    assert!(got.symbols.is_empty());
+    assert_eq!(got.report.too_large, 1);
     Ok(())
 }

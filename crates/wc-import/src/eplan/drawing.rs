@@ -73,7 +73,7 @@ pub fn node_directions(symbol: u16, variant: u8) -> Option<[bool; 4]> {
     Some(dirs)
 }
 
-fn rotation_of(variant: u8) -> (Rotation, bool) {
+pub(crate) fn rotation_of(variant: u8) -> (Rotation, bool) {
     let r = match variant % 4 {
         0 => Rotation::R0,
         1 => Rotation::R270,
@@ -83,7 +83,7 @@ fn rotation_of(variant: u8) -> (Rotation, bool) {
     (r, variant >= 4)
 }
 
-fn vector(d: PinDir) -> Point {
+pub(crate) fn vector(d: PinDir) -> Point {
     match d {
         PinDir::Up => Point::new(0.0, -1.0),
         PinDir::Down => Point::new(0.0, 1.0),
@@ -93,7 +93,7 @@ fn vector(d: PinDir) -> Point {
 }
 
 /// Index into an up, right, down, left array.
-fn dir_index(v: Point) -> usize {
+pub(crate) fn dir_index(v: Point) -> usize {
     if v.y < -0.5 {
         0
     } else if v.x > 0.5 {

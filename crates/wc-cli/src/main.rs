@@ -514,8 +514,10 @@ enum ImportCmd {
         lib: PathBuf,
     },
     /// Parts from an EDZ file (EPLAN Data Exchange archive, 7-Zip or zip): part number, maker,
-    /// description and the EPLAN part properties. Macros are listed, with the macro each part
-    /// names and whether the archive holds it, but not drawn; pictures are counted.
+    /// description and the EPLAN part properties. Each macro's multi-line representation,
+    /// variant A, becomes a library symbol (`eplan.<macro name>`) with its connection points as
+    /// pins, and each part gets the symbol made from the macro it names; what the macros leave
+    /// out is reported. Pictures are counted.
     PartsEdz {
         file: PathBuf,
         #[arg(long)]
@@ -2790,10 +2792,18 @@ fn import_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>) -> Res<(usize,
         None => None,
     };
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
-    let (mut parts, mut report, warnings) =
-        wc_import::edz::read(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    let wc_import::edz::Edz {
+        mut parts,
+        symbols,
+        mut report,
+        warnings,
+    } = wc_import::edz::read_all(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
     if let Some(map) = &map {
         wc_import::edz::apply_symbol_map(&mut parts, map, &mut report);
+    }
+    // Symbols first, so no part is written pointing at a symbol the library lacks.
+    for s in &symbols {
+        wc_library::write_symbol(lib, s).map_err(e)?;
     }
     for p in &parts {
         wc_library::write_part(lib, p).map_err(e)?;
