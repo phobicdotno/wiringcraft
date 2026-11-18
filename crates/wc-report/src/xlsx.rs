@@ -13,11 +13,21 @@ use crate::Table;
 
 /// Longest sheet name Excel accepts.
 const MAX_SHEET_NAME: usize = 31;
+/// Excel's limits: characters in a cell, columns and rows (the header row included).
+const MAX_CELL_CHARS: usize = 32_767;
+const MAX_COLUMNS: usize = 16_384;
+const MAX_ROWS: usize = 1_048_576;
 /// Widest column written, in characters; longer cells wrap or overflow in the program.
 const MAX_WIDTH: usize = 60;
 
-/// A workbook with one worksheet per table, in order, named after each table's title.
+/// A workbook with one worksheet per table, in order, named after each table's title. Refuses
+/// (`InvalidInput`, naming the sheet and cell) a table Excel could not open without cutting it:
+/// more than 16,384 columns, more than 1,048,576 rows with the header, or a cell longer than
+/// 32,767 characters.
 pub fn workbook(tables: &[&Table]) -> std::io::Result<Vec<u8>> {
+    for t in tables {
+        check_limits(t)?;
+    }
     let mut names = Vec::new();
     let mut taken = BTreeSet::new();
     for (i, t) in tables.iter().enumerate() {
@@ -48,6 +58,43 @@ impl Table {
     }
 }
 
+fn check_limits(t: &Table) -> std::io::Result<()> {
+    let refuse = |why: String| Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why));
+    let header = usize::from(!t.columns.is_empty());
+    if t.rows.len() + header > MAX_ROWS {
+        return refuse(format!(
+            "{:?}: {} rows do not fit in an Excel sheet ({MAX_ROWS} at most)",
+            t.title,
+            t.rows.len() + header
+        ));
+    }
+    let rows = std::iter::once(&t.columns).chain(&t.rows);
+    // Without a header the empty first entry is no row; the sheet's row numbers start at 1.
+    let rows = rows.skip(1 - header);
+    for (i, cells) in rows.enumerate() {
+        if cells.len() > MAX_COLUMNS {
+            return refuse(format!(
+                "{:?}: {} columns do not fit in an Excel sheet ({MAX_COLUMNS} at most)",
+                t.title,
+                cells.len()
+            ));
+        }
+        for (c, v) in cells.iter().enumerate() {
+            // Counted as Excel counts: UTF-16 code units.
+            let len = v.encode_utf16().count();
+            if len > MAX_CELL_CHARS {
+                return refuse(format!(
+                    "{:?} cell {}{}: {len} characters, more than the {MAX_CELL_CHARS} an Excel cell holds",
+                    t.title,
+                    column_letters(c),
+                    i + 1
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A sheet name Excel accepts: no `[]:*?/\`, no leading or trailing apostrophe, at most 31
 /// characters, not empty and not used by an earlier sheet (names compare without case).
 fn sheet_name(title: &str, number: usize, taken: &mut BTreeSet<String>) -> String {
@@ -61,18 +108,22 @@ fn sheet_name(title: &str, number: usize, taken: &mut BTreeSet<String>) -> Strin
             }
         })
         .collect();
-    let clean = clean.trim().trim_matches('\'').trim();
-    let base = if clean.is_empty() {
-        format!("Sheet{number}")
-    } else {
-        clean.chars().take(MAX_SHEET_NAME).collect()
+    // Spaces and apostrophes cut from both ends, also after shortening, which can bring an
+    // inner apostrophe to the end.
+    let tidy = |s: &str, keep: usize| -> String {
+        let s: String = s.trim_matches([' ', '\'']).chars().take(keep).collect();
+        s.trim_matches([' ', '\'']).to_owned()
+    };
+    let base = match tidy(&clean, MAX_SHEET_NAME) {
+        b if b.is_empty() => format!("Sheet{number}"),
+        b => b,
     };
     let mut name = base.clone();
     let mut n = 2;
     while taken.contains(&name.to_lowercase()) {
         let suffix = format!(" ({n})");
         let keep = MAX_SHEET_NAME - suffix.chars().count();
-        name = format!("{}{suffix}", base.chars().take(keep).collect::<String>().trim_end());
+        name = format!("{}{suffix}", tidy(&base, keep));
         n += 1;
     }
     taken.insert(name.to_lowercase());
@@ -82,8 +133,11 @@ fn sheet_name(title: &str, number: usize, taken: &mut BTreeSet<String>) -> Strin
 /// Text made safe for XML 1.0: markup characters escaped, characters XML cannot hold dropped.
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    for (i, c) in s.char_indices() {
         match c {
+            // A literal `_xHHHH_` would be read as the character it encodes: its underscore is
+            // written as the escape `_x005F_`.
+            '_' if is_xstring_escape(&s[i..]) => out.push_str("_x005F_"),
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
@@ -94,6 +148,12 @@ fn esc(s: &str) -> String {
         }
     }
     out
+}
+
+/// Whether `s` starts with a SpreadsheetML escape, `_x` four hex digits and `_`.
+fn is_xstring_escape(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 7 && b.starts_with(b"_x") && b[2..6].iter().all(u8::is_ascii_hexdigit) && b[6] == b'_'
 }
 
 /// The column letters of a zero-based index: 0 is `A`, 25 is `Z`, 26 is `AA`.
@@ -237,6 +297,9 @@ mod tests {
         assert_eq!(second.chars().count(), 31);
         assert!(second.ends_with(" (2)"), "{second}");
         assert_eq!(sheet_name("SHEET2", 6, &mut taken), "SHEET2 (2)");
+        // Shortening must not leave an apostrophe at the end.
+        let cut = format!("{}'tail", "A".repeat(30));
+        assert_eq!(sheet_name(&cut, 7, &mut taken), "A".repeat(30));
     }
 
     #[test]
@@ -287,5 +350,35 @@ mod tests {
         assert!(wb.contains("name=\"Wires\""));
         assert!(wb.contains("name=\"Wires (2)\""));
         Ok(())
+    }
+
+    #[test]
+    fn a_literal_spreadsheet_escape_is_written_so_it_reads_back_as_written() {
+        assert_eq!(esc("part_x0041_"), "part_x005F_x0041_");
+        assert_eq!(esc("a_b _x00_ _xZZZZ_"), "a_b _x00_ _xZZZZ_");
+    }
+
+    #[test]
+    fn tables_past_excel_limits_are_refused_not_cut() {
+        let mut t = Table {
+            title: "Parts".into(),
+            columns: vec!["A".into()],
+            rows: vec![vec!["x".repeat(MAX_CELL_CHARS)]],
+            ..Table::default()
+        };
+        assert!(t.to_xlsx().is_ok());
+        t.rows.push(vec![String::new(), "y".repeat(MAX_CELL_CHARS + 1)]);
+        let err = t.to_xlsx().err().map(|e| (e.kind(), e.to_string()));
+        let (kind, msg) = err.unwrap_or((std::io::ErrorKind::Other, String::new()));
+        assert_eq!(kind, std::io::ErrorKind::InvalidInput);
+        assert!(msg.contains("cell B3"), "{msg}");
+        t.rows.pop();
+        t.columns = vec![String::new(); MAX_COLUMNS + 1];
+        assert!(t.to_xlsx().is_err());
+        t.columns = vec!["A".into()];
+        t.rows = vec![Vec::new(); MAX_ROWS];
+        assert!(t.to_xlsx().is_err(), "the header takes a row");
+        t.rows.pop();
+        assert!(check_limits(&t).is_ok());
     }
 }

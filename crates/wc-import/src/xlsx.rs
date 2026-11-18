@@ -20,6 +20,9 @@ const MAX_PART: u64 = 64 * 1024 * 1024;
 /// Excel's own limits: columns `A` to `XFD`, rows 1 to 1,048,576.
 const MAX_COLUMNS: usize = 16_384;
 const MAX_ROWS: usize = 1_048_576;
+/// Most cells read in all, the empty ones a row skips included: a row with one cell in column
+/// `XFD` holds 16,384, so this bounds memory, not only the row count.
+const MAX_CELLS: usize = 20_000_000;
 
 /// Whether `bytes` look like an Office Open XML package (a zip file).
 pub fn is_xlsx(bytes: &[u8]) -> bool {
@@ -34,7 +37,7 @@ pub fn is_legacy_xls(bytes: &[u8]) -> bool {
 /// The first visible worksheet as rows of cell text. Rows with no text are left out; a row is
 /// as long as its last cell, and cells a row skips are empty strings.
 pub fn rows(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
-    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| Error::Format(format!("xlsx: {e}")))?;
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(xml_error)?;
     let workbook = part(&mut zip, "xl/workbook.xml")?
         .ok_or_else(|| Error::Format("xlsx: no xl/workbook.xml, not an Excel workbook".into()))?;
     let rels = part(&mut zip, "xl/_rels/workbook.xml.rels")?.unwrap_or_default();
@@ -57,7 +60,7 @@ pub fn rows(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
         None => Vec::new(),
     };
     let sheet = part(&mut zip, &sheet_path)?
-        .ok_or_else(|| Error::Format(format!("xlsx: the worksheet {sheet_path} is missing")))?;
+        .ok_or_else(|| Error::Format(format!("xlsx: the worksheet {sheet_path:?} is missing")))?;
     sheet_rows(&sheet, &strings)
 }
 
@@ -66,15 +69,20 @@ fn part(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Option<S
     let f = match zip.by_name(name) {
         Ok(f) => f,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(e) => return Err(Error::Format(format!("xlsx: {name}: {e}"))),
+        Err(e) => {
+            return Err(Error::Format(format!(
+                "xlsx: {name:?}: {}",
+                crate::printable(&e.to_string())
+            )));
+        }
     };
     let mut data = Vec::new();
     f.take(MAX_PART + 1)
         .read_to_end(&mut data)
-        .map_err(|e| Error::Format(format!("xlsx: {name}: {e}")))?;
+        .map_err(|e| Error::Format(format!("xlsx: {name:?}: {}", crate::printable(&e.to_string()))))?;
     if data.len() as u64 > MAX_PART {
         return Err(Error::Format(format!(
-            "xlsx: {name} is larger than {} MB",
+            "xlsx: {name:?} is larger than {} MB",
             MAX_PART / 1024 / 1024
         )));
     }
@@ -90,7 +98,8 @@ fn target_path(target: &str) -> String {
 }
 
 fn xml_error(e: impl std::fmt::Display) -> Error {
-    Error::Format(format!("xlsx: {e}"))
+    // Parser and zip messages can quote the file's own bytes: printed without control characters.
+    Error::Format(format!("xlsx: {}", crate::printable(&e.to_string())))
 }
 
 fn attr(e: &BytesStart, name: &[u8]) -> Option<String> {
@@ -162,7 +171,7 @@ fn shared_strings(xml: &str) -> Result<Vec<String>> {
                 _ => {}
             },
             Event::End(e) => match e.local_name().as_ref() {
-                b"si" => out.push(std::mem::take(&mut current)),
+                b"si" => out.push(unescape_xstring(&std::mem::take(&mut current))),
                 b"t" => in_t = false,
                 b"rPh" => in_phonetic = false,
                 _ => {}
@@ -174,6 +183,36 @@ fn shared_strings(xml: &str) -> Result<Vec<String>> {
             _ => {}
         }
     }
+}
+
+/// Text with SpreadsheetML's `_xHHHH_` escapes turned back into their characters: `_x000D_` is
+/// a carriage return and `_x005F_` a literal underscore, so `_x005F_x0041_` reads `_x0041_`.
+/// An escape for a code that is no character is left as written.
+fn unescape_xstring(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("_x") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let decoded = tail
+            .get(2..6)
+            .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .filter(|_| tail.as_bytes().get(6) == Some(&b'_'))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .and_then(char::from_u32);
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[7..];
+            }
+            None => {
+                out.push_str("_x");
+                rest = &tail[2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The zero-based column of a cell reference such as `B7` (`None` when it has no letters or
@@ -225,7 +264,7 @@ impl Cell {
                 .ok()
                 .and_then(|i| strings.get(i).cloned())
                 .unwrap_or_default(),
-            "inlineStr" => self.inline,
+            "inlineStr" => unescape_xstring(&self.inline),
             "str" | "e" => self.value,
             "b" => match self.value.trim() {
                 "1" => "TRUE".into(),
@@ -245,12 +284,17 @@ fn sheet_rows(xml: &str, strings: &[String]) -> Result<Vec<Vec<String>>> {
     let mut next_column = 0;
     // Inside `<v>`, inside an inline string's `<t>`, inside a phonetic run.
     let (mut in_v, mut in_t, mut in_phonetic) = (false, false, false);
-    let finish_row = |row: &mut BTreeMap<usize, String>, out: &mut Vec<Vec<String>>| -> Result<()> {
+    let mut cells_read = 0usize;
+    let mut finish_row = |row: &mut BTreeMap<usize, String>, out: &mut Vec<Vec<String>>| -> Result<()> {
         if row.values().any(|v| !v.trim().is_empty()) {
             if out.len() >= MAX_ROWS {
                 return Err(Error::Format(format!("xlsx: more than {MAX_ROWS} rows")));
             }
             let width = row.keys().next_back().map_or(0, |c| c + 1);
+            cells_read += width;
+            if cells_read > MAX_CELLS {
+                return Err(Error::Format(format!("xlsx: more than {MAX_CELLS} cells")));
+            }
             let mut cells = vec![String::new(); width];
             for (c, v) in std::mem::take(row) {
                 cells[c] = v;
@@ -515,5 +559,43 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains(".xlsx"), "{err}");
+    }
+
+    #[test]
+    fn spreadsheet_escapes_read_back_as_their_characters() {
+        assert_eq!(unescape_xstring("a_x000D_b"), "a\rb");
+        assert_eq!(unescape_xstring("part_x005F_x0041_"), "part_x0041_");
+        assert_eq!(unescape_xstring("_x00_ _xZZZZ_ _x0041"), "_x00_ _xZZZZ_ _x0041");
+        assert_eq!(unescape_xstring("plain_name"), "plain_name");
+    }
+
+    #[test]
+    fn a_wide_sheet_stops_at_the_cell_budget() {
+        let mut xml = String::from("<worksheet><sheetData>");
+        for r in 1..=(MAX_CELLS / MAX_COLUMNS + 2) {
+            xml.push_str(&format!(
+                "<row><c r=\"XFD{r}\" t=\"inlineStr\"><is><t>x</t></is></c></row>"
+            ));
+        }
+        xml.push_str("</sheetData></worksheet>");
+        let err = sheet_rows(&xml, &[]).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("cells"), "{err}");
+    }
+
+    #[test]
+    fn a_path_from_the_file_is_quoted_in_errors() {
+        let bytes = workbook(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook xmlns:r="r"><sheets><sheet name="a" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                "<Relationships><Relationship Id=\"rId1\" Type=\"x/worksheet\" Target=\"a&#27;]0;title&#7;.xml\"/></Relationships>",
+            ),
+        ]);
+        let err = rows(&bytes).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(!err.contains('\u{1b}') && !err.contains('\u{7}'), "{err:?}");
+        assert!(err.contains("\\u{1b}"), "{err:?}");
     }
 }
