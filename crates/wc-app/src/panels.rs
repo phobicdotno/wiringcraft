@@ -1655,7 +1655,11 @@ fn rotation_label(r: Rotation) -> &'static str {
     }
 }
 
-pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
+/// The status bar. `live` is the check while drawing's text, whether a check is pending and
+/// whether the last one failed, or `None` when that is off; it returns true when that text was
+/// clicked.
+pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Option<(String, bool, bool)>) -> bool {
+    let mut show_check = false;
     let t = Theme::of(ui.ctx());
     let sep = |ui: &mut egui::Ui| {
         let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, 14.0), egui::Sense::hover());
@@ -1701,6 +1705,27 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
         ui.label(RichText::new(&ed.message).color(t.muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(o) = open {
+                if let Some((mut text, pending, failed)) = live {
+                    let errors = ed.live.iter().any(|f| f.severity == wc_report::Severity::Error);
+                    let warnings = ed.live.iter().any(|f| f.severity == wc_report::Severity::Warning);
+                    let c = if errors || failed {
+                        t.error
+                    } else if warnings {
+                        t.warning
+                    } else {
+                        t.muted
+                    };
+                    if pending {
+                        text.push_str(" …");
+                    }
+                    let r = ui
+                        .add(egui::Label::new(RichText::new(text).color(c)).sense(egui::Sense::click()))
+                        .on_hover_text("Problems the check found after the last edit: click to list them");
+                    show_check = r.clicked();
+                    if !o.branch.is_empty() {
+                        sep(ui);
+                    }
+                }
                 if !o.branch.is_empty() {
                     ui.label(RichText::new(&o.branch).monospace().color(t.text));
                     let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
@@ -1720,6 +1745,7 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
             }
         });
     });
+    show_check
 }
 
 /// The properties of the panel layout shown: plate size, the picked device, and the devices

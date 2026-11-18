@@ -2615,8 +2615,61 @@ mod tests {
             find: None,
             strip_editor: None,
             show_layers: false,
+            live: Default::default(),
         };
         (tmp, app)
+    }
+
+    #[test]
+    fn checks_while_drawing_are_shown_again_after_the_editor_is_replaced() {
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        for x in [20.0, 60.0] {
+            let id = o.place(1, "wc.coil", Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+        }
+        let ctx = egui::Context::default();
+        let drawn_twice = |a: &App| a.ed.live.iter().filter(|f| f.message.contains("-K1 is drawn")).count();
+        for _ in 0..200 {
+            a.live_check(&ctx);
+            if drawn_twice(&a) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // Opening the same unchanged project replaces the editor; the checker keeps its
+        // findings for the same inputs, and they show again at once.
+        a.ed = crate::canvas::Editor::default();
+        a.live_check(&ctx);
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // Turned off while markers are shown: they go.
+        a.prefs.live_check = false;
+        a.live_check(&ctx);
+        assert!(a.ed.live.is_empty(), "{:?}", a.ed.live);
+        a.prefs.live_check = true;
+        // On again: the checker checks project A afresh and shows both findings, so the
+        // switch below starts from a checker that holds A's findings.
+        for _ in 0..200 {
+            a.live_check(&ctx);
+            if drawn_twice(&a) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // Another project is opened: the first one's findings are not shown on it.
+        let (_other, b) = crate::state::tests::project();
+        a.open = Some(b);
+        a.ed = crate::canvas::Editor::default();
+        a.live_check(&ctx);
+        assert!(a.ed.live.is_empty(), "{:?}", a.ed.live);
+        assert_eq!(
+            a.live.status(&a.ed.live),
+            "Check: checking",
+            "no counts of the first project"
+        );
     }
 
     #[test]
