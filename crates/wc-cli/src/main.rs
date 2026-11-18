@@ -3380,7 +3380,13 @@ fn add_built(
     let before = if p.meta.jumpers.is_empty() {
         None
     } else {
-        let (symbols, _) = store::vendored_symbols(dir, p);
+        // Read with the definitions the import brings for symbols the project has no readable
+        // copy of, as the numbering after it will be: otherwise a terminal that only gets its
+        // role back from the import would look renumbered.
+        let (mut symbols, _) = store::vendored_symbols(dir, p);
+        for s in &built.symbols {
+            symbols.entry(s.id.clone()).or_insert_with(|| s.clone());
+        }
         Some(wc_core::project::terminal_numbers(p, |id| {
             symbols.get(id).map(|s| s.role)
         }))
@@ -4763,6 +4769,52 @@ mod tests {
             .collect();
         sets.sort();
         assert_eq!(sets, [vec!["1", "2"], vec!["10", "11"]]);
+    }
+
+    #[test]
+    fn an_import_that_brings_back_a_missing_terminal_symbol_leaves_jumpers_where_they_are() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let term = |id: &str| wc_core::Symbol {
+            id: id.into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let placed = |id: &str, symbol: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse("-X1").ok(),
+        };
+        let mut p = load(&dir).unwrap();
+        // Three terminals tagged with only the strip, numbered 1, 2, 3; the first one's symbol
+        // has no copy in the project, and the import brings it.
+        store::write_vendored_symbol(&dir, &term("test.term")).unwrap();
+        p.pages[0].symbols.extend([
+            placed("a", "test.missing", 10.0),
+            placed("b", "test.term", 20.0),
+            placed("c", "test.term", 30.0),
+        ]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        let mut p = load(&dir).unwrap();
+        let built = wc_import::aml::Built {
+            symbols: vec![term("test.missing")],
+            ..Default::default()
+        };
+        add_built(&dir, &mut p, built, "import:a.tewzip", Replace::No).unwrap();
+        save_imported(&dir, &p).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["1", "2"]);
     }
 
     #[test]

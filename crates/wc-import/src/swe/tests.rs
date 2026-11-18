@@ -2502,6 +2502,63 @@ fn jumpers_from_the_terminal_strip_editor_become_the_strips_jumper() {
 }
 
 #[test]
+fn a_jumper_counts_even_where_the_drawing_already_joins_its_terminals() {
+    let c = sample_with_strip();
+    // A drawn line from terminal 1's upper pin to terminal 2's lower pin, not linked to the
+    // record 90 between the same two pins.
+    c.execute_batch(
+        "INSERT INTO tew_line VALUES (12, 10, 150, 205, 170, 195, NULL);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 60, 0, 61, 1);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    assert_eq!(built.jumpers.len(), 1, "{:?}", built.jumpers);
+    let mut terminals = built.jumpers[0].terminals.clone();
+    terminals.sort();
+    assert_eq!(terminals, ["1", "2"]);
+}
+
+#[test]
+fn a_jumper_to_a_terminal_whose_tag_was_taken_names_both_tags() {
+    let c = sample_with_strip();
+    // Another device already has -X1.2, so terminal 2 is renamed.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (205, 'X1.2', '-X1.2', -1);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 60, 0, 61, 1);",
+    )
+    .unwrap();
+    let (built, warnings, _) = build(&read(&c).unwrap(), None);
+    assert!(built.jumpers.is_empty(), "{:?}", built.jumpers);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("the tag -X1.2 was taken by another device")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_jumper_between_terminals_not_drawn_is_still_a_jumper() {
+    let c = sample_with_strip();
+    // Terminal 3 on the strip has no symbol: its circuit is in no drawing.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (203, '3', '-X1 3', 4, 200, 3);
+         INSERT INTO tew_componentelement VALUES (62, NULL, 0, 203, 0);
+         INSERT INTO tew_componentterminal VALUES (62, 0, NULL), (62, 1, NULL);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 61, 0, 62, 1);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    assert_eq!(built.jumpers.len(), 1, "{:?}", built.jumpers);
+    let mut terminals = built.jumpers[0].terminals.clone();
+    terminals.sort();
+    assert_eq!(terminals, ["2", "3"]);
+}
+
+#[test]
 fn a_jumper_to_a_terminal_without_a_number_is_refused_with_its_reason() {
     let c = sample_with_strip();
     // A terminal on the strip with no name: its tag path `-X1.9` must not stand in for a number.
