@@ -22,7 +22,7 @@ From `crates/wc-import`:
 | PDF (vector) | `pdf` | Traced drawings. |
 | CSV | `csv` | Parts lists and PLC address lists. |
 | BMEcat catalogues (XML, 1.2 and 2005) | `bmecat` | `wiringcraft import parts-bmecat <file> --lib <folder>`: one part per product/article with order number, maker (or the catalogue's supplier), description in the catalogue's language, and as properties the maker's part number, GTIN, ECLASS (or other) class and every feature with its unit. Products marked for deletion are skipped; prices, pictures and other media are not read. |
-| EDZ (EPLAN Data Exchange archives, 7-Zip or zip) | `edz` | `wiringcraft import parts-edz <file> --lib <folder>`: the part data (EPLAN part XML, `partsmanagement` root) becomes one part per `part`: order number (or type number, or the EPLAN part number without the maker), maker, description (English when given), and every other EPLAN part property; a `variant` fills what the part leaves empty. Macros (`.ema`) are a closed binary format and are not drawn: the report lists each macro file and, per part, the macro it names (`P_ARTICLE_MACRO`, `P_ARTICLE_GROUPSYMBOLMACRO`) and whether the archive holds it. `--symbol-map <file>` (one `macro = symbol.id` per line, matched by full name, file name or name without `.ema`) gives mapped parts that library symbol. Pictures and other files are counted (#144). Built from public format knowledge and synthetic archives; not yet checked against a real portal download. |
+| EDZ (EPLAN Data Exchange archives, 7-Zip or zip) | `edz` | `wiringcraft import parts-edz <file> --lib <folder>`: the part data (EPLAN part XML, `partsmanagement` root) becomes one part per `part`: order number (or type number, or the EPLAN part number without the maker), maker, description (English when given), and every other EPLAN part property; a `variant` fills what the part leaves empty. Macros (`.ema`) are EPLAN XML: each macro's multi-line representation, variant A, becomes a library symbol `eplan.<macro name>` with its drawing (lines, polylines, rectangles, arcs, texts, black box outlines) and a pin for each connection point (position, direction, designation; in a macro of several devices led by the device tag, `K1:A1`), and each part gets the symbol of the macro it names (`P_ARTICLE_MACRO`, else `P_ARTICLE_GROUPSYMBOLMACRO`). Symbols EPLAN keeps in its own libraries (coils, contacts, lamps) are drawn as the WiringCraft symbol of the same kind. The report counts what is left out (other representations and variants, connections, potentials) and lists, per part, the macro it names and whether the archive holds it (#311). `--symbol-map <file>` (one `macro = symbol.id` per line, matched by full name, file name or name without `.ema`) gives mapped parts that library symbol. Pictures and other files are counted (#144). Part data built from public format knowledge and synthetic archives; the macro reader worked out from a set of about 240 real maker macros (device, PLC module and circuit macros), which are not in the repository, and tested with synthetic macros. |
 | AutomationML (IEC 62714, CAEX XML) | `aml` | Devices, properties, connection points, links. |
 | EPLAN P8 projects (`.elk` + `.edb`) | `eplan` | Projects. Parts from EDZ files: see `edz` above. |
 | SolidWorks Electrical archives (`.tewzip`) | `swe` | Projects. Content Portal parts also arrive as `.tewzip`; `import swe-library` reads their parts, cable types and symbol blocks (blocks drawn from their DWG files in the archive, #230; a block without one is a box with its connection points). |
@@ -36,7 +36,7 @@ libraries (ahead of the others) the first time symbols are written there. Ids ar
 symbol written, every warning and every file that failed; a failing file does not stop the others.
 A symbol already in the folder is kept unless "Replace symbols already in the library" is ticked.
 
-Not read today: the drawings of EPLAN macros inside EDZ files (listed only, #144), **DWG** older than AutoCAD 2004 or from AutoCAD 2013 on, **STEP** (3D), ECLASS data
+Not read today: the panel layout, overview, single-line and 3D representations of EPLAN macros (counted only, #343), **DWG** older than AutoCAD 2004 or from AutoCAD 2013 on, **STEP** (3D), ECLASS data
 outside a BMEcat catalogue.
 
 ## Portals that serve many manufacturers
@@ -83,9 +83,9 @@ outside a BMEcat catalogue.
 2. **The biggest pool is EPLAN EDZ.** Almost every industrial maker publishes EPLAN macros, most
    through the EPLAN Data Portal, which needs an EPLAN licence. Many also put EDZ files on their
    own product pages without the portal (Siemens CAx data, Schneider, SEW, Dold, Euchner, Lenze,
-   Beckhoff). An EDZ importer (macros to symbols, parts to the library) would open that pool for
-   people who download from those pages; it should be built from the public format and own test
-   files, as the EPLAN project importer was.
+   Beckhoff). The EDZ importer (macros to symbols, parts to the library, #144 and #311) opens that pool
+   for people who download from those pages; like the EPLAN project importer it was built from
+   the public format, real files and its own test files.
 3. **Part data without drawings:** Phoenix Contact's BMEcat XML and ECLASS classification carry
    order numbers, descriptions and technical data. The `bmecat` importer fills the parts library
    from them for makers who publish it.
