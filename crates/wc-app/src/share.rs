@@ -26,7 +26,7 @@ use wc_share::discovery::{Announcer, Beacon, Browser};
 use wc_share::net::{self, Listener};
 use wc_share::transport::{GuestLink, Hub};
 use wc_share::{ChangeInfo, ChangeKind, redo_target, undo_target};
-use wc_share::{GitJournal, Guest, GuestMsg, GuestStatus, HOST, Host, Peer, PeerId, ProjectEdit, apply_edit};
+use wc_share::{GitJournal, Guest, GuestMsg, GuestStatus, HOST, Host, Peer, PeerId, ProjectEdit};
 
 use crate::state::Open;
 
@@ -694,17 +694,8 @@ impl Role {
                 }
             }
             Role::Guest(j) => {
-                // Applied to this copy at once; the host sends it back in its order, and applying
-                // it again then gives the same result, so every copy ends up the same. Whole
-                // pages wait for the host: it refuses them when someone else changed one first,
-                // and applying them here would hide that change until the next join.
-                // Symbols and parts wait for the host too: it refuses one the session has in
-                // another version, or cannot store, and this copy must not count it as taken.
-                if !matches!(edit, ProjectEdit::SetPages { .. } | ProjectEdit::AddItems { .. })
-                    && let Some(p) = j.guest.project.as_mut()
-                {
-                    apply_edit(p, &edit);
-                }
+                // Applied to this copy at once (see `Guest::edit_project`); a refusal puts it
+                // right again.
                 let msg = j.guest.edit_project(edit);
                 send(&j.link, msg, notes);
             }

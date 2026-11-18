@@ -46,6 +46,10 @@ pub struct Guest {
     /// [`ProjectEdit::AddItems`]), by id: what this guest's copy needs to draw the project.
     pub symbols: BTreeMap<String, wc_core::Symbol>,
     pub parts: BTreeMap<String, wc_core::Part>,
+    /// The number of the last project edit sent.
+    last_edit: u64,
+    /// Project edits sent and not answered yet, by number.
+    unanswered: std::collections::BTreeSet<u64>,
 }
 
 impl Default for Guest {
@@ -69,6 +73,8 @@ impl Guest {
             taking_back: 0,
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
+            last_edit: 0,
+            unanswered: std::collections::BTreeSet::new(),
         }
     }
 
@@ -123,10 +129,30 @@ impl Guest {
         Some(GuestMsg::EditPage { page })
     }
 
-    /// Change project-level data. Applied when the host sends it back, so every copy applies
-    /// project changes in the same order.
-    pub fn edit_project(&self, edit: ProjectEdit) -> GuestMsg {
-        GuestMsg::EditProject { edit }
+    /// Change project-level data. Most changes are applied to this copy at once, and again when
+    /// the host sends them back in its order, which gives the same result, so every copy ends
+    /// up the same; when the host refuses one, it sends back what the change touched as the
+    /// host has it, and this copy takes that. Whole pages wait for the host (it refuses them
+    /// when someone else changed one first, and applying them here would hide that change), as
+    /// do symbols and parts (it refuses one the session has in another version, or cannot
+    /// store, and this copy must not count it as taken). See [`ProjectEdit::applied_at_once`].
+    pub fn edit_project(&mut self, edit: ProjectEdit) -> GuestMsg {
+        if edit.applied_at_once()
+            && let Some(p) = self.project.as_mut()
+        {
+            apply_edit(p, &edit);
+        }
+        self.last_edit += 1;
+        self.unanswered.insert(self.last_edit);
+        GuestMsg::EditProject {
+            edit,
+            seq: self.last_edit,
+        }
+    }
+
+    /// How many project edits the host has not answered yet.
+    pub fn unanswered_edits(&self) -> usize {
+        self.unanswered.len()
     }
 
     /// Whether Undo has a change of this guest's to take back.
@@ -188,6 +214,7 @@ impl Guest {
                 self.status = GuestStatus::Closed;
                 self.locks.clear();
                 self.taking_back = 0;
+                self.unanswered.clear();
             }
             HostMsg::PageChanged { page, .. } => {
                 if self.answered(&page.id) {
@@ -197,7 +224,13 @@ impl Guest {
                     *p = page;
                 }
             }
-            HostMsg::ProjectChanged { edit, by } => {
+            HostMsg::Unchanged { seq } => {
+                self.unanswered.remove(&seq);
+            }
+            HostMsg::ProjectChanged { edit, by, seq } => {
+                if let Some(seq) = seq {
+                    self.unanswered.remove(&seq);
+                }
                 if matches!(edit, ProjectEdit::Restore { .. }) && Some(by) == self.me {
                     self.taking_back = self.taking_back.saturating_sub(1);
                 }
@@ -224,7 +257,18 @@ impl Guest {
                 self.locks = locks;
             }
             HostMsg::Peers { peers } => self.peers = peers,
-            HostMsg::Refused { refusal, take_back } => {
+            HostMsg::Refused {
+                refusal,
+                take_back,
+                edit,
+                put_back,
+            } => {
+                if let Some(seq) = edit {
+                    self.unanswered.remove(&seq);
+                }
+                if let Some(parts) = put_back {
+                    self.put_back(*parts);
+                }
                 // Only the refusal of an undo, redo or revert answers one: a refusal of an
                 // earlier edit, arriving first, must not end the wait for the restoration.
                 if take_back {
@@ -242,6 +286,25 @@ impl Guest {
                 self.refusals.push(refusal);
             }
         }
+    }
+
+    /// Take the host's version of what a refused project edit touched. A page this guest has
+    /// open keeps its content (page edits of it may still be on their way), and takes only the
+    /// host's display number.
+    fn put_back(&mut self, mut parts: crate::Parts) {
+        let me = self.me;
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        for (id, host) in parts.pages.iter_mut() {
+            let held = me.is_some() && self.locks.get(id) == me.as_ref();
+            if held && let (Some(host), Some(mine)) = (host.as_mut(), project.page(id)) {
+                let number = std::mem::take(&mut host.number);
+                *host = mine.clone();
+                host.number = number;
+            }
+        }
+        parts.apply(project);
     }
 
     fn switching_to(&self, page: &str) -> bool {

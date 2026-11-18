@@ -249,7 +249,7 @@ impl Host {
 
     /// The host's own user changed project-level data.
     pub fn edit_project(&mut self, edit: ProjectEdit) -> Result<(), Refusal> {
-        self.do_edit_project(HOST, edit)
+        self.do_edit_project(HOST, edit, None).map(|_| ())
     }
 
     /// The session's recorded changes, oldest first (at most [`crate::MAX_HISTORY`]).
@@ -290,6 +290,11 @@ impl Host {
             return Err(Refusal::NotApproved);
         };
         let take_back = matches!(msg, GuestMsg::Undo | GuestMsg::Redo | GuestMsg::Revert { .. });
+        // A project edit gets exactly one answer of its own.
+        let msg = match (&status, msg) {
+            (Status::Joined, GuestMsg::EditProject { edit, seq }) => return self.guest_edit_project(from, edit, seq),
+            (_, msg) => msg,
+        };
         let result = match (status, msg) {
             (Status::Connected, GuestMsg::Join { name, email }) => {
                 if let Some(p) = self.peers.get_mut(&from) {
@@ -325,7 +330,6 @@ impl Host {
                 }
                 result
             }
-            (Status::Joined, GuestMsg::EditProject { edit }) => self.do_edit_project(from, edit),
             (Status::Joined, GuestMsg::Undo | GuestMsg::Redo | GuestMsg::Revert { .. })
                 if self.take_backs_held.is_some() =>
             {
@@ -344,6 +348,8 @@ impl Host {
                 HostMsg::Refused {
                     refusal: refusal.clone(),
                     take_back,
+                    edit: None,
+                    put_back: None,
                 },
             ));
         }
@@ -423,7 +429,37 @@ impl Host {
         Ok(())
     }
 
-    fn do_edit_project(&mut self, by: PeerId, edit: ProjectEdit) -> Result<(), Refusal> {
+    /// A guest's project edit, answered: applied (its `seq` on the author's
+    /// [`HostMsg::ProjectChanged`]), unchanged, or refused with what it touches as the host has
+    /// it, since the guest applied it to its copy at once.
+    fn guest_edit_project(&mut self, from: PeerId, edit: ProjectEdit, seq: u64) -> Result<(), Refusal> {
+        let keys = edit.applied_at_once().then(|| edit.touches(&self.project));
+        match self.do_edit_project(from, edit, Some(seq)) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.outbox.push((from, HostMsg::Unchanged { seq }));
+                Ok(())
+            }
+            Err(refusal) => {
+                // Read again: a refused change leaves the project as it was before it.
+                let put_back = keys.map(|k| Box::new(Parts::read(&self.project, &k)));
+                self.outbox.push((
+                    from,
+                    HostMsg::Refused {
+                        refusal: refusal.clone(),
+                        take_back: false,
+                        edit: Some(seq),
+                        put_back,
+                    },
+                ));
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Apply a project edit; true when it changed the project. `seq` is the author's number for
+    /// it, sent back on the author's copy of the change.
+    fn do_edit_project(&mut self, by: PeerId, edit: ProjectEdit, seq: Option<u64>) -> Result<bool, Refusal> {
         // A restore is made only by the host's own undo (`do_revert`), after it checked that
         // every part is still as the undone change left it.
         if matches!(edit, ProjectEdit::Restore { .. }) {
@@ -435,7 +471,7 @@ impl Host {
         let before = self.project.clone();
         apply_edit(&mut self.project, &edit);
         if self.project == before {
-            return Ok(());
+            return Ok(false);
         }
         let message = edit.describe();
         let page = edit.page().map(str::to_owned);
@@ -477,11 +513,18 @@ impl Host {
         }
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for id in ids {
-            self.outbox
-                .push((id, HostMsg::ProjectChanged { edit: edit.clone(), by }));
+            let seq = if id == by { seq } else { None };
+            self.outbox.push((
+                id,
+                HostMsg::ProjectChanged {
+                    edit: edit.clone(),
+                    by,
+                    seq,
+                },
+            ));
         }
         self.remember(by, page, message, ChangeKind::Edit, None, was, now);
-        Ok(())
+        Ok(true)
     }
 
     fn do_undo(&mut self, by: PeerId) -> Result<(), Refusal> {
@@ -566,8 +609,14 @@ impl Host {
         }
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for g in ids {
-            self.outbox
-                .push((g, HostMsg::ProjectChanged { edit: edit.clone(), by }));
+            self.outbox.push((
+                g,
+                HostMsg::ProjectChanged {
+                    edit: edit.clone(),
+                    by,
+                    seq: None,
+                },
+            ));
         }
         self.remember(by, entry.info.page, message, kind, Some(id), entry.after, entry.before);
         Ok(())
