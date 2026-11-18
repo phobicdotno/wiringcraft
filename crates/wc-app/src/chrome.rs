@@ -245,10 +245,26 @@ fn icon_button_rect(
         format!("{} ({})\n{}", info.label, info.shortcut, info.tip)
     };
     // A pointer release counts only over the button where it is now: egui hit-tests against the
-    // last frame, where a button that has moved since still looks to be under the pointer.
-    let released_off =
-        ui.input(|i| i.pointer.any_released() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p)));
-    (resp.on_hover_text(tip).clicked() && !released_off, rect)
+    // last frame, where a button that has moved since still looks to be under the pointer. Where
+    // the release happened counts, not where the pointer went after it in the same frame. Enter
+    // or Space on the focused button is no pointer click, and counts wherever the pointer is.
+    let (released_off, keyed) = ui.input(|i| {
+        let release = i.events.iter().rev().find_map(|e| match e {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                ..
+            } => Some(*pos),
+            _ => None,
+        });
+        (
+            release.is_some_and(|p| !rect.contains(p)),
+            i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
+        )
+    });
+    let keyed = keyed && resp.has_focus();
+    (resp.on_hover_text(tip).clicked() && (keyed || !released_off), rect)
 }
 
 fn divider(ui: &mut egui::Ui, t: &Theme, height: f32) {
@@ -544,23 +560,37 @@ mod tests {
         crate::theme::install_fonts(&ctx);
         let mut state = ChromeState { ribbon_tab: tab };
         let (mut rects, mut out) = (Vec::new(), Vec::new());
-        let input = |width: f32, events: Vec<egui::Event>| egui::RawInput {
+        // The first frame loads the fonts.
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        for (width, events) in frames {
+            rects = ribbon_frame(&ctx, &mut state, *width, events.clone(), &mut out);
+        }
+        (rects, out)
+    }
+
+    /// One frame of the ribbon in a window `width` points wide, as the app lays it out; returns
+    /// the icon rectangles and adds the commands clicked to `out`.
+    fn ribbon_frame(
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        width: f32,
+        events: Vec<egui::Event>,
+        out: &mut Vec<Action>,
+    ) -> Vec<Rect> {
+        let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 600.0))),
             events,
             ..Default::default()
         };
-        // The first frame loads the fonts.
-        let _ = ctx.run(input(frames[0].0, Vec::new()), |_| {});
-        for (width, events) in frames {
-            let _ = ctx.run(input(*width, events.clone()), |ctx| {
-                egui::TopBottomPanel::top("menus")
-                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 4)))
-                    .show(ctx, |ui| {
-                        rects = ribbon_rects(ui, &mut state, &AllOn, &mut out);
-                    });
-            });
-        }
-        (rects, out)
+        let mut rects = Vec::new();
+        let _ = ctx.run(input, |ctx| {
+            egui::TopBottomPanel::top("menus")
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 4)))
+                .show(ctx, |ui| {
+                    rects = ribbon_rects(ui, state, &AllOn, out);
+                });
+        });
+        rects
     }
 
     /// The icon rectangles of ribbon tab `tab` in a window `width` points wide.
@@ -609,24 +639,82 @@ mod tests {
     }
 
     #[test]
+    fn a_ribbon_release_counts_where_it_happened_not_where_the_pointer_went_after() {
+        let start = RIBBON[0].1;
+        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
+        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
+        let (narrow, wide) = (1210.0, 1220.0);
+        let at = ribbon_icons(0, narrow)[undo].center();
+        let now = ribbon_icons(0, wide)[undo].center();
+        assert!(!ribbon_icons(0, wide)[undo].contains(at), "Undo moved");
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Released where Undo was, then moved over where it is now, in the same frame.
+        let (_, out) = ribbon_frames(
+            0,
+            &[
+                (narrow, Vec::new()),
+                (narrow, vec![egui::Event::PointerMoved(at)]),
+                (narrow, vec![button(at, true)]),
+                (wide, vec![button(at, false), egui::Event::PointerMoved(now)]),
+            ],
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn enter_on_a_focused_ribbon_button_counts_beside_a_cancelled_press() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = ChromeState { ribbon_tab: 0 };
+        let mut out = Vec::new();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let rects = ribbon_frame(&ctx, &mut state, 1210.0, Vec::new(), &mut out);
+        let start = RIBBON[0].1;
+        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
+        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
+        let at = rects[undo].center();
+        let off = egui::pos2(at.x, 590.0);
+        ctx.memory_mut(|m| m.request_focus(ribbon_id("Edit", Action::Undo)));
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let key = |pressed| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut frame = |events: Vec<egui::Event>, out: &mut Vec<Action>| {
+            ribbon_frame(&ctx, &mut state, 1210.0, events, out);
+        };
+        frame(vec![egui::Event::PointerMoved(at)], &mut out);
+        frame(vec![button(at, true)], &mut out);
+        // Dragged off and let go (no click), and Enter, in one frame: one Undo.
+        frame(
+            vec![egui::Event::PointerMoved(off), button(off, false), key(true)],
+            &mut out,
+        );
+        frame(vec![key(false)], &mut out);
+        assert_eq!(out, [Action::Undo]);
+    }
+
+    #[test]
     fn a_focused_ribbon_button_keeps_its_focus_when_the_groups_move() {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
         let mut state = ChromeState { ribbon_tab: 0 };
         let mut out = Vec::new();
         let mut frame = |width: f32, events: Vec<egui::Event>, out: &mut Vec<Action>| {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 600.0))),
-                events,
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::TopBottomPanel::top("menus")
-                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 4)))
-                    .show(ctx, |ui| {
-                        ribbon_rects(ui, &mut state, &AllOn, out);
-                    });
-            });
+            ribbon_frame(&ctx, &mut state, width, events, out);
         };
         let key = |pressed| egui::Event::Key {
             key: egui::Key::Enter,
