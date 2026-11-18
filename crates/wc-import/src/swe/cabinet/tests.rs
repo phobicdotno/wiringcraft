@@ -251,3 +251,77 @@ INSERT INTO tew_symbol VALUES (40, 12, 105, 'FP_SWITCH', 300, 640, 0, 1, 1, NULL
         items.note
     );
 }
+
+#[test]
+fn a_footprint_without_a_box_takes_the_size_of_its_block_drawing() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    // F1 (no box) has a 45 x 80 mm block drawing below and right of its insertion point and a
+    // catalog part with a size too: the drawing wins. S1 (no box) is drawn at half its width.
+    // K1 has a box and a drawing: the box wins.
+    let c = with_layout();
+    c.execute_batch(
+        "
+UPDATE tew_buildofmaterial SET bom_reference = 'FUSE-1', bom_manufacturer = 'Maker F' WHERE bom_id = 2;
+UPDATE tew_buildofmaterial SET bom_objectid = 101 WHERE bom_id = 2;
+INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (105, 'S1', '', -1);
+INSERT INTO tew_symbol VALUES (40, 12, 105, 'FP_SWITCH', 300, 640, 0, 0.5, 1, NULL, NULL);
+",
+    )
+    .unwrap();
+    let mut sw = read(&c).unwrap();
+    sw.catalog = vec![Part {
+        id: Part::make_id("Maker F", "FUSE-1"),
+        manufacturer: "Maker F".into(),
+        order_number: "FUSE-1".into(),
+        properties: BTreeMap::from([
+            ("Width".to_owned(), "9".to_owned()),
+            ("Height".to_owned(), "60".to_owned()),
+        ]),
+        ..Default::default()
+    }];
+    let outline = |w: f64, h: f64| {
+        model_space_dwg(&[
+            E::Line((0.0, 0.0), (w, 0.0)),
+            E::Line((w, 0.0), (w, -h)),
+            E::Line((w, -h), (0.0, -h)),
+            E::Line((0.0, -h), (0.0, 0.0)),
+        ])
+    };
+    sw.drawings.add_block("FP_FUSE", &outline(45.0, 80.0)).unwrap();
+    // Drawn left of and above its insertion point: the footprint sits where the drawing is.
+    sw.drawings
+        .add_block(
+            "fp_switch",
+            &model_space_dwg(&[E::Circle((-10.0, 10.0), 5.0), E::Line((-30.0, 0.0), (10.0, 40.0))]),
+        )
+        .unwrap();
+    sw.drawings.add_block("FP_RLY", &outline(100.0, 100.0)).unwrap();
+    let (built, _, report) = build(&sw, None);
+    let panel = &built.panels[0];
+    let device = |end: &str| {
+        panel
+            .items
+            .iter()
+            .find_map(|i| match i {
+                PanelItem::Device { tag, at, width, height } if tag.to_string().ends_with(end) => {
+                    Some((*at, *width, *height))
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(device("-F1"), (Point::new(200.0, 160.0), 45.0, 80.0));
+    // x from -30 to 10 at half width: -15 to 5; y from 0 to 40 above the insertion point.
+    assert_eq!(device("-S1"), (Point::new(285.0, 120.0), 20.0, 40.0));
+    assert_eq!(device("-K1"), (Point::new(100.0, 160.0), 18.0, 90.0), "the box wins");
+    let items = report.iter().find(|r| r.what == "cabinet layout items").unwrap();
+    assert!(
+        items
+            .note
+            .contains("2 device(s) placed with the size of their block's drawing"),
+        "{}",
+        items.note
+    );
+    assert!(!items.note.contains("catalog part"), "{}", items.note);
+    assert!(!items.note.contains("estimated"), "{}", items.note);
+}

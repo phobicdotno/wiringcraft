@@ -137,6 +137,31 @@ impl SweDrawings {
         self.mapped(&s.block, m, s.angle, budget, skipped)
     }
 
+    /// The box round block `name` placed like `s` (turned and scaled like
+    /// [`Self::symbol_graphics`]), on the page: y up, in page millimetres. `None` when the
+    /// archive has no drawing for the block, it draws nothing, or its box has no width or no
+    /// height. Used for cabinet layout footprints without a box size (#232). Entities the
+    /// import's limit would leave out are left out here too; nothing is counted.
+    pub(crate) fn placed_extents(&self, s: &SweSymbol) -> Option<(Point, Point)> {
+        let mut budget = self.draw_limit();
+        let shapes = self.symbol_graphics(s, &mut budget, &mut BTreeMap::new())?;
+        let corners: Vec<Point> = shapes
+            .iter()
+            .flat_map(|sh| {
+                let (a, b) = sh.bounds();
+                [a, b]
+            })
+            .collect();
+        // The symbol's frame is y down from the insertion point.
+        let (min, max) = wc_core::geom::bounds_of(&corners);
+        let (lo, hi) = (
+            Point::new(s.at.x + min.x, s.at.y - max.y),
+            Point::new(s.at.x + max.x, s.at.y - min.y),
+        );
+        let ok = [lo.x, lo.y, hi.x, hi.y].iter().all(|v| v.is_finite()) && hi.x > lo.x && hi.y > lo.y;
+        ok.then_some((lo, hi))
+    }
+
     /// The shapes of block `name` as they are, unturned and unscaled, in the symbol's own frame:
     /// y down, the insertion point at the origin. `None` when the archive has no drawing for the
     /// block or it draws nothing. Used for library symbols (#230).
