@@ -223,7 +223,7 @@ impl Obj {
         self
     }
 
-    /// The texts, their size and a flag, at the end of the data (2007 and 2010).
+    /// The texts, their size and a flag, at the end of the data (2007 on).
     fn string_stream(&self, w: &mut W) {
         if self.strings.0.is_empty() {
             w.b(false);
@@ -862,6 +862,15 @@ fn a_2018_multi_line_attribute_is_counted_and_skipped() -> TestResult {
     objs.push(a);
     let d = drawing(&sections(v, &objs, &[]))?;
     assert_eq!(d.skipped.get("ATTRIB (multi-line)"), Some(&1), "{:?}", d.skipped);
+    // A multi-line ATTDEF (type 4) in the RELAY block likewise.
+    let mut objs = sample(v);
+    let mut a = entity(v, 3, 0x5D, head(Some(RELAY_H)));
+    text_data_with(&mut a, (0.0, 12.0), "?", 2.5, 0.0, Some(1));
+    a.data.rc(0).rc(4);
+    objs.push(a);
+    let d2 = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d2.skipped.get("ATTDEF (multi-line)"), Some(&1), "{:?}", d2.skipped);
+    assert!(!d2.skipped.contains_key(DAMAGED), "{:?}", d2.damaged);
     assert!(!texts(&d.model).contains(&"two lines"));
     assert!(!d.skipped.contains_key(DAMAGED), "{:?}", d.damaged);
     assert!(texts(&d.model).contains(&"-K1"), "the single-line one is still drawn");

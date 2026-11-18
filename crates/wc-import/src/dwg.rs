@@ -1,6 +1,6 @@
-//! The container of AutoCAD DWG files from AutoCAD 2004 to 2018 (`AC1018`, `AC1021`, `AC1024`,
-//! `AC1027`, `AC1032`): the first step of reading DWG drawings, which SolidWorks Electrical stores its
-//! symbol and page graphics in (#59).
+//! The container of AutoCAD DWG files from AutoCAD 2004 to 2018 (`AC1018`, `AC1021`,
+//! `AC1024`, `AC1027`, `AC1032`): the first step of reading DWG drawings, which SolidWorks
+//! Electrical stores its symbol and page graphics in (#59).
 //!
 //! A DWG file of these versions is a set of pages. A short header at the start holds a second,
 //! XOR-scrambled header that says where the *page map* (each page's number and size) and the

@@ -1,4 +1,5 @@
-//! The container of AutoCAD 2007 drawings (`AC1021`), which differs from the 2004 and 2010 one.
+//! The container of AutoCAD 2007 drawings (`AC1021`), which differs from the one of 2004, 2010
+//! and later versions.
 //!
 //! A 2007 file starts with 0x80 bytes of metadata, then a file header of 0x400 bytes. Its first
 //! 3 x 255 bytes are three Reed-Solomon (255, 239) code words, interleaved byte by byte; their
@@ -11,7 +12,7 @@
 //! lists each section by a UTF-16 name with its pages: where each page goes in the section, its
 //! sizes and a checksum. *Data pages* are compressed and coded as Reed-Solomon (255, 251)
 //! words, interleaved or not. A page of zeros is not written at all; the section map then skips
-//! its place. 2007 files use their own LZ77-like compression, unlike 2004 and 2010.
+//! its place. 2007 files use their own LZ77-like compression, unlike the other versions.
 //!
 //! Written from the published Open Design Specification for .dwg files, chapter 5. Where it is
 //! unclear (the field polynomials, where the first instruction of the compressed header starts,
