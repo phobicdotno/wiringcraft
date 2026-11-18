@@ -674,6 +674,17 @@ fn shape_rows(
     let mut shape = drawing.clone();
     set_shape_fields(&mut shape, &draft);
     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    // Text typed, pasted or deleted this frame (it goes to the field with focus). A field left
+    // without any is no entry, even when egui reads its rounded text back as another number.
+    let typing = ui.input(|i| {
+        i.events.iter().any(|e| match e {
+            egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut => true,
+            egui::Event::Key { key, pressed: true, .. } => {
+                matches!(key, egui::Key::Backspace | egui::Key::Delete)
+            }
+            _ => false,
+        })
+    });
     let mut ended = vec![false; now.len()];
     let mut in_use = vec![false; now.len()];
     let mut entered = vec![false; now.len()];
@@ -705,7 +716,7 @@ fn shape_rows(
         // number; tabbing through it, or text that is no number, enters none.
         if let Some(t) = touched.get_mut(field) {
             // Text typed and entered in one frame is applied as the field loses focus.
-            if r.changed() && (r.has_focus() || r.dragged() || (r.lost_focus() && !escape)) {
+            if r.changed() && (r.has_focus() || r.dragged() || (r.lost_focus() && !escape && typing)) {
                 *t = true;
             }
             if done {
@@ -2624,6 +2635,26 @@ mod tests {
         p.frame(Vec::new());
         assert!(p.ps.shape_error.is_some(), "tabbed through: still shown");
         assert_eq!(p.drawing(0), circle(100.0, 5.0));
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_stays_when_a_field_with_more_decimals_than_shown_is_tabbed_through()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 7.123456789)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        let mark = p.o.undo_mark();
+        // egui reads the shown 7.123457 back as the field loses focus: no text was entered.
+        p.tab(n);
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert!(p.ps.shape_error.is_some(), "tabbed through: still shown");
+        assert_eq!(p.drawing(0), circle(100.0, 7.123456789));
         assert_eq!(p.o.undo_mark(), mark);
         Ok(())
     }
