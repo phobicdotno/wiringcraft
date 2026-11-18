@@ -138,27 +138,32 @@ pub(crate) struct Mark {
     form_step: Option<u64>,
     dirty: bool,
     terminals_before: Option<wc_core::project::TerminalNumbers>,
-    /// The vendored symbol and part files there were (`None`: not known).
-    files: Option<std::collections::BTreeSet<(ItemKind, String)>>,
+    /// The vendored symbol and part files there were, or why that is not known.
+    files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
 }
 
 /// The vendored symbol and part files by kind and id (plain files only, not links), from folders
-/// inside the project folder. Only names are read. `None` when a folder that is there cannot be
-/// listed: then nothing is known to be new.
-fn vendor_names(dir: &Path) -> Option<std::collections::BTreeSet<(ItemKind, String)>> {
-    let root = dir.canonicalize().ok()?;
+/// inside the project folder. Only names are read. An error (with its reason) when a folder that
+/// may be there cannot be checked or listed, or lies outside the project: then nothing is known
+/// to be new.
+fn vendor_names(dir: &Path) -> Result<std::collections::BTreeSet<(ItemKind, String)>, String> {
+    let root = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut out = std::collections::BTreeSet::new();
     for kind in [ItemKind::Symbol, ItemKind::Part] {
         let folder = dir.join(store::VENDOR_DIR).join(kind.dir());
+        let at = |e: std::io::Error| format!("{}: {e}", folder.display());
         // Only a folder known to be missing is skipped; one that cannot be checked is unknown.
-        if !folder.try_exists().ok()? {
+        if !folder.try_exists().map_err(at)? {
             continue;
         }
-        let folder = folder.canonicalize().ok().filter(|f| f.starts_with(&root))?;
-        for e in std::fs::read_dir(folder).ok()? {
-            let e = e.ok()?;
+        let real = folder.canonicalize().map_err(at)?;
+        if !real.starts_with(&root) {
+            return Err(format!("{} lies outside the project", folder.display()));
+        }
+        for e in std::fs::read_dir(real).map_err(at)? {
+            let e = e.map_err(at)?;
             let path = e.path();
-            if e.file_type().ok()?.is_file()
+            if e.file_type().map_err(at)?.is_file()
                 && path.extension().is_some_and(|x| x == "json")
                 && let Some(id) = path.file_stem().and_then(|s| s.to_str())
             {
@@ -166,7 +171,7 @@ fn vendor_names(dir: &Path) -> Option<std::collections::BTreeSet<(ItemKind, Stri
             }
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 pub struct Open {
@@ -1410,8 +1415,11 @@ impl Open {
         self.undo_dropped = mark.undo_dropped;
         (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
         self.terminals_before = mark.terminals_before;
-        let (Some(before), Some(now)) = (mark.files, vendor_names(&self.dir)) else {
-            return Ok(());
+        let (before, now) = match (mark.files, vendor_names(&self.dir)) {
+            (Ok(before), Ok(now)) => (before, now),
+            (Err(e), _) | (_, Err(e)) => {
+                return Err(format!("Library files it may have added were not checked: {e}"));
+            }
         };
         let lock = &self.project.lock;
         let mut failed = Vec::new();
@@ -2490,6 +2498,24 @@ pub(crate) mod tests {
             o.project.lock.parts.contains_key(pid),
             "the leftover copy is pinned again"
         );
+        // A vendor folder that cannot be checked (here: a link out of the project) is reported,
+        // and nothing in it is removed.
+        #[cfg(unix)]
+        {
+            let parts = o.dir.join(store::VENDOR_DIR).join(ItemKind::Part.dir());
+            let outside = _tmp.path().join("outside-parts");
+            std::fs::rename(&parts, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, &parts).unwrap();
+            let mark = o.mark();
+            let err = o.back_to(mark).unwrap_err();
+            assert!(
+                err.contains("not checked") && err.contains("outside the project"),
+                "{err}"
+            );
+            assert!(part_file.exists(), "nothing removed");
+            std::fs::remove_file(&parts).unwrap();
+            std::fs::rename(&outside, &parts).unwrap();
+        }
         // A mark taken inside a kept change (a form it opened) means the same step afterwards.
         let mark = o.mark();
         let inside = o.start_live_form();
