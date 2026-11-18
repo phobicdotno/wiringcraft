@@ -12,6 +12,7 @@ mod edit;
 mod feedback;
 mod find_window;
 mod icons;
+mod import_symbols;
 mod panel_view;
 mod panels;
 mod prefs;
@@ -115,6 +116,11 @@ enum Dialog {
     },
     /// Macros to insert.
     Macros(Vec<state::MacroEntry>),
+    /// Library, Import symbols: the library folders to import into and the one chosen.
+    ImportSymbols {
+        targets: Vec<symbol_editor::Target>,
+        chosen: usize,
+    },
     /// WAGO smartScript marker export: which markers, the text lines of each, the language of
     /// the header row, and optionally one terminal strip.
     WagoMarking {
@@ -737,15 +743,7 @@ impl App {
                     Ok(l) => (Some(l), None),
                     Err(e) => (None, Some(format!("The project's library could not be opened: {e}"))),
                 };
-                // Only folders: a git source is a cache that the next sync overwrites. Each
-                // source is paired with its declaration by position (`Library::open` keeps the
-                // order), so a git source sharing a folder's name is never offered.
-                let targets: Vec<symbol_editor::Target> = lib
-                    .iter()
-                    .flat_map(|l| l.sources.iter().zip(&open.project.meta.libraries))
-                    .filter(|(_, decl)| decl.kind == "folder")
-                    .map(|(s, _)| (s.name.clone(), s.root.clone()))
-                    .collect();
+                let targets = lib.as_ref().map(|l| folder_targets(l, open)).unwrap_or_default();
                 let selected = self.ed.selection.iter().find_map(|s| match s {
                     Selection::Symbol(item) => open
                         .project
@@ -778,6 +776,21 @@ impl App {
                 }
                 self.symbol_editor = Some(ed);
             }
+            Action::ImportSymbols => match wc_library::Library::open(&open.dir, &open.project) {
+                Ok(lib) => {
+                    let targets = folder_targets(&lib, open);
+                    self.dialog = Some(if targets.is_empty() {
+                        Dialog::Message(
+                            "The project has no library folder to import into. Add one under the project's \
+                             libraries (a folder source), then import again."
+                                .into(),
+                        )
+                    } else {
+                        Dialog::ImportSymbols { targets, chosen: 0 }
+                    });
+                }
+                Err(e) => self.dialog = Some(Dialog::Message(format!("The library could not be opened:\n{e}"))),
+            },
             Action::LibraryStatus | Action::LibraryUpdate => {
                 match wc_library::Library::open(&open.dir, &open.project) {
                     Ok(lib) => {
@@ -891,6 +904,7 @@ impl App {
             Dialog::Message(_) => "WiringCraft",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
+            Dialog::ImportSymbols { .. } => "Import symbols",
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
@@ -1792,6 +1806,47 @@ impl App {
                         }
                     });
                 }
+                Dialog::ImportSymbols { targets, chosen } => {
+                    ui.label(
+                        "Pick DXF, SVG, KiCad (.kicad_sym) or QElectroTech (.elmt) files. Each is read by its \
+                         extension and its symbols are written into the library folder below.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Library folder");
+                        let shown = |t: &symbol_editor::Target| format!("{} ({})", t.0, t.1.display());
+                        egui::ComboBox::from_id_salt("import_lib")
+                            .selected_text(targets.get(*chosen).map(shown).unwrap_or_default())
+                            .show_ui(ui, |ui| {
+                                for (k, t) in targets.iter().enumerate() {
+                                    ui.selectable_value(chosen, k, shown(t));
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Choose files and import…").clicked()
+                            && let Some((_, root)) = targets.get(*chosen)
+                            && let Some(files) = rfd::FileDialog::new()
+                                .set_title("Import symbols")
+                                .add_filter("Symbol files", import_symbols::EXTENSIONS)
+                                .pick_files()
+                        {
+                            let root = root.clone();
+                            then = Some(Box::new(move |app: &mut App| {
+                                let out = import_symbols::import(&files, &root);
+                                if let Some(open) = app.open.as_mut() {
+                                    open.refresh_library();
+                                }
+                                app.ed.message =
+                                    format!("Imported {} symbols, {} failed.", out.written.len(), out.failed.len());
+                                app.dialog = Some(Dialog::Message(out.report(&root)));
+                            }));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::NewBranch(name) => {
                     ui.label("Branch name (for example customer-changes):");
                     ui.text_edit_singleline(name);
@@ -2042,6 +2097,19 @@ fn main_viewport() -> egui::ViewportBuilder {
         .with_min_inner_size([900.0, 560.0])
         .with_title("WiringCraft")
         .with_icon(window_icon())
+}
+
+/// The project's library folders that symbols can be written into, in the project's order (the
+/// first is its own). Only folders: a git source is a cache that the next sync overwrites. Each
+/// source is paired with its declaration by position (`Library::open` keeps the order), so a git
+/// source sharing a folder's name is never offered.
+fn folder_targets(lib: &wc_library::Library, open: &Open) -> Vec<symbol_editor::Target> {
+    lib.sources
+        .iter()
+        .zip(&open.project.meta.libraries)
+        .filter(|(_, decl)| decl.kind == "folder")
+        .map(|(s, _)| (s.name.clone(), s.root.clone()))
+        .collect()
 }
 
 /// The starter symbol library: `library/` beside the executable or in the source tree.
