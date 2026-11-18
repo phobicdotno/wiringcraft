@@ -215,9 +215,11 @@ fn a_jumper_part_is_listed_as_used_by_its_jumper() -> std::result::Result<(), Bo
 #[test]
 fn a_library_file_declaring_another_id_is_not_taken() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut f = fixture()?;
-    // `fake.json` in the library holds the symbol `other`.
-    let other = f.company.join("symbols").join("other.json");
-    std::fs::copy(&other, f.company.join("symbols").join("fake.json"))?;
+    // `fake.json` in the library holds a symbol declaring `other`, with other contents than
+    // the library's `other`: taking it would write over the project's copy of `other`.
+    let fake = write_symbol(&f.company, &sym("other", 77.0))?;
+    std::fs::rename(&fake, f.company.join("symbols").join("fake.json"))?;
+    write_symbol(&f.company, &sym("other", 5.0))?;
     let lib = Library::open(&f.proj, &f.project)?;
     take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "other")?;
     let kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "other")?)?;
@@ -228,6 +230,34 @@ fn a_library_file_declaring_another_id_is_not_taken() -> std::result::Result<(),
     assert!(!f.project.lock.symbols.contains_key("fake"), "not pinned");
     assert_eq!(
         std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "other")?)?,
+        kept
+    );
+    Ok(())
+}
+
+#[test]
+fn a_library_part_file_declaring_another_id_is_not_taken() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut f = fixture()?;
+    let part = |description: &str| Part {
+        id: "other".into(),
+        description: description.into(),
+        ..Part::default()
+    };
+    // `fake.json` holds a part declaring `other`, with other contents than the library's `other`.
+    let fake = write_part(&f.company, &part("fake"))?;
+    std::fs::rename(&fake, f.company.join("parts").join("fake.json"))?;
+    write_part(&f.company, &part("the real one"))?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    take(&f.proj, &mut f.project, &lib, ItemKind::Part, "other")?;
+    let kept = std::fs::read(store::vendor_path(&f.proj, ItemKind::Part, "other")?)?;
+    let err = take(&f.proj, &mut f.project, &lib, ItemKind::Part, "fake")
+        .err()
+        .ok_or("taken")?;
+    assert!(matches!(err, Error::Source { .. }), "{err:?}");
+    assert!(err.to_string().contains("declares id \"other\""), "{err}");
+    assert!(!f.project.lock.parts.contains_key("fake"), "not pinned");
+    assert_eq!(
+        std::fs::read(store::vendor_path(&f.proj, ItemKind::Part, "other")?)?,
         kept
     );
     Ok(())

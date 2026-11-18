@@ -1985,9 +1985,9 @@ impl App {
             }
             "part" => {
                 let terminal = need_s(v, "terminal")?.trim();
-                // Only a text (empty clears it) or nothing at all: another value is a mistake,
-                // not a request to clear the part.
-                if v.get("part").is_some_and(|p| !p.is_string() && !p.is_null()) {
+                // Only a text, empty to clear it: a missing or other value is a mistake, not a
+                // request to clear the part.
+                if !v.get("part").is_some_and(Value::is_string) {
                     return Err("`part` must be a part id, or an empty text to clear it.".into());
                 }
                 let part = s(v, "part").map(str::trim).filter(|p| !p.is_empty());
@@ -2599,11 +2599,13 @@ mod tests {
         let with_part = json!([{"strip": "-X1", "terminals": ["1", "2", "4"], "part": "example.ex-tb-2-5"}]);
         assert_eq!(list(&mut a), with_part);
 
-        // A two-level terminal or a part that is not a text is refused whole.
+        // A two-level terminal, or a part that is missing or not a text, is refused whole.
         let mark = undo_mark(&a);
         for bad in [
             json!({"action": "remove", "strip": "-X1", "terminals": ["1", "2.1"]}),
             json!({"action": "part", "strip": "-X1", "terminal": "4", "part": 42}),
+            json!({"action": "part", "strip": "-X1", "terminal": "4", "part": null}),
+            json!({"action": "part", "strip": "-X1", "terminal": "4"}),
         ] {
             assert!(call(&mut a, "jumpers", bad.clone()).is_err(), "{bad}");
         }
