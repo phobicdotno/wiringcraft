@@ -1155,23 +1155,25 @@ fn run(cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
-            // Only SVG shows pictures; a DXF export does not read them.
-            let pictures = if ext == "svg" {
-                wc_pdf::read_pictures(dir, &p)
-            } else {
-                wc_pdf::Pictures::default()
-            };
-            let (drawings, report) = wc_pdf::page_drawings(
-                &p,
-                &symbols,
-                &wc_pdf::Options {
+            // Only SVG shows pictures; a DXF export neither reads nor checks them.
+            let (drawings, report) = if ext == "svg" {
+                let pictures = wc_pdf::read_pictures(dir, &p);
+                let options = wc_pdf::Options {
                     pages,
                     date,
                     underlays: pictures.files,
                     unreadable: pictures.unreadable,
                     ..Default::default()
-                },
-            );
+                };
+                wc_pdf::page_drawings(&p, &symbols, &options)
+            } else {
+                let options = wc_pdf::Options {
+                    pages,
+                    date,
+                    ..Default::default()
+                };
+                wc_pdf::page_lines(&p, &symbols, &options)
+            };
             std::fs::create_dir_all(&out).map_err(e)?;
             let mut used = std::collections::BTreeSet::new();
             for d in &drawings {

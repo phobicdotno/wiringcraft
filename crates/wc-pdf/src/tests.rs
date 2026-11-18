@@ -1113,3 +1113,26 @@ fn svg_drawings_leave_out_a_missing_or_damaged_picture() {
             .any(|w| w.starts_with("page 1: underlay underlays/p1.jpg") && w.contains("damaged"))
     );
 }
+
+#[test]
+fn page_lines_leave_out_pictures_without_warning() {
+    let mut project = Project::new("Lines");
+    let mut p1 = Page::new("p1", "1", "One");
+    p1.underlay = Some(wc_core::Underlay {
+        file: "underlays/p1.png".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(10.0, 10.0),
+    });
+    project.pages = vec![p1];
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    // No picture bytes are given: a DXF export does not read them, so none may be missed.
+    let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(pages.len(), 1);
+    assert!(pages[0].pictures.is_empty());
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(svg_report.warnings.len(), 2, "{:?}", svg_report.warnings);
+}

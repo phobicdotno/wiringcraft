@@ -65,6 +65,25 @@ pub fn page_drawings(
     symbols: &BTreeMap<String, Symbol>,
     options: &Options,
 ) -> (Vec<PageDrawing>, Report) {
+    drawings(project, symbols, options, true)
+}
+
+/// As [`page_drawings`], but without the logo and underlays: they are neither looked up nor
+/// warned about, for formats that do not show pictures (DXF).
+pub fn page_lines(
+    project: &Project,
+    symbols: &BTreeMap<String, Symbol>,
+    options: &Options,
+) -> (Vec<PageDrawing>, Report) {
+    drawings(project, symbols, options, false)
+}
+
+fn drawings(
+    project: &Project,
+    symbols: &BTreeMap<String, Symbol>,
+    options: &Options,
+    with_pictures: bool,
+) -> (Vec<PageDrawing>, Report) {
     let pages: Vec<&wc_core::Page> = project
         .pages
         .iter()
@@ -75,7 +94,7 @@ pub fn page_drawings(
         warnings: Vec::new(),
     };
     // The logo is checked once, however many pages show it.
-    let logo = project.meta.logo.as_ref().and_then(|l| {
+    let logo = project.meta.logo.as_ref().filter(|_| with_pictures).and_then(|l| {
         let found = picture_bytes(options, &l.file, "logo").and_then(|b| {
             checked(b)
                 .map(|c| (c, b))
@@ -94,7 +113,7 @@ pub fn page_drawings(
         .map(|(i, page)| {
             let drawn = layout::draw_page(project, page, i, total, symbols, &xref, options, &mut report.warnings);
             let mut pictures = Vec::new();
-            if let Some(u) = &page.underlay {
+            if let Some(u) = page.underlay.as_ref().filter(|_| with_pictures) {
                 let found = picture_bytes(options, &u.file, "underlay")
                     .map_err(|w| format!("page {}: {w}", page.number))
                     .and_then(|b| {

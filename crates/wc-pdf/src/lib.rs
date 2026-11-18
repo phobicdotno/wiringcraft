@@ -19,7 +19,7 @@ pub use layout::{
     fit_picture, frame_marks, junctions, logo_boxes, pin_position, title_logo_box, xref_marks,
 };
 pub use picture::{Pictures, read_picture, read_pictures};
-pub use vector::{PageDrawing, Picture, dxf, page_drawings, svg};
+pub use vector::{PageDrawing, Picture, dxf, page_drawings, page_lines, svg};
 pub use writer::{Layer, Prim, Stroke};
 
 #[derive(Debug, Clone)]
