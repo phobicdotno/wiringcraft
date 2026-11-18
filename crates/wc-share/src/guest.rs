@@ -15,6 +15,8 @@ pub enum GuestStatus {
     Waiting,
     Joined,
     Declined,
+    /// The host and this guest run session protocol versions that cannot work together.
+    WrongVersion(crate::VersionMismatch),
     /// The host ended the session.
     Closed,
 }
@@ -92,6 +94,7 @@ impl Guest {
         GuestMsg::Join {
             name: name.to_owned(),
             email: email.to_owned(),
+            protocol: crate::PROTOCOL_VERSION,
         }
     }
 
@@ -218,7 +221,17 @@ impl Guest {
                 locks,
                 peers,
                 history,
+                protocol,
             } => {
+                // A host on another version (one too old to check the guest's) may send
+                // messages this guest cannot read: stop here.
+                if protocol != crate::PROTOCOL_VERSION {
+                    self.status = GuestStatus::WrongVersion(crate::VersionMismatch {
+                        host: protocol,
+                        guest: crate::PROTOCOL_VERSION,
+                    });
+                    return;
+                }
                 self.history = history;
                 self.status = GuestStatus::Joined;
                 self.me = Some(you);
@@ -229,7 +242,8 @@ impl Guest {
                 self.locks = locks;
                 self.peers = peers;
             }
-            HostMsg::Declined => self.status = GuestStatus::Declined,
+            HostMsg::Declined { version: None } => self.status = GuestStatus::Declined,
+            HostMsg::Declined { version: Some(v) } => self.status = GuestStatus::WrongVersion(v),
             HostMsg::Closed => {
                 self.status = GuestStatus::Closed;
                 self.locks.clear();

@@ -67,6 +67,12 @@ edits; Undo is off. Tools that change pages nobody else has open (wire numbering
 on every page) send those pages together as one change (#77); wire numbering leaves pages other
 people hold as they are and says which. Still open: undo per change (#78). #43 tracks it.
 
+Host and guests must run builds with the same session protocol version
+(`wc_share::PROTOCOL_VERSION`, raised whenever a message changes). A guest on another version is
+turned away when it asks to join (#201). A guest from this build on shows a message naming both
+versions in Join session, and marks announced sessions on another version; a guest from before
+versions were sent (counted as version 0) only shows that the host declined.
+
 ## Planning and integrations
 
 | Gap | Todo |

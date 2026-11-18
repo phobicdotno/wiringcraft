@@ -13,6 +13,30 @@ use crate::{ChangeInfo, Parts};
 /// A participant's number in a session. The host is always [`crate::HOST`].
 pub type PeerId = u32;
 
+/// The version of the messages below. A host lets in only guests on the same version (a build
+/// before versions were sent counts as 0), since a message one side does not know cannot be
+/// read by the other. Raise it whenever a message, edit or field is added or changed in a way
+/// an older build cannot read.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The session protocol versions of a host and a guest that cannot work together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionMismatch {
+    pub host: u32,
+    pub guest: u32,
+}
+
+impl std::fmt::Display for VersionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let newer = if self.host > self.guest { "host's" } else { "guest's" };
+        write!(
+            f,
+            "the host's WiringCraft uses session protocol version {} and the guest's uses version {}; update the other side to the {newer} WiringCraft version",
+            self.host, self.guest
+        )
+    }
+}
+
 /// The largest picture file a session carries (a logo or a page underlay), in bytes. It keeps
 /// each message well under the connection's line limit ([`crate::net::MAX_LINE`]).
 pub const MAX_PICTURE: usize = 16 * 1024 * 1024;
@@ -94,8 +118,14 @@ pub struct Peer {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuestMsg {
-    /// Ask to join. The host shows the name and email and approves or declines.
-    Join { name: String, email: String },
+    /// Ask to join. The host shows the name and email and approves or declines. A guest on
+    /// another [`PROTOCOL_VERSION`] (0 from a build that did not send one) is declined at once.
+    Join {
+        name: String,
+        email: String,
+        #[serde(default)]
+        protocol: u32,
+    },
     /// Open a page (taking its lock), or `None` to close the open page (releasing it).
     Open { page: Option<String> },
     /// The new content of the page the guest holds the lock for.
@@ -507,9 +537,17 @@ pub enum HostMsg {
         /// The session's changes so far, for undo and the change list.
         #[serde(default)]
         history: Vec<ChangeInfo>,
+        /// The host's [`PROTOCOL_VERSION`]; 0 from a build that did not send one.
+        #[serde(default)]
+        protocol: u32,
     },
-    /// The host declined the join request. The connection should be closed.
-    Declined,
+    /// The host declined the join request, or (with `version`) the guest runs another
+    /// [`PROTOCOL_VERSION`]. The connection should be closed. A build that does not know
+    /// `version` still reads this as declined.
+    Declined {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<VersionMismatch>,
+    },
     /// A page changed (sent to everyone except the person who changed it).
     PageChanged { page: Page, by: PeerId },
     /// A project-level change was applied (sent to everyone, the author included, so all

@@ -970,12 +970,22 @@ impl Role {
             Role::Guest(j) => {
                 loop {
                     match j.link.try_recv() {
-                        Ok(Some(msg)) => j.guest.handle(msg),
+                        Ok(Some(msg)) => {
+                            j.guest.handle(msg);
+                            // Nothing after a welcome from another version can be read safely,
+                            // and a close behind it would hide why.
+                            if matches!(j.guest.status, GuestStatus::WrongVersion(_)) {
+                                break;
+                            }
+                        }
                         Ok(None) => break,
                         Err(_) => {
                             // A host that declined or ended the session closes the connection
                             // after saying so; only an unexplained close is news.
-                            if !matches!(j.guest.status, GuestStatus::Declined | GuestStatus::Closed) {
+                            if !matches!(
+                                j.guest.status,
+                                GuestStatus::Declined | GuestStatus::WrongVersion(_) | GuestStatus::Closed
+                            ) {
                                 notes.push(closed_note(&j.link));
                                 j.guest.status = GuestStatus::Closed;
                             }
@@ -989,6 +999,10 @@ impl Role {
                 match j.guest.status {
                     GuestStatus::Declined => {
                         notes.push("The host declined your request to join.".into());
+                        false
+                    }
+                    GuestStatus::WrongVersion(v) => {
+                        notes.push(format!("You cannot join this session: {v}."));
                         false
                     }
                     GuestStatus::Closed => {
@@ -1099,6 +1113,53 @@ struct Form {
     browse_error: Option<String>,
     sessions: Vec<wc_share::discovery::Session>,
     error: Option<String>,
+    /// The field `error` is about.
+    error_about: ErrorAbout,
+}
+
+/// Which field of the join form an error is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ErrorAbout {
+    /// The host: it could not be reached, or it refused.
+    #[default]
+    Address,
+    /// The folder to keep the copy in.
+    Folder,
+}
+
+impl Form {
+    /// Show an error about one field.
+    fn fail(&mut self, about: ErrorAbout, error: String) {
+        self.error = Some(error);
+        self.error_about = about;
+    }
+
+    /// An error is about the field it was for: once that field is changed (another address
+    /// picked or typed, another folder typed), it no longer applies. `addr` and `folder` are
+    /// the fields as they were before this frame's edits.
+    fn forget_error_unless(&mut self, addr: &str, folder: &str) {
+        let changed = match self.error_about {
+            ErrorAbout::Address => self.addr != addr,
+            ErrorAbout::Folder => self.folder != folder,
+        };
+        if changed {
+            self.error = None;
+        }
+    }
+}
+
+/// How a discovered session is listed in the Join dialog, and whether it can be joined.
+fn session_row(s: &wc_share::discovery::Session) -> (String, bool) {
+    let mut label = format!("{}  ·  {}  ({})", s.project, s.host, s.addr);
+    let joinable = s.protocol == wc_share::PROTOCOL_VERSION;
+    if !joinable {
+        label.push_str(&format!(
+            "  ·  WiringCraft session version {}, this one uses {}; cannot be joined",
+            s.protocol,
+            wc_share::PROTOCOL_VERSION
+        ));
+    }
+    (label, joinable)
 }
 
 impl Default for Form {
@@ -1112,6 +1173,7 @@ impl Default for Form {
             browse_error: None,
             sessions: Vec::new(),
             error: None,
+            error_about: ErrorAbout::Address,
         }
     }
 }
@@ -1200,6 +1262,9 @@ impl Share {
         let form = self.form.get_or_insert_with(Form::default);
         form.error = None;
         if self.view == View::Join && form.browser.is_none() {
+            // Sessions heard by an earlier browser may be gone; listing them would also hide
+            // why browsing cannot start again.
+            form.sessions.clear();
             match Browser::open() {
                 Ok(b) => {
                     form.browser = Some(b);
@@ -1298,6 +1363,7 @@ impl Share {
             project: open.project.meta.name.clone(),
             host: name.to_owned(),
             port,
+            protocol: wc_share::PROTOCOL_VERSION,
         }) {
             Ok(a) => Some(a),
             Err(e) => {
@@ -1402,9 +1468,27 @@ impl Share {
     pub fn frame(&mut self, open: Option<&mut Open>, page: Option<String>, busy: bool) -> Option<Open> {
         let role = self.role.as_mut()?;
         if !role.pump(&mut self.notes) {
+            // A join that was turned away goes back to the Join dialog, which says why: always
+            // for another version (the person has to update one side), for a plain decline only
+            // while the status window is still open (the note says it otherwise).
+            let shown = self.view == View::Status;
+            let refused = match role {
+                Role::Guest(j) => match &j.guest.status {
+                    GuestStatus::WrongVersion(v) => Some(format!("You cannot join this session: {v}.")),
+                    GuestStatus::Declined if shown => Some("The host declined your request to join.".to_owned()),
+                    _ => None,
+                },
+                Role::Host(_) => None,
+            };
             self.role = None;
             self.base = None;
             self.forget_items();
+            if let Some(why) = refused {
+                self.show_join();
+                if let Some(f) = self.form.as_mut() {
+                    f.fail(ErrorAbout::Address, why);
+                }
+            }
             return None;
         }
 
@@ -1749,9 +1833,12 @@ impl Share {
                         None => "None found yet. Over a VPN, type the host's address below.".into(),
                     });
                 }
+                let typed = (form.addr.clone(), form.folder.clone());
                 for s in &form.sessions {
-                    let label = format!("{}  ·  {}  ({})", s.project, s.host, s.addr);
-                    if ui.selectable_label(form.addr == s.addr.to_string(), label).clicked() {
+                    let (label, joinable) = session_row(s);
+                    // A session on another version cannot be joined, so it cannot be picked either.
+                    let row = egui::SelectableLabel::new(form.addr == s.addr.to_string(), label);
+                    if ui.add_enabled(joinable, row).clicked() {
                         form.addr = s.addr.to_string();
                     }
                 }
@@ -1770,6 +1857,7 @@ impl Share {
                     ui.text_edit_singleline(&mut form.folder);
                     ui.end_row();
                 });
+                form.forget_error_unless(&typed.0, &typed.1);
                 if let Some(e) = &form.error {
                     ui.colored_label(ui.visuals().error_fg_color, e);
                 }
@@ -1778,27 +1866,40 @@ impl Share {
                     .clicked();
             });
         if join {
-            let (addr, name, email) = (form.addr.clone(), form.name.clone(), form.email.clone());
-            let joined =
-                crate::prefs::project_path(&form.folder).and_then(|folder| self.join(&addr, &name, &email, folder));
-            match joined {
-                Ok(()) => {
-                    if let Some(f) = self.form.as_mut() {
-                        f.browser = None;
-                    }
-                    self.view = View::Status;
-                }
-                Err(e) => {
-                    if let Some(f) = self.form.as_mut() {
-                        f.error = Some(e);
-                    }
-                }
-            }
+            self.ask_to_join(crate::prefs::project_path);
         } else if !keep {
             if let Some(f) = self.form.as_mut() {
                 f.browser = None;
             }
             self.view = View::Closed;
+        }
+    }
+
+    /// "Ask to join" with what the join form holds. `folder` resolves the typed folder (see
+    /// [`crate::prefs::project_path`]); an error is shown on the field it is about.
+    fn ask_to_join(&mut self, folder: impl FnOnce(&str) -> Result<PathBuf, String>) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        let (addr, name, email) = (form.addr.clone(), form.name.clone(), form.email.clone());
+        let joined = folder(&form.folder)
+            .map_err(|e| (ErrorAbout::Folder, e))
+            .and_then(|folder| {
+                self.join(&addr, &name, &email, folder)
+                    .map_err(|e| (ErrorAbout::Address, e))
+            });
+        match joined {
+            Ok(()) => {
+                if let Some(f) = self.form.as_mut() {
+                    f.browser = None;
+                }
+                self.view = View::Status;
+            }
+            Err((about, e)) => {
+                if let Some(f) = self.form.as_mut() {
+                    f.fail(about, e);
+                }
+            }
         }
     }
 

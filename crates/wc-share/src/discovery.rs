@@ -36,7 +36,9 @@ pub const FORGET_AFTER: Duration = Duration::from_secs(7);
 const MAGIC: &str = "wiringcraft-session";
 
 /// The largest beacon, in bytes. An announcer refuses a longer one; a browser reads no more.
-pub const MAX_BEACON: usize = 2048;
+/// 2048 bytes of names and port as before the protocol version was announced, plus room for
+/// that field, so every project and host name that could be announced then still can.
+pub const MAX_BEACON: usize = 2048 + 64;
 
 /// The most datagrams one [`Browser::poll`] reads, so a flood cannot hold up the window.
 /// The rest wait for the next poll.
@@ -51,6 +53,10 @@ pub struct Beacon {
     pub host: String,
     /// The TCP port the session listens on.
     pub port: u16,
+    /// The host's session protocol version ([`crate::PROTOCOL_VERSION`]); 0 from a build that
+    /// did not announce one.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,6 +88,9 @@ pub struct Session {
     pub host: String,
     /// Where to connect to join: the sender's IP address with the announced port.
     pub addr: SocketAddr,
+    /// The host's session protocol version, as announced: a session on another version than
+    /// [`crate::PROTOCOL_VERSION`] cannot be joined.
+    pub protocol: u32,
 }
 
 /// A running announcement. Stops on [`Announcer::stop`] or when dropped.
@@ -219,6 +228,7 @@ impl Browser {
                             project: b.project,
                             host: b.host,
                             addr,
+                            protocol: b.protocol,
                         };
                         self.heard.insert(addr, (s, Instant::now()));
                     }
