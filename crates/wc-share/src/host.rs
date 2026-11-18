@@ -467,10 +467,9 @@ impl Host {
             let mut probe = Project::new("");
             probe.lock = self.project.lock.clone();
             probe.pages = vec![p.clone()];
-            self.dangling_in(&probe)
+            probe
         };
-        let was = on_page(current);
-        let dangling: Vec<String> = on_page(&page).difference(&was).cloned().collect();
+        let dangling = self.newly_dangling(&on_page(current), &on_page(&page));
         if !dangling.is_empty() {
             return Err(Refusal::Invalid {
                 reason: format!(
@@ -557,9 +556,21 @@ impl Host {
         }
         // Pages set whole, as a page edit: a wire may not newly end on a pin the locked version of
         // its symbol lacks (an update may have dropped the pin after the author drew the wire).
-        if edit.set_pages().next().is_some() {
-            let was = self.dangling_in(&before);
-            let dangling: Vec<String> = self.dangling_in(&self.project).difference(&was).cloned().collect();
+        let set: BTreeSet<&str> = edit.set_pages().map(|p| p.id.as_str()).collect();
+        if !set.is_empty() {
+            // Only the pages set can have changed ends: the others are left out of both scans.
+            let only = |p: &Project| {
+                let mut probe = Project::new("");
+                probe.lock = p.lock.clone();
+                probe.pages = p
+                    .pages
+                    .iter()
+                    .filter(|pg| set.contains(pg.id.as_str()))
+                    .cloned()
+                    .collect();
+                probe
+            };
+            let dangling = self.newly_dangling(&only(&before), &only(&self.project));
             if !dangling.is_empty() {
                 self.project = before;
                 return Err(Refusal::Invalid {
@@ -745,8 +756,7 @@ impl Host {
         apply_edit(&mut self.project, &edit);
         // Every wire end the undo leaves must be on a pin of its symbol's locked version: a symbol
         // locked again in an older version, or a wire put back on a pin a later update dropped.
-        let was = self.dangling_in(&before);
-        let dangling: Vec<String> = self.dangling_in(&self.project).difference(&was).cloned().collect();
+        let dangling = self.newly_dangling(&before, &self.project);
         if !dangling.is_empty() {
             self.project = before;
             return invalid(format!(
@@ -917,14 +927,36 @@ impl Host {
     /// Symbol `id` in the version `hash`: the one guests get, or one an update replaced.
     /// Wire ends in `project` on pins the locked version of their symbol does not have, for the
     /// versions the session has.
-    fn dangling_in(&self, project: &Project) -> BTreeSet<String> {
-        project
+    /// The wire ends dangling in `project`, counted (two wires sharing an id count twice), each
+    /// with its label.
+    fn dangling_in(&self, project: &Project) -> BTreeMap<wc_core::project::DanglingEnd, (usize, String)> {
+        let mut out: BTreeMap<_, (usize, String)> = BTreeMap::new();
+        let ends = project
             .lock
             .symbols
             .iter()
             .filter_map(|(id, e)| Some((id, self.symbol_version(id, &e.hash)?)))
-            .flat_map(|(id, s)| project.dangling_pins(id, &s))
-            .collect()
+            .flat_map(|(id, s)| project.dangling_ends(id, &s));
+        for (end, label) in ends {
+            out.entry(end).or_insert((0, label)).0 += 1;
+        }
+        out
+    }
+
+    /// The labels of wire ends dangling in `after` that did not dangle in `before`: compared by
+    /// what each end is, not by its label (a renamed device relabels an end already dangling;
+    /// two wires on one missing pin share a label), and by how many there are of it.
+    fn newly_dangling(&self, before: &Project, after: &Project) -> Vec<String> {
+        let was = self.dangling_in(before);
+        let mut out: Vec<String> = self
+            .dangling_in(after)
+            .into_iter()
+            .filter(|(k, (n, _))| was.get(k).is_none_or(|(m, _)| n > m))
+            .map(|(_, (_, label))| label)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn symbol_version(&self, id: &str, hash: &str) -> Option<wc_core::Symbol> {

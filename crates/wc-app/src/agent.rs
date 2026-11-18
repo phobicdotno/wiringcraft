@@ -2628,6 +2628,7 @@ mod tests {
             find: None,
             pending: None,
             pending_for: None,
+            strip_editor: None,
         };
         (tmp, app)
     }

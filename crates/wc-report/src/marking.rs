@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use wc_core::DeviceTag;
 use wc_core::symbol::SymbolRole;
 
-use crate::{Inputs, Table, natural_key, terminal_plan};
+use crate::{Inputs, Table, natural_key};
 
 /// What kind of marker a row is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,7 +47,7 @@ impl MarkerKind {
     }
 
     /// The marker type as written in the file's first column.
-    fn label(self, lang: Language) -> &'static str {
+    pub(crate) fn label(self, lang: Language) -> &'static str {
         use Language::*;
         match (self, lang) {
             (MarkerKind::Terminals, En) => "Terminal",
@@ -219,13 +219,19 @@ pub fn terminal_strips(i: &Inputs<'_>) -> Vec<String> {
 /// (strip, number, level) of every numbered terminal, sorted and without repeats. The level is
 /// the terminal plan's: set on the levels of a multi-level terminal.
 fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
-    // The terminal plan already numbers terminals and sorts strips and numbers.
-    let mut rows: Vec<(String, String, Option<u32>)> = terminal_plan(i)
+    // The terminal plan already numbers terminals and sorts strips and numbers. A spare
+    // without a level of its own (terminal strip editor) is in no multi-level block, so it
+    // goes after its strip's other terminals and never splits a block's marker.
+    let (plan, spares) = crate::terminal_plan_with_spares(i);
+    let mut rows: Vec<(String, bool, String, Option<u32>)> = plan
         .rows
         .into_iter()
-        .filter_map(|r| match (r.first(), r.get(1)) {
+        .enumerate()
+        .filter_map(|(k, r)| match (r.first(), r.get(1)) {
             (Some(strip), Some(number)) if strip != "(untagged)" => {
-                Some((strip.clone(), number.clone(), r.get(7).and_then(|l| l.parse().ok())))
+                let level = r.get(7).and_then(|l| l.parse().ok());
+                let loose = level.is_none() && spares.contains(&k);
+                Some((strip.clone(), loose, number.clone(), level))
             }
             _ => None,
         })
@@ -236,13 +242,14 @@ fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
         natural_key(&a.0)
             .cmp(&natural_key(&b.0))
             .then_with(|| a.0.cmp(&b.0))
-            .then(natural_key(&a.1).cmp(&natural_key(&b.1)))
+            .then(a.1.cmp(&b.1))
+            .then(natural_key(&a.2).cmp(&natural_key(&b.2)))
             // `1` and `01` have equal keys: order them exactly too, so `dedup` sees
             // repeats side by side.
-            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
     });
-    rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-    rows
+    rows.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
+    rows.into_iter().map(|(s, _, n, l)| (s, n, l)).collect()
 }
 
 /// The terminal markers of `rows` (from [`terminal_rows`]) as (strip, marker text): one per
@@ -360,20 +367,35 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
         }
     }
 
-    if wanted(MarkerKind::Devices) {
-        // Devices are marked by their tag; terminals and cables have markers of their own,
-        // and interruption points (links between pages) are not devices.
-        let mut skip: BTreeSet<DeviceTag> = cables.clone();
+    // Terminals have terminal markers: the drawn ones and the spares the terminal strip editor
+    // keeps (a spare that is drawn too is a drawn terminal already). Only the device and cable
+    // markers need them.
+    let mut terminals: BTreeSet<DeviceTag> = BTreeSet::new();
+    if wanted(MarkerKind::Devices) || wanted(MarkerKind::Cables) {
+        for l in &i.project.meta.strips {
+            for n in &l.spares {
+                if let Ok(tag) = DeviceTag::parse(&format!("{}.{n}", l.strip)) {
+                    terminals.insert(tag);
+                }
+            }
+        }
         for page in &i.project.pages {
             for s in &page.symbols {
                 let role = i.symbols.get(&s.symbol).map(|y| y.role);
                 if matches!(role, Some(SymbolRole::Terminal))
                     && let Some(tag) = &s.tag
                 {
-                    skip.insert(tag.clone());
+                    terminals.insert(tag.clone());
                 }
             }
         }
+    }
+
+    if wanted(MarkerKind::Devices) {
+        // Devices are marked by their tag; terminals and cables have markers of their own,
+        // and interruption points (links between pages) are not devices.
+        let mut skip: BTreeSet<DeviceTag> = cables.clone();
+        skip.extend(terminals.iter().cloned());
         let mut list: Vec<DeviceTag> = crate::all_tags(i)
             .into_iter()
             .filter(|t| !skip.contains(t) && !is_cable_tag(t))
@@ -388,10 +410,21 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
     }
 
     if wanted(MarkerKind::Cables) {
-        // Cables drawn as cores of wires, and cable devices listed without cores yet.
+        // Cables drawn as cores of wires, and cable devices listed without cores yet; a
+        // terminal named like a cable (-X1.W1) is a terminal.
         let mut list: BTreeSet<DeviceTag> = cables;
-        list.extend(crate::all_tags(i).into_iter().filter(is_cable_tag));
-        list.extend(i.project.devices.keys().filter(|t| is_cable_tag(t)).cloned());
+        list.extend(
+            crate::all_tags(i)
+                .into_iter()
+                .filter(|t| is_cable_tag(t) && !terminals.contains(t)),
+        );
+        list.extend(
+            i.project
+                .devices
+                .keys()
+                .filter(|t| is_cable_tag(t) && !terminals.contains(*t))
+                .cloned(),
+        );
         let mut list: Vec<DeviceTag> = list.into_iter().collect();
         list.sort_by_key(|t| natural_key(&t.to_string()));
         for tag in list {

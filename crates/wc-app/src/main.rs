@@ -19,6 +19,7 @@ mod prefs;
 mod screenshot;
 mod share;
 mod state;
+mod strip_editor;
 mod symbol_editor;
 mod template_form;
 mod theme;
@@ -179,6 +180,8 @@ struct App {
     pending: Option<Pending>,
     /// The project folder open when the waiting picker was asked for: it is for that project.
     pending_for: Option<PathBuf>,
+    /// The terminal strip editor, while open.
+    strip_editor: Option<strip_editor::StripEditor>,
 }
 
 /// A file or folder picker an action needs before it can be carried out. It is shown after the
@@ -393,6 +396,7 @@ impl App {
             find: None,
             pending: None,
             pending_for: None,
+            strip_editor: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -669,6 +673,13 @@ impl App {
             Action::Find => {
                 if self.open.is_some() {
                     self.find.get_or_insert_with(Default::default);
+                }
+                return;
+            }
+            Action::TerminalStrips => {
+                if let Some(o) = self.open.as_ref() {
+                    self.strip_editor
+                        .get_or_insert_with(|| strip_editor::StripEditor::for_project(o));
                 }
                 return;
             }
@@ -3322,6 +3333,7 @@ impl eframe::App for App {
             .windows(ctx, self.open.as_mut(), self.assistant.command_running());
         self.symbol_editor_window(ctx);
         self.find_window(ctx);
+        self.strip_editor_window(ctx);
         self.sync_session(ctx);
 
         let title = match &self.open {
@@ -3377,6 +3389,23 @@ impl App {
             find_window::FindOutcome::Close => self.find = None,
             find_window::FindOutcome::Go { page, select } => self.show_found(&page, select),
             find_window::FindOutcome::Replace => self.replace_found(),
+        }
+    }
+
+    /// The terminal strip editor, while open and its project is.
+    fn strip_editor_window(&mut self, ctx: &egui::Context) {
+        let (Some(ed), Some(open)) = (self.strip_editor.as_mut(), self.open.as_mut()) else {
+            self.strip_editor = None;
+            return;
+        };
+        // The window belongs to the project it was opened in: another project opened since
+        // (or a shared session joined) closes it, so nothing typed in it lands there.
+        if ed.owner.as_deref() != Some(open.dir.as_path()) {
+            self.strip_editor = None;
+            return;
+        }
+        if !ed.show(ctx, open) {
+            self.strip_editor = None;
         }
     }
 
