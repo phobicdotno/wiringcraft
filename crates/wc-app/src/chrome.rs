@@ -327,49 +327,96 @@ pub fn ribbon(ui: &mut egui::Ui, state: &mut ChromeState, status: &dyn Status, o
     let Some((_, groups)) = RIBBON.get(state.ribbon_tab) else {
         return;
     };
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for (gi, (gname, actions)) in groups.iter().enumerate() {
-            if gi > 0 {
-                divider(ui, &t, 62.0);
+    ribbon_groups(ui, groups, status, out);
+}
+
+/// A ribbon button's width, its icon and label.
+const RIBBON_BUTTON: f32 = 66.0;
+/// The room a divider takes between two ribbon groups.
+const RIBBON_DIVIDER: f32 = 9.0;
+
+/// Lay out one ribbon tab's groups; returns the rectangles of its buttons. Groups go side by
+/// side and start a new row when the next one would not fit, so every button stays on screen in
+/// a narrow window; a group wider than the window wraps its own buttons.
+fn ribbon_groups(
+    ui: &mut egui::Ui,
+    groups: &[crate::actions::RibbonGroup],
+    status: &dyn Status,
+    out: &mut Vec<Action>,
+) -> Vec<Rect> {
+    let t = Theme::of(ui.ctx());
+    let avail = ui.available_width().max(RIBBON_BUTTON);
+    let per_row = ((avail / RIBBON_BUTTON).floor() as usize).max(1);
+    let width_of = |n: usize| n.min(per_row) as f32 * RIBBON_BUTTON;
+    // Which groups share a row.
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut x = 0.0;
+    for (gi, (_, actions)) in groups.iter().enumerate() {
+        let w = width_of(actions.len());
+        match rows.last_mut() {
+            Some(row) if x + RIBBON_DIVIDER + w <= avail => {
+                row.push(gi);
+                x += RIBBON_DIVIDER + w;
             }
-            let width = actions.len() as f32 * 66.0;
-            ui.allocate_ui_with_layout(
-                Vec2::new(width, 70.0),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    ui.set_width(width);
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        for a in *actions {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(66.0, 52.0),
-                                egui::Layout::top_down(egui::Align::Center),
-                                |ui| {
-                                    ui.set_width(66.0);
-                                    ui.spacing_mut().item_spacing.y = 1.0;
-                                    if icon_button(ui, *a, 34.0, status, &t) {
-                                        out.push(*a);
-                                    }
-                                    let c = if status.enabled(*a) {
-                                        t.text
-                                    } else {
-                                        t.muted.gamma_multiply(0.6)
-                                    };
-                                    ui.add(
-                                        egui::Label::new(egui::RichText::new(a.info().label).size(11.0).color(c))
-                                            .wrap_mode(egui::TextWrapMode::Truncate),
-                                    );
-                                },
-                            );
-                        }
-                    });
-                    ui.label(egui::RichText::new(gname.to_uppercase()).size(9.5).color(t.muted));
-                },
-            );
+            _ => {
+                rows.push(vec![gi]);
+                x = w;
+            }
         }
-    });
+    }
+    let mut rects = Vec::new();
+    for row in rows {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (k, gi) in row.into_iter().enumerate() {
+                let (gname, actions) = groups[gi];
+                if k > 0 {
+                    divider(ui, &t, 62.0);
+                }
+                let width = width_of(actions.len());
+                ui.allocate_ui_with_layout(
+                    Vec2::new(width, 70.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for line in actions.chunks(per_row) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for a in line {
+                                    let r = ui.allocate_ui_with_layout(
+                                        Vec2::new(RIBBON_BUTTON, 52.0),
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |ui| {
+                                            ui.set_width(RIBBON_BUTTON);
+                                            ui.spacing_mut().item_spacing.y = 1.0;
+                                            if icon_button(ui, *a, 34.0, status, &t) {
+                                                out.push(*a);
+                                            }
+                                            let c = if status.enabled(*a) {
+                                                t.text
+                                            } else {
+                                                t.muted.gamma_multiply(0.6)
+                                            };
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(a.info().label).size(11.0).color(c),
+                                                )
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                            );
+                                        },
+                                    );
+                                    rects.push(r.response.rect);
+                                }
+                            });
+                        }
+                        ui.label(egui::RichText::new(gname.to_uppercase()).size(9.5).color(t.muted));
+                    },
+                );
+            }
+        });
+    }
+    rects
 }
 
 /// The whole command area under the window title, in the chosen layout.
@@ -438,6 +485,55 @@ mod tests {
             });
         });
         rects
+    }
+
+    /// The rectangles of the buttons of ribbon tab `tab` in a window `width` points wide.
+    fn ribbon_rects(tab: usize, width: f32) -> Vec<Rect> {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 600.0))),
+            ..Default::default()
+        };
+        let mut rects = Vec::new();
+        let _ = ctx.run(input.clone(), |_| {});
+        let _ = ctx.run(input, |ctx| {
+            egui::TopBottomPanel::top("rb").show(ctx, |ui| {
+                rects = ribbon_groups(ui, RIBBON[tab].1, &AllOn, &mut Vec::new());
+            });
+        });
+        rects
+    }
+
+    #[test]
+    fn every_ribbon_button_fits_the_smallest_window() {
+        // 900 points is the window's minimum width: every button of every tab stays on screen.
+        for (tab, (name, groups)) in RIBBON.iter().enumerate() {
+            let rects = ribbon_rects(tab, 900.0);
+            let buttons: usize = groups.iter().map(|(_, a)| a.len()).sum();
+            assert_eq!(rects.len(), buttons, "{name}");
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.left() >= 0.0 && r.right() <= 900.0, "{name}: button {i} at {r:?}");
+                for (j, o) in rects.iter().enumerate().skip(i + 1) {
+                    assert!(
+                        !r.shrink(0.5).intersects(o.shrink(0.5)),
+                        "{name}: buttons {i} and {j} overlap: {r:?} {o:?}"
+                    );
+                }
+            }
+        }
+        // The Start tab takes more than one row at that width, and one row in a wide window.
+        let start = ribbon_rects(0, 900.0);
+        assert!(start.iter().any(|r| r.top() > start[0].bottom()), "wraps at 900");
+        let wide = ribbon_rects(0, 2400.0);
+        assert!(
+            wide.iter().all(|r| (r.center().y - wide[0].center().y).abs() < 1.0),
+            "one row"
+        );
+        // Even a window narrower than the widest group keeps that group's buttons on screen.
+        for r in ribbon_rects(0, 400.0) {
+            assert!(r.left() >= 0.0 && r.right() <= 400.0, "{r:?}");
+        }
     }
 
     #[test]
