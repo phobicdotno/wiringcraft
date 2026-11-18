@@ -100,6 +100,37 @@ impl Library {
         self.item_in(ItemKind::Symbol, source, id)
     }
 
+    /// Item `id` of `kind` in a version `fits` accepts: the source named `first` is tried first,
+    /// then every other source in order. The reason it is not found names what each source
+    /// had (another version, or why it could not be read).
+    pub fn find_version<T: serde::de::DeserializeOwned>(
+        &self,
+        kind: ItemKind,
+        id: &str,
+        first: &str,
+        fits: impl Fn(&T) -> bool,
+    ) -> std::result::Result<T, String> {
+        let order = self
+            .sources
+            .iter()
+            .filter(|s| s.name == first)
+            .chain(self.sources.iter().filter(|s| s.name != first));
+        let mut seen = Vec::new();
+        for s in order {
+            match self.item_in::<T>(kind, &s.name, id) {
+                Ok(item) if fits(&item) => return Ok(item),
+                Ok(_) => seen.push(format!("{}: another version", s.name)),
+                Err(Error::NotFound { .. }) => {}
+                Err(e) => seen.push(format!("{}: {e}", s.name)),
+            }
+        }
+        Err(if seen.is_empty() {
+            "no library has it".to_owned()
+        } else {
+            seen.join("; ")
+        })
+    }
+
     fn item_in<T: serde::de::DeserializeOwned>(&self, kind: ItemKind, source: &str, id: &str) -> Result<T> {
         store::check_id(id)?;
         let not_found = || Error::NotFound { kind, id: id.into() };
