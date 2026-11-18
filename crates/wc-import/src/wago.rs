@@ -146,9 +146,17 @@ impl Candidates {
                     continue;
                 }
             };
-            // A library without a parts folder has no parts; one whose folder cannot be listed
-            // is reported, or its parts would look missing.
+            // A library without a parts folder has no parts; one that is not there, or whose
+            // parts folder cannot be listed, is reported, or its parts would look missing.
             for s in &lib.sources {
+                if let Err(why) = std::fs::read_dir(&s.root) {
+                    warnings.push(format!(
+                        "library {} cannot be read ({}): {why}",
+                        source.name,
+                        s.root.display()
+                    ));
+                    continue;
+                }
                 let folder = s.root.join(ItemKind::Part.dir());
                 if let Err(why) = std::fs::read_dir(&folder)
                     && why.kind() != std::io::ErrorKind::NotFound
@@ -960,7 +968,11 @@ mod tests {
         let bad = tmp.path().join("bad");
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join(ItemKind::Part.dir()), "not a folder").unwrap();
-        for (name, root) in [("bad", &bad), ("good", &good)] {
+        // A library that is not there at all, and one that has no parts (which is fine).
+        let gone = tmp.path().join("gone");
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        for (name, root) in [("bad", &bad), ("gone", &gone), ("empty", &empty), ("good", &good)] {
             p.meta.libraries.push(wc_core::project::LibrarySource {
                 name: name.into(),
                 kind: "folder".into(),
@@ -969,11 +981,12 @@ mod tests {
             });
         }
         let (c, warnings) = Candidates::load(&dir, &p);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].contains("the parts of library bad cannot be listed"),
             "{warnings:?}"
         );
+        assert!(warnings[1].contains("library gone cannot be read"), "{warnings:?}");
         assert!(c.library.contains_key("wago.2002-1201"), "{c:?}");
     }
 
