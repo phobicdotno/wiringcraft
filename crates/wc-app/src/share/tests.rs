@@ -68,6 +68,7 @@ fn host(open: &Open) -> (Share, Log) {
     // As `Share::start_host` does.
     let files = vendored_files(&open.dir, &open.project);
     host.share_files(files.symbols, files.parts);
+    host.share_pictures(wc_pdf::read_pictures(&open.dir, &open.project).files);
     let share = Share {
         role: Some(Role::Host(Box::new(Hosting {
             host,
@@ -145,10 +146,27 @@ fn session_with(
     tmp: &Path,
     setup: impl FnOnce(&mut Open) -> std::result::Result<(), Box<dyn std::error::Error>>,
 ) -> std::result::Result<Session, Box<dyn std::error::Error>> {
+    session_sharing(tmp, setup, BTreeMap::new())
+}
+
+/// Like [`session_with`], with `pictures` shared on top of the ones the host's project uses,
+/// before the guest is let in.
+fn session_sharing(
+    tmp: &Path,
+    setup: impl FnOnce(&mut Open) -> std::result::Result<(), Box<dyn std::error::Error>>,
+    pictures: BTreeMap<String, Vec<u8>>,
+) -> std::result::Result<Session, Box<dyn std::error::Error>> {
     let mut host_open = project(&tmp.join("host"))?;
     setup(&mut host_open)?;
     host_open.save()?;
     let (mut h, log) = host(&host_open);
+    if let Some(Role::Host(hosting)) = h.role.as_mut()
+        && !pictures.is_empty()
+    {
+        let mut all = hosting.host.pictures().clone();
+        all.extend(pictures);
+        hosting.host.share_pictures(all);
+    }
     let mut g = guest(&mut h, "Ola", &tmp.join("guest"));
     h.frame(Some(&mut host_open), Some("p0002".into()), false);
     let ids = pending(&h);
@@ -1426,5 +1444,196 @@ fn whole_record_edits_say_what_the_record_was_at_the_last_sync() -> TestResult {
         assert_eq!(stamp, edit.record(&base), "made from the last sync, not from this copy");
         assert_ne!(stamp, edit.record(&local));
     }
+    Ok(())
+}
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnot really";
+
+/// The bytes of the project file `file` in `dir`.
+fn file_bytes(dir: &Path, file: &str) -> std::io::Result<Vec<u8>> {
+    std::fs::read(dir.join(file))
+}
+
+#[test]
+fn a_guest_gets_the_hosts_logo_and_underlays() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        std::fs::create_dir_all(o.dir.join("pictures"))?;
+        std::fs::create_dir_all(o.dir.join("underlays"))?;
+        std::fs::write(o.dir.join("pictures/logo.png"), PNG)?;
+        std::fs::write(o.dir.join("underlays/p0002.jpg"), b"\xFF\xD8\xFFscan")?;
+        o.project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/logo.png".into(),
+            cover: None,
+        });
+        if let Some(p) = o.project.page_mut("p0002") {
+            p.underlay = Some(wc_core::Underlay {
+                file: "underlays/p0002.jpg".into(),
+                min: wc_core::Point::new(0.0, 0.0),
+                max: wc_core::Point::new(100.0, 100.0),
+            });
+        }
+        Ok(())
+    })?;
+    // The window looked for the logo before it arrived; that is forgotten once it is there.
+    guest_open
+        .picture_problems
+        .insert("pictures/logo.png".into(), "the file is missing".into());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/logo.png")?, PNG);
+    assert_eq!(
+        file_bytes(&guest_open.dir, "underlays/p0002.jpg")?,
+        file_bytes(&host_open.dir, "underlays/p0002.jpg")?
+    );
+    assert!(guest_open.picture_problems.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_logo_picked_by_a_guest_reaches_the_host_and_the_others() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    let mut k = guest(&mut h, "Kari", &tmp.path().join("kari"));
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    let ids = pending(&h);
+    approve(&mut h, ids[0], true);
+    let mut kari_open = k.frame(None, None, false).ok_or("Kari got no project")?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    let src = tmp.path().join("Acme logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        k.frame(Some(&mut kari_open), Some("p0001".into()), false);
+    }
+    assert_eq!(
+        host_open.project.meta.logo.as_ref().map(|l| l.file.as_str()),
+        Some(file.as_str())
+    );
+    assert_eq!(kari_open.project.meta.logo, host_open.project.meta.logo);
+    for dir in [&host_open.dir, &kari_open.dir] {
+        assert_eq!(file_bytes(dir, &file)?, PNG, "{}", dir.display());
+    }
+    assert!(
+        log.messages().iter().any(|m| m == "Change project properties"),
+        "{:?}",
+        log.messages()
+    );
+    // Sent once: more frames send nothing new.
+    let n = log.messages().len();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages().len(), n);
+    Ok(())
+}
+
+#[test]
+fn a_logo_picked_by_the_host_reaches_the_guest() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = host_open.set_logo_from(&src)?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(guest_open.project.meta.logo, host_open.project.meta.logo);
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, PNG);
+    Ok(())
+}
+
+#[test]
+fn a_picture_outside_the_picture_folders_is_named_once_and_not_sent() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    std::fs::write(guest_open.dir.join("logo.png"), PNG)?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: "logo.png".into(),
+        cover: None,
+    });
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let notes: Vec<String> = g.take_notes().into_iter().filter(|n| n.contains("logo.png")).collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(h.role.as_ref().is_some_and(|r| r.pictures().is_empty()));
+    // The change that names it still goes.
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    Ok(())
+}
+
+#[test]
+fn a_picture_picked_here_is_not_written_over_by_the_sessions_picture_of_that_name() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // The session has a picture under a name this copy does not use (yet).
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        g.role.as_ref().and_then(|r| r.pictures().get("pictures/brand.png")),
+        Some(&PNG.to_vec()),
+        "the guest has the session's picture"
+    );
+    // The guest picks its own picture of that name.
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, mine, "kept");
+    let notes: Vec<String> = g
+        .take_notes()
+        .into_iter()
+        .filter(|n| n.contains("pictures/brand.png"))
+        .collect();
+    assert_eq!(notes.len(), 1, "named once: {notes:?}");
+    assert!(notes[0].contains("another picture"), "{}", notes[0]);
+    Ok(())
+}
+
+#[test]
+fn a_picture_that_could_not_be_written_is_tried_again_only_after_a_while() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        std::fs::create_dir_all(o.dir.join("pictures"))?;
+        std::fs::write(o.dir.join("pictures/brand.png"), PNG)?;
+        o.project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/brand.png".into(),
+            cover: None,
+        });
+        Ok(())
+    })?;
+    // A folder stands where the picture goes, so writing it fails.
+    let target = guest_open.dir.join("pictures/brand.png");
+    assert!(!target.exists(), "not taken before the first frame");
+    std::fs::create_dir_all(&target)?;
+    let started = std::time::Instant::now();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(target.is_dir(), "not written");
+    // The obstacle is gone, but the picture is not tried again right away.
+    std::fs::remove_dir(&target)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    if started.elapsed() < ITEM_RETRY_LATER {
+        assert!(!target.exists(), "skipped while it failed a moment ago");
+    }
+    // After a while it is tried again, and written.
+    std::thread::sleep(ITEM_RETRY_LATER + std::time::Duration::from_millis(50));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, PNG, "written");
+    let notes: Vec<String> = g
+        .take_notes()
+        .into_iter()
+        .filter(|n| n.contains("pictures/brand.png"))
+        .collect();
+    assert_eq!(notes.len(), 1, "named once: {notes:?}");
+    assert!(notes[0].contains("could not be written"), "{}", notes[0]);
     Ok(())
 }
