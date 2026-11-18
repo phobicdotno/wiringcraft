@@ -58,13 +58,20 @@ pub struct Orientation {
     pub flip_y: bool,
 }
 
-/// Uncompressed samples (8 bits, or 1 bit for black and white scans) as PNG. `channels` is 1
-/// (grey) or 3 (RGB); `invert` swaps black and white, as a PDF `/Decode [1 0]` asks.
+/// Uncompressed samples as PNG: 8 or 16 bits per sample, or 1 bit for black and white scans.
+/// `channels` is 1 (grey), 3 (RGB) or 4 (CMYK, turned into RGB); 16-bit samples (big-endian,
+/// as PDF stores them) keep their high byte. `invert` swaps black and white, as a PDF
+/// `/Decode [1 0]` asks.
 pub fn samples_to_png(width: u32, height: u32, channels: u8, bits: u8, invert: bool, data: &[u8]) -> Option<Raster> {
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_PIXELS {
         return None;
     }
     let (w, h) = (width as usize, height as usize);
+    if bits == 16 && matches!(channels, 1 | 3) {
+        let need = w.checked_mul(h)?.checked_mul(usize::from(channels))?.checked_mul(2)?;
+        let high: Vec<u8> = data.get(..need)?.iter().step_by(2).copied().collect();
+        return samples_to_png(width, height, channels, 8, invert, &high);
+    }
     let img = match (channels, bits) {
         (1, 8) => {
             let need = w.checked_mul(h)?;
@@ -93,6 +100,24 @@ pub fn samples_to_png(width: u32, height: u32, channels: u8, bits: u8, invert: b
             if invert {
                 px.iter_mut().for_each(|v| *v = 255 - *v);
             }
+            DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, px)?)
+        }
+        (4, 8) => {
+            let need = w.checked_mul(h)?.checked_mul(4)?;
+            let px: Vec<u8> = data
+                .get(..need)?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|cmyk| {
+                    let ink = |i: usize| {
+                        let v = u16::from(cmyk.get(i).copied().unwrap_or(0));
+                        if invert { 255 - v } else { v }
+                    };
+                    let k = 255 - ink(3);
+                    [0, 1, 2].map(|i| ((255 - ink(i)) * k / 255) as u8)
+                })
+                .collect();
             DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, px)?)
         }
         _ => return None,
@@ -215,7 +240,9 @@ mod tests {
         assert!(samples_to_png(3, 2, 1, 1, false, &[0]).is_none());
         assert!(samples_to_png(0, 2, 1, 8, false, &[]).is_none());
         assert!(samples_to_png(u32::MAX, u32::MAX, 3, 8, false, &[]).is_none());
-        assert!(samples_to_png(2, 2, 4, 8, false, &[0; 16]).is_none());
+        assert!(samples_to_png(2, 2, 2, 8, false, &[0; 8]).is_none());
+        assert!(samples_to_png(2, 2, 4, 8, false, &[0; 15]).is_none(), "short CMYK");
+        assert!(samples_to_png(2, 1, 3, 16, false, &[0; 11]).is_none(), "short 16-bit");
         assert!(
             decode(&Raster {
                 format: RasterFormat::Jpeg,
