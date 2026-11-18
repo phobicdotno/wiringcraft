@@ -132,8 +132,15 @@ fn keep_libraries(project: &mut Project, base: &Path) {
         // does when it opens the path.
         let full = base.join(&lib.location);
         let named = resolved(&full).unwrap_or_else(|_| lexical(&full));
-        if !named.starts_with(base) {
-            lib.location = named.to_string_lossy().into_owned();
+        match named.strip_prefix(base) {
+            Err(_) => lib.location = named.to_string_lossy().into_owned(),
+            // Inside the base, but reached through a link: links are not copied, so point
+            // at the folder the link leads to, which is.
+            Ok(rel) if named != lexical(&full) => {
+                let parts: Vec<_> = rel.iter().map(|c| c.to_string_lossy()).collect();
+                lib.location = parts.join("/");
+            }
+            Ok(_) => {}
         }
     }
 }
@@ -492,6 +499,29 @@ mod tests {
             Path::new(&made.meta.libraries[0].location),
             fs::canonicalize(tmp.path().join("other/library")).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_library_link_inside_the_base_points_at_the_copied_folder() {
+        use crate::project::LibrarySource;
+        let tmp = tempfile::tempdir().unwrap();
+        let b = tmp.path().join("base");
+        base(&b);
+        fs::create_dir_all(b.join("own-library/parts")).unwrap();
+        std::os::unix::fs::symlink(b.join("own-library"), b.join("lib-link")).unwrap();
+        let mut p = store::load(&b).unwrap();
+        p.meta.libraries = vec![LibrarySource {
+            name: "linked".into(),
+            kind: "folder".into(),
+            location: "lib-link/parts".into(),
+            reference: None,
+        }];
+        store::save(&b, &p).unwrap();
+        let new = tmp.path().join("new");
+        let made = create_from(&b, &new, "New", "2026-11-18").unwrap();
+        assert_eq!(made.meta.libraries[0].location, "own-library/parts");
+        assert!(new.join(&made.meta.libraries[0].location).is_dir());
     }
 
     #[cfg(unix)]
