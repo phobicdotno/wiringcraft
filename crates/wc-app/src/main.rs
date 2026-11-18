@@ -87,6 +87,9 @@ enum Dialog {
         /// The page's own title-block fields, key and value, as the form shows them; a blank
         /// value shows the project's as a hint and is not stored.
         fields: Vec<(String, String)>,
+        /// The fields as the dialog opened: only the ones changed since are saved, so a value
+        /// changed meanwhile (by the assistant, or someone in a shared session) is kept.
+        loaded: Vec<(String, String)>,
         error: Option<String>,
     },
     DeletePage(usize),
@@ -667,14 +670,8 @@ impl App {
                         title: p.title.clone(),
                         size: p.size,
                         overview: p.overview,
-                        fields: p
-                            .title_field_keys()
-                            .into_iter()
-                            .map(|k| {
-                                let v = p.title_block.get(&k).cloned().unwrap_or_default();
-                                (k, v)
-                            })
-                            .collect(),
+                        fields: own_fields(p),
+                        loaded: own_fields(p),
                         error: None,
                     });
                 }
@@ -1429,6 +1426,7 @@ impl App {
                     size,
                     overview,
                     fields,
+                    loaded,
                     error,
                 } => {
                     let project_fields = self
@@ -1487,7 +1485,7 @@ impl App {
                         if ui.button("OK").clicked()
                             && let Some(o) = self.open.as_mut()
                         {
-                            let own: std::collections::BTreeMap<String, String> = fields.iter().cloned().collect();
+                            let own = changed_fields(loaded, fields);
                             match confirm_page_props(o, &self.ed, id, number, title, *size, *overview, &own)
                             {
                                 Ok(i) => {
@@ -2946,6 +2944,51 @@ impl App {
 
 /// The page properties dialog's OK: refused when the page was removed, or when someone else
 /// opened it while the dialog was open.
+/// A page's own title-block fields as the page properties show them, key and value.
+fn own_fields(p: &wc_core::Page) -> Vec<(String, String)> {
+    p.title_field_keys()
+        .into_iter()
+        .map(|k| {
+            let v = p.title_block.get(&k).cloned().unwrap_or_default();
+            (k, v)
+        })
+        .collect()
+}
+
+/// The fields of `draft` whose value differs from when the dialog opened (`loaded`).
+fn changed_fields(
+    loaded: &[(String, String)],
+    draft: &[(String, String)],
+) -> std::collections::BTreeMap<String, String> {
+    draft
+        .iter()
+        .filter(|(k, v)| {
+            loaded
+                .iter()
+                .find(|(lk, _)| lk == k)
+                .is_none_or(|(_, lv)| lv.trim() != v.trim())
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod page_field_tests {
+    use super::changed_fields;
+
+    #[test]
+    fn only_fields_changed_in_the_dialog_are_saved() {
+        let row = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        let loaded = [row("revision", "A"), row("date", ""), row("checked_by", "OH")];
+        let draft = [row("revision", "A"), row("date", "2026-11-18"), row("checked_by", " ")];
+        let got = changed_fields(&loaded, &draft);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got["date"], "2026-11-18");
+        assert_eq!(got["checked_by"], " ", "a cleared field is sent to be cleared");
+        assert!(!got.contains_key("revision"), "unchanged: a newer value is kept");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn confirm_page_props(
     o: &mut Open,

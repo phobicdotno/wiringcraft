@@ -2835,7 +2835,11 @@ fn page_fields(p: &Project, page: usize) -> String {
         } else {
             "project"
         };
-        out.push_str(&format!("{k:<16} {value:<24} ({from})\n"));
+        out.push_str(&format!(
+            "{:<16} {:<24} ({from})\n",
+            escape_field(&k),
+            escape_field(value)
+        ));
     }
     out
 }
@@ -3582,6 +3586,23 @@ mod tests {
             .to_owned();
         assert!(line.contains('A') && line.contains("(project)"), "falls back: {line}");
         assert_eq!(p.pages[i].title_block.get("checked_by").map(String::as_str), Some("OH"));
+
+        // A value that would steer the terminal or start a false row is printed escaped.
+        let mut p = load(&dir).unwrap();
+        p.pages[i]
+            .title_block
+            .insert("note\nfake".into(), "A\u{1b}[2JB\nrevision X".into());
+        let listed = page_fields(&p, i);
+        assert!(!listed.contains('\u{1b}'), "{listed}");
+        assert_eq!(
+            listed.lines().filter(|l| l.starts_with("revision")).count(),
+            1,
+            "{listed}"
+        );
+        assert!(
+            listed.contains("note\\nfake") && listed.contains("A\\u{1b}[2JB\\nrevision X"),
+            "{listed}"
+        );
 
         assert!(cli(&["page", "fields", "p9", "revision"]).is_err());
         assert!(cli(&["page", "fields", "p9", "bad key=x"]).is_err());

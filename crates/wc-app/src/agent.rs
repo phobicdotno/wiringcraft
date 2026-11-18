@@ -1090,6 +1090,10 @@ impl App {
                 let page = self.page_of(v, "page")?;
                 let size = page_size(v)?;
                 let open = need_open(self.open.as_mut())?;
+                // Someone else in a shared session has the page open: it is theirs to change.
+                if let Some(why) = open.held_reason(page) {
+                    return Err(why);
+                }
                 let cur = open.project.pages.get(page).cloned().ok_or("No such page.")?;
                 let fields = match v.get("title_block") {
                     None | Some(Value::Null) => None,
@@ -3128,6 +3132,21 @@ mod tests {
             "OH",
             "a refused change changes nothing"
         );
+
+        // In a shared session, a page someone else has open is refused, fields and all.
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let before = page2(&a).clone();
+        let refused = call(
+            &mut a,
+            "update_page",
+            json!({"page": "p0002", "title": "Mine", "title_block": {"revision": "D"}}),
+        );
+        assert!(refused.is_err_and(|e| e.contains("Ola")));
+        assert_eq!(page2(&a), &before);
     }
 
     #[test]
