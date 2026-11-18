@@ -1921,7 +1921,6 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     .unwrap_or_default()
             );
             let (n_sym, joined) = add_swe_built(dir, &mut p, built, &source, &choice.1)?;
-            save_imported(dir, &p)?;
             println!(
                 "{:<18} {:>8} {:>9}  why the rest is not imported",
                 "", "source", "imported"
@@ -3041,9 +3040,10 @@ fn project_copy(dir: &Path, id: &str) -> Res<Option<wc_core::Symbol>> {
         .map_err(|why| format!("project copy of symbol {id} cannot be read: {why}"))
 }
 
-/// Adds a SolidWorks Electrical import to `p`, keeping the library symbols it used (named in
-/// `sources`, new to the project or pinned before) pinned to their libraries. Returns how many
-/// symbol shapes the import made itself.
+/// Adds a SolidWorks Electrical import to `p` and saves it ([`add_and_save`]), keeping the
+/// library symbols it used (named in `sources`, new to the project or pinned before) pinned to
+/// their libraries. Returns how many symbol shapes the import made itself, and how many imported
+/// jumper groups joined the project's own.
 fn add_swe_built(
     dir: &Path,
     p: &mut Project,
@@ -3058,9 +3058,11 @@ fn add_swe_built(
         .filter(|s| sources.contains_key(&s.id))
         .map(|s| s.id.clone())
         .collect();
-    // Not replacing: a generated symbol may still be placed on pages the project keeps.
-    let (_, joined) = add_built_joining(dir, p, built, source, Replace::No)?;
-    keep_library_sources(p, &from_library, sources);
+    // Not replacing: a generated symbol may still be placed on pages the project keeps. Saved
+    // like every import: a failed save puts every file back, jumpers and pages together.
+    let joined = add_and_save_with(dir, p, built, source, Replace::No, |p| {
+        keep_library_sources(p, &from_library, sources);
+    })?;
     Ok((n_sym, joined))
 }
 
@@ -3161,6 +3163,19 @@ enum Replace {
 /// [`add_built`], then save: when the save fails, the vendored files and every project file
 /// the save may have written go back as they were, so the project on disk is the one before.
 fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str, replace: Replace) -> Res<()> {
+    add_and_save_with(dir, p, built, source, replace, |_| {}).map(|_| ())
+}
+
+/// [`add_and_save`], with `finish` changing the project after the import and before the save,
+/// and giving how many imported jumper groups joined the project's own ([`add_built`]).
+fn add_and_save_with(
+    dir: &Path,
+    p: &mut Project,
+    built: wc_import::aml::Built,
+    source: &str,
+    replace: Replace,
+    finish: impl FnOnce(&mut Project),
+) -> Res<usize> {
     // Every file the save may write or remove, read before anything is written: the project's
     // own files, every file in its page, panel and comment folders, and the files the new pages
     // and panels will get.
@@ -3215,7 +3230,8 @@ fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, sourc
         };
         project_files.push((path, before));
     }
-    let written = add_built(dir, p, built, source, replace)?;
+    let (written, joined) = add_built(dir, p, built, source, replace)?;
+    finish(p);
     if let Err(err) = save_imported(dir, p) {
         let mut failed = put_files_back(&project_files);
         failed.extend(put_files_back(&written));
@@ -3227,7 +3243,7 @@ fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, sourc
             failed.join("; ")
         ));
     }
-    Ok(())
+    Ok(joined)
 }
 
 /// Wire ends in `p` on pins of the symbol `symbol.id` that `symbol` does not have:
@@ -3263,20 +3279,11 @@ fn put_files_back(files: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
         .collect()
 }
 
+/// Add an import to `p` (not saved yet), giving the vendored files it wrote and how many
+/// imported jumper groups joined a jumper the project already had (directly, or through another
+/// imported group that did): the saved project holds those as part of that jumper, not as
+/// jumpers of their own.
 fn add_built(
-    dir: &Path,
-    p: &mut Project,
-    built: wc_import::aml::Built,
-    source: &str,
-    replace: Replace,
-) -> Result<Written, String> {
-    add_built_joining(dir, p, built, source, replace).map(|(written, _)| written)
-}
-
-/// [`add_built`], also giving how many imported jumper groups joined a jumper the project
-/// already had (directly, or through another imported group that did): the saved project
-/// holds those as part of that jumper, not as jumpers of their own.
-fn add_built_joining(
     dir: &Path,
     p: &mut Project,
     mut built: wc_import::aml::Built,
@@ -3507,15 +3514,28 @@ fn add_built_joining(
         .iter()
         .flat_map(|j| j.terminals.iter().map(|t| (j.strip.clone(), t.clone())))
         .collect();
-    let mut joined = 0;
-    for j in &built.jumpers {
-        if j.terminals
-            .iter()
-            .any(|t| joined_terminals.contains(&(j.strip.clone(), t.clone())))
-        {
-            joined += 1;
-            joined_terminals.extend(j.terminals.iter().map(|t| (j.strip.clone(), t.clone())));
+    // Until nothing more joins, so a group that reaches the project's jumper only through one
+    // listed after it counts too.
+    let mut joined_groups = vec![false; built.jumpers.len()];
+    loop {
+        let mut more = false;
+        for (j, done) in built.jumpers.iter().zip(joined_groups.iter_mut()) {
+            if !*done
+                && j.terminals
+                    .iter()
+                    .any(|t| joined_terminals.contains(&(j.strip.clone(), t.clone())))
+            {
+                *done = true;
+                more = true;
+                joined_terminals.extend(j.terminals.iter().map(|t| (j.strip.clone(), t.clone())));
+            }
         }
+        if !more {
+            break;
+        }
+    }
+    let joined = joined_groups.iter().filter(|j| **j).count();
+    for j in &built.jumpers {
         p.meta
             .add_jumper(&j.strip, &j.terminals)
             .map_err(|why| format!("jumper on {}: {why}", j.strip))?;
@@ -4752,10 +4772,11 @@ mod tests {
             part: None,
         };
         let built = wc_import::aml::Built {
-            jumpers: vec![jumper(&["4", "5"]), jumper(&["5", "6"]), jumper(&["7", "8"])],
+            // 5-6 is listed before the group that links it to the project's jumper.
+            jumpers: vec![jumper(&["5", "6"]), jumper(&["4", "5"]), jumper(&["7", "8"])],
             ..Default::default()
         };
-        let (_, joined) = add_built_joining(&dir, &mut p, built, "import:a.tewzip", Replace::No).unwrap();
+        let (_, joined) = add_built(&dir, &mut p, built, "import:a.tewzip", Replace::No).unwrap();
         let mut sets: Vec<Vec<String>> = p.meta.jumpers.iter().map(|j| j.terminals.clone()).collect();
         sets.sort();
         assert_eq!(sets, [vec!["3", "4", "5", "6"], vec!["7", "8"]]);
@@ -4886,6 +4907,84 @@ mod tests {
         let mut p = load(&dir).unwrap();
         add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap();
         assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
+    fn a_swe_import_whose_save_fails_leaves_jumpers_and_pages_as_they_were() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let term = wc_core::Symbol {
+            id: "test.term".into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let placed = |id: &str, tag: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: "test.term".into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse(tag).ok(),
+        };
+        store::write_vendored_symbol(&dir, &term).unwrap();
+        let mut p = load(&dir).unwrap();
+        // Two terminals tagged with only the strip (1 and 2), jumpered.
+        p.pages[0]
+            .symbols
+            .extend([placed("b", "-X1", 20.0), placed("c", "-X1", 30.0)]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        // The import draws terminals 5 and 6 with their own jumper: the project's become 7 and 8.
+        let built = || {
+            let mut page = Page::new("swe-page-9", "9", "Nine");
+            page.symbols
+                .extend([placed("t5", "-X1.5", 10.0), placed("t6", "-X1.6", 20.0)]);
+            wc_import::aml::Built {
+                pages: vec![page],
+                jumpers: vec![wc_core::project::Jumper {
+                    strip: x1.clone(),
+                    terminals: vec!["5".into(), "6".into()],
+                    part: None,
+                }],
+                ..Default::default()
+            }
+        };
+        let page_file = dir
+            .join(store::PAGES_DIR)
+            .join(format!("swe-page-9{}", store::PAGE_SUFFIX));
+        let mut blocker = page_file.as_os_str().to_owned();
+        blocker.push(".tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        let project_toml = std::fs::read(dir.join(store::PROJECT_FILE)).unwrap();
+        let sources = std::collections::BTreeMap::new();
+        let mut p = load(&dir).unwrap();
+        assert!(add_swe_built(&dir, &mut p, built(), "import:a.tewzip", &sources).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(store::PROJECT_FILE)).unwrap(),
+            project_toml,
+            "the jumpers on disk are the ones before the import"
+        );
+        // The same import again keeps the two jumpers apart.
+        let mut p = load(&dir).unwrap();
+        add_swe_built(&dir, &mut p, built(), "import:a.tewzip", &sources).unwrap();
+        let mut sets: Vec<Vec<String>> = load(&dir)
+            .unwrap()
+            .meta
+            .jumpers
+            .iter()
+            .map(|j| j.terminals.clone())
+            .collect();
+        sets.sort();
+        assert_eq!(sets, [vec!["5", "6"], vec!["7", "8"]]);
     }
 
     #[test]
