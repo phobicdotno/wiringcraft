@@ -181,16 +181,18 @@ fn resolved(dir: &Path) -> Result<PathBuf> {
                     real.pop();
                 }
             }
-            Component::Normal(n) => {
-                let found = missing
-                    .is_empty()
-                    .then(|| fs::canonicalize(real.join(n)).ok())
-                    .flatten();
-                match found {
-                    Some(p) => real = p,
-                    None => missing.push(n.to_owned()),
+            Component::Normal(n) if missing.is_empty() => {
+                let next = real.join(n);
+                match fs::canonicalize(&next) {
+                    Ok(p) => real = p,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        missing.push(n.to_owned());
+                    }
+                    // A file where a folder should be, or no access: the path cannot be used.
+                    Err(e) => return Err(Error::io(&next, e)),
                 }
             }
+            Component::Normal(n) => missing.push(n.to_owned()),
         }
     }
     Ok(missing.iter().fold(real, |p, c| p.join(c)))
@@ -467,6 +469,19 @@ mod tests {
         let via = tmp.path().join("work").join("out").join("..").join("made");
         create_from(&b, &via, "Made", "2026-11-18").unwrap();
         assert!(tmp.path().join("elsewhere/made").join(PROJECT_FILE).is_file());
+    }
+
+    // Windows reports a file used as a folder as "not found", which the lexical part handles.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_in_the_new_folder_path_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = tmp.path().join("base");
+        base(&b);
+        fs::write(tmp.path().join("file"), "not a folder").unwrap();
+        let through = tmp.path().join("file").join("child").join("..").join("..").join("new");
+        assert!(create_from(&b, &through, "X", "2026-11-18").is_err());
+        assert!(!tmp.path().join("new").exists());
     }
 
     #[cfg(unix)]
