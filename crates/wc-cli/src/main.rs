@@ -605,8 +605,9 @@ enum ImportCmd {
     /// the project already vendors is replaced by the new version (an earlier import's box by
     /// the drawn block) when its copy is still the one the project pins; a copy changed in the
     /// project is refused, not replaced. To take the new version into such a project, import
-    /// with --lib into a library folder, add that folder as a source (`lib add`) and run
-    /// `lib update <id>`. Into a library folder with --lib, else vendored into the project.
+    /// with --lib into a library folder, add that folder as a source (`lib add`) ahead of any
+    /// source with the same id, and run `lib update <id>`. Into a library folder with --lib,
+    /// else vendored into the project.
     SweLibrary {
         path: PathBuf,
         /// A library folder to write into instead of the project.
@@ -1808,7 +1809,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             let (n_dev, n_pages) = (built.devices.len(), built.pages.len());
             let n_drawn = built.pages.iter().filter(|pg| pg.id.starts_with("eplan-page-")).count();
-            add_and_save(dir, &mut p, built, &source)?;
+            add_and_save(dir, &mut p, built, &source, Replace::No)?;
             println!(
                 "imported {} Eplan pages as {n_pages} page(s), {n_drawn} of them as drawn: {n_dev} devices, {} \
                  connections",
@@ -1965,7 +1966,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             );
             // Through the shared preflight: conflicts are refused before anything is written.
             let (n_pages, n_dev) = (built.pages.len(), built.devices.len());
-            add_and_save(dir, &mut p, built, &source)?;
+            add_and_save(dir, &mut p, built, &source, Replace::No)?;
             println!(
                 "imported {n_dev} devices, {} connections on {n_pages} page(s)",
                 imp.links.len()
@@ -2744,7 +2745,7 @@ fn import_swe_library(
                 parts: got.parts,
                 ..Default::default()
             };
-            add_and_save(dir, &mut p, built, source)?;
+            add_and_save(dir, &mut p, built, source, Replace::Unchanged)?;
         }
     }
     Ok((got.report, got.warnings))
@@ -3027,7 +3028,8 @@ fn add_swe_built(
         .filter(|s| sources.contains_key(&s.id))
         .map(|s| s.id.clone())
         .collect();
-    add_built(dir, p, built, source)?;
+    // Not replacing: a generated symbol may still be placed on pages the project keeps.
+    add_built(dir, p, built, source, Replace::No)?;
     keep_library_sources(p, &from_library, sources);
     Ok(n_sym)
 }
@@ -3116,12 +3118,48 @@ fn fill_cover(p: &mut Project, fields: std::collections::BTreeMap<String, String
 /// such file), for [`put_files_back`] when the save after it fails.
 type Written = Vec<(PathBuf, Option<Vec<u8>>)>;
 
-/// [`add_built`], then save: when the save fails, the vendored files go back as they were, so
-/// each still matches the pin the project's files keep.
-fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Res<()> {
-    let written = add_built(dir, p, built, source)?;
+/// Whether an import may replace a vendored item the project pins in another version.
+#[derive(Clone, Copy, PartialEq)]
+enum Replace {
+    /// Never: an Eplan, AML or SolidWorks Electrical project import makes its own symbols, and a
+    /// page the project kept may still use the old one's pins.
+    No,
+    /// When the project's copy is still the pinned one (a library import, #258).
+    Unchanged,
+}
+
+/// [`add_built`], then save: when the save fails, the vendored files and every project file
+/// the save may have written go back as they were, so the project on disk is the one before.
+fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str, replace: Replace) -> Res<()> {
+    let written = add_built(dir, p, built, source, replace)?;
+    let mut project_files: Written = Vec::new();
+    let mut keep = |path: PathBuf| -> Res<()> {
+        let before = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
+            Err(x) => return Err(format!("{}: {x}", path.display())),
+        };
+        project_files.push((path, before));
+        Ok(())
+    };
+    for name in [store::PROJECT_FILE, store::DEVICES_FILE, store::LOCK_FILE] {
+        keep(dir.join(name))?;
+    }
+    for page in &p.pages {
+        keep(
+            dir.join(store::PAGES_DIR)
+                .join(format!("{}{}", page.id, store::PAGE_SUFFIX)),
+        )?;
+    }
+    for panel in &p.panels {
+        keep(
+            dir.join(store::PANELS_DIR)
+                .join(format!("{}{}", panel.id, store::PANEL_SUFFIX)),
+        )?;
+    }
     if let Err(err) = save(dir, p) {
-        let failed = put_files_back(&written);
+        let mut failed = put_files_back(&project_files);
+        failed.extend(put_files_back(&written));
         if failed.is_empty() {
             return Err(err);
         }
@@ -3143,7 +3181,13 @@ fn put_files_back(files: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
         .collect()
 }
 
-fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, source: &str) -> Result<Written, String> {
+fn add_built(
+    dir: &Path,
+    p: &mut Project,
+    mut built: wc_import::aml::Built,
+    source: &str,
+    replace: Replace,
+) -> Result<Written, String> {
     let cover_fields = keep_one_cover(p, &mut built.pages);
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of
     // an earlier one and then fail half way.
@@ -3152,6 +3196,10 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
             "page {} exists; remove it or import into a fresh project",
             page.id
         ));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    if let Some(page) = built.pages.iter().find(|pg| !ids.insert(pg.id.as_str())) {
+        return Err(format!("the import has page {} twice", page.id));
     }
     let numbers: std::collections::BTreeSet<&str> = p.pages.iter().map(|pg| pg.number.as_str()).collect();
     if let Some(page) = built.pages.iter().find(|pg| numbers.contains(pg.number.as_str())) {
@@ -3177,6 +3225,9 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
         };
         let (path, before) = vendored_bytes(dir, kind, id)?;
         if let Some(entry) = p.lock.map(kind).get(id) {
+            if replace == Replace::No && entry.hash != hash {
+                return Err(format!("{name} exists with other content; import into a fresh project"));
+            }
             let have = match (&before, kind) {
                 (None, _) => None,
                 (Some(_), ItemKind::Symbol) => Some(store::read_vendored_symbol(dir, id).map(|x| x.hash())),
@@ -3339,9 +3390,9 @@ fn put_file_back(path: &Path, before: Option<&[u8]>) -> Result<(), String> {
         drop(file);
         std::fs::rename(&part, path)
     });
-    done.map_err(|x| {
-        let _ = std::fs::remove_file(&part);
-        fail(x)
+    done.map_err(|x| match std::fs::remove_file(&part) {
+        Ok(()) => fail(x),
+        Err(y) => format!("{}; the staging file {} is left: {y}", fail(x), part.display()),
     })
 }
 
@@ -4153,12 +4204,26 @@ mod tests {
             ..Default::default()
         };
         let mut p = load(&dir).unwrap();
-        add_built(&dir, &mut p, built("Coil, box", "Relay"), "import:a.tewzip").unwrap();
+        add_built(
+            &dir,
+            &mut p,
+            built("Coil, box", "Relay"),
+            "import:a.tewzip",
+            Replace::Unchanged,
+        )
+        .unwrap();
         save(&dir, &p).unwrap();
 
         // The block is drawn now and the catalog is newer: both replace the untouched copies.
         let mut p = load(&dir).unwrap();
-        add_built(&dir, &mut p, built("Coil, drawn", "Relay 24 V"), "import:a.tewzip").unwrap();
+        add_built(
+            &dir,
+            &mut p,
+            built("Coil, drawn", "Relay 24 V"),
+            "import:a.tewzip",
+            Replace::Unchanged,
+        )
+        .unwrap();
         save(&dir, &p).unwrap();
         let p = load(&dir).unwrap();
         assert_eq!(
@@ -4190,7 +4255,8 @@ mod tests {
                 &dir,
                 &mut p,
                 built("Coil, drawn again", "Relay 24 V, v2"),
-                "import:a.tewzip"
+                "import:a.tewzip",
+                Replace::Unchanged
             )
             .is_err()
         );
@@ -4211,7 +4277,7 @@ mod tests {
             parts: vec![relay("Relay 24 V, v2")],
             ..Default::default()
         };
-        assert!(add_built(&dir, &mut p, fresh, "import:a.tewzip").is_err());
+        assert!(add_built(&dir, &mut p, fresh, "import:a.tewzip", Replace::Unchanged).is_err());
         std::fs::remove_dir(&blocker).unwrap();
         assert!(!lamp_file.exists(), "the new copy is removed");
         assert_eq!(load(&dir).unwrap().lock, lock);
@@ -4225,7 +4291,8 @@ mod tests {
                 &dir,
                 &mut p,
                 built("Coil, drawn again", "Relay 24 V, v2"),
-                "import:a.tewzip"
+                "import:a.tewzip",
+                Replace::Unchanged
             )
             .is_err()
         );
@@ -4237,12 +4304,77 @@ mod tests {
         );
         assert_eq!(load(&dir).unwrap().lock, lock);
 
+        // A save that fails at a page, after the lock was written, puts the lock back too, so
+        // the same import goes through once the page can be written.
+        let page_file = dir
+            .join(store::PAGES_DIR)
+            .join(format!("swe-page-9{}", store::PAGE_SUFFIX));
+        let mut page_blocker = page_file.as_os_str().to_owned();
+        page_blocker.push(".tmp");
+        std::fs::create_dir_all(&page_blocker).unwrap();
+        let with_page = || wc_import::aml::Built {
+            pages: vec![Page::new("swe-page-9", "9", "Nine")],
+            ..built("Coil, drawn again", "Relay 24 V, v2")
+        };
+        let mut p = load(&dir).unwrap();
+        let lock_bytes = std::fs::read(dir.join(store::LOCK_FILE)).unwrap();
+        assert!(add_and_save(&dir, &mut p, with_page(), "import:a.tewzip", Replace::Unchanged).is_err());
+        std::fs::remove_dir(&page_blocker).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(store::LOCK_FILE)).unwrap(),
+            lock_bytes,
+            "lock put back"
+        );
+        assert_eq!(std::fs::read(&coil_file).unwrap(), coil_bytes);
+        let mut p = load(&dir).unwrap();
+        add_and_save(&dir, &mut p, with_page(), "import:a.tewzip", Replace::Unchanged).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.lock.symbols["swe.lib.coil"].hash, coil("Coil, drawn again").hash());
+        // Put the earlier state back for the steps below.
+        let mut p = p;
+        p.pages.retain(|pg| pg.id != "swe-page-9");
+        save(&dir, &p).unwrap();
+        std::fs::write(&coil_file, &coil_bytes).unwrap();
+        p.lock.symbols.get_mut("swe.lib.coil").unwrap().hash = coil("Coil, drawn").hash();
+        p.lock.parts.get_mut("maker-a.rly-24").unwrap().hash = relay("Relay 24 V").hash();
+        store::write_vendored_part(&dir, &relay("Relay 24 V")).unwrap();
+        save(&dir, &p).unwrap();
+
+        // A project import never replaces: its symbols may be placed on pages the project kept.
+        let mut p = load(&dir).unwrap();
+        let err = add_built(
+            &dir,
+            &mut p,
+            built("Coil, v4", "Relay 24 V"),
+            "import:a.tewzip",
+            Replace::No,
+        )
+        .unwrap_err();
+        assert!(err.contains("symbol swe.lib.coil exists with other content"), "{err}");
+        assert_eq!(std::fs::read(&coil_file).unwrap(), coil_bytes);
+
+        // Two pages with one id in an import are refused before anything is written.
+        let twice = wc_import::aml::Built {
+            pages: vec![Page::new("swe-page-7", "7", "a"), Page::new("swe-page-7", "8", "b")],
+            ..built("Coil, v4", "Relay 24 V, v4")
+        };
+        let err = add_built(&dir, &mut p, twice, "import:a.tewzip", Replace::Unchanged).unwrap_err();
+        assert!(err.contains("page swe-page-7 twice"), "{err}");
+        assert_eq!(std::fs::read(&coil_file).unwrap(), coil_bytes);
+
         // Changed in the project since: still refused, and nothing is written.
         let edited = coil("Coil, edited here");
         store::write_vendored_symbol(&dir, &edited).unwrap();
         let mut p = load(&dir).unwrap();
         let before = p.clone();
-        let err = add_built(&dir, &mut p, built("Coil, v3", "Relay 24 V, v3"), "import:a.tewzip").unwrap_err();
+        let err = add_built(
+            &dir,
+            &mut p,
+            built("Coil, v3", "Relay 24 V, v3"),
+            "import:a.tewzip",
+            Replace::Unchanged,
+        )
+        .unwrap_err();
         assert!(err.contains("symbol swe.lib.coil exists with other content"), "{err}");
         assert_eq!(p, before);
         assert_eq!(store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap(), edited);
@@ -4251,13 +4383,27 @@ mod tests {
             relay("Relay 24 V")
         );
         // Also when the import brings the pinned version itself: the edit is not written over.
-        let err = add_built(&dir, &mut p, built("Coil, drawn", "Relay 24 V"), "import:a.tewzip").unwrap_err();
+        let err = add_built(
+            &dir,
+            &mut p,
+            built("Coil, drawn", "Relay 24 V"),
+            "import:a.tewzip",
+            Replace::Unchanged,
+        )
+        .unwrap_err();
         assert!(err.contains("symbol swe.lib.coil exists with other content"), "{err}");
         assert_eq!(store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap(), edited);
 
         // A copy that cannot be read says why.
         std::fs::write(&coil_file, "{ not json").unwrap();
-        let err = add_built(&dir, &mut p, built("Coil, v3", "Relay 24 V, v3"), "import:a.tewzip").unwrap_err();
+        let err = add_built(
+            &dir,
+            &mut p,
+            built("Coil, v3", "Relay 24 V, v3"),
+            "import:a.tewzip",
+            Replace::Unchanged,
+        )
+        .unwrap_err();
         assert!(err.contains("cannot be read") && err.contains("line 1"), "{err}");
     }
 
@@ -4272,7 +4418,7 @@ mod tests {
             panels: vec![panel("swe-layout-b"), panel("swe-layout-a")],
             ..Default::default()
         };
-        add_built(&dir, &mut p, built, "import:a.tewzip").unwrap();
+        add_built(&dir, &mut p, built, "import:a.tewzip", Replace::Unchanged).unwrap();
         let ids = |p: &Project| p.panels.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
         // Sorted by the import itself, before saving (loading sorts too).
         assert_eq!(ids(&p), ["swe-layout-a", "swe-layout-b"]);
@@ -4295,7 +4441,7 @@ mod tests {
             pages: vec![cover],
             ..Default::default()
         };
-        let err = add_built(&dir, &mut p, built, "import:b.tewzip").unwrap_err();
+        let err = add_built(&dir, &mut p, built, "import:b.tewzip", Replace::Unchanged).unwrap_err();
         assert!(err.contains("panel swe-layout-a exists"), "{err}");
         assert_eq!(p, before);
         assert!(
@@ -4386,7 +4532,7 @@ mod tests {
             ..Default::default()
         };
         // The imported cover is numbered 1 like the project's own: no clash, it is merged.
-        add_built(&dir, &mut p, built, "import:a.tewzip").unwrap();
+        add_built(&dir, &mut p, built, "import:a.tewzip", Replace::Unchanged).unwrap();
         let covers: Vec<_> = p.pages.iter().filter(|pg| pg.cover).collect();
         assert_eq!(covers.len(), 1);
         assert_eq!(covers[0].title_block.get("revision").map(String::as_str), Some("C"));

@@ -33,9 +33,9 @@ pub const DEVICES_FILE: &str = "devices.json";
 pub const LOCK_FILE: &str = "library.lock";
 pub const PAGES_DIR: &str = "pages";
 pub const VENDOR_DIR: &str = "vendor";
-const PAGE_SUFFIX: &str = ".page.json";
+pub const PAGE_SUFFIX: &str = ".page.json";
 pub const PANELS_DIR: &str = "panels";
-const PANEL_SUFFIX: &str = ".panel.json";
+pub const PANEL_SUFFIX: &str = ".panel.json";
 pub const COMMENTS_DIR: &str = "comments";
 const COMMENTS_SUFFIX: &str = ".comments.json";
 
