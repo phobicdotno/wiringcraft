@@ -4378,6 +4378,37 @@ mod tests {
     }
 
     #[test]
+    fn a_drawing_hidden_or_locked_in_the_layer_list_is_not_deleted_before_the_canvas_redraws() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        for hide in [true, false] {
+            call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            // The layer list changed; Delete runs before the canvas is drawn again.
+            a.apply_layers();
+            assert!(a.ed.selection.is_empty());
+            a.run(Action::Delete);
+            assert_eq!(page2(&a).graphics.len(), 1, "the drawing stays");
+            a.prefs.layers = Default::default();
+            a.apply_layers();
+        }
+        // Shown and unlocked, the same Delete removes it.
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.run(Action::Delete);
+        assert!(page2(&a).graphics.is_empty());
+    }
+
+    #[test]
     fn the_assistant_cannot_change_a_page_someone_else_holds_but_can_read_and_comment_there() {
         let (_tmp, mut a) = app(vec![]);
         call(

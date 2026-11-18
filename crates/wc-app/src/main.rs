@@ -2940,9 +2940,24 @@ impl App {
             .collapsible(false)
             .show(ctx, |ui| changed = self.prefs.layers.ui(ui));
         if changed {
-            self.prefs.save();
+            self.layers_changed();
         }
         self.show_layers = open;
+    }
+
+    /// The layer list changed: save it and apply it to the editor at once, so a command run
+    /// before the canvas is drawn again (Delete, Cut, Rotate…) does not act on an item that
+    /// was just hidden or locked.
+    fn layers_changed(&mut self) {
+        self.prefs.save();
+        self.apply_layers();
+    }
+
+    /// Hand the layer list to the editor and drop what it no longer lets be selected.
+    fn apply_layers(&mut self) {
+        self.ed.layers = self.prefs.layers.clone();
+        let layers = &self.ed.layers;
+        self.ed.selection.retain(|s| layers.may_select(s));
     }
 
     /// The terminal strip editor, while open and its project is.

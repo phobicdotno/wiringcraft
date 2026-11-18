@@ -2544,6 +2544,163 @@ mod tests {
         assert_eq!(o.project.pages[0], page, "the page is unchanged");
     }
 
+    /// Draw one frame of the canvas with `events`; returns every text painted and where.
+    fn painted(
+        ctx: &egui::Context,
+        o: &mut Open,
+        ed: &mut Editor,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, Rect)> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, false, 1.0));
+        });
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                EShape::Text(t) => Some((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Click at `pos`: move there, press, release.
+    fn click_at(ctx: &egui::Context, o: &mut Open, ed: &mut Editor, pos: egui::Pos2, t: f64) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        painted(ctx, o, ed, t, vec![egui::Event::PointerMoved(pos)]);
+        painted(ctx, o, ed, t + 0.01, vec![button(true)]);
+        painted(ctx, o, ed, t + 0.02, vec![button(false)]);
+    }
+
+    /// Page 2 with a free text, a numbered wire, a coil -K1 whose contact is on page 3 (so a
+    /// cross-reference shows under the coil), and a review comment.
+    fn annotated() -> (tempfile::TempDir, Open, Editor) {
+        let (tmp, mut o) = project();
+        o.project.pages.push(Page::new("p0003", "3", "Contacts"));
+        let coil = o.place(1, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let contact = o.place(2, "wc.contact.no", Point::new(100.0, 60.0)).unwrap();
+        for (page, id) in [(1, &coil), (2, &contact)] {
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| &s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+        }
+        let page = &mut o.project.pages[1];
+        page.graphics.push(
+            serde_json::from_value(serde_json::json!({
+                "kind": "text", "at": {"x": 40.0, "y": 150.0}, "text": "Hello note", "height": 5.0
+            }))
+            .unwrap(),
+        );
+        page.wires.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "w1",
+                "from": {"at": {"x": 200.0, "y": 40.0}},
+                "to": {"at": {"x": 300.0, "y": 40.0}},
+                "number": "W101"
+            }))
+            .unwrap(),
+        );
+        o.project.comments.push(wc_core::Comment {
+            id: "c742".into(),
+            page: "p0002".into(),
+            at: Some(Point::new(250.0, 150.0)),
+            author: "Kari".into(),
+            time: 0,
+            text: "Check this".into(),
+            resolved: false,
+            replies: Vec::new(),
+        });
+        let ed = Editor {
+            page: 1,
+            ..Editor::default()
+        };
+        (tmp, o, ed)
+    }
+
+    #[test]
+    fn a_hidden_layer_is_not_painted_and_a_shown_one_is() {
+        let (_tmp, mut o, mut ed) = annotated();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let has = |texts: &[(String, Rect)], want: &str| texts.iter().any(|(t, _)| t.contains(want));
+        // A first frame fits the page; the second is drawn as it stays.
+        painted(&ctx, &mut o, &mut ed, 0.0, vec![]);
+        let all = painted(&ctx, &mut o, &mut ed, 0.1, vec![]);
+        let xref = all
+            .iter()
+            .find(|(t, _)| t.contains("3."))
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        assert!(!xref.is_empty(), "a cross-reference to page 3 is drawn: {all:?}");
+        for want in ["Hello note", "W101", "742", xref.as_str()] {
+            assert!(has(&all, want), "{want} is drawn: {all:?}");
+        }
+        for (layer, gone) in [
+            (Layer::Drawings, "Hello note"),
+            (Layer::WireNumbers, "W101"),
+            (Layer::CrossReferences, xref.as_str()),
+            (Layer::Comments, "742"),
+        ] {
+            ed.layers = Default::default();
+            ed.layers.set_shown(layer, false);
+            let texts = painted(&ctx, &mut o, &mut ed, 0.2, vec![]);
+            assert!(!has(&texts, gone), "{layer:?} hidden: {gone} is not drawn");
+            for other in ["Hello note", "W101", "742", xref.as_str()]
+                .into_iter()
+                .filter(|w| *w != gone)
+            {
+                assert!(has(&texts, other), "{layer:?} hidden: {other} is still drawn");
+            }
+            // Locked is still drawn.
+            ed.layers = Default::default();
+            ed.layers.set_locked(layer, true);
+            let texts = painted(&ctx, &mut o, &mut ed, 0.3, vec![]);
+            assert!(has(&texts, gone), "{layer:?} locked: {gone} is still drawn");
+        }
+    }
+
+    #[test]
+    fn a_locked_comment_or_cross_reference_does_not_open_on_a_click() {
+        let (_tmp, mut o, mut ed) = annotated();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.0, vec![]);
+        let texts = painted(&ctx, &mut o, &mut ed, 0.1, vec![]);
+        let at = |want: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t == want || (want == "xref" && t.contains("3.")))
+                .map(|(_, r)| r.center())
+                .unwrap()
+        };
+        let (bubble, xref) = (at("742"), at("xref"));
+
+        // Locked: a click on the bubble opens nothing, a click on the cross-reference stays.
+        ed.layers.set_locked(Layer::Comments, true);
+        ed.layers.set_locked(Layer::CrossReferences, true);
+        click_at(&ctx, &mut o, &mut ed, bubble, 1.0);
+        assert_eq!(ed.comment, None);
+        click_at(&ctx, &mut o, &mut ed, xref, 2.0);
+        assert_eq!(ed.page, 1, "still on page 2");
+
+        // Unlocked: the bubble opens its comment, the cross-reference goes to page 3.
+        ed.layers = Default::default();
+        click_at(&ctx, &mut o, &mut ed, bubble, 3.0);
+        assert_eq!(ed.comment.as_deref(), Some("c742"));
+        click_at(&ctx, &mut o, &mut ed, xref, 4.0);
+        assert_eq!(ed.page, 2, "on page 3");
+    }
+
     #[test]
     fn the_comment_tool_leaves_a_hidden_comment_layer() {
         let mut ed = Editor {
