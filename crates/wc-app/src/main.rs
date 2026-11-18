@@ -3600,7 +3600,7 @@ mod marking_tests {
     }
 
     #[test]
-    fn a_jumper_row_is_matched_to_the_jumper_after_a_terminal_change_still_in_progress() {
+    fn a_wago_jumper_row_is_matched_to_the_jumper_after_a_terminal_change_still_in_progress() {
         let (_tmp, mut o) = state::tests::project();
         let mut ids = Vec::new();
         for (x, tag) in [(20.0, "-X1.1"), (40.0, "-X1.2")] {
@@ -3626,7 +3626,13 @@ mod marking_tests {
         s.tag = Some(wc_core::DeviceTag::parse("-X1.5").unwrap());
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"], "not followed yet");
 
+        let mark = o.undo_mark();
         let msg = o.import_wago_configured(csv.as_bytes()).unwrap();
+        assert_eq!(
+            o.undo_mark(),
+            mark,
+            "nothing taken, no undo step: Undo goes to the terminal edit"
+        );
         assert!(msg.contains("0 device(s) or jumper(s) changed"), "{msg}");
         assert!(msg.contains("1 not matched"), "{msg}");
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "5"], "followed");
