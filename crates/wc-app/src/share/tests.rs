@@ -2042,6 +2042,53 @@ fn a_guest_with_the_pinned_copy_brings_in_the_file_the_session_lacks() -> TestRe
 }
 
 #[test]
+fn a_guests_update_of_an_item_whose_file_the_session_lacks_is_kept_while_it_waits() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+        o.save()?;
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil")?)?;
+        o.symbols.remove("wc.coil");
+        Ok(())
+    })?;
+    // The session cannot store files: the guest's copy goes out as the missing file and is
+    // refused.
+    log.fail_vendor(true);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The guest updates the coil meanwhile: that update holds everything until it is answered,
+    // or what comes in would put the session's entry back over it.
+    let v1 = guest_open.symbols.get("wc.coil").cloned().ok_or("the guest's copy")?;
+    let mut v2 = v1.clone();
+    v2.name = "Coil, newer".into();
+    store::write_vendored_symbol(&guest_open.dir, &v2)?;
+    guest_open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = v2.hash();
+    guest_open.symbols.insert("wc.coil".into(), v2.clone());
+    let hash = |o: &Open| o.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone());
+    for _ in 0..3 {
+        // Something of the host's comes in on every frame.
+        let n = host_open.project.devices.len();
+        host_open
+            .project
+            .devices
+            .insert(DeviceTag::parse(&format!("-K{}", 50 + n))?, Device::default());
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        assert_eq!(
+            hash(&guest_open),
+            Some(v2.hash()),
+            "the guest keeps its update: {:?}",
+            g.notes
+        );
+    }
+    // Once the session can store it, the update goes in.
+    log.fail_vendor(false);
+    retry_due(&mut g);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(hash(&host_open), Some(v2.hash()), "{:?} {:?}", g.notes, h.notes);
+    assert_eq!(hash(&guest_open), Some(v2.hash()));
+    Ok(())
+}
+
+#[test]
 fn a_symbol_used_for_the_first_time_reaches_the_host_with_its_file() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;

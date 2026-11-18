@@ -3085,13 +3085,17 @@ impl Share {
         }
         // While an item is on its way (a few tries, seconds at most) everything waits: what
         // comes in would put the session's lock entry back over an update sent from here. A
-        // missing file sent again is no such item (the session's entry is the one sent), so
-        // only the changes that use it wait for it, below.
+        // missing file sent again in the session's own version is no such item (the session's
+        // entry is the one sent), so only the changes that use it wait for it, below. An update
+        // of an item whose file the session lacks still holds everything.
         let repair = repairs_due(role);
+        let auth = role.project()?;
+        let only_repair =
+            |name: &String, o: &ItemOut| repair.contains(name) && o.hash.is_some() && o.hash == local_hash(auth, name);
         if self
             .items_out
             .iter()
-            .any(|(name, o)| !o.gave_up && !repair.contains(name))
+            .any(|(name, o)| !o.gave_up && !only_repair(name, o))
         {
             return None;
         }
