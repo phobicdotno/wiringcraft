@@ -520,9 +520,9 @@ pub fn cover_logo_default(project: &Project, page: &Page) -> (Point, Point) {
     let band = project.meta.template.band_height();
     let (x0, y0, x1, ty) = (MARGIN, MARGIN + HEADER, w - MARGIN, h - MARGIN - band);
     let cx = (x0 + x1) / 2.0;
-    let name_y = cover_name_y(cover_rows(project, "").len(), y0, ty);
-    let top = y0 + 4.0;
-    let bottom = (name_y - 10.0).max(top + 5.0);
+    let name_y = cover_name_y(cover_rows(project, "").len(), project.meta.logo.is_some(), y0, ty);
+    let top = y0 + COVER_LOGO_TOP;
+    let bottom = (name_y - COVER_LOGO_TO_NAME).max(top + COVER_LOGO_MIN);
     let half = 45.0_f64.min((x1 - x0) / 2.0 - 5.0);
     (Point::new(cx - half, top), Point::new(cx + half, bottom))
 }
@@ -568,6 +568,12 @@ pub fn fit_picture((min, max): (Point, Point), (width, height): (u32, u32)) -> (
     (Point::new(x, y), Point::new(x + w, y + h))
 }
 
+/// From the top of the cover's drawing area to its default logo box.
+const COVER_LOGO_TOP: f64 = 4.0;
+/// The smallest height of the cover's default logo box.
+const COVER_LOGO_MIN: f64 = 5.0;
+/// From the bottom of the cover's default logo box to the project name's baseline.
+const COVER_LOGO_TO_NAME: f64 = 10.0;
 /// The smallest height a row of the cover's field table gets; below it, rows are left out.
 const COVER_MIN_ROW: f64 = 4.0;
 /// The room under the cover's table, above the title block.
@@ -577,11 +583,25 @@ const COVER_NAME_TO_TABLE: f64 = 18.0;
 
 /// Where the project's name stands on a cover whose drawing area runs from `y0` to `y1` and
 /// lists `rows` fields: a fifth of the way down, or higher on a short sheet so the table has
-/// room for its rows, but never closer to the top than the name's height.
-fn cover_name_y(rows: usize, y0: f64, y1: f64) -> f64 {
+/// room for its rows, but never closer to the top than the name's height, or, with a `logo`,
+/// than the smallest default logo box above it (see [`cover_logo_default`]).
+fn cover_name_y(rows: usize, logo: bool, y0: f64, y1: f64) -> f64 {
     let ideal = y0 + (y1 - y0) * 0.2;
     let needed = rows as f64 * COVER_MIN_ROW + COVER_TABLE_GAP + COVER_NAME_TO_TABLE;
-    ideal.min((y1 - needed).max(y0 + 10.0))
+    let highest = y0
+        + if logo {
+            COVER_LOGO_TOP + COVER_LOGO_MIN + COVER_LOGO_TO_NAME
+        } else {
+            10.0
+        };
+    ideal.min((y1 - needed).max(highest))
+}
+
+/// How many rows of the cover's field table fit on a cover whose drawing area runs from `y0`
+/// to `y1` and lists `rows` fields, at no less than [`COVER_MIN_ROW`] each.
+fn cover_fits(rows: usize, logo: bool, y0: f64, y1: f64) -> usize {
+    let room = y1 - COVER_TABLE_GAP - cover_name_y(rows, logo, y0, y1) - COVER_NAME_TO_TABLE;
+    (room / COVER_MIN_ROW).floor().max(0.0) as usize
 }
 
 /// The rows of the cover's field table, label and value. Standard fields are listed even
@@ -629,18 +649,20 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     };
     let fit = |t: &str, height: f64| fit_height(t, height, x1 - x0 - 10.0);
     let mut rows = cover_rows(project, date);
-    let name_y = cover_name_y(rows.len(), y0, y1);
+    let logo = project.meta.logo.is_some();
+    let name_y = cover_name_y(rows.len(), logo, y0, y1);
     let name = &project.meta.name;
     push_text((cx, name_y), fit(name, 9.0), Align::Center, name, Ink::Thin, out);
     let desc = tb.get("description").map(String::as_str).unwrap_or("");
     push_text((cx, name_y + 9.0), fit(desc, 4.0), Align::Center, desc, Ink::Thin, out);
 
     // The table fits under the description; rows shrink on small sheets. When they would be
-    // too small to read, empty fields are left out first, then the last ones, with a row that
-    // says how many are not shown.
+    // too small to read, empty fields are left out first, then the last filled-in ones, with a
+    // row that says how many filled-in fields are not shown (empty ones have nothing to show).
+    // When not even that row fits, the export warns (see `draw_page`).
     let top = name_y + COVER_NAME_TO_TABLE;
     let room = y1 - COVER_TABLE_GAP - top;
-    let fits = (room / COVER_MIN_ROW).floor().max(0.0) as usize;
+    let fits = cover_fits(rows.len(), logo, y0, y1);
     if rows.len() > fits {
         rows.retain(|(_, v)| !v.trim().is_empty());
     }
@@ -719,6 +741,23 @@ pub fn draw_page(
     pen.ops.push_str("1 J 1 j\n");
     pen.colour(0.0, 0.0, 0.0);
     frame(&mut pen, project, page, index, total, &options.date);
+    if page.cover {
+        let rows = cover_rows(project, &options.date);
+        let band = project.meta.template.band_height();
+        if rows.iter().any(|(_, v)| !v.trim().is_empty())
+            && cover_fits(
+                rows.len(),
+                project.meta.logo.is_some(),
+                MARGIN + HEADER,
+                h - MARGIN - band,
+            ) == 0
+        {
+            warnings.push(format!(
+                "page {}: the cover page is too short to list the project fields",
+                page.number
+            ));
+        }
+    }
 
     // Free graphics: texts, lines and rectangles drawn on the sheet, and imported drawings.
     pen.colour(0.0, 0.0, 0.0);

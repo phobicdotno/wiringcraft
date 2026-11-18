@@ -850,15 +850,23 @@ fn a_short_cover_keeps_its_field_table_above_the_title_block() -> Result<(), Str
         .ok_or(format!("no count of fields left out: {texts:?}"))?;
     assert!(more_y < ty, "{more_y} {ty}");
     assert!(row("value 11").is_none(), "{texts:?}");
-    // Every line of the table ends above the title block.
-    for m in &marks {
-        if let Shape::Line { a, b } = &m.shape
-            && (a.y - b.y).abs() < 1e-9
-            && a.y > ty - 30.0
-            && a.y < ty - 1e-6
-        {
-            assert!(a.y <= ty - 1.0, "{a:?}");
-        }
+    // Every rule of the table, picked by its ends, stays above the title block.
+    let (x0, x1) = (wc_core::project::FRAME_MARGIN, 297.0 - wc_core::project::FRAME_MARGIN);
+    let (tx0, tx1) = ((x0 + x1) / 2.0 - 90.0, (x0 + x1) / 2.0 + 90.0);
+    let rules: Vec<f64> = marks
+        .iter()
+        .filter_map(|m| match &m.shape {
+            Shape::Line { a, b }
+                if (a.x - tx0).abs() < 1e-6 && (b.x - tx1).abs() < 1e-6 && (a.y - b.y).abs() < 1e-9 =>
+            {
+                Some(a.y)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!rules.is_empty(), "no table rules");
+    for y in &rules {
+        assert!(*y <= ty - 1.0, "rule at {y}, title block at {ty}");
     }
     // A tall sheet keeps today's layout: every field is listed.
     cover.size = PageSize::A3;
@@ -868,6 +876,63 @@ fn a_short_cover_keeps_its_field_table_above_the_title_block() -> Result<(), Str
             .iter()
             .any(|m| matches!(&m.shape, Shape::Text { text, .. } if text == "value 11"))
     );
+    Ok(())
+}
+
+#[test]
+fn a_short_cover_moves_the_name_up_and_keeps_the_default_logo_above_it() -> Result<(), String> {
+    let mut project = wc_core::Project::new("Plant");
+    for i in 0..12 {
+        project
+            .meta
+            .title_block
+            .insert(format!("Extra {i}"), format!("value {i}"));
+    }
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = PageSize::custom(297, 170)?;
+    let (_, h) = cover.size.mm();
+    let y0 = wc_core::project::FRAME_MARGIN + 6.0;
+    let ty = h - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let (name_y, name_h) = marks
+        .iter()
+        .find_map(|m| match &m.shape {
+            Shape::Text { text, at, height, .. } if text == "Plant" && at.y < ty => Some((at.y, *height)),
+            _ => None,
+        })
+        .ok_or("no project name on the cover")?;
+    // A fifth of the way down leaves too little room for the table here: the name moves up.
+    assert!(name_y < y0 + (ty - y0) * 0.2 - 1.0, "name at {name_y}");
+    // The default logo box still ends above the name's letters.
+    let (a, b) = layout::cover_logo_default(&project, &cover);
+    assert!(a.y >= y0 && b.y - a.y >= 5.0, "{a:?} {b:?}");
+    assert!(b.y <= name_y - name_h, "logo to {}, name from {}", b.y, name_y - name_h);
+    Ok(())
+}
+
+#[test]
+fn a_cover_too_short_for_any_field_is_a_warning() -> Result<(), String> {
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = PageSize::custom(297, 100)?;
+    project.meta.template.height = wc_core::template::MAX_TITLE_HEIGHT;
+    project.meta.title_block.insert("customer".into(), "Acme".into());
+    project.pages = vec![cover];
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        ["page 1: the cover page is too short to list the project fields"]
+    );
+    // On a sheet with room for the table, no warning.
+    project.pages[0].size = PageSize::A4;
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     Ok(())
 }
 
