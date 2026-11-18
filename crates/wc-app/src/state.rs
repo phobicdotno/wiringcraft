@@ -178,6 +178,8 @@ pub struct Open {
     unreadable: Option<PathBuf>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
+    /// Parts the last Undo or Redo could not load, with the reason, though the step was done.
+    step_warning: Option<String>,
 }
 
 impl Open {
@@ -211,6 +213,7 @@ impl Open {
             #[cfg(test)]
             unreadable: None,
             undo_error: None,
+            step_warning: None,
         };
         // Locked symbols no page uses are loaded too, so Undo can put back the version a
         // library update replaces.
@@ -550,6 +553,8 @@ impl Open {
                     self.undo_error = Some(e);
                     return false;
                 }
+                let sources = self.redo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
+                self.follow_step(sources);
                 self.dirty = true;
                 self.history += 1;
                 true
@@ -571,12 +576,44 @@ impl Open {
                     self.undo_error = Some(e);
                     return false;
                 }
+                let sources = self.undo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
+                self.follow_step(sources);
                 self.dirty = true;
                 self.history += 1;
                 true
             }
             None => false,
         }
+    }
+
+    /// After an undo or redo: rebuild the library list when the step added or removed a library
+    /// source (`sources_changed`), so symbols of a source that is gone are no longer offered and
+    /// those of one that came back are; then load every part a device uses that is not loaded,
+    /// since a redo can bring back an assignment whose part an earlier rebuild dropped.
+    fn follow_step(&mut self, sources_changed: bool) {
+        if sources_changed {
+            self.refresh_library();
+        }
+        let missing: Vec<String> = self
+            .project
+            .devices
+            .values()
+            .flat_map(|d| d.all_parts())
+            .map(|(id, _)| id)
+            .filter(|id| !self.parts.contains_key(*id))
+            .map(str::to_owned)
+            .collect();
+        let mut failed = Vec::new();
+        for id in missing {
+            match store::read_vendored_part(&self.dir, &id) {
+                Ok(p) => {
+                    self.parts.insert(id, p);
+                }
+                Err(e) => failed.push(format!("{id} ({e})")),
+            }
+        }
+        self.step_warning =
+            (!failed.is_empty()).then(|| format!("these parts could not be loaded: {}", failed.join("; ")));
     }
 
     /// Load the vendored symbols again after the library changed them, keeping the versions
@@ -838,6 +875,11 @@ impl Open {
     /// Why the last Undo or Redo failed, once.
     pub fn take_undo_error(&mut self) -> Option<String> {
         self.undo_error.take()
+    }
+
+    /// Parts the last Undo or Redo could not load, though the step was done; once.
+    pub fn take_step_warning(&mut self) -> Option<String> {
+        self.step_warning.take()
     }
 
     /// After the symbol editor saved symbol `id` into the library: take that symbol (only the
@@ -3134,5 +3176,79 @@ pub(crate) mod tests {
         assert!(o.project.meta.locations.is_empty());
         assert!(o.undo());
         assert_eq!(o.project.meta.locations.len(), 2);
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_new_library_source_update_the_library_list() {
+        let (_tmp, mut o) = project();
+        let root = o.dir.join("library");
+        let sym = wc_core::Symbol {
+            id: "test.imported".into(),
+            name: "Imported".into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role: wc_core::symbol::SymbolRole::Standalone,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        wc_library::write_symbol(&root, &sym).unwrap();
+        let listed = |o: &Open| o.library.iter().any(|(id, _)| id == "test.imported");
+        o.refresh_library();
+        assert!(!listed(&o), "the folder is not a source yet");
+
+        // As Library -> Import symbols does the first time it writes into the project's folder.
+        o.checkpoint();
+        o.project.meta.libraries.insert(
+            0,
+            LibrarySource {
+                name: "project".into(),
+                kind: "folder".into(),
+                location: "library".into(),
+                reference: None,
+            },
+        );
+        o.refresh_library();
+        assert!(listed(&o));
+        assert!(o.undo());
+        assert!(!listed(&o), "undo removed the source, so its symbols go");
+        assert!(o.redo());
+        assert!(listed(&o), "redo brings them back");
+
+        // A part assigned after the source: undo both steps, then redo both. The rebuild on the
+        // first redo drops the part (no device uses it yet); the second redo loads it again.
+        let part = Part {
+            id: "acme.relay".into(),
+            manufacturer: "Acme".into(),
+            ..Default::default()
+        };
+        store::write_vendored_part(&o.dir, &part).unwrap();
+        o.checkpoint();
+        o.project.devices.insert(
+            DeviceTag::parse("-K1").unwrap(),
+            wc_core::Device {
+                part: Some(part.id.clone()),
+                ..Default::default()
+            },
+        );
+        o.parts.insert(part.id.clone(), part.clone());
+        assert!(o.undo() && o.undo());
+        assert!(!o.parts.contains_key("acme.relay"));
+        assert!(o.redo() && o.redo());
+        assert_eq!(
+            o.parts.get("acme.relay"),
+            Some(&part),
+            "the device's part is loaded again"
+        );
+        assert_eq!(o.take_step_warning(), None);
+
+        // A part file that is gone: the step is done, and the warning names the part and why.
+        assert!(o.undo());
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Part, "acme.relay").unwrap()).unwrap();
+        o.parts.remove("acme.relay");
+        assert!(o.redo());
+        let warning = o.take_step_warning().unwrap_or_default();
+        assert!(warning.contains("acme.relay"), "{warning}");
     }
 }

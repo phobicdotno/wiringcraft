@@ -47,6 +47,7 @@ pub enum Action {
     LibraryUpdate,
     NewSymbol,
     EditSymbol,
+    ImportSymbols,
     ExportPdf,
     ExportDrawings,
     ExportAml,
@@ -121,6 +122,7 @@ impl Action {
         Action::LibraryUpdate,
         Action::NewSymbol,
         Action::EditSymbol,
+        Action::ImportSymbols,
         Action::ExportPdf,
         Action::ExportDrawings,
         Action::ExportAml,
@@ -338,6 +340,12 @@ impl Action {
                 Icon::Symbol,
                 "",
             ),
+            Action::ImportSymbols => i(
+                "Import symbols",
+                "Import DXF, SVG, KiCad (.kicad_sym) and QElectroTech (.elmt) files into a library folder",
+                Icon::Library,
+                "",
+            ),
             Action::ExportPdf => i("PDF", "Export all pages and the reports to PDF", Icon::Pdf, "Ctrl+P"),
             Action::ExportAml => i(
                 "AutomationML",
@@ -522,7 +530,10 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
         "Library",
         &[
             ("Library", &[Action::LibraryStatus, Action::LibraryUpdate]),
-            ("Symbols", &[Action::NewSymbol, Action::EditSymbol]),
+            (
+                "Symbols",
+                &[Action::NewSymbol, Action::EditSymbol, Action::ImportSymbols],
+            ),
         ],
     ),
     (

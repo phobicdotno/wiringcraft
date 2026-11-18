@@ -27,6 +27,14 @@ From `crates/wc-import`:
 | SolidWorks Electrical archives (`.tewzip`) | `swe` | Projects. Content Portal parts also arrive as `.tewzip`; `import swe-library` reads their parts, cable types and symbol blocks (blocks as placeholder boxes with their connection points; the original graphics need the DWG reader, #59). |
 | Plain zip | `archive` | Opens the container and imports PDF, DXF and AutomationML entries inside; `.kicad_sym` entries go through the KiCad importer into the folder given with `--lib` (listed with a warning without it). CSV entries are told apart by their header, like the single-file commands: a device and an address column make a PLC address list, applied to the project's devices after the pages (as `import plc-csv`); an order/part number column makes a parts list, imported into `--lib` (as `import parts-csv`; listed with a warning without it). A CSV that is neither is listed with a warning. Other entries are listed, not imported. |
 
+In the app, **Library → Import symbols…** takes DXF, SVG, `.kicad_sym` and `.elmt` files together,
+each read by its extension, and writes them into one of the project's library folders. The
+project's own folder, `library/` in the project, comes first and is added to the project's
+libraries (ahead of the others) the first time symbols are written there. Ids are `dxf.<file name>`, `svg.<file name>`, `kicad.<file name>.<symbol>` and
+`qet.<file name>`; QElectroTech uses the default 5 mm grid and KiCad scale 1. The result lists every
+symbol written, every warning and every file that failed; a failing file does not stop the others.
+A symbol already in the folder is kept unless "Replace symbols already in the library" is ticked.
+
 Not read today: the drawings of EPLAN macros inside EDZ files (listed only, #144), **DWG**, **STEP** (3D), ECLASS data
 outside a BMEcat catalogue.
 
