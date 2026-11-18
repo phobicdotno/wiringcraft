@@ -3391,6 +3391,77 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_follows_its_graphic_through_a_session_sync_and_goes_with_its_page() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        // A third page, so the page under a panel has one after it.
+        open.duplicate_page(0).unwrap();
+        assert_eq!(open.project.pages.len(), 3);
+        open.project.pages[1].graphics = vec![line(1.0), line(2.0)];
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        a.ed.page = 1;
+        // Delete the first line; the second is then graphic 0 and selected.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].graphics.remove(0);
+        a.sync_session_now(false);
+        a.ed.selection = vec![Selection::Graphic(0)];
+        // The session's undo puts the first line back in front: the selection follows its line,
+        // also with a panel open over the page while a page before it goes.
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[1].graphics,
+            vec![line(1.0), line(2.0)]
+        );
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(1)]);
+        // With a panel open over the page, the session takes back a page added before it: the
+        // page under the panel is found again at its new place, and so is the selection.
+        let open = a.open.as_mut().unwrap();
+        let id = open.project.pages[1].id.clone();
+        open.checkpoint();
+        let mut extra = open.project.pages[0].clone();
+        (extra.id, extra.number) = ("p0099".into(), "0".into());
+        open.project.pages.insert(0, extra);
+        a.sync_session_now(false);
+        let pages = &a.open.as_ref().unwrap().project.pages;
+        a.ed.page = pages.iter().position(|p| p.id == id).unwrap();
+        assert_eq!((a.ed.page, pages[0].id.as_str()), (2, "p0099"));
+        a.ed.panel = Some(0);
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), 3);
+        assert_eq!(a.open.as_ref().unwrap().project.pages[a.ed.page].id, id);
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(1)]);
+        a.ed.panel = None;
+        a.ed.page = 0;
+
+        // A page added and shown, something selected on it, and the session takes the page
+        // back: nothing stays selected on the page shown instead, though it has a graphic 0 too.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        for p in &mut open.project.pages {
+            p.graphics.push(line(5.0));
+        }
+        a.sync_session_now(false);
+        let open = a.open.as_mut().unwrap();
+        let i = open.duplicate_page(0).unwrap();
+        a.sync_session_now(false);
+        a.ed.page = i;
+        a.ed.selection = vec![Selection::Graphic(0)];
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        let pages = &a.open.as_ref().unwrap().project.pages;
+        assert_eq!(pages.len(), i);
+        assert!(!pages[a.ed.page].graphics.is_empty(), "graphic 0 is there to select");
+        assert!(a.ed.selection.is_empty(), "{:?}", a.ed.selection);
+    }
+
+    #[test]
     fn undo_in_a_shared_session_goes_through_the_host() {
         let (_tmp, mut a) = app(vec![]);
         let open = a.open.as_mut().unwrap();
