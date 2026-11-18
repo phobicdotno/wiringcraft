@@ -1149,12 +1149,17 @@ impl Open {
     /// Save the project as a copy in `target`, which must not exist yet or be an empty folder,
     /// and go on working in the copy. Everything in the project folder is copied (its history
     /// included), then the changes not saved yet are saved in the copy only, so the original
-    /// stays as it was last saved. Library folders given relative to the project are pointed
-    /// at the same folders from the new place. Returns the folder the copy is in.
-    pub fn save_as(&mut self, target: &Path) -> Result<PathBuf, String> {
+    /// stays as it was last saved. Library folders given relative to the project and lying
+    /// outside it are pointed at the same folders from the new place; the project's own library
+    /// (inside it) is copied and stays the copy's own. Returns the folder the copy is in and how
+    /// many links in the project folder were left out of the copy. When saving in the copy
+    /// fails, the project goes on being worked on in its old folder.
+    pub fn save_as(&mut self, target: &Path) -> Result<(PathBuf, usize), String> {
         let target = crate::prefs::absolute(target)?;
         let from = self.dir.clone();
-        if target.starts_with(&from) {
+        // Compared as the file system resolves them, so another letter case on Windows, a link
+        // or `..` cannot hide that the target is inside the project.
+        if resolved(&target).starts_with(resolved(&from)) {
             return Err(format!(
                 "{} is inside the project folder; pick a place outside it.",
                 target.display()
@@ -1171,17 +1176,37 @@ impl Open {
                 ));
             }
         }
-        copy_dir(&from, &target).map_err(|e| format!("Copying to {} failed: {e}", target.display()))?;
-        for lib in &mut self.project.meta.libraries {
-            if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
-                let at = from.join(&lib.location);
-                lib.location = relative_to(&at, &target).unwrap_or(at).display().to_string();
-                self.dirty = true;
+        let links = copy_dir(&from, &target).map_err(|e| format!("Copying to {} failed: {e}", target.display()))?;
+        // A relative library folder outside the project is the same folder seen from the copy;
+        // one inside it was copied along.
+        let repoint = |libs: &mut Vec<wc_core::project::LibrarySource>| {
+            for lib in libs {
+                if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
+                    let at = lexical(&from.join(&lib.location));
+                    if !at.starts_with(lexical(&from)) {
+                        lib.location = relative_to(&at, &target).unwrap_or(at).display().to_string();
+                    }
+                }
             }
-        }
+        };
+        let (old_libraries, old_dirty) = (self.project.meta.libraries.clone(), self.dirty);
+        repoint(&mut self.project.meta.libraries);
         self.dir = target.clone();
-        self.save()?;
-        Ok(target)
+        if let Err(e) = self.save() {
+            self.dir = from.clone();
+            self.project.meta.libraries = old_libraries;
+            self.dirty = old_dirty;
+            return Err(format!(
+                "{e}\nThe copy in {} is not complete; you are still working in {}.",
+                target.display(),
+                from.display()
+            ));
+        }
+        // Undo and Redo must not bring the old folders back into the copy.
+        for p in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            repoint(&mut p.meta.libraries);
+        }
+        Ok((target, links))
     }
 
     /// Make sure a library symbol is vendored and pinned before it is placed.
@@ -2228,40 +2253,65 @@ fn restore_file(path: &Path, was: Option<&[u8]>) -> std::io::Result<()> {
 }
 
 /// Copy a folder and everything in it. Links are not followed: a link is left out, so a copy
-/// never reaches outside the folder.
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+/// never reaches outside the folder. Returns how many links were left out.
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<usize> {
     std::fs::create_dir_all(to)?;
+    let mut links = 0;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         let dest = to.join(entry.file_name());
         if kind.is_dir() {
-            copy_dir(&entry.path(), &dest)?;
+            links += copy_dir(&entry.path(), &dest)?;
         } else if kind.is_file() {
             std::fs::copy(entry.path(), &dest)?;
+        } else {
+            links += 1;
         }
     }
-    Ok(())
+    Ok(links)
+}
+
+/// A path's parts with `.` dropped and `..` taken back where it can be (lexically).
+fn lexical_parts(p: &Path) -> Vec<std::path::Component<'_>> {
+    use std::path::Component;
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.last(), Some(Component::Normal(_))) => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// [`lexical_parts`] as a path: `/w/old/../lib` is `/w/lib`.
+fn lexical(p: &Path) -> PathBuf {
+    lexical_parts(p).iter().map(|c| c.as_os_str()).collect()
+}
+
+/// A path as the file system resolves it: its longest existing part resolved (letter case,
+/// links), the rest added as written.
+fn resolved(p: &Path) -> PathBuf {
+    let p = lexical(p);
+    for at in p.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            return match p.strip_prefix(at) {
+                Ok(rest) if !rest.as_os_str().is_empty() => real.join(rest),
+                _ => real,
+            };
+        }
+    }
+    p
 }
 
 /// `path` as seen from the folder `base`, both full paths: `../library` and the like. `None`
 /// when they share no root (another drive).
 fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-    fn normal(p: &Path) -> Vec<Component<'_>> {
-        let mut out: Vec<Component<'_>> = Vec::new();
-        for c in p.components() {
-            match c {
-                Component::CurDir => {}
-                Component::ParentDir if matches!(out.last(), Some(Component::Normal(_))) => {
-                    out.pop();
-                }
-                c => out.push(c),
-            }
-        }
-        out
-    }
-    let (p, b) = (normal(path), normal(base));
+    let (p, b) = (lexical_parts(path), lexical_parts(base));
     let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
     if common == 0 {
         return None;
@@ -2304,10 +2354,18 @@ pub(crate) mod tests {
             location: "../library".into(),
             reference: None,
         });
+        // The project's own library, inside it, goes along with the copy.
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "own".into(),
+            kind: "folder".into(),
+            location: "library".into(),
+            reference: None,
+        });
+        o.checkpoint();
         o.project.meta.name = "Changed".into();
         o.dirty = true;
         let to = tmp.path().join("copies").join("plant 2");
-        assert_eq!(o.save_as(&to).unwrap(), to);
+        assert_eq!(o.save_as(&to).unwrap(), (to.clone(), 0));
         assert_eq!(o.dir, to);
         assert!(!o.dirty);
         // The original is as it was last saved; the copy has the change and its library is
@@ -2317,7 +2375,13 @@ pub(crate) mod tests {
         assert_eq!(copy.project.meta.name, "Changed");
         let lib = copy.project.meta.libraries.iter().find(|l| l.name == "shared").unwrap();
         assert_eq!(Path::new(&lib.location), Path::new("../../library"));
+        let own = copy.project.meta.libraries.iter().find(|l| l.name == "own").unwrap();
+        assert_eq!(own.location, "library");
         assert_eq!(copy.project.pages.len(), o.project.pages.len());
+        // Undo goes back to the name before, not to the library folders seen from the original.
+        assert!(o.undo());
+        let shared = o.project.meta.libraries.iter().find(|l| l.name == "shared").unwrap();
+        assert_eq!(Path::new(&shared.location), Path::new("../../library"));
         // Not over a folder with something in it, and not inside the project itself.
         assert!(o.save_as(&from).unwrap_err().contains("already exists"));
         assert!(o.save_as(&to.join("inner")).unwrap_err().contains("inside the project"));

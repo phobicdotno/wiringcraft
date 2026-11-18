@@ -3074,7 +3074,16 @@ impl Share {
                     ui.text_edit_singleline(&mut form.email);
                     ui.end_row();
                     ui.label("Keep my copy in");
-                    ui.text_edit_singleline(&mut form.folder);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut form.folder);
+                        if ui.button("Browse…").clicked() {
+                            match crate::pick_folder("Keep my copy in", &form.folder) {
+                                crate::Picked::Path(d) => form.folder = d.display().to_string(),
+                                crate::Picked::Failed(e) => form.error = Some(e),
+                                crate::Picked::Cancelled => {}
+                            }
+                        }
+                    });
                     ui.end_row();
                 });
                 form.forget_error_unless(&typed.0, &typed.1);
