@@ -508,6 +508,28 @@ fn an_item_the_session_took_back_leaves_the_local_lock() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn a_version_the_copy_has_not_taken_yet_still_goes_when_the_session_takes_back_the_next() {
+    let entry = |hash: &str| wc_core::LockEntry {
+        hash: hash.into(),
+        source: "starter".into(),
+    };
+    let mut v1 = Project::new("Demo");
+    v1.lock.symbols.insert("wc.coil".into(), entry("v1"));
+    let local = v1.clone();
+    // The session moved to v2 before this copy took it.
+    let mut v2 = Project::new("Demo");
+    v2.lock.symbols.insert("wc.coil".into(), entry("v2"));
+    let seen = next_seen(&v1.lock, &local, &v2);
+    assert_eq!(seen.symbols.get("wc.coil").map(|e| e.hash.as_str()), Some("v1"));
+    // Then took v2 back as well: the v1 copy here goes with it.
+    let mut local = local;
+    let dropped = taken_back(&mut local, &v1, &seen, &Project::new("Demo"));
+    assert_eq!(dropped, [(ItemKind::Symbol, "wc.coil".to_owned())]);
+    // Once this copy holds v2, the session's version is what is seen.
+    assert_eq!(next_seen(&seen, &v2, &v2), v2.lock);
+}
+
 /// Run frames of both windows until `done` or a few seconds have passed.
 fn until(
     a: (&mut Share, &mut Open, &str),
@@ -1428,6 +1450,20 @@ fn a_file_in_another_version_than_its_lock_is_not_shared_or_taken() -> TestResul
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].0, "symbol wc.coil");
     assert!(!open.symbols.contains_key("wc.coil"));
+    Ok(())
+}
+
+#[test]
+fn a_symbol_taken_from_the_session_is_offered_in_the_symbol_list() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(&tmp.path().join("p"))?;
+    open.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+    let coil = open.symbols.remove("wc.coil").ok_or("no coil")?;
+    open.library.retain(|(i, _)| i != "wc.coil");
+    let offered = [("wc.coil".to_owned(), coil)].into_iter().collect();
+    assert!(take_files(&mut open, &offered, &BTreeMap::new()).is_empty());
+    assert!(open.symbols.contains_key("wc.coil"));
+    assert!(open.library.iter().any(|(i, _)| i == "wc.coil"));
     Ok(())
 }
 
