@@ -212,5 +212,15 @@ fn a_retry_after_a_failed_placement_pins_every_symbol() -> TestResult {
         lock.contains_key("wc.coil") && lock.contains_key("wc.zcoil"),
         "both are pinned: {lock:?}"
     );
+
+    // A pinned copy that cannot be read stops the placement, naming the file, and the page
+    // stays as it was.
+    let before = wc_core::store::load(&dir)?.pages;
+    std::fs::write(&copy, "{ not json")?;
+    let Err(err) = wiringcraft(&dir, &["macro", "place", "p1", "pair", "--at", "0,0"]) else {
+        return Err("placed with a broken symbol copy".into());
+    };
+    assert!(err.contains("wc.coil"), "the file is named: {err}");
+    assert_eq!(wc_core::store::load(&dir)?.pages, before, "nothing is placed");
     Ok(())
 }
