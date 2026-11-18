@@ -1127,9 +1127,25 @@ fn run(cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
             let pins = pins.iter().map(|s| parse_box_pin(s)).collect::<Res<Vec<_>>>()?;
+            let lock = p.lock.symbols.clone();
             let pg = page_mut(&mut p, &page)?;
-            let id = pg.next_id("s");
-            let symbol_id = format!("box.{}.{id}", pg.id);
+            // The first item id whose box symbol is free too: a box deleted from the page keeps
+            // its symbol file and lock entry, and its id must not be taken over.
+            let (id, symbol_id, symbol_path) = {
+                let mut n = 1usize;
+                loop {
+                    let id = format!("s{n}");
+                    n += 1;
+                    if pg.symbol(&id).is_some() || pg.wires.iter().any(|w| w.id == id) {
+                        continue;
+                    }
+                    let symbol_id = format!("box.{}.{id}", pg.id);
+                    let path = store::vendor_path(dir, ItemKind::Symbol, &symbol_id).map_err(e)?;
+                    if !lock.contains_key(&symbol_id) && !path.exists() {
+                        break (id, symbol_id, path);
+                    }
+                }
+            };
             let name = tag
                 .as_ref()
                 .map_or_else(|| "Black box".to_owned(), |t| format!("Black box {t}"));
@@ -1145,10 +1161,6 @@ fn run(cli: Cli) -> Res<()> {
             if let Some(t) = &tag {
                 p.devices.entry(t.clone()).or_default();
             }
-            // A symbol file left by an earlier box under the same id would be taken over.
-            if store::read_vendored_symbol(dir, &symbol_id).is_ok() || p.lock.symbols.contains_key(&symbol_id) {
-                return Err(format!("symbol {symbol_id} exists already; remove it first"));
-            }
             p.lock.symbols.insert(
                 symbol_id.clone(),
                 wc_core::LockEntry {
@@ -1156,12 +1168,28 @@ fn run(cli: Cli) -> Res<()> {
                     hash: symbol.hash(),
                 },
             );
+            // Every project file the save may change, read first: a save that fails half way is
+            // put back, so no lock entry or placement is left pointing at the symbol file.
+            let before = snapshot_project(dir, &[], &[])?;
             store::write_vendored_symbol(dir, &symbol).map_err(e)?;
             if let Err(err) = save(dir, &p) {
-                if let Ok(path) = store::vendor_path(dir, ItemKind::Symbol, &symbol_id) {
-                    let _ = std::fs::remove_file(path);
+                let failed = put_files_back(&before);
+                if !failed.is_empty() {
+                    // A page or the lock may still name the box: keep its symbol file.
+                    return Err(format!(
+                        "{err}; putting back the project files failed too, so the box's symbol {} is kept: {}",
+                        symbol_path.display(),
+                        failed.join("; ")
+                    ));
                 }
-                return Err(err);
+                return match std::fs::remove_file(&symbol_path) {
+                    Ok(()) => Err(err),
+                    Err(x) if x.kind() == std::io::ErrorKind::NotFound => Err(err),
+                    Err(x) => Err(format!(
+                        "{err}; removing the box's symbol {} failed too: {x}",
+                        symbol_path.display()
+                    )),
+                };
             }
             println!("{id}");
         }
@@ -3487,6 +3515,30 @@ fn add_and_save_with(
     replace: Replace,
     finish: impl FnOnce(&mut Project),
 ) -> Res<usize> {
+    let pages: Vec<&str> = built.pages.iter().map(|pg| pg.id.as_str()).collect();
+    let panels: Vec<&str> = built.panels.iter().map(|n| n.id.as_str()).collect();
+    let project_files = snapshot_project(dir, &pages, &panels)?;
+    let (written, joined) = add_built(dir, p, built, source, replace)?;
+    finish(p);
+    if let Err(err) = save_imported(dir, p) {
+        let mut failed = put_files_back(&project_files);
+        failed.extend(put_files_back(&written));
+        if failed.is_empty() {
+            return Err(err);
+        }
+        return Err(format!(
+            "{err}; putting back the vendored files failed too: {}",
+            failed.join("; ")
+        ));
+    }
+    Ok(joined)
+}
+
+/// Every file a save of the project may write or remove, with its bytes before (`None` when it
+/// does not exist yet): the project's own files, every file in its page, panel and comment
+/// folders, and the files of the pages and panels about to be added. [`put_files_back`] restores
+/// them when a save fails half way.
+fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> Res<Written> {
     // Every file the save may write or remove, read before anything is written: the project's
     // own files, every file in its page, panel and comment folders, and the files the new pages
     // and panels will get.
@@ -3518,17 +3570,11 @@ fn add_and_save_with(
             }
         }
     }
-    for page in &built.pages {
-        paths.push(
-            dir.join(store::PAGES_DIR)
-                .join(format!("{}{}", page.id, store::PAGE_SUFFIX)),
-        );
+    for id in new_pages {
+        paths.push(dir.join(store::PAGES_DIR).join(format!("{id}{}", store::PAGE_SUFFIX)));
     }
-    for panel in &built.panels {
-        paths.push(
-            dir.join(store::PANELS_DIR)
-                .join(format!("{}{}", panel.id, store::PANEL_SUFFIX)),
-        );
+    for id in new_panels {
+        paths.push(dir.join(store::PANELS_DIR).join(format!("{id}{}", store::PANEL_SUFFIX)));
     }
     paths.sort();
     paths.dedup();
@@ -3541,20 +3587,7 @@ fn add_and_save_with(
         };
         project_files.push((path, before));
     }
-    let (written, joined) = add_built(dir, p, built, source, replace)?;
-    finish(p);
-    if let Err(err) = save_imported(dir, p) {
-        let mut failed = put_files_back(&project_files);
-        failed.extend(put_files_back(&written));
-        if failed.is_empty() {
-            return Err(err);
-        }
-        return Err(format!(
-            "{err}; putting back the vendored files failed too: {}",
-            failed.join("; ")
-        ));
-    }
-    Ok(joined)
+    Ok(project_files)
 }
 
 /// Wire ends in `p` on pins of the symbol `symbol.id` that `symbol` does not have:
@@ -5907,6 +5940,15 @@ mod tests {
         let symbol = store::read_vendored_symbol(&dir, &page.symbols[1].symbol).unwrap();
         assert_eq!(symbol.pins[0].name, "X1:1");
         assert_eq!(symbol.pins[0].at, Point::new(0.0, 15.0));
+
+        // A box deleted from the page keeps its symbol file: its id is not taken over.
+        let stale = wc_core::black_box("box.p1.s3", "old", 5.0, 5.0, &[]).unwrap();
+        store::write_vendored_symbol(&dir, &stale).unwrap();
+        boxed(&["--at", "100,100", "--size", "10,10"]).unwrap();
+        let p = load(&dir).unwrap();
+        let third = &p.page("p1").unwrap().symbols[2];
+        assert_eq!((third.id.as_str(), third.symbol.as_str()), ("s4", "box.p1.s4"));
+        assert_eq!(store::read_vendored_symbol(&dir, "box.p1.s3").unwrap(), stale);
 
         cli(&dir, &["wire", "p1", &format!("{a1}:2"), &format!("{a2}:X1:1")]).unwrap();
         let part = wc_core::Part {
