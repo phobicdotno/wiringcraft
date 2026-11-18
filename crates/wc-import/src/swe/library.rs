@@ -822,20 +822,6 @@ pub fn catalog_from_archive<R: Read + std::io::Seek>(reader: R) -> Result<SweLib
     from_archive_with(reader, false)
 }
 
-/// `text` with control characters (line breaks, terminal escapes) written as escapes, so a name
-/// from the archive cannot start a new line or steer the terminal when the warning is printed.
-fn printable(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
-}
-
 /// What reading the block drawings left out: files that could not be read, and entities the DWG
 /// reader does not read, by type (damaged objects are already in the files' warnings).
 fn read_warnings(d: &SweDrawings) -> Vec<String> {
@@ -843,7 +829,7 @@ fn read_warnings(d: &SweDrawings) -> Vec<String> {
     let mut out: Vec<String> = d
         .warnings
         .iter()
-        .map(|w| printable(&format!("block drawings: {w}")))
+        .map(|w| crate::printable(&format!("block drawings: {w}")))
         .collect();
     let kinds: Vec<String> = d
         .skipped
@@ -852,7 +838,7 @@ fn read_warnings(d: &SweDrawings) -> Vec<String> {
         .map(|(k, n)| format!("{k}: {n}"))
         .collect();
     if !kinds.is_empty() {
-        out.push(printable(&format!(
+        out.push(crate::printable(&format!(
             "block drawings: entities not read ({})",
             kinds.join(", ")
         )));
@@ -894,7 +880,7 @@ fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<S
                 Some(d)
             }
             Err(e) => {
-                drawing_warnings.push(printable(&format!(
+                drawing_warnings.push(crate::printable(&format!(
                     "block drawings were not read, blocks are boxes: {e}"
                 )));
                 None

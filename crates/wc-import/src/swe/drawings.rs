@@ -50,6 +50,12 @@ pub struct SweDrawings {
     limit: Option<usize>,
 }
 
+/// The key a block's drawing is kept under: its name without surrounding spaces, in lower case,
+/// so `Coil .dwg` is the drawing of block `Coil` (the database's names are trimmed).
+fn block_key(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
 impl SweDrawings {
     /// Entities all drawings of one import may expand to.
     pub(crate) fn draw_limit(&self) -> usize {
@@ -63,10 +69,10 @@ impl SweDrawings {
     }
 
     /// Read a symbol's block file (DWG bytes) for block `name`. A second file for the same
-    /// name (ignoring case) replaces the first.
+    /// name (ignoring case and surrounding spaces, see [`block_key`]) replaces the first.
     pub fn add_block(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         let d = self.read(bytes, &format!("block {name}"))?;
-        self.blocks.insert(name.to_lowercase(), d);
+        self.blocks.insert(block_key(name), d);
         Ok(())
     }
 
@@ -94,7 +100,7 @@ impl SweDrawings {
     /// Whether the archive has a drawing for block `name`.
     #[cfg(test)]
     pub(crate) fn has_block(&self, name: &str) -> bool {
-        self.blocks.contains_key(&name.to_lowercase())
+        self.blocks.contains_key(&block_key(name))
     }
 
     fn read(&mut self, bytes: &[u8], what: &str) -> Result<dxf::Drawing> {
@@ -152,7 +158,7 @@ impl SweDrawings {
         budget: &mut usize,
         skipped: &mut BTreeMap<String, usize>,
     ) -> Option<Vec<Shape>> {
-        let d = self.blocks.get(&name.to_lowercase())?;
+        let d = self.blocks.get(&block_key(name))?;
         let (shapes, _) = dxf::draw_mapped(d, &d.entities, m, rot, skipped, budget);
         let shapes: Vec<Shape> = shapes.into_iter().filter_map(|(_, sh)| rounded(&sh)).collect();
         (!shapes.is_empty()).then_some(shapes)

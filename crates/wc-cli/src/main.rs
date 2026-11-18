@@ -603,7 +603,9 @@ enum ImportCmd {
     /// terminals, cable types with their cores, and symbol blocks with their connection points,
     /// drawn from the archive's block DWG files (boxes where a block has none). A symbol or part
     /// the project already vendors with other content (an earlier import's box) is refused, not
-    /// replaced (import into a fresh project, or into a library folder with --lib). Into a library folder with --lib, else vendored into the project.
+    /// replaced. To take the drawn version into such a project, import with --lib into a library
+    /// folder, add that folder as a source (`lib add`) and run `lib update <id>`. Into a library
+    /// folder with --lib, else vendored into the project.
     SweLibrary {
         path: PathBuf,
         /// A library folder to write into instead of the project.
