@@ -277,7 +277,13 @@ impl App {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
         });
-        let mut shown = page.clone();
+        // The page under the canvas, also under an open panel: it is found again after the
+        // sync, and so is what was selected on it.
+        let mut shown = self
+            .open
+            .as_ref()
+            .and_then(|o| o.project.pages.get(self.ed.page))
+            .map(|p| p.id.clone());
         // The shown page's graphics, so a selection follows its items when a merge moves them.
         let graphics_before = self
             .open
