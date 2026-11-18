@@ -438,7 +438,7 @@ impl Host {
     /// [`HostMsg::ProjectChanged`]), unchanged, or refused with what it touches as the host has
     /// it, since the guest applied it to its copy at once.
     fn guest_edit_project(&mut self, from: PeerId, edit: ProjectEdit, seq: u64) -> Result<(), Refusal> {
-        let keys = edit.applied_at_once().then(|| edit.touches(&self.project));
+        let keys = edit.partly_applied_at_once().then(|| edit.touches(&self.project));
         match self.do_edit_project(from, edit, Some(seq)) {
             Ok(true) => Ok(()),
             Ok(false) => {

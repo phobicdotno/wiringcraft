@@ -2265,3 +2265,135 @@ fn what_a_record_was_survives_the_wire_and_old_messages_still_read() -> TestResu
     assert_ne!(edit.record(&p), was);
     Ok(())
 }
+
+#[test]
+fn a_batch_is_one_change_applied_all_or_nothing() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    let old = wc_core::DeviceTag::parse("-K1")?;
+    let new = wc_core::DeviceTag::parse("-K2")?;
+    // -K1 is used on page 2.
+    let mut page = s.host.project().page("p0002").ok_or("no page")?.clone();
+    place(&mut page, "s1", 10.0);
+    page.symbols[0].tag = Some(old.clone());
+    let seen = s.host.project().clone();
+    a_link.send(a.edit_project(ProjectEdit::Batch {
+        edits: vec![
+            ProjectEdit::SetDevice {
+                tag: old.clone(),
+                device: Some(Device::default()),
+                before: None,
+            }
+            .stamped(&seen),
+            ProjectEdit::SetPages {
+                pages: vec![page.clone()],
+                before: vec![seen.page("p0002").ok_or("no page")?.clone()],
+            },
+        ],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    let messages: Vec<String> = s.log.0.borrow().iter().map(|c| c.message.clone()).collect();
+    assert_eq!(
+        messages.last().map(String::as_str),
+        Some("Change device -K1; Edit page 2 Motor")
+    );
+    let commits = messages.len();
+
+    // Kari makes -K2 first; then Ola renames -K1 to -K2 from a copy that has not seen it: the
+    // new device is refused, so the old one stays and so does the page.
+    let renamed_from = s.host.project().clone();
+    b_link.send(
+        b.edit_project(
+            ProjectEdit::SetDevice {
+                tag: new.clone(),
+                device: Some(Device {
+                    description: "Kari's".into(),
+                    ..Device::default()
+                }),
+                before: None,
+            }
+            .stamped(&renamed_from),
+        ),
+    )?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    let after_kari = s.host.project().clone();
+    let mut renamed = page.clone();
+    renamed.symbols[0].tag = Some(new.clone());
+    a_link.send(a.edit_project(ProjectEdit::Batch {
+        edits: vec![
+            ProjectEdit::SetDevice {
+                tag: old.clone(),
+                device: None,
+                before: None,
+            }
+            .stamped(&renamed_from),
+            ProjectEdit::SetDevice {
+                tag: new.clone(),
+                device: Some(Device::default()),
+                before: None,
+            }
+            .stamped(&renamed_from),
+            ProjectEdit::SetPages {
+                pages: vec![renamed],
+                before: vec![page.clone()],
+            },
+        ],
+    }))?;
+    // Applied at once in Ola's copy: the device part (the pages wait for the host).
+    assert!(a.project.as_ref().is_some_and(|p| !p.devices.contains_key(&old)));
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(
+        matches!(a.refusals.last(), Some(Refusal::Invalid { reason }) if reason.contains("device -K2")),
+        "{:?}",
+        a.refusals
+    );
+    assert_eq!(s.host.project(), &after_kari, "nothing of the rename was applied");
+    assert_eq!(s.log.0.borrow().len(), commits + 1, "only Kari's change was recorded");
+    assert_eq!(a.project.as_ref(), Some(s.host.project()), "Ola's copy is put right");
+    assert_eq!(b.project.as_ref(), Some(s.host.project()));
+
+    // A batch holds two batchable edits or more.
+    a_link.send(a.edit_project(ProjectEdit::Batch {
+        edits: vec![
+            ProjectEdit::AddPage {
+                page: Page::new("p0009", "9", "New"),
+            },
+            ProjectEdit::RemovePanel { id: "cab1".into() },
+        ],
+    }))?;
+    a_link.send(a.edit_project(ProjectEdit::Batch {
+        edits: vec![ProjectEdit::RemovePanel { id: "cab1".into() }],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(matches!(
+        &a.refusals[a.refusals.len() - 2..],
+        [Refusal::Invalid { .. }, Refusal::Invalid { .. }]
+    ));
+    assert_eq!(s.host.project(), &after_kari);
+    Ok(())
+}
+
+#[test]
+fn edits_that_can_go_together_are_batched_after_the_others() {
+    let device = |t: &str| ProjectEdit::SetDevice {
+        tag: wc_core::DeviceTag::parse(t).unwrap_or_default(),
+        device: None,
+        before: None,
+    };
+    let add = ProjectEdit::AddPage {
+        page: Page::new("p0009", "9", "New"),
+    };
+    assert_eq!(ProjectEdit::batched(vec![device("-K1")]), [device("-K1")], "one alone");
+    assert_eq!(
+        ProjectEdit::batched(vec![device("-K1"), add.clone(), device("-K2")]),
+        [
+            add,
+            ProjectEdit::Batch {
+                edits: vec![device("-K1"), device("-K2")]
+            }
+        ]
+    );
+    assert!(ProjectEdit::batched(Vec::new()).is_empty());
+}
