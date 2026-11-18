@@ -57,6 +57,10 @@ fn the_too_large_sheet_warning_names_the_pdf_it_came_from() -> TestResult {
     )?;
     assert!(stderr.contains("warning: page 200 (wide plan.pdf page 1)"), "{stderr}");
     assert!(stderr.contains("A0"), "{stderr}");
+    // And the page is drawn on A0.
+    let project = wc_core::store::load(&dir)?;
+    let page = project.page("pdf-200").ok_or("no page pdf-200")?;
+    assert_eq!(page.size, wc_core::PageSize::A0);
     Ok(())
 }
 
@@ -68,7 +72,8 @@ fn in_an_archive_the_warning_names_the_entry_with_control_characters_escaped() -
     {
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive)?);
         let opts = zip::write::SimpleFileOptions::default();
-        zip.start_file("small.pdf", opts)?;
+        // "a-small.pdf" sorts before "plans/...", so the wide one comes second, after one page.
+        zip.start_file("a-small.pdf", opts)?;
         zip.write_all(&pdf(842.0, 595.0))?;
         zip.start_file("plans/wide\u{1b}[2J.pdf", opts)?;
         zip.write_all(&pdf(TOO_WIDE.0, TOO_WIDE.1))?;
@@ -80,7 +85,7 @@ fn in_an_archive_the_warning_names_the_entry_with_control_characters_escaped() -
         .find(|l| l.contains("A0"))
         .ok_or_else(|| format!("no warning in {stderr:?}"))?;
     // Named by its entry and not by the staging file it was read from.
-    assert!(warning.starts_with("warning: page 30"), "{warning}");
+    assert!(warning.starts_with("warning: page 301 "), "{warning}");
     assert!(warning.contains(" (plans/wide\\u{1b}[2J.pdf page 1): "), "{warning}");
     assert!(
         !stderr.contains('\u{1b}') && !stdout.contains('\u{1b}'),

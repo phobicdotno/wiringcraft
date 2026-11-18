@@ -1946,11 +1946,6 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 &[Kind::Pdf, Kind::Dxf, Kind::AutomationMl, Kind::KicadSymbols, Kind::Csv],
             )
             .map_err(e)?;
-            // Entry names are printed: written so a name cannot send the terminal control sequences.
-            let entries: Vec<_> = entries
-                .into_iter()
-                .map(|(name, kind, data)| (escape_field(&name), kind, data))
-                .collect();
             if entries.is_empty() {
                 return Err(
                     "no importable PDF, DXF, AutomationML, KiCad symbols or CSV lists inside; run `wiringcraft inspect` to see what is there"
@@ -1961,17 +1956,24 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let (symbols, entries): (Vec<_>, Vec<_>) = entries
                 .into_iter()
                 .partition(|(_, kind, _)| *kind == Kind::KicadSymbols);
+            // Entry names are printed: written so a name cannot send the terminal control
+            // sequences. A library's prefix is made from its name as it is.
+            let entries: Vec<_> = entries
+                .into_iter()
+                .map(|(name, kind, data)| (escape_field(&name), kind, data))
+                .collect();
             // CSV lists come last, so PLC addresses reach devices that pages in the same archive add.
             let (csvs, entries): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, kind, _)| *kind == Kind::Csv);
             // Two entries with the same file name would write the same ids over each other.
             let mut prefixes = std::collections::BTreeSet::new();
-            for (name, _, data) in symbols {
+            for (raw, _, data) in symbols {
+                let name = escape_field(&raw);
                 println!("{name}:");
                 let Some(lib) = &lib else {
                     eprintln!("warning: {name}: KiCad symbols, not imported: pass --lib <folder>");
                     continue;
                 };
-                let prefix = kicad_prefix(&name);
+                let prefix = kicad_prefix(&raw);
                 if prefixes.contains(&prefix) {
                     eprintln!("warning: {name}: skipped, an earlier entry already imports as {prefix}");
                     continue;
@@ -2212,7 +2214,8 @@ fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str) -> Resul
             return Err(format!("page {id} exists; pick another --first-page"));
         }
         if t.graphics.is_empty() && t.scan.is_none() {
-            let why = t.scan_problem.as_deref().unwrap_or("no picture covers the page");
+            // The reason can quote the file: written so it cannot send control sequences.
+            let why = escape_field(t.scan_problem.as_deref().unwrap_or("no picture covers the page"));
             eprintln!(
                 "warning: {} page {}: no vector content and no usable scan ({why})",
                 source,
