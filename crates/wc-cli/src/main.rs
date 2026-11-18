@@ -1785,7 +1785,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 page.underlay = underlay;
                 let (size, why) = sheet_for(t.size_mm);
                 if let Some(why) = why {
-                    eprintln!("warning: page {} of {stem}: {why}", i + 1);
+                    // Named by the page it became: in an archive, `stem` is a staging name.
+                    eprintln!("warning: page {} (PDF page {}): {why}", first_page + i, i + 1);
                 }
                 page.size = size;
                 println!("page {}: {} shapes", page.number, t.graphics.len());

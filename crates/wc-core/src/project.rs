@@ -840,10 +840,17 @@ impl PageSize {
         // Spaces around `x` and before `mm` are fine; inside a number they are not.
         let dims = lower.strip_suffix("mm").unwrap_or(&lower);
         let (w, h) = dims.split_once('x').ok_or_else(bad)?;
-        let (width, height) = (
-            w.trim().parse::<u32>().map_err(|_| bad())?,
-            h.trim().parse::<u32>().map_err(|_| bad())?,
-        );
+        let side = |name: &str, v: &str| {
+            v.trim().parse::<u32>().map_err(|e| {
+                format!(
+                    "size {text:?}: the {name} {:?} is not a whole number of millimetres ({e}); each side is {} to {} mm",
+                    v.trim(),
+                    Self::MIN_MM,
+                    Self::MAX_MM
+                )
+            })
+        };
+        let (width, height) = (side("width", w)?, side("height", h)?);
         PageSize::custom(width, height)
     }
 
@@ -1467,6 +1474,14 @@ mod tests {
         ] {
             assert!(PageSize::parse(bad).is_err(), "{bad}");
         }
+        // The error says which side is wrong and why.
+        let err = PageSize::parse("5 00x700").unwrap_err();
+        assert!(
+            err.contains("the width \"5 00\"") && err.contains("100 to 2000 mm"),
+            "{err}"
+        );
+        let err = PageSize::parse("500x9000").unwrap_err();
+        assert!(err.contains("9000 mm is outside 100 to 2000 mm"), "{err}");
         for size in PageSize::NAMED.into_iter().chain([PageSize::Custom {
             width: 500,
             height: 700,

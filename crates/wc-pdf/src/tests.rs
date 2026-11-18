@@ -1232,18 +1232,25 @@ fn a_report_after_a_short_first_page_prints_on_the_larger_sheet() {
             rows: vec![vec!["Relay".into()]],
             ..Default::default()
         }],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
         ..Default::default()
     };
     let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
-    assert_eq!(report.pages, 2);
+    assert_eq!(report.pages, 3);
     let text = String::from_utf8_lossy(&pdf);
     let want = layout::report_size(project.pages[0].size, project.meta.template.band_height());
     assert_eq!(want, PageSize::A4);
     let pt = |mm: f64| mm / 25.4 * 72.0;
-    let media = |(w, h): (f64, f64)| format!("/MediaBox [0 0 {:.2} {:.2}]", pt(w), pt(h));
-    assert!(
-        text.contains(&media(project.pages[0].size.mm())),
-        "the page keeps its sheet"
-    );
-    assert!(text.contains(&media(want.mm())), "the report is on A4");
+    let media = |(w, h): (f64, f64)| format!("[0 0 {:.2} {:.2}]", pt(w), pt(h));
+    // The sheets in page order: the schematic page and the panel layout keep the page's
+    // sheet; the report after them is on A4.
+    let boxes: Vec<&str> = text
+        .match_indices("/MediaBox ")
+        .map(|(i, _)| {
+            let rest = &text[i + "/MediaBox ".len()..];
+            &rest[..rest.find(']').map_or(0, |e| e + 1)]
+        })
+        .collect();
+    let strip = media(project.pages[0].size.mm());
+    assert_eq!(boxes, [strip.as_str(), strip.as_str(), media(want.mm()).as_str()]);
 }
