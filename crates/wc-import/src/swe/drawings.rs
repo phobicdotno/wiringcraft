@@ -52,14 +52,14 @@ impl SweDrawings {
     /// Read a symbol's block file (DWG bytes) for block `name`. A second file for the same
     /// name (ignoring case) replaces the first.
     pub fn add_block(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
-        let d = self.read(bytes)?;
+        let d = self.read(bytes, &format!("block {name}"))?;
         self.blocks.insert(name.to_lowercase(), d);
         Ok(())
     }
 
     /// Read the drawing of page `id` (DWG bytes, as in an `.ewg` file).
     pub fn add_page(&mut self, id: i64, bytes: &[u8]) -> Result<()> {
-        let d = self.read(bytes)?;
+        let d = self.read(bytes, &format!("page drawing {id}"))?;
         self.pages.insert(id, d);
         Ok(())
     }
@@ -78,35 +78,60 @@ impl SweDrawings {
         self.blocks.is_empty() && self.pages.is_empty()
     }
 
-    fn read(&mut self, bytes: &[u8]) -> Result<dxf::Drawing> {
+    /// Whether the archive has a drawing for block `name`.
+    pub(crate) fn has_block(&self, name: &str) -> bool {
+        self.blocks.contains_key(&name.to_lowercase())
+    }
+
+    fn read(&mut self, bytes: &[u8], what: &str) -> Result<dxf::Drawing> {
         let sections = dwg::read_sections(bytes)?;
         let read = dwg::objects::dxf_drawing(&sections)?;
+        let damaged = read.skipped.get(dwg::objects::DAMAGED).copied().unwrap_or(0);
         for (k, n) in read.skipped {
             *self.skipped.entry(k).or_default() += n;
+        }
+        // A drawing read in part is used; why the rest is missing is said once per file.
+        if damaged > 0 {
+            let first = read.damaged.first().map(String::as_str).unwrap_or("");
+            self.warnings.push(format!(
+                "{what}: {damaged} object(s) could not be read and are not drawn, the first because of: {first}"
+            ));
         }
         Ok(read.drawing)
     }
 
-    /// The shapes of block `name` placed like `s` (turned by its angle, then scaled), in the
-    /// symbol's own frame on the page: y down, the insertion point at the origin. `None` when
-    /// the archive has no drawing for the block or it draws nothing.
-    pub(crate) fn symbol_graphics(&self, s: &SweSymbol, budget: &mut usize) -> Option<Vec<Shape>> {
+    /// The shapes of block `name` placed like `s` (turned by its angle, then scaled along the
+    /// page axes, exactly as [`super::place`] places its points), in the symbol's own frame on
+    /// the page: y down, the insertion point at the origin. `None` when the archive has no
+    /// drawing for the block or it draws nothing. Entities left out are counted in `skipped`
+    /// (`dxf::OVER_LIMIT` once `budget` runs out).
+    pub(crate) fn symbol_graphics(
+        &self,
+        s: &SweSymbol,
+        budget: &mut usize,
+        skipped: &mut BTreeMap<String, usize>,
+    ) -> Option<Vec<Shape>> {
         let d = self.blocks.get(&s.block.to_lowercase())?;
-        // SolidWorks Electrical turns, then scales; the drawing code scales, then turns. The
-        // two agree when both scales are the same size, with the angle reversed when exactly
-        // one of them mirrors.
         let (sx, sy) = s.scale;
-        let angle = if sx * sy < 0.0 { -s.angle } else { s.angle };
-        let mut skipped = BTreeMap::new();
-        let (shapes, _) = dxf::draw_turned(d, &d.entities, (angle, sx, sy), &mut skipped, budget);
+        let (sin, cos) = s.angle.to_radians().sin_cos();
+        let m = [cos * sx, -sin * sx, sin * sy, cos * sy];
+        let (shapes, _) = dxf::draw_mapped(d, &d.entities, m, s.angle, skipped, budget);
         let shapes: Vec<Shape> = shapes.into_iter().filter_map(|(_, sh)| rounded(&sh)).collect();
         (!shapes.is_empty()).then_some(shapes)
     }
 
-    /// The extra graphics of page `id` (texts, frames, notes) on a sheet `height` mm high, in
-    /// page coordinates (y down): block references and lines on one of `lines` (the page's wire
-    /// lines, y up) are left out. Empty when the archive has no drawing for the page.
-    pub(crate) fn page_graphics(&self, id: i64, height: f64, lines: &[&SweLine], budget: &mut usize) -> Vec<Shape> {
+    /// The extra graphics of page `id` (texts, frames, notes) with y flipped and not yet moved
+    /// onto a sheet: `(x, -y)` for a drawing point `(x, y)`. Block references and lines on one
+    /// of `lines` (the page's wire lines, y up) are left out. Empty when the archive has no
+    /// drawing for the page. Entities left out are counted in `skipped`. [`on_sheet`] moves them
+    /// onto a sheet once its size is known.
+    pub(crate) fn page_graphics(
+        &self,
+        id: i64,
+        lines: &[&SweLine],
+        budget: &mut usize,
+        skipped: &mut BTreeMap<String, usize>,
+    ) -> Vec<Shape> {
         let Some(d) = self.pages.get(&id) else {
             return Vec::new();
         };
@@ -127,13 +152,25 @@ impl SweDrawings {
             })
             .cloned()
             .collect();
-        let mut skipped = BTreeMap::new();
-        let (shapes, _) = dxf::draw(d, &kept, &mut skipped, budget);
+        let (shapes, _) = dxf::draw(d, &kept, skipped, budget);
         shapes
             .into_iter()
-            .filter_map(|(_, sh)| rounded(&sh.translate(Point::new(0.0, height))))
+            .map(|(_, sh)| sh)
+            .filter(|sh| {
+                let (min, max) = sh.bounds();
+                [min.x, min.y, max.x, max.y].iter().all(|v| v.is_finite())
+            })
             .collect()
     }
+}
+
+/// Page graphics from [`SweDrawings::page_graphics`] moved onto a sheet `height` mm high, y
+/// down, rounded like the rest of the import.
+pub(crate) fn on_sheet(shapes: Vec<Shape>, height: f64) -> Vec<Shape> {
+    shapes
+        .iter()
+        .filter_map(|sh| rounded(&sh.translate(Point::new(0.0, height))))
+        .collect()
 }
 
 /// `sh` with its coordinates rounded like the rest of the import, or nothing when a coordinate
@@ -208,7 +245,13 @@ fn kind_of(name: &str, folder: &str) -> Option<Kind> {
         && dir.is_char_boundary(folder.len())
         && dir[..folder.len()].eq_ignore_ascii_case(folder)
         && dir.as_bytes()[folder.len()] == b'/';
-    if ext.eq_ignore_ascii_case("dwg") && dir.split('/').any(|d| d.eq_ignore_ascii_case("block")) {
+    // Another project's own blocks are never used for this one.
+    let other_project = !own
+        && dir
+            .split('/')
+            .next()
+            .is_some_and(|top| top.eq_ignore_ascii_case("projects"));
+    if ext.eq_ignore_ascii_case("dwg") && !other_project && dir.split('/').any(|d| d.eq_ignore_ascii_case("block")) {
         return Some(Kind::Block(stem.to_owned(), own));
     }
     if ext.eq_ignore_ascii_case("ewg") && own && dir[folder.len() + 1..].eq_ignore_ascii_case("drawings") {
@@ -243,14 +286,16 @@ pub fn drawings_from_archive<R: Read + std::io::Seek>(reader: R, folder: &str) -
             left_out += 1;
             continue;
         }
-        let bytes = match read_entry(&mut zip, i, &name) {
+        // Every byte read counts against the total, also of a file then refused.
+        let (got, read) = read_entry(&mut zip, i, &name, MAX_DRAWINGS_TOTAL - total);
+        total += read;
+        let bytes = match got {
             Ok(b) => b,
             Err(e) => {
                 failed.push(e.to_string());
                 continue;
             }
         };
-        total += bytes.len() as u64;
         let got = match kind {
             Kind::Block(block, _) => out.add_block(&block, &bytes),
             Kind::Page(id) => out.add_page(id, &bytes),
@@ -281,20 +326,45 @@ pub fn drawings_from_archive<R: Read + std::io::Seek>(reader: R, folder: &str) -
     Ok(out)
 }
 
-fn read_entry<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, i: usize, name: &str) -> Result<Vec<u8>> {
-    let f = zip.by_index(i).map_err(|e| Error::Format(format!("{name}: {e}")))?;
+/// Read entry `i`, at most [`MAX_DRAWING_BYTES`] and at most `left` bytes. Returns the bytes
+/// (or why not) and how many bytes were read either way.
+fn read_entry<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    i: usize,
+    name: &str,
+    left: u64,
+) -> (Result<Vec<u8>>, u64) {
+    let f = match zip.by_index(i) {
+        Ok(f) => f,
+        Err(e) => return (Err(Error::Format(format!("{name}: {e}"))), 0),
+    };
     let mut bytes = Vec::new();
     // Read at most one byte past the limit, whatever the zip header claims.
-    f.take(MAX_DRAWING_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| Error::Format(format!("{name}: {e}")))?;
-    if bytes.len() as u64 > MAX_DRAWING_BYTES {
-        return Err(Error::Format(format!(
-            "{name} is larger than {} MB",
-            MAX_DRAWING_BYTES >> 20
-        )));
+    let limit = MAX_DRAWING_BYTES.min(left);
+    let got = f.take(limit + 1).read_to_end(&mut bytes);
+    let read = bytes.len() as u64;
+    if let Err(e) = got {
+        return (Err(Error::Format(format!("{name}: {e}"))), read);
     }
-    Ok(bytes)
+    if read > MAX_DRAWING_BYTES {
+        return (
+            Err(Error::Format(format!(
+                "{name} is larger than {} MB",
+                MAX_DRAWING_BYTES >> 20
+            ))),
+            read,
+        );
+    }
+    if read > limit {
+        return (
+            Err(Error::Format(format!(
+                "{name} would take the drawings past {} MB in all",
+                MAX_DRAWINGS_TOTAL >> 20
+            ))),
+            read,
+        );
+    }
+    (Ok(bytes), read)
 }
 
 #[cfg(test)]
@@ -318,6 +388,9 @@ mod tests {
         // Another project's pages, a page not named by its id, other files.
         assert_eq!(kind_of("Projects/40/Drawings/17.ewg", f), None);
         assert_eq!(kind_of("Projects/5/Drawings/17.ewg", f), None);
+        // Another project's blocks are not the library's.
+        assert_eq!(kind_of("Projects/5/Block/Coil.dwg", f), None);
+        assert_eq!(kind_of("Projects/40/Block/Coil.dwg", f), None);
         assert_eq!(kind_of("Projects/4/Drawings/cover.ewg", f), None);
         assert_eq!(kind_of("Projects/4/Drawings/sub/17.ewg", f), None);
         assert_eq!(kind_of("Block/.dwg", f), None);

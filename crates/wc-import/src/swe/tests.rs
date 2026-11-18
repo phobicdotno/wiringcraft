@@ -2240,3 +2240,77 @@ fn drawings_are_read_from_the_archive_and_the_project_copy_wins() {
     assert_eq!(texts, ["Note"]);
     assert!(drawings_from_archive(std::io::Cursor::new(b"not a zip".to_vec()), "Projects/3").is_err());
 }
+
+#[test]
+fn a_page_drawing_that_needs_a_bigger_sheet_gets_one() {
+    let mut sw = read(&sample()).unwrap();
+    // Page 01 has no frame name; its symbols and lines fit A4/A3, but the note at (500, 350)
+    // only fits A2 (594 x 420).
+    sw.drawings
+        .add_page(10, &model_space_dwg(&[E::Text((500.0, 350.0), "Far note")]))
+        .unwrap();
+    let (built, _, _) = build(&sw, None);
+    let pg = page(&built, "01");
+    let (w, h) = pg.size.mm();
+    assert!(w >= 500.0 && h >= 350.0, "{:?}", pg.size);
+    assert!(
+        pg.graphics
+            .iter()
+            .any(|s| matches!(s, Shape::Text { at, .. } if *at == Point::new(500.0, h - 350.0) && at.y >= 0.0)),
+        "{:?}",
+        pg.graphics
+    );
+}
+
+#[test]
+fn another_projects_block_never_replaces_the_library_one() {
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    let library = model_space_dwg(&[E::Circle((0.0, 0.0), 3.0)]);
+    let other = model_space_dwg(&[E::Line((0.0, 0.0), (0.0, 6.0))]);
+    let buf = archive(&[
+        ("Projects/3/Database/tew_project_data.sqlite", &db),
+        ("Block/Coil.dwg", &library),
+        ("Projects/5/Block/Coil.dwg", &other),
+    ]);
+    let drawings = drawings_from_archive(buf, "Projects/3").unwrap();
+    assert_eq!(drawings.block_count(), 1);
+    let mut sw = read(&sample()).unwrap();
+    sw.drawings = drawings;
+    let (built, _, _) = build(&sw, None);
+    let g = &symbol_of(&built, "01", "s1").graphics;
+    assert!(matches!(g[..], [Shape::Circle { .. }]), "the library's: {g:?}");
+}
+
+#[test]
+fn a_symbol_scaled_unevenly_and_turned_is_drawn_like_its_points() {
+    let mut sw = read(&sample()).unwrap();
+    sw.drawings
+        .add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (10.0, 0.0))]))
+        .unwrap();
+    let k1 = sw.symbols.iter_mut().find(|s| s.id == 1).unwrap();
+    (k1.angle, k1.scale) = (90.0, (2.0, 1.0));
+    let end = place(Point::new(0.0, 0.0), 90.0, (2.0, 1.0), Point::new(10.0, 0.0));
+    let (built, _, _) = build(&sw, None);
+    let g = &symbol_of(&built, "01", "s1").graphics;
+    // y flipped on the page.
+    assert!(
+        has_line(g, Point::new(0.0, 0.0), Point::new(round(end.x), -round(end.y))),
+        "{end:?} {g:?}"
+    );
+}
+
+#[test]
+fn the_drawing_limit_is_reported_apart_from_missing_drawings() {
+    // Two symbols drawn from blocks, with no budget left once the first page drawing is in:
+    // checked through the parts the build uses.
+    let mut d = SweDrawings::default();
+    d.add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]))
+        .unwrap();
+    let sw = read(&sample()).unwrap();
+    let coil = sw.symbols.iter().find(|s| s.id == 1).unwrap();
+    let mut skipped = BTreeMap::new();
+    let mut budget = 0;
+    assert_eq!(d.symbol_graphics(coil, &mut budget, &mut skipped), None);
+    assert!(skipped.contains_key(crate::dxf::OVER_LIMIT), "{skipped:?}");
+    assert!(d.has_block("COIL"));
+}

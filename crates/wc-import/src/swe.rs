@@ -1809,6 +1809,10 @@ pub fn build_with(
     let mut pages_with_drawing = 0usize;
     // One budget for every drawing of the import, like the DWG reader's own.
     let mut draw_budget = crate::dxf::MAX_DRAWN;
+    // Entities of the drawings left out while drawing, and symbols that fell back to boxes
+    // only because that budget ran out.
+    let mut draw_skipped: BTreeMap<String, usize> = BTreeMap::new();
+    let mut over_budget_symbols = 0usize;
     let mut lines_in = 0;
     let mut lines_out = 0usize;
     let mut zero_length = 0;
@@ -1857,6 +1861,14 @@ pub fn build_with(
             grow(l.a);
             grow(l.b);
         }
+        // The page drawing's own texts, frames and notes, y flipped: they need room too.
+        let page_drawing = p
+            .drawings
+            .page_graphics(pg.id, &lines, &mut draw_budget, &mut draw_skipped);
+        for sh in &page_drawing {
+            let (min, max) = sh.bounds();
+            grow(Point::new(max.x, -min.y));
+        }
         // The sheet the title block names, unless the content does not fit on it.
         let (fitted, fits) = page_size(extent);
         let size = match frame_size(&pg.frame) {
@@ -1883,8 +1895,7 @@ pub fn build_with(
         // A line diagram repeats devices the schematics draw in detail.
         page.overview = pg.kind == KIND_LINE_DIAGRAM;
         page.title_block = pg.title_block.clone();
-        // The page drawing's own texts, frames and notes.
-        page.graphics = p.drawings.page_graphics(pg.id, height, &lines, &mut draw_budget);
+        page.graphics = drawings::on_sheet(page_drawing, height);
         if !page.graphics.is_empty() {
             pages_with_drawing += 1;
         }
@@ -1918,10 +1929,14 @@ pub fn build_with(
                 Some(fit) => (Vec::new(), fit.pins.clone()),
                 None => {
                     let (boxed, pins) = box_symbol(&s.block, origin, s.corner.map(flip), &pins);
-                    match p.drawings.symbol_graphics(s, &mut draw_budget) {
+                    match p.drawings.symbol_graphics(s, &mut draw_budget, &mut draw_skipped) {
                         Some(drawn) => {
                             dwg_symbols += 1;
                             (drawn, pins)
+                        }
+                        None if draw_budget == 0 && p.drawings.has_block(&s.block) => {
+                            over_budget_symbols += 1;
+                            (boxed, pins)
                         }
                         None => {
                             fallback_blocks.insert(s.block.to_lowercase());
@@ -2369,6 +2384,12 @@ pub fn build_with(
     let layouts = cabinet::layouts(p, &tags, &built.devices, &built.parts);
     built.panels.clone_from(&layouts.panels);
 
+    if let Some(n) = draw_skipped.get(crate::dxf::OVER_LIMIT) {
+        warnings.push(format!(
+            "the symbol and page drawings reached the limit of {} entities; {n} more were left out",
+            crate::dxf::MAX_DRAWN
+        ));
+    }
     if unknown_component > 0 {
         warnings.push(format!(
             "{unknown_component} symbol(s) refer to a component the database does not have; they are drawn without a tag"
@@ -2451,15 +2472,19 @@ pub fn build_with(
             what: "DWG symbol graphics",
             source: boxed_symbols,
             imported: dwg_symbols,
-            note: if boxed_symbols > dwg_symbols {
-                format!(
-                    "{} drawn as boxes: {} block(s) without a readable drawing in the archive",
-                    boxed_symbols - dwg_symbols,
-                    fallback_blocks.len()
-                )
-            } else {
-                String::new()
-            },
+            note: note(vec![
+                (
+                    boxed_symbols - dwg_symbols - over_budget_symbols,
+                    &format!(
+                        "drawn as boxes: {} block(s) without a readable drawing in the archive",
+                        fallback_blocks.len()
+                    ),
+                ),
+                (
+                    over_budget_symbols,
+                    "drawn as boxes: the drawings' entity limit was reached",
+                ),
+            ]),
         },
         Count {
             what: "page drawings",
