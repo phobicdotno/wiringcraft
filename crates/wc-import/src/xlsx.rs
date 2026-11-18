@@ -44,12 +44,8 @@ pub fn rows(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
         .ok_or_else(|| Error::Format("xlsx: no xl/workbook.xml, not an Excel workbook".into()))?;
     let rels = part(&mut zip, "xl/_rels/workbook.xml.rels")?.unwrap_or_default();
     let rels = relationships(&rels)?;
-    let sheet_path = match first_sheet(&workbook)? {
-        Some(id) => rels
-            .iter()
-            .find(|r| r.id == id)
-            .map(|r| target_path(&r.target))
-            .ok_or_else(|| Error::Format(format!("xlsx: the first sheet's relationship {id:?} is missing")))?,
+    let sheet_path = match first_worksheet(&sheets(&workbook)?, &rels)? {
+        Some(r) => target_path(&r.target),
         None => "xl/worksheets/sheet1.xml".into(),
     };
     let strings_path = rels
@@ -88,15 +84,52 @@ fn part(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Option<S
             MAX_PART / 1024 / 1024
         )));
     }
-    Ok(Some(String::from_utf8_lossy(&data).into_owned()))
+    Ok(Some(decode(&data)))
 }
 
-/// A relationship target as a package path: relative to `xl/` unless it starts with `/`.
+/// An XML part as text: UTF-16 when it starts with a byte order mark (or with `<` as UTF-16),
+/// otherwise UTF-8 with any byte order mark left out.
+fn decode(data: &[u8]) -> String {
+    let utf16 = |bytes: &[u8], big: bool| {
+        let units = bytes.chunks_exact(2).map(|p| {
+            if big {
+                u16::from_be_bytes([p[0], p[1]])
+            } else {
+                u16::from_le_bytes([p[0], p[1]])
+            }
+        });
+        char::decode_utf16(units)
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect::<String>()
+    };
+    match data {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
+        [b'<', 0, ..] => utf16(data, false),
+        [0, b'<', ..] => utf16(data, true),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(data).into_owned(),
+    }
+}
+
+/// A relationship target as a package path: relative to `xl/` unless it starts with `/`, with
+/// `.` and `..` segments resolved (`./worksheets/a.xml` is `xl/worksheets/a.xml`).
 fn target_path(target: &str) -> String {
-    match target.strip_prefix('/') {
+    let joined = match target.strip_prefix('/') {
         Some(abs) => abs.to_owned(),
         None => format!("xl/{target}"),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in joined.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
     }
+    parts.join("/")
 }
 
 fn xml_error(e: impl std::fmt::Display) -> Error {
@@ -104,11 +137,16 @@ fn xml_error(e: impl std::fmt::Display) -> Error {
     Error::Format(format!("xlsx: {}", crate::printable(&e.to_string())))
 }
 
-fn attr(e: &BytesStart, name: &[u8]) -> Option<String> {
-    e.attributes()
-        .flatten()
-        .find(|a| a.key.local_name().as_ref() == name)
-        .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()))
+/// An attribute's value, `None` when the element has no such attribute. A malformed attribute
+/// list or value is an error with the parser's reason.
+fn attr(e: &BytesStart, name: &[u8]) -> Result<Option<String>> {
+    for a in e.attributes() {
+        let a = a.map_err(xml_error)?;
+        if a.key.local_name().as_ref() == name {
+            return a.unescape_value().map(|v| Some(v.into_owned())).map_err(xml_error);
+        }
+    }
+    Ok(None)
 }
 
 struct Relationship {
@@ -124,9 +162,9 @@ fn relationships(xml: &str) -> Result<Vec<Relationship>> {
         match r.read_event().map_err(xml_error)? {
             Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"Relationship" => {
                 out.push(Relationship {
-                    id: attr(&e, b"Id").unwrap_or_default(),
-                    kind: attr(&e, b"Type").unwrap_or_default(),
-                    target: attr(&e, b"Target").unwrap_or_default(),
+                    id: attr(&e, b"Id")?.unwrap_or_default(),
+                    kind: attr(&e, b"Type")?.unwrap_or_default(),
+                    target: attr(&e, b"Target")?.unwrap_or_default(),
                 });
             }
             Event::Eof => return Ok(out),
@@ -135,26 +173,45 @@ fn relationships(xml: &str) -> Result<Vec<Relationship>> {
     }
 }
 
-/// The relationship id of the first sheet that is not hidden (or of the first sheet when all
-/// are hidden); `None` when the workbook lists no sheets.
-fn first_sheet(xml: &str) -> Result<Option<String>> {
+/// The workbook's sheets in order: each one's relationship id and whether it is hidden.
+fn sheets(xml: &str) -> Result<Vec<(String, bool)>> {
     let mut r = Reader::from_str(xml);
-    let mut first = None;
+    let mut out = Vec::new();
     loop {
         match r.read_event().map_err(xml_error)? {
             Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"sheet" => {
-                let id = attr(&e, b"id");
-                let hidden = attr(&e, b"state").is_some_and(|s| s != "visible");
-                if !hidden && id.is_some() {
-                    return Ok(id);
-                }
-                if first.is_none() {
-                    first = id;
+                if let Some(id) = attr(&e, b"id")? {
+                    let hidden = attr(&e, b"state")?.is_some_and(|s| s != "visible");
+                    out.push((id, hidden));
                 }
             }
-            Event::Eof => return Ok(first),
+            Event::Eof => return Ok(out),
             _ => {}
         }
+    }
+}
+
+/// The relationship of the first worksheet that is not hidden (or of the first worksheet when
+/// all are hidden). Chartsheets and dialog sheets hold no cells and are passed over; `None`
+/// when the workbook lists no sheets.
+fn first_worksheet<'a>(sheets: &[(String, bool)], rels: &'a [Relationship]) -> Result<Option<&'a Relationship>> {
+    let Some((first_id, _)) = sheets.first() else {
+        return Ok(None);
+    };
+    let worksheet = |id: &str| rels.iter().find(|r| r.id == id && r.kind.ends_with("/worksheet"));
+    let found = sheets
+        .iter()
+        .filter(|(_, hidden)| !hidden)
+        .chain(sheets.iter().filter(|(_, hidden)| *hidden))
+        .find_map(|(id, _)| worksheet(id));
+    match found {
+        Some(r) => Ok(Some(r)),
+        None if rels.iter().any(|r| &r.id == first_id) => Err(Error::Format(
+            "xlsx: the workbook has no worksheet, only chart or dialog sheets".into(),
+        )),
+        None => Err(Error::Format(format!(
+            "xlsx: the first sheet's relationship {first_id:?} is missing"
+        ))),
     }
 }
 
@@ -250,6 +307,8 @@ fn number(v: &str) -> String {
 
 #[derive(Default)]
 struct Cell {
+    /// The cell's place for messages, such as `B7` or `column C`.
+    reference: String,
     column: usize,
     kind: String,
     value: String,
@@ -257,15 +316,23 @@ struct Cell {
 }
 
 impl Cell {
-    fn text(self, strings: &[String]) -> String {
-        match self.kind.as_str() {
-            "s" => self
-                .value
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .and_then(|i| strings.get(i).cloned())
-                .unwrap_or_default(),
+    fn text(self, strings: &[String]) -> Result<String> {
+        Ok(match self.kind.as_str() {
+            "s" => {
+                let index = self.value.trim();
+                index
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| strings.get(i).cloned())
+                    .ok_or_else(|| {
+                        Error::Format(format!(
+                            "xlsx: cell {} refers to shared string {:?}, but the workbook has {} shared strings",
+                            self.reference,
+                            crate::printable(index),
+                            strings.len()
+                        ))
+                    })?
+            }
             "inlineStr" => unescape_xstring(&self.inline),
             // A formula's cached text is escaped like any other string.
             "str" => unescape_xstring(&self.value),
@@ -276,7 +343,7 @@ impl Cell {
                 v => v.to_owned(),
             },
             _ => number(&self.value),
-        }
+        })
     }
 }
 
@@ -337,7 +404,7 @@ fn sheet_rows_within(xml: &str, strings: &[String], max_text: usize) -> Result<V
                 b"c" => {
                     if let Some(c) = cell.take() {
                         let column = c.column;
-                        let text = c.text(strings);
+                        let text = c.text(strings)?;
                         text_bytes = text_bytes.saturating_add(text.len());
                         if text_bytes > max_text {
                             return Err(Error::Format(format!(
@@ -364,6 +431,16 @@ fn sheet_rows_within(xml: &str, strings: &[String], max_text: usize) -> Result<V
                     }
                 }
             }
+            // CDATA is text taken as written, without entity unescaping.
+            Event::CData(t) => {
+                if let Some(c) = cell.as_mut() {
+                    if in_v {
+                        c.value.push_str(&String::from_utf8_lossy(&t));
+                    } else if in_t && !in_phonetic {
+                        c.inline.push_str(&String::from_utf8_lossy(&t));
+                    }
+                }
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -373,18 +450,28 @@ fn sheet_rows_within(xml: &str, strings: &[String], max_text: usize) -> Result<V
 }
 
 fn start_cell(e: &BytesStart, next_column: &mut usize) -> Result<Cell> {
-    let column = match attr(e, b"r") {
-        Some(reference) => column_of(&reference)
-            .ok_or_else(|| Error::Format(format!("xlsx: cell reference {reference:?} is not a column Excel has")))?,
+    let given = attr(e, b"r")?;
+    let column = match &given {
+        Some(reference) => column_of(reference).ok_or_else(|| {
+            Error::Format(format!(
+                "xlsx: cell reference {:?} is not a column Excel has",
+                crate::printable(reference)
+            ))
+        })?,
         None => *next_column,
     };
     if column >= MAX_COLUMNS {
         return Err(Error::Format(format!("xlsx: more than {MAX_COLUMNS} columns")));
     }
     *next_column = column + 1;
+    let reference = match given {
+        Some(r) => format!("{:?}", crate::printable(&r)),
+        None => format!("in column {}", column + 1),
+    };
     Ok(Cell {
+        reference,
         column,
-        kind: attr(e, b"t").unwrap_or_default(),
+        kind: attr(e, b"t")?.unwrap_or_default(),
         ..Cell::default()
     })
 }
@@ -496,7 +583,7 @@ mod tests {
             title: "Parts".into(),
             columns: vec!["Order number".into(), "Description".into()],
             rows: vec![
-                vec!["0042".into(), "=SUM(A1) & <b>\r\n_x000D_".into()],
+                vec!["0042".into(), "=SUM(A1) & <b>\r\n_x000D_\u{c}\u{1}".into()],
                 vec!["1e3".into(), String::new()],
             ],
             ..wc_report::Table::default()
@@ -640,6 +727,119 @@ mod tests {
             sheet_rows(xml, &[])?,
             vec![vec!["part_x0041_".to_owned(), "plain".into()]]
         );
+        Ok(())
+    }
+
+    /// A workbook whose one sheet, `rId1`, has the given relationship target and worksheet.
+    fn one_sheet(target: &str, sheet_path: &str, sheet: &str) -> Vec<u8> {
+        let rels = format!(
+            r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{target}"/></Relationships>"#
+        );
+        workbook(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="A" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            ("xl/_rels/workbook.xml.rels", &rels),
+            (sheet_path, sheet),
+        ])
+    }
+
+    const ONE_CELL: &str =
+        r#"<worksheet><sheetData><row><c t="inlineStr"><is><t>x</t></is></c></row></sheetData></worksheet>"#;
+
+    #[test]
+    fn relationship_targets_with_dot_segments_resolve() -> Result<()> {
+        let plain = rows(&one_sheet("worksheets/data.xml", "xl/worksheets/data.xml", ONE_CELL))?;
+        assert_eq!(plain, vec![vec!["x".to_owned()]]);
+        assert_eq!(
+            rows(&one_sheet("./worksheets/data.xml", "xl/worksheets/data.xml", ONE_CELL))?,
+            plain
+        );
+        assert_eq!(
+            rows(&one_sheet(
+                "../xl/worksheets/./data.xml",
+                "xl/worksheets/data.xml",
+                ONE_CELL
+            ))?,
+            plain
+        );
+        assert_eq!(target_path("/xl/a/../b.xml"), "xl/b.xml");
+        Ok(())
+    }
+
+    #[test]
+    fn utf16_parts_read_like_utf8() -> Result<()> {
+        let xml = r#"<?xml version="1.0" encoding="UTF-16"?><worksheet><sheetData><row><c t="inlineStr"><is><t>Ø x</t></is></c></row></sheetData></worksheet>"#;
+        let utf8 = sheet_rows(&decode(xml.as_bytes()), &[])?;
+        let mut le = vec![0xFF, 0xFE];
+        le.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        let mut be = vec![0xFE, 0xFF];
+        be.extend(xml.encode_utf16().flat_map(u16::to_be_bytes));
+        let no_bom: Vec<u8> = xml.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut bom8 = vec![0xEF, 0xBB, 0xBF];
+        bom8.extend(xml.as_bytes());
+        assert_eq!(utf8, vec![vec!["Ø x".to_owned()]]);
+        for bytes in [le, be, no_bom, bom8] {
+            assert_eq!(sheet_rows(&decode(&bytes), &[])?, utf8);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_cell_reference_is_refused_with_its_reason() {
+        let xml = r#"<worksheet><sheetData><row><c r="&missing;"><v>1</v></c></row></sheetData></worksheet>"#;
+        let err = sheet_rows(xml, &[]).map(|_| ()).map_err(|e| e.to_string());
+        assert!(err.as_ref().is_err_and(|e| e.contains("missing")), "{err:?}");
+        // A cell without `r` still takes the next column.
+        let implicit = r#"<worksheet><sheetData><row><c><v>1</v></c><c><v>2</v></c></row></sheetData></worksheet>"#;
+        assert_eq!(
+            sheet_rows(implicit, &[]).ok(),
+            Some(vec![vec!["1".to_owned(), "2".into()]])
+        );
+    }
+
+    #[test]
+    fn a_chartsheet_before_the_data_is_passed_over() -> Result<()> {
+        let bytes = workbook(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="Chart" r:id="rId1"/><sheet name="Parts" r:id="rId2"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships>
+                    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/>
+                    <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+                </Relationships>"#,
+            ),
+            ("xl/chartsheets/sheet1.xml", "<chartsheet/>"),
+            ("xl/worksheets/sheet1.xml", ONE_CELL),
+        ]);
+        assert_eq!(rows(&bytes)?, vec![vec!["x".to_owned()]]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unresolved_shared_string_is_an_error() {
+        let strings = vec!["Order number".to_owned(), String::new()];
+        let ok = r#"<worksheet><sheetData><row><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row></sheetData></worksheet>"#;
+        assert_eq!(
+            sheet_rows(ok, &strings).ok(),
+            Some(vec![vec!["Order number".to_owned()]])
+        );
+        let bad = r#"<worksheet><sheetData><row><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>99</v></c></row></sheetData></worksheet>"#;
+        let err = sheet_rows(bad, &strings).map(|_| ()).map_err(|e| e.to_string());
+        assert!(
+            err.as_ref().is_err_and(|e| e.contains("B1") && e.contains("99")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn cdata_in_cells_is_kept_as_written() -> Result<()> {
+        let xml = r#"<worksheet><sheetData><row><c t="inlineStr"><is><t>a<![CDATA[<b>&amp;]]>c</t></is></c><c t="str"><f>A1</f><v><![CDATA[x&y]]></v></c></row></sheetData></worksheet>"#;
+        assert_eq!(sheet_rows(xml, &[])?, vec![vec!["a<b>&amp;c".to_owned(), "x&y".into()]]);
         Ok(())
     }
 }

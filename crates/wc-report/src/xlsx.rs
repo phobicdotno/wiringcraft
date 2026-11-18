@@ -23,8 +23,14 @@ const MAX_WIDTH: usize = 60;
 /// A workbook with one worksheet per table, in order, named after each table's title. Refuses
 /// (`InvalidInput`, naming the sheet and cell) a table Excel could not open without cutting it:
 /// more than 16,384 columns, more than 1,048,576 rows with the header, or a cell longer than
-/// 32,767 characters.
+/// 32,767 characters. Refuses no tables at all too: a workbook needs at least one sheet.
 pub fn workbook(tables: &[&Table]) -> std::io::Result<Vec<u8>> {
+    if tables.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a workbook needs at least one report",
+        ));
+    }
     for t in tables {
         check_limits(t)?;
     }
@@ -130,7 +136,8 @@ fn sheet_name(title: &str, number: usize, taken: &mut BTreeSet<String>) -> Strin
     name
 }
 
-/// Text made safe for XML 1.0: markup characters escaped, characters XML cannot hold dropped.
+/// Text made safe for XML 1.0: markup characters escaped, and the control characters XML
+/// cannot hold written as SpreadsheetML escapes (`_x000C_`), so every character reads back.
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (i, c) in s.char_indices() {
@@ -142,10 +149,12 @@ fn esc(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            // XML readers turn a carriage return into a line feed: written as its escape.
-            '\r' => out.push_str("_x000D_"),
             '\t' | '\n' => out.push(c),
-            c if (c as u32) < 0x20 || c == '\u{FFFE}' || c == '\u{FFFF}' => {}
+            // XML readers turn a carriage return into a line feed, and XML cannot hold the
+            // other control characters at all: each is written as its escape.
+            c if (c as u32) < 0x20 || c == '\u{FFFE}' || c == '\u{FFFF}' => {
+                out.push_str(&format!("_x{:04X}_", c as u32));
+            }
             c => out.push(c),
         }
     }
@@ -305,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn cells_are_inline_text_escaped_and_without_invalid_characters() {
+    fn cells_are_inline_text_escaped_and_keep_control_characters() {
         let t = Table {
             title: "Parts".into(),
             columns: vec!["Order number".into(), "Text".into()],
@@ -315,9 +324,16 @@ mod tests {
         let xml = sheet_xml(&t);
         assert!(xml.contains("<c r=\"A1\" s=\"1\" t=\"inlineStr\"><is><t xml:space=\"preserve\">Order number</t>"));
         assert!(xml.contains("<c r=\"A2\" t=\"inlineStr\"><is><t xml:space=\"preserve\">=SUM(A1)</t>"));
-        assert!(xml.contains("a&lt;b &amp; &quot;c&quot;</t>"), "{xml}");
         assert!(!xml.contains("<f>"));
+        assert!(xml.contains("&quot;c&quot;_x0001__x0007_</t>"), "{xml}");
         assert!(!xml.contains('\u{1}'));
+    }
+
+    #[test]
+    fn no_tables_is_refused_but_one_empty_table_is_a_workbook() {
+        let refused = workbook(&[]).map_err(|e| e.kind());
+        assert_eq!(refused, Err(std::io::ErrorKind::InvalidInput));
+        assert!(Table::default().to_xlsx().is_ok());
     }
 
     #[test]
