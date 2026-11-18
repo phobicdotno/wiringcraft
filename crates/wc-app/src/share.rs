@@ -1772,6 +1772,10 @@ pub struct Share {
     /// Pictures looked at for the session and not taken yet, by project path, with when: each
     /// is looked at again only after [`ITEM_RETRY_LATER`]. Changes never wait for a picture.
     pictures_out: BTreeMap<String, std::time::Instant>,
+    /// Pictures this copy sent to the session, by project path: only a refusal of one of
+    /// these makes this copy give a picture a name of its own. Kept while the session lasts,
+    /// as a refusal can arrive after the session's own picture of that name.
+    pictures_sent: std::collections::BTreeSet<String>,
     /// The session's pictures written into this copy (or found there already), by project path.
     pictures_taken: std::collections::BTreeSet<String>,
     /// Session pictures that could not be written into this copy, with when: each is tried
@@ -2020,6 +2024,7 @@ impl Share {
         self.delist.clear();
         self.unreadable.clear();
         self.pictures_out.clear();
+        self.pictures_sent.clear();
         self.pictures_taken.clear();
         self.pictures_failed.clear();
         self.renames_due.clear();
@@ -2241,7 +2246,7 @@ impl Share {
         let mut taken: Vec<String> = role
             .picture_names_taken()
             .into_iter()
-            .filter(|f| self.pictures_out.contains_key(f))
+            .filter(|f| self.pictures_sent.contains(f))
             .collect();
         taken.append(&mut self.clashes);
         rename_pictures(
@@ -2269,6 +2274,9 @@ impl Share {
             }
         }
         for edit in pictures.edits {
+            if let ProjectEdit::AddPicture { picture } = &edit {
+                self.pictures_sent.insert(picture.file.clone());
+            }
             role.edit_project(edit, &mut self.notes);
         }
         if self.items_out.values().any(|o| !o.gave_up) {

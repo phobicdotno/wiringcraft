@@ -2050,7 +2050,10 @@ fn a_refusal_of_a_picture_this_copy_never_sent_shares_nothing() -> TestResult {
     std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
     std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-    // A refusal naming a path this copy never sent.
+    // A refusal naming a path this copy never sent, though it looked at that path (a read
+    // that failed is remembered the same way, so it is not tried again at once).
+    g.pictures_out
+        .insert("pictures/brand.png".into(), std::time::Instant::now());
     if let Some(Role::Guest(j)) = g.role.as_mut() {
         j.guest.refusals.push(wc_share::Refusal::PictureNameTaken {
             file: "pictures/brand.png".into(),
