@@ -1718,18 +1718,27 @@ struct Held {
     was: wc_share::Parts,
     /// The items they wait for, by [`item_name`].
     items: Vec<String>,
-    /// The targets of a device rename that waits ([`Held::hold_renames`]): put back all
-    /// together or not at all.
-    rename: RenameGroup,
+    /// The targets of each device rename that waits ([`Held::hold_renames`]): each group is
+    /// put back all together or not at all; separate renames are kept or lost on their own.
+    renames: Vec<RenameGroup>,
 }
 
-/// See [`Held::rename`].
+/// See [`Held::renames`].
 #[derive(Debug, Default)]
 struct RenameGroup {
     pages: BTreeSet<String>,
     devices: BTreeSet<wc_core::DeviceTag>,
     panels: BTreeSet<String>,
     meta: bool,
+}
+
+impl RenameGroup {
+    fn merge(&mut self, other: RenameGroup) {
+        self.pages.extend(other.pages);
+        self.devices.extend(other.devices);
+        self.panels.extend(other.panels);
+        self.meta |= other.meta;
+    }
 }
 
 impl Held {
@@ -1795,102 +1804,157 @@ impl Held {
             return;
         }
         let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
+        let gone: Vec<wc_core::DeviceTag> = base
+            .devices
+            .keys()
+            .filter(|t| !local.devices.contains_key(*t))
+            .cloned()
+            .collect();
         // Only a device gone since `base` whose placements or cables now name a new tag instead
-        // is the old side of a rename; other devices removed here go out as usual. The new tags
-        // it hands over to are its partners: only those, and the targets naming them, wait
-        // together with it, so a new device that merely waits for a part stays on its own.
-        let partners = |old: &wc_core::DeviceTag| {
-            let was = |t: &wc_core::DeviceTag| t == old;
-            let mut to = BTreeSet::new();
-            for b in &base.pages {
-                let Some(l) = local.page(&b.id) else { continue };
-                for s in b.symbols.iter().filter(|s| s.tag.as_ref().is_some_and(was)) {
-                    if let Some(t) = l.symbols.iter().find(|n| n.id == s.id).and_then(|n| n.tag.as_ref())
-                        && named(t)
-                    {
-                        to.insert(t.clone());
-                    }
-                }
-                for w in b
-                    .wires
-                    .iter()
-                    .filter(|w| w.cable.as_ref().is_some_and(|c| was(&c.cable)))
+        // is the old side of a rename; other devices removed here go out as usual. Symbols and
+        // wires keep their ids, so each one names its own pair.
+        let mut pairs: BTreeSet<(wc_core::DeviceTag, wc_core::DeviceTag)> = BTreeSet::new();
+        for b in &base.pages {
+            let Some(l) = local.page(&b.id) else { continue };
+            for s in &b.symbols {
+                if let Some(old) = s.tag.as_ref().filter(|t| gone.contains(t))
+                    && let Some(new) = l.symbols.iter().find(|n| n.id == s.id).and_then(|n| n.tag.as_ref())
+                    && named(new)
                 {
-                    if let Some(c) = l.wires.iter().find(|n| n.id == w.id).and_then(|n| n.cable.as_ref())
-                        && named(&c.cable)
-                    {
-                        to.insert(c.cable.clone());
-                    }
+                    pairs.insert((old.clone(), new.clone()));
                 }
             }
-            // Panel footprints and jumpers carry no id: the same entry at the same place, with
-            // only its tag changed, is the renamed one.
-            use wc_core::panel::PanelItem;
-            for b in &base.panels {
-                let Some(l) = local.panels.iter().find(|l| l.id == b.id) else {
-                    continue;
-                };
-                for (bi, li) in b.items.iter().zip(&l.items) {
-                    if let (
-                        PanelItem::Device {
-                            tag: bt,
-                            at: ba,
-                            width: bw,
-                            height: bh,
-                        },
-                        PanelItem::Device {
-                            tag: lt,
-                            at: la,
-                            width: lw,
-                            height: lh,
-                        },
-                    ) = (bi, li)
-                        && was(bt)
-                        && named(lt)
-                        && (ba, bw, bh) == (la, lw, lh)
-                    {
-                        to.insert(lt.clone());
-                    }
+            for w in &b.wires {
+                if let Some(old) = w.cable.as_ref().map(|c| &c.cable).filter(|t| gone.contains(t))
+                    && let Some(new) = l.wires.iter().find(|n| n.id == w.id).and_then(|n| n.cable.as_ref())
+                    && named(&new.cable)
+                {
+                    pairs.insert((old.clone(), new.cable.clone()));
                 }
-            }
-            for (bj, lj) in base.meta.jumpers.iter().zip(&local.meta.jumpers) {
-                if was(&bj.strip) && named(&lj.strip) && (&bj.terminals, &bj.part) == (&lj.terminals, &lj.part) {
-                    to.insert(lj.strip.clone());
-                }
-            }
-            to
-        };
-        let mut paired = BTreeSet::new();
-        for tag in base.devices.keys().filter(|t| !local.devices.contains_key(*t)) {
-            let to = partners(tag);
-            if !to.is_empty() {
-                self.now.devices.insert(tag.clone(), None);
-                self.rename.devices.insert(tag.clone());
-                paired.extend(to);
             }
         }
-        self.rename.devices.extend(paired.iter().cloned());
-        let in_rename = |t: &wc_core::DeviceTag| paired.contains(t);
+        // Panel footprints and jumpers carry no id: an old tag whose entries, in order, are
+        // exactly a new tag's entries now, and that kept none under its own tag, is renamed to
+        // it when no other tag matches either side. A removed entry may shift the others, so the place in the list says nothing.
+        use wc_core::panel::PanelItem;
+        let mut by_content: BTreeSet<(wc_core::DeviceTag, wc_core::DeviceTag)> = BTreeSet::new();
+        for b in &base.panels {
+            let Some(l) = local.panels.iter().find(|l| l.id == b.id) else {
+                continue;
+            };
+            let footprints = |p: &wc_core::panel::Panel, tag: &wc_core::DeviceTag| -> Vec<String> {
+                p.items
+                    .iter()
+                    .filter_map(|i| match i {
+                        PanelItem::Device {
+                            tag: t,
+                            at,
+                            width,
+                            height,
+                        } if t == tag => Some(format!("{at:?} {width} {height}")),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            for old in &gone {
+                let was = footprints(b, old);
+                if was.is_empty() || !footprints(l, old).is_empty() {
+                    continue;
+                }
+                for new in &new_tags {
+                    if footprints(l, new) == was && footprints(b, new).is_empty() {
+                        by_content.insert((old.clone(), new.clone()));
+                    }
+                }
+            }
+        }
+        let strips = |p: &Project, tag: &wc_core::DeviceTag| -> Vec<(Vec<String>, Option<String>)> {
+            p.meta
+                .jumpers
+                .iter()
+                .filter(|j| &j.strip == tag)
+                .map(|j| (j.terminals.clone(), j.part.clone()))
+                .collect()
+        };
+        for old in &gone {
+            let was = strips(base, old);
+            if was.is_empty() || !strips(local, old).is_empty() {
+                continue;
+            }
+            for new in &new_tags {
+                if strips(local, new) == was && strips(base, new).is_empty() {
+                    by_content.insert((old.clone(), new.clone()));
+                }
+            }
+        }
+        for (old, new) in &by_content {
+            let unique = by_content.iter().filter(|(o, _)| o == old).count() == 1
+                && by_content.iter().filter(|(_, n)| n == new).count() == 1;
+            if unique {
+                pairs.insert((old.clone(), new.clone()));
+            }
+        }
+        // Each rename is its own group; renames that share a tag or a target wait as one.
+        let mut groups: Vec<RenameGroup> = Vec::new();
+        let join = |groups: &mut Vec<RenameGroup>, tags: &[&wc_core::DeviceTag]| -> usize {
+            let hit: Vec<usize> = (0..groups.len())
+                .filter(|&i| tags.iter().any(|t| groups[i].devices.contains(*t)))
+                .collect();
+            let mut into = match hit.first() {
+                Some(&i) => i,
+                None => {
+                    groups.push(RenameGroup::default());
+                    groups.len() - 1
+                }
+            };
+            for &i in hit.iter().skip(1).rev() {
+                let g = groups.remove(i);
+                if i < into {
+                    into -= 1;
+                }
+                groups[into].merge(g);
+            }
+            groups[into].devices.extend(tags.iter().map(|t| (*t).clone()));
+            into
+        };
+        for (old, new) in &pairs {
+            self.now.devices.insert(old.clone(), None);
+            join(&mut groups, &[old, new]);
+        }
+        let paired: Vec<wc_core::DeviceTag> = pairs.iter().map(|(_, n)| n.clone()).collect();
+        // The paired new tags among those a target names.
+        let renamed_in = |names: &dyn Fn(&wc_core::DeviceTag) -> bool| -> Vec<&wc_core::DeviceTag> {
+            paired.iter().filter(|t| names(t)).collect()
+        };
         for p in &local.pages {
             if page_mentions(p, &named) && base.page(&p.id) != Some(p) {
                 self.now.pages.insert(p.id.clone(), Some(p.clone()));
-                if page_mentions(p, &in_rename) {
-                    self.rename.pages.insert(p.id.clone());
+                let tags = renamed_in(&|t| page_mentions(p, &|x| x == t));
+                if !tags.is_empty() {
+                    let g = join(&mut groups, &tags);
+                    groups[g].pages.insert(p.id.clone());
                 }
             }
         }
         for panel in &local.panels {
             if panel_mentions(panel, &named) && base.panels.iter().find(|b| b.id == panel.id) != Some(panel) {
                 self.now.panels.insert(panel.id.clone(), Some(panel.clone()));
-                if panel_mentions(panel, &in_rename) {
-                    self.rename.panels.insert(panel.id.clone());
+                let tags = renamed_in(&|t| panel_mentions(panel, &|x| x == t));
+                if !tags.is_empty() {
+                    let g = join(&mut groups, &tags);
+                    groups[g].panels.insert(panel.id.clone());
                 }
             }
         }
         if local.meta != base.meta && local.meta.jumpers.iter().any(|j| named(&j.strip)) {
             self.now.meta = Some(Box::new(local.meta.clone()));
-            self.rename.meta |= local.meta.jumpers.iter().any(|j| in_rename(&j.strip));
+            let tags = renamed_in(&|t| local.meta.jumpers.iter().any(|j| &j.strip == t));
+            if !tags.is_empty() {
+                let g = join(&mut groups, &tags);
+                groups[g].meta = true;
+            }
         }
+        self.renames = groups;
     }
 
     fn is_empty(&self) -> bool {
@@ -1904,7 +1968,7 @@ impl Held {
     /// this copy renumbered it.
     fn put_back(&self, project: &mut Project) -> Vec<String> {
         let mut lost = Vec::new();
-        let mut rename_lost = false;
+        let mut gone = RenameGroup::default();
         let mut keep = wc_share::Parts::default();
         for (id, now) in &self.now.pages {
             let Some(now) = now else { continue };
@@ -1922,7 +1986,7 @@ impl Held {
                     keep.pages.insert(id.clone(), Some(now.clone()));
                 }
                 _ => {
-                    rename_lost |= self.rename.pages.contains(id);
+                    gone.pages.insert(id.clone());
                     lost.push(format!("page {}", now.number));
                 }
             }
@@ -1932,7 +1996,7 @@ impl Held {
             if project.devices.get(tag) == was.as_ref() {
                 keep.devices.insert(tag.clone(), now.clone());
             } else {
-                rename_lost |= self.rename.devices.contains(tag);
+                gone.devices.insert(tag.clone());
                 lost.push(format!("device {tag}"));
             }
         }
@@ -1941,7 +2005,7 @@ impl Held {
             if project.panels.iter().find(|p| &p.id == id) == was.as_ref() {
                 keep.panels.insert(id.clone(), now.clone());
             } else {
-                rename_lost |= self.rename.panels.contains(id);
+                gone.panels.insert(id.clone());
                 lost.push(format!("panel {id}"));
             }
         }
@@ -1958,18 +2022,25 @@ impl Held {
             if project.meta == **was {
                 keep.meta = Some(now.clone());
             } else {
-                rename_lost |= self.rename.meta;
+                gone.meta = true;
                 lost.push("the project properties".into());
             }
         }
         // A rename whose page the session changed must not leave the new tag here without the
         // page that uses it, nor the page without its device.
-        if rename_lost {
-            keep.pages.retain(|id, _| !self.rename.pages.contains(id));
-            keep.comments.retain(|id, _| !self.rename.pages.contains(id));
-            keep.devices.retain(|tag, _| !self.rename.devices.contains(tag));
-            keep.panels.retain(|id, _| !self.rename.panels.contains(id));
-            if self.rename.meta {
+        for group in &self.renames {
+            let hit = !group.pages.is_disjoint(&gone.pages)
+                || !group.devices.is_disjoint(&gone.devices)
+                || !group.panels.is_disjoint(&gone.panels)
+                || (group.meta && gone.meta);
+            if !hit {
+                continue;
+            }
+            keep.pages.retain(|id, _| !group.pages.contains(id));
+            keep.comments.retain(|id, _| !group.pages.contains(id));
+            keep.devices.retain(|tag, _| !group.devices.contains(tag));
+            keep.panels.retain(|id, _| !group.panels.contains(id));
+            if group.meta {
                 keep.meta = None;
             }
             lost.push("the device rename that waited with it".into());

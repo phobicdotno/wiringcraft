@@ -2768,6 +2768,66 @@ fn a_device_removed_beside_a_waiting_rename_with_jumpers_goes_out_at_once() -> T
 }
 
 #[test]
+fn a_waiting_rename_lost_to_the_session_leaves_another_rename_alone() -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3, k4) = (tag("-K1")?, tag("-K2")?, tag("-K3")?, tag("-K4")?);
+    let mut base = Project::new("Test");
+    for (id, num, sym, t) in [("p1", "1", "s1", &k1), ("p2", "2", "s3", &k3)] {
+        let mut page = Page::new(id, num, "Page");
+        page.symbols.push(wc_core::PlacedSymbol {
+            tag: Some(t.clone()),
+            ..symbol(sym, 10.0)
+        });
+        base.pages.push(page);
+        base.devices.insert(t.clone(), wc_core::Device::default());
+    }
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.rename_device(&k3, &k4);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    local.devices.get_mut(&k4).ok_or("no -K4")?.part = Some("acme.relay".into());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    let mut session = base.clone();
+    session.pages[0].title = "Theirs".into();
+    assert_eq!(
+        held.put_back(&mut session),
+        ["page 1", "the device rename that waited with it"]
+    );
+    // The first rename is lost whole; the second one, on its own page, is put back.
+    assert_eq!(session.pages[0].title, "Theirs");
+    assert!(session.devices.contains_key(&k1) && !session.devices.contains_key(&k2));
+    assert!(!session.devices.contains_key(&k3) && session.devices.contains_key(&k4));
+    assert_eq!(session.pages[1], local.pages[1]);
+    Ok(())
+}
+
+#[test]
+fn a_jumper_removed_beside_a_waiting_strip_rename_is_not_taken_for_its_old_side() -> TestResult {
+    let x1 = wc_core::DeviceTag::parse("-X1")?;
+    let x2 = wc_core::DeviceTag::parse("-X2")?;
+    let x9 = wc_core::DeviceTag::parse("-X9")?;
+    let mut base = Project::new("Test");
+    for strip in [&x1, &x9] {
+        base.meta.jumpers.push(wc_core::project::Jumper {
+            strip: strip.clone(),
+            terminals: vec!["1".into(), "2".into()],
+            part: None,
+        });
+        base.devices.insert(strip.clone(), wc_core::Device::default());
+    }
+    let mut local = base.clone();
+    // -X1 goes with its jumper, which shifts -X9's jumper to the front; -X9 becomes -X2.
+    local.meta.jumpers.remove(0);
+    local.devices.remove(&x1);
+    local.rename_device(&x9, &x2);
+    local.devices.get_mut(&x2).ok_or("no -X2")?.part = Some("acme.strip".into());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.strip")]));
+    assert!(!held.now.devices.contains_key(&x1));
+    assert!(held.now.devices.contains_key(&x2));
+    Ok(())
+}
+
+#[test]
 fn a_waiting_rename_is_dropped_whole_when_the_session_changed_one_of_its_pages() -> TestResult {
     let k1 = wc_core::DeviceTag::parse("-K1")?;
     let k2 = wc_core::DeviceTag::parse("-K2")?;
