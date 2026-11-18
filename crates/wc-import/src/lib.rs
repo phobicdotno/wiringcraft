@@ -28,6 +28,21 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// `s` with control characters (escape, line breaks, ...) written as `\u{1b}`, so a name from a
+/// source file prints as one line of plain text and cannot steer the terminal. Other characters,
+/// backslashes in paths included, are kept as they are.
+pub(crate) fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// One segment of an imported item's id, from a name in the source: ASCII letters and digits
 /// in lower case and `-` are kept, everything else becomes `_` (`Relay Coil` is `relay_coil`).
 pub fn id_segment(s: &str) -> String {
