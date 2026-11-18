@@ -1331,19 +1331,33 @@ fn custom_entities_are_counted_by_their_class_name_and_custom_objects_not() -> T
 
 #[test]
 fn a_damaged_class_section_is_named_and_the_rest_read() -> TestResult {
-    let v = Version::R2010;
-    let objs = vec![
-        entry(v, LAYER, LAYER_H, "0"),
-        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
-        line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
-    ];
-    for bad in [
-        vec![0u8; 40],
-        classes_section(v, &[(500, "WIPEOUT", true)])[..30].to_vec(),
-    ] {
-        let d = drawing(&sections_with_classes(v, &objs, bad))?;
-        assert_eq!(d.model.len(), 1, "the drawing is still read");
-        assert!(d.damaged.iter().any(|r| r.contains("AcDb:Classes")), "{:?}", d.damaged);
+    for v in [Version::R2004, Version::R2010] {
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+        ];
+        let whole = classes_section(v, &[(500, "WIPEOUT", true), (501, "IMAGE", true)]);
+        // A wrong sentinel, a section cut in its header, and one cut inside its second class.
+        for bad in [vec![0u8; 40], whole[..22].to_vec(), whole[..whole.len() - 6].to_vec()] {
+            let d = drawing(&sections_with_classes(v, &objs, bad))?;
+            assert_eq!(d.model.len(), 1, "{v:?}: the drawing is still read");
+            assert!(
+                d.damaged.iter().any(|r| r.contains("AcDb:Classes")),
+                "{v:?}: {:?}",
+                d.damaged
+            );
+            assert!(d.damaged.iter().all(|r| !r.contains("DWG: DWG:")), "{:?}", d.damaged);
+            assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{v:?}: {:?}", d.skipped);
+            assert!(
+                !d.skipped.contains_key(DAMAGED),
+                "a section is not an object: {:?}",
+                d.skipped
+            );
+        }
+        // An empty class list (highest class 499) is no damage.
+        let d = drawing(&sections_with_classes(v, &objs, classes_section(v, &[])))?;
+        assert!(d.damaged.is_empty(), "{v:?}: {:?}", d.damaged);
     }
     Ok(())
 }

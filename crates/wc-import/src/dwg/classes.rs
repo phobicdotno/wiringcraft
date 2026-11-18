@@ -39,7 +39,11 @@ pub(crate) struct Class {
 /// The classes by number, read from the `AcDb:Classes` section `data` of a drawing of `version`
 /// and maintenance release `maint` (byte 0x0B of the file header).
 pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<HashMap<u16, Class>> {
-    let damaged = |why: &str| bad(format!("the class section (AcDb:Classes) is damaged: {why}"));
+    // The reasons below are errors of their own; their "DWG: " is not repeated.
+    let damaged = |why: &str| {
+        let why = why.strip_prefix("DWG: ").unwrap_or(why);
+        bad(format!("the class section (AcDb:Classes) is damaged: {why}"))
+    };
     if !data.starts_with(&SENTINEL) {
         return Err(damaged("it does not start with its sentinel"));
     }
@@ -75,7 +79,8 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
         d.rc()?;
         d.b()?;
         let count = usize::from(max).saturating_sub(499);
-        if max < 500 && max != 0 || count > MAX_CLASSES {
+        // No classes is written as 499 (or 0); anything else below 500 is no class number.
+        if (max != 0 && max < 499) || count > MAX_CLASSES {
             return Err(bad(format!("it says the highest class is {max}")));
         }
         let mut classes = HashMap::new();

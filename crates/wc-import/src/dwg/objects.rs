@@ -36,6 +36,10 @@ pub const MAX_OBJECTS: usize = 4_000_000;
 /// The key under which objects that could not be decoded are counted in [`Drawing::skipped`].
 pub const DAMAGED: &str = "damaged objects";
 
+/// The skipped-count key for a class section that could not be read: custom entities (types 500
+/// and up) are then not named or counted.
+pub const CLASSES_DAMAGED: &str = "class section damaged (custom entities not counted)";
+
 /// The skipped-count key for blocks whose base point could not be read: they are kept, placed
 /// as if their base point were (0, 0).
 pub const BASE_UNREAD: &str = "block base points not read (placed from 0, 0)";
@@ -130,7 +134,8 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     let classes = match sections.get("AcDb:Classes") {
         None => HashMap::new(),
         Some(data) => read_classes(data, sections.version, sections.maint).unwrap_or_else(|e| {
-            *skipped.entry(DAMAGED.to_owned()).or_default() += 1;
+            // A section, not an object: counted under its own key, its reason with the others.
+            *skipped.entry(CLASSES_DAMAGED.to_owned()).or_default() += 1;
             damaged.push(e.to_string());
             HashMap::new()
         }),
