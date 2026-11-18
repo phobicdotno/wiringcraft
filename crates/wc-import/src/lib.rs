@@ -1,4 +1,4 @@
-//! Importers: symbols from DXF and SVG, parts from CSV, schematic drawings from DXF.
+//! Importers: symbols from DXF and SVG, parts from CSV and Excel workbooks, schematic drawings from DXF.
 //!
 //! Input is treated as hostile: malformed files produce errors or are skipped, never panics.
 
@@ -17,6 +17,7 @@ pub mod raster;
 pub mod svg;
 pub mod swe;
 pub mod wago;
+pub mod xlsx;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -1672,6 +1672,16 @@ impl App {
                                     Err(e) => format!("Could not save {}: {e}", path.display()),
                                 };
                             }
+                            if ui.button("Save as Excel").clicked() {
+                                let path = o.dir.join("export").join(format!("{}.xlsx", kind.name()));
+                                let res = std::fs::create_dir_all(o.dir.join("export"))
+                                    .and_then(|()| table.to_xlsx())
+                                    .and_then(|bytes| std::fs::write(&path, bytes));
+                                self.ed.message = match res {
+                                    Ok(()) => format!("Saved {}", path.display()),
+                                    Err(e) => format!("Could not save {}: {e}", path.display()),
+                                };
+                            }
                             if ui.button("Close").clicked() {
                                 keep = false;
                             }

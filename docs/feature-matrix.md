@@ -187,7 +187,7 @@ For the other areas, the chapter to read in each help is:
 | Table of contents | yes | yes | yes, linked in the PDF | done |
 | Report pages in the drawing set | yes | yes | yes | done |
 | Report templates the user designs | yes | yes | no | later |
-| Reports as CSV / Markdown | yes (Excel) | yes (Excel) | yes | done |
+| Reports as CSV / Markdown / Excel | yes (Excel) | yes (Excel) | yes: `report --format xlsx`, Reports → Save as Excel | done (#264) |
 
 ## 11. Panel layout and 3D
 
@@ -221,7 +221,7 @@ For the other areas, the chapter to read in each help is:
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |
 | AutomationML export | yes | partly | yes | done |
 | List exchange as CSV (import and export) | yes | yes | yes | done |
-| Excel workbook (.xlsx) import and export | yes | yes | no: CSV only | later |
+| Excel workbook (.xlsx) import and export | yes | yes | yes: parts and PLC address lists read from the first visible sheet with the CSV column names (`import parts-csv`, `import plc-csv`, `.xlsx` entries in archives); reports written one sheet per report, every cell as text; the old binary `.xls` is not read | done (#264) |
 | WAGO and other maker configurator links | add-on | partly | partly: terminal strips with rails, jumpers and accessories as a CSV for the WAGO configurator ([docs](wago-configurator.md)), and the chosen articles back onto the devices and jumpers (`import wago`, File → WAGO articles back) | partly (#122) |
 
 ## 14. Revisions and collaboration

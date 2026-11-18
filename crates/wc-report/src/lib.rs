@@ -1,6 +1,6 @@
 //! Reports generated from a project: parts list, device list, wire list, net list and terminal
-//! plan. Each report is a [`Table`] that can be written as CSV or Markdown, or laid out on PDF
-//! report pages.
+//! plan. Each report is a [`Table`] that can be written as CSV, Markdown or an Excel workbook, or
+//! laid out on PDF report pages.
 //!
 //! Reports are always derived from the schematic; they are never stored, so they can never be
 //! out of date.
@@ -19,6 +19,7 @@ pub mod plc;
 pub mod step;
 #[cfg(test)]
 mod tests;
+pub mod xlsx;
 
 pub use aml::{AmlCounts, automationml};
 pub use check::{Finding, Severity, check, check_table};
