@@ -98,11 +98,9 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     };
     let xref = layout::CrossRefs::build(project, symbols);
     // Report pages use the size of the first schematic page (a larger one when that is too
-    // short for a table) and are counted in the sheet total.
-    let size = layout::report_size(
-        pages.first().map(|p| p.size).unwrap_or_default(),
-        project.meta.template.band_height(),
-    );
+    // short for a table) and are counted in the sheet total. Panel layouts keep that page's size.
+    let first_size = pages.first().map(|p| p.size).unwrap_or_default();
+    let size = layout::report_size(first_size, project.meta.template.band_height());
     let per_page = layout::rows_per_page(size, project.meta.template.band_height());
     // Each report page: (table, first row, part, parts). Front tables (the table of contents)
     // come before the schematic pages, the rest after them.
@@ -191,10 +189,10 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     // Panel layouts follow the schematic pages, one sheet each.
     for (k, panel) in options.panels.iter().enumerate() {
         let mut page = wc_core::Page::new(format!("panel-{}", panel.id), format!("P{}", k + 1), panel.name.clone());
-        page.size = size;
+        page.size = first_size;
         let mut drawn = layout::draw_panel_page(project, &page, sheet, total, panel, &options.date);
         place_logo(&mut drawn, &page);
-        doc.add_page(size.mm(), &format!("{} {}", page.number, panel.name), drawn);
+        doc.add_page(first_size.mm(), &format!("{} {}", page.number, panel.name), drawn);
         sheet += 1;
     }
     add_reports(&mut doc, back_pages, &mut sheet);

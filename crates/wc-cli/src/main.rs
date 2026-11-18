@@ -1783,7 +1783,11 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 };
                 let mut page = Page::new(id, (first_page + i).to_string(), format!("{stem} p.{}", i + 1));
                 page.underlay = underlay;
-                page.size = sheet_for(t.size_mm);
+                let (size, why) = sheet_for(t.size_mm);
+                if let Some(why) = why {
+                    eprintln!("warning: page {} of {stem}: {why}", i + 1);
+                }
+                page.size = size;
                 println!("page {}: {} shapes", page.number, t.graphics.len());
                 page.graphics = t.graphics;
                 p.pages.push(page);
@@ -2238,21 +2242,30 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
 
 /// The sheet for a traced drawing of `(width, height)` millimetres: the smallest ISO size
 /// that holds both sides, upright when the drawing is. A drawing larger than A0 gets a sheet
-/// of its own size (A0 when that is beyond the custom range).
-fn sheet_for((w, h): (f64, f64)) -> PageSize {
+/// of its own size, each side at least [`PageSize::MIN_MM`]; one beyond the custom range gets
+/// A0, with the reason as a warning.
+fn sheet_for((w, h): (f64, f64)) -> (PageSize, Option<String>) {
     // PDF sizes are in points, so an A3 page reads a fraction of a millimetre off.
     const SLACK: f64 = 1.0;
     let portrait = h > w;
-    PageSize::NAMED
+    if let Some(named) = PageSize::NAMED
         .into_iter()
         .filter(|s| s.is_portrait() == portrait)
         .find(|s| {
             let (sw, sh) = s.mm();
             w <= sw + SLACK && h <= sh + SLACK
         })
-        // Larger than A0: a sheet of the page's own size, or A0 when even that is too large.
-        .or_else(|| PageSize::custom(w.ceil() as u32, h.ceil() as u32).ok())
-        .unwrap_or(if portrait { PageSize::A0Portrait } else { PageSize::A0 })
+    {
+        return (named, None);
+    }
+    let side = |mm: f64| (mm.ceil() as u32).max(PageSize::MIN_MM);
+    match PageSize::custom(side(w), side(h)) {
+        Ok(size) => (size, None),
+        Err(why) => {
+            let a0 = if portrait { PageSize::A0Portrait } else { PageSize::A0 };
+            (a0, Some(format!("{why}, so it is drawn on {}", a0.label())))
+        }
+    }
 }
 
 /// What `lib lock` could not pin, one line each.
@@ -3661,6 +3674,7 @@ mod tests {
 
     #[test]
     fn pages_can_be_upright_large_or_of_their_own_size() {
+        let sheet_for_size = |mm| sheet_for(mm).0;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
@@ -3686,22 +3700,31 @@ mod tests {
         );
         let err = cli(&dir, &["page", "add", "bad", "--number", "bad", "--size", "A5"]).unwrap_err();
         assert!(err.contains("portrait"), "{err}");
-        assert_eq!(sheet_for((210.0, 297.0)), PageSize::A4Portrait);
-        assert_eq!(sheet_for((841.0, 594.0)), PageSize::A1);
-        assert_eq!(sheet_for((420.0, 297.0)), PageSize::A3);
+        assert_eq!(sheet_for_size((210.0, 297.0)), PageSize::A4Portrait);
+        assert_eq!(sheet_for_size((841.0, 594.0)), PageSize::A1);
+        assert_eq!(sheet_for_size((420.0, 297.0)), PageSize::A3);
         // Both sides count: a 950 x 600 mm page is wider than A1 though its long side is short
         // of A0's.
-        assert_eq!(sheet_for((950.0, 600.0)), PageSize::A0);
+        assert_eq!(sheet_for_size((950.0, 600.0)), PageSize::A0);
         // A point-rounded A3 still reads as A3.
-        assert_eq!(sheet_for((420.3, 297.2)), PageSize::A3);
+        assert_eq!(sheet_for_size((420.3, 297.2)), PageSize::A3);
         assert_eq!(
-            sheet_for((1300.0, 900.0)),
+            sheet_for_size((1300.0, 900.0)),
             PageSize::Custom {
                 width: 1300,
                 height: 900
             }
         );
-        assert_eq!(sheet_for((5000.0, 900.0)), PageSize::A0);
+        assert_eq!(sheet_for_size((5000.0, 900.0)), PageSize::A0);
+        assert!(sheet_for((5000.0, 900.0)).1.is_some_and(|w| w.contains("A0 landscape")));
+        // A long, low drawing gets the smallest side a sheet may have.
+        assert_eq!(
+            sheet_for_size((1300.0, 80.0)),
+            PageSize::Custom {
+                width: 1300,
+                height: 100
+            }
+        );
     }
 
     #[test]

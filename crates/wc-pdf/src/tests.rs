@@ -1214,3 +1214,36 @@ fn an_upright_a1_page_prints_on_an_upright_a1_sheet() {
         "upright A1 is 594 x 841 mm"
     );
 }
+
+#[test]
+fn a_report_after_a_short_first_page_prints_on_the_larger_sheet() {
+    let mut project = Project::new("x");
+    project.meta.template.height = 60.0;
+    let mut page = Page::new("p1", "1", "Strip");
+    page.size = PageSize::Custom {
+        width: 300,
+        height: 100,
+    };
+    project.pages = vec![page];
+    let opts = Options {
+        reports: vec![wc_report::Table {
+            title: "Parts list".into(),
+            columns: vec!["Part".into()],
+            rows: vec![vec!["Relay".into()]],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    assert_eq!(report.pages, 2);
+    let text = String::from_utf8_lossy(&pdf);
+    let want = layout::report_size(project.pages[0].size, project.meta.template.band_height());
+    assert_eq!(want, PageSize::A4);
+    let pt = |mm: f64| mm / 25.4 * 72.0;
+    let media = |(w, h): (f64, f64)| format!("/MediaBox [0 0 {:.2} {:.2}]", pt(w), pt(h));
+    assert!(
+        text.contains(&media(project.pages[0].size.mm())),
+        "the page keeps its sheet"
+    );
+    assert!(text.contains(&media(want.mm())), "the report is on A4");
+}

@@ -837,12 +837,12 @@ impl PageSize {
                 "size {text:?} is not A4, A3, A2, A1 or A0 (add \"portrait\" for an upright sheet) or a custom WIDTHxHEIGHT in millimetres"
             )
         };
-        let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
-        let compact = compact.strip_suffix("mm").unwrap_or(&compact);
-        let (w, h) = compact.split_once('x').ok_or_else(bad)?;
+        // Spaces around `x` and before `mm` are fine; inside a number they are not.
+        let dims = lower.strip_suffix("mm").unwrap_or(&lower);
+        let (w, h) = dims.split_once('x').ok_or_else(bad)?;
         let (width, height) = (
-            w.parse::<u32>().map_err(|_| bad())?,
-            h.parse::<u32>().map_err(|_| bad())?,
+            w.trim().parse::<u32>().map_err(|_| bad())?,
+            h.trim().parse::<u32>().map_err(|_| bad())?,
         );
         PageSize::custom(width, height)
     }
@@ -1452,7 +1452,18 @@ mod tests {
             assert_eq!(PageSize::parse(text), Ok(want), "{text}");
         }
         for bad in [
-            "A5", "B4", "50x700", "500x9000", "500x", "x", "", "-500x700", "500x-700", "ap", "a4pp",
+            "A5",
+            "B4",
+            "50x700",
+            "500x9000",
+            "500x",
+            "x",
+            "",
+            "-500x700",
+            "500x-700",
+            "ap",
+            "a4pp",
+            "50 0 x 700 mm",
         ] {
             assert!(PageSize::parse(bad).is_err(), "{bad}");
         }

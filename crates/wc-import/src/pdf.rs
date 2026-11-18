@@ -538,7 +538,7 @@ impl Doc {
         node: &Obj,
         res: Option<&Obj>,
         mb: Option<[f64; 4]>,
-        rotate: Option<&Obj>,
+        rotate: Option<f64>,
         out: &mut Vec<(BTreeMap<String, Obj>, Obj, [f64; 4])>,
         depth: usize,
     ) {
@@ -548,13 +548,15 @@ impl Doc {
         let Some(d) = node.dict() else { return };
         let res = d.get("Resources").map(|r| self.get(r)).or(res);
         let mb = self.media_box(d.get("MediaBox")).or(mb);
-        let rotate = d.get("Rotate").map(|r| self.get(r)).or(rotate);
+        // Only a number rotates; a missing or null /Rotate keeps what the parent has.
+        let rotate = d.get("Rotate").and_then(|r| self.get(r).num()).or(rotate);
         match d.get("Type").and_then(Obj::name) {
             Some("Page") => {
                 let mut page = d.clone();
-                if let Some(r) = rotate {
-                    page.insert("Rotate".into(), r.clone());
-                }
+                match rotate {
+                    Some(r) => page.insert("Rotate".into(), Obj::Num(r)),
+                    None => page.remove("Rotate"),
+                };
                 out.push((
                     page,
                     res.cloned().unwrap_or(Obj::Null),
@@ -1611,6 +1613,9 @@ mod tests {
         // The page's own rotation wins.
         let p = pages(&doc("/Rotate 0"))?;
         assert!((p[0].size_mm.0 - 210.0).abs() < 0.5, "{:?}", p[0].size_mm);
+        // A null one is no rotation of its own: the parent's still applies.
+        let p = pages(&doc("/Rotate null"))?;
+        assert!((p[0].size_mm.0 - 297.0).abs() < 0.5, "{:?}", p[0].size_mm);
         Ok(())
     }
 
