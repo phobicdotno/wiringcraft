@@ -1822,7 +1822,8 @@ struct Form {
     name: String,
     email: String,
     addr: String,
-    folder: String,
+    /// Picked with Browse it is used exactly as picked; typed it follows the typed-path rules.
+    folder: crate::prefs::FolderField,
     browser: Option<Browser>,
     browse_error: Option<String>,
     sessions: Vec<wc_share::discovery::Session>,
@@ -1842,6 +1843,20 @@ enum ErrorAbout {
 }
 
 impl Form {
+    /// What Browse gave for the folder: a picked folder is kept exactly (a name ending in a
+    /// space included); a picker that could not open is an error on the folder field.
+    fn browsed(&mut self, picked: crate::Picked) {
+        match picked {
+            crate::Picked::Path(d) => {
+                if let Err(e) = self.folder.pick(d) {
+                    self.fail(ErrorAbout::Folder, e);
+                }
+            }
+            crate::Picked::Failed(e) => self.fail(ErrorAbout::Folder, e),
+            crate::Picked::Cancelled => {}
+        }
+    }
+
     /// Show an error about one field.
     fn fail(&mut self, about: ErrorAbout, error: String) {
         self.error = Some(error);
@@ -1854,7 +1869,7 @@ impl Form {
     fn forget_error_unless(&mut self, addr: &str, folder: &str) {
         let changed = match self.error_about {
             ErrorAbout::Address => self.addr != addr,
-            ErrorAbout::Folder => self.folder != folder,
+            ErrorAbout::Folder => self.folder.text != folder,
         };
         if changed {
             self.error = None;
@@ -1882,7 +1897,7 @@ impl Default for Form {
             name: crate::state::author_name(),
             email: author_email(),
             addr: String::new(),
-            folder: crate::prefs::projects_dir().join("Shared").display().to_string(),
+            folder: crate::prefs::FolderField::typed(crate::prefs::projects_dir().join("Shared").display().to_string()),
             browser: None,
             browse_error: None,
             sessions: Vec::new(),
@@ -3166,7 +3181,7 @@ impl Share {
                         None => "None found yet. Over a VPN, type the host's address below.".into(),
                     });
                 }
-                let typed = (form.addr.clone(), form.folder.clone());
+                let typed = (form.addr.clone(), form.folder.text.clone());
                 for s in &form.sessions {
                     let (label, joinable) = session_row(s);
                     // A session on another version cannot be joined, so it cannot be picked either.
@@ -3188,13 +3203,9 @@ impl Share {
                     ui.end_row();
                     ui.label("Keep my copy in");
                     ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut form.folder);
+                        ui.text_edit_singleline(&mut form.folder.text);
                         if ui.button("Browse…").clicked() {
-                            match crate::pick_folder("Keep my copy in", &form.folder) {
-                                crate::Picked::Path(d) => form.folder = d.display().to_string(),
-                                crate::Picked::Failed(e) => form.fail(ErrorAbout::Folder, e),
-                                crate::Picked::Cancelled => {}
-                            }
+                            form.browsed(crate::pick_folder("Keep my copy in", &form.folder.text));
                         }
                     });
                     ui.end_row();
@@ -3208,7 +3219,7 @@ impl Share {
                     .clicked();
             });
         if join {
-            self.ask_to_join(crate::prefs::project_path);
+            self.ask_to_join(crate::prefs::FolderField::path);
         } else if !keep {
             if let Some(f) = self.form.as_mut() {
                 f.browser = None;
@@ -3217,9 +3228,9 @@ impl Share {
         }
     }
 
-    /// "Ask to join" with what the join form holds. `folder` resolves the typed folder (see
-    /// [`crate::prefs::project_path`]); an error is shown on the field it is about.
-    fn ask_to_join(&mut self, folder: impl FnOnce(&str) -> Result<PathBuf, String>) {
+    /// "Ask to join" with what the join form holds. `folder` resolves the folder field (see
+    /// [`crate::prefs::FolderField::path`]); an error is shown on the field it is about.
+    fn ask_to_join(&mut self, folder: impl FnOnce(&crate::prefs::FolderField) -> Result<PathBuf, String>) {
         let Some(form) = self.form.as_ref() else {
             return;
         };

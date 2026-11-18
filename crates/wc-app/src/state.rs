@@ -1191,7 +1191,9 @@ impl Open {
     /// many links in the project folder were left out of the copy. When saving in the copy
     /// fails, the project goes on being worked on in its old folder.
     pub fn save_as(&mut self, target: &Path) -> Result<(PathBuf, usize), String> {
-        let target = crate::prefs::absolute(target)?;
+        // Resolved as the file system walks it (a link, then `..`), and that same folder is
+        // checked, copied into and worked in, so the check and the copy cannot part ways.
+        let target = destination(&crate::prefs::absolute(target)?);
         let from = self.dir.clone();
         // Compared as the file system resolves them, so another letter case on Windows, a link
         // or `..` cannot hide that the target is inside the project.
@@ -1287,12 +1289,15 @@ impl Open {
             }
         };
         let (old_libraries, old_dirty) = (self.project.meta.libraries.clone(), self.dirty);
+        // The save in the copy repairs stale symbol files there; the original still needs them.
+        let old_stale = self.stale_symbol_files.clone();
         repoint(&mut self.project.meta.libraries);
         self.dir = target.clone();
         if let Err(e) = self.save() {
             self.dir = from.clone();
             self.project.meta.libraries = old_libraries;
             self.dirty = old_dirty;
+            self.stale_symbol_files = old_stale;
             discard();
             return Err(format!(
                 "{e}\nThe copy in {} was taken away again; you are still working in {}.",
@@ -2373,6 +2378,42 @@ fn lexical_parts(p: &Path) -> Vec<std::path::Component<'_>> {
     out
 }
 
+/// A full path as the file system walks it: its longest existing part (with any `..` in it)
+/// resolved, links and all, then the rest added, a `..` in the rest going up from the folder
+/// reached so far. `/w/link/../copy` with `link` pointing at `/w/a/b` is `/w/a/copy`.
+fn destination(p: &Path) -> PathBuf {
+    use std::path::Component;
+    for at in p.ancestors() {
+        let Ok(real) = std::fs::canonicalize(at) else { continue };
+        let mut out = without_verbatim(real);
+        // Components after the existing part, none of which exists: no link among them, so a
+        // `..` there goes up from the folder reached so far.
+        for c in p.strip_prefix(at).map(Path::components).into_iter().flatten() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    out.pop();
+                }
+                c => out.push(c.as_os_str()),
+            }
+        }
+        return out;
+    }
+    lexical(p)
+}
+
+/// A resolved Windows path in its usual form (`C:\x`, not `\\?\C:\x`); others as they are.
+fn without_verbatim(p: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut parts = p.components();
+    if let Some(Component::Prefix(pre)) = parts.next()
+        && let Prefix::VerbatimDisk(d) = pre.kind()
+    {
+        return PathBuf::from(format!("{}:", char::from(d))).join(parts.as_path());
+    }
+    p
+}
+
 /// [`lexical_parts`] as a path: `/w/old/../lib` is `/w/lib`.
 fn lexical(p: &Path) -> PathBuf {
     lexical_parts(p).iter().map(|c| c.as_os_str()).collect()
@@ -2459,8 +2500,10 @@ pub(crate) mod tests {
         o.project.meta.name = "Changed".into();
         o.dirty = true;
         let to = tmp.path().join("copies").join("plant 2");
-        assert_eq!(o.save_as(&to).unwrap(), (to.clone(), 0));
-        assert_eq!(o.dir, to);
+        // The folder as the file system names it (a temp folder can be reached through a link
+        // or a short name).
+        assert_eq!(o.save_as(&to).unwrap(), (destination(&to), 0));
+        assert_eq!(o.dir, destination(&to));
         assert!(!o.dirty);
         // The original is as it was last saved; the copy has the change and its library is
         // the same folder seen from the new place.
@@ -2489,6 +2532,61 @@ pub(crate) mod tests {
         // Not over a folder with something in it, and not inside the project itself.
         assert!(o.save_as(&from).unwrap_err().contains("already exists"));
         assert!(o.save_as(&to.join("inner")).unwrap_err().contains("inside the project"));
+    }
+
+    #[test]
+    fn a_destination_is_resolved_as_the_file_system_walks_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = destination(tmp.path());
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        // `..` in the part that does not exist yet goes up from the folder reached so far.
+        assert_eq!(
+            destination(&root.join("new").join("..").join("copy")),
+            root.join("copy")
+        );
+        assert_eq!(destination(&root.join("a").join("..").join("copy")), root.join("copy"));
+        assert_eq!(
+            destination(&root.join("a").join("b").join("x")),
+            root.join("a").join("b").join("x")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_through_a_link_and_dots_into_the_project_is_refused() {
+        let (tmp, mut o) = project();
+        // `link` points at a folder inside the project: `link/../copy` is inside it too.
+        std::fs::create_dir_all(o.dir.join("inner")).unwrap();
+        std::os::unix::fs::symlink(o.dir.join("inner"), tmp.path().join("link")).unwrap();
+        let typed = tmp.path().join("link").join("..").join("copy");
+        let err = o.save_as(&typed).unwrap_err();
+        assert!(err.contains("inside the project"), "{err}");
+        assert!(!o.dir.join("copy").exists() && !tmp.path().join("copy").exists());
+    }
+
+    #[test]
+    fn a_failed_save_as_leaves_the_symbol_repairs_for_the_original() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        o.place(1, "wc.lamp", Point::new(60.0, 20.0)).unwrap();
+        o.save().unwrap();
+        // Both files on disk hold another version than the loaded one.
+        let (coil, lamp) = (o.symbols["wc.coil"].clone(), o.symbols["wc.lamp"].clone());
+        for s in [&coil, &lamp] {
+            let mut other = s.clone();
+            other.name = "Other version".into();
+            store::write_vendored_symbol(&o.dir, &other).unwrap();
+            o.mark_symbol_file_stale(&s.id);
+        }
+        // In the copy the coil is repaired, then the lamp cannot be written: Save as fails.
+        o.fail_symbol_writes = [false, true].into();
+        let from = o.dir.clone();
+        assert!(o.save_as(&tmp.path().join("copy")).is_err());
+        assert_eq!(o.dir, from);
+        // Saving the original still repairs both of its files.
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), coil);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.lamp").unwrap(), lamp);
     }
 
     #[test]
