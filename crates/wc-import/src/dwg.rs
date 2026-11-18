@@ -1,6 +1,6 @@
-//! The container of AutoCAD DWG files from AutoCAD 2004 and 2010 (`AC1018`, `AC1024`): the first
-//! step of reading DWG drawings, which SolidWorks Electrical stores its symbol and page graphics
-//! in (#59).
+//! The container of AutoCAD DWG files from AutoCAD 2004, 2007 and 2010 (`AC1018`, `AC1021`,
+//! `AC1024`): the first step of reading DWG drawings, which SolidWorks Electrical stores its
+//! symbol and page graphics in (#59).
 //!
 //! A DWG file of these versions is a set of pages. A short header at the start holds a second,
 //! XOR-scrambled header that says where the *page map* (each page's number and size) and the
@@ -9,17 +9,19 @@
 //! returns each named section (`AcDb:Header`, `AcDb:Classes`, `AcDb:Handles`,
 //! `AcDb:AcDbObjects`, ...) as plain bytes, for the later steps that decode objects and entities.
 //!
-//! AutoCAD 2007 files (`AC1021`) use a different container and are refused with a clear message;
-//! older and newer versions are refused too. Sections stored encrypted (password-protected
-//! drawings) are listed in [`Sections::skipped`] and not returned.
+//! AutoCAD 2007 files (`AC1021`) use a different container, with Reed-Solomon coded pages and
+//! another compression; [`read_sections`] reads them too and returns the same sections (#215).
+//! Older and newer versions are refused with a clear message. Sections stored encrypted
+//! (password-protected drawings) are listed in [`Sections::skipped`] and not returned.
 //!
 //! [`read_drawing`] goes on to decode the objects in those sections into blocks and shapes; see
 //! [`objects`].
 //!
 //! Written from the published Open Design Specification for .dwg files and LibreDWG's reading
 //! of it, tested with files the tests write themselves and checked against 1666 real AutoCAD
-//! 2004 and 2010 files of a SolidWorks Electrical symbol library. Input is treated as hostile: every size and offset is
-//! checked, and a damaged file gives an error naming what is wrong, never a panic.
+//! 2004 and 2010 files of a SolidWorks Electrical symbol library. The 2007 container is written
+//! from the specification only (see [`r2007`]). Input is treated as hostile: every size and
+//! offset is checked, and a damaged file gives an error naming what is wrong, never a panic.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +29,7 @@ use crate::{Error, Result};
 
 mod bits;
 pub mod objects;
+pub mod r2007;
 
 pub use objects::{Drawing, read_drawing};
 
@@ -65,6 +68,8 @@ const SECTION_DESCRIPTION: usize = 0x60;
 pub enum Version {
     /// AutoCAD 2004 to 2006 (`AC1018`).
     R2004,
+    /// AutoCAD 2007 to 2009 (`AC1021`).
+    R2007,
     /// AutoCAD 2010 to 2012 (`AC1024`).
     R2010,
 }
@@ -108,12 +113,10 @@ pub fn version(bytes: &[u8]) -> Result<Version> {
         .ok_or_else(|| bad("the file is too short to be a drawing"))?;
     match tag {
         b"AC1018" => Ok(Version::R2004),
+        b"AC1021" => Ok(Version::R2007),
         b"AC1024" => Ok(Version::R2010),
-        b"AC1021" => Err(bad(
-            "AutoCAD 2007 drawings (AC1021) are not supported yet; save the drawing as AutoCAD 2010 or 2004",
-        )),
         t if t.starts_with(b"AC") => Err(bad(format!(
-            "drawing version {} is not supported; save it as AutoCAD 2010 or 2004",
+            "drawing version {} is not supported; save it as AutoCAD 2010, 2007 or 2004",
             String::from_utf8_lossy(t)
         ))),
         _ => Err(bad("not a DWG drawing (it does not start with a version)")),
@@ -129,6 +132,9 @@ pub fn read_sections(bytes: &[u8]) -> Result<Sections> {
 /// their pages may decompress to, in bytes.
 pub fn read_sections_with(bytes: &[u8], max_total: usize) -> Result<Sections> {
     let version = version(bytes)?;
+    if version == Version::R2007 {
+        return r2007::read_sections(bytes, max_total);
+    }
     let header = second_header(bytes)?;
     let page_map_at = header
         .u64(0x54)?
@@ -634,6 +640,10 @@ impl<T: AsRef<[u8]>> Reader<T> {
 
     fn u64(&self, at: usize) -> Result<u64> {
         self.bytes(at).map(u64::from_le_bytes)
+    }
+
+    fn i64(&self, at: usize) -> Result<i64> {
+        self.bytes(at).map(i64::from_le_bytes)
     }
 
     /// A name in a 64-byte field, ended by a zero byte.

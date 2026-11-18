@@ -216,16 +216,49 @@ impl Obj {
             Version::R2004 => {
                 self.data.t8(s);
             }
-            Version::R2010 => {
+            Version::R2007 | Version::R2010 => {
                 self.strings.tu(s);
             }
         }
         self
     }
 
+    /// The texts, their size and a flag, at the end of the data (2007 and 2010).
+    fn string_stream(&self, w: &mut W) {
+        if self.strings.0.is_empty() {
+            w.b(false);
+        } else {
+            let n = self.strings.0.len();
+            w.append(&self.strings);
+            if n >= 0x8000 {
+                w.rs((n >> 15) as u16).rs((n & 0x7FFF) as u16 | 0x8000);
+            } else {
+                w.rs(n as u16);
+            }
+            w.b(true);
+        }
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut w = W::default();
         match self.version {
+            Version::R2007 => {
+                // As 2004, with the texts at the end of the data, before the size in bits says
+                // it ends.
+                w.bs(self.kind);
+                let rl_at = w.0.len();
+                w.rl(0).h(0, self.handle).append(&self.data);
+                self.string_stream(&mut w);
+                let size = w.0.len() as u32;
+                let mut rl = W::default();
+                rl.rl(size);
+                w.0.splice(rl_at..rl_at + 32, rl.0);
+                w.append(&self.handles);
+                let bytes = w.bytes();
+                let mut out = ms(bytes.len());
+                out.extend(bytes);
+                out
+            }
             Version::R2004 => {
                 w.bs(self.kind);
                 let rl_at = w.0.len();
@@ -247,18 +280,7 @@ impl Obj {
                     k => w.bb(2).rs(k),
                 };
                 w.h(0, self.handle).append(&self.data);
-                if self.strings.0.is_empty() {
-                    w.b(false);
-                } else {
-                    let n = self.strings.0.len();
-                    w.append(&self.strings);
-                    if n >= 0x8000 {
-                        w.rs((n >> 15) as u16).rs((n & 0x7FFF) as u16 | 0x8000);
-                    } else {
-                        w.rs(n as u16);
-                    }
-                    w.b(true);
-                }
+                self.string_stream(&mut w);
                 let end = w.0.len();
                 w.append(&self.handles);
                 let bytes = w.bytes();
@@ -319,7 +341,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
         d.bs(3).h(5, 0x99).rc(1).rc(2).rc(3).bs(0);
         d.b(true);
         match v {
-            Version::R2004 => d.rl(2),
+            Version::R2004 | Version::R2007 => d.rl(2),
             Version::R2010 => d.bll(2),
         };
         d.rc(0xAB).rc(0xCD);
@@ -337,8 +359,12 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
     d.bd(1.0)
         .bb(if h.extras { 3 } else { 0 })
         .bb(if h.extras { 3 } else { 0 });
+    // Material and shadow flags from 2007 on, visual styles from 2010 on.
+    if v != Version::R2004 {
+        d.bb(0).rc(0);
+    }
     if v == Version::R2010 {
-        d.bb(0).rc(0).b(false).b(h.extras).b(false);
+        d.b(false).b(h.extras).b(false);
     }
     d.bs(u16::from(h.invisible)).rc(0);
     let hs = &mut o.handles;
@@ -417,7 +443,8 @@ fn attrib(v: Version, kind: u16, handle: u64, h: Head, at: (f64, f64), value: &s
     }
     o.text(tag);
     o.data.bs(0).rc(flags);
-    if v == Version::R2010 {
+    // The lock position flag, from 2007 on.
+    if v != Version::R2004 {
         o.data.b(false);
     }
     if kind == 3 {
@@ -575,7 +602,8 @@ fn sample(v: Version) -> Vec<Obj> {
         .bd3((0.0, 0.0, 1.0))
         .bd3((1.0, 0.0, 0.0))
         .bd(50.0);
-    if v == Version::R2010 {
+    // The reference rectangle's height, from 2007 on.
+    if v != Version::R2004 {
         m.data.bd(10.0);
     }
     m.data.bd(2.5).bs(5).bs(1).bd(0.0).bd(0.0);
@@ -1129,7 +1157,7 @@ fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: boo
     let mut o = named(v, BLOCK_HEADER, handle, name);
     match v {
         Version::R2004 => o.data.b(true).bs(0).b(false),
-        Version::R2010 => o.data.bs(0),
+        Version::R2007 | Version::R2010 => o.data.bs(0),
     };
     o.data.b(false).b(false).b(xref).b(false).b(false);
     if !xref {

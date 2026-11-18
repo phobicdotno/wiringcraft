@@ -139,6 +139,10 @@ pub(super) struct TestSection {
     pub(super) claimed_extra: u32,
     /// The page size the section map gives instead of the real one (a damaged file).
     pub(super) page_size: Option<u32>,
+    /// 2007: pages coded without interleaving (encoding 1).
+    pub(super) plain: bool,
+    /// 2007: pages of zeros are not written, as AutoCAD does.
+    pub(super) zero_pages_left_out: bool,
 }
 
 const MAX_PAGE_DATA: usize = 0x7400;
@@ -408,10 +412,17 @@ fn other_versions_are_refused_with_a_reason() {
         Err(e) => e.to_string(),
         Ok(_) => String::from("read"),
     };
+    // AutoCAD 2007 is read; a 2010 container named 2007 is not one.
     let mut r2007 = write_dwg(b"AC1024", &sample_sections()[..1]);
     r2007[..6].copy_from_slice(b"AC1021");
-    assert!(message(&r2007).contains("AutoCAD 2007"), "{}", message(&r2007));
-    assert!(message(b"AC1015 and more").contains("AC1015"));
+    r2007.resize(0x1000, 0);
+    assert!(
+        message(&r2007).contains("file header is damaged"),
+        "{}",
+        message(&r2007)
+    );
+    let old = message(b"AC1015 and more");
+    assert!(old.contains("AC1015") && old.contains("2010, 2007 or 2004"), "{old}");
     assert!(message(b"PK\x03\x04 a zip file").contains("not a DWG"));
     assert!(message(b"AC").contains("too short"));
 }
@@ -749,5 +760,618 @@ fn a_changed_byte_in_a_compressed_page_that_still_decompresses_is_caught() -> Te
         m.contains("AcDb:Classes") && m.contains("page 1") && m.contains("page's data is damaged (wrong checksum)"),
         "{m}"
     );
+    Ok(())
+}
+
+// ---- AutoCAD 2007: a compressor, Reed-Solomon words and a file writer for the tests ----
+
+use super::r2007::{self, Field, PAGE_FIELD, SYSTEM_FIELD, unshuffle};
+
+/// Store a literal run so that the reader's order gives `run` back.
+fn shuffle(run: &[u8], out: &mut Vec<u8>) {
+    for part in run.chunks(32) {
+        let index: Vec<u8> = (0..part.len() as u8).collect();
+        let mut order = Vec::new();
+        unshuffle(&index, &mut order);
+        let mut stored = vec![0u8; part.len()];
+        for (t, &from) in order.iter().enumerate() {
+            stored[usize::from(from)] = part[t];
+        }
+        out.extend(stored);
+    }
+}
+
+/// Compress `data` in the 2007 compression, with a greedy search for repeats. It writes short
+/// and long literal runs (also one starting the stream with 0x20) and copies of each kind
+/// but the one only reachable as 0xF?: near (0x30..), up to 0x2000 back (0x10..) and up to
+/// 0xFFFF back, short and long (0x20..).
+pub(super) fn compress_2007(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut seen: HashMap<[u8; 3], usize> = HashMap::new();
+    let mut pending: Vec<u8> = Vec::new();
+    // Where the last copy's final byte is, whose low bits can hold a literal count.
+    let mut slot: Option<usize> = None;
+    let mut pos = 0;
+    while pos < data.len() {
+        let mut best = None;
+        if let Some(key) = data.get(pos..pos + 3).and_then(|k| <[u8; 3]>::try_from(k).ok()) {
+            if let Some(&prev) = seen.get(&key) {
+                let back = pos - prev;
+                let mut len = 0;
+                while pos + len < data.len() && data[prev + len] == data[pos + len] && len < 0x1_00FF {
+                    len += 1;
+                }
+                if back <= 0xFFFF && len >= 3 {
+                    best = Some((len, back));
+                }
+            }
+            seen.insert(key, pos);
+        }
+        match best {
+            None => {
+                pending.push(data[pos]);
+                pos += 1;
+            }
+            Some((len, back)) => {
+                literals_2007(&mut out, &mut pending, slot);
+                slot = Some(copy_2007(&mut out, len, back));
+                for p in pos + 1..pos + len {
+                    if let Some(key) = data.get(p..p + 3).and_then(|k| <[u8; 3]>::try_from(k).ok()) {
+                        seen.insert(key, p);
+                    }
+                }
+                pos += len;
+            }
+        }
+    }
+    literals_2007(&mut out, &mut pending, slot);
+    out
+}
+
+fn literals_2007(out: &mut Vec<u8>, pending: &mut Vec<u8>, slot: Option<usize>) {
+    let n = pending.len();
+    if n == 0 {
+        return;
+    }
+    match slot {
+        Some(slot) if n <= 7 => out[slot] |= n as u8,
+        None if n <= 7 => out.extend([0x20, 0, 0, n as u8]),
+        _ if n <= 0x16 => out.push((n - 8) as u8),
+        _ => {
+            out.push(0x0F);
+            let x = n - 0x17;
+            if x < 0xFF {
+                out.push(x as u8);
+            } else {
+                out.push(0xFF);
+                let mut rest = x - 0xFF;
+                while rest >= 0xFFFF {
+                    out.extend([0xFF, 0xFF]);
+                    rest -= 0xFFFF;
+                }
+                out.extend((rest as u16).to_le_bytes());
+            }
+        }
+    }
+    shuffle(pending, out);
+    pending.clear();
+}
+
+/// Write a copy of `len` bytes from `back` bytes back; returns where its final byte is.
+fn copy_2007(out: &mut Vec<u8>, len: usize, back: usize) -> usize {
+    let b = back - 1;
+    if (3..=14).contains(&len) && back <= 0x200 {
+        out.push(((len << 4) | (b & 15)) as u8);
+        out.push(((b >> 4) << 3) as u8);
+    } else if len <= 18 && back <= 0x2000 {
+        out.push(0x10 | (len - 3) as u8);
+        out.push((b & 0xFF) as u8);
+        out.push(((b >> 8) << 3) as u8);
+    } else if len <= 0xFF {
+        out.push(0x20 | (len & 7) as u8);
+        out.extend((back as u16).to_le_bytes());
+        out.push((len & 0xF8) as u8);
+    } else {
+        let l = len - 0x100;
+        out.push(0x28 | (l & 7) as u8);
+        out.extend((b as u16).to_le_bytes());
+        out.push(((l >> 3) & 0xFF) as u8);
+        out.push((((l >> 11) & 0x1F) << 3) as u8);
+    }
+    out.len() - 1
+}
+
+/// The data compressed when that is shorter, else as it is.
+fn packed_2007(data: &[u8]) -> Vec<u8> {
+    let packed = compress_2007(data);
+    if packed.len() < data.len() {
+        packed
+    } else {
+        data.to_vec()
+    }
+}
+
+/// A Reed-Solomon word of `data` with `parity` check bytes after it, byte `i` the
+/// coefficient of x^i, zero at the field's powers 1 to `parity`.
+fn rs_word(field: &Field, data: &[u8], parity: usize) -> Vec<u8> {
+    // Reversed, the word is the usual systematic one: data high, check bytes low, with roots
+    // at the negative powers.
+    let mut generator = vec![1u8];
+    for j in 1..=parity {
+        let root = field.power(255 - j);
+        let mut next = vec![0u8; generator.len() + 1];
+        for (i, &c) in generator.iter().enumerate() {
+            next[i + 1] ^= c;
+            next[i] ^= field.mul(c, root);
+        }
+        generator = next;
+    }
+    let mut rest = vec![0u8; 255];
+    for (t, &b) in data.iter().enumerate() {
+        rest[254 - t] = b;
+    }
+    for i in (parity..255).rev() {
+        let c = rest[i];
+        if c != 0 {
+            for (k, &g) in generator.iter().enumerate() {
+                rest[i - parity + k] ^= field.mul(c, g);
+            }
+        }
+    }
+    let mut word = data.to_vec();
+    word.extend((0..parity).map(|i| rest[parity - 1 - i]));
+    word
+}
+
+/// Code `data` (a whole number of `k`-byte blocks) as Reed-Solomon words, interleaved.
+fn interleave(field: &Field, data: &[u8], k: usize) -> Vec<u8> {
+    let words: Vec<Vec<u8>> = data.chunks(k).map(|d| rs_word(field, d, 255 - k)).collect();
+    let mut out = vec![0u8; words.len() * 255];
+    for (j, word) in words.iter().enumerate() {
+        for (i, &b) in word.iter().enumerate() {
+            out[i * words.len() + j] = b;
+        }
+    }
+    out
+}
+
+/// A system page: the data compressed, padded to 8 bytes, repeated and coded. Returns the
+/// page and its stored and full sizes.
+fn system_page_2007(data: &[u8], repeat: usize) -> (Vec<u8>, u64, u64) {
+    let packed = packed_2007(data);
+    let mut aligned = packed.clone();
+    aligned.resize(packed.len().next_multiple_of(8), 0);
+    let mut pre = aligned.repeat(repeat);
+    pre.resize(pre.len().next_multiple_of(239), 0);
+    let mut page = interleave(&SYSTEM_FIELD, &pre, 239);
+    pad32(&mut page);
+    (page, packed.len() as u64, data.len() as u64)
+}
+
+/// Write an AutoCAD 2007 file holding `sections`, each split into pages of at most 0x7400
+/// bytes, followed by the section map and the page map.
+pub(super) fn write_dwg_2007(sections: &[TestSection]) -> Vec<u8> {
+    let mut file = vec![0u8; 0x480];
+    file[..6].copy_from_slice(b"AC1021");
+    let mut pages: Vec<(i64, i64)> = Vec::new();
+    let mut next = 1u64;
+    let mut map = Vec::new();
+    let put = |map: &mut Vec<u8>, values: &[u64]| {
+        for v in values {
+            map.extend(v.to_le_bytes());
+        }
+    };
+    for section in sections {
+        let mut listed: Vec<[u64; 7]> = Vec::new();
+        let mut start = 0u64;
+        for chunk in section.data.chunks(MAX_PAGE_DATA) {
+            if section.zero_pages_left_out && chunk.iter().all(|b| *b == 0) {
+                start += chunk.len() as u64;
+                continue;
+            }
+            let number = next;
+            next += 1;
+            let packed = if section.stored {
+                chunk.to_vec()
+            } else {
+                packed_2007(chunk)
+            };
+            let mut pre = packed.clone();
+            pre.resize(packed.len().next_multiple_of(8), 0);
+            pre.resize(pre.len().next_multiple_of(251), 0);
+            let mut page = if section.plain {
+                // The data of all words, then their check bytes.
+                let mut page = pre.clone();
+                for d in pre.chunks(251) {
+                    page.extend(&rs_word(&PAGE_FIELD, d, 4)[251..]);
+                }
+                page
+            } else {
+                interleave(&PAGE_FIELD, &pre, 251)
+            };
+            pad32(&mut page);
+            let sum = u64::from(r2007::page_checksum(0, chunk));
+            let stored = packed.len() as u64 + u64::from(section.claimed_extra);
+            for _ in 0..=section.listed_again {
+                listed.push([start, page.len() as u64, number, chunk.len() as u64, stored, sum, 0]);
+            }
+            pages.push((number as i64, page.len() as i64));
+            file.extend(page);
+            start += chunk.len() as u64;
+        }
+        let name: Vec<u8> = section
+            .name
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let encoding = if section.plain { 1 } else { 4 };
+        put(
+            &mut map,
+            &[
+                section.data.len() as u64,
+                MAX_PAGE_DATA as u64,
+                u64::from(section.encrypted),
+                0,
+                name.len() as u64,
+                0,
+                encoding,
+                listed.len() as u64,
+            ],
+        );
+        map.extend(name);
+        for entry in listed {
+            put(&mut map, &entry);
+        }
+    }
+    // The map ends with an unnamed entry, as AutoCAD writes it.
+    put(&mut map, &[0, 0xF800, 0, 0, 0, 0, 4, 0]);
+    let section_map_id = next;
+    let (section_map, sm_stored, sm_size) = system_page_2007(&map, 2);
+    pages.push((section_map_id as i64, section_map.len() as i64));
+    file.extend(section_map);
+
+    // The page map lists itself too, so its size is found by trying until it fits.
+    let page_map_id = section_map_id + 1;
+    let page_map_at = file.len() as u64;
+    let mut size = 0x400;
+    let (page_map, pm_stored, pm_size) = loop {
+        let mut entries = Vec::new();
+        for (number, len) in pages.iter().chain([&(page_map_id as i64, size)]) {
+            entries.extend(len.to_le_bytes());
+            entries.extend(number.to_le_bytes());
+        }
+        let (mut page, stored, full) = system_page_2007(&entries, 3);
+        if page.len() <= size as usize {
+            page.resize(size as usize, 0);
+            break (page, stored, full);
+        }
+        size = page.len() as i64;
+    };
+    file.extend(page_map);
+
+    let mut header = vec![0u8; 0x110];
+    for (at, value) in [
+        (0x00, 0x70),
+        (0x08, file.len() as u64 + 0x400),
+        (0x18, 3),
+        (0x38, page_map_at - 0x480),
+        (0x40, page_map_id),
+        (0x50, pm_stored),
+        (0x58, pm_size),
+        (0x60, pages.len() as u64 + 1),
+        (0x68, page_map_id),
+        (0x70, 0x20),
+        (0x78, 0x40),
+        (0xA0, sections.len() as u64 + 2),
+        (0xB0, sm_stored),
+        (0xC0, section_map_id),
+        (0xC8, sm_size),
+        (0xD8, 2),
+        (0xE8, 0x60100),
+    ] {
+        header[at..at + 8].copy_from_slice(&u64::to_le_bytes(value));
+    }
+    let packed = compress_2007(&header);
+    let (length, body) = if packed.len() < header.len() {
+        (packed.len() as i32, packed)
+    } else {
+        (-(header.len() as i32), header)
+    };
+    let mut block = vec![0u8; 0x18];
+    block.extend(length.to_le_bytes());
+    block.extend(0u32.to_le_bytes());
+    block.extend(body);
+    block.resize(block.len().next_multiple_of(8), 0);
+    let mut pre = Vec::new();
+    loop {
+        pre.extend(&block);
+        if pre.len() + block.len() > 3 * 239 {
+            break;
+        }
+    }
+    pre.resize(3 * 239, 0);
+    file[0x80..0x80 + 3 * 255].copy_from_slice(&interleave(&SYSTEM_FIELD, &pre, 239));
+    // The file header is written at the end too.
+    let copy = file[0x80..0x480].to_vec();
+    file.extend(copy);
+    file
+}
+
+/// Where the page map of a 2007 file the tests wrote starts: the last page, right before the
+/// copy of the file header at the end, found as the place where a changed byte damages it.
+fn page_map_2007(file: &[u8]) -> std::result::Result<usize, Box<dyn std::error::Error>> {
+    let end = file.len() - 0x400;
+    (end.saturating_sub(0x2000)..end)
+        .step_by(0x20)
+        .find(|&at| {
+            let mut damaged = file.to_vec();
+            damaged[at] ^= 0x01;
+            error_of(&damaged).contains("page map is damaged")
+        })
+        .ok_or_else(|| "no page map".into())
+}
+
+// ---- AutoCAD 2007 ----
+
+#[test]
+fn reed_solomon_words_are_checked() {
+    for field in [&SYSTEM_FIELD, &PAGE_FIELD] {
+        // The generator reaches every non-zero byte once.
+        let mut powers: Vec<u8> = (0..255).map(|i| field.power(i)).collect();
+        powers.sort_unstable();
+        powers.dedup();
+        assert_eq!(powers.len(), 255);
+    }
+    let data = noise(251, 21);
+    let word = rs_word(&SYSTEM_FIELD, &data[..239], 16);
+    assert_eq!(&word[..239], &data[..239]);
+    assert!(SYSTEM_FIELD.is_code_word(&word, 16));
+    assert!(PAGE_FIELD.is_code_word(&rs_word(&PAGE_FIELD, &data, 4), 4));
+    // Any one changed byte, data or check byte, is seen.
+    for at in [0, 100, 238, 239, 254] {
+        let mut damaged = word.clone();
+        damaged[at] ^= 0x10;
+        assert!(!SYSTEM_FIELD.is_code_word(&damaged, 16), "byte {at}");
+    }
+}
+
+#[test]
+fn a_hand_written_2007_stream_decompresses() -> TestResult {
+    // Started by 0x20 and two bytes, a literal run of two (stored backwards), then a copy of
+    // six bytes from one back.
+    let stream = [0x20, 0x00, 0x00, 0x02, 0x00, 0x70, 0x60, 0x03];
+    assert_eq!(r2007::decompress(&stream, 8)?, [0x70, 0, 0, 0, 0, 0, 0, 0]);
+    // A literal run of 32 bytes (0x0F, then 9 more than 0x17) comes out in groups of eight
+    // from the end.
+    let mut stream = vec![0x0F, 9];
+    stream.extend(0u8..32);
+    let mut want: Vec<u8> = (24..32).collect();
+    want.extend(16..24);
+    want.extend(8..16);
+    want.extend(0..8);
+    assert_eq!(r2007::decompress(&stream, 32)?, want);
+    Ok(())
+}
+
+#[test]
+fn the_2007_compression_comes_back_the_same() -> TestResult {
+    let mut long_run = b"start".to_vec();
+    long_run.extend([b'z'; 70_000]);
+    let mut far = noise(0x9000, 12);
+    far.extend_from_within(10..400); // a long copy from over 0x8000 back
+    far.extend(noise(30, 5));
+    far.extend_from_within(0x100..0x10C); // a short copy from far back
+    far.extend(noise(30, 6));
+    far.extend_from_within(0x8E00..0x8E10); // 16 bytes from under 0x2000 back
+    let cases: Vec<Vec<u8>> = vec![
+        b"abc".to_vec(),
+        b"abcabcabcabcabc".to_vec(),
+        b"WiringCraft ".repeat(500),
+        noise(9, 1),
+        noise(20, 2),
+        noise(300, 3),
+        noise(70_000, 4), // a literal run past 0xFFFF
+        long_run,
+        far,
+    ];
+    for data in cases {
+        let packed = compress_2007(&data);
+        assert_eq!(r2007::decompress(&packed, data.len())?, data, "{} bytes", data.len());
+    }
+    Ok(())
+}
+
+#[test]
+fn damaged_2007_compressed_data_gives_an_error() {
+    // A copy from before the start.
+    assert!(r2007::decompress(&[0x20, 0, 0, 0x01, b'a', 0x30, 0x08], 4).is_err());
+    // Ends inside a literal run.
+    assert!(r2007::decompress(&[0x02, b'a', b'b'], 10).is_err());
+    // More bytes than the page holds.
+    assert!(r2007::decompress(&[0x20, 0, 0, 0x01, b'a', 0x30, 0x00], 3).is_err());
+    // Fewer.
+    assert!(r2007::decompress(&[0x20, 0, 0, 0x01, b'a', 0x30, 0x00], 9).is_err());
+    // A literal length made of many 0xFFFF parts is bounded by the page size.
+    let mut bomb = vec![0x0F, 0xFF];
+    bomb.extend([0xFF; 10_000]);
+    bomb.extend([0x01, 0x00]);
+    assert!(r2007::decompress(&bomb, 100).is_err());
+    assert!(r2007::decompress(&[], 1).is_err());
+}
+
+#[test]
+fn the_sections_of_a_2007_drawing_are_read() -> TestResult {
+    let sections = sample_sections();
+    let read = read_sections(&write_dwg_2007(&sections))?;
+    assert_eq!(read.version, Version::R2007);
+    let names: Vec<&str> = read.sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["AcDb:Header", "AcDb:Classes", "AcDb:Handles", "AcDb:AcDbObjects"]
+    );
+    for section in sections.iter().filter(|s| !s.encrypted) {
+        assert_eq!(
+            read.get(section.name),
+            Some(section.data.as_slice()),
+            "{}",
+            section.name
+        );
+    }
+    assert!(sections[4].data.len() > 2 * MAX_PAGE_DATA, "objects span three pages");
+    assert_eq!(read.skipped, ["AcDb:SummaryInfo"]);
+    Ok(())
+}
+
+#[test]
+fn stored_plain_and_left_out_2007_pages_are_read() -> TestResult {
+    let mut zeros = noise(100, 1);
+    zeros.extend(vec![0u8; MAX_PAGE_DATA - 100]);
+    zeros.extend(vec![0u8; MAX_PAGE_DATA]); // a page of zeros, not written
+    zeros.extend(noise(500, 2));
+    let sections = [
+        TestSection {
+            name: "AcDb:Classes",
+            data: noise(300, 3),
+            stored: true,
+            ..TestSection::default()
+        },
+        TestSection {
+            name: "AcDb:AppInfo",
+            data: b"AppInfo ".repeat(100),
+            plain: true,
+            ..TestSection::default()
+        },
+        TestSection {
+            name: "AcDb:Preview",
+            data: noise(MAX_PAGE_DATA + 50, 4),
+            plain: true,
+            stored: true,
+            ..TestSection::default()
+        },
+        TestSection {
+            name: "AcDb:AcDbObjects",
+            data: zeros,
+            zero_pages_left_out: true,
+            ..TestSection::default()
+        },
+    ];
+    let read = read_sections(&write_dwg_2007(&sections))?;
+    for section in &sections {
+        assert_eq!(
+            read.get(section.name),
+            Some(section.data.as_slice()),
+            "{}",
+            section.name
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_damaged_2007_header_or_map_is_reported() -> TestResult {
+    let file = write_dwg_2007(&sample_sections()[..2]);
+    assert!(read_sections(&file).is_ok());
+    // Any byte of the file header's words, data or check byte.
+    for at in [0x80, 0x80 + 100, 0x80 + 3 * 239, 0x80 + 3 * 255 - 1] {
+        let mut damaged = file.clone();
+        damaged[at] ^= 0x04;
+        let m = error_of(&damaged);
+        assert!(m.contains("file header is damaged"), "{at:#x}: {m}");
+    }
+    // The page map, and the section map before it.
+    let at = page_map_2007(&file)?;
+    let mut damaged = file.clone();
+    damaged[at + 7] ^= 0x80;
+    assert!(error_of(&damaged).contains("page map is damaged"));
+    let mut damaged = file.clone();
+    damaged[at - 0x40] ^= 0x80;
+    let m = error_of(&damaged);
+    assert!(m.contains("section map") && m.contains("damaged"), "{m}");
+    Ok(())
+}
+
+#[test]
+fn a_changed_byte_in_a_2007_page_is_caught_by_its_checksum() -> TestResult {
+    for plain in [false, true] {
+        let section = TestSection {
+            name: "AcDb:Classes",
+            data: noise(300, 3),
+            stored: true,
+            plain,
+            ..TestSection::default()
+        };
+        let file = write_dwg_2007(&[section]);
+        assert!(read_sections(&file).is_ok());
+        // The first page is at 0x480.
+        let mut damaged = file.clone();
+        damaged[0x480 + 5] ^= 0x01;
+        let m = error_of(&damaged);
+        assert!(
+            m.contains("AcDb:Classes") && m.contains("page 1") && m.contains("wrong checksum"),
+            "{m}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_2007_page_claiming_more_than_its_page_is_refused() {
+    let section = TestSection {
+        name: "AcDb:Classes",
+        data: noise(300, 3),
+        stored: true,
+        plain: true,
+        claimed_extra: 0x10_0000,
+        ..TestSection::default()
+    };
+    let m = error_of(&write_dwg_2007(&[section]));
+    assert!(m.contains("AcDb:Classes") && m.contains("page 1"), "{m}");
+}
+
+#[test]
+fn a_2007_page_listed_many_times_cannot_make_endless_work() -> TestResult {
+    let section = |listed_again| TestSection {
+        name: "AcDb:AcDbObjects",
+        data: b"WiringCraft ".repeat(MAX_PAGE_DATA / 12),
+        listed_again,
+        ..TestSection::default()
+    };
+    let budget = 4 * MAX_PAGE_DATA + 0x1000;
+    let read = read_sections_with(&write_dwg_2007(&[section(3)]), budget)?;
+    assert_eq!(
+        read.get("AcDb:AcDbObjects").map(<[u8]>::len),
+        Some(section(0).data.len())
+    );
+    let m = read_sections_with(&write_dwg_2007(&[section(4)]), budget).map_err(|e| e.to_string());
+    assert!(m.as_ref().is_err_and(|m| m.contains("decompress to too much")), "{m:?}");
+    Ok(())
+}
+
+#[test]
+fn cut_or_flipped_2007_files_give_errors_not_panics() -> TestResult {
+    let file = write_dwg_2007(&sample_sections());
+    assert!(read_sections(&file).is_ok());
+    for len in (0..file.len()).step_by(7) {
+        let _ = read_sections(&file[..len]);
+    }
+    // Cut into the page map: refused.
+    let page_map = page_map_2007(&file)?;
+    assert!(read_sections(&file[..page_map + 0x100]).is_err());
+    let mut seed = 3u32;
+    for i in 0..1500 {
+        let mut damaged = file.clone();
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        let at = (seed as usize >> 4) % damaged.len();
+        damaged[at] ^= 1 << (i % 8);
+        let _ = read_sections(&damaged);
+    }
+    // Every byte of the file header's words and of the maps, each set to 0xFF.
+    let maps = page_map.saturating_sub(0x1000)..file.len() - 0x400;
+    for at in (0x80..0x80 + 3 * 255).chain(maps) {
+        let mut damaged = file.clone();
+        damaged[at] = 0xFF;
+        let _ = read_sections(&damaged);
+    }
     Ok(())
 }

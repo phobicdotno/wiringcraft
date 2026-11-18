@@ -204,11 +204,11 @@ struct Object<'a> {
 }
 
 impl Object<'_> {
-    /// TV: a text, from the data stream (2004) or the string stream (2010).
+    /// TV: a text, from the data stream (2004) or the string stream (2007 and 2010).
     fn text(&mut self) -> Result<String> {
         match self.version {
             Version::R2004 => self.data.t8(),
-            Version::R2010 => self
+            Version::R2007 | Version::R2010 => self
                 .strings
                 .as_mut()
                 .ok_or_else(|| bad("an object's text is missing"))?
@@ -239,7 +239,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     let (size, n) = modular_short(rest)?;
     let mut start = at + n;
     let handle_bits = match version {
-        Version::R2004 => 0,
+        Version::R2004 | Version::R2007 => 0,
         Version::R2010 => {
             let (h, m) = modular_char(objects.get(start..).unwrap_or_default(), false)?;
             start += m;
@@ -252,16 +252,19 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
         .ok_or_else(|| bad("an object is cut off"))?;
     let total = size * 8;
     let mut head = Bits::new(bytes, 0, total);
+    // A bit short up to 2007, a bit pair and one or two bytes from 2010 on.
     let kind = match version {
-        Version::R2004 => head.bs()?,
+        Version::R2004 | Version::R2007 => head.bs()?,
         Version::R2010 => match head.bb()? {
             0 => u16::from(head.rc()?),
             1 => u16::from(head.rc()?) + 0x1F0,
             _ => head.rs()?,
         },
     };
+    // Where the data ends and the handles start: a size in bits up to 2007, from 2010 on
+    // the handle stream's size before the type.
     let end = match version {
-        Version::R2004 => head.rl()? as usize,
+        Version::R2004 | Version::R2007 => head.rl()? as usize,
         Version::R2010 => total
             .checked_sub(handle_bits)
             .ok_or_else(|| bad("an object's handle stream is larger than the object"))?,
@@ -273,7 +276,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     let handle = data.h()?.1;
     let strings = match version {
         Version::R2004 => None,
-        Version::R2010 => string_stream(bytes, end)?,
+        Version::R2007 | Version::R2010 => string_stream(bytes, end)?,
     };
     Ok(Object {
         version,
@@ -285,7 +288,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     })
 }
 
-/// The string stream of a 2010 object whose data ends at bit `end`: a flag in the last bit, a
+/// The string stream of a 2007 or 2010 object whose data ends at bit `end`: a flag in the last bit, a
 /// size before it (in one or two 16-bit parts), and the texts before that.
 fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>> {
     let all = Bits::new(bytes, 0, end);
