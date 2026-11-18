@@ -118,7 +118,7 @@ enum Dialog {
     Macros(Vec<state::MacroEntry>),
     /// Library, Import symbols: the library folders to import into and the one chosen.
     ImportSymbols {
-        targets: Vec<symbol_editor::Target>,
+        targets: Vec<import_symbols::ImportTarget>,
         chosen: usize,
         /// Overwrite symbols already in the library folder (off: they are kept and listed).
         replace: bool,
@@ -782,19 +782,10 @@ impl App {
             }
             Action::ImportSymbols => match wc_library::Library::open(&open.dir, &open.project) {
                 Ok(lib) => {
-                    let targets = folder_targets(&lib, open);
-                    self.dialog = Some(if targets.is_empty() {
-                        Dialog::Message(
-                            "The project has no library folder to import into. Add one under the project's \
-                             libraries (a folder source), then import again."
-                                .into(),
-                        )
-                    } else {
-                        Dialog::ImportSymbols {
-                            targets,
-                            chosen: 0,
-                            replace: false,
-                        }
+                    self.dialog = Some(Dialog::ImportSymbols {
+                        targets: import_symbols::targets(&open.dir, folder_targets(&lib, open)),
+                        chosen: 0,
+                        replace: false,
                     });
                 }
                 Err(e) => self.dialog = Some(Dialog::Message(format!("The library could not be opened:\n{e}"))),
@@ -1837,7 +1828,7 @@ impl App {
                     );
                     ui.horizontal(|ui| {
                         ui.label("Library folder");
-                        let shown = |t: &symbol_editor::Target| format!("{} ({})", t.0, t.1.display());
+                        let shown = |t: &import_symbols::ImportTarget| t.label();
                         egui::ComboBox::from_id_salt("import_lib")
                             .selected_text(targets.get(*chosen).map(shown).unwrap_or_default())
                             .show_ui(ui, |ui| {
@@ -1850,17 +1841,26 @@ impl App {
                         .on_hover_text("Off: a symbol with the same id stays as it is, and the result lists it");
                     ui.horizontal(|ui| {
                         if ui.button("Choose files and import…").clicked()
-                            && let Some((_, root)) = targets.get(*chosen)
+                            && let Some(target) = targets.get(*chosen)
                             && let Some(files) = rfd::FileDialog::new()
                                 .set_title("Import symbols")
                                 .add_filter("Symbol files", import_symbols::EXTENSIONS)
                                 .pick_files()
                         {
-                            let root = root.clone();
+                            let target = target.clone();
+                            let root = target.root.clone();
                             let replace = *replace;
                             then = Some(Box::new(move |app: &mut App| {
                                 let out = import_symbols::import(&files, &root, replace);
                                 if let Some(open) = app.open.as_mut() {
+                                    // The project's own folder is listed first once something is in it.
+                                    if !out.written.is_empty()
+                                        && let Some(source) = target.declare
+                                    {
+                                        open.checkpoint();
+                                        open.project.meta.libraries.insert(0, source);
+                                        open.dirty = true;
+                                    }
                                     open.refresh_library();
                                 }
                                 app.ed.message =

@@ -11,6 +11,77 @@ pub const EXTENSIONS: &[&str] = &["dxf", "svg", "kicad_sym", "elmt"];
 /// The largest file read; a bigger one fails without being read whole.
 const MAX_LEN: usize = 16 << 20;
 
+/// The folder the project's own library lives in, relative to the project.
+pub const PROJECT_LIBRARY: &str = "library";
+
+/// A library folder the import can write into.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportTarget {
+    pub name: String,
+    pub root: PathBuf,
+    /// For the project's own folder while the project does not list it yet: the source to add
+    /// (first, so it wins) once symbols are written there.
+    pub declare: Option<wc_core::project::LibrarySource>,
+}
+
+impl ImportTarget {
+    pub fn label(&self) -> String {
+        if self.declare.is_some() {
+            format!("{} ({}, new)", self.name, self.root.display())
+        } else {
+            format!("{} ({})", self.name, self.root.display())
+        }
+    }
+}
+
+/// Where symbols can be imported: the project's own library folder (`library/` in the project)
+/// first, then the project's other library folders (`folders`, as (name, root) in the project's
+/// order). The own folder is offered even when the project does not list it yet.
+pub fn targets(project_dir: &Path, folders: Vec<(String, PathBuf)>) -> Vec<ImportTarget> {
+    let own = project_dir.join(PROJECT_LIBRARY);
+    let same = |root: &Path| {
+        root == own
+            || matches!(
+                (root.canonicalize(), own.canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            )
+    };
+    let mut out: Vec<ImportTarget> = Vec::new();
+    if let Some((name, root)) = folders.iter().find(|(_, r)| same(r)) {
+        out.push(ImportTarget {
+            name: name.clone(),
+            root: root.clone(),
+            declare: None,
+        });
+    } else {
+        let mut name = "project".to_owned();
+        while folders.iter().any(|(n, _)| *n == name) {
+            name.push('_');
+        }
+        out.push(ImportTarget {
+            name: name.clone(),
+            root: own.clone(),
+            declare: Some(wc_core::project::LibrarySource {
+                name,
+                kind: "folder".into(),
+                location: PROJECT_LIBRARY.into(),
+                reference: None,
+            }),
+        });
+    }
+    out.extend(
+        folders
+            .into_iter()
+            .filter(|(_, r)| !same(r))
+            .map(|(name, root)| ImportTarget {
+                name,
+                root,
+                declare: None,
+            }),
+    );
+    out
+}
+
 /// What an import did: every symbol written, every warning and every file that failed.
 #[derive(Debug, Default)]
 pub struct Outcome {
@@ -285,5 +356,28 @@ mod tests {
         let out = import(&[file], lib.path(), true);
         assert_eq!(out.written.len(), 1, "{out:?}");
         assert!(std::fs::read_to_string(&path).unwrap().contains("svg.coil"));
+    }
+
+    #[test]
+    fn the_projects_own_library_is_offered_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let starter = ("starter".to_owned(), PathBuf::from("/opt/wc/library"));
+        // A new project lists only the starter library: its own folder comes first, to be added.
+        let t = targets(dir.path(), vec![starter.clone()]);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].root, dir.path().join("library"));
+        let source = t[0].declare.as_ref().unwrap();
+        assert_eq!((source.name.as_str(), source.location.as_str()), ("project", "library"));
+        assert_eq!(t[1].name, "starter");
+        assert!(t[1].declare.is_none());
+        // Once listed (anywhere), it is first and not added again.
+        let own = ("mine".to_owned(), dir.path().join("library"));
+        let t = targets(dir.path(), vec![starter.clone(), own]);
+        assert_eq!(t[0].name, "mine");
+        assert!(t[0].declare.is_none());
+        assert_eq!(t.len(), 2);
+        // A source already called `project` elsewhere keeps its name.
+        let t = targets(dir.path(), vec![("project".to_owned(), PathBuf::from("/x"))]);
+        assert_eq!(t[0].name, "project_");
     }
 }
