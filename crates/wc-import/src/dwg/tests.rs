@@ -535,3 +535,23 @@ fn a_file_short_of_its_last_padding_is_read_and_one_cut_into_its_data_is_not() -
     assert!(read_sections(&file[..end - 1]).is_err());
     Ok(())
 }
+
+#[test]
+fn a_stored_page_listed_many_times_is_bounded_too() -> TestResult {
+    // Each listing of a stored page costs its stored bytes.
+    let section = |listed_again| TestSection {
+        name: "AcDb:AcDbObjects",
+        data: noise(4000, 7),
+        stored: true,
+        listed_again,
+        ..TestSection::default()
+    };
+    let budget = 3 * 4000;
+    assert!(read_sections_with(&write_dwg(b"AC1024", &[section(2)]), budget).is_ok());
+    let message = read_sections_with(&write_dwg(b"AC1024", &[section(3)]), budget).map_err(|e| e.to_string());
+    assert!(
+        message.as_ref().is_err_and(|m| m.contains("decompress to too much")),
+        "{message:?}"
+    );
+    Ok(())
+}

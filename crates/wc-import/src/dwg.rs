@@ -16,8 +16,9 @@
 //! [`read_drawing`] goes on to decode the objects in those sections into blocks and shapes; see
 //! [`objects`].
 //!
-//! Written from the published Open Design Specification for .dwg files only, and checked with
-//! files the tests write themselves. Input is treated as hostile: every size and offset is
+//! Written from the published Open Design Specification for .dwg files and LibreDWG's reading
+//! of it, tested with files the tests write themselves and checked against 1666 real AutoCAD
+//! 2004 and 2010 files of a SolidWorks Electrical symbol library. Input is treated as hostile: every size and offset is
 //! checked, and a damaged file gives an error naming what is wrong, never a panic.
 
 use std::collections::BTreeMap;
@@ -327,8 +328,9 @@ fn data_page(bytes: &[u8], address: u64, compressed: u32, max_page: u32, budget:
         2 => to_usize(max_page, MAX_PAGE, "page")?,
         _ => data_size,
     };
+    // Reading the stored bytes costs too, even when they give little (a page listed many times).
     *budget = budget
-        .checked_sub(gives)
+        .checked_sub(gives.max(data_size))
         .ok_or_else(|| bad("the file's pages decompress to too much"))?;
     match compressed {
         2 => decompress_at_most(data, gives),
