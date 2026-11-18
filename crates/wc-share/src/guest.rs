@@ -42,6 +42,10 @@ pub struct Guest {
     /// Undo, redo and revert requests sent and not answered yet. The host answers each with
     /// its restoration (a `Restore` edit by this guest) or a refusal.
     taking_back: usize,
+    /// Symbol and part files the session sent (in the welcome and with each
+    /// [`ProjectEdit::AddItems`]), by id: what this guest's copy needs to draw the project.
+    pub symbols: BTreeMap<String, wc_core::Symbol>,
+    pub parts: BTreeMap<String, wc_core::Part>,
 }
 
 impl Default for Guest {
@@ -63,6 +67,8 @@ impl Guest {
             switching: None,
             in_flight: BTreeMap::new(),
             taking_back: 0,
+            symbols: BTreeMap::new(),
+            parts: BTreeMap::new(),
         }
     }
 
@@ -170,7 +176,10 @@ impl Guest {
                 self.history = history;
                 self.status = GuestStatus::Joined;
                 self.me = Some(you);
-                self.project = Some((*project).into());
+                let mut project = *project;
+                self.symbols = std::mem::take(&mut project.symbols);
+                self.parts = std::mem::take(&mut project.parts);
+                self.project = Some(project.into());
                 self.locks = locks;
                 self.peers = peers;
             }
@@ -191,6 +200,11 @@ impl Guest {
             HostMsg::ProjectChanged { edit, by } => {
                 if matches!(edit, ProjectEdit::Restore { .. }) && Some(by) == self.me {
                     self.taking_back = self.taking_back.saturating_sub(1);
+                }
+                if let ProjectEdit::AddItems { symbols, parts } = &edit {
+                    self.symbols
+                        .extend(symbols.iter().map(|(s, _)| (s.id.clone(), s.clone())));
+                    self.parts.extend(parts.iter().map(|(p, _)| (p.id.clone(), p.clone())));
                 }
                 if let Some(p) = self.project.as_mut() {
                     apply_edit(p, &edit);

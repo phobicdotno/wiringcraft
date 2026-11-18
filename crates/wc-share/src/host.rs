@@ -53,6 +53,10 @@ pub struct Host {
     /// Why guests' Undo, Redo and "Undo this change" are refused for now, if they are: the
     /// host's project folder belongs to something else meanwhile (an assistant command).
     take_backs_held: Option<String>,
+    /// The vendored symbol and part files guests get when they join, by id: what the host's
+    /// user shared ([`Host::share_files`]) and what participants added since.
+    symbols: BTreeMap<String, wc_core::Symbol>,
+    parts: BTreeMap<String, wc_core::Part>,
 }
 
 /// A recorded change and the parts of the project it changed, before and after.
@@ -101,7 +105,21 @@ impl Host {
             history: Vec::new(),
             next_change: 1,
             take_backs_held: None,
+            symbols: BTreeMap::new(),
+            parts: BTreeMap::new(),
         }
+    }
+
+    /// The project's vendored symbol and part files, sent to every guest that joins so they can
+    /// draw the project without the host's libraries.
+    pub fn share_files(&mut self, symbols: BTreeMap<String, wc_core::Symbol>, parts: BTreeMap<String, wc_core::Part>) {
+        self.symbols = symbols;
+        self.parts = parts;
+    }
+
+    /// The symbol and part files guests get, by id.
+    pub fn files(&self) -> (&BTreeMap<String, wc_core::Symbol>, &BTreeMap<String, wc_core::Part>) {
+        (&self.symbols, &self.parts)
     }
 
     pub fn project(&self) -> &Project {
@@ -179,9 +197,12 @@ impl Host {
             Some(p) if p.status == Status::Pending => p.status = Status::Joined,
             _ => return false,
         }
+        let mut snapshot = Snapshot::from(&self.project);
+        snapshot.symbols = self.symbols.clone();
+        snapshot.parts = self.parts.clone();
         let welcome = HostMsg::Welcome {
             you: id,
-            project: Box::new(Snapshot::from(&self.project)),
+            project: Box::new(snapshot),
             locks: self.locks.clone(),
             peers: self.peers(),
             history: self.history(),
@@ -418,10 +439,30 @@ impl Host {
         }
         let message = edit.describe();
         let page = edit.page().map(str::to_owned);
-        if let Err(refusal) = self.record(by, page.clone(), message.clone()) {
+        let added = match &edit {
+            ProjectEdit::AddItems { symbols, parts } => Some((
+                symbols.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>(),
+                parts.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            )),
+            _ => None,
+        };
+        // The files go in first, so the change's commit holds them with their lock entries. A
+        // file left behind by a change that is not recorded is harmless: nothing locks it.
+        let stored = match &added {
+            Some((symbols, parts)) => self
+                .journal
+                .vendor(symbols, parts)
+                .map_err(|e| Refusal::NotRecorded { reason: e.to_string() }),
+            None => Ok(()),
+        };
+        if let Err(refusal) = stored.and_then(|()| self.record(by, page.clone(), message.clone())) {
             self.project = before;
             self.restore_files(by);
             return Err(refusal);
+        }
+        if let Some((symbols, parts)) = added {
+            self.symbols.extend(symbols.into_iter().map(|s| (s.id.clone(), s)));
+            self.parts.extend(parts.into_iter().map(|p| (p.id.clone(), p)));
         }
         let (was, now) = Parts::delta(&before, &self.project);
         if let ProjectEdit::RemovePage { id } = &edit

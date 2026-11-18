@@ -47,14 +47,18 @@ fn project(dir: &Path) -> std::result::Result<Open, Box<dyn std::error::Error>> 
 /// Share the open project in-process (no network), with a journal the test reads.
 fn host(open: &Open) -> (Share, Log) {
     let log = Log::default();
+    let mut host = Host::new(
+        open.project.clone(),
+        "Hanna",
+        "hanna@example.com",
+        Box::new(log.clone()),
+    );
+    // As `Share::start_host` does.
+    let (symbols, parts) = vendored_files(&open.dir, &open.project);
+    host.share_files(symbols, parts);
     let share = Share {
         role: Some(Role::Host(Box::new(Hosting {
-            host: Host::new(
-                open.project.clone(),
-                "Hanna",
-                "hanna@example.com",
-                Box::new(log.clone()),
-            ),
+            host,
             hub: Hub::new(),
             listener: None,
             announcer: None,
@@ -871,5 +875,64 @@ fn a_guest_sends_nothing_until_its_undo_has_come_back() -> TestResult {
         "the stale page never went out"
     );
     assert!(g.take_notes().iter().any(|n| n.contains("was not kept")));
+    Ok(())
+}
+
+#[test]
+fn a_guest_without_the_libraries_draws_every_symbol_of_the_project() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (_h, _log, host_open, _g, guest_open) = session_with(tmp.path(), |o| {
+        o.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+        // No library at all: the guest's copy can only have the symbol from the session.
+        o.project.meta.libraries.clear();
+        Ok(())
+    })?;
+    assert!(guest_open.project.meta.libraries.is_empty());
+    assert_eq!(guest_open.symbols.get("wc.coil"), host_open.symbols.get("wc.coil"));
+    assert!(guest_open.symbols.contains_key("wc.coil"));
+    assert_eq!(
+        store::read_vendored_symbol(&guest_open.dir, "wc.coil").ok().as_ref(),
+        host_open.symbols.get("wc.coil")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_symbol_used_for_the_first_time_reaches_the_host_with_its_file() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(!host_open.project.lock.symbols.contains_key("wc.contact.no"));
+
+    let item = guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    let ours = guest_open.symbols.get("wc.contact.no").cloned();
+    assert!(ours.is_some());
+    assert_eq!(
+        host_open.symbols.get("wc.contact.no").cloned(),
+        ours,
+        "the host can draw it"
+    );
+    assert_eq!(
+        host_open.project.lock.symbols.get("wc.contact.no"),
+        guest_open.project.lock.symbols.get("wc.contact.no")
+    );
+    assert_eq!(store::read_vendored_symbol(&host_open.dir, "wc.contact.no").ok(), ours);
+    assert!(
+        host_open
+            .project
+            .page("p0003")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    );
+    assert!(
+        log.messages().iter().any(|m| m == "Add wc.contact.no to the project"),
+        "{:?}",
+        log.messages()
+    );
+    // Sent once: more frames send nothing new.
+    let n = log.messages().len();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages().len(), n);
     Ok(())
 }

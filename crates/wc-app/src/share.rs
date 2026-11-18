@@ -10,13 +10,18 @@
 //! to one of them is put back, and the whole action with it. Nothing goes out
 //! while a mouse button is down or a live form is open, so a drag over many frames is one
 //! change, and one commit on the host.
+//!
+//! Symbol and part files travel too: a guest gets the project's vendored files when it joins,
+//! and a symbol or part someone uses for the first time goes out as an `AddItems` edit with its
+//! file, so every copy can draw it and the host's folder and history keep it.
 
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, RichText};
-use wc_core::{Page, Project, store};
+use wc_core::lock::ItemKind;
+use wc_core::{Page, Part, Project, Symbol, store};
 use wc_share::discovery::{Announcer, Beacon, Browser};
 use wc_share::net::{self, Listener};
 use wc_share::transport::{GuestLink, Hub};
@@ -318,9 +323,18 @@ fn number_of(p: &Project, page: &str) -> String {
 }
 
 /// Make `local` the session's project `auth`, changing only what differs. The symbol lock stays
-/// local: each person's copy keeps its own symbol files. Returns whether anything changed.
+/// local, except that items the session has and this copy lacks are added (their files come
+/// with the session, see [`take_files`]). Returns whether anything changed.
 pub fn incoming(local: &mut Project, auth: &Project) -> bool {
     let mut changed = false;
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        for (id, entry) in auth.lock.map(kind) {
+            if !local.lock.map(kind).contains_key(id) {
+                local.lock.map_mut(kind).insert(id.clone(), entry.clone());
+                changed = true;
+            }
+        }
+    }
     let set = |changed: &mut bool, differ: bool| {
         *changed |= differ;
         differ
@@ -350,6 +364,87 @@ pub fn incoming(local: &mut Project, auth: &Project) -> bool {
         local.comments = auth.comments.clone();
     }
     changed
+}
+
+/// The symbols and parts locked in `local` and not in `base` (the project after the last sync),
+/// with their vendored files from `dir`, as one edit: what this person started using since. An
+/// item whose file cannot be read is left out; the others still see it as unknown.
+pub fn new_items(dir: &Path, local: &Project, base: &Project) -> Option<ProjectEdit> {
+    let fresh = |kind: ItemKind| {
+        local
+            .lock
+            .map(kind)
+            .iter()
+            .filter(move |(id, _)| !base.lock.map(kind).contains_key(*id))
+            .map(|(id, e)| (id.clone(), e.source.clone()))
+    };
+    let symbols: Vec<(Symbol, String)> = fresh(ItemKind::Symbol)
+        .filter_map(|(id, source)| Some((store::read_vendored_symbol(dir, &id).ok()?, source)))
+        .collect();
+    let parts: Vec<(Part, String)> = fresh(ItemKind::Part)
+        .filter_map(|(id, source)| Some((store::read_vendored_part(dir, &id).ok()?, source)))
+        .collect();
+    (!symbols.is_empty() || !parts.is_empty()).then_some(ProjectEdit::AddItems { symbols, parts })
+}
+
+/// Write the session's files for items `open` locks but has not loaded (symbols and parts
+/// someone else added) into its vendor folder, and load them. Returns the ids that could not
+/// be written.
+pub fn take_files(open: &mut Open, symbols: &BTreeMap<String, Symbol>, parts: &BTreeMap<String, Part>) -> Vec<String> {
+    let mut failed = Vec::new();
+    let wanted: Vec<String> = open
+        .project
+        .lock
+        .symbols
+        .keys()
+        .filter(|id| !open.symbols.contains_key(*id))
+        .cloned()
+        .collect();
+    for id in wanted {
+        let Some(s) = symbols.get(&id) else { continue };
+        match store::write_vendored_symbol(&open.dir, s) {
+            Ok(_) => {
+                open.symbols.insert(id, s.clone());
+            }
+            Err(e) => failed.push(format!("{id} ({e})")),
+        }
+    }
+    let wanted: Vec<String> = open
+        .project
+        .lock
+        .parts
+        .keys()
+        .filter(|id| !open.parts.contains_key(*id))
+        .cloned()
+        .collect();
+    for id in wanted {
+        let Some(p) = parts.get(&id) else { continue };
+        match store::write_vendored_part(&open.dir, p) {
+            Ok(_) => {
+                open.parts.insert(id, p.clone());
+            }
+            Err(e) => failed.push(format!("{id} ({e})")),
+        }
+    }
+    failed
+}
+
+/// The project's vendored symbol and part files in `dir`, for every item its lock lists that
+/// has one.
+fn vendored_files(dir: &Path, project: &Project) -> (BTreeMap<String, Symbol>, BTreeMap<String, Part>) {
+    let symbols = project
+        .lock
+        .symbols
+        .keys()
+        .filter_map(|id| Some((id.clone(), store::read_vendored_symbol(dir, id).ok()?)))
+        .collect();
+    let parts = project
+        .lock
+        .parts
+        .keys()
+        .filter_map(|id| Some((id.clone(), store::read_vendored_part(dir, id).ok()?)))
+        .collect();
+    (symbols, parts)
 }
 
 /// The host's side: the session itself, the connections and the announcement.
@@ -412,6 +507,14 @@ impl Role {
         match self {
             Role::Host(_) => false,
             Role::Guest(j) => j.guest.taking_back(),
+        }
+    }
+
+    /// The symbol and part files the session has, by id.
+    fn files(&self) -> (&BTreeMap<String, Symbol>, &BTreeMap<String, Part>) {
+        match self {
+            Role::Host(h) => h.host.files(),
+            Role::Guest(j) => (&j.guest.symbols, &j.guest.parts),
         }
     }
 
@@ -816,7 +919,9 @@ impl Share {
                 None
             }
         };
-        let host = Host::new(open.project.clone(), name, email, Box::new(journal));
+        let mut host = Host::new(open.project.clone(), name, email, Box::new(journal));
+        let (symbols, parts) = vendored_files(&open.dir, &open.project);
+        host.share_files(symbols, parts);
         self.role = Some(Role::Host(Box::new(Hosting {
             host,
             hub: Hub::new(),
@@ -891,7 +996,7 @@ impl Share {
             && j.guest.status == GuestStatus::Joined
             && let Some(project) = j.guest.project.as_ref()
         {
-            return match write_copy(&j.folder, project) {
+            return match write_copy(&j.folder, project, &j.guest.symbols, &j.guest.parts) {
                 Ok(o) => {
                     j.dir = Some(o.dir.clone());
                     self.notes
@@ -947,6 +1052,9 @@ impl Share {
         }
         let mine = page.as_deref().filter(|p| role.holds(p));
         let me = role.me().unwrap_or(HOST);
+        // Symbols and parts used for the first time go out first, whatever happens to the rest:
+        // pages that draw them may follow in this edit or a later one.
+        let items = new_items(&open.dir, &open.project, base);
         let mut out = outgoing(&open.project, base, mine, &role.locks(), me);
         if !out.dropped.is_empty() {
             // One action is kept whole or not at all: a device renamed on two pages must not
@@ -958,8 +1066,8 @@ impl Share {
             out.page = None;
             out.edits.clear();
         }
-        let sent = out.page.is_some() || !out.edits.is_empty();
-        for edit in out.edits {
+        let sent = out.page.is_some() || !out.edits.is_empty() || items.is_some();
+        for edit in items.into_iter().chain(out.edits) {
             role.edit_project(edit, &mut self.notes);
         }
         if let Some(p) = out.page {
@@ -971,6 +1079,14 @@ impl Share {
         }
         let auth = role.project()?;
         let changed = incoming(&mut open.project, auth);
+        let (symbols, parts) = role.files();
+        let failed = take_files(open, symbols, parts);
+        if !failed.is_empty() {
+            self.notes.push(format!(
+                "Symbols and parts from the session could not be saved in your copy: {}",
+                failed.join(", ")
+            ));
+        }
         if changed {
             // Others' changes are in the window, not yet in this copy's files.
             open.dirty = true;
@@ -1251,11 +1367,23 @@ impl Share {
 }
 
 /// Write the session's project to a new folder under `folder` (named after the project) and
-/// open it there. Symbols the project uses are taken from the libraries where they can be.
-fn write_copy(folder: &Path, project: &Project) -> Result<Open, String> {
+/// open it there, with the symbol and part files the session sent. Symbols it did not send are
+/// taken from the libraries where they can be.
+fn write_copy(
+    folder: &Path,
+    project: &Project,
+    symbols: &BTreeMap<String, Symbol>,
+    parts: &BTreeMap<String, Part>,
+) -> Result<Open, String> {
     let leaf = crate::prefs::folder_name(&project.meta.name).unwrap_or_else(|| "shared-project".into());
     let dir = fresh_dir(folder, &leaf)?;
     store::save(&dir, project).map_err(|e| e.to_string())?;
+    for s in symbols.values() {
+        store::write_vendored_symbol(&dir, s).map_err(|e| e.to_string())?;
+    }
+    for p in parts.values() {
+        store::write_vendored_part(&dir, p).map_err(|e| e.to_string())?;
+    }
     let mut open = Open::load(&dir)?;
     let wanted: Vec<String> = open.project.lock.symbols.keys().cloned().collect();
     let mut missing = Vec::new();

@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use wc_core::lock::LockEntry;
 use wc_core::panel::Panel;
-use wc_core::{Comment, Device, DeviceTag, Page, Project, ProjectMeta};
+use wc_core::{Comment, Device, DeviceTag, Page, Part, Project, ProjectMeta, Symbol};
 
 use crate::{ChangeInfo, Parts};
 
@@ -75,6 +76,16 @@ pub enum ProjectEdit {
     /// after checking the parts are still as the undone change left them; sent as a plain edit
     /// (by a guest or the host's user) it is refused.
     Restore { parts: Box<Parts> },
+    /// Add symbols and parts to the project: their vendored files, and lock entries naming the
+    /// library source each came from (`(item, source)`). What a participant sends when they
+    /// use a symbol or part the project did not have yet, so every copy can draw it. An item
+    /// the project already has in another version is refused.
+    AddItems {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        symbols: Vec<(Symbol, String)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<(Part, String)>,
+    },
 }
 
 impl ProjectEdit {
@@ -95,6 +106,14 @@ impl ProjectEdit {
                 _ => format!("Edit {} pages", pages.len()),
             },
             Self::Restore { .. } => "Put back an earlier state".to_owned(),
+            Self::AddItems { symbols, parts } => {
+                let names: Vec<&str> = symbols
+                    .iter()
+                    .map(|(s, _)| s.id.as_str())
+                    .chain(parts.iter().map(|(p, _)| p.id.as_str()))
+                    .collect();
+                format!("Add {} to the project", names.join(", "))
+            }
         }
     }
 
@@ -145,6 +164,13 @@ pub struct Snapshot {
     pub lock: wc_core::Lockfile,
     pub panels: Vec<Panel>,
     pub comments: Vec<Comment>,
+    /// The vendored symbol files the host shares ([`crate::Host::share_files`]), by id, so a
+    /// guest without the host's libraries can draw them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub symbols: BTreeMap<String, Symbol>,
+    /// The vendored part files, by id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parts: BTreeMap<String, Part>,
 }
 
 impl From<&Project> for Snapshot {
@@ -156,6 +182,8 @@ impl From<&Project> for Snapshot {
             lock: p.lock.clone(),
             panels: p.panels.clone(),
             comments: p.comments.clone(),
+            symbols: BTreeMap::new(),
+            parts: BTreeMap::new(),
         }
     }
 }
@@ -261,6 +289,14 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
         }
         ProjectEdit::SetMeta { meta } => project.meta = (**meta).clone(),
         ProjectEdit::Restore { parts } => parts.apply(project),
+        ProjectEdit::AddItems { symbols, parts } => {
+            for (s, source) in symbols {
+                project.lock.symbols.insert(s.id.clone(), lock_entry(source, s.hash()));
+            }
+            for (p, source) in parts {
+                project.lock.parts.insert(p.id.clone(), lock_entry(source, p.hash()));
+            }
+        }
         ProjectEdit::SetPages { pages, .. } => {
             for page in pages {
                 if let Some(p) = project.page_mut(&page.id) {
@@ -270,6 +306,13 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
                 }
             }
         }
+    }
+}
+
+fn lock_entry(source: &str, hash: String) -> LockEntry {
+    LockEntry {
+        source: source.to_owned(),
+        hash,
     }
 }
 
@@ -348,6 +391,32 @@ pub(crate) fn check_edit(
             Ok(())
         }
         ProjectEdit::SetMeta { .. } => Ok(()),
+        ProjectEdit::AddItems { symbols, parts } => {
+            if symbols.is_empty() && parts.is_empty() {
+                return invalid("nothing to add".into());
+            }
+            let items = symbols
+                .iter()
+                .map(|(s, _)| ("symbol", &project.lock.symbols, s.id.as_str(), s.hash()))
+                .chain(
+                    parts
+                        .iter()
+                        .map(|(p, _)| ("part", &project.lock.parts, p.id.as_str(), p.hash())),
+                );
+            let mut seen = std::collections::BTreeSet::new();
+            for (kind, lock, id, hash) in items {
+                if let Err(e) = wc_core::store::check_id(id) {
+                    return invalid(format!("{kind} {id}: {e}"));
+                }
+                if !seen.insert((kind, id)) {
+                    return invalid(format!("{kind} {id} is listed twice"));
+                }
+                if lock.get(id).is_some_and(|e| e.hash != hash) {
+                    return invalid(format!("the project already has {kind} {id} in another version"));
+                }
+            }
+            Ok(())
+        }
         ProjectEdit::Restore { parts } => {
             for (id, page) in &parts.pages {
                 if let Some(page) = page

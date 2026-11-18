@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use wc_core::Project;
+use wc_core::{Part, Project, Symbol};
 use wc_vcs::Git;
 
 use crate::{PeerId, Result};
@@ -23,6 +23,13 @@ pub struct Change {
 pub trait Journal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()>;
 
+    /// Called before `record` for a change that adds symbols and parts
+    /// ([`crate::ProjectEdit::AddItems`]): store their files with the project, so the commit
+    /// holds them next to their lock entries.
+    fn vendor(&mut self, _symbols: &[Symbol], _parts: &[Part]) -> Result<()> {
+        Ok(())
+    }
+
     /// Called when `record` failed: put back what it stored, so it holds `project` again.
     fn restore(&mut self, _project: &Project) -> Result<()> {
         Ok(())
@@ -33,11 +40,23 @@ pub trait Journal {
 #[derive(Debug, Default)]
 pub struct MemoryJournal {
     pub changes: Vec<Change>,
+    /// Ids of the symbols and parts handed to [`Journal::vendor`].
+    pub vendored: Vec<String>,
 }
 
 impl Journal for MemoryJournal {
     fn record(&mut self, _project: &Project, change: &Change) -> Result<()> {
         self.changes.push(change.clone());
+        Ok(())
+    }
+
+    fn vendor(&mut self, symbols: &[Symbol], parts: &[Part]) -> Result<()> {
+        self.vendored.extend(
+            symbols
+                .iter()
+                .map(|s| s.id.clone())
+                .chain(parts.iter().map(|p| p.id.clone())),
+        );
         Ok(())
     }
 }
@@ -71,6 +90,17 @@ impl Journal for GitJournal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()> {
         wc_core::store::save(&self.dir, project)?;
         self.git.commit_as(&change.message, &change.author)?;
+        Ok(())
+    }
+
+    /// Write the vendored files into the project folder (`vendor/symbols`, `vendor/parts`).
+    fn vendor(&mut self, symbols: &[Symbol], parts: &[Part]) -> Result<()> {
+        for s in symbols {
+            wc_core::store::write_vendored_symbol(&self.dir, s)?;
+        }
+        for p in parts {
+            wc_core::store::write_vendored_part(&self.dir, p)?;
+        }
         Ok(())
     }
 
