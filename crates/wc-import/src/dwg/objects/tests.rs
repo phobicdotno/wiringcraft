@@ -1989,6 +1989,11 @@ fn a_dwg_spline_by_fit_points_is_a_smooth_curve() -> TestResult {
             .iter()
             .min_by(|a, b| (a.x - 2.5).abs().total_cmp(&(b.x - 2.5).abs()));
         assert!(quarter.is_some_and(|q| q.y < -22.5 - 0.3), "{v:?}: {quarter:?}");
+        // And it reaches its three fit points (page y down).
+        for (x, y) in [(0.0, -20.0), (5.0, -25.0), (10.0, -20.0)] {
+            let d = pts.iter().map(|q| (q.x - x).hypot(q.y - y)).fold(f64::MAX, f64::min);
+            assert!(d < 0.05, "{v:?}: ({x}, {y}) is {d} away");
+        }
     }
     Ok(())
 }

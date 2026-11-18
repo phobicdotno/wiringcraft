@@ -386,10 +386,15 @@ fn shapes(
             }
             "SPLINE" => {
                 let (pts, closed, curve) = spline_points(e);
-                let drawn = polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false);
+                // Placed on the page, every sample must still be a number (a huge scale could
+                // overflow a curve that bulges past its points).
+                let placed: Vec<Point> = pts.into_iter().map(|(x, y)| p(x, y)).collect();
+                let numbers = placed.iter().all(|q| q.x.is_finite() && q.y.is_finite());
+                let drawn = if numbers { polyline(placed, closed, false) } else { None };
                 // Knots that make no curve (wrong count or degree, an empty interval): the points
                 // are still joined, and said; a spline with too few points to join is said too.
                 let note = match (&drawn, curve) {
+                    (None, _) if !numbers => Some(SPLINE_NOT_NUMBERS),
                     (None, _) => Some(SPLINE_TOO_FEW),
                     (Some(_), false) => Some(SPLINE_NOT_CURVE),
                     (Some(_), true) => None,
@@ -642,6 +647,9 @@ const HATCH_UNFILLED: &str = "solid HATCH (holes too complex)";
 /// points instead).
 const SPLINE_NOT_CURVE: &str = "SPLINE whose knots make no curve";
 
+/// The key under which splines whose points are not numbers once placed are counted.
+const SPLINE_NOT_NUMBERS: &str = "SPLINE whose points are not numbers once placed";
+
 /// The key under which splines with too few points to draw are counted.
 const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 
@@ -718,6 +726,10 @@ fn through_fit_points(fit: &[(f64, f64)], degree: usize, tangents: Tangents) -> 
         if q.last().is_none_or(|l| (l.0 - pt.0).hypot(l.1 - pt.1) > 1e-12) {
             q.push(pt);
         }
+    }
+    // A repeat merge must not lose the curve's end: the last point given is its end.
+    if let (Some(last), Some(&end)) = (q.last_mut(), fit.last()) {
+        *last = end;
     }
     let n = q.len();
     let p = if degree == 0 { 3 } else { degree }.min(MAX_SPLINE_DEGREE);
@@ -1327,6 +1339,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
                 format!(
                     "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
                 )
+            } else if kind == SPLINE_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} SPLINE{s} whose points are not numbers once placed, left out")
             } else if kind == SPLINE_TOO_FEW {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} with too few points to draw, left out")
@@ -2399,22 +2414,62 @@ mod tests {
 
     #[test]
     fn a_hatch_spline_edge_follows_its_start_tangent() -> Result<()> {
-        // A spline edge by fit points (0, 0), (5, 5), (10, 0) with start tangent (1, 0) and end
-        // tangent (1, -1), then a line back: the edge leaves flat, the line is still there.
+        // A spline edge by fit points (0, 0), (5, 5), (10, 0) with start and end tangents (1, 0)
+        // (the fit chords rise and fall at 45 degrees), then a line back: the edge leaves and
+        // arrives flat, the line is still there.
         let ents = "0\nHATCH\n2\nANSI31\n70\n0\n91\n1\n92\n1\n93\n2\n\
                     72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n\
-                    12\n1\n22\n0\n13\n1\n23\n-1\n\
+                    12\n1\n22\n0\n13\n1\n23\n0\n\
                     72\n1\n10\n10\n20\n0\n11\n0\n21\n0\n97\n0\n";
         let (g, _) = drawn(ents, "")?;
         let (s, _, _) = poly(&g[0]);
         assert!(s.len() > 10, "{s:?}");
         let slope = (s[1].y - s[0].y) / (s[1].x - s[0].x);
         assert!(slope.abs() < 0.15 && s[1].x > s[0].x, "leaves flat: {:?}", &s[..2]);
+        // It arrives at (10, 0) flat too, towards +x.
+        let end = s
+            .iter()
+            .position(|q| (q.x - 10.0).abs() < 1e-6 && q.y.abs() < 1e-6)
+            .unwrap_or(0);
+        let (a, b) = (s[end.saturating_sub(1)], s[end]);
+        assert!(
+            end > 0 && ((b.y - a.y) / (b.x - a.x)).abs() < 0.15 && b.x > a.x,
+            "{a:?} {b:?}"
+        );
         // The closing line back to (0, 0): the last point is (0, 0) or next to it.
         assert!(
             s.iter().filter(|q| q.y.abs() < 1e-9).count() >= 2,
             "the line is kept: {s:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_last_fit_point_is_kept_and_an_overflowing_curve_is_left_out() -> Result<()> {
+        // The last point is within the repeat tolerance of the one before: the curve still ends
+        // on it.
+        let fit = [(0.0, 0.0), (2e-12, 1e-12), (4e-12, 0.0), (4e-12, 5e-13)];
+        let pts = through_fit_points(&fit, 2, (None, None)).unwrap_or_default();
+        assert_eq!(pts.last(), Some(&(4e-12, 5e-13)), "{pts:?}");
+        // A curve that bulges past its points by a little overflows when placed at a huge
+        // scale; its points alone would not.
+        let ents = "0\nSPLINE\n71\n2\n11\n0\n21\n0\n11\n0.5\n21\n1\n11\n1\n21\n1\n";
+        let d = parse(&format!("0\nSECTION\n2\nENTITIES\n{ents}0\nENDSEC\n0\nEOF\n"))?;
+        let (mut raw, mut points, mut skipped, mut budget) = (Vec::new(), Vec::new(), BTreeMap::new(), MAX_DRAWN);
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            1.75e308,
+            0,
+            &|_| false,
+            &mut raw,
+            &mut points,
+            &mut skipped,
+            &mut budget,
+        );
+        assert!(raw.is_empty(), "{raw:?}");
+        assert_eq!(skipped.get(SPLINE_NOT_NUMBERS), Some(&1), "{skipped:?}");
         Ok(())
     }
 }
