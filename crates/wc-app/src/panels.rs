@@ -14,7 +14,9 @@ use crate::theme::Theme;
 pub struct PanelState {
     pub search: String,
     /// Edit buffers for the properties panel and the selection they belong to.
-    loaded_for: Option<Selection>,
+    /// The page and item the fields were loaded from: the same item id on another page is
+    /// another item.
+    loaded_for: Option<(usize, Selection)>,
     tag: String,
     description: String,
     number: String,
@@ -513,10 +515,11 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
 
 fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
     let one = ed.one().cloned();
-    if ps.loaded_for == one {
+    let key = one.clone().map(|s| (ed.page, s));
+    if ps.loaded_for == key {
         return;
     }
-    ps.loaded_for = one.clone();
+    ps.loaded_for = key;
     ps.tag_error = None;
     let Some(page) = open.project.pages.get(ed.page) else {
         return;
@@ -1422,6 +1425,41 @@ mod tests {
         assert_eq!(ps.spec[1].buffer, "BU");
         assert!(!ps.spec[1].dirty);
         assert_eq!(o.project, before);
+    }
+
+    #[test]
+    fn the_same_item_id_on_another_page_loads_that_pages_values() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        for (page, tag) in [(0, "-K1"), (1, "-K2")] {
+            o.project.pages[page].symbols.push(wc_core::PlacedSymbol {
+                id: "s1".into(),
+                symbol: "iec.coil".into(),
+                at: wc_core::geom::Point::new(50.0, 50.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, ps: &mut PanelState| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        };
+        ed.selection = vec![Selection::Symbol("s1".into())];
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.tag, "-K1");
+        // Nothing selected for a frame, then s1 on the next page.
+        ed.selection.clear();
+        frame(&mut o, &mut ed, &mut ps);
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol("s1".into())];
+        frame(&mut o, &mut ed, &mut ps);
+        assert_eq!(ps.tag, "-K2");
+        Ok(())
     }
 
     #[test]

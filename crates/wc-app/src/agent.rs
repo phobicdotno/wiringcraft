@@ -2409,12 +2409,34 @@ mod tests {
         // With a panel shown instead of the held page, the page's own actions stay refused,
         // while the panel's are not affected.
         a.ed.panel = Some(0);
-        for act in [Action::PageProps, Action::DeletePage, Action::PageDown] {
+        let schematic = a.open.as_ref().unwrap().project.pages[0].clone();
+        for act in [
+            Action::PageProps,
+            Action::DeletePage,
+            Action::PageDown,
+            // These work on the schematic page under the panel.
+            Action::Paste,
+            Action::Cut,
+            Action::Rotate,
+            Action::Mirror,
+        ] {
             assert!(!status(&a, act), "{act:?} is still about the held page");
             a.run(act);
         }
         assert!(a.dialog.is_none());
         assert_eq!(numbers(&a), before_numbers);
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[0],
+            schematic,
+            "the held page is as it was"
+        );
+
+        // A page properties dialog opened before the page became held cannot change it.
+        let id = schematic.id.clone();
+        let o = a.open.as_mut().unwrap();
+        let refused = crate::confirm_page_props(o, &a.ed, &id, "99", "Renamed", schematic.size, false);
+        assert!(refused.is_err_and(|e| e.contains("Ola")));
+        assert_eq!(o.project.pages[0], schematic);
         assert!(status(&a, Action::ArrangePanel), "the panel's own actions work");
         a.ed.panel = None;
 

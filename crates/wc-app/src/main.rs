@@ -1451,10 +1451,7 @@ impl App {
                         if ui.button("OK").clicked()
                             && let Some(o) = self.open.as_mut()
                         {
-                            let at = o.project.pages.iter().position(|p| p.id == *id);
-                            match at
-                                .ok_or_else(|| "This page was removed by another participant.".to_owned())
-                                .and_then(|i| o.set_page_props(i, number, title, *size, *overview))
+                            match confirm_page_props(o, &self.ed, id, number, title, *size, *overview)
                             {
                                 Ok(i) => {
                                     self.ed.page = i;
@@ -2911,8 +2908,37 @@ impl App {
 /// actions (properties, delete, move up or down) are about the current page even while a panel
 /// is shown; canvas actions only when the page itself is shown, as in the panel view they work
 /// on the panel.
+/// The page properties dialog's OK: refused when the page was removed, or when someone else
+/// opened it while the dialog was open.
+fn confirm_page_props(
+    o: &mut Open,
+    ed: &Editor,
+    id: &str,
+    number: &str,
+    title: &str,
+    size: wc_core::PageSize,
+    overview: bool,
+) -> Result<usize, String> {
+    let i = o
+        .project
+        .pages
+        .iter()
+        .position(|p| p.id == id)
+        .ok_or_else(|| "This page was removed by another participant.".to_owned())?;
+    if let Some(name) = ed.held_by.get(id) {
+        return Err(format!(
+            "{name} has this page open; it is read-only here until they leave it."
+        ));
+    }
+    o.set_page_props(i, number, title, size, overview)
+}
+
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
-    let name = if a.edits_page_itself() {
+    // With a panel shown these still work on the schematic page under it (Delete goes to the
+    // panel first), so they follow that page's hold.
+    let on_page_under_panel =
+        ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Rotate | Action::Mirror);
+    let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
         ed.held_by.get(&page.id).map(String::as_str)
     } else if a.edits_page() {
