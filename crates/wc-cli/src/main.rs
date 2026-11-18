@@ -4242,6 +4242,9 @@ mod tests {
         // Nor one whose id differs only in case: its file may be the same file.
         let mut p = load(&dir).unwrap();
         p.pages.retain(|pg| pg.id != "dxf-300");
+        // Saved apart: on a folder that ignores case, one save that drops `dxf-300` and adds
+        // `DXF-300` would delete the file it just wrote.
+        save(&dir, &p).unwrap();
         let mut upper = Page::new("DXF-300", "299", "Earlier drawing");
         upper.title_block.insert("revision".into(), "C".into());
         p.pages.push(upper.clone());
