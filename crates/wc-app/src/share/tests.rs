@@ -923,14 +923,20 @@ fn a_refused_rename_on_your_own_page_is_taken_back_also_when_the_session_ends_wi
     h.frame(Some(&mut host_open), Some("p0002".into()), false);
     guest_open.project.rename_device(&k1, &k2);
     g.frame(Some(&mut guest_open), Some("p0003".into()), false);
-    // The host refuses, then ends the session before the guest's next frame.
+    // The host refuses, changes -K1 again, then ends the session before the guest's next
+    // frame: the guest gets all three at once.
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor, 2".into();
     h.frame(Some(&mut host_open), Some("p0002".into()), false);
     h.stop();
     g.frame(Some(&mut guest_open), Some("p0003".into()), false);
     assert!(!g.active());
     assert_eq!(coil_on(&guest_open, &coil)?, start);
-    // The device records come back with the page: -K1 as the session has it, no -K2.
-    assert_eq!(guest_open.project.devices.get(&k1), host_open.project.devices.get(&k1));
+    // The device records come back with the page: -K1 as the session has it last, no -K2.
+    assert_eq!(
+        guest_open.project.devices.get(&k1).map(|d| d.description.as_str()),
+        Some("Pump contactor, 2")
+    );
     assert!(!guest_open.project.devices.contains_key(&k2));
     assert!(g.take_notes().iter().any(|n| n.contains("nor what you did on it")));
     Ok(())
@@ -3442,4 +3448,18 @@ fn a_page_too_large_to_go_twice_in_one_message_is_not_folded_into_the_batch() {
     base.pages[0].title = "x".repeat(net::MAX_LINE * 3 / 8);
     let out = fold(&base, "y".repeat(net::MAX_LINE * 3 / 8));
     assert!(out.page.is_none() && out.edits.len() == 2);
+    // Many small edits whose sizes add up to just under the limit: the commas between them take
+    // it over, so the page stays apart.
+    base.pages[0].title = "One".into();
+    let mut page = base.pages[0].clone();
+    page.title = "Two".into();
+    let each = json_len(&device);
+    let n = (FOLD_LIMIT - json_len(&page) - json_len(&base.pages[0])) / each;
+    let mut out = Outgoing {
+        page: Some(page),
+        edits: vec![device.clone(); n],
+        dropped: Vec::new(),
+    };
+    fold_own_page(&mut out, &base);
+    assert!(out.page.is_some() && out.edits.len() == n);
 }

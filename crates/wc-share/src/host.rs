@@ -927,26 +927,32 @@ impl Host {
     /// Symbol `id` in the version `hash`: the one guests get, or one an update replaced.
     /// Wire ends in `project` on pins the locked version of their symbol does not have, for the
     /// versions the session has.
-    fn dangling_in(&self, project: &Project) -> BTreeMap<wc_core::project::DanglingEnd, String> {
-        project
+    /// The wire ends dangling in `project`, counted (two wires sharing an id count twice), each
+    /// with its label.
+    fn dangling_in(&self, project: &Project) -> BTreeMap<wc_core::project::DanglingEnd, (usize, String)> {
+        let mut out: BTreeMap<_, (usize, String)> = BTreeMap::new();
+        let ends = project
             .lock
             .symbols
             .iter()
             .filter_map(|(id, e)| Some((id, self.symbol_version(id, &e.hash)?)))
-            .flat_map(|(id, s)| project.dangling_ends(id, &s))
-            .collect()
+            .flat_map(|(id, s)| project.dangling_ends(id, &s));
+        for (end, label) in ends {
+            out.entry(end).or_insert((0, label)).0 += 1;
+        }
+        out
     }
 
     /// The labels of wire ends dangling in `after` that did not dangle in `before`: compared by
     /// what each end is, not by its label (a renamed device relabels an end already dangling;
-    /// two wires on one missing pin share a label).
+    /// two wires on one missing pin share a label), and by how many there are of it.
     fn newly_dangling(&self, before: &Project, after: &Project) -> Vec<String> {
         let was = self.dangling_in(before);
         let mut out: Vec<String> = self
             .dangling_in(after)
             .into_iter()
-            .filter(|(k, _)| !was.contains_key(k))
-            .map(|(_, label)| label)
+            .filter(|(k, (n, _))| was.get(k).is_none_or(|(m, _)| n > m))
+            .map(|(_, (_, label))| label)
             .collect();
         out.sort();
         out.dedup();

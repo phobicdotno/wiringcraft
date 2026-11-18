@@ -201,8 +201,8 @@ pub fn outgoing(
 
 /// Put back in the window (and in `base`, the last state synced) what a refused change of this
 /// person's own page touched: the pages `ids` as the session has them (also one deleted here
-/// meanwhile, or one the session no longer has) and the project `records` it touched, so the
-/// action is not left half kept.
+/// meanwhile, or one the session no longer has) and the project `records` it touched (as the
+/// session has them now), so the action is not left half kept.
 fn take_back_pages(
     open: &mut Open,
     base: Option<&mut Project>,
@@ -211,7 +211,9 @@ fn take_back_pages(
     records: wc_share::Parts,
     notes: &mut Vec<String>,
 ) {
-    let mut parts = records;
+    // The records it touched as the session has them now: a later change to one may have come
+    // in with the refusal.
+    let mut parts = wc_share::Parts::read(auth, &records);
     for id in ids {
         parts.pages.insert(id.clone(), auth.page(id).cloned());
     }
@@ -260,25 +262,27 @@ fn fold_own_page(out: &mut Outgoing, base: &Project) {
         return;
     };
     // The batch goes as one message, which carries the page twice (as it is and as it was): one
-    // that would not fit a session message goes as before, the page edit apart.
-    let total = out.edits.iter().map(json_len).sum::<usize>() + json_len(&page) + json_len(&was);
-    if total > FOLD_LIMIT {
-        out.page = Some(page);
-        return;
-    }
-    match out.edits.iter_mut().find_map(|e| match e {
+    // that would not fit a session message goes as before, the page edit apart. Measured as it
+    // would go, separators and all.
+    let mut edits = out.edits.clone();
+    match edits.iter_mut().find_map(|e| match e {
         ProjectEdit::SetPages { pages, before } => Some((pages, before)),
         _ => None,
     }) {
         Some((pages, before)) => {
-            pages.push(page);
+            pages.push(page.clone());
             before.push(was);
         }
-        None => out.edits.push(ProjectEdit::SetPages {
-            pages: vec![page],
+        None => edits.push(ProjectEdit::SetPages {
+            pages: vec![page.clone()],
             before: vec![was],
         }),
     }
+    if json_len(&edits) > FOLD_LIMIT {
+        out.page = Some(page);
+        return;
+    }
+    out.edits = edits;
 }
 
 /// Page `base` as both this window (`local`) and the session (`auth`) changed it: the session's
