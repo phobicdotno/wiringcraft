@@ -1999,11 +1999,6 @@ fn classes_section_max(v: Version, max: u16, classes: &[(u16, &str, bool)]) -> V
     match v {
         Version::R2004 => {
             out.rl(data.bytes().len() as u32).append(&data);
-            // A CRC and the closing sentinel.
-            let mut bytes = out.bytes();
-            bytes.extend([0, 0]);
-            bytes.extend(SENTINEL.iter().map(|b| !b));
-            return bytes;
         }
         Version::R2010 => {
             // Data, texts, their size and the flag; the flag sits `bitsize` after bit 191.
@@ -2018,7 +2013,11 @@ fn classes_section_max(v: Version, max: u16, classes: &[(u16, &str, bool)]) -> V
                 .append(&body);
         }
     }
-    out.bytes()
+    // A CRC and the closing sentinel after the class data area.
+    let mut bytes = out.bytes();
+    bytes.extend([0, 0]);
+    bytes.extend(SENTINEL.iter().map(|b| !b));
+    bytes
 }
 
 /// `sections` plus a class section, maintenance release 6.
@@ -2167,6 +2166,34 @@ fn a_2004_class_section_cut_inside_a_record_or_with_a_wrong_end_is_damaged() -> 
     // A class numbered past the declared highest one.
     let over = classes_section_max(v, 500, &[(501, "WIPEOUT", true)]);
     for bad in [cut, wrong, over] {
+        let d = drawing(&sections_with_classes(v, &objs, bad))?;
+        assert_eq!(d.model.len(), 1, "the drawing is still read");
+        assert_eq!(
+            d.skipped.get(CLASSES_DAMAGED),
+            Some(&1),
+            "{:?} {:?}",
+            d.skipped,
+            d.damaged
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_2010_class_record_that_cannot_be_read_and_a_cut_trailer_are_damage() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+    ];
+    // Sizes, texts and trailer consistent, but the header declares a second class that is not
+    // there: reading its record fails.
+    let short = classes_section_max(v, 501, &[(500, "WIPEOUT", true)]);
+    // The trailer cut off.
+    let whole = classes_section(v, &[(500, "WIPEOUT", true)]);
+    let cut = whole[..whole.len() - 10].to_vec();
+    for bad in [short, cut] {
         let d = drawing(&sections_with_classes(v, &objs, bad))?;
         assert_eq!(d.model.len(), 1, "the drawing is still read");
         assert_eq!(

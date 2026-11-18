@@ -107,8 +107,18 @@ impl SweDrawings {
         let sections = dwg::read_sections(bytes)?;
         let read = dwg::objects::dxf_drawing(&sections)?;
         let damaged = read.skipped.get(dwg::objects::DAMAGED).copied().unwrap_or(0);
-        for (k, n) in read.skipped {
-            *self.skipped.entry(k).or_default() += n;
+        for (k, n) in &read.skipped {
+            *self.skipped.entry(k.clone()).or_default() += n;
+        }
+        // A class section that could not be read: its custom entities are not counted.
+        if read.skipped.contains_key(dwg::objects::CLASSES_DAMAGED) {
+            let why = read
+                .damaged
+                .iter()
+                .find(|r| r.contains("AcDb:Classes"))
+                .map_or("", String::as_str);
+            self.warnings
+                .push(format!("{what}: {why}; its custom entities are not counted"));
         }
         // A drawing read in part is used; why the rest is missing is said once per file.
         if damaged > 0 {

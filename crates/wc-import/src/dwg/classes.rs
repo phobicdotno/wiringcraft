@@ -36,6 +36,17 @@ pub(crate) struct Class {
     pub(crate) entity: bool,
 }
 
+/// Check that a CRC (RS) and the closing sentinel, the opening one with every bit flipped,
+/// follow the class data area ending at byte `end`.
+fn closing_sentinel(data: &[u8], end: usize) -> std::result::Result<(), &'static str> {
+    let closing = end.checked_add(2).and_then(|at| data.get(at..at + SENTINEL.len()));
+    match closing {
+        None => Err("its closing sentinel is missing"),
+        Some(c) if c.iter().zip(SENTINEL).all(|(a, b)| *a == !b) => Ok(()),
+        Some(_) => Err("its closing sentinel is wrong"),
+    }
+}
+
 /// The classes by number, read from the `AcDb:Classes` section `data` of a drawing of `version`
 /// and maintenance release `maint` (byte 0x0B of the file header).
 pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<HashMap<u16, Class>> {
@@ -72,6 +83,8 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
             .checked_add(if second { 191 } else { 159 })
             .filter(|f| *f < data.len() * 8)
             .ok_or_else(|| damaged("its texts lie past its end"))?;
+        // A CRC and the closing sentinel follow the area, as in 2004.
+        closing_sentinel(data, area_end).map_err(&damaged)?;
         // The streams lie in that area.
         if flag_at / 8 >= area_end {
             return Err(damaged("its texts lie past its class data"));
@@ -85,11 +98,7 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
             .checked_add(size)
             .filter(|e| e.saturating_add(2 + SENTINEL.len()) <= data.len())
             .ok_or_else(|| damaged("its size is past its end, or its closing sentinel is missing"))?;
-        // The closing sentinel is the opening one with every bit flipped.
-        let closing = data.get(end + 2..end + 2 + SENTINEL.len());
-        if !closing.is_some_and(|c| c.iter().zip(SENTINEL).all(|(a, b)| *a == !b)) {
-            return Err(damaged("its closing sentinel is wrong"));
-        }
+        closing_sentinel(data, end).map_err(&damaged)?;
         data_end = end * 8;
     }
     let mut d = Bits::new(data, head.pos(), data_end);
