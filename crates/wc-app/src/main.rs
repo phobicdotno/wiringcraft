@@ -2334,8 +2334,17 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
             (Key::F, Action::Find),
             (Key::J, Action::Assistant),
         ] {
-            if k == Key::N && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k)) {
-                out.push(Action::NewProject);
+            // With Shift first: Ctrl+Shift+N is a new project, Ctrl+Shift+Z redoes (a plain Ctrl
+            // shortcut would also take them, as it lets Shift through).
+            let shifted = match k {
+                Key::N => Some(Action::NewProject),
+                Key::Z => Some(Action::Redo),
+                _ => None,
+            };
+            if let Some(sa) = shifted
+                && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k))
+            {
+                out.push(sa);
             } else if i.consume_shortcut(&ctrl(k)) {
                 out.push(a);
             }
@@ -3150,6 +3159,32 @@ mod renderer_tests {
         };
         assert!(press(true).is_empty(), "Ctrl+N does nothing under a dialog");
         assert!(matches!(press(false).as_slice(), [Action::AddPage]));
+    }
+
+    #[test]
+    fn ctrl_shift_z_redoes_and_ctrl_z_undoes() {
+        let ctx = egui::Context::default();
+        let press = |modifiers: Modifiers, key: Key| {
+            let raw = egui::RawInput {
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            let mut got = Vec::new();
+            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, false));
+            got
+        };
+        let shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        assert_eq!(press(shift, Key::Z), [Action::Redo]);
+        assert_eq!(press(Modifiers::COMMAND, Key::Z), [Action::Undo]);
+        assert_eq!(press(Modifiers::COMMAND, Key::Y), [Action::Redo]);
+        assert_eq!(press(shift, Key::N), [Action::NewProject]);
     }
 
     #[test]

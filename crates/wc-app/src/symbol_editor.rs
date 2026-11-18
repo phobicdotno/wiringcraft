@@ -1454,6 +1454,27 @@ mod tests {
     }
 
     #[test]
+    fn undo_during_a_drag_takes_back_the_whole_drag() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        let drawn = e.symbol.clone();
+        e.set_tool(Tool::Select);
+        e.start_drag(Point::new(-5.0, 0.0));
+        e.drag_to(Point::new(0.0, 0.0));
+        let moved = e.symbol.clone();
+        assert_ne!(moved, drawn);
+        // Undo before the mouse is let go.
+        e.undo();
+        assert!(!e.dragging());
+        assert_eq!(e.symbol, drawn);
+        e.redo();
+        assert_eq!(e.symbol, moved);
+        // The mouse moving on after that moves nothing.
+        e.drag_to(Point::new(5.0, 0.0));
+        assert_eq!(e.symbol, moved);
+    }
+
+    #[test]
     fn redo_takes_back_an_undo_until_something_new_is_done() {
         let mut e = SymbolEditor::new(Vec::new());
         draw_coil(&mut e);
