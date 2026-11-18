@@ -1586,6 +1586,22 @@ fn a_terminal_whose_symbol_is_missing_is_counted_the_same_everywhere() {
         "{:?}",
         markers.rows
     );
+    // With devices asked for too, -X1.3 has its terminal marker only, not a device marker.
+    let both = marking_list(&i, &[MarkerKind::Devices, MarkerKind::Terminals]);
+    let device = MarkerKind::Devices.label(MarkingOptions::default().language);
+    assert!(
+        !both
+            .rows
+            .iter()
+            .any(|r| r[0] == device && r.iter().any(|c| c.contains("X1.3"))),
+        "{:?}",
+        both.rows
+    );
+    assert!(
+        both.rows.iter().any(|r| r[1] == "-X1" && r[2] == "3"),
+        "{:?}",
+        both.rows
+    );
     let out = configurator_list(&i);
     assert!(
         out.table.rows.iter().any(|r| r.iter().any(|c| c == "-X1/T3")),

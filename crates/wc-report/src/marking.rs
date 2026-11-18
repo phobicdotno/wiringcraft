@@ -381,9 +381,14 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
         }
         for page in &i.project.pages {
             for s in &page.symbols {
+                // The same rule as the terminal plan: a symbol the project has no copy of is a
+                // terminal when its tag has a terminal level (`-X1.3`).
                 let role = i.symbols.get(&s.symbol).map(|y| y.role);
-                if matches!(role, Some(SymbolRole::Terminal))
-                    && let Some(tag) = &s.tag
+                if let Some(tag) = &s.tag
+                    && match role {
+                        Some(r) => r == SymbolRole::Terminal,
+                        None => wc_core::project::is_terminal(tag, None),
+                    }
                 {
                     terminals.insert(tag.clone());
                 }
