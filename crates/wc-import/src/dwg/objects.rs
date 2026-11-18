@@ -752,6 +752,7 @@ fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
 }
 
 /// Decode the object at `at` into `out`.
+#[allow(clippy::too_many_arguments)]
 fn decode(
     objects: &[u8],
     at: usize,
