@@ -1600,3 +1600,54 @@ pub fn staging_dir(prefix: &str) -> std::io::Result<tempfile::TempDir> {
     }
     builder.tempdir()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp() -> tempfile::TempDir {
+        match tempfile::tempdir() {
+            Ok(t) => t,
+            Err(x) => unreachable!("no temp folder: {x}"),
+        }
+    }
+
+    #[test]
+    fn the_log_keeps_the_order_and_tells_warnings_apart() {
+        let mut log = Log::default();
+        out!(log, "a {}", 1);
+        err!(log, "warning: b");
+        out!(log, "c");
+        assert_eq!(log.text(), "a 1\nwarning: b\nc");
+        assert_eq!(log.warnings().collect::<Vec<_>>(), vec!["warning: b"]);
+    }
+
+    #[test]
+    fn parts_csv_writes_each_part_into_the_library_folder_and_says_how_many() {
+        let t = tmp();
+        let csv = t.path().join("parts.csv");
+        let lib = t.path().join("lib");
+        assert!(std::fs::write(&csv, "order number;manufacturer\nX-1;Acme\nX-2;Acme\n").is_ok());
+        let mut log = Log::default();
+        assert_eq!(parts_csv(&csv, &lib, &mut log), Ok(()));
+        let files = std::fs::read_dir(lib.join("parts")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(files, 2);
+        assert!(
+            log.text()
+                .ends_with(&format!("imported 2 part(s) into {}", lib.display())),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn an_import_of_a_missing_file_fails_and_leaves_the_project_as_it_was() {
+        let t = tmp();
+        let dir = t.path().join("p");
+        assert!(store::save(&dir, &Project::new("t")).is_ok());
+        let before = load(&dir);
+        let mut log = Log::default();
+        let r = aml(&dir, &t.path().join("missing.aml"), 100, &mut log);
+        assert!(r.is_err());
+        assert_eq!(load(&dir), before);
+    }
+}

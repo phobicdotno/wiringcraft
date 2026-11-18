@@ -13,6 +13,7 @@ mod feedback;
 mod find_window;
 mod icons;
 mod import_symbols;
+mod imports;
 mod panel_view;
 mod panels;
 mod prefs;
@@ -186,6 +187,7 @@ enum Pending {
     Export(Export),
     Marking(wc_report::MarkingOptions),
     ReportCsv(wc_report::Kind),
+    Import(imports::Kind),
 }
 
 /// The whole-project exports that ask where to go.
@@ -450,9 +452,13 @@ impl App {
             }
             return;
         }
+        if let Pending::Import(kind) = p {
+            self.import(kind);
+            return;
+        }
         let Some(open) = self.open.as_mut() else { return };
         match p {
-            Pending::Open => {}
+            Pending::Open | Pending::Import(_) => {}
             Pending::SaveAs => {
                 let parent = open
                     .dir
@@ -542,6 +548,43 @@ impl App {
                 };
             }
         }
+    }
+
+    /// File > Import: pick the file (and, for parts, the library folder), then run the import
+    /// the CLI runs and show what it said.
+    fn import(&mut self, kind: imports::Kind) {
+        if self.share.active() {
+            self.dialog = Some(Dialog::Message(
+                "Imports are not available in a shared session: leave the session, import, and share again.".to_owned(),
+            ));
+            return;
+        }
+        let Some(open) = self.open.as_mut() else { return };
+        let file = match pick_file(kind.title(), &open.dir, kind.filter()) {
+            Picked::Path(f) => f,
+            Picked::Failed(e) => {
+                self.dialog = Some(Dialog::Message(format!("{e}\n\nNothing was imported.")));
+                return;
+            }
+            Picked::Cancelled => return,
+        };
+        let lib = if kind.needs_library() {
+            let start = open.dir.display().to_string();
+            match pick_folder("Library folder for the imported parts", &start) {
+                Picked::Path(d) => Some(d),
+                Picked::Failed(e) => {
+                    self.dialog = Some(Dialog::Message(format!("{e}\n\nNothing was imported.")));
+                    return;
+                }
+                Picked::Cancelled => return,
+            }
+        } else {
+            None
+        };
+        let msg = imports::import(open, kind, &file, lib.as_deref(), self.ed.page);
+        applog::info(&format!("import {kind:?} {}", file.display()));
+        self.prune_selection();
+        self.dialog = Some(Dialog::Message(msg));
     }
 
     fn run(&mut self, a: Action) {
@@ -924,6 +967,11 @@ impl App {
             }
             Action::InsertMacro => self.dialog = Some(Dialog::Macros(open.macros())),
             Action::ExportDrawings => self.pending = Some(Pending::Export(Export::Drawings)),
+            a if imports::Kind::of(a).is_some() => {
+                if let Some(kind) = imports::Kind::of(a) {
+                    self.pending = Some(Pending::Import(kind));
+                }
+            }
             Action::ExportAml => self.pending = Some(Pending::Export(Export::Aml)),
             Action::ExportWagoMarking => {
                 let strip = self.ed.marking_strip.take();
@@ -2336,6 +2384,19 @@ fn pick_save(title: &str, dir: &Path, name: &str, filter: Option<(&str, &[&str])
     picker_outcome(r, shown.elapsed(), &applog::take_picker_errors())
 }
 
+/// The system's file picker for one file of a kind, starting in `dir`. Blocks the window while
+/// open, like any modal dialog.
+fn pick_file(title: &str, dir: &Path, filter: (&str, &[&str])) -> Picked {
+    let mut dialog = rfd::FileDialog::new().set_title(title).add_filter(filter.0, filter.1);
+    if dir.is_dir() {
+        dialog = dialog.set_directory(dir);
+    }
+    applog::take_picker_errors();
+    let shown = std::time::Instant::now();
+    let r = dialog.pick_file();
+    picker_outcome(r, shown.elapsed(), &applog::take_picker_errors())
+}
+
 /// Where an export goes: the file picked in the save dialog, or `default` with a note when the
 /// dialog could not open; `None` when the person cancelled.
 fn export_target(title: &str, default: &Path, filter: (&str, &[&str])) -> Option<(PathBuf, String)> {
@@ -2762,7 +2823,7 @@ fn export_wago_configurator(open: &Open) -> String {
     export_wago_configurator_to(open, &open.dir.join("export").join("wago-configurator.csv"))
 }
 
-/// [`export_wago_configurator`] to the file `path`.
+/// `export_wago_configurator`, to the file `path`.
 fn export_wago_configurator_to(open: &Open, path: &Path) -> String {
     let inputs = wc_report::Inputs {
         project: &open.project,
@@ -2813,7 +2874,7 @@ fn wago_marking_file(open: &Open, options: &wc_report::MarkingOptions) -> PathBu
     open.dir.join("export").join(name)
 }
 
-/// [`export_wago_marking`] to the file `path`.
+/// `export_wago_marking`, to the file `path`.
 fn export_wago_marking_to(open: &Open, options: &wc_report::MarkingOptions, path: &Path) -> String {
     let inputs = wc_report::Inputs {
         project: &open.project,

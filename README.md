@@ -56,6 +56,9 @@ pin, click bends, click a pin to finish or double-click a free point), rotate (R
 Wheel zooms around the pointer, right or middle drag pans, F fits the page, G toggles the grid.
 New devices get the next free tag, with the function and location used on that page.
 Versions → Commit / Branch / History records versions and shows the subway map.
+File → Import brings in EPLAN, SolidWorks Electrical, AutomationML, DWG, PDF and archive
+projects and EDZ, BMEcat and CSV parts through the system file picker, with the same import
+code as `wiringcraft import`.
 
 ### Assistant
 

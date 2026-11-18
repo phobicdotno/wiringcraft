@@ -943,6 +943,26 @@ impl Open {
         Ok(())
     }
 
+    /// Take in what an import wrote to the project folder, as one Undo step. Call it with no
+    /// changes left unsaved (they would be replaced). Returns whether the project changed.
+    pub fn adopt_saved(&mut self) -> Result<bool, String> {
+        let fresh = Open::load(&self.dir)?;
+        self.branch = fresh.branch;
+        let changed = fresh.project != self.project;
+        // The versions the import replaced are kept, so its undo step can put them back.
+        self.archive_symbols();
+        self.symbols.extend(fresh.symbols);
+        if changed {
+            self.forget_terminal_change();
+            self.checkpoint();
+            self.project = fresh.project;
+            self.forget_terminal_change();
+            self.dirty = false;
+        }
+        self.refresh_library();
+        Ok(changed)
+    }
+
     /// Keep the loaded symbol versions, so a step that replaces them can be undone.
     pub fn archive_symbols(&mut self) {
         for sym in self.symbols.values() {
