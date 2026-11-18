@@ -199,25 +199,27 @@ pub fn outgoing(
     out
 }
 
-/// Pages `ids` of this person's whose change the session refused, as the session has them, in
-/// the window (and in `base`, what it last synced to), dropping what was changed on them since.
+/// Put back in the window (and in `base`, the last state synced) what a refused change of this
+/// person's own page touched: the pages `ids` as the session has them (also one deleted here
+/// meanwhile, or one the session no longer has) and the project `records` it touched (as the
+/// session has them now), so the action is not left half kept.
 fn take_back_pages(
     open: &mut Open,
     base: Option<&mut Project>,
     auth: &Project,
     ids: &[String],
+    records: wc_share::Parts,
     notes: &mut Vec<String>,
 ) {
-    let mut base = base;
+    // The records it touched as the session has them now: a later change to one may have come
+    // in with the refusal.
+    let mut parts = wc_share::Parts::read(auth, &records);
     for id in ids {
-        if let Some(page) = auth.page(id) {
-            if let Some(p) = open.project.page_mut(id) {
-                *p = page.clone();
-            }
-            if let Some(p) = base.as_deref_mut().and_then(|b| b.page_mut(id)) {
-                *p = page.clone();
-            }
-        }
+        parts.pages.insert(id.clone(), auth.page(id).cloned());
+    }
+    parts.apply(&mut open.project);
+    if let Some(base) = base {
+        parts.apply(base);
     }
     open.dirty = true;
     notes.push(format!(
@@ -226,9 +228,21 @@ fn take_back_pages(
     ));
 }
 
-/// The most a folded batch may take as JSON: well under a session message's limit
-/// ([`net::MAX_LINE`]), leaving room for the message around it.
-const FOLD_LIMIT: usize = net::MAX_LINE / 2;
+/// Take back in the window what the session refused since the last look ([`Role::retaken`]).
+fn drain_retaken(role: &mut Role, open: &mut Open, base: Option<&mut Project>, notes: &mut Vec<String>) {
+    let (ids, records) = role.retaken();
+    if ids.is_empty() {
+        return;
+    }
+    if let Some(auth) = role.project() {
+        take_back_pages(open, base, auth, &ids, records, notes);
+    }
+}
+
+/// The most a folded batch may take as JSON: a session message's limit ([`net::MAX_LINE`])
+/// less room for the message around it (its kind, number and author, a few hundred bytes; the
+/// edits are carried as they are, not quoted again).
+const FOLD_LIMIT: usize = net::MAX_LINE - 64 * 1024;
 
 /// How long `v` is as JSON (what a session message carries).
 fn json_len<T: serde::Serialize>(v: &T) -> usize {
@@ -248,25 +262,27 @@ fn fold_own_page(out: &mut Outgoing, base: &Project) {
         return;
     };
     // The batch goes as one message, which carries the page twice (as it is and as it was): one
-    // that would not fit a session message goes as before, the page edit apart.
-    let total = out.edits.iter().map(json_len).sum::<usize>() + json_len(&page) + json_len(&was);
-    if total > FOLD_LIMIT {
-        out.page = Some(page);
-        return;
-    }
-    match out.edits.iter_mut().find_map(|e| match e {
+    // that would not fit a session message goes as before, the page edit apart. Measured as it
+    // would go, separators and all.
+    let mut edits = out.edits.clone();
+    match edits.iter_mut().find_map(|e| match e {
         ProjectEdit::SetPages { pages, before } => Some((pages, before)),
         _ => None,
     }) {
         Some((pages, before)) => {
-            pages.push(page);
+            pages.push(page.clone());
             before.push(was);
         }
-        None => out.edits.push(ProjectEdit::SetPages {
-            pages: vec![page],
+        None => edits.push(ProjectEdit::SetPages {
+            pages: vec![page.clone()],
             before: vec![was],
         }),
     }
+    if json_len(&edits) > FOLD_LIMIT {
+        out.page = Some(page);
+        return;
+    }
+    out.edits = edits;
 }
 
 /// Page `base` as both this window (`local`) and the session (`auth`) changed it: the session's
@@ -1533,10 +1549,13 @@ impl Role {
 
     /// This person's pages whose change the session refused, taken back whole since the last
     /// call ([`Guest::retaken`]).
-    fn retaken(&mut self) -> Vec<String> {
+    fn retaken(&mut self) -> (Vec<String>, wc_share::Parts) {
         match self {
-            Role::Host(_) => Vec::new(),
-            Role::Guest(j) => std::mem::take(&mut j.guest.retaken),
+            Role::Host(_) => Default::default(),
+            Role::Guest(j) => (
+                std::mem::take(&mut j.guest.retaken),
+                std::mem::take(&mut j.guest.retaken_records),
+            ),
         }
     }
 
@@ -2593,12 +2612,10 @@ impl Share {
         if !role.pump(&mut self.notes) {
             // A refusal that came with the end of the session still takes its page back: the
             // action is not left half kept in this copy.
-            let retaken = role.retaken();
-            if let (Some(open), Some(auth)) = (open.as_deref_mut(), role.project())
-                && !retaken.is_empty()
+            if let Some(open) = open.as_deref_mut()
                 && role.dir().is_some_and(|d| d == open.dir)
             {
-                take_back_pages(open, None, auth, &retaken, &mut self.notes);
+                drain_retaken(role, open, None, &mut self.notes);
             }
             // A join that was turned away goes back to the Join dialog, which says why: always
             // for another version (the person has to update one side), for a plain decline only
@@ -2665,13 +2682,8 @@ impl Share {
         // The session refused an action that changed this person's own page with project
         // records: the page takes the session's version, also over what was changed on it while
         // the answer was on its way, so the action is not half kept.
-        let retaken = role.retaken();
-        if !retaken.is_empty()
-            && let Some(auth) = role.project()
-        {
-            let base = self.base.get_or_insert_with(|| open.project.clone());
-            take_back_pages(open, Some(base), auth, &retaken, &mut self.notes);
-        }
+        let base = self.base.get_or_insert_with(|| open.project.clone());
+        drain_retaken(role, open, Some(base), &mut self.notes);
         // While such a change is on its way, later changes wait in the window: sent now, they
         // could not be taken back with it.
         if role.own_page_waits() {
@@ -2915,6 +2927,8 @@ impl Share {
             role.pump(&mut self.notes);
         }
         let base = self.base.get_or_insert_with(|| open.project.clone());
+        // A refusal in that answer takes its pages back now, before anything is done on them.
+        drain_retaken(role, open, Some(base), &mut self.notes);
         take_updates(role, base, &mut self.items_out);
         let auth = role.project()?;
         let conflicting = conflicts(&open.project, base, auth);

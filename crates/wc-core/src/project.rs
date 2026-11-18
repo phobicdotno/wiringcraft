@@ -1511,6 +1511,17 @@ pub struct Project {
     pub comments: Vec<crate::review::Comment>,
 }
 
+/// One wire end on a pin its symbol does not have: see [`Project::dangling_ends`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DanglingEnd {
+    pub page: String,
+    pub wire: String,
+    /// The wire's `to` end (else its `from` end).
+    pub to: bool,
+    pub item: String,
+    pub pin: String,
+}
+
 impl Project {
     /// Add spare terminal `number` to `strip` ([`ProjectMeta::add_spare`]), refused also when
     /// its tag (`-X1.S1`) is drawn as a device that is not a terminal of the strip: the spare
@@ -1560,23 +1571,46 @@ impl Project {
     /// Wire ends on pins of symbol `id` that `symbol` does not have: `page 3 -K1:13` each. What
     /// replacing the symbol with that version would leave unconnected.
     pub fn dangling_pins(&self, id: &str, symbol: &crate::Symbol) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .dangling_ends(id, symbol)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The wire ends [`Self::dangling_pins`] reports, one by one: keyed by what the end is
+    /// (page id, wire id, which end, and the item and pin it names), so the same end is
+    /// recognised after a device is renamed and two wires on one missing pin are two ends. With
+    /// the end's label for a message. Every end is listed: two wires that share an id (as a
+    /// replaced page may have them) give two entries alike.
+    pub fn dangling_ends(&self, id: &str, symbol: &crate::Symbol) -> Vec<(DanglingEnd, String)> {
         let mut out = Vec::new();
         for page in &self.pages {
             for w in &page.wires {
-                for end in [&w.from, &w.to] {
+                for (to, end) in [(false, &w.from), (true, &w.to)] {
                     let crate::Endpoint::Pin { item, pin } = end else {
                         continue;
                     };
                     let Some(placed) = page.symbol(item) else { continue };
                     if placed.symbol == id && symbol.pin(pin).is_none() {
                         let name = placed.tag.as_ref().map_or_else(|| item.clone(), ToString::to_string);
-                        out.push(format!("page {} {name}:{pin}", page.number));
+                        out.push((
+                            DanglingEnd {
+                                page: page.id.clone(),
+                                wire: w.id.clone(),
+                                to,
+                                item: item.clone(),
+                                pin: pin.clone(),
+                            },
+                            format!("page {} {name}:{pin}", page.number),
+                        ));
                     }
                 }
             }
         }
-        out.sort();
-        out.dedup();
         out
     }
 
