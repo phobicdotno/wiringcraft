@@ -64,7 +64,9 @@ devices and jumpers:
   `wiringcraft jumper part`. The row's Connects must still name the jumper's terminals (spaces
   do not matter); otherwise the jumpers changed since the export and the row is not taken.
 - A row the configurator added without an index, with a Strip the project has, becomes a new
-  accessory of the strip device (unless it has that part already), with its quantity.
+  accessory of the strip device (unless it has that part already), with its quantity. A row
+  without an index that is a Jumper, or has no Type but names terminals in Connects, is not taken:
+  it may be a jumper that lost its index.
 - In the app it is one undo step.
 
 Every row with an article that is not taken is listed with the reason: an index the project no

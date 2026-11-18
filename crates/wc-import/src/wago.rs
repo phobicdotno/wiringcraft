@@ -321,6 +321,11 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
                 miss("a jumper row without an index cannot be matched to a jumper; export the list again".into());
                 continue;
             }
+            // Without a Type the row could be a jumper that lost its index: its Connects says so.
+            if row.kind.is_empty() && row.connects.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+                miss("a row without an index or a type but with terminals in Connects may be a jumper; export the list again".into());
+                continue;
+            }
             match DeviceTag::parse(&row.strip) {
                 Ok(t) if strips.contains(&row.strip) => (t, Slot::NewAccessory),
                 _ if row.strip.is_empty() => {
@@ -1028,6 +1033,18 @@ mod tests {
         let blank = plan(&inputs, &library(&parts), &rows);
         assert!(blank.assignments.is_empty(), "{blank:#?}");
         assert!(blank.unmatched[0].contains("without an index"), "{:?}", blank.unmatched);
+
+        // Nor is one that has lost its type too but still names terminals.
+        let text = "Index;Strip;Article;Connects\n;-X1;2002-402;1, 2\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        let untyped = plan(&inputs, &library(&parts), &rows);
+        assert!(untyped.assignments.is_empty(), "{untyped:#?}");
+        assert_eq!(untyped.unmatched.len(), 1, "{:?}", untyped.unmatched);
+        assert!(
+            untyped.unmatched[0].contains("may be a jumper"),
+            "{:?}",
+            untyped.unmatched
+        );
 
         // Without a Connects column the jumper cannot be checked.
         let text = "Index;Type;Article\n-X1/J1;Jumper;2002-402\n";

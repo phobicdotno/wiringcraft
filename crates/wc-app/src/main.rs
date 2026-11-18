@@ -3600,6 +3600,43 @@ mod marking_tests {
     }
 
     #[test]
+    fn a_jumper_row_is_matched_to_the_jumper_after_a_terminal_change_still_in_progress() {
+        let (_tmp, mut o) = state::tests::project();
+        let mut ids = Vec::new();
+        for (x, tag) in [(20.0, "-X1.1"), (40.0, "-X1.2")] {
+            let id = o.place(1, "wc.terminal", wc_core::geom::Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse(tag).unwrap());
+            ids.push(id);
+        }
+        let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+        o.project
+            .meta
+            .add_jumper(&x1, &["1".to_owned(), "2".to_owned()])
+            .unwrap();
+        export_wago_configurator(&o);
+        let csv = std::fs::read_to_string(o.dir.join("export").join("wago-configurator.csv"))
+            .unwrap()
+            .replace("-X1/J1;Jumper;-X1;;;;;", "-X1/J1;Jumper;-X1;;;;EX-TB-2.5;");
+        assert!(csv.contains("EX-TB-2.5"), "{csv}");
+
+        // Terminal 2 becomes 5 after the list was exported, and the jumper has not followed yet.
+        o.checkpoint();
+        let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == ids[1]).unwrap();
+        s.tag = Some(wc_core::DeviceTag::parse("-X1.5").unwrap());
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"], "not followed yet");
+
+        let msg = o.import_wago_configured(csv.as_bytes()).unwrap();
+        assert!(msg.contains("0 device(s) or jumper(s) changed"), "{msg}");
+        assert!(msg.contains("1 not matched"), "{msg}");
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "5"], "followed");
+        assert!(
+            o.project.meta.jumpers[0].part.is_none(),
+            "the row stood for terminals 1 and 2"
+        );
+    }
+
+    #[test]
     fn one_strips_markers_are_exported_from_its_menu_with_the_chosen_lines() {
         let (_tmp, mut o) = state::tests::project();
         let a = o
