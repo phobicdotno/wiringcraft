@@ -539,17 +539,19 @@ impl SymbolEditor {
         });
     }
 
-    /// The mouse moved to `p` during a drag: the item moves by whole grid steps.
+    /// The mouse moved to `p` during a drag: the item moves by whole grid steps; a
+    /// dragged handle lands on the grid point nearest the pointer.
     pub fn drag_to(&mut self, p: Point) {
         let Some(drag) = self.drag.as_ref() else { return };
-        let d = snap(Point::new(p.x - drag.from.x, p.y - drag.from.y));
+        let raw = Point::new(p.x - drag.from.x, p.y - drag.from.y);
+        let d = snap(raw);
         let (item, handle) = (drag.item, drag.handle);
         self.symbol = drag.before.clone();
         match (item, handle) {
             (Item::Shape(i), Some(k)) => {
                 if let Some(g) = self.symbol.graphics.get_mut(i)
                     && let Some(h) = handles(g).get(k).copied()
-                    && let Some(new) = with_handle(g, k, snap(h + d))
+                    && let Some(new) = with_handle(g, k, snap(h + raw))
                 {
                     *g = new;
                 }
@@ -1339,6 +1341,47 @@ mod tests {
         e.start_drag(Point::new(15.0, 15.0));
         assert!(!e.dragging());
         assert_eq!(e.selected, None);
+    }
+
+    #[test]
+    fn a_corner_dragged_onto_the_opposite_side_leaves_the_rectangle_as_it_was() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        e.set_tool(Tool::Select);
+        e.click(Point::new(-5.0, 0.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        let drawn = e.symbol.clone();
+        let steps = e.undo.len();
+        // The bottom-right corner (5,2.5) onto the opposite corner's x, then onto its y.
+        for to in [Point::new(-5.0, 5.0), Point::new(10.0, -2.5)] {
+            e.start_drag(Point::new(5.0, 2.5));
+            e.drag_to(to);
+            e.end_drag();
+            assert_eq!(e.symbol, drawn, "no rectangle of no area at {to:?}");
+            assert_eq!(e.undo.len(), steps, "and no undo step");
+        }
+    }
+
+    #[test]
+    fn an_off_grid_line_end_lands_on_the_grid_point_under_the_pointer() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.symbol.graphics.push(Shape::Line {
+            a: Point::new(20.0, 1.25),
+            b: Point::new(20.0, -10.0),
+        });
+        e.set_tool(Tool::Select);
+        e.click(Point::new(20.0, -5.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        e.start_drag(Point::new(20.0, 1.25));
+        e.drag_to(Point::new(20.0, 5.0));
+        e.end_drag();
+        assert_eq!(
+            e.symbol.graphics[0],
+            Shape::Line {
+                a: Point::new(20.0, 5.0),
+                b: Point::new(20.0, -10.0)
+            }
+        );
     }
 
     #[test]
