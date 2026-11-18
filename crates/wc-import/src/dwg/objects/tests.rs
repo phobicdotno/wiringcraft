@@ -289,6 +289,9 @@ struct Head {
     /// Write the extras most entities do not have: extended data, a preview, a reactor, an
     /// extension dictionary, a true colour and linetype/plot style handles.
     extras: bool,
+    /// With `extras`, the true colour also names a colour-book colour (0x4000), whose handle
+    /// comes before the layer's.
+    book: bool,
 }
 
 fn head(owner: Option<u64>) -> Head {
@@ -297,6 +300,7 @@ fn head(owner: Option<u64>) -> Head {
         layer: LAYER_H,
         invisible: false,
         extras: false,
+        book: false,
     }
 }
 
@@ -317,7 +321,8 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
     d.bb(if h.owner.is_some() { 0 } else { 2 });
     d.bl(u32::from(h.extras)).b(!h.extras);
     if h.extras {
-        d.bs(0x8000 | 0x4000 | 0x2000 | 7).bl(0x00FF_0000).bl(0x0200_0080);
+        let book = if h.book { 0x4000 } else { 0 };
+        d.bs(0x8000 | book | 0x2000 | 7).bl(0x00FF_0000).bl(0x0200_0080);
     } else {
         d.bs(256);
     }
@@ -334,7 +339,10 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
     }
     if h.extras {
         // A reactor, the extension dictionary and the colour-book colour.
-        hs.h(4, 0x77).h(3, 0x78).h(5, 0x79);
+        hs.h(4, 0x77).h(3, 0x78);
+        if h.book {
+            hs.h(5, 0x79);
+        }
         // The layer as an offset back from the entity's own handle.
         hs.h(0xC, handle - h.layer);
         hs.h(5, 0x14).h(5, 0x15);
@@ -431,7 +439,17 @@ fn sample(v: Version) -> Vec<Obj> {
     objs.push(c);
     // RELAY: a line with every extra, an arc, a closed lightweight polyline, a text, an
     // attribute definition, a turned and scaled COIL and a solid.
-    objs.push(line(v, 0x40, Head { extras: true, ..relay }, (0.0, 0.0), (10.0, 0.0)));
+    objs.push(line(
+        v,
+        0x40,
+        Head {
+            extras: true,
+            book: true,
+            ..relay
+        },
+        (0.0, 0.0),
+        (10.0, 0.0),
+    ));
     let mut a = entity(v, 17, 0x41, relay);
     a.data
         .bd3((5.0, 5.0, 0.0))
@@ -456,7 +474,17 @@ fn sample(v: Version) -> Vec<Obj> {
     text_data(&mut t, (1.0, 2.0), "K1", 3.5, std::f64::consts::FRAC_PI_2);
     objs.push(t);
     objs.push(attrib(v, 3, 0x44, relay, (0.0, 8.0), "?", "TAG", 0));
-    let mut i = entity(v, 7, 0x45, relay);
+    // The COIL insert has a colour-book colour: its handle must not be taken for the block's.
+    let mut i = entity(
+        v,
+        7,
+        0x45,
+        Head {
+            extras: true,
+            book: true,
+            ..relay
+        },
+    );
     i.data
         .bd3((20.0, 0.0, 0.0))
         .bb(2)
@@ -490,7 +518,8 @@ fn sample(v: Version) -> Vec<Obj> {
     objs.push(tr);
     // Model space: RELAY with a visible and a hidden attribute, a 2D polyline of three
     // vertices, an MTEXT, a point, an invisible line, an ellipse and a custom object.
-    let mut i = entity(v, 7, 0x50, model);
+    // The RELAY insert has a true colour without a colour book (no colour handle).
+    let mut i = entity(v, 7, 0x50, Head { extras: true, ..model });
     i.data
         .bd3((100.0, 50.0, 0.0))
         .bb(3)
