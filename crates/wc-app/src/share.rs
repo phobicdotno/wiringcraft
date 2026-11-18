@@ -2363,14 +2363,17 @@ impl Share {
         // drawings name is theirs: the file here is kept, but neither renamed nor shared.
         let (mine, theirs): (Vec<_>, Vec<_>) = clashes.into_iter().partition(|f| named_here.contains(f));
         self.clashes = mine;
+        let now = std::time::Instant::now();
         for file in theirs {
             if self.unreadable.insert(format!("clash {file}")) {
                 self.notes.push(format!(
                     "The session's picture {file} differs from your file of that name; your copy keeps showing your file."
                 ));
             }
+            // Compared again only after a while, as a picture that could not be written: once
+            // the file here is gone, the session's picture comes in.
+            self.pictures_failed.insert(file, now);
         }
-        let now = std::time::Instant::now();
         for (file, _) in &failed {
             self.pictures_failed.insert(file.clone(), now);
         }
