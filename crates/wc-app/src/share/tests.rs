@@ -1946,7 +1946,12 @@ fn a_guests_new_placement_of_a_symbol_whose_file_the_session_lacks_reaches_other
     approve(&mut h, ids[0], true);
     let mut kari_open = g2.frame(None, None, false).ok_or("the second guest got no project")?;
     kari_open.project.meta.libraries.clear();
-    std::fs::remove_file(store::vendor_path(&kari_open.dir, ItemKind::Symbol, "wc.coil")?).ok();
+    let kari_copy = store::vendor_path(&kari_open.dir, ItemKind::Symbol, "wc.coil")?;
+    match std::fs::remove_file(&kari_copy) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    assert!(!kari_copy.exists(), "the second guest has no copy");
     kari_open.symbols.remove("wc.coil");
     // A few frames of all three windows.
     let run = |h: &mut Share, ho: &mut Open, g: &mut Share, go: &mut Open, g2: &mut Share, ko: &mut Open| {

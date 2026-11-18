@@ -484,20 +484,10 @@ impl Guest {
     /// that shared the project with a copy missing): kind and id. Others in the session cannot
     /// draw a new use of one until the file comes in.
     pub fn files_missing(&self) -> Vec<(ItemKind, String)> {
-        let Some(project) = &self.project else {
-            return Vec::new();
-        };
-        [ItemKind::Symbol, ItemKind::Part]
-            .into_iter()
-            .flat_map(|kind| {
-                project
-                    .lock
-                    .map(kind)
-                    .iter()
-                    .filter(move |(id, e)| self.file_hashes.get(&(kind, (*id).clone())) != Some(&e.hash))
-                    .map(move |(id, _)| (kind, id.clone()))
-            })
-            .collect()
+        self.project
+            .as_ref()
+            .map(|p| crate::files_missing(&p.lock, &self.file_hashes))
+            .unwrap_or_default()
     }
 
     fn put_back(&mut self, mut parts: crate::Parts, whole: &[String]) {

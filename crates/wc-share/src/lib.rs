@@ -67,5 +67,23 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The items `lock` pins that `files` (the hash of each file the session has, by kind and id)
+/// has no file of in that version: kind and id. What the host and each guest count as missing.
+fn files_missing(
+    lock: &wc_core::Lockfile,
+    files: &std::collections::BTreeMap<(wc_core::lock::ItemKind, String), String>,
+) -> Vec<(wc_core::lock::ItemKind, String)> {
+    use wc_core::lock::ItemKind;
+    [ItemKind::Symbol, ItemKind::Part]
+        .into_iter()
+        .flat_map(|kind| {
+            lock.map(kind)
+                .iter()
+                .filter(move |(id, e)| files.get(&(kind, (*id).clone())) != Some(&e.hash))
+                .map(move |(id, _)| (kind, id.clone()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;
