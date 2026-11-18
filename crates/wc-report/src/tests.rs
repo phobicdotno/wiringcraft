@@ -1733,3 +1733,45 @@ fn check_finds_a_device_that_draws_more_contacts_than_its_parts_have() {
     p.pages.push(overview);
     assert!(overflow(&p, &s, &parts).is_empty());
 }
+
+#[test]
+fn csv_cells_a_spreadsheet_would_run_are_written_as_text() {
+    for (cell, out) in [
+        ("=1+2", "'=1+2"),
+        ("+C1", "'+C1"),
+        ("@SUM(A1)", "'@SUM(A1)"),
+        ("\tx", "'\tx"),
+        ("\rx", "'\rx"),
+        ("-cmd|' /C calc'!A0", "'-cmd|' /C calc'!A0"),
+        ("=A+C1-K1", "'=A+C1-K1"),
+        ("+C1-K1", "'+C1-K1"),
+        // Kept: ordinary text, plain numbers and product-aspect tags.
+        ("Motor 3", "Motor 3"),
+        ("", ""),
+        ("-5", "-5"),
+        ("-0.75", "-0.75"),
+        ("-2,5", "-2,5"),
+        ("-K1", "-K1"),
+        ("-X12", "-X12"),
+        ("a=b", "a=b"),
+    ] {
+        assert_eq!(formula_safe(cell), out, "{cell:?}");
+    }
+}
+
+#[test]
+fn every_csv_report_goes_through_the_guard_but_the_marker_list_keeps_its_text() {
+    let mut t = Table::new("T", &["Tag", "Text"]);
+    t.rows.push(vec!["-K1".into(), "=HYPERLINK(\"x\")".into()]);
+    t.rows.push(vec!["-5".into(), "@x".into()]);
+    let csv = t.to_csv();
+    assert_eq!(csv, "Tag,Text\r\n-K1,\"'=HYPERLINK(\"\"x\"\")\"\r\n-5,'@x\r\n");
+    assert_eq!(t.to_csv_with(';'), csv.replace(',', ";"));
+    // smartScript prints the text on the marker: it is written as it is.
+    let raw = t.to_csv_raw_with(';');
+    assert!(
+        raw.contains(";\"=HYPERLINK(\"\"x\"\")\"\r\n") && raw.contains(";@x\r\n"),
+        "{raw}"
+    );
+    assert!(to_smartscript_csv(&t).contains(";@x\r\n"));
+}

@@ -5,6 +5,7 @@
 //! Reports are always derived from the schematic; they are never stored, so they can never be
 //! out of date.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::connectivity::{self, PinRef};
@@ -52,19 +53,32 @@ impl Table {
         }
     }
 
-    /// RFC 4180 CSV with a header row; fields are quoted when they need it.
+    /// RFC 4180 CSV with a header row; fields are quoted when they need it, and cells a
+    /// spreadsheet would run as a formula are written as text (see [`formula_safe`]).
     pub fn to_csv(&self) -> String {
         self.to_csv_with(',')
     }
 
     /// CSV separated by `sep` (`,` or `;`), with a header row and CRLF line ends; fields are
-    /// quoted when they contain the separator, a quote or a line end.
+    /// quoted when they contain the separator, a quote or a line end. Every cell, the header
+    /// too, goes through [`formula_safe`].
     pub fn to_csv_with(&self, sep: char) -> String {
+        self.csv(sep, true)
+    }
+
+    /// [`Table::to_csv_with`] with every cell exactly as it is, for a file read by a program
+    /// that takes the text literally (a label printer), never for one meant for a spreadsheet.
+    pub fn to_csv_raw_with(&self, sep: char) -> String {
+        self.csv(sep, false)
+    }
+
+    fn csv(&self, sep: char, safe: bool) -> String {
         let field = |s: &str| {
+            let s = if safe { formula_safe(s) } else { Cow::Borrowed(s) };
             if s.contains([sep, '"', '\n', '\r']) {
                 format!("\"{}\"", s.replace('"', "\"\""))
             } else {
-                s.to_owned()
+                s.into_owned()
             }
         };
         let line = |cells: &[String]| {
@@ -100,6 +114,34 @@ impl Table {
         }
         out
     }
+}
+
+/// A cell as a spreadsheet should show it: text that Excel or LibreOffice would run as a formula
+/// when the CSV is opened (CWE-1236) gets a leading `'`, which makes it plain text there.
+///
+/// Guarded: cells starting with `=`, `+`, `@`, a tab or a carriage return, and cells starting
+/// with `-` unless they are a plain number (`-5`, `-0.75`, a value a column means as a number)
+/// or written exactly as a device tag with only a product aspect (`-K1`, `-X12`): such tags
+/// begin every device list, and a `'` in front of each would spoil them for the reader and for
+/// a later import. A tag with a function or location aspect (`=A-K1`, `+C1-K1`) is guarded.
+pub fn formula_safe(cell: &str) -> Cow<'_, str> {
+    let guard = match cell.chars().next() {
+        Some('=' | '+' | '@' | '\t' | '\r') => true,
+        Some('-') => !plain_number(&cell[1..]) && !marking::is_tag(cell),
+        _ => false,
+    };
+    if guard {
+        Cow::Owned(format!("'{cell}"))
+    } else {
+        Cow::Borrowed(cell)
+    }
+}
+
+/// Digits with at most one decimal point or comma, such as `5`, `0.75` or `2,5`.
+fn plain_number(s: &str) -> bool {
+    s.chars().any(|c| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+        && s.chars().filter(|c| matches!(c, '.' | ',')).count() <= 1
 }
 
 /// Which report to build.
