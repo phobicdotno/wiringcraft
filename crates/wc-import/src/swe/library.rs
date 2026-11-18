@@ -849,6 +849,23 @@ fn read_warnings(d: &SweDrawings) -> Vec<String> {
 }
 
 fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<SweLibrary> {
+    from_archive_within(reader, draw, super::drawings::Limits::ARCHIVE)
+}
+
+/// The block names (trimmed, lower case, as [`super::drawings::block_key`] keys them) of the
+/// blocks [`read_blocks`] imports: those with connection points. Only their drawings are read.
+fn importable_blocks(app_data: &Connection) -> Result<BTreeSet<String>> {
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let symbols = read_blocks(app_data, None, &mut report, &mut warnings)?;
+    Ok(symbols.iter().map(|s| super::drawings::block_key(&s.name)).collect())
+}
+
+/// [`from_archive_with`] with byte limits `lim` on the block drawings read.
+fn from_archive_within<R: Read + std::io::Seek>(
+    reader: R,
+    draw: bool,
+    lim: super::drawings::Limits,
+) -> Result<SweLibrary> {
     let mut zip =
         zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
     let catalog = find_entry(&zip, CATALOG_DB);
@@ -868,14 +885,15 @@ fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<S
     };
     // Block drawings only matter when there are blocks to draw.
     let mut drawing_warnings = Vec::new();
-    let drawings = if draw && app_data.is_some() {
+    let drawings = if draw && let Some(app) = app_data.as_ref() {
+        let blocks = importable_blocks(app)?;
         let mut reader = zip.into_inner();
         // No project folder: only the shared library's block files are read. A rewind that
         // fails leaves the blocks boxes, like a drawing read that fails.
         let read = reader
             .seek(std::io::SeekFrom::Start(0))
             .map_err(|e| Error::Format(format!("archive: {e}")))
-            .and_then(|_| super::drawings_from_archive(reader, ""));
+            .and_then(|_| super::drawings::block_drawings_within(reader, &blocks, lim));
         match read {
             Ok(d) => {
                 drawing_warnings = read_warnings(&d);
