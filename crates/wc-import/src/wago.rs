@@ -519,7 +519,28 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
             out.unchanged += 1;
         }
     }
+    // The reasons quote cells of the file as they are: a control character in one (a terminal
+    // escape sequence) is shown escaped, so printing the list cannot change the terminal.
+    for u in &mut out.unmatched {
+        *u = escape_controls(u);
+    }
     out
+}
+
+/// `text` with every control character written as its escape (`\u{1b}`), the rest as it is.
+fn escape_controls(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_owned();
+    }
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The `n`-th jumper (from 0) of `strip`, in the project's order.
@@ -982,6 +1003,18 @@ mod tests {
             moved.unmatched[0].contains("joins terminals 1,2 in the file but 1, 2, 3 in the project now"),
             "{:#?}",
             moved.unmatched
+        );
+
+        // A control character in a cell is shown escaped in the reason.
+        let text = "Index;Type;Article;Connects\n-X1/J1;Jumper;2002-402;1\u{1b}[2J,2\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        let escaped = plan(&inputs, &library(&parts), &rows);
+        assert_eq!(escaped.unmatched.len(), 1);
+        assert!(!escaped.unmatched[0].contains('\u{1b}'), "{:?}", escaped.unmatched);
+        assert!(
+            escaped.unmatched[0].contains("1\\u{1b}[2J,2"),
+            "{:?}",
+            escaped.unmatched
         );
 
         // Without a Connects column the jumper cannot be checked.
