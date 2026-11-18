@@ -201,8 +201,9 @@ pub fn outgoing(
 
 /// Page `base` as both this window (`local`) and the session (`auth`) changed it: the session's
 /// page with the local changes on top, or `None` when the two touched the same thing. Symbols
-/// and wires are matched by id, title-block fields by name; the title, size, underlay, the
-/// overview and cover marks, and the free graphics (which carry no id) each count as one thing.
+/// and wires are matched by id, title-block fields by name, the free graphics and texts (which
+/// carry no id) item by item ([`merge_unordered`]); the title, size, underlay, and the overview
+/// and cover marks each count as one thing.
 /// A wire that ends at a symbol the other side took away is a clash too. The page number is
 /// left as the session's.
 fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
@@ -212,7 +213,7 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
     page.underlay = pick(&base.underlay, &auth.underlay, &local.underlay)?;
     page.overview = pick(&base.overview, &auth.overview, &local.overview)?;
     page.cover = pick(&base.cover, &auth.cover, &local.cover)?;
-    page.graphics = pick(&base.graphics, &auth.graphics, &local.graphics)?;
+    page.graphics = merge_unordered(&base.graphics, &auth.graphics, &local.graphics)?;
     let names: std::collections::BTreeSet<&String> =
         [base, auth, local].iter().flat_map(|p| p.title_block.keys()).collect();
     let mut title_block = BTreeMap::new();
@@ -244,6 +245,55 @@ fn pick<T: PartialEq + Clone>(base: &T, auth: &T, local: &T) -> Option<T> {
     } else {
         None
     }
+}
+
+/// A three-way merge of items without ids (a page's free graphics and texts), as multisets:
+/// the session's items in its order, less those removed here that the session still has, then
+/// the items added here (one the session added the same way is not added twice). A change to an
+/// item is its removal and the new version's addition, so `None` (a clash) when an item removed
+/// here is gone from the session too while this window also added something: it was most likely
+/// changed here and removed or changed by the session. Removed on both sides with nothing added
+/// here is no clash.
+fn merge_unordered<T: PartialEq + Clone>(base: &[T], auth: &[T], local: &[T]) -> Option<Vec<T>> {
+    // `a` less `b`, counting repeats.
+    let minus = |a: &[T], b: &[T]| -> Vec<T> {
+        let mut left: Vec<&T> = b.iter().collect();
+        a.iter()
+            .filter(|x| match left.iter().position(|y| y == x) {
+                Some(i) => {
+                    left.swap_remove(i);
+                    false
+                }
+                None => true,
+            })
+            .cloned()
+            .collect()
+    };
+    let removed_here = minus(base, local);
+    let mut added_here = minus(local, base);
+    let mut added_there = minus(auth, base);
+    let mut out = auth.to_vec();
+    let mut gone_there = false;
+    for r in &removed_here {
+        match out.iter().position(|x| x == r) {
+            Some(i) => {
+                out.remove(i);
+            }
+            None => gone_there = true,
+        }
+    }
+    if gone_there && !added_here.is_empty() {
+        return None;
+    }
+    added_here.retain(|x| match added_there.iter().position(|y| y == x) {
+        Some(i) => {
+            added_there.swap_remove(i);
+            false
+        }
+        None => true,
+    });
+    out.extend(added_here);
+    Some(out)
 }
 
 /// A three-way merge of items with ids: the session's items in its order, each with this

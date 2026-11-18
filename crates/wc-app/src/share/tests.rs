@@ -1142,6 +1142,108 @@ fn a_guest_edit_right_after_its_undo_is_kept_when_the_undo_did_not_touch_it() ->
     Ok(())
 }
 
+fn line(x: f64) -> wc_core::geom::Shape {
+    wc_core::geom::Shape::Line {
+        a: wc_core::geom::Point::new(x, 5.0),
+        b: wc_core::geom::Point::new(x, 9.0),
+    }
+}
+
+#[test]
+fn a_text_added_right_after_an_undo_that_moved_a_line_is_kept() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // A line on the page, then moved: the undo of the move puts it back.
+    guest_open
+        .project
+        .page_mut("p0003")
+        .ok_or("no page")?
+        .graphics
+        .push(line(5.0));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.graphics = vec![line(20.0)];
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    // Before the undo's result is in, a text is added to the same page.
+    let text = wc_core::geom::Shape::Text {
+        at: wc_core::geom::Point::new(40.0, 40.0),
+        text: "Note".into(),
+        height: 3.5,
+        align: Default::default(),
+        angle: 0.0,
+    };
+    guest_open
+        .project
+        .page_mut("p0003")
+        .ok_or("no page")?
+        .graphics
+        .push(text.clone());
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    for open in [&host_open, &guest_open] {
+        let page = open.project.page("p0003").ok_or("no page")?;
+        assert_eq!(
+            page.graphics,
+            [line(5.0), text.clone()],
+            "the line is back and the text kept"
+        );
+    }
+    assert!(!g.take_notes().iter().any(|n| n.contains("was not kept")));
+    Ok(())
+}
+
+#[test]
+fn a_line_moved_here_that_the_undo_removed_is_not_kept() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open
+        .project
+        .page_mut("p0003")
+        .ok_or("no page")?
+        .graphics
+        .push(line(5.0));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    // Moved before the undo, which takes the line away, is in.
+    guest_open.project.page_mut("p0003").ok_or("no page")?.graphics = vec![line(20.0)];
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    for open in [&host_open, &guest_open] {
+        assert!(open.project.page("p0003").ok_or("no page")?.graphics.is_empty());
+    }
+    assert!(g.take_notes().iter().any(|n| n.contains("was not kept")));
+    Ok(())
+}
+
+#[test]
+fn free_graphics_merge_item_by_item() {
+    let [a, b, c, d] = [1.0, 2.0, 3.0, 4.0].map(line);
+    let m = |base: &[&wc_core::geom::Shape], auth: &[&wc_core::geom::Shape], local: &[&wc_core::geom::Shape]| {
+        let own = |v: &[&wc_core::geom::Shape]| v.iter().map(|x| (*x).clone()).collect::<Vec<_>>();
+        merge_unordered(&own(base), &own(auth), &own(local))
+    };
+    // Added on each side: both kept, the session's order first.
+    assert_eq!(
+        m(&[&a], &[&a, &b], &[&a, &c]),
+        Some(vec![a.clone(), b.clone(), c.clone()])
+    );
+    // Removed here while the session still has it; a repeat counts once per copy.
+    assert_eq!(
+        m(&[&a, &a, &b], &[&a, &a, &b, &d], &[&a, &b]),
+        Some(vec![a.clone(), b.clone(), d.clone()])
+    );
+    // Removed on both sides, nothing added here: no clash.
+    assert_eq!(m(&[&a, &b], &[&b], &[&b]), Some(vec![b.clone()]));
+    // The same item added on both sides is there once.
+    assert_eq!(m(&[], &[&c], &[&c]), Some(vec![c.clone()]));
+    // Changed here (a to c) while the session changed it too (a to b): a clash.
+    assert_eq!(m(&[&a], &[&b], &[&c]), None);
+}
+
 #[test]
 fn a_guest_without_the_libraries_draws_every_symbol_of_the_project() -> TestResult {
     let tmp = tempfile::tempdir()?;
