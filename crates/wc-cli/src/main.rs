@@ -3133,41 +3133,47 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
     }
     // A library item already in the project may come again unchanged (same content hash), or
     // in a new version when the project's copy is still the one its lock pinned: nobody changed
-    // it in the project, so the import replaces it (a block now drawn, a newer catalog).
-    let mut replaced: Vec<(PathBuf, Vec<u8>)> = Vec::new();
-    for s in &built.symbols {
-        if let Some(entry) = p.lock.symbols.get(&s.id)
-            && entry.hash != s.hash()
-        {
-            match store::read_vendored_symbol(dir, &s.id) {
-                Ok(have) if have.hash() == entry.hash => {
-                    replaced.push(vendored_bytes(dir, ItemKind::Symbol, &s.id)?);
+    // it in the project, so the import replaces it (a block now drawn, a newer catalog). Every
+    // file is read first, so a failed write can put them all back as they were.
+    let mut files: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let items = built
+        .symbols
+        .iter()
+        .map(|s| (ItemKind::Symbol, s.id.as_str(), s.hash()))
+        .chain(built.parts.iter().map(|x| (ItemKind::Part, x.id.as_str(), x.hash())));
+    for (kind, id, hash) in items {
+        let name = match kind {
+            ItemKind::Symbol => format!("symbol {id}"),
+            ItemKind::Part => format!("part {id}"),
+        };
+        let (path, before) = vendored_bytes(dir, kind, id)?;
+        if let Some(entry) = p.lock.map(kind).get(id) {
+            let have = match (&before, kind) {
+                (None, _) => None,
+                (Some(_), ItemKind::Symbol) => Some(store::read_vendored_symbol(dir, id).map(|x| x.hash())),
+                (Some(_), ItemKind::Part) => Some(store::read_vendored_part(dir, id).map(|x| x.hash())),
+            };
+            match have {
+                Some(Ok(h)) if h == entry.hash => {}
+                Some(Ok(_)) => {
+                    return Err(format!("{name} exists with other content; import into a fresh project"));
                 }
-                _ => {
+                Some(Err(why)) => {
                     return Err(format!(
-                        "symbol {} exists with other content; import into a fresh project",
-                        s.id
+                        "{name}: its copy {} cannot be read ({why}); repair it and import again",
+                        path.display()
+                    ));
+                }
+                None if entry.hash == hash => {}
+                None => {
+                    return Err(format!(
+                        "{name}: the project pins another version and has no copy of it ({}); put the copy back or run `lib lock`",
+                        path.display()
                     ));
                 }
             }
         }
-    }
-    for part in &built.parts {
-        if let Some(entry) = p.lock.parts.get(&part.id)
-            && entry.hash != part.hash()
-        {
-            match store::read_vendored_part(dir, &part.id) {
-                Ok(have) if have.hash() == entry.hash => {
-                    replaced.push(vendored_bytes(dir, ItemKind::Part, &part.id)?);
-                }
-                _ => {
-                    return Err(format!(
-                        "part {} exists with other content; import into a fresh project",
-                        part.id
-                    ));
-                }
-            }
-        }
+        files.push((path, before));
     }
     if let Some(panel) = built
         .panels
@@ -3189,18 +3195,28 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
             "device {tag} exists with other data; rename it or import into a fresh project"
         ));
     }
-    // A write that fails puts the copies it was replacing back, so each still matches its pin.
-    let put_back = |err: wc_core::Error| {
-        for (path, bytes) in &replaced {
-            let _ = std::fs::write(path, bytes);
+    // A write that fails puts back the files written before it (and removes the ones it made),
+    // so each copy still matches its pin.
+    let writes = built
+        .symbols
+        .iter()
+        .map(|s| store::write_vendored_symbol(dir, s))
+        .chain(built.parts.iter().map(|x| store::write_vendored_part(dir, x)));
+    for (n, written) in writes.enumerate() {
+        if let Err(err) = written {
+            let failed: Vec<String> = files[..n]
+                .iter()
+                .rev()
+                .filter_map(|(path, before)| put_file_back(path, before.as_deref()).err())
+                .collect();
+            if failed.is_empty() {
+                return Err(err.to_string());
+            }
+            return Err(format!(
+                "{err}; putting back the files written before it failed too: {}",
+                failed.join("; ")
+            ));
         }
-        err.to_string()
-    };
-    for s in &built.symbols {
-        store::write_vendored_symbol(dir, s).map_err(put_back)?;
-    }
-    for part in &built.parts {
-        store::write_vendored_part(dir, part).map_err(put_back)?;
     }
     fill_cover(p, cover_fields);
     for s in &built.symbols {
@@ -3245,10 +3261,38 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
 }
 
 /// The path and bytes of a vendored copy, kept before an import replaces it.
-fn vendored_bytes(dir: &Path, kind: ItemKind, id: &str) -> Result<(PathBuf, Vec<u8>), String> {
+/// The vendored file of an item and its bytes, none when there is no such file.
+fn vendored_bytes(dir: &Path, kind: ItemKind, id: &str) -> Result<(PathBuf, Option<Vec<u8>>), String> {
     let path = store::vendor_path(dir, kind, id).map_err(|x| x.to_string())?;
-    let bytes = std::fs::read(&path).map_err(|x| format!("{}: {x}", path.display()))?;
-    Ok((path, bytes))
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok((path, Some(bytes))),
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => Ok((path, None)),
+        Err(x) => Err(format!("{}: {x}", path.display())),
+    }
+}
+
+/// Put `path` back to `before` (remove it when it had none). The bytes go to a file beside it
+/// first and then replace it, so a failure never leaves it cut off. Returns why it failed.
+fn put_file_back(path: &Path, before: Option<&[u8]>) -> Result<(), String> {
+    let fail = |x: std::io::Error| format!("{}: {x}", path.display());
+    let Some(bytes) = before else {
+        return match std::fs::remove_file(path) {
+            Err(x) if x.kind() != std::io::ErrorKind::NotFound => Err(fail(x)),
+            _ => Ok(()),
+        };
+    };
+    if std::fs::read(path).is_ok_and(|now| now == bytes) {
+        return Ok(());
+    }
+    let mut part = path.as_os_str().to_owned();
+    part.push(".restore");
+    let part = PathBuf::from(part);
+    std::fs::write(&part, bytes)
+        .and_then(|()| std::fs::rename(&part, path))
+        .map_err(|x| {
+            let _ = std::fs::remove_file(&part);
+            fail(x)
+        })
 }
 
 /// The current time in UTC as `YYYY-MM-DDThh:mm:ssZ`.
@@ -4035,7 +4079,15 @@ mod tests {
             category: String::new(),
             letter_code: "K".into(),
             role: Default::default(),
-            graphics: vec![],
+            // A drawn block has its drawing.
+            graphics: if name.contains("drawn") {
+                vec![wc_core::geom::Shape::Line {
+                    a: wc_core::geom::Point::new(0.0, 0.0),
+                    b: wc_core::geom::Point::new(10.0, 0.0),
+                }]
+            } else {
+                vec![]
+            },
             pins: vec![],
             tag_at: Default::default(),
             description: String::new(),
@@ -4066,17 +4118,58 @@ mod tests {
         assert_eq!(p.lock.symbols["swe.lib.coil"].hash, coil("Coil, drawn").hash());
         assert_eq!(p.lock.parts["maker-a.rly-24"].hash, relay("Relay 24 V").hash());
 
+        assert!(
+            !store::read_vendored_symbol(&dir, "swe.lib.coil")
+                .unwrap()
+                .graphics
+                .is_empty()
+        );
+
+        // A write that fails after the coil was replaced puts the coil's copy back as it was,
+        // and the saved lock keeps its pins.
+        let coil_file = store::vendor_path(&dir, ItemKind::Symbol, "swe.lib.coil").unwrap();
+        let coil_bytes = std::fs::read(&coil_file).unwrap();
+        let relay_file = store::vendor_path(&dir, ItemKind::Part, "maker-a.rly-24").unwrap();
+        let mut blocker = relay_file.as_os_str().to_owned();
+        blocker.push(".tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        let mut p = load(&dir).unwrap();
+        let lock = p.lock.clone();
+        assert!(
+            add_built(
+                &dir,
+                &mut p,
+                built("Coil, drawn again", "Relay 24 V, v2"),
+                "import:a.tewzip"
+            )
+            .is_err()
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(std::fs::read(&coil_file).unwrap(), coil_bytes, "put back");
+        assert_eq!(load(&dir).unwrap().lock, lock);
+
         // Changed in the project since: still refused, and nothing is written.
-        store::write_vendored_symbol(&dir, &coil("Coil, edited here")).unwrap();
+        let edited = coil("Coil, edited here");
+        store::write_vendored_symbol(&dir, &edited).unwrap();
         let mut p = load(&dir).unwrap();
         let before = p.clone();
         let err = add_built(&dir, &mut p, built("Coil, v3", "Relay 24 V, v3"), "import:a.tewzip").unwrap_err();
         assert!(err.contains("symbol swe.lib.coil exists with other content"), "{err}");
         assert_eq!(p, before);
+        assert_eq!(store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap(), edited);
         assert_eq!(
             store::read_vendored_part(&dir, "maker-a.rly-24").unwrap(),
             relay("Relay 24 V")
         );
+        // Also when the import brings the pinned version itself: the edit is not written over.
+        let err = add_built(&dir, &mut p, built("Coil, drawn", "Relay 24 V"), "import:a.tewzip").unwrap_err();
+        assert!(err.contains("symbol swe.lib.coil exists with other content"), "{err}");
+        assert_eq!(store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap(), edited);
+
+        // A copy that cannot be read says why.
+        std::fs::write(&coil_file, "{ not json").unwrap();
+        let err = add_built(&dir, &mut p, built("Coil, v3", "Relay 24 V, v3"), "import:a.tewzip").unwrap_err();
+        assert!(err.contains("cannot be read") && err.contains("line 1"), "{err}");
     }
 
     #[test]
