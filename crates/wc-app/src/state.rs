@@ -707,8 +707,8 @@ impl Open {
         let changed =
             wc_core::project::follow_terminals_in(&mut self.project, &before, |id| symbols.get(id).map(|s| s.role));
         // Keep tracking: the next change before a checkpoint (the next frame of one drag) is
-        // measured from here. Without jumpers there is nothing to follow until the next one.
-        if !self.project.meta.jumpers.is_empty() {
+        // measured from here. Without jumpers or a strip layout there is nothing to follow.
+        if self.project.meta.follows_terminals() {
             self.terminals_before = Some(self.terminal_numbers());
         }
         changed
@@ -1178,12 +1178,17 @@ impl Open {
     /// Terminal tracking goes back with them: a copy put back restarted it from that copy.
     pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
         let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
-        let (jumpers, terminals) = (self.project.meta.jumpers.clone(), self.terminals_before.clone());
+        // Putting a terminal copy back follows terminals: jumpers, rail orders and the device
+        // data and panel places of spares a strip took along all go back too.
+        let (meta, terminals) = (self.project.meta.clone(), self.terminals_before.clone());
+        let (devices, panels) = (self.project.devices.clone(), self.project.panels.clone());
         for id in ids {
             if let Err(e) = self.ensure_symbol(id) {
                 self.project.lock = lock;
                 self.symbols = symbols;
-                self.project.meta.jumpers = jumpers;
+                self.project.meta = meta;
+                self.project.devices = devices;
+                self.project.panels = panels;
                 self.terminals_before = terminals;
                 let named = e.starts_with(&format!("symbol {id}:"));
                 return Err(if named { e } else { format!("symbol {id}: {e}") });
@@ -2616,18 +2621,37 @@ pub(crate) mod tests {
         }
         let x1 = DeviceTag::parse("-X1").unwrap();
         o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        o.project.meta.strips.push(wc_core::project::StripLayout {
+            strip: x1.clone(),
+            order: vec!["2".into(), "1".into()],
+            spares: vec![],
+        });
         o.save().unwrap();
         // Opened with a copy in which A is no terminal: B and C are 1 and 2 here.
         store::write_vendored_symbol(&o.dir, &terminal("test.term", wc_core::symbol::SymbolRole::Main)).unwrap();
         let mut o = Open::load(&o.dir).unwrap();
         o.checkpoint();
         let jumpers = o.project.meta.jumpers.clone();
+        // A change in progress: B and C swap places, so they swap numbers (C 1, B 2). The rail
+        // order (C, B) follows it once.
+        let page = &mut o.project.pages[1].symbols;
+        let (b, c) = (
+            page.iter().position(|s| s.id == "b").unwrap(),
+            page.iter().position(|s| s.id == "c").unwrap(),
+        );
+        let (at_b, at_c) = (page[b].at, page[c].at);
+        page[b].at = at_c;
+        page[c].at = at_b;
         // A paste puts the pinned copy back, then fails on a symbol no library has.
         store::write_vendored_symbol(&o.dir, &pinned).unwrap();
         assert!(o.ensure_symbols(["test.term", "no.such.symbol"]).is_err());
         // Nothing was added, and the next step does not read the rollback as terminals moved.
         o.checkpoint();
         assert_eq!(o.project.meta.jumpers, jumpers);
+        assert_eq!(
+            o.project.meta.strip_layout(&x1).map(|l| l.order.clone()),
+            Some(vec!["1".into(), "2".into()])
+        );
     }
 
     #[test]
@@ -4344,6 +4368,35 @@ pub(crate) mod tests {
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
         o.set_device_property(&x2, "note", "x");
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
+    fn a_renamed_terminal_keeps_its_place_on_the_rail() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64, tag: &str| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(DeviceTag::parse(tag).unwrap());
+            id
+        };
+        let (three, _four) = (put(10.0, "-X1.3"), put(20.0, "-X1.4"));
+        o.checkpoint();
+        o.project
+            .meta
+            .set_terminal_order(&x1, &["4".into(), "3".into()])
+            .unwrap();
+        // -X1.3 renamed to -X1.7 (no jumper on the strip): it stays after 4.
+        o.checkpoint();
+        o.project.pages[page]
+            .symbols
+            .iter_mut()
+            .find(|s| s.id == three)
+            .unwrap()
+            .tag = Some(DeviceTag::parse("-X1.7").unwrap());
+        o.checkpoint();
+        assert_eq!(o.project.meta.strip_layout(&x1).unwrap().order, ["4", "7"]);
     }
 
     #[test]

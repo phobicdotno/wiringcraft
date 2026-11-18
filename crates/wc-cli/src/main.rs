@@ -797,13 +797,13 @@ fn load(dir: &Path) -> Res<Project> {
     store::load(dir).map_err(e)
 }
 
-/// Save the project. Jumpers first follow their terminals: what the command renamed, moved or
-/// deleted is found by comparing with the project as it is on disk.
+/// Save the project. Jumpers and strip layouts first follow their terminals: what the command
+/// renamed, moved or deleted is found by comparing with the project as it is on disk.
 fn save(dir: &Path, p: &Project) -> Res<()> {
     let mut p = p.clone();
     // A new project has nothing on disk to compare with; any other load failure is reported.
     let on_disk = dir.join(store::PROJECT_FILE).exists();
-    if !p.meta.jumpers.is_empty() && on_disk {
+    if p.meta.follows_terminals() && on_disk {
         let old = store::load(dir).map_err(|err| format!("jumpers not updated: {}", e(err)))?;
         let (old_symbols, _) = store::vendored_symbols(dir, &old);
         let before = wc_core::project::terminal_numbers(&old, |id| old_symbols.get(id).map(|s| s.role));
@@ -3751,12 +3751,12 @@ fn add_built(
     }
     // The imported pages can renumber the project's terminals tagged with only their strip, so
     // the project's own jumpers follow first; the imported ones already have the final numbers.
-    let before = if p.meta.jumpers.is_empty() {
+    let before = if !p.meta.follows_terminals() {
         None
     } else {
         // A symbol the project has no readable copy of, which the import brings, changes which
-        // placed items are terminals. Whether the jumpers' numbers were given with it or without
-        // it cannot be told, so jumpers on a strip it renumbers are not guessed at.
+        // placed items are terminals. Whether the jumpers' and rail order's numbers were given
+        // with it or without it cannot be told, so a strip it renumbers is not guessed at.
         let (own, _) = store::vendored_symbols(dir, p);
         let mut symbols = own.clone();
         for s in &built.symbols {
@@ -3775,10 +3775,9 @@ fn add_built(
                     .map(|(_, (strip, _))| strip),
             )
             .collect();
-        if let Some(strip) = strips
-            .into_iter()
-            .find(|s| p.meta.jumpers.iter().any(|j| &j.strip == *s))
-        {
+        if let Some(strip) = strips.into_iter().find(|s| {
+            p.meta.jumpers.iter().any(|j| &j.strip == *s) || p.meta.strip_layout(s).is_some_and(|l| !l.is_empty())
+        }) {
             let missing: Vec<&str> = built
                 .symbols
                 .iter()
@@ -3787,7 +3786,7 @@ fn add_built(
                 .filter(|id| p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == *id)))
                 .collect();
             return Err(format!(
-                "the jumpers of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
+                "the jumpers and rail order of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
                 missing.join(", ")
             ));
         }
@@ -4595,6 +4594,34 @@ mod tests {
     }
 
     #[test]
+    fn saving_from_the_command_line_keeps_a_renamed_terminal_in_its_rail_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let page = &mut p.pages[0];
+        for (id, tag) in [("t3", "-X1.3"), ("t4", "-X1.4")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0, 10.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: DeviceTag::parse(tag).ok(),
+            });
+        }
+        // No jumper: the rail order alone is followed.
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.set_terminal_order(&x1, &["4".into(), "3".into()]).unwrap();
+        save(&dir, &p).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.pages[0].symbols[0].tag = DeviceTag::parse("-X1.7").ok();
+        save(&dir, &p).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.meta.strip_layout(&x1).unwrap().order, ["4", "7"]);
+    }
+
+    #[test]
     fn the_logo_is_set_and_removed_from_the_command_line() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -5384,6 +5411,58 @@ mod tests {
         let mut p = load(&dir).unwrap();
         add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap();
         assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
+    fn an_import_that_brings_a_missing_terminal_symbol_does_not_guess_a_rail_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let term = |id: &str| wc_core::Symbol {
+            id: id.into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let placed = |id: &str, symbol: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse("-X1").ok(),
+        };
+        let mut p = load(&dir).unwrap();
+        // No jumpers, only a rail order "2, 1": c then b without the missing symbol, b then a
+        // with it.
+        store::write_vendored_symbol(&dir, &term("test.term")).unwrap();
+        p.pages[0].symbols.extend([
+            placed("a", "test.missing", 10.0),
+            placed("b", "test.term", 20.0),
+            placed("c", "test.term", 30.0),
+        ]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.set_terminal_order(&x1, &["2".into(), "1".into()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        let mut p = load(&dir).unwrap();
+        let built = || wc_import::aml::Built {
+            symbols: vec![term("test.missing")],
+            ..Default::default()
+        };
+        let err = add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap_err();
+        assert!(err.contains("rail order of -X1"), "{err}");
+        assert!(err.contains("no readable copy of test.missing"), "{err}");
+        assert!(
+            store::read_vendored_symbol(&dir, "test.missing").is_err(),
+            "nothing written"
+        );
+        let order = |p: &Project| p.meta.strip_layout(&x1).map(|l| l.order.clone());
+        assert_eq!(order(&load(&dir).unwrap()), Some(vec!["2".into(), "1".into()]));
     }
 
     #[test]
