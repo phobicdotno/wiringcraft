@@ -13,6 +13,7 @@ use wc_core::{DeviceTag, Endpoint, Part, Project, Symbol};
 
 pub mod aml;
 pub mod check;
+pub mod configurator;
 pub mod marking;
 pub mod plc;
 pub mod step;
@@ -21,6 +22,7 @@ mod tests;
 
 pub use aml::{AmlCounts, automationml};
 pub use check::{Finding, Severity, check, check_table};
+pub use configurator::{CONFIGURATOR_COLUMNS, configurator_list};
 pub use marking::{
     LEVEL_SEPARATOR, Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,
     marking_list_with, parse_kinds, parse_lines, terminal_strips, to_smartscript_csv,

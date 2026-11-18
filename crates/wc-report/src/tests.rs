@@ -1079,3 +1079,133 @@ fn a_bottom_level_is_inferred_in_the_marking_order_and_never_over_a_bad_value() 
     assert_eq!(marked(&p, &s, &parts), ["1", "2"]);
     assert_eq!(level_warnings(&p).len(), 1);
 }
+
+#[test]
+fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_strip() {
+    use wc_core::DevicePart;
+    use wc_core::panel::{Panel, PanelItem};
+    let (mut p, s, mut parts) = fixture();
+    let term = Part {
+        id: "wago.2002-1201".into(),
+        manufacturer: "WAGO".into(),
+        order_number: "2002-1201".into(),
+        description: "2-conductor through terminal block".into(),
+        ..Default::default()
+    };
+    let end_plate = Part {
+        id: "wago.2002-1291".into(),
+        manufacturer: "WAGO".into(),
+        order_number: "2002-1291".into(),
+        description: "End and intermediate plate".into(),
+        ..Default::default()
+    };
+    for part in [&term, &end_plate] {
+        parts.insert(part.id.clone(), part.clone());
+    }
+    let tag = |t: &str| DeviceTag::parse(t).unwrap();
+    for t in ["-X1.1", "-X1.2"] {
+        p.devices.insert(
+            tag(t),
+            Device {
+                part: Some(term.id.clone()),
+                ..Default::default()
+            },
+        );
+    }
+    p.devices.get_mut(&tag("-X1.2")).unwrap().accessories = vec![DevicePart {
+        part: "acme.marker".into(),
+        qty: 2,
+    }];
+    p.devices.insert(
+        tag("-X1"),
+        Device {
+            accessories: vec![DevicePart {
+                part: end_plate.id.clone(),
+                qty: 1,
+            }],
+            ..Default::default()
+        },
+    );
+    p.meta
+        .add_jumper(&tag("-X1"), &["1".to_owned(), "2".to_owned()])
+        .unwrap();
+    // w2 ends on -X1.1's upper side, w3 on its lower side.
+    for w in p.pages.iter_mut().flat_map(|pg| pg.wires.iter_mut()) {
+        match w.id.as_str() {
+            "w2" => {
+                w.spec.section = Some("1.5 mm²".into());
+                w.spec.colour = Some("BU".into());
+            }
+            "w3" => w.spec.section = Some("2.5 mm²".into()),
+            _ => {}
+        }
+    }
+    let mut plate = Panel::with_rails("main", "Main plate", 600.0, 800.0);
+    let at = plate
+        .items
+        .iter()
+        .find_map(|i| match i {
+            PanelItem::Rail { at, .. } => Some(*at),
+            _ => None,
+        })
+        .unwrap();
+    plate.items.push(PanelItem::Device {
+        tag: tag("-X1.1"),
+        at: Point::new(at.x + 10.0, at.y - 20.0),
+        width: 5.2,
+        height: 40.0,
+    });
+    p.panels.push(plate);
+
+    let t = configurator_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.columns, CONFIGURATOR_COLUMNS);
+    let x1: Vec<(&str, &str)> = t
+        .rows
+        .iter()
+        .filter(|r| r[2] == "-X1")
+        .map(|r| (r[0].as_str(), r[1].as_str()))
+        .collect();
+    assert_eq!(
+        x1,
+        [
+            ("-X1/P1", "Plate"),
+            ("-X1/R1", "Rail"),
+            ("-X1/T1", "Terminal"),
+            ("-X1/T2", "Terminal"),
+            ("-X1/J1", "Jumper"),
+            ("-X1/A1", "Accessory"),
+            ("-X1/A2", "Accessory"),
+        ]
+    );
+    let row = |index: &str| t.rows.iter().find(|r| r[0] == index).unwrap().clone();
+    assert_eq!(row("-X1/P1")[8], "Mounting plate 600 x 800 mm");
+    assert_eq!(
+        (row("-X1/R1")[15].as_str(), row("-X1/R1")[16].as_str()),
+        ("Main plate", "1")
+    );
+    assert_eq!(row("-X1/R1")[18], "0");
+    let t1 = row("-X1/T1");
+    assert_eq!((t1[3].as_str(), t1[4].as_str()), ("1", "1"));
+    assert_eq!((t1[6].as_str(), t1[7].as_str()), ("2002-1201", "WAGO"));
+    assert_eq!(&t1[10..14], ["1.5 mm²", "BU", "2.5 mm²", ""]);
+    assert_eq!(row("-X1/J1")[14], "1, 2");
+    // The strip's own end plate first, then -X1.2's markers with their quantity.
+    assert_eq!(
+        (row("-X1/A1")[6].as_str(), row("-X1/A1")[9].as_str()),
+        ("2002-1291", "1")
+    );
+    let a2 = row("-X1/A2");
+    assert_eq!(
+        (a2[6].as_str(), a2[9].as_str(), a2[14].as_str()),
+        ("acme.marker", "2", "2")
+    );
+    // -X2 is on no plate and has no part: one bare terminal row.
+    let x2: Vec<&Vec<String>> = t.rows.iter().filter(|r| r[2] == "-X2").collect();
+    assert_eq!(x2.len(), 1);
+    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T1", ""));
+    assert!(to_smartscript_csv(&t).starts_with("\u{feff}Index;Type;Strip;"));
+}
