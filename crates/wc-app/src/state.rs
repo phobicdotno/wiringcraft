@@ -150,14 +150,15 @@ fn vendor_names(dir: &Path) -> Option<std::collections::BTreeSet<(ItemKind, Stri
     let mut out = std::collections::BTreeSet::new();
     for kind in [ItemKind::Symbol, ItemKind::Part] {
         let folder = dir.join(store::VENDOR_DIR).join(kind.dir());
-        if !folder.exists() {
+        // Only a folder known to be missing is skipped; one that cannot be checked is unknown.
+        if !folder.try_exists().ok()? {
             continue;
         }
         let folder = folder.canonicalize().ok().filter(|f| f.starts_with(&root))?;
         for e in std::fs::read_dir(folder).ok()? {
             let e = e.ok()?;
             let path = e.path();
-            if e.file_type().is_ok_and(|t| t.is_file())
+            if e.file_type().ok()?.is_file()
                 && path.extension().is_some_and(|x| x == "json")
                 && let Some(id) = path.file_stem().and_then(|s| s.to_str())
             {
