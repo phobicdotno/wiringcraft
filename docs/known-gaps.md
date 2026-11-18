@@ -45,7 +45,7 @@ These branches can be deleted once their pull requests are merged.
 | PDF trace: pictures compressed other than Flate, LZW or DCT (CCITT fax, JBIG2, JPEG 2000), or in other sample layouts than 1-bit gray, 8- or 16-bit gray and RGB and 8-bit CMYK, are refused ("not supported yet"); LZW, CMYK and 16-bit are read since #171 | `crates/wc-import/src/pdf.rs` | not filed |
 | SolidWorks Electrical cabinet layouts: items are sorted by block name (rail, duct, plate) since the database has no item kind; a footprint without a box size takes its catalog part's width and height, else 18 x 90 mm; upright rails are left out (WiringCraft rails run left to right) | `crates/wc-import/src/swe/cabinet.rs` | #59 (sizes from the DWG blocks) |
 | Binary DXF | `crates/wc-import/src/dxf.rs` | Not planned: the error tells the user to save as ASCII DXF, which every CAD program can do. |
-| DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004 and 2010 drawings only (2007 is #215); ELLIPSE, SPLINE and HATCH are skipped (#221 for HATCH); a DWG page import (`import page-dwg`) still goes through an installed DWG to DXF converter. |
+| DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004 and 2010 drawings only (2007 is #215); a DWG page import (`import page-dwg`) still goes through an installed DWG to DXF converter. |
 | STEP (3D) | `docs/manufacturer-data.md` | Later: 3D belongs to the one-way export to SolidCraft (phase 5). |
 
 ## Editing and app
