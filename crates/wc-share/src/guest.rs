@@ -387,8 +387,10 @@ impl Guest {
                 whole.extend(own.iter().cloned());
                 if let Some(parts) = put_back {
                     if !own.is_empty() {
+                        // The own pages are put back by id (`retaken`); other pages the batch
+                        // touched (one renumbered with it) stay listed, for their number.
                         let mut records = (*parts).clone();
-                        records.pages.clear();
+                        records.pages.retain(|id, _| !own.contains(id));
                         self.retaken_records.merge(records);
                     }
                     self.put_back(*parts, &whole);
