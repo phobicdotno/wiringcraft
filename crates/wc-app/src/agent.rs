@@ -428,7 +428,7 @@ pub fn specs() -> Vec<Value> {
                 "terminal": {"type": "string", "description": "A terminal number on the strip, e.g. 3 or S1 (move, spare, unspare, level)."},
                 "to": {"type": "integer", "minimum": 1, "description": "The place on the rail to move the terminal to, 1 is first (move)."},
                 "after": {"type": "string", "description": "The terminal the new spare goes right after; at the end when left out (spare)."},
-                "level": {"type": ["integer", "null"], "minimum": 1, "description": "The terminal's level, or null to clear it (level)."}
+                "level": {"type": ["integer", "null"], "minimum": 1, "maximum": u32::MAX, "description": "The terminal's level, or null to clear it (level)."}
             }),
             &["action"],
         ),
@@ -2236,9 +2236,11 @@ impl App {
                 let level = match v.get("level") {
                     Some(Value::Null) => None,
                     Some(l) => Some(
+                        // The terminal plan's range: a level it cannot read would be stored
+                        // and then shown as none.
                         l.as_u64()
-                            .filter(|l| *l >= 1)
-                            .ok_or("`level` must be 1 or more, or null to clear it.")?,
+                            .and_then(|l| wc_report::parse_level(&l.to_string()).ok())
+                            .ok_or(format!("`level` must be 1 to {}, or null to clear it.", u32::MAX))?,
                     ),
                     None => return Err("`level` is missing: give 1 or more, or null to clear it.".into()),
                 };
@@ -2983,6 +2985,8 @@ mod tests {
             json!({"action": "spare", "strip": "-X1", "terminal": "S1", "after": "9"}),
             json!({"action": "unspare", "strip": "-X1", "terminal": "2"}),
             json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 0}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 4_294_967_296_u64}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 1.5}),
             json!({"action": "level", "strip": "-X1", "terminal": "2", "level": "2"}),
             json!({"action": "level", "strip": "-X1", "terminal": "2"}),
             json!({"action": "level", "strip": "-X1", "terminal": "9", "level": 2}),
