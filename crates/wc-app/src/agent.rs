@@ -944,7 +944,16 @@ impl wc_agent::Tools for AppTools<'_> {
                 self.0.prune_selection();
                 Started::Done(r)
             }
-            running => running,
+            running => {
+                // A tool that runs on in the background is not checked here (its result is
+                // applied later); the undo history set aside for the check goes back now.
+                if let (Some(g), Some(open)) = (guard, self.0.open.as_mut())
+                    && open.dir == g.dir
+                {
+                    open.keep(g.mark);
+                }
+                running
+            }
         }
     }
 
@@ -4120,6 +4129,25 @@ mod tests {
         assert_eq!(customer(&a).as_deref(), Some("Second"));
         assert!(!format!("{r:?}").contains("not loaded"), "{r:?}");
         assert!(!a.assistant.command_running());
+    }
+
+    #[test]
+    fn a_background_tool_started_while_a_page_is_held_keeps_the_undo_history() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({})).unwrap();
+        call(&mut a, "add_page", json!({})).unwrap();
+        call(&mut a, "undo", json!({})).unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.held_by_others.insert("p0002".into(), "Ola".into());
+        let (mark, can_undo, can_redo) = (open.undo_mark(), open.can_undo(), open.can_redo());
+        let v = json!({"action": "search", "query": "relay"});
+        let started = wc_agent::Tools::start(&mut AppTools(&mut a), "todo", &v);
+        assert!(matches!(started, Started::Running(_)));
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(
+            (open.undo_mark(), open.can_undo(), open.can_redo()),
+            (mark, can_undo, can_redo)
+        );
     }
 
     #[test]
