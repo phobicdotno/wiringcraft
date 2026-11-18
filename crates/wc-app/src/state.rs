@@ -456,11 +456,14 @@ impl Open {
                     Ok(p) if fits(&p) => p,
                     named => match lib.part(id) {
                         Ok((p, _)) if fits(&p) => p,
-                        _ => {
-                            let why = match named {
-                                Err(e) => format!(" (source {}: {e})", pin.source),
-                                Ok(_) => String::new(),
-                            };
+                        first => {
+                            let mut why = String::new();
+                            if let Err(e) = named {
+                                why.push_str(&format!(" (source {}: {e})", pin.source));
+                            }
+                            if let Err(e) = first {
+                                why.push_str(&format!(" ({e})"));
+                            }
                             return Err(format!(
                                 "part {id}: its copy in the project is missing and the library has another version than the project pins{why}; put the copy back or update the part from the library"
                             ));
@@ -2144,6 +2147,18 @@ pub(crate) mod tests {
         o.parts.remove(pid);
         std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
         o.project.lock.parts.insert(pid.into(), pin);
+        // Pinned to a source that has moved on, while the source that comes first still has the
+        // pinned version: the copy comes from that one, and the pin stays as it is.
+        let pin = o.project.lock.parts[pid].clone();
+        assert_eq!(pin.source, "mine");
+        o.project.meta.libraries.rotate_left(1);
+        let seventh = DeviceTag::parse("-K7").unwrap();
+        o.set_device_part(&seventh, Some(pid)).unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), copy);
+        assert_eq!(o.project.lock.parts[pid], pin);
+        o.project.meta.libraries.rotate_right(1);
+        o.parts.remove(pid);
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
         // With the pinned version back in the library, the copy is put back and the pin kept.
         let pin = o.project.lock.parts[pid].clone();
         wc_library::write_part(&tmp.path().join("mine"), &copy).unwrap();

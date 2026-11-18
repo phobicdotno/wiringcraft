@@ -96,8 +96,13 @@ impl Library {
         };
         let s = self.sources.iter().find(|s| s.name == source).ok_or_else(not_found)?;
         let path = s.root.join(ItemKind::Part.dir()).join(format!("{id}.json"));
-        match std::fs::metadata(&path) {
+        // An entry that is there but cannot be followed (a link to nothing) says so.
+        match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
+            Err(e) => return Err(wc_core::Error::io(&path, e).into()),
+            Ok(_) => {}
+        }
+        match std::fs::metadata(&path) {
             Err(e) => return Err(wc_core::Error::io(&path, e).into()),
             Ok(m) if !m.is_file() => {
                 return Err(wc_core::Error::io(&path, std::io::Error::other("it is not a file")).into());

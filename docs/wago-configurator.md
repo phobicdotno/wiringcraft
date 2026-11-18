@@ -76,7 +76,8 @@ devices and jumpers:
   by an earlier import whose lock could not be written), even one no row names: then only
   `library.lock` is written (and the part's copy, when the project has none and a library has
   the part). A used part no library has and the project has no copy of stays unpinned; `lib
-  lock` reports it. With every used part pinned and nothing to change, nothing is written.
+  lock` reports it, once every configured library can be opened (`import wago` itself goes on
+  past a library it cannot open). With every used part pinned and nothing to change, nothing is written.
 
 Every row with an article that is not taken is listed with the reason: an index the project no
 longer has, or whose type, terminal number or (for an accessory) terminal in Connects changed
