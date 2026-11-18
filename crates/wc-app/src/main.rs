@@ -201,6 +201,9 @@ impl chrome::Status for StatusView<'_> {
 
     fn enabled(&self, a: Action) -> bool {
         let has = self.open.is_some();
+        if a.edits_page() && self.open.is_some_and(|o| self.ed.held_page(&o.project).is_some()) {
+            return false;
+        }
         match a {
             Action::NewProject
             | Action::Open
@@ -236,6 +239,12 @@ impl chrome::Status for StatusView<'_> {
 }
 
 impl App {
+    /// Who holds the page shown, in a shared session (it is read-only here then).
+    fn held_page(&self) -> Option<String> {
+        let o = self.open.as_ref()?;
+        self.ed.held_page(&o.project).map(str::to_owned)
+    }
+
     /// Keep the open project in step with the shared session, at the end of the frame so this
     /// frame's change goes out. Nothing goes out while a button is held or the live cover form
     /// is open, so one action is one change.
@@ -368,6 +377,12 @@ impl App {
     fn run(&mut self, a: Action) {
         let page = self.ed.page;
         applog::info(&format!("command {a:?}"));
+        if a.edits_page()
+            && let Some(name) = self.held_page()
+        {
+            self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
+            return;
+        }
         if a == Action::ReportProblem {
             self.dialog = Some(Dialog::Report {
                 log: applog::tail(REPORT_LOG_BYTES),
@@ -2669,7 +2684,11 @@ impl eframe::App for App {
                     ui.separator();
                     egui::ScrollArea::vertical().id_salt("properties").show(ui, |ui| {
                         ui.set_max_width(ui.available_width());
-                        panels::properties(ui, open, &mut self.ed, &mut self.panels);
+                        // A page someone else holds: values are shown, not edited.
+                        let held = self.ed.held_page(&open.project).is_some();
+                        ui.add_enabled_ui(!held, |ui| {
+                            panels::properties(ui, open, &mut self.ed, &mut self.panels);
+                        });
                     });
                 });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {

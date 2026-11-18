@@ -80,6 +80,27 @@ pub struct Info {
 }
 
 impl Action {
+    /// True for actions that change the page shown: on a page someone else in a shared
+    /// session holds they are greyed out and do nothing.
+    pub fn edits_page(self) -> bool {
+        matches!(
+            self,
+            Action::PlaceSymbol
+                | Action::DrawWire
+                | Action::InsertMacro
+                | Action::TextTool
+                | Action::LineTool
+                | Action::RectTool
+                | Action::Delete
+                | Action::Rotate
+                | Action::Mirror
+                | Action::Cut
+                | Action::Paste
+                | Action::PageProps
+                | Action::DeletePage
+        )
+    }
+
     /// Every action, for the assistant's `run_action` tool.
     pub const ALL: &'static [Action] = &[
         Action::NewProject,

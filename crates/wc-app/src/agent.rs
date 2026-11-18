@@ -2325,6 +2325,76 @@ mod tests {
     }
 
     #[test]
+    fn editing_actions_are_off_and_do_nothing_on_a_page_someone_else_holds() {
+        use crate::chrome::Status;
+        let (_tmp, mut a) = app(vec![]);
+        {
+            let o = a.open.as_mut().unwrap();
+            o.project.pages[0].graphics.push(wc_core::Shape::Line {
+                a: wc_core::geom::Point::new(50.0, 50.0),
+                b: wc_core::geom::Point::new(80.0, 50.0),
+            });
+        }
+        a.ed.selection = vec![crate::state::Selection::Graphic(0)];
+        a.clipboard = a.open.as_ref().unwrap().copy(0, &a.ed.selection);
+        let status = |a: &App, act: Action| {
+            crate::StatusView {
+                open: a.open.as_ref(),
+                ed: &a.ed,
+                prefs: &a.prefs,
+                clipboard: &a.clipboard,
+                sharing: true,
+                share_undo: false,
+                share_redo: false,
+            }
+            .enabled(act)
+        };
+        let editing = [
+            Action::Delete,
+            Action::Cut,
+            Action::Paste,
+            Action::PlaceSymbol,
+            Action::DrawWire,
+            Action::TextTool,
+            Action::LineTool,
+            Action::RectTool,
+            Action::PageProps,
+        ];
+        for act in editing {
+            assert!(status(&a, act), "{act:?} works on your own page");
+        }
+
+        let page_id = a.open.as_ref().unwrap().project.pages[0].id.clone();
+        a.ed.held_by.insert(page_id, "Ola".into());
+        for act in editing {
+            assert!(!status(&a, act), "{act:?} is greyed out on a held page");
+        }
+        for act in [
+            Action::Select,
+            Action::ZoomIn,
+            Action::ZoomFit,
+            Action::Copy,
+            Action::CommentTool,
+        ] {
+            assert!(status(&a, act), "{act:?} still works");
+        }
+
+        // Pressed anyway (a shortcut): nothing changes, and the status line says why.
+        let before = a.open.as_ref().unwrap().project.clone();
+        for act in editing {
+            a.run(act);
+        }
+        assert_eq!(a.open.as_ref().unwrap().project, before, "no project change");
+        assert_eq!(a.ed.tool, crate::state::Tool::Select, "no drawing tool was picked");
+        assert!(a.ed.message.contains("Ola"), "{}", a.ed.message);
+        assert!(a.dialog.is_none(), "no page properties dialog");
+
+        // On another page everything works as before.
+        a.ed.page = 1;
+        assert!(status(&a, Action::DrawWire));
+    }
+
+    #[test]
     fn editing_keys_go_to_the_symbol_editor_while_it_is_open() {
         let (_tmp, mut a) = app(vec![]);
         let keys = vec![Action::Undo, Action::Delete, Action::Redo, Action::ZoomIn];

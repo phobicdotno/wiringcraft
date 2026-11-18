@@ -119,6 +119,16 @@ enum Drag {
 }
 
 impl Editor {
+    /// Who holds the page shown, in a shared session: then it is read-only here and only
+    /// selecting, panning and zooming work on it. `None` in the panel view and on own pages.
+    pub fn held_page<'a>(&'a self, project: &wc_core::Project) -> Option<&'a str> {
+        if self.panel.is_some() {
+            return None;
+        }
+        let page = project.pages.get(self.page)?;
+        self.held_by.get(&page.id).map(String::as_str)
+    }
+
     /// The selected item when exactly one is selected.
     pub fn one(&self) -> Option<&Selection> {
         match self.selection.as_slice() {
@@ -846,13 +856,22 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         ed.comment = None;
     }
 
+    // On a page someone else holds, only selecting (and comments, which are not part of the
+    // page) work: a tool that draws or places falls back to Select.
+    let held = ed.held_page(&open.project).is_some();
+    if held && !matches!(ed.tool, Tool::Select | Tool::Comment) {
+        ed.tool = Tool::Select;
+        ed.wire = None;
+        ed.shape_start = None;
+    }
+
     // Pointer position in page mm, snapped.
     let hover = resp.hover_pos().map(|hp| xf.mm(hp));
     ed.cursor = hover.map(|p| snap(p, snap_step));
     let tol = (6.0 / f64::from(xf.zoom)).max(0.8);
 
     match ed.tool {
-        Tool::Select => select_tool(&painter, &resp, open, ed, &page, &xf, tol, snap_step),
+        Tool::Select => select_tool(&painter, &resp, open, ed, &page, &xf, tol, snap_step, held),
         Tool::Place => place_tool(&painter, &resp, open, ed, &xf, &t),
         Tool::Wire => wire_tool(&painter, &resp, open, ed, &page, &xf, &t),
         Tool::Text => {
@@ -885,6 +904,7 @@ fn select_tool(
     xf: &Xf,
     tol: f64,
     snap_step: f64,
+    held: bool,
 ) {
     let t = theme::Theme::of(&resp.ctx);
     let shift = resp.ctx.input(|i| i.modifiers.shift || i.modifiers.command);
@@ -911,43 +931,13 @@ fn select_tool(
     {
         right_clicked(ed, open.hit(page, at, tol));
     }
-    if !selected_wires(ed).is_empty() {
+    if !held && !selected_wires(ed).is_empty() {
         resp.context_menu(|ui| route_menu(ui, open, ed));
     }
     if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
-        let logo = wc_pdf::cover_logo_box(&open.project, page);
-        let hit = open.hit(page, at, tol);
-        ed.drag = match (logo, hit) {
-            // The sizing corner wins over whatever lies under it; elsewhere the page's items do.
-            (Some((a, b)), _) if logo_corner(b, at, tol) => Some(Drag::Logo {
-                from: at,
-                start: (a, b),
-                size: true,
-                checkpoint: false,
-            }),
-            (Some((a, b)), None) if a.x <= at.x && at.x <= b.x && a.y <= at.y && at.y <= b.y => Some(Drag::Logo {
-                from: at,
-                start: (a, b),
-                size: false,
-                checkpoint: false,
-            }),
-            (_, Some(h)) => {
-                if !ed.is_selected(&h) {
-                    if shift {
-                        ed.selection.push(h);
-                    } else {
-                        ed.select_only(h);
-                    }
-                }
-                Some(Drag::Move {
-                    from: snap(at, snap_step),
-                    checkpoint: false,
-                })
-            }
-            (_, None) => Some(Drag::Box { from: at }),
-        };
+        ed.drag = Some(drag_start(open, ed, page, at, tol, snap_step, shift, held));
     }
     match ed.drag {
         Some(Drag::Logo {
@@ -1021,6 +1011,56 @@ fn select_tool(
 }
 
 /// Whether `at` is on the sizing corner of a logo box whose bottom-right corner is `max`.
+/// What a select-tool drag starting at `at` does: size or move the cover logo, move the
+/// items under it (selecting them first), or draw a selection box. On a page someone else
+/// holds (`held`) nothing moves: every drag is a selection box.
+#[allow(clippy::too_many_arguments)]
+fn drag_start(
+    open: &Open,
+    ed: &mut Editor,
+    page: &Page,
+    at: Point,
+    tol: f64,
+    snap_step: f64,
+    shift: bool,
+    held: bool,
+) -> Drag {
+    if held {
+        return Drag::Box { from: at };
+    }
+    let logo = wc_pdf::cover_logo_box(&open.project, page);
+    let hit = open.hit(page, at, tol);
+    match (logo, hit) {
+        // The sizing corner wins over whatever lies under it; elsewhere the page's items do.
+        (Some((a, b)), _) if logo_corner(b, at, tol) => Drag::Logo {
+            from: at,
+            start: (a, b),
+            size: true,
+            checkpoint: false,
+        },
+        (Some((a, b)), None) if a.x <= at.x && at.x <= b.x && a.y <= at.y && at.y <= b.y => Drag::Logo {
+            from: at,
+            start: (a, b),
+            size: false,
+            checkpoint: false,
+        },
+        (_, Some(h)) => {
+            if !ed.is_selected(&h) {
+                if shift {
+                    ed.selection.push(h);
+                } else {
+                    ed.select_only(h);
+                }
+            }
+            Drag::Move {
+                from: snap(at, snap_step),
+                checkpoint: false,
+            }
+        }
+        (_, None) => Drag::Box { from: at },
+    }
+}
+
 fn logo_corner(max: Point, at: Point, tol: f64) -> bool {
     let r = tol.max(2.0);
     (at.x - max.x).abs() <= r && (at.y - max.y).abs() <= r
@@ -1575,6 +1615,39 @@ mod tests {
     }
 
     /// Drag the selection by `d` the way the select tool does: one checkpoint, then the move.
+    #[test]
+    fn a_drag_on_a_page_someone_else_holds_moves_nothing() {
+        let (_tmp, mut o) = project();
+        o.project.pages[0].graphics.push(Shape::Line {
+            a: Point::new(50.0, 50.0),
+            b: Point::new(80.0, 50.0),
+        });
+        let page = o.project.pages[0].clone();
+        let mut ed = Editor::default();
+        let at = Point::new(60.0, 50.0);
+        assert!(o.hit(&page, at, 1.0).is_some(), "the line is under the mouse");
+
+        // Own page: the drag picks the line up to move it.
+        assert_eq!(ed.held_page(&o.project), None);
+        let d = drag_start(&o, &mut ed, &page, at, 1.0, 2.5, false, false);
+        assert!(matches!(d, Drag::Move { .. }));
+        assert_eq!(ed.selection, vec![Selection::Graphic(0)]);
+
+        // Held by Ola: the same drag only draws a selection box, and nothing is picked up.
+        ed.selection.clear();
+        ed.held_by.insert(page.id.clone(), "Ola".into());
+        assert_eq!(ed.held_page(&o.project), Some("Ola"));
+        let held = ed.held_page(&o.project).is_some();
+        let d = drag_start(&o, &mut ed, &page, at, 1.0, 2.5, false, held);
+        assert!(matches!(d, Drag::Box { .. }));
+        assert!(ed.selection.is_empty());
+        assert_eq!(o.project.pages[0], page, "the page is unchanged");
+
+        // The panel view is not the page: it is not held.
+        ed.panel = Some(0);
+        assert_eq!(ed.held_page(&o.project), None);
+    }
+
     fn drag(o: &mut Open, ed: &mut Editor, d: Point) {
         o.checkpoint();
         o.move_by(ed.page, &ed.selection.clone(), d);
