@@ -8,7 +8,8 @@
 //! texts of an object are in a third stream at the end of its data.
 //!
 //! The entities read are LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE (2D and 3D) with their
-//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), HATCH, SOLID,
+//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), HATCH,
+//! ELLIPSE, SPLINE, SOLID,
 //! TRACE and POINT. Each entity belongs to
 //! the block whose BLOCK_HEADER owns it, or to model space; vertices belong to their polyline
 //! and attributes to their INSERT. The entities become the same entities the DXF reader works
@@ -358,8 +359,6 @@ fn unread_entity(kind: u16) -> Option<&'static str> {
         29 => "POLYLINE_PFACE",
         30 => "POLYLINE_MESH",
         33 => "SHAPE",
-        35 => "ELLIPSE",
-        36 => "SPLINE",
         37 => "REGION",
         38 => "3DSOLID",
         39 => "BODY",
@@ -393,6 +392,8 @@ fn read_entity(kind: u16) -> Option<&'static str> {
         27 => "POINT",
         31 | 32 => "SOLID",
         34 => "VIEWPORT",
+        35 => "ELLIPSE",
+        36 => "SPLINE",
         44 => "MTEXT",
         77 => "LWPOLYLINE",
         78 => "HATCH",
@@ -611,6 +612,98 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
     Ok(())
 }
 
+/// ELLIPSE: centre, major axis end (relative), extrusion, axis ratio and the start and end
+/// parameters (radians, as in DXF).
+fn ellipse(o: &mut Object, e: &mut Codes) -> Result<()> {
+    let d = &mut o.data;
+    let (cx, cy, cz) = d.bd3()?;
+    let (mx, my, mz) = d.bd3()?;
+    let (ex, ey, z) = d.bd3()?;
+    let ratio = d.bd()?;
+    let (start, end) = (d.bd()?, d.bd()?);
+    if ![cx, cy, cz, mx, my, mz, ex, ey, z, ratio, start, end]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return Err(bad("an ellipse has a value that is not a number"));
+    }
+    e.f(10, cx).f(20, cy).f(11, mx).f(21, my).f(230, z);
+    e.f(40, ratio).f(41, start).f(42, end);
+    Ok(())
+}
+
+/// The most knots, control points or fit points a SPLINE may list; more is a damaged object.
+const MAX_SPLINE_POINTS: u32 = 10_000;
+
+fn spline_count(o: &mut Object, what: &str) -> Result<u32> {
+    let n = o.data.bl()?;
+    if n > MAX_SPLINE_POINTS {
+        return Err(bad(format!("a spline lists {n} {what}")));
+    }
+    Ok(n)
+}
+
+/// SPLINE, as DXF codes: 70 (closed), 71 degree, and either knots (40), control points (10/20)
+/// and weights (41), or fit points (11/21). Before 2013 a scenario says which: 1 control
+/// points, 2 fit points.
+fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
+    let scenario = o.data.bl()?;
+    if scenario != 1 && scenario != 2 {
+        return Err(bad(format!("a spline has unknown scenario {scenario}")));
+    }
+    let degree = o.data.bl()?;
+    if scenario == 1 {
+        let d = &mut o.data;
+        let _rational = d.b()?;
+        let closed = d.b()?;
+        let periodic = d.b()?;
+        d.bd()?;
+        d.bd()?;
+        let knots = spline_count(o, "knots")?;
+        let points = spline_count(o, "control points")?;
+        let weighted = o.data.b()?;
+        // A curve of degree d over n control points needs n + d + 1 knots; a periodic one may
+        // list fewer, but never fewer than n + 1.
+        let full = points.saturating_add(degree).saturating_add(1);
+        if knots < points.saturating_add(1) || (!periodic && knots != full) {
+            return Err(bad(format!(
+                "a spline of degree {degree} lists {knots} knots for {points} control points"
+            )));
+        }
+        e.i(70, i64::from(closed)).i(71, i64::from(degree));
+        let mut last = f64::NEG_INFINITY;
+        for _ in 0..knots {
+            let k = o.data.bd()?;
+            // Knots are numbers that never decrease (repeats are fine).
+            if !k.is_finite() || k < last {
+                return Err(bad("a spline's knots are not numbers in order"));
+            }
+            last = k;
+            e.f(40, k);
+        }
+        for _ in 0..points {
+            let (x, y, _) = o.data.bd3()?;
+            e.f(10, x).f(20, y);
+            if weighted {
+                e.f(41, o.data.bd()?);
+            }
+        }
+    } else {
+        // Fit tolerance, the start and end tangents (DXF 12/22 and 13/23), then the fit points.
+        o.data.bd()?;
+        let (sx, sy, _) = o.data.bd3()?;
+        let (ex, ey, _) = o.data.bd3()?;
+        let fit = spline_count(o, "fit points")?;
+        e.i(70, 0).i(71, i64::from(degree));
+        e.f(12, sx).f(22, sy).f(13, ex).f(23, ey);
+        for _ in 0..fit {
+            let (x, y, _) = o.data.bd3()?;
+            e.f(11, x).f(21, y);
+        }
+    }
+    Ok(())
+}
+
 /// Decode the object at `at` into `out`.
 fn decode(
     objects: &[u8],
@@ -667,6 +760,8 @@ fn decode(
         1..=3 => text(&mut o, &mut e)?,
         7 => block = Some(insert(&mut o, &mut e)?),
         78 => hatch(&mut o, &mut e)?,
+        35 => ellipse(&mut o, &mut e)?,
+        36 => spline(&mut o, &mut e)?,
         // Drawn by its anonymous block, which comes after the dimension style in the handles.
         20..=26 => {
             o.handle_ref()?;
