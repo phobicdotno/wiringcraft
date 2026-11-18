@@ -169,7 +169,13 @@ fn lexical(p: &Path) -> PathBuf {
 /// link points. Past the first folder that does not exist yet, `..` is worked out by name (a
 /// folder that does not exist holds no links).
 fn resolved(dir: &Path) -> Result<PathBuf> {
-    let abs = std::path::absolute(dir).map_err(|e| Error::io(dir, e))?;
+    // Not `std::path::absolute`: on Windows it works out `..` by name before anything is
+    // checked on disk.
+    let abs = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|e| Error::io(dir, e))?.join(dir)
+    };
     let mut real = PathBuf::new();
     let mut missing: Vec<std::ffi::OsString> = Vec::new();
     for c in abs.components() {
@@ -185,7 +191,9 @@ fn resolved(dir: &Path) -> Result<PathBuf> {
                 let next = real.join(n);
                 match fs::canonicalize(&next) {
                     Ok(p) => real = p,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Only a folder can hold what is missing; Windows reports a file used
+                    // as a folder as "not found" too.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && real.is_dir() => {
                         missing.push(n.to_owned());
                     }
                     // A file where a folder should be, or no access: the path cannot be used.
@@ -471,8 +479,6 @@ mod tests {
         assert!(tmp.path().join("elsewhere/made").join(PROJECT_FILE).is_file());
     }
 
-    // Windows reports a file used as a folder as "not found", which the lexical part handles.
-    #[cfg(unix)]
     #[test]
     fn a_file_in_the_new_folder_path_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
