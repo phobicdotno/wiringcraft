@@ -609,44 +609,83 @@ fn fresh_uses(
     local: &Project,
     base: &Project,
 ) -> (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>) {
-    let symbols = local
+    let fresh = FreshUses::find(local, base);
+    let symbols = fresh
         .pages
-        .iter()
-        .flat_map(|p| {
-            let had: std::collections::BTreeSet<(&str, &str)> = base
-                .page(&p.id)
-                .map(|b| b.symbols.iter().map(|o| (o.id.as_str(), o.symbol.as_str())).collect())
-                .unwrap_or_default();
-            p.symbols
-                .iter()
-                .filter(move |s| !had.contains(&(s.id.as_str(), s.symbol.as_str())))
-                .map(|s| s.symbol.clone())
-        })
+        .into_iter()
+        .flat_map(|(_, s)| s)
+        .map(str::to_owned)
         .collect();
-    let parts = local
+    let parts = fresh
         .devices
-        .iter()
-        .flat_map(|(tag, d)| {
-            let had: std::collections::BTreeSet<String> = base
-                .devices
-                .get(tag)
-                .map(|b| b.all_parts().into_iter().map(|(p, _)| p.to_owned()).collect())
-                .unwrap_or_default();
-            d.all_parts()
-                .into_iter()
-                .map(|(p, _)| p.to_owned())
-                .filter(move |p| !had.contains(p))
-        })
-        .chain(
-            local
-                .meta
-                .jumpers
-                .iter()
-                .filter(|j| !base.meta.jumpers.contains(j))
-                .filter_map(|j| j.part.clone()),
-        )
+        .into_iter()
+        .flat_map(|(_, p)| p)
+        .chain(fresh.jumpers)
+        .map(str::to_owned)
         .collect();
     (symbols, parts)
+}
+
+/// The fresh uses of [`fresh_uses`], by the target that has them (targets without any left out).
+struct FreshUses<'a> {
+    /// Page id, and the symbols of its placements the base's page does not have.
+    pages: Vec<(&'a str, Vec<&'a str>)>,
+    /// Device tag, and the parts it names that the base's device does not.
+    devices: Vec<(&'a wc_core::DeviceTag, Vec<&'a str>)>,
+    /// The parts of jumpers the base does not have.
+    jumpers: Vec<&'a str>,
+}
+
+impl<'a> FreshUses<'a> {
+    fn find(local: &'a Project, base: &Project) -> Self {
+        let pages = local
+            .pages
+            .iter()
+            .filter_map(|p| {
+                let had: std::collections::BTreeSet<(&str, &str)> = base
+                    .page(&p.id)
+                    .map(|b| b.symbols.iter().map(|o| (o.id.as_str(), o.symbol.as_str())).collect())
+                    .unwrap_or_default();
+                let new: Vec<&str> = p
+                    .symbols
+                    .iter()
+                    .filter(|s| !had.contains(&(s.id.as_str(), s.symbol.as_str())))
+                    .map(|s| s.symbol.as_str())
+                    .collect();
+                (!new.is_empty()).then_some((p.id.as_str(), new))
+            })
+            .collect();
+        let devices = local
+            .devices
+            .iter()
+            .filter_map(|(tag, d)| {
+                let had: std::collections::BTreeSet<String> = base
+                    .devices
+                    .get(tag)
+                    .map(|b| b.all_parts().into_iter().map(|(p, _)| p.to_owned()).collect())
+                    .unwrap_or_default();
+                let new: Vec<&str> = d
+                    .all_parts()
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .filter(|p| !had.contains(*p))
+                    .collect();
+                (!new.is_empty()).then_some((tag, new))
+            })
+            .collect();
+        let jumpers = local
+            .meta
+            .jumpers
+            .iter()
+            .filter(|j| !base.meta.jumpers.contains(j))
+            .filter_map(|j| j.part.as_deref())
+            .collect();
+        FreshUses {
+            pages,
+            devices,
+            jumpers,
+        }
+    }
 }
 
 /// Items the session locked at the last sync (`was`) and no longer locks were taken back (an
@@ -1659,57 +1698,75 @@ impl Held {
     /// `waiting`.
     fn find(local: &Project, base: &Project, waiting: &BTreeMap<String, ItemOut>) -> Held {
         let waits = |kind: ItemKind, id: &str| waiting.contains_key(&item_name(kind, id));
+        let fresh = FreshUses::find(local, base);
         let mut held = Held::default();
         let mut items = std::collections::BTreeSet::new();
-        for p in &local.pages {
-            let had: std::collections::BTreeSet<(&str, &str)> = base
-                .page(&p.id)
-                .map(|b| b.symbols.iter().map(|o| (o.id.as_str(), o.symbol.as_str())).collect())
-                .unwrap_or_default();
-            let new: Vec<&str> = p
-                .symbols
-                .iter()
-                .filter(|o| !had.contains(&(o.id.as_str(), o.symbol.as_str())) && waits(ItemKind::Symbol, &o.symbol))
-                .map(|o| o.symbol.as_str())
-                .collect();
+        for (id, symbols) in &fresh.pages {
+            let new: Vec<&&str> = symbols.iter().filter(|s| waits(ItemKind::Symbol, s)).collect();
             if !new.is_empty() {
                 items.extend(new.iter().map(|id| item_name(ItemKind::Symbol, id)));
-                held.now.pages.insert(p.id.clone(), Some(p.clone()));
+                held.now.pages.insert((*id).to_owned(), local.page(id).cloned());
             }
         }
-        for (tag, d) in &local.devices {
-            let had: std::collections::BTreeSet<&str> = base
-                .devices
-                .get(tag)
-                .map(|b| b.all_parts().into_iter().map(|(p, _)| p).collect())
-                .unwrap_or_default();
-            let new: Vec<String> = d
-                .all_parts()
-                .into_iter()
-                .map(|(p, _)| p)
-                .filter(|p| !had.contains(p) && waits(ItemKind::Part, p))
-                .map(str::to_owned)
-                .collect();
+        for (tag, parts) in &fresh.devices {
+            let new: Vec<&&str> = parts.iter().filter(|p| waits(ItemKind::Part, p)).collect();
             if !new.is_empty() {
                 items.extend(new.iter().map(|id| item_name(ItemKind::Part, id)));
-                held.now.devices.insert(tag.clone(), Some(d.clone()));
+                held.now
+                    .devices
+                    .insert((*tag).clone(), local.devices.get(*tag).cloned());
             }
         }
-        let jumper_parts: Vec<String> = local
-            .meta
-            .jumpers
-            .iter()
-            .filter(|j| !base.meta.jumpers.contains(j))
-            .filter_map(|j| j.part.clone())
-            .filter(|p| waits(ItemKind::Part, p))
-            .collect();
+        let jumper_parts: Vec<&&str> = fresh.jumpers.iter().filter(|p| waits(ItemKind::Part, p)).collect();
         if !jumper_parts.is_empty() {
             items.extend(jumper_parts.iter().map(|id| item_name(ItemKind::Part, id)));
             held.now.meta = Some(Box::new(local.meta.clone()));
         }
+        held.hold_renames(local, base);
         held.was = wc_share::Parts::read(base, &held.now);
         held.items = items.into_iter().collect();
         held
+    }
+
+    /// A held device the base does not have may be a rename: the old device going away and
+    /// what was retagged to the new tag wait with it, so the session never has the new tag
+    /// without its device, nor loses the old one first.
+    fn hold_renames(&mut self, local: &Project, base: &Project) {
+        let new_tags: Vec<wc_core::DeviceTag> = self
+            .now
+            .devices
+            .keys()
+            .filter(|t| !base.devices.contains_key(*t))
+            .cloned()
+            .collect();
+        if new_tags.is_empty() {
+            return;
+        }
+        for tag in base.devices.keys().filter(|t| !local.devices.contains_key(*t)) {
+            self.now.devices.insert(tag.clone(), None);
+        }
+        let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
+        for p in &local.pages {
+            let mentions = p.symbols.iter().any(|s| s.tag.as_ref().is_some_and(named))
+                || p.wires
+                    .iter()
+                    .any(|w| w.cable.as_ref().is_some_and(|c| named(&c.cable)));
+            if mentions && base.page(&p.id) != Some(p) {
+                self.now.pages.insert(p.id.clone(), Some(p.clone()));
+            }
+        }
+        for panel in &local.panels {
+            let mentions = panel
+                .items
+                .iter()
+                .any(|i| matches!(i, wc_core::panel::PanelItem::Device { tag, .. } if named(tag)));
+            if mentions && base.panels.iter().find(|b| b.id == panel.id) != Some(panel) {
+                self.now.panels.insert(panel.id.clone(), Some(panel.clone()));
+            }
+        }
+        if local.meta != base.meta && local.meta.jumpers.iter().any(|j| named(&j.strip)) {
+            self.now.meta = Some(Box::new(local.meta.clone()));
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -1724,15 +1781,19 @@ impl Held {
         let mut lost = Vec::new();
         let mut keep = wc_share::Parts::default();
         for (id, now) in &self.now.pages {
+            let Some(now) = now else { continue };
             let was = self.was.pages.get(id).cloned().flatten();
-            let (Some(now), Some(was)) = (now, was) else { continue };
-            match project.page(id) {
-                Some(session) if wc_share::same_but_number(session, &was) => {
+            match (project.page(id), was) {
+                (Some(session), Some(was)) if wc_share::same_but_number(session, &was) => {
                     let mut page = now.clone();
                     if now.number == was.number {
                         page.number = session.number.clone();
                     }
                     keep.pages.insert(id.clone(), Some(page));
+                }
+                // A page new here, and still free in the session.
+                (None, None) => {
+                    keep.pages.insert(id.clone(), Some(now.clone()));
                 }
                 _ => lost.push(format!("page {}", now.number)),
             }
@@ -1743,6 +1804,14 @@ impl Held {
                 keep.devices.insert(tag.clone(), now.clone());
             } else {
                 lost.push(format!("device {tag}"));
+            }
+        }
+        for (id, now) in &self.now.panels {
+            let was = self.was.panels.get(id).cloned().flatten();
+            if project.panels.iter().find(|p| &p.id == id) == was.as_ref() {
+                keep.panels.insert(id.clone(), now.clone());
+            } else {
+                lost.push(format!("panel {id}"));
             }
         }
         if let (Some(now), Some(was)) = (&self.now.meta, &self.was.meta) {
@@ -2247,7 +2316,8 @@ impl Share {
         // long: the session refuses a page that draws a symbol it does not have. Others' changes
         // come in meanwhile; the session never had the item, so nothing replaces its entry here.
         let held = Held::find(&open.project, self.base.as_ref()?, &self.items_out);
-        if std::mem::take(&mut self.drop_held) && !held.is_empty() {
+        let undo = std::mem::take(&mut self.drop_held);
+        if undo && !held.is_empty() {
             // Undo of a change that never reached the session: taken back here only.
             held.drop_from(&mut open.project);
             self.notes.push(format!(
@@ -2293,6 +2363,13 @@ impl Share {
         if sent {
             // The host answers what was sent this frame at once; the reply goes out now.
             role.pump(&mut self.notes);
+        }
+        if undo {
+            // What waited when Undo was asked for has gone out meanwhile (its item arrived):
+            // the session takes it back, after it.
+            if role.take_back(false, None, &mut self.notes).is_ok() {
+                self.took_back = true;
+            }
         }
         let base = self.base.get_or_insert_with(|| open.project.clone());
         take_updates(role, base, &mut self.items_out);

@@ -2597,3 +2597,86 @@ fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
     assert!(has_placement(&host_open, "p0003", &item));
     Ok(())
 }
+
+fn waiting(names: &[String]) -> BTreeMap<String, ItemOut> {
+    let out = ItemOut {
+        at: std::time::Instant::now(),
+        tries: ITEM_TRIES,
+        gave_up: true,
+    };
+    names.iter().map(|n| (n.clone(), out)).collect()
+}
+
+#[test]
+fn a_new_page_that_waits_for_its_symbol_is_kept_while_others_changes_come_in() -> TestResult {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let mut local = base.clone();
+    let mut new_page = Page::new("p9", "9", "New");
+    new_page.symbols.push(symbol("s1", 10.0));
+    local.pages.push(new_page.clone());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert_eq!(held.items, ["symbol coil"]);
+    // The session renamed the project meanwhile and has no page p9.
+    let mut session = base.clone();
+    session.meta.name = "Renamed".into();
+    let lost = held.put_back(&mut session);
+    assert!(lost.is_empty(), "{lost:?}");
+    assert_eq!(session.page("p9"), Some(&new_page));
+    assert_eq!(session.meta.name, "Renamed");
+    // A page p9 the session made meanwhile is its own: the waiting page is not kept, and said so.
+    let mut session = base.clone();
+    session.pages.push(Page::new("p9", "9", "Theirs"));
+    assert_eq!(held.put_back(&mut session), ["page 9"]);
+    assert_eq!(session.page("p9").map(|p| p.title.as_str()), Some("Theirs"));
+    Ok(())
+}
+
+#[test]
+fn a_rename_to_a_device_with_a_waiting_part_waits_whole() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.pages.push(Page::new("p2", "2", "Two"));
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    local.pages[1].title = "Two, changed".into();
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    assert_eq!(held.items, ["part acme.relay"]);
+    // What goes out meanwhile: the old device and its page as they were, the other page changed.
+    let mut sendable = local.clone();
+    held.drop_from(&mut sendable);
+    assert_eq!(sendable.devices, base.devices);
+    assert_eq!(sendable.pages[0], base.pages[0]);
+    assert_eq!(sendable.pages[1].title, "Two, changed");
+    // Kept here while it waits.
+    let mut session = sendable.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session, local);
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_waiting_change_whose_symbol_arrives_first_takes_it_back_in_the_session() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    g.undo()?;
+    // The session gets the symbol from someone else before this copy looks at the undo: the
+    // change goes out with the next sync, and the undo then takes it back there.
+    log.fail_vendor(false);
+    host_open.place(1, "wc.contact.no", wc_core::Point::new(60.0, 100.0))?;
+    for _ in 0..4 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&host_open, "p0003", &item), "{:?}", g.notes);
+    assert!(!has_placement(&guest_open, "p0003", &item), "{:?}", g.notes);
+    Ok(())
+}

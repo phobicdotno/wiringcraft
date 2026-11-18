@@ -1037,13 +1037,22 @@ impl Host {
 /// (by placement and symbol), so placements the page already had stay editable, also of a
 /// symbol the project never locked (older projects), while a new one of that symbol is refused.
 fn unlocked_placements(project: &Project, old: Option<&Page>, new: &Page) -> Result<(), Refusal> {
-    let had: BTreeSet<(&str, &str)> = old
-        .map(|p| p.symbols.iter().map(|o| (o.id.as_str(), o.symbol.as_str())).collect())
-        .unwrap_or_default();
+    // Counted: one placement the page had keeps one placement editable, so copies of it under
+    // the same id are new uses.
+    let mut had: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for o in old.map(|p| p.symbols.as_slice()).unwrap_or_default() {
+        *had.entry((o.id.as_str(), o.symbol.as_str())).or_default() += 1;
+    }
     let unlocked: BTreeSet<&str> = new
         .symbols
         .iter()
-        .filter(|o| !had.contains(&(o.id.as_str(), o.symbol.as_str())))
+        .filter(|o| match had.get_mut(&(o.id.as_str(), o.symbol.as_str())) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
         .map(|o| o.symbol.as_str())
         .filter(|id| !project.lock.symbols.contains_key(*id))
         .collect();

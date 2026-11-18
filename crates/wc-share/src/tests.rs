@@ -3447,6 +3447,10 @@ fn a_page_that_already_used_an_unlocked_symbol_stays_editable() -> TestResult {
     place_symbol(&mut page, "again", 60.0, "lamp");
     let err = host.edit_page(page).err().ok_or("refused")?;
     assert!(err.to_string().contains("symbol lamp"), "{err}");
+    // So is a copy of the old placement under its id.
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    place_symbol(&mut page, "old", 80.0, "lamp");
+    assert!(host.edit_page(page).is_err());
     host.open(Some("p0003"))?;
     let mut page = host.project().page("p0003").ok_or("page")?.clone();
     place_symbol(&mut page, "s1", 10.0, "lamp");
