@@ -243,8 +243,8 @@ impl Journal for GitJournal {
 
 /// Write `picture` into the project folder `dir`, making its folder. A file there with the same
 /// content is left as it is; one with other content is never written over (an undo may still
-/// show it, or the person picked it here) and is an error. The file always lands inside the
-/// project, even when a folder on the way is a link.
+/// show it, or the person picked it here) and is [`crate::Error::PictureNameTaken`]. The file
+/// always lands inside the project, even when a folder on the way is a link.
 pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
     use std::io::{Error, ErrorKind};
     if let Some(why) = picture.problem() {
@@ -279,11 +279,10 @@ pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
     let existing = || -> Result<()> {
         match std::fs::read(&path) {
             Ok(have) if have == picture.data => Ok(()),
-            Ok(_) => Err(Error::new(
-                ErrorKind::AlreadyExists,
-                format!("the project already has another picture named {}", picture.file),
-            )
-            .into()),
+            Ok(_) => Err(crate::Error::PictureNameTaken(format!(
+                "the project already has another picture named {}",
+                picture.file
+            ))),
             Err(e) => Err(e.into()),
         }
     };

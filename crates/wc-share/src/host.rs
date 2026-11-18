@@ -611,14 +611,7 @@ impl Host {
     fn add_picture(&mut self, picture: crate::Picture) -> Result<(), Refusal> {
         match self.pictures.get(&picture.file) {
             Some(have) if *have == picture.data => return Ok(()),
-            Some(_) => {
-                return Err(Refusal::Invalid {
-                    reason: format!(
-                        "the session already has another picture named {}; pick the picture again to give it a new name",
-                        picture.file
-                    ),
-                });
-            }
+            Some(_) => return Err(Refusal::PictureNameTaken { file: picture.file }),
             None => {}
         }
         let (count, bytes) = self.added_pictures;
@@ -633,9 +626,14 @@ impl Host {
                 ),
             });
         }
-        self.journal
-            .picture(&picture)
-            .map_err(|e| Refusal::NotRecorded { reason: e.to_string() })?;
+        // A file of that name in the host's folder that the session does not use (an old logo) is
+        // never written over: the sender renames its picture instead.
+        self.journal.picture(&picture).map_err(|e| match e {
+            crate::Error::PictureNameTaken(_) => Refusal::PictureNameTaken {
+                file: picture.file.clone(),
+            },
+            e => Refusal::NotRecorded { reason: e.to_string() },
+        })?;
         self.added_pictures = (count + 1, bytes + picture.data.len());
         self.pictures.insert(picture.file.clone(), picture.data.clone());
         let ids: Vec<PeerId> = self.joined_guests().collect();

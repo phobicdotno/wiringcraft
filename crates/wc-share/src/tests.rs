@@ -2873,10 +2873,11 @@ fn guests_get_the_pictures_and_pictures_added_during_the_session() -> TestResult
     }
     s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
     assert_eq!(b.refusals.len(), 4, "{:?}", b.refusals);
-    assert!(
-        b.refusals[0].to_string().contains("another picture"),
-        "{}",
-        b.refusals[0]
+    assert_eq!(
+        b.refusals[0],
+        Refusal::PictureNameTaken {
+            file: "pictures/logo.png".into()
+        }
     );
     assert_eq!(a.pictures.get("pictures/logo.png"), Some(&png));
     assert_eq!(s.host.pictures().len(), 3);
@@ -2926,13 +2927,13 @@ fn an_added_picture_is_committed_with_the_change_that_names_it() -> TestResult {
     );
 
     // A file already in the folder under that name with other content is kept: the picture is
-    // refused.
+    // refused by name, so its sender can rename it.
     std::fs::write(dir.join("pictures/old.png"), b"old")?;
     let refused = host.edit_project(ProjectEdit::AddPicture {
         picture: picture("pictures/old.png", b"new"),
     });
     assert!(
-        matches!(&refused, Err(Refusal::NotRecorded { reason }) if reason.contains("another picture")),
+        matches!(&refused, Err(Refusal::PictureNameTaken { file }) if file == "pictures/old.png"),
         "{refused:?}"
     );
     assert_eq!(std::fs::read(dir.join("pictures/old.png"))?, b"old");
@@ -3028,8 +3029,21 @@ fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
     );
     // The same picture again is fine; another under that name is refused and changes nothing.
     write_picture(dir, &logo)?;
-    assert!(write_picture(dir, &picture("pictures/logo.png", b"other")).is_err());
+    assert!(matches!(
+        write_picture(dir, &picture("pictures/logo.png", b"other")),
+        Err(Error::PictureNameTaken(_))
+    ));
     assert_eq!(std::fs::read(pictures.join("logo.png"))?, logo.data);
+    Ok(())
+}
+
+#[test]
+fn a_file_in_the_way_of_a_pictures_folder_is_a_storage_failure_and_not_a_taken_name() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // `create_dir_all` fails with `AlreadyExists` here, which is no other picture's name.
+    std::fs::write(tmp.path().join("pictures"), b"not a folder")?;
+    let r = write_picture(tmp.path(), &picture("pictures/logo.png", b"png"));
+    assert!(matches!(r, Err(Error::Io(_))), "{r:?}");
     Ok(())
 }
 
