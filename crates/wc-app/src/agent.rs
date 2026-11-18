@@ -834,30 +834,41 @@ fn edits_page(name: &str, v: &Value) -> bool {
     }
 }
 
+/// What [`AppTools::held_check`] checks a tool's change against.
+struct HeldGuard {
+    dir: PathBuf,
+    held: Vec<Page>,
+    mark: crate::state::Mark,
+}
+
 impl AppTools<'_> {
     /// In a shared session, what a tool's change is checked against: the pages someone else
     /// holds, and the state to go back to. `None` when nobody holds a page, and for `undo`,
     /// which the session's host carries out and checks itself.
-    fn held_guard(&self, name: &str) -> Option<(Vec<Page>, crate::state::Mark)> {
+    fn held_guard(&self, name: &str) -> Option<HeldGuard> {
         let open = self.0.open.as_ref()?;
         let held = open.held_pages();
-        (!held.is_empty() && name != "undo").then(|| (held, open.mark()))
+        (!held.is_empty() && name != "undo").then(|| HeldGuard {
+            dir: open.dir.clone(),
+            held,
+            mark: open.mark(),
+        })
     }
 
     /// A page someone else holds is read-only here, whatever the tool did: a change that
     /// reached one (a rename that also renames symbols there, a cover flag moved off it) is
     /// taken back as a whole and refused with who holds the page, as the host would refuse it.
-    fn held_check(
-        &mut self,
-        guard: Option<(Vec<Page>, crate::state::Mark)>,
-        r: Result<String, String>,
-    ) -> Result<String, String> {
-        let (Some((held, mark)), Some(open)) = (guard, self.0.open.as_mut()) else {
+    fn held_check(&mut self, guard: Option<HeldGuard>, r: Result<String, String>) -> Result<String, String> {
+        // Another project opened in between (open_project) is not this project's change.
+        let (Some(g), Some(open)) = (guard, self.0.open.as_mut()) else {
             return r;
         };
-        match open.held_change(&held) {
+        if open.dir != g.dir {
+            return r;
+        }
+        match open.held_change(&g.held) {
             Some(why) => {
-                open.back_to(mark);
+                open.back_to(g.mark);
                 Err(format!("Not done: {why}"))
             }
             None => r,
