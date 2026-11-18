@@ -77,6 +77,7 @@ fn host_with(open: &Open, journal: Box<dyn Journal>) -> Share {
             port: 0,
             dir: open.dir.clone(),
             took_updates: Vec::new(),
+            names_taken: Vec::new(),
         }))),
         base: Some(open.project.clone()),
         ..Default::default()
@@ -2287,6 +2288,67 @@ fn a_picture_replaced_here_under_its_name_reaches_the_session_under_a_name_of_it
     let n = log.messages().len();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert_eq!(log.messages().len(), n);
+    Ok(())
+}
+
+#[test]
+fn a_picture_the_host_replaced_in_its_folder_gets_a_name_of_its_own() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    // The host replaces the file it took in its folder, under the same name.
+    let new = b"\x89PNG\r\n\x1a\nthe host's logo".to_vec();
+    std::fs::write(host_open.dir.join(&file), &new)?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let renamed = host_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(renamed, file);
+    assert_eq!(guest_open.project.meta.logo, host_open.project.meta.logo);
+    assert_eq!(file_bytes(&guest_open.dir, &renamed)?, new);
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, PNG);
+    assert!(!h.take_notes().iter().any(|n| n.contains("not kept")));
+    Ok(())
+}
+
+#[test]
+fn an_empty_file_put_in_place_of_a_picture_is_named_once_and_not_sent() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    g.take_notes();
+    let n = log.messages().len();
+    std::fs::write(guest_open.dir.join(&file), b"")?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(log.messages().len(), n, "{:?}", log.messages());
+    let notes = g.take_notes();
+    assert_eq!(
+        notes.iter().filter(|n| n.contains("cannot be shared")).count(),
+        1,
+        "{notes:?}"
+    );
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
     Ok(())
 }
 

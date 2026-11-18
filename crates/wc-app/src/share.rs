@@ -1335,15 +1335,25 @@ pub fn new_pictures(
                         out.same.push((file, now));
                     }
                 }
+                // Gone here: the session's stays, and the window says it is missing.
+                Ok(None) => {}
+                // Another file: sent, or (empty, too big) the reason is told. Either way it is
+                // looked at again only after a while.
                 Ok(Some(data)) => {
                     out.tried.push(file.clone());
                     out.replaced.push(file.clone());
-                    out.edits.push(ProjectEdit::AddPicture {
-                        picture: Picture { file, data },
-                    });
+                    let picture = Picture { file, data };
+                    match picture.problem() {
+                        Some(why) => out.unreadable.push((picture.file, why)),
+                        None => out.edits.push(ProjectEdit::AddPicture { picture }),
+                    }
                 }
-                // Gone or unreadable here: the session's stays; the window says what is wrong.
-                Ok(None) | Err(_) => {}
+                // Unreadable here: the session's stays, and the reason is told.
+                Err(why) => {
+                    out.tried.push(file.clone());
+                    out.replaced.push(file.clone());
+                    out.unreadable.push((file, why));
+                }
             }
             continue;
         }
@@ -1582,6 +1592,9 @@ pub struct Hosting {
     dir: PathBuf,
     /// Items of the host's own updates the session took, as [`Guest::took_updates`].
     took_updates: Vec<(ItemKind, String, String)>,
+    /// Pictures the host sent whose name the session has for another file (a picture replaced
+    /// in its folder), since the last look: given a name of their own, as a guest's are.
+    names_taken: Vec<String>,
 }
 
 /// A guest's side: its view of the session and the connection to the host.
@@ -1666,11 +1679,11 @@ impl Role {
         }
     }
 
-    /// Pictures this guest sent whose name the session has for another file
+    /// Pictures this person sent whose name the session has for another file
     /// ([`wc_share::Refusal::PictureNameTaken`]), since the last call.
     fn picture_names_taken(&mut self) -> Vec<String> {
         match self {
-            Role::Host(_) => Vec::new(),
+            Role::Host(h) => std::mem::take(&mut h.names_taken),
             Role::Guest(j) => std::mem::take(&mut j.guest.refusals)
                 .into_iter()
                 .filter_map(|r| match r {
@@ -1741,6 +1754,8 @@ impl Role {
                 let updated = edit.updated_items();
                 match h.host.edit_project(edit) {
                     Ok(()) => h.took_updates.extend(updated),
+                    // Given a name of its own on the next look, as a guest's picture is.
+                    Err(wc_share::Refusal::PictureNameTaken { file }) => h.names_taken.push(file),
                     Err(e) => notes.push(format!("Your change was not kept: {e}")),
                 }
             }
@@ -2647,6 +2662,7 @@ impl Share {
             port,
             dir: open.dir.clone(),
             took_updates: Vec::new(),
+            names_taken: Vec::new(),
         })));
         self.base = Some(open.project.clone());
         self.forget_items();
