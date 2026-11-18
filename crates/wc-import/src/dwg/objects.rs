@@ -505,12 +505,13 @@ fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
             }
         }
     } else {
-        // Fit tolerance and the start and end tangents, then the fit points.
+        // Fit tolerance, the start and end tangents (DXF 12/22 and 13/23), then the fit points.
         o.data.bd()?;
-        o.data.bd3()?;
-        o.data.bd3()?;
+        let (sx, sy, _) = o.data.bd3()?;
+        let (ex, ey, _) = o.data.bd3()?;
         let fit = spline_count(o, "fit points")?;
         e.i(70, 0).i(71, i64::from(degree));
+        e.f(12, sx).f(22, sy).f(13, ex).f(23, ey);
         for _ in 0..fit {
             let (x, y, _) = o.data.bd3()?;
             e.f(11, x).f(21, y);

@@ -386,12 +386,18 @@ fn shapes(
             }
             "SPLINE" => {
                 let (pts, closed, curve) = spline_points(e);
+                let drawn = polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false);
                 // Knots that make no curve (wrong count or degree, an empty interval): the points
-                // are still joined, and said.
-                if !curve {
-                    *skipped.entry(SPLINE_NOT_CURVE.to_owned()).or_default() += 1;
+                // are still joined, and said; a spline with too few points to join is said too.
+                let note = match (&drawn, curve) {
+                    (None, _) => Some(SPLINE_TOO_FEW),
+                    (Some(_), false) => Some(SPLINE_NOT_CURVE),
+                    (Some(_), true) => None,
+                };
+                if let Some(note) = note {
+                    *skipped.entry(note.to_owned()).or_default() += 1;
                 }
-                polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false)
+                drawn
             }
             "HATCH" => {
                 let solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
@@ -622,6 +628,9 @@ const HATCH_UNFILLED: &str = "solid HATCH (holes too complex)";
 /// The key under which splines whose knots make no curve are counted (drawn through their
 /// points instead).
 const SPLINE_NOT_CURVE: &str = "SPLINE whose knots make no curve";
+
+/// The key under which splines with too few points to draw are counted.
+const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -1055,6 +1064,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
                 format!(
                     "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
                 )
+            } else if kind == SPLINE_TOO_FEW {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} SPLINE{s} with too few points to draw, left out")
             } else if kind == SPLINE_NOT_CURVE {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
@@ -1985,6 +1997,20 @@ mod tests {
                 a: Point::new(0.0, 0.0),
                 b: Point::new(5.0, 0.0)
             }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_spline_whose_knots_make_no_curve_says_so() -> Result<()> {
+        // A quadratic over three points whose knots leave no interval.
+        let ents = "0\nSPLINE\n71\n2\n40\n0\n40\n0\n40\n0\n40\n0\n40\n1\n40\n1\n\
+                    10\n0\n20\n0\n10\n5\n20\n10\n10\n10\n20\n0\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert_eq!(g.len(), 1, "drawn through its points");
+        assert_eq!(
+            skipped_warnings(skipped),
+            ["1 SPLINE whose knots make no curve, drawn through their points"]
         );
         Ok(())
     }

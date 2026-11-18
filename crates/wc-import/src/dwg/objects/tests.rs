@@ -1487,27 +1487,7 @@ fn an_ellipse_not_a_number_and_a_spline_short_of_knots_are_damaged() -> TestResu
         .bd(0.5)
         .bd(0.0)
         .bd(1.0);
-    let spline = |h: u64, knots: &[f64]| {
-        let mut sp = entity(v, 36, h, model);
-        sp.data
-            .bl(1)
-            .bl(2)
-            .b(false)
-            .b(false)
-            .b(false)
-            .bd(0.0)
-            .bd(0.0)
-            .bl(knots.len() as u32)
-            .bl(3)
-            .b(false);
-        for k in knots {
-            sp.data.bd(*k);
-        }
-        for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
-            sp.data.bd3(p);
-        }
-        sp
-    };
+    let spline = |h: u64, knots: &[f64]| control_spline(v, h, 2, knots);
     let objs = vec![
         entry(v, LAYER, LAYER_H, "0"),
         entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -1537,30 +1517,9 @@ fn an_ellipse_not_a_number_and_a_spline_short_of_knots_are_damaged() -> TestResu
 #[test]
 fn a_spline_whose_knots_make_no_curve_is_drawn_through_its_points_and_said() -> TestResult {
     let v = Version::R2010;
-    let model = head(None);
     // A cubic over three control points (degree too high), and a quadratic whose knots leave
     // no interval: both pass the count and order checks.
-    let spline = |h: u64, degree: u32, knots: &[f64]| {
-        let mut sp = entity(v, 36, h, model);
-        sp.data
-            .bl(1)
-            .bl(degree)
-            .b(false)
-            .b(false)
-            .b(false)
-            .bd(0.0)
-            .bd(0.0)
-            .bl(knots.len() as u32)
-            .bl(3)
-            .b(false);
-        for k in knots {
-            sp.data.bd(*k);
-        }
-        for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
-            sp.data.bd3(p);
-        }
-        sp
-    };
+    let spline = |h: u64, degree: u32, knots: &[f64]| control_spline(v, h, degree, knots);
     let objs = vec![
         entry(v, LAYER, LAYER_H, "0"),
         entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -1575,5 +1534,52 @@ fn a_spline_whose_knots_make_no_curve_is_drawn_through_its_points_and_said() -> 
         "{:?}",
         d.skipped
     );
+    Ok(())
+}
+
+/// A scenario-1 SPLINE in model space of `degree` with `knots`, over the control points
+/// (0, 0), (5, 10), (10, 0), unweighted.
+fn control_spline(v: Version, handle: u64, degree: u32, knots: &[f64]) -> Obj {
+    let mut sp = entity(v, 36, handle, head(None));
+    sp.data
+        .bl(1)
+        .bl(degree)
+        .b(false)
+        .b(false)
+        .b(false)
+        .bd(0.0)
+        .bd(0.0)
+        .bl(knots.len() as u32)
+        .bl(3)
+        .b(false);
+    for k in knots {
+        sp.data.bd(*k);
+    }
+    for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
+        sp.data.bd3(p);
+    }
+    sp
+}
+
+#[test]
+fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestResult {
+    let v = Version::R2010;
+    let mut one = entity(v, 36, 0x300, head(None));
+    one.data
+        .bl(2)
+        .bl(3)
+        .bd(0.0)
+        .bd3((1.0, 0.0, 0.0))
+        .bd3((1.0, 0.0, 0.0))
+        .bl(1)
+        .bd3((5.0, 5.0, 0.0));
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        one,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert!(d.model.is_empty(), "{:?}", d.model);
+    assert_eq!(d.skipped.get("SPLINE with too few points"), Some(&1), "{:?}", d.skipped);
     Ok(())
 }
