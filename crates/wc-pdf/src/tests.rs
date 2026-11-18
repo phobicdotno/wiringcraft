@@ -817,6 +817,61 @@ fn long_cover_table_labels_and_values_stay_in_their_columns() -> Result<(), Stri
 }
 
 #[test]
+fn a_short_cover_keeps_its_field_table_above_the_title_block() -> Result<(), String> {
+    let mut project = wc_core::Project::new("Plant");
+    for i in 0..12 {
+        project
+            .meta
+            .title_block
+            .insert(format!("Extra {i}"), format!("value {i}"));
+    }
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = PageSize::custom(297, 100)?;
+    let (_, h) = cover.size.mm();
+    let ty = h - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let texts: Vec<(&str, f64, f64)> = marks
+        .iter()
+        .filter_map(|m| match &m.shape {
+            Shape::Text { text, at, height, .. } => Some((text.as_str(), at.y, *height)),
+            _ => None,
+        })
+        .collect();
+    let row = |t: &str| texts.iter().find(|(x, ..)| *x == t).copied();
+    // The rows that are shown sit above the title block, at a readable size.
+    let (_, y, size) = row("value 0").ok_or(format!("the first field is not shown: {texts:?}"))?;
+    assert!(y < ty && size >= 1.2, "{y} {size} {ty}");
+    // The rest are counted, not drawn into the title block.
+    let (_, more_y, _) = texts
+        .iter()
+        .find(|(t, ..)| t.ends_with(" more"))
+        .copied()
+        .ok_or(format!("no count of fields left out: {texts:?}"))?;
+    assert!(more_y < ty, "{more_y} {ty}");
+    assert!(row("value 11").is_none(), "{texts:?}");
+    // Every line of the table ends above the title block.
+    for m in &marks {
+        if let Shape::Line { a, b } = &m.shape
+            && (a.y - b.y).abs() < 1e-9
+            && a.y > ty - 30.0
+            && a.y < ty - 1e-6
+        {
+            assert!(a.y <= ty - 1.0, "{a:?}");
+        }
+    }
+    // A tall sheet keeps today's layout: every field is listed.
+    cover.size = PageSize::A3;
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    assert!(
+        marks
+            .iter()
+            .any(|m| matches!(&m.shape, Shape::Text { text, .. } if text == "value 11"))
+    );
+    Ok(())
+}
+
+#[test]
 fn text_widths_are_helvetica_advance_widths() {
     // Adobe Helvetica AFM: W 944, O 778, H 722, e 556, l 222, o 556, i 222, space 278.
     let em_mm = |units: f64| units / 1000.0 * (10.0 / 0.72);

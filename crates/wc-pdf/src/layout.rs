@@ -520,7 +520,7 @@ pub fn cover_logo_default(project: &Project, page: &Page) -> (Point, Point) {
     let band = project.meta.template.band_height();
     let (x0, y0, x1, ty) = (MARGIN, MARGIN + HEADER, w - MARGIN, h - MARGIN - band);
     let cx = (x0 + x1) / 2.0;
-    let name_y = y0 + (ty - y0) * 0.2;
+    let name_y = cover_name_y(cover_rows(project, "").len(), y0, ty);
     let top = y0 + 4.0;
     let bottom = (name_y - 10.0).max(top + 5.0);
     let half = 45.0_f64.min((x1 - x0) / 2.0 - 5.0);
@@ -568,6 +568,44 @@ pub fn fit_picture((min, max): (Point, Point), (width, height): (u32, u32)) -> (
     (Point::new(x, y), Point::new(x + w, y + h))
 }
 
+/// The smallest height a row of the cover's field table gets; below it, rows are left out.
+const COVER_MIN_ROW: f64 = 4.0;
+/// The room under the cover's table, above the title block.
+const COVER_TABLE_GAP: f64 = 8.0;
+/// From the project's name to the top of the cover's table: the description sits between.
+const COVER_NAME_TO_TABLE: f64 = 18.0;
+
+/// Where the project's name stands on a cover whose drawing area runs from `y0` to `y1` and
+/// lists `rows` fields: a fifth of the way down, or higher on a short sheet so the table has
+/// room for its rows, but never closer to the top than the name's height.
+fn cover_name_y(rows: usize, y0: f64, y1: f64) -> f64 {
+    let ideal = y0 + (y1 - y0) * 0.2;
+    let needed = rows as f64 * COVER_MIN_ROW + COVER_TABLE_GAP + COVER_NAME_TO_TABLE;
+    ideal.min((y1 - needed).max(y0 + 10.0))
+}
+
+/// The rows of the cover's field table, label and value. Standard fields are listed even
+/// when empty, so the cover reads as a form; other fields are listed when they have a value.
+/// An empty date shows `date`.
+fn cover_rows<'a>(project: &'a Project, date: &'a str) -> Vec<(&'a str, &'a str)> {
+    let tb = &project.meta.title_block;
+    let mut rows: Vec<(&str, &str)> = wc_core::project::TITLE_FIELDS
+        .iter()
+        .filter(|(k, _)| *k != "description")
+        .map(|(k, label)| {
+            let v = tb.get(*k).map(String::as_str).unwrap_or("");
+            let v = if *k == "date" && v.trim().is_empty() { date } else { v };
+            (*label, v)
+        })
+        .collect();
+    for (k, v) in tb {
+        if !wc_core::project::TITLE_FIELDS.iter().any(|(f, _)| f == k) && !v.trim().is_empty() {
+            rows.push((k.as_str(), v.as_str()));
+        }
+    }
+    rows
+}
+
 /// The cover page's content inside the drawing area `(x0, y0, x1, y1)`: the project's name
 /// large, its description under it, and a table of the project fields. Every value comes from
 /// the project, so it always matches the title blocks. Standard fields are listed even when
@@ -575,7 +613,6 @@ pub fn fit_picture((min, max): (Point, Point), (width, height): (u32, u32)) -> (
 fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: &str, out: &mut Vec<FrameMark>) {
     let tb = &project.meta.title_block;
     let cx = (x0 + x1) / 2.0;
-    let h = y1 - y0;
     let push_text = |at: (f64, f64), height: f64, align: Align, t: &str, ink: Ink, out: &mut Vec<FrameMark>| {
         if !t.trim().is_empty() {
             out.push(FrameMark {
@@ -591,29 +628,35 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
         }
     };
     let fit = |t: &str, height: f64| fit_height(t, height, x1 - x0 - 10.0);
-    let name_y = y0 + h * 0.2;
+    let mut rows = cover_rows(project, date);
+    let name_y = cover_name_y(rows.len(), y0, y1);
     let name = &project.meta.name;
     push_text((cx, name_y), fit(name, 9.0), Align::Center, name, Ink::Thin, out);
     let desc = tb.get("description").map(String::as_str).unwrap_or("");
     push_text((cx, name_y + 9.0), fit(desc, 4.0), Align::Center, desc, Ink::Thin, out);
 
-    let mut rows: Vec<(&str, &str)> = wc_core::project::TITLE_FIELDS
-        .iter()
-        .filter(|(k, _)| *k != "description")
-        .map(|(k, label)| {
-            let v = tb.get(*k).map(String::as_str).unwrap_or("");
-            let v = if *k == "date" && v.trim().is_empty() { date } else { v };
-            (*label, v)
-        })
-        .collect();
-    for (k, v) in tb {
-        if !wc_core::project::TITLE_FIELDS.iter().any(|(f, _)| f == k) && !v.trim().is_empty() {
-            rows.push((k.as_str(), v.as_str()));
+    // The table fits under the description; rows shrink on small sheets. When they would be
+    // too small to read, empty fields are left out first, then the last ones, with a row that
+    // says how many are not shown.
+    let top = name_y + COVER_NAME_TO_TABLE;
+    let room = y1 - COVER_TABLE_GAP - top;
+    let fits = (room / COVER_MIN_ROW).floor().max(0.0) as usize;
+    if rows.len() > fits {
+        rows.retain(|(_, v)| !v.trim().is_empty());
+    }
+    let more;
+    if rows.len() > fits {
+        let shown = fits.saturating_sub(1);
+        more = format!("{} more", rows.len() - shown);
+        rows.truncate(shown);
+        if fits > 0 {
+            rows.push(("...", more.as_str()));
         }
     }
-    // The table fits under the description; rows shrink a little on small sheets.
-    let top = name_y + 18.0;
-    let row_h = ((y1 - 8.0 - top) / rows.len().max(1) as f64).min(8.0);
+    if rows.is_empty() {
+        return;
+    }
+    let row_h = (room / rows.len() as f64).min(8.0);
     let (tx0, tx1) = (
         cx - 90.0_f64.min((x1 - x0) / 2.0 - 5.0),
         cx + 90.0_f64.min((x1 - x0) / 2.0 - 5.0),
