@@ -2893,6 +2893,11 @@ fn guests_get_the_pictures_and_pictures_added_during_the_session() -> TestResult
             file: "pictures/logo.png".into()
         }
     );
+    // With the edit that sent it, the first of the four.
+    assert_eq!(
+        b.names_taken,
+        vec![("pictures/logo.png".into(), Some(b.last_edit() - 3))]
+    );
     assert_eq!(a.pictures.get("pictures/logo.png"), Some(&png));
     assert_eq!(s.host.pictures().len(), 3);
 

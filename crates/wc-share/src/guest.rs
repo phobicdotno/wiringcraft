@@ -36,6 +36,10 @@ pub struct Guest {
     pub history: Vec<ChangeInfo>,
     /// Refusals from the host not yet shown to the user.
     pub refusals: Vec<Refusal>,
+    /// The picture names the session refused ([`Refusal::PictureNameTaken`], also in
+    /// `refusals`), each with the `seq` of the project edit that sent the picture: a refusal
+    /// is told from one of a later attempt at that name.
+    pub names_taken: Vec<(String, Option<u64>)>,
     /// A page switch the host has not answered yet: the page asked for.
     switching: Option<Option<String>>,
     /// Page edits sent and not answered yet, by page. The host answers each with the page as
@@ -90,6 +94,12 @@ pub struct Guest {
     /// set there meanwhile is kept and goes out), and drops a page the session no longer has.
     /// A page the change set without renumbering it (a device rename, say) keeps its number.
     pub retaken_numbers: BTreeMap<String, String>,
+    /// Pages a refused change of this guest's touched, and whether it touched the project's
+    /// settings (`meta`): the host's version came back for them. The window drops a picture
+    /// pick it made there (a logo or an underlay), as the reference is the host's again. Taken
+    /// by whoever shows the project.
+    pub refused_pages: std::collections::BTreeSet<String>,
+    pub refused_meta: bool,
 }
 
 impl Default for Guest {
@@ -108,6 +118,7 @@ impl Guest {
             peers: Vec::new(),
             history: Vec::new(),
             refusals: Vec::new(),
+            names_taken: Vec::new(),
             switching: None,
             in_flight: BTreeMap::new(),
             taking_back: 0,
@@ -124,6 +135,8 @@ impl Guest {
             retaken: Vec::new(),
             retaken_records: crate::Parts::default(),
             retaken_numbers: BTreeMap::new(),
+            refused_pages: std::collections::BTreeSet::new(),
+            refused_meta: false,
         }
     }
 
@@ -239,6 +252,11 @@ impl Guest {
             edit,
             seq: self.last_edit,
         }
+    }
+
+    /// The `seq` of the latest project edit this guest sent (0 before the first).
+    pub fn last_edit(&self) -> u64 {
+        self.last_edit
     }
 
     /// Whether a change that set a page this guest holds is unanswered: edits of that page wait
@@ -425,6 +443,20 @@ impl Guest {
                     self.answered(page);
                 }
                 whole.extend(own.iter().cloned());
+                self.refused_pages.extend(whole.iter().cloned());
+                if let Some(parts) = &put_back {
+                    // A page this guest holds keeps its content (only its number comes back),
+                    // unless it is one of `whole`, recorded above.
+                    let me = self.me;
+                    let restored: Vec<String> = parts
+                        .pages
+                        .keys()
+                        .filter(|id| !(me.is_some() && self.locks.get(*id) == me.as_ref()))
+                        .cloned()
+                        .collect();
+                    self.refused_pages.extend(restored);
+                    self.refused_meta |= parts.meta.is_some();
+                }
                 if let Some(parts) = put_back {
                     if !own.is_empty() {
                         // The own pages are put back by id (`retaken`), and only the numbers
@@ -450,6 +482,9 @@ impl Guest {
                         self.answered(page);
                     }
                     _ => {}
+                }
+                if let Refusal::PictureNameTaken { file } = &refusal {
+                    self.names_taken.push((file.clone(), edit));
                 }
                 self.refusals.push(refusal);
             }
