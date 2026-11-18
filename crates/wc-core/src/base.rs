@@ -61,6 +61,13 @@ pub fn create_from(base: &Path, dir: &Path, name: &str, date: &str) -> Result<Pr
         .ok_or_else(|| Error::Invalid(format!("{} has no parent folder", dir.display())))?;
     fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     let staging = staging_dir(&target)?;
+    if let Ok(meta) = fs::metadata(&target) {
+        // An empty folder that is replaced keeps its permissions.
+        if let Err(e) = fs::set_permissions(&staging, meta.permissions()) {
+            let _ = fs::remove_dir(&staging);
+            return Err(Error::io(&staging, e));
+        }
+    }
     let built = copy_tree(base, &staging, true)
         .and_then(|()| fail_for_test())
         .and_then(|()| store::save(&staging, &project).map(|_| ()));
@@ -157,25 +164,36 @@ fn lexical(p: &Path) -> PathBuf {
     out
 }
 
-/// Where `dir` really is: its nearest existing folder with links resolved, and the rest of
-/// the path after it, with `..` worked out by name (a folder that does not exist yet holds
-/// no links).
+/// Where `dir` really is. Each existing folder on the way is looked up on disk with its
+/// links resolved before a `..` after it is applied, so `link/../new` goes up from where the
+/// link points. Past the first folder that does not exist yet, `..` is worked out by name (a
+/// folder that does not exist holds no links).
 fn resolved(dir: &Path) -> Result<PathBuf> {
-    let abs = lexical(&std::path::absolute(dir).map_err(|e| Error::io(dir, e))?);
-    let mut rest = Vec::new();
-    let mut at = abs.as_path();
-    loop {
-        if let Ok(real) = fs::canonicalize(at) {
-            return Ok(rest.iter().rev().fold(real, |p, c| p.join(c)));
-        }
-        match (at.file_name(), at.parent()) {
-            (Some(n), Some(up)) => {
-                rest.push(n.to_owned());
-                at = up;
+    let abs = std::path::absolute(dir).map_err(|e| Error::io(dir, e))?;
+    let mut real = PathBuf::new();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    for c in abs.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => real.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if missing.pop().is_none() {
+                    real.pop();
+                }
             }
-            _ => return Ok(abs),
+            Component::Normal(n) => {
+                let found = missing
+                    .is_empty()
+                    .then(|| fs::canonicalize(real.join(n)).ok())
+                    .flatten();
+                match found {
+                    Some(p) => real = p,
+                    None => missing.push(n.to_owned()),
+                }
+            }
         }
     }
+    Ok(missing.iter().fold(real, |p, c| p.join(c)))
 }
 
 /// A new, empty folder next to `target` to put the project together in.
@@ -429,6 +447,42 @@ mod tests {
         let new = tmp.path().join("new");
         create_from(&b, &new, "New", "2026-11-18").unwrap();
         assert!(!new.join("pictures/secret.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_the_new_folder_path_is_followed_before_going_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = tmp.path().join("work").join("base");
+        base(&b);
+        // `work/link` points into the base project, so `work/link/../new` is `base/new`.
+        std::os::unix::fs::symlink(b.join("pictures"), tmp.path().join("work/link")).unwrap();
+        let through = tmp.path().join("work").join("link").join("..").join("new");
+        assert!(create_from(&b, &through, "X", "2026-11-18").is_err());
+        assert!(!b.join("new").exists() && !tmp.path().join("work/new").exists());
+        // A link that leads out of the base is fine and lands where the link points.
+        let out = tmp.path().join("elsewhere").join("deep");
+        fs::create_dir_all(&out).unwrap();
+        std::os::unix::fs::symlink(&out, tmp.path().join("work/out")).unwrap();
+        let via = tmp.path().join("work").join("out").join("..").join("made");
+        create_from(&b, &via, "Made", "2026-11-18").unwrap();
+        assert!(tmp.path().join("elsewhere/made").join(PROJECT_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_folder_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let b = tmp.path().join("base");
+        base(&b);
+        let private = tmp.path().join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        create_from(&b, &private, "Private", "2026-11-18").unwrap();
+        let mode = fs::metadata(&private).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_eq!(store::load(&private).unwrap().meta.name, "Private");
     }
 
     #[test]
