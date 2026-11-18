@@ -1457,6 +1457,21 @@ struct LibraryFit<'a> {
 /// terminal, an interruption for an arrow), as many pins, each pin named like a point and within
 /// [`JOIN`] of it once the symbol is turned by a quarter step and maybe mirrored (blocks drawn
 /// turned, as in horizontal circuits). `pins` are the points relative to the symbol's origin.
+/// A symbol's points around its origin, y down: each coordinate rounded, then the origin
+/// taken off, so the sheet's height (a whole number of mm) never changes the result. Both
+/// library-symbol checks of a page use it, so they always agree.
+fn local_pins(s: &SweSymbol) -> Vec<(String, Point)> {
+    s.pins
+        .iter()
+        .map(|q| {
+            (
+                q.name.clone(),
+                Point::new(round(q.at.x) - round(s.at.x), round(s.at.y) - round(q.at.y)),
+            )
+        })
+        .collect()
+}
+
 /// The role a symbol's component gives it.
 fn symbol_role(p: &SweProject, s: &SweSymbol) -> SymbolRole {
     match s.component.and_then(|c| p.components.get(&c)).map(|c| c.kind) {
@@ -1871,17 +1886,8 @@ pub fn build_with(
             if s.pins.is_empty() && s.corner.is_none() {
                 continue;
             }
-            // The points around the symbol's origin, y down, as the build below gives them.
-            let local: Vec<(String, Point)> = s
-                .pins
-                .iter()
-                .map(|q| {
-                    (
-                        q.name.clone(),
-                        Point::new(round(q.at.x - s.at.x), round(s.at.y - q.at.y)),
-                    )
-                })
-                .collect();
+            // The points around the symbol's origin, y down, as the build below takes them.
+            let local = local_pins(s);
             if library_fit(choice, &s.block, symbol_role(p, s), &local).is_some() {
                 continue;
             }
@@ -1950,10 +1956,7 @@ pub fn build_with(
                 unknown_component += 1;
             }
             let role = symbol_role(p, s);
-            let local: Vec<(String, Point)> = pins
-                .iter()
-                .map(|(n, at)| (n.clone(), Point::new(at.x - origin.x, at.y - origin.y)))
-                .collect();
+            let local = local_pins(s);
             let matched = library_fit(choice, &s.block, role, &local);
             let from_library = matched.is_some();
             let (graphics, out_pins) = match &matched {

@@ -2387,3 +2387,16 @@ fn refused_drawing_files_count_against_the_archive_total() {
         drawings.warnings
     );
 }
+
+#[test]
+fn local_pins_round_each_point_before_taking_off_the_origin() {
+    let mut sw = read(&sample()).unwrap();
+    let k1 = sw.symbols.iter_mut().find(|s| s.id == 1).unwrap();
+    // Rounding the difference would give 0.500, right on JOIN; rounding each point gives 0.501.
+    k1.at = Point::new(100.0004, 50.0);
+    k1.pins.truncate(1);
+    k1.pins[0].at = Point::new(100.5008, 40.0);
+    let local = local_pins(k1);
+    assert!((local[0].1.x - 0.501).abs() < 1e-9, "{local:?}");
+    assert!((local[0].1.y - 10.0).abs() < 1e-9, "y down: {local:?}");
+}
