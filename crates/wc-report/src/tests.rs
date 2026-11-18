@@ -1858,6 +1858,10 @@ fn csv_cells_a_spreadsheet_would_run_are_written_as_text() {
         // Excel reads -K1 as =-K1: product-aspect tags are guarded too.
         ("-K1", "'-K1"),
         ("-X12", "'-X12"),
+        // A typed `'` before such text gets a second one, so the import keeps the first.
+        ("'-K1", "''-K1"),
+        ("'=1", "''=1"),
+        ("'quoted'", "'quoted'"),
         // Kept: ordinary text and plain numbers.
         ("Motor 3", "Motor 3"),
         ("", ""),

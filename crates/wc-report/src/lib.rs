@@ -124,11 +124,13 @@ impl Table {
 /// Device tags with only a product aspect (`-K1`, `-X12`) are guarded too: Excel reads `-K1` as
 /// the formula `=-K1` and shows the negated cell K1 instead of the tag. WiringCraft's own CSV
 /// import (`wc_import::csv::records`) takes the `'` off again, so such a file reads back
-/// with the same tags.
+/// with the same tags. A cell that itself starts with `'` before one of those characters
+/// (`'-K1` as typed) gets a second `'`, so it reads back with its own `'`.
 pub fn formula_safe(cell: &str) -> Cow<'_, str> {
     let guard = match cell.chars().next() {
         Some('=' | '+' | '@' | '\t' | '\r') => true,
         Some('-') => !plain_number(&cell[1..]),
+        Some('\'') => cell[1..].starts_with(['=', '+', '-', '@', '\t', '\r']),
         _ => false,
     };
     if guard {
