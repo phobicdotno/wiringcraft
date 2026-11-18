@@ -559,6 +559,12 @@ impl App {
             ));
             return;
         }
+        if self.assistant.command_running() {
+            self.dialog = Some(Dialog::Message(
+                "The assistant is running a command on the project; import when it is done.".to_owned(),
+            ));
+            return;
+        }
         let Some(open) = self.open.as_mut() else { return };
         let file = match pick_file(kind.title(), &open.dir, kind.filter()) {
             Picked::Path(f) => f,

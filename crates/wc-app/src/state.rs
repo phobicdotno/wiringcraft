@@ -952,6 +952,9 @@ impl Open {
         // The versions the import replaced are kept, so its undo step can put them back.
         self.archive_symbols();
         self.symbols.extend(fresh.symbols);
+        // An import can write a picture over a file shown before (a PDF scan at the same page).
+        self.underlays.clear();
+        self.picture_problems.clear();
         if changed {
             self.forget_terminal_change();
             self.checkpoint();
