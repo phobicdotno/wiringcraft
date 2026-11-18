@@ -202,6 +202,11 @@ enum ExportCmd {
         #[command(flatten)]
         args: MarkingArgs,
     },
+    /// Terminal strips for the WAGO configurator (smartDESIGNER): a semicolon-separated CSV
+    /// (UTF-8) with, for every strip in natural tag order, its plates and DIN rails, its
+    /// terminals in strip order (part, level, wire cross-section and colour on each side), its
+    /// jumpers and its accessories. Each row has a stable Index for importing the list back.
+    WagoConfigurator { out: PathBuf },
 }
 
 /// Options of `export wago-marking`.
@@ -1239,6 +1244,13 @@ fn run(cli: Cli) -> Res<()> {
             }
             println!("wrote {} ({} markers)", out.display(), done.markers);
         }
+        Cmd::Export(ExportCmd::WagoConfigurator { out }) => {
+            let done = export_wago_configurator(dir, &out)?;
+            for w in &done.warnings {
+                eprintln!("warning: {w}");
+            }
+            println!("wrote {} ({} rows)", out.display(), done.markers);
+        }
         Cmd::Aml { out } => {
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
@@ -2260,6 +2272,61 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
     let t = wc_report::marking_list_with(&inputs, &options);
     std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::formula_warnings(&t));
+    warnings.extend(wc_report::level_warnings(inputs.project));
+    Ok(Exported {
+        markers: t.rows.len(),
+        warnings,
+    })
+}
+
+/// Write the project's terminal strips in `dir` for the WAGO configurator to `out`. Symbols
+/// without a vendored copy are warned about: their terminals cannot be recognised and are left
+/// out. `markers` in the result counts the rows.
+fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
+    let p = load(dir)?;
+    let (symbols, missing) = store::vendored_symbols(dir, &p);
+    let mut warnings: Vec<String> = missing
+        .iter()
+        .map(|m| {
+            format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals are not in the list")
+        })
+        .collect();
+    let mut parts = vendored_parts(dir, &p);
+    // Accessories are read here too; a part that is used but could not be read is written by
+    // its id, and the warning says why.
+    let used: std::collections::BTreeSet<&str> = p
+        .devices
+        .values()
+        .flat_map(|d| d.all_parts())
+        .map(|(id, _)| id)
+        .collect();
+    for id in used {
+        if parts.contains_key(id) {
+            continue;
+        }
+        match store::read_vendored_part(dir, id) {
+            Ok(part) => {
+                parts.insert(id.to_owned(), part);
+            }
+            Err(err) => warnings.push(format!(
+                "part {id} could not be read ({err}); its article number is written as the part id"
+            )),
+        }
+    }
+    let inputs = wc_report::Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let wc_report::Configurator {
+        table: t,
+        warnings: more,
+    } = wc_report::configurator_list(&inputs);
+    warnings.extend(more);
+    if t.rows.is_empty() {
+        warnings.push("the project has no numbered terminals on its schematic pages".into());
+    }
+    std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::level_warnings(inputs.project));
     Ok(Exported {
         markers: t.rows.len(),
@@ -3650,6 +3717,112 @@ mod tests {
             lang: "en".into(),
             ..MarkingArgs::default()
         }
+    }
+
+    #[test]
+    fn wago_configurator_export_writes_one_row_per_terminal_and_jumper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        let mut p = store::create(&dir, "Test").unwrap();
+        let out = tmp.path().join("empty.csv");
+        let done = export_wago_configurator(&dir, &out).unwrap();
+        assert_eq!(done.markers, 0);
+        assert!(
+            done.warnings.iter().any(|w| w.contains("no numbered terminals")),
+            "{:?}",
+            done.warnings
+        );
+
+        let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+        let term = wc_core::Symbol {
+            id: "test.term".into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: ["1", "2"]
+                .iter()
+                .enumerate()
+                .map(|(k, n)| wc_core::symbol::Pin {
+                    name: (*n).into(),
+                    at: wc_core::geom::Point::new(0.0, 10.0 * k as f64),
+                    dir: wc_core::symbol::PinDir::Down,
+                })
+                .collect(),
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        store::write_vendored_symbol(&dir, &term).unwrap();
+        for (n, id, symbol) in [
+            ("1", "s1", "test.term"),
+            ("2", "s2", "test.term"),
+            ("3", "s3", "no.such.symbol"),
+        ] {
+            p.pages[0].symbols.push(wc_core::PlacedSymbol {
+                id: id.into(),
+                symbol: symbol.into(),
+                at: wc_core::geom::Point::new(50.0, 50.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(wc_core::DeviceTag::parse(&format!("-X1.{n}")).unwrap()),
+            });
+        }
+        p.meta.add_jumper(&x1, &["1".to_owned(), "2".to_owned()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        let out = tmp.path().join("c.csv");
+        let done = export_wago_configurator(&dir, &out).unwrap();
+        // -X1.3 has no vendored symbol: it is not known as a terminal and is left out.
+        assert_eq!(done.markers, 3, "{:?}", std::fs::read_to_string(&out));
+        let csv = std::fs::read_to_string(&out).unwrap();
+        assert!(csv.starts_with("\u{feff}Index;Type;Strip;Position;Terminal;"), "{csv}");
+        assert!(csv.contains("\r\n-X1/T2;Terminal;-X1;2;2;"), "{csv}");
+        assert!(csv.contains("\r\n-X1/J1;Jumper;-X1;"), "{csv}");
+        assert!(done.warnings.iter().any(|w| w.contains("no.such.symbol")));
+
+        // A part that is used but cannot be read is named, with the reason.
+        p.devices.insert(
+            wc_core::DeviceTag::parse("-X1.1").unwrap(),
+            wc_core::Device {
+                part: Some("broken.part".into()),
+                ..Default::default()
+            },
+        );
+        store::save(&dir, &p).unwrap();
+        let path = store::vendor_path(&dir, wc_core::lock::ItemKind::Part, "broken.part").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        let done = export_wago_configurator(&dir, &out).unwrap();
+        let w = done.warnings.iter().find(|w| w.contains("broken.part"));
+        assert!(
+            w.is_some_and(|w| w.contains("could not be read (")),
+            "{:?}",
+            done.warnings
+        );
+
+        // An accessory with a readable vendored part gives its article, not the part id.
+        let stop = wc_core::Part {
+            id: "wago.2002-1291".into(),
+            manufacturer: "WAGO".into(),
+            order_number: "2002-1291".into(),
+            description: "End plate".into(),
+            ..Default::default()
+        };
+        store::write_vendored_part(&dir, &stop).unwrap();
+        p.devices.insert(
+            x1.clone(),
+            wc_core::Device {
+                accessories: vec![wc_core::DevicePart {
+                    part: stop.id.clone(),
+                    qty: 1,
+                }],
+                ..Default::default()
+            },
+        );
+        store::save(&dir, &p).unwrap();
+        export_wago_configurator(&dir, &out).unwrap();
+        let csv = std::fs::read_to_string(&out).unwrap();
+        assert!(csv.contains(";2002-1291;WAGO;End plate;"), "{csv}");
     }
 
     #[test]

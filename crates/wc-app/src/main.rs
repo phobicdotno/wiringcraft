@@ -731,6 +731,9 @@ impl App {
                 let strip = self.ed.marking_strip.take();
                 self.dialog = Some(wago_marking_dialog(open, strip));
             }
+            Action::ExportWagoConfigurator => {
+                self.dialog = Some(Dialog::Message(export_wago_configurator(open)));
+            }
             Action::NumberWires => {
                 let done = open.number_wires(wc_core::numbering::Rule::PageColumn);
                 self.dialog = Some(Dialog::Message(done.report()));
@@ -2445,6 +2448,43 @@ fn wago_marking_dialog(open: &Open, strip: Option<String>) -> Dialog {
     }
 }
 
+/// The project's terminal strips for the WAGO configurator, written to
+/// `export/wago-configurator.csv`.
+fn export_wago_configurator(open: &Open) -> String {
+    let dir = open.dir.join("export");
+    let path = dir.join("wago-configurator.csv");
+    let inputs = wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    };
+    let wc_report::Configurator { table: t, warnings } = wc_report::configurator_list(&inputs);
+    if t.rows.is_empty() {
+        return "Nothing exported: the project has no numbered terminals on its schematic pages (terminals drawn \
+                only on an overview page are not listed)."
+            .to_owned();
+    }
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, wc_report::to_smartscript_csv(&t))) {
+        Ok(()) => {
+            let strips: std::collections::BTreeSet<&str> =
+                t.rows.iter().filter_map(|r| r.get(2)).map(String::as_str).collect();
+            let mut msg = format!(
+                "Exported {} terminal strips ({} rows) to\n{}\n\nIn the WAGO configurator, import it as an \
+                 Excel/CSV article list and map the Article and Quantity columns.",
+                strips.len(),
+                t.rows.len(),
+                path.display()
+            );
+            for w in warnings.into_iter().chain(wc_report::level_warnings(inputs.project)) {
+                msg.push_str("\n\nWarning: ");
+                msg.push_str(&w);
+            }
+            msg
+        }
+        Err(e) => format!("Export failed: {e}"),
+    }
+}
+
 /// The markers `options` asks for as a smartScript CSV in `export`: `wago-marking.csv`, or
 /// `wago-marking-<strip>.csv` for one strip.
 fn export_wago_marking(open: &Open, options: &wc_report::MarkingOptions) -> String {
@@ -3284,6 +3324,27 @@ mod picker_tests {
 #[allow(clippy::unwrap_used)]
 mod marking_tests {
     use super::*;
+
+    #[test]
+    fn terminal_strips_are_exported_for_the_wago_configurator() {
+        let (_tmp, mut o) = state::tests::project();
+        let msg = export_wago_configurator(&o);
+        assert!(msg.starts_with("Nothing exported"), "{msg}");
+        let path = o.dir.join("export").join("wago-configurator.csv");
+        assert!(!path.exists());
+
+        for (x, tag) in [(20.0, "-X1.2"), (40.0, "-X1.1"), (60.0, "-X2.1")] {
+            let id = o.place(1, "wc.terminal", wc_core::geom::Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse(tag).unwrap());
+        }
+        let msg = export_wago_configurator(&o);
+        assert!(msg.contains("Exported 2 terminal strips (3 rows)"), "{msg}");
+        let csv = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<&str> = csv.lines().map(|l| l.split(';').next().unwrap()).collect();
+        assert_eq!(rows, ["\u{feff}Index", "-X1/T1", "-X1/T2", "-X2/T1"]);
+        assert!(csv.contains("-X1/T1;Terminal;-X1;1;1;"), "{csv}");
+    }
 
     #[test]
     fn one_strips_markers_are_exported_from_its_menu_with_the_chosen_lines() {
