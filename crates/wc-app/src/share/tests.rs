@@ -3624,6 +3624,30 @@ fn undo_of_a_waiting_placement_keeps_the_sessions_page_number() -> TestResult {
 }
 
 #[test]
+fn undo_of_a_renumbering_here_of_a_waiting_page_puts_its_number_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    let original = number(&guest_open).ok_or("no page")?;
+    // The guest renumbers the waiting page, then numbers it back: two actions here.
+    for to in ["30", original.as_str()] {
+        guest_open.checkpoint();
+        guest_open.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        guest_open.project.sort_pages();
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open), Some(original.clone()));
+    // Undo takes back the latest of them: the page is numbered 30 again, and still waits.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
 fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;

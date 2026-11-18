@@ -2109,6 +2109,9 @@ pub struct Share {
     items_out: BTreeMap<String, ItemOut>,
     /// The items this copy's waiting changes wait for ([`Held`]), as of the last sync.
     holding: Vec<String>,
+    /// Waiting pages the session renumbered while they waited, with the number they had
+    /// before: an Undo here keeps the session's number on them ([`latest_waiting_step`]).
+    renumbered: BTreeMap<String, String>,
     /// Undo asked for while changes were waiting: they are taken back here at the next sync,
     /// instead of an older change in the session.
     drop_held: bool,
@@ -2509,19 +2512,18 @@ impl Held {
 
 /// What takes back the latest action here, when it changed what waits (`held`): those
 /// targets as they were before that action, from the copy's own undo history. `None` when the
-/// latest action changed nothing that waits.
-fn latest_waiting_step(open: &Open, held: &Held) -> Option<wc_share::Parts> {
+/// latest action changed nothing that waits. A page the session renumbered since that action
+/// (`renumbered`: page id to its number before) keeps the session's number, as when the
+/// waiting changes are put back; a number this copy changed is taken back like the rest.
+fn latest_waiting_step(open: &Open, held: &Held, renumbered: &BTreeMap<String, String>) -> Option<wc_share::Parts> {
     let prev = open.before_last_change()?;
     let mut step = wc_share::Parts::read(prev, &held.now);
     if step == wc_share::Parts::read(&open.project, &held.now) {
         return None;
     }
-    // A page keeps the session's number unless this copy renumbered it, as when the waiting
-    // changes are put back: a renumbering by someone else since stays.
     for (id, page) in step.pages.iter_mut() {
-        let synced = held.was.pages.get(id).cloned().flatten();
-        if let (Some(page), Some(now), Some(synced)) = (page.as_mut(), open.project.page(id), synced)
-            && now.number == synced.number
+        if let (Some(page), Some(now), Some(old)) = (page.as_mut(), open.project.page(id), renumbered.get(id))
+            && page.number == *old
         {
             page.number = now.number.clone();
         }
@@ -3189,7 +3191,7 @@ impl Share {
             // Undo of a change that never reached the session: taken back here only, and only
             // the latest action. What waited before it waits still.
             let before = open.project.clone();
-            match latest_waiting_step(open, &held) {
+            match latest_waiting_step(open, &held, &self.renumbered) {
                 Some(step) => {
                     step.apply(&mut open.project);
                     open.forget_last_change();
@@ -3251,6 +3253,17 @@ impl Share {
         drain_retaken(role, open, Some(base), &mut self.notes);
         take_updates(role, base, &mut self.items_out);
         let auth = role.project()?;
+        // A waiting page the session renumbers keeps that number through an Undo here.
+        if held.is_empty() {
+            self.renumbered.clear();
+        }
+        for id in held.now.pages.keys() {
+            if let (Some(was), Some(now)) = (base.page(id), auth.page(id))
+                && was.number != now.number
+            {
+                self.renumbered.entry(id.clone()).or_insert_with(|| was.number.clone());
+            }
+        }
         let conflicting = conflicts(&open.project, base, auth);
         if !conflicting.is_empty() {
             self.notes.push(format!(
