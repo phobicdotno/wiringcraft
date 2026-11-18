@@ -10,8 +10,9 @@
 //! a component of type 3; its terminals are components of type 4 whose `com_com_id` is the strip,
 //! numbered by `com_tag` in `com_tagorderno` order. Each wire record names the component terminal
 //! at both of its ends (`wir_cel_idfrom` + `wir_cte_nofrom`, and the same for `to`). Page drawings and
-//! symbol graphics are DWG files and are not read: each placed symbol becomes a box with its
-//! connection points where the database puts them.
+//! symbol graphics are DWG files in the archive, read by [`drawings`] when the caller gives them
+//! ([`SweProject::drawings`]): a placed symbol is drawn from its block's drawing, or as a box
+//! when there is none, with its connection points where the database puts them.
 //!
 //! Tag paths come in two forms. Most databases write them with aspect signs (`=F1+L1+L11-CR1`,
 //! location `+L1+L11`). Some write the levels separated by spaces with no signs at all
@@ -42,7 +43,10 @@ use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymb
 use crate::aml::Built;
 use crate::{Error, Result};
 
+pub mod drawings;
 pub mod library;
+
+pub use drawings::{SweDrawings, drawings_from_archive};
 
 /// `tew_file.fil_filetype` values (the product's `EwFileType`). Drawn as schematics: schematic
 /// sheet, line diagram, mixed schematic, P&ID, fluid. The others are folders, reports (bill of
@@ -114,6 +118,10 @@ pub struct SweSymbol {
     /// The opposite corner of a box symbol (black box), y up.
     pub corner: Option<Point>,
     pub pins: Vec<SwePin>,
+    /// How the block is placed, like its connection points ([`place`]): turned by this many
+    /// degrees, then scaled along the page axes (a negative scale mirrors).
+    pub angle: f64,
+    pub scale: (f64, f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,6 +205,9 @@ pub struct SweProject {
     /// The archive's catalog parts ([`library::from_archive`]), set by the caller. Devices and
     /// cables that name one of them are linked to it, and their layout footprints take its size.
     pub catalog: Vec<wc_core::Part>,
+    /// The archive's symbol and page drawings ([`drawings::drawings_from_archive`]), set by the
+    /// caller. Without them every symbol that no library symbol fits is drawn as a box.
+    pub drawings: SweDrawings,
     pub warnings: Vec<String>,
 }
 
@@ -1069,6 +1080,8 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
             at,
             corner,
             pins: out_pins,
+            angle,
+            scale,
         });
     }
     if unplaced > 0 {
@@ -1788,8 +1801,14 @@ pub fn build_with(
     let mut used_components: BTreeSet<i64> = BTreeSet::new();
     let mut symbols_in = 0;
     let mut symbols_out = 0;
-    // Of those, drawn as a library symbol and as a box.
+    // Of those, drawn as a library symbol and not; of the others, drawn from their DWG block and
+    // as a box, with the blocks that fell back to boxes.
     let (mut library_symbols, mut boxed_symbols) = (0usize, 0usize);
+    let mut dwg_symbols = 0usize;
+    let mut fallback_blocks: BTreeSet<String> = BTreeSet::new();
+    let mut pages_with_drawing = 0usize;
+    // One budget for every drawing of the import, like the DWG reader's own.
+    let mut draw_budget = crate::dxf::MAX_DRAWN;
     let mut lines_in = 0;
     let mut lines_out = 0usize;
     let mut zero_length = 0;
@@ -1864,6 +1883,11 @@ pub fn build_with(
         // A line diagram repeats devices the schematics draw in detail.
         page.overview = pg.kind == KIND_LINE_DIAGRAM;
         page.title_block = pg.title_block.clone();
+        // The page drawing's own texts, frames and notes.
+        page.graphics = p.drawings.page_graphics(pg.id, height, &lines, &mut draw_budget);
+        if !page.graphics.is_empty() {
+            pages_with_drawing += 1;
+        }
 
         // Pin positions on this page (y down) for joining wire ends.
         let mut pin_at: Vec<(Point, String, String)> = Vec::new();
@@ -1892,7 +1916,19 @@ pub fn build_with(
             let from_library = matched.is_some();
             let (graphics, out_pins) = match &matched {
                 Some(fit) => (Vec::new(), fit.pins.clone()),
-                None => box_symbol(&s.block, origin, s.corner.map(flip), &pins),
+                None => {
+                    let (boxed, pins) = box_symbol(&s.block, origin, s.corner.map(flip), &pins);
+                    match p.drawings.symbol_graphics(s, &mut draw_budget) {
+                        Some(drawn) => {
+                            dwg_symbols += 1;
+                            (drawn, pins)
+                        }
+                        None => {
+                            fallback_blocks.insert(s.block.to_lowercase());
+                            (boxed, pins)
+                        }
+                    }
+                }
             };
             let key = format!("{}|{:?}|{:?}|{:?}", s.block, role, graphics, out_pins);
             let (rotation, mirror) = matched
@@ -2406,7 +2442,37 @@ pub fn build_with(
             what: "library symbols",
             source: symbols_out,
             imported: library_symbols,
-            note: note(vec![(boxed_symbols, "drawn as boxes: no library symbol fits")]),
+            note: note(vec![(
+                boxed_symbols,
+                "drawn from their DWG block or as boxes: no library symbol fits",
+            )]),
+        },
+        Count {
+            what: "DWG symbol graphics",
+            source: boxed_symbols,
+            imported: dwg_symbols,
+            note: if boxed_symbols > dwg_symbols {
+                format!(
+                    "{} drawn as boxes: {} block(s) without a readable drawing in the archive",
+                    boxed_symbols - dwg_symbols,
+                    fallback_blocks.len()
+                )
+            } else {
+                String::new()
+            },
+        },
+        Count {
+            what: "page drawings",
+            source: drawn.iter().filter(|pg| pg.kind != KIND_COVER).count(),
+            imported: pages_with_drawing,
+            note: note(vec![(
+                drawn
+                    .iter()
+                    .filter(|pg| pg.kind != KIND_COVER)
+                    .count()
+                    .saturating_sub(pages_with_drawing),
+                "without a drawing in the archive, or with nothing in it besides symbols and wires",
+            )]),
         },
         Count {
             what: "wire lines",

@@ -15,7 +15,7 @@ use wc_core::{DeviceTag, PlacedSymbol};
 use crate::{Error, Result, make_symbol};
 
 /// One entity as group-code/value pairs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Entity {
     pub(crate) kind: String,
     pub(crate) codes: Vec<(i32, String)>,
@@ -49,7 +49,7 @@ impl Entity {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Drawing {
     pub(crate) entities: Vec<Entity>,
     pub(crate) blocks: BTreeMap<String, Vec<Entity>>,
@@ -69,12 +69,30 @@ pub(crate) type Drawn = (Vec<(String, Shape)>, Vec<(String, Point)>);
 /// expanded, and the POINT positions. Entities not drawn are counted in `skipped`. Each entity
 /// visited takes one from `budget`; when it runs out the rest is left out (and counted).
 pub(crate) fn draw(d: &Drawing, ents: &[Entity], skipped: &mut BTreeMap<String, usize>, budget: &mut usize) -> Drawn {
+    draw_turned(d, ents, (0.0, 1.0, 1.0), skipped, budget)
+}
+
+/// [`draw`], with `ents` first scaled by `turn.1` along x and `turn.2` along y (a negative
+/// scale mirrors), then turned by `turn.0` degrees counter-clockwise around the origin: how a
+/// block reference places its block.
+pub(crate) fn draw_turned(
+    d: &Drawing,
+    ents: &[Entity],
+    turn: (f64, f64, f64),
+    skipped: &mut BTreeMap<String, usize>,
+    budget: &mut usize,
+) -> Drawn {
     let mut out = Vec::new();
     let mut points = Vec::new();
     shapes(
         d,
         ents,
-        Xf::ID,
+        Xf {
+            at: (0.0, 0.0),
+            sx: turn.1,
+            sy: turn.2,
+            rot: turn.0,
+        },
         1.0,
         0,
         &|_| false,
@@ -267,6 +285,19 @@ fn shapes(
                     (180.0 - e.f(51), 180.0 - e.f(50))
                 } else {
                     (e.f(50), e.f(51))
+                };
+                // A placement mirrored in one axis (one negative scale) mirrors the arc too, and
+                // runs it the other way round.
+                let mirrored = |a: f64| {
+                    let (sin, cos) = a.to_radians().sin_cos();
+                    (sin * xf.sy.signum()).atan2(cos * xf.sx.signum()).to_degrees()
+                };
+                let (s, en) = if xf.sx * xf.sy < 0.0 {
+                    (mirrored(en), mirrored(s))
+                } else if xf.sx < 0.0 && xf.sy < 0.0 {
+                    (s + 180.0, en + 180.0)
+                } else {
+                    (s, en)
                 };
                 let (s, en) = (s + xf.rot, en + xf.rot);
                 Some(Shape::Arc {

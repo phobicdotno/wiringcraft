@@ -1025,3 +1025,84 @@ fn blocks_inserting_blocks_many_times_stop_at_the_limit() -> TestResult {
     assert!(d.skipped.contains_key(dxf::OVER_LIMIT), "{:?}", d.skipped);
     Ok(())
 }
+
+// ---- Drawings for other modules' tests ----
+
+/// One entity of a test drawing, in drawing units (y up).
+pub(crate) enum TestEntity {
+    Line((f64, f64), (f64, f64)),
+    Circle((f64, f64), f64),
+    /// Centre, radius, start and end angle in degrees, counter-clockwise.
+    Arc((f64, f64), f64, f64, f64),
+    Text((f64, f64), &'static str),
+    /// A reference to a block `FRAME` holding a 10 mm line, at this point.
+    Insert((f64, f64)),
+}
+
+/// An AutoCAD 2010 drawing whose model space holds `items`, for tests elsewhere in the crate.
+pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
+    const FRAME_H: u64 = 0x22;
+    let v = Version::R2010;
+    let model = head(None);
+    let mut objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, PAPER_H, "*Paper_Space"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        entry(v, BLOCK_HEADER, FRAME_H, "FRAME"),
+        line(v, 0x30, head(Some(FRAME_H)), (0.0, 0.0), (10.0, 0.0)),
+    ];
+    for (n, item) in items.iter().enumerate() {
+        let handle = 0x100 + n as u64;
+        objs.push(match *item {
+            TestEntity::Line(a, b) => line(v, handle, model, a, b),
+            TestEntity::Circle(c, r) => {
+                let mut o = entity(v, 18, handle, model);
+                o.data.bd3((c.0, c.1, 0.0)).bd(r).bt(0.0).be((0.0, 0.0, 1.0));
+                o
+            }
+            TestEntity::Arc(c, r, start, end) => {
+                let mut o = entity(v, 17, handle, model);
+                o.data
+                    .bd3((c.0, c.1, 0.0))
+                    .bd(r)
+                    .bt(0.0)
+                    .be((0.0, 0.0, 1.0))
+                    .bd(start.to_radians())
+                    .bd(end.to_radians());
+                o
+            }
+            TestEntity::Text(at, value) => {
+                let mut o = entity(v, 1, handle, model);
+                text_data(&mut o, at, value, 2.5, 0.0);
+                o
+            }
+            TestEntity::Insert(at) => {
+                let mut o = entity(v, 7, handle, model);
+                o.data
+                    .bd3((at.0, at.1, 0.0))
+                    .bb(3)
+                    .bd(0.0)
+                    .bd3((0.0, 0.0, 1.0))
+                    .b(false);
+                o.handles.h(5, FRAME_H);
+                o
+            }
+        });
+    }
+    let (map, objects) = sections_bytes(&objs, &[]);
+    write_dwg(
+        b"AC1024",
+        &[
+            TestSection {
+                name: "AcDb:AcDbObjects",
+                data: objects,
+                ..Default::default()
+            },
+            TestSection {
+                name: "AcDb:Handles",
+                data: map,
+                ..Default::default()
+            },
+        ],
+    )
+}
