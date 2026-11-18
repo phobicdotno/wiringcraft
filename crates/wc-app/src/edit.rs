@@ -258,9 +258,12 @@ impl Open {
         out
     }
 
-    /// Add a free drawing to a page and return its selection.
+    /// Add a free drawing to a page and return its selection. Refused (None) on a page someone else has open in a shared session.
     pub fn add_graphic(&mut self, page: usize, g: Shape) -> Option<Selection> {
         self.project.pages.get(page)?;
+        if self.held_reason(page).is_some() {
+            return None;
+        }
         self.checkpoint();
         let p = self.project.pages.get_mut(page)?;
         p.graphics.push(g);

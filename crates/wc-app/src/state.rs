@@ -1160,6 +1160,14 @@ impl Open {
         Ok(self.index_of(&id))
     }
 
+    /// Why `page` cannot be changed here: in a shared session someone else has it open.
+    pub fn held_reason(&self, page: usize) -> Option<String> {
+        let id = &self.project.pages.get(page)?.id;
+        self.held_by_others
+            .get(id)
+            .map(|name| format!("{name} has this page open; it is read-only here until they leave it."))
+    }
+
     /// Delete a page. The last page of a project cannot be deleted. Returns the page to show next.
     pub fn delete_page(&mut self, page: usize) -> Result<usize, String> {
         if self.project.pages.len() <= 1 {
@@ -1167,6 +1175,9 @@ impl Open {
         }
         if page >= self.project.pages.len() {
             return Err("No such page.".into());
+        }
+        if let Some(why) = self.held_reason(page) {
+            return Err(why);
         }
         self.checkpoint();
         self.project.pages.remove(page);
@@ -2805,6 +2816,30 @@ pub(crate) mod tests {
         let a1 = o.pin_pos(&pg, &a, "A1").unwrap();
         let (item, pin, _) = o.pin_near(&pg, a1 + Point::new(0.5, 0.5), 2.0).unwrap();
         assert_eq!((item.as_str(), pin.as_str()), (a.as_str(), "A1"));
+    }
+
+    #[test]
+    fn a_page_someone_else_has_open_is_neither_deleted_nor_written_on() {
+        // A Delete page or Text dialog confirmed after the page became held changes nothing.
+        let (_tmp, mut o) = project();
+        let id = o.project.pages[1].id.clone();
+        o.held_by_others.insert(id, "Ola".into());
+        let before = o.project.clone();
+        let text = wc_core::geom::Shape::Text {
+            at: wc_core::geom::Point::new(10.0, 10.0),
+            text: "Note".into(),
+            height: 3.5,
+            align: wc_core::geom::Align::Left,
+            angle: 0.0,
+        };
+        assert!(o.delete_page(1).is_err_and(|e| e.contains("Ola")));
+        assert!(o.add_graphic(1, text.clone()).is_none());
+        assert!(o.held_reason(1).is_some_and(|e| e.contains("Ola")));
+        assert_eq!(o.project, before);
+        assert!(!o.can_undo(), "nothing was recorded");
+        // The other page is not held.
+        assert!(o.held_reason(0).is_none());
+        assert!(o.add_graphic(0, text).is_some());
     }
 
     #[test]

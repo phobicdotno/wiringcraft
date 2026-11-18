@@ -1596,6 +1596,10 @@ impl App {
                             && !text.trim().is_empty()
                         {
                             if let Some(o) = self.open.as_mut()
+                                && let Some(why) = o.held_reason(self.ed.page)
+                            {
+                                self.ed.message = why;
+                            } else if let Some(o) = self.open.as_mut()
                                 && let Some(sel) = o.add_graphic(
                                     self.ed.page,
                                     wc_core::geom::Shape::Text {
@@ -2903,11 +2907,6 @@ impl App {
     }
 }
 
-/// A note across the top of the canvas: someone else has this page open, so it is read-only.
-/// Who holds the page action `a` would change, in a shared session: then it is refused. Page
-/// actions (properties, delete, move up or down) are about the current page even while a panel
-/// is shown; canvas actions only when the page itself is shown, as in the panel view they work
-/// on the panel.
 /// The page properties dialog's OK: refused when the page was removed, or when someone else
 /// opened it while the dialog was open.
 fn confirm_page_props(
@@ -2933,6 +2932,10 @@ fn confirm_page_props(
     o.set_page_props(i, number, title, size, overview)
 }
 
+/// Who holds the page action `a` would change, in a shared session: then it is refused. Page
+/// actions (properties, delete, move up or down) are about the current page even while a panel
+/// is shown; canvas actions only when the page itself is shown, as in the panel view they work
+/// on the panel.
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
     // With a panel shown these still work on the schematic page under it (Delete goes to the
     // panel first), so they follow that page's hold.
@@ -2949,6 +2952,7 @@ fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String
     name.map(str::to_owned)
 }
 
+/// A note across the top of the canvas: someone else has this page open, so it is read-only.
 fn read_only_banner(ui: &egui::Ui, t: &theme::Theme, name: &str) {
     let p = ui.painter();
     let galley = p.layout_no_wrap(
