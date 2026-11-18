@@ -2209,7 +2209,6 @@ impl Held {
             items.extend(jumper_parts.iter().map(|id| item_name(ItemKind::Part, id)));
             held.now.meta = Some(Box::new(local.meta.clone()));
         }
-        held.hold_renames(local, base);
         // A device new since `base` that a waiting page names waits with it: placing the symbol
         // made its record, and Undo of the placement takes both back here alone.
         let pages: Vec<&Page> = held.now.pages.values().flatten().collect();
@@ -2221,6 +2220,8 @@ impl Held {
             .map(|(tag, d)| (tag.clone(), Some(d.clone())))
             .collect();
         held.now.devices.extend(new_devices);
+        // After those, so a rename to a tag only a waiting page names is held as a pair.
+        held.hold_renames(local, base);
         // A new page's comments wait with it, however it came to wait: the session has no page
         // to put them on.
         let new_pages: Vec<String> = held
@@ -2511,8 +2512,21 @@ impl Held {
 /// latest action changed nothing that waits.
 fn latest_waiting_step(open: &Open, held: &Held) -> Option<wc_share::Parts> {
     let prev = open.before_last_change()?;
-    let step = wc_share::Parts::read(prev, &held.now);
-    (step != wc_share::Parts::read(&open.project, &held.now)).then_some(step)
+    let mut step = wc_share::Parts::read(prev, &held.now);
+    if step == wc_share::Parts::read(&open.project, &held.now) {
+        return None;
+    }
+    // A page keeps the session's number unless this copy renumbered it, as when the waiting
+    // changes are put back: a renumbering by someone else since stays.
+    for (id, page) in step.pages.iter_mut() {
+        let synced = held.was.pages.get(id).cloned().flatten();
+        if let (Some(page), Some(now), Some(synced)) = (page.as_mut(), open.project.page(id), synced)
+            && now.number == synced.number
+        {
+            page.number = now.number.clone();
+        }
+    }
+    Some(step)
 }
 
 /// Whether a symbol or cable on `page` names a device `tag` picks.

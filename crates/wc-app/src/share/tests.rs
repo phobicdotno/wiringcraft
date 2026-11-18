@@ -3600,6 +3600,30 @@ fn undo_of_a_second_waiting_placement_takes_back_only_that_one() -> TestResult {
 }
 
 #[test]
+fn undo_of_a_waiting_placement_keeps_the_sessions_page_number() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The host renumbers the waiting page meanwhile, and the guest takes that in.
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    assert_eq!(number(&guest_open).as_deref(), Some("30"));
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    assert_eq!(number(&host_open).as_deref(), Some("30"), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
 fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
@@ -3627,6 +3651,37 @@ fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
 
 fn waiting(names: &[String]) -> std::collections::BTreeSet<String> {
     names.iter().cloned().collect()
+}
+
+#[test]
+fn a_rename_to_a_tag_only_a_waiting_page_names_waits_as_a_pair() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    let mut contact = symbol("s1", 10.0);
+    contact.symbol = "contact".into();
+    contact.tag = Some(k1.clone());
+    page.symbols.push(contact);
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), Default::default());
+    // On the same page: -K1 renamed to -K2, and a symbol the session does not have placed.
+    let mut local = base.clone();
+    let p1 = local.page_mut("p1").ok_or("no page")?;
+    p1.symbols[0].tag = Some(k2.clone());
+    p1.symbols.push(symbol("s9", 40.0));
+    local.devices.remove(&k1);
+    local.devices.insert(k2.clone(), Default::default());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert!(held.now.devices.contains_key(&k2), "the new tag waits with its page");
+    assert_eq!(
+        held.now.devices.get(&k1),
+        Some(&None),
+        "and the old one's removal with it"
+    );
+    assert_eq!(held.renames.len(), 1);
+    assert_eq!(held.renames[0].devices, [k1, k2].into_iter().collect());
+    Ok(())
 }
 
 #[test]
