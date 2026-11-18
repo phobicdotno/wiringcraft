@@ -3720,3 +3720,14 @@ fn a_page_too_large_to_go_twice_in_one_message_is_not_folded_into_the_batch() {
     fold_own_page(&mut out, &base);
     assert!(out.page.is_some() && out.edits.len() == n);
 }
+
+#[test]
+fn a_picture_whose_write_time_is_unknown_is_read_again_even_at_the_same_size() {
+    let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+    // Without a write time a same-size replacement looks the same: it must be read.
+    assert!(!still_taken(Some(&(4, None)), &(4, None)));
+    // With one, an unchanged size and time is the file taken in.
+    assert!(still_taken(Some(&(4, Some(at))), &(4, Some(at))));
+    assert!(!still_taken(Some(&(5, Some(at))), &(4, Some(at))));
+    assert!(!still_taken(None, &(4, Some(at))));
+}

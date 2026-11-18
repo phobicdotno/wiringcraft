@@ -1305,6 +1305,13 @@ pub fn picture_version(dir: &Path, file: &str) -> Option<PictureVersion> {
     Some((m.len(), m.modified().ok()))
 }
 
+/// Whether a picture file here is still the one taken in at `was`, judged without reading it.
+/// Only a version with a known write time can say so: without one (the file system gives
+/// none), a same-size replacement would look unchanged, so the file is read again instead.
+fn still_taken(now: Option<&PictureVersion>, was: &PictureVersion) -> bool {
+    was.1.is_some() && now == Some(was)
+}
+
 /// The pictures `local` uses that the session (`session`, by project path) does not have, read
 /// from `dir`, each as its own edit so each message stays small. Pictures named in `skip` were
 /// tried a moment ago and are left out. A picture missing here is left out silently: nobody
@@ -1326,7 +1333,7 @@ pub fn new_pictures(
             // Taken in here: unchanged since, it is the session's (no read needed).
             let Some(was) = taken.get(&file) else { continue };
             let now = picture_version(dir, &file);
-            if now.as_ref() == Some(was) {
+            if still_taken(now.as_ref(), was) {
                 continue;
             }
             match wc_pdf::read_picture(dir, &file) {
