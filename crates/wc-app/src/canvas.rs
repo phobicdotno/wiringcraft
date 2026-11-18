@@ -181,12 +181,17 @@ fn snap(p: Point, step: f64) -> Point {
     Point::new((p.x / step).round() * step, (p.y / step).round() * step)
 }
 
+/// The signed sweep from `start` to `end` in degrees as an arc is drawn: counterclockwise,
+/// a full turn when they are equal. Angles stored past a full turn (from a file) can make it
+/// negative, which draws the other way round.
+pub(crate) fn arc_sweep(start: f64, end: f64) -> f64 {
+    let sweep = end - start;
+    if sweep <= 0.0 { sweep + 360.0 } else { sweep }
+}
+
 pub(crate) fn arc_points(center: Point, r: f64, start: f64, end: f64) -> Vec<Point> {
-    let mut sweep = end - start;
-    if sweep <= 0.0 {
-        sweep += 360.0;
-    }
-    let n = ((sweep / 10.0).ceil() as usize).clamp(2, 72);
+    let sweep = arc_sweep(start, end);
+    let n = ((sweep.abs() / 10.0).ceil() as usize).clamp(2, 72);
     (0..=n)
         .map(|i| {
             let t = (start + sweep * i as f64 / n as f64).to_radians();

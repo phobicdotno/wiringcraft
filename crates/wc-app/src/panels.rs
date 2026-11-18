@@ -26,15 +26,17 @@ pub struct PanelState {
     /// Edit buffer for a free drawing's own values (a circle's centre and radius, an arc's
     /// radius and angles, a polyline closed or open).
     shape: Option<Shape>,
-    /// A field of `shape` is being typed in or dragged: the buffer is not read again from the
-    /// drawing meanwhile. Otherwise it is, each frame, so a drawing moved on the canvas is not
-    /// put back by the next value set here.
-    shape_busy: bool,
-    /// The drawing's values when `shape` was read: only the fields that differ from these are
-    /// applied, to the drawing as it is then (moved meanwhile, it stays where it went).
+    /// Which of `shape`'s fields (as [`shape_fields`] lists them) are being typed in or dragged:
+    /// those are not read again from the drawing meanwhile. The others are, each frame, so a
+    /// drawing moved on the canvas is not put back by the next value set here.
+    shape_in_use: Vec<bool>,
+    /// The drawing's values when each field was read: a field is applied only when it differs
+    /// from these, to the drawing as it is then (moved meanwhile, it stays where it went).
     shape_base: Option<Shape>,
     /// Why the last value set for the drawing was refused.
     shape_error: Option<String>,
+    /// The fields whose values were refused: the reason stays until one of them is entered again.
+    shape_refused: Vec<usize>,
     /// The page, index and number of drawings on the page `shape` was read for.
     shape_slot: Option<(usize, usize, usize)>,
     cable: String,
@@ -603,29 +605,56 @@ fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
                 ps.text = text.clone();
                 ps.text_height = *height;
             }
-            ps.shape_busy = false;
+            ps.shape_in_use.clear();
             ps.shape_error = None;
+            ps.shape_refused.clear();
         }
         None => {}
     }
 }
 
-/// The fields of a circle, an arc or a polyline (`drawing`, read into the edit buffer unless a
-/// field is in use). When a value is committed (a drag ended, a typed value left its field, the
-/// closed box was ticked), the drawing with the changed fields set: `None` when no field
-/// changed. A field only tabbed through, or typed in with text that is not a number, is no
-/// change.
-fn shape_rows(ui: &mut egui::Ui, ps: &mut PanelState, drawing: &Shape, slot: (usize, usize, usize)) -> Option<Shape> {
+/// What [`shape_rows`] commits: the fields whose edit ended, and the drawing with those of them
+/// that changed set (`None` when none did).
+struct ShapeCommit {
+    fields: Vec<usize>,
+    new: Option<Shape>,
+}
+
+/// The fields of a circle, an arc or a polyline (`drawing`, read into the edit buffer except
+/// for a field in use). When values are committed (a drag ended, a typed value left its field,
+/// the closed box was ticked), the fields that ended, with the drawing as it is now with those
+/// of them that changed set. A field only tabbed through, or typed in with text that is not a
+/// number, is no change, and a field still in use is left to its own commit.
+fn shape_rows(
+    ui: &mut egui::Ui,
+    ps: &mut PanelState,
+    drawing: &Shape,
+    slot: (usize, usize, usize),
+) -> Option<ShapeCommit> {
+    let now = shape_fields(drawing);
     // A draft is for the drawing in its slot while the page has as many drawings: one deleted
     // or added before it moves another drawing into the slot, and the draft is dropped.
-    if !ps.shape_busy || ps.shape_slot != Some(slot) {
-        ps.shape = Some(drawing.clone());
-        ps.shape_base = Some(drawing.clone());
+    if ps.shape_slot != Some(slot) || ps.shape_in_use.len() != now.len() {
+        ps.shape_in_use = vec![false; now.len()];
         ps.shape_slot = Some(slot);
     }
+    let mut draft = ps.shape.as_ref().map(shape_fields).unwrap_or_default();
+    let mut base = ps.shape_base.as_ref().map(shape_fields).unwrap_or_default();
+    if draft.len() != now.len() || base.len() != now.len() {
+        (draft, base) = (now.clone(), now.clone());
+    }
+    for (k, used) in ps.shape_in_use.iter().enumerate() {
+        if !used {
+            draft[k] = now[k];
+            base[k] = now[k];
+        }
+    }
+    let mut shape = drawing.clone();
+    set_shape_fields(&mut shape, &draft);
     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-    let mut done = false;
-    let mut busy = false;
+    let mut ended = vec![false; now.len()];
+    let mut in_use = vec![false; now.len()];
+    let mut field = 0;
     let mut num = |ui: &mut egui::Ui, label: &str, v: &mut f64, suffix: &str| {
         ui.label(label);
         // Typed text is read when it leaves the field, not as it is typed: a number typed and
@@ -638,30 +667,31 @@ fn shape_rows(ui: &mut egui::Ui, ps: &mut PanelState, drawing: &Shape, slot: (us
                 .suffix(suffix),
         );
         ui.end_row();
-        let ended = r.drag_stopped() || r.lost_focus();
-        done |= ended;
+        let done = r.drag_stopped() || r.lost_focus();
+        ended[field] = done;
         // A field still in use, also one focus just moved to as another one ended.
-        busy |= (r.has_focus() || r.dragged()) && !ended;
+        in_use[field] = (r.has_focus() || r.dragged()) && !done;
+        field += 1;
     };
-    match ps.shape.as_mut() {
-        Some(Shape::Circle { center, radius, .. }) => {
+    match &mut shape {
+        Shape::Circle { center, radius, .. } => {
             num(ui, "Centre X", &mut center.x, " mm");
             num(ui, "Centre Y", &mut center.y, " mm");
             num(ui, "Radius", radius, " mm");
         }
-        Some(Shape::Arc {
+        Shape::Arc {
             center,
             radius,
             start,
             end,
-        }) => {
+        } => {
             num(ui, "Centre X", &mut center.x, " mm");
             num(ui, "Centre Y", &mut center.y, " mm");
             num(ui, "Radius", radius, " mm");
             num(ui, "Start angle", start, "°");
             num(ui, "End angle", end, "°");
         }
-        Some(Shape::Polyline { points, closed, .. }) => {
+        Shape::Polyline { points, closed, .. } => {
             ui.label("Points");
             ui.label(points.len().to_string());
             ui.end_row();
@@ -671,25 +701,48 @@ fn shape_rows(ui: &mut egui::Ui, ps: &mut PanelState, drawing: &Shape, slot: (us
                 .add_enabled(can, egui::Checkbox::without_text(closed))
                 .on_disabled_hover_text("A polyline needs three points or more to close.");
             ui.end_row();
-            done |= r.changed();
+            if let Some(e) = ended.first_mut() {
+                *e = r.changed();
+            }
         }
         _ => {}
     }
-    ps.shape_busy = busy;
-    if !done {
+    let mut draft = shape_fields(&shape);
+    ps.shape_in_use = in_use;
+    let fields: Vec<usize> = (0..ended.len()).filter(|&k| ended[k]).collect();
+    if fields.is_empty() {
+        ps.shape = Some(shape);
+        ps.shape_base = Some(with_fields(drawing, &base));
         return None;
     }
-    // A value committed takes back the refusal shown; one that changes nothing leaves no step.
-    ps.shape_error = None;
-    let (base, draft) = (ps.shape_base.clone()?, ps.shape.clone()?);
-    // Escape drops the draft (an arrow key may already have changed it).
+    // Escape drops what was entered in the fields it ended (an arrow key may already have
+    // changed one).
     if escape {
-        ps.shape = Some(base);
+        for &k in &fields {
+            draft[k] = base[k];
+        }
+        ps.shape = Some(with_fields(drawing, &draft));
+        ps.shape_base = Some(with_fields(drawing, &base));
         return None;
     }
-    // What was entered is the baseline now, for a field still in use after this commit.
-    ps.shape_base = Some(draft.clone());
-    changed_fields(&base, &draft, drawing)
+    let mut new = now.clone();
+    let mut any = false;
+    for &k in &fields {
+        // Not within reach of the shown value (a number that is not finite included).
+        let shown = (draft[k] - base[k]).abs() <= SAME_VALUE;
+        if !shown {
+            new[k] = draft[k];
+            any = true;
+        }
+        // What was entered is the baseline now.
+        base[k] = draft[k];
+    }
+    ps.shape = Some(with_fields(drawing, &draft));
+    ps.shape_base = Some(with_fields(drawing, &base));
+    Some(ShapeCommit {
+        fields,
+        new: any.then(|| with_fields(drawing, &new)),
+    })
 }
 
 /// Decimals shown in a drawing's fields (egui may show fewer for a large value): the text
@@ -699,77 +752,49 @@ const SHAPE_DECIMALS: usize = 6;
 /// what it showed was not changed.
 const SAME_VALUE: f64 = 1e-4;
 
-/// `now` with the fields that differ between `base` (the values shown) and `draft` (the values
-/// entered) set from `draft`: `None` when none differ or the kinds no longer match.
-fn changed_fields(base: &Shape, draft: &Shape, now: &Shape) -> Option<Shape> {
-    let mut any = false;
-    let mut pick = |b: f64, d: f64, n: f64| {
-        // Not within reach of the shown value (a number that is not finite included).
-        if (d - b).abs() <= SAME_VALUE {
-            n
-        } else {
-            any = true;
-            d
+/// The values [`shape_rows`] shows for a drawing, in its order: a circle's centre x, centre y
+/// and radius; an arc's, then its start and end angle; a polyline's closed box (1 when ticked).
+fn shape_fields(s: &Shape) -> Vec<f64> {
+    match s {
+        Shape::Circle { center, radius, .. } => vec![center.x, center.y, *radius],
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => vec![center.x, center.y, *radius, *start, *end],
+        Shape::Polyline { closed, .. } => vec![if *closed { 1.0 } else { 0.0 }],
+        _ => Vec::new(),
+    }
+}
+
+/// Set `s`'s fields from `v`, in [`shape_fields`]' order.
+fn set_shape_fields(s: &mut Shape, v: &[f64]) {
+    match (s, v) {
+        (Shape::Circle { center, radius, .. }, [x, y, r]) => {
+            (center.x, center.y, *radius) = (*x, *y, *r);
         }
-    };
-    let out = match (base, draft, now) {
-        (
-            Shape::Circle {
-                center: bc, radius: br, ..
-            },
-            Shape::Circle {
-                center: dc, radius: dr, ..
-            },
-            Shape::Circle {
-                center: nc,
-                radius: nr,
-                filled,
-            },
-        ) => Shape::Circle {
-            center: wc_core::geom::Point::new(pick(bc.x, dc.x, nc.x), pick(bc.y, dc.y, nc.y)),
-            radius: pick(*br, *dr, *nr),
-            filled: *filled,
-        },
         (
             Shape::Arc {
-                center: bc,
-                radius: br,
-                start: bs,
-                end: be,
+                center,
+                radius,
+                start,
+                end,
             },
-            Shape::Arc {
-                center: dc,
-                radius: dr,
-                start: ds,
-                end: de,
-            },
-            Shape::Arc {
-                center: nc,
-                radius: nr,
-                start: ns,
-                end: ne,
-            },
-        ) => Shape::Arc {
-            center: wc_core::geom::Point::new(pick(bc.x, dc.x, nc.x), pick(bc.y, dc.y, nc.y)),
-            radius: pick(*br, *dr, *nr),
-            start: pick(*bs, *ds, *ns),
-            end: pick(*be, *de, *ne),
-        },
-        (
-            Shape::Polyline { closed: b, .. },
-            Shape::Polyline { closed: d, .. },
-            Shape::Polyline { points, closed, filled },
+            [x, y, r, a, b],
         ) => {
-            any = b != d;
-            Shape::Polyline {
-                points: points.clone(),
-                closed: if b != d { *d } else { *closed },
-                filled: *filled,
-            }
+            (center.x, center.y, *radius, *start, *end) = (*x, *y, *r, *a, *b);
         }
-        _ => return None,
-    };
-    any.then_some(out)
+        (Shape::Polyline { closed, .. }, [c]) => *closed = *c != 0.0,
+        _ => {}
+    }
+}
+
+/// `s` with its fields set from `v`.
+fn with_fields(s: &Shape, v: &[f64]) -> Shape {
+    let mut out = s.clone();
+    set_shape_fields(&mut out, v);
+    out
 }
 
 fn committed(r: &egui::Response) -> bool {
@@ -989,10 +1014,30 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
             };
             // The fields are this drawing's: one being typed in when another is selected goes
             // with its drawing, not into the same field of the next one.
-            // With the page's count of drawings: one deleted or added before it puts another
-            // drawing at this index, which must not take the field being typed in either.
-            let count = open.project.pages.get(page_idx).map_or(0, |p| p.graphics.len());
-            ui.push_id(("gfx-props", page_idx, i, count), |ui| {
+            // With the drawings before it, and a text as it is: one deleted or added before it,
+            // or the drawing itself deleted, puts another drawing at this index, which must not
+            // take the field being typed in either. One appended after it leaves a text being
+            // typed alone. The number fields go with the page's count of drawings instead, as
+            // their drafts do (see `shape_rows`).
+            let graphics = open
+                .project
+                .pages
+                .get(page_idx)
+                .map(|p| p.graphics.as_slice())
+                .unwrap_or_default();
+            let count = graphics.len();
+            let before = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                format!("{:?}", graphics.get(..i).unwrap_or_default()).hash(&mut h);
+                if matches!(g, Shape::Text { .. }) {
+                    format!("{g:?}").hash(&mut h);
+                } else {
+                    count.hash(&mut h);
+                }
+                h.finish()
+            };
+            ui.push_id(("gfx-props", page_idx, i, before), |ui| {
                 egui::Grid::new("gfx-props")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -1024,10 +1069,23 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                             ui.label(format!("{:.1}, {:.1} mm", at.x, at.y));
                             ui.end_row();
                         } else if matches!(g, Shape::Circle { .. } | Shape::Arc { .. } | Shape::Polyline { .. }) {
-                            if let Some(new) = shape_rows(ui, ps, &g, (page_idx, i, count)) {
-                                // Refused (no radius, too few points to close): the reason is shown
-                                // and the fields read the drawing's own values again.
-                                ps.shape_error = open.set_shape(page_idx, i, new).err().map(str::to_owned);
+                            if let Some(c) = shape_rows(ui, ps, &g, (page_idx, i, count)) {
+                                let set = c.new.map_or(Ok(false), |new| open.set_shape(page_idx, i, new));
+                                match set {
+                                    // Refused (no radius, too few points to close): the reason is
+                                    // shown and the fields read the drawing's own values again.
+                                    Err(why) => {
+                                        ps.shape_error = Some(why.to_owned());
+                                        ps.shape_refused = c.fields;
+                                    }
+                                    // A refused field entered again with a value that is taken (or
+                                    // changes nothing) takes the reason back; another field doesn't.
+                                    Ok(_) if c.fields.iter().any(|f| ps.shape_refused.contains(f)) => {
+                                        ps.shape_error = None;
+                                        ps.shape_refused.clear();
+                                    }
+                                    Ok(_) => {}
+                                }
                             }
                             if let Some(err) = &ps.shape_error {
                                 ui.label("");
@@ -1973,6 +2031,42 @@ mod tests {
         fn drawing(&self, k: usize) -> Shape {
             self.o.project.pages[0].graphics[self.at[k]].clone()
         }
+
+        /// A frame in which `f` runs first, before the panel is drawn.
+        fn frame_with(&mut self, f: impl FnOnce(&egui::Context)) {
+            let (o, ed, ps) = (&mut self.o, &mut self.ed, &mut self.ps);
+            let mut f = Some(f);
+            let _ = self.ctx.run(egui::RawInput::default(), |ctx| {
+                if let Some(f) = f.take() {
+                    f(ctx);
+                }
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        }
+    }
+
+    fn text(s: &str) -> Shape {
+        Shape::Text {
+            at: wc_core::geom::Point::new(20.0, 20.0),
+            text: s.into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        }
+    }
+
+    /// The tabs from nothing focused to a text drawing's text field.
+    fn tabs_to_text() -> Result<usize, &'static str> {
+        for n in 1..30 {
+            let mut p = ShapePanel::new(&[text("a")]);
+            p.tab(n);
+            p.typed("b");
+            p.key(egui::Key::Enter);
+            if p.drawing(0) == text("b") {
+                return Ok(n);
+            }
+        }
+        Err("no text field reached by tabbing")
     }
 
     fn circle(x: f64, r: f64) -> Shape {
@@ -2162,6 +2256,134 @@ mod tests {
         p.key(egui::Key::Tab);
         p.frame(Vec::new());
         assert_eq!(p.o.project.pages[0].graphics[i], circle(100.0, 9.0).moved_y(60.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_stays_while_another_field_is_only_tabbed_through() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        // Centre X, then on to Centre Y: the radius was not entered again.
+        p.tab(n - 2);
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert!(p.ps.shape_error.is_some(), "the radius's refusal is still shown");
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_focused_in_the_frame_another_commits_keeps_a_change_made_meanwhile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let radius = {
+            let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+            p.tab(n);
+            p.ctx.memory(|m| m.focused()).ok_or("the radius field has the focus")?
+        };
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n - 1);
+        p.typed("60");
+        // In one frame Centre Y ends and the radius field takes the focus.
+        p.frame_with(|ctx| ctx.memory_mut(|m| m.request_focus(radius)));
+        let i = p.at[0];
+        assert_eq!(p.o.project.pages[0].graphics[i], circle(100.0, 5.0).moved_y(60.0));
+        assert_eq!(p.ctx.memory(|m| m.focused()), Some(radius));
+        let mark = p.o.undo_mark();
+        // The radius changes elsewhere while its field has the focus, then the field is left
+        // untouched: the change stays, with no step of its own.
+        p.o.project.pages[0].graphics[i] = circle(100.0, 9.0).moved_y(60.0);
+        p.frame(Vec::new());
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert_eq!(p.o.project.pages[0].graphics[i], circle(100.0, 9.0).moved_y(60.0));
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_radius_dragged_as_another_field_commits_is_one_step_of_its_own() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let radius = {
+            let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+            p.tab(n);
+            p.ctx.memory(|m| m.focused()).ok_or("the radius field has the focus")?
+        };
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        let rect = p.ctx.read_response(radius).ok_or("the radius field is shown")?.rect;
+        p.tab(n - 1);
+        let y = p.ctx.memory(|m| m.focused()).ok_or("Centre Y has the focus")?;
+        p.typed("60");
+        let mark = p.o.undo_mark();
+        let at = rect.center();
+        let pointer = |x: f32, pressed: Option<bool>| {
+            let mut ev = vec![egui::Event::PointerMoved(egui::pos2(at.x + x, at.y))];
+            if let Some(pressed) = pressed {
+                ev.push(egui::Event::PointerButton {
+                    pos: egui::pos2(at.x + x, at.y),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            ev
+        };
+        // Pressing on the radius ends Centre Y ("60"); as the radius is dragged, Centre Y
+        // takes the focus (from the keyboard) and ends again.
+        p.frame(pointer(0.0, Some(true)));
+        p.frame(pointer(20.0, None));
+        p.frame_with(|ctx| ctx.memory_mut(|m| m.request_focus(y)));
+        p.frame(pointer(30.0, None));
+        p.frame_with(|ctx| ctx.memory_mut(|m| m.surrender_focus(y)));
+        p.frame(pointer(40.0, None));
+        p.frame(pointer(40.0, Some(false)));
+        p.frame(Vec::new());
+        let i = p.at[0];
+        let Shape::Circle { center, radius: r, .. } = p.o.project.pages[0].graphics[i] else {
+            return Err("still a circle".into());
+        };
+        assert_eq!(center.y, 60.0);
+        assert!(r > 5.0, "dragged: {r}");
+        // One step for Centre Y, one for the whole drag.
+        p.o.undo();
+        let Shape::Circle { center, radius: r, .. } = p.o.project.pages[0].graphics[i] else {
+            return Err("still a circle".into());
+        };
+        assert_eq!((center.y, r), (60.0, 5.0), "the drag is undone in one step");
+        p.o.undo();
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_being_typed_keeps_its_field_when_a_drawing_is_added_after_it() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_text()?;
+        let mut p = ShapePanel::new(&[text("a")]);
+        p.tab(n);
+        p.typed("b");
+        p.o.project.pages[0].graphics.push(circle(100.0, 5.0));
+        p.frame(Vec::new());
+        p.key(egui::Key::Enter);
+        assert_eq!(p.drawing(0), text("b"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_being_typed_does_not_go_to_a_drawing_moved_into_its_place() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_text()?;
+        let mut p = ShapePanel::new(&[text("a"), text("c")]);
+        p.tab(n);
+        p.typed("b");
+        // The text is deleted; the next one takes its place in the list.
+        let i = p.at[0];
+        p.o.project.pages[0].graphics.remove(i);
+        p.frame(Vec::new());
+        p.key(egui::Key::Enter);
+        p.frame(Vec::new());
+        assert_eq!(p.o.project.pages[0].graphics[i], text("c"));
         Ok(())
     }
 

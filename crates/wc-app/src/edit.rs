@@ -401,13 +401,10 @@ impl Open {
                 if moved.1 {
                     *end = turn(*end);
                 }
-                // The sweep as the canvas draws it (`canvas::arc_points`): one that rounds to
-                // nothing (370.1° to 10.1°) leaves no arc either.
-                let drawn = {
-                    let sweep = *end - *start;
-                    if sweep <= 0.0 { sweep + 360.0 } else { sweep }
-                };
-                if (moved.0 || moved.1) && (turn(*start) == turn(*end) || drawn <= 1e-9) {
+                // The sweep as the canvas draws it: one that rounds to nothing (370.1° to
+                // 10.1°) leaves no arc either, while a negative one (720° to 100°) is drawn.
+                let drawn = crate::canvas::arc_sweep(*start, *end);
+                if (moved.0 || moved.1) && (turn(*start) == turn(*end) || drawn.abs() <= 1e-9) {
                     return Err("The start and end angles must differ.");
                 }
             }
@@ -1057,6 +1054,21 @@ mod tests {
             )
             .is_err()
         );
+        // Stored from a file past a full turn: the canvas draws 720° to 100° as -260°.
+        o.project.pages[page].graphics[n] = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 90.0,
+        };
+        let wide = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 100.0,
+        };
+        assert_eq!(o.set_shape(page, n, wide.clone()), Ok(true));
+        assert_eq!(o.project.pages[page].graphics[n], wide);
     }
 
     #[test]
