@@ -474,6 +474,11 @@ fn hatch_degrees(a0: f64, a1: f64) -> Result<(f64, f64)> {
     if !(d0.is_finite() && d1.is_finite()) {
         return Err(bad("a hatch edge angle is too large"));
     }
+    // Angles so far apart that their difference is no number are taken round the circle, so
+    // the sweep can be measured; ordinary angles are kept as they are.
+    if !(d1 - d0).is_finite() {
+        return Ok((d0.rem_euclid(360.0), d1.rem_euclid(360.0)));
+    }
     Ok((d0, d1))
 }
 

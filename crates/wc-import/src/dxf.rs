@@ -389,13 +389,20 @@ fn shapes(
                 polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false)
             }
             "HATCH" => {
-                let solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
-                // A loop whose points are not all numbers (a huge radius) is left out and counted.
+                let mut solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
+                // A loop whose points are not all numbers, in the drawing or once placed on the
+                // page (a huge radius or scale), is left out and counted. A solid hatch that lost
+                // one is drawn as outlines: the lost loop may have been a hole.
+                let placed = |(x, y): (f64, f64)| {
+                    let pt = q(x, y);
+                    x.is_finite() && y.is_finite() && pt.x.is_finite() && pt.y.is_finite()
+                };
                 let (loops, bad): (Vec<_>, Vec<_>) = hatch_loops(e)
                     .into_iter()
-                    .partition(|lp| lp.iter().all(|(x, y)| x.is_finite() && y.is_finite()));
+                    .partition(|lp| lp.iter().all(|pt| placed(*pt)));
                 if !bad.is_empty() {
                     *skipped.entry(HATCH_NOT_NUMBERS.to_owned()).or_default() += 1;
+                    solid = false;
                 }
                 // Islands inside a solid fill stay open: each is cut into the loop around it.
                 // Style (75): 0 fills every other level, 1 only the outermost area, 2 ignores

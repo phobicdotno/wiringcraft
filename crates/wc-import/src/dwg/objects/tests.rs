@@ -1419,7 +1419,11 @@ fn a_hatch_listing_too_much_is_a_damaged_object() -> TestResult {
         "{:?}",
         d.damaged
     );
-    assert!(d.damaged.iter().any(|r| r.contains("not a number")), "{:?}", d.damaged);
+    assert!(
+        d.damaged.iter().any(|r| r.contains("boundary point is not a number")),
+        "{:?}",
+        d.damaged
+    );
     assert!(
         d.damaged.iter().any(|r| r.contains("50000 boundary paths")),
         "{:?}",
@@ -1540,5 +1544,54 @@ fn a_hatch_loop_that_overflows_is_left_out_and_counted() -> TestResult {
     let d = drawing(&sections(v, &objs, &[]))?;
     assert!(d.model.is_empty(), "{:?}", d.model);
     assert!(d.skipped.keys().any(|k| k.contains("not numbers")), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn far_apart_arc_angles_still_make_an_arc_and_a_lost_hole_unfills() -> TestResult {
+    let v = Version::R2010;
+    // A half circle whose angles are 2e306 apart in radians (both finite in degrees), closed by
+    // a line: the arc is still drawn.
+    let far = hatch_obj(v, 0x300, "ANSI31", false, 1, |d| {
+        d.bl(1).bl(2);
+        d.rc(1).rd(20.0).rd(0.0).rd(30.0).rd(0.0);
+        d.rc(2).rd(25.0).rd(0.0).bd(5.0).bd(-1e306).bd(1e306).b(true);
+        d.bl(0);
+    });
+    // A solid square with a hole whose arc overflows: drawn as outlines, not filled over.
+    let lost = hatch_obj(v, 0x301, "SOLID", true, 2, |d| {
+        d.bl(2).b(false).b(true).bl(4);
+        for p in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)] {
+            d.rd(p.0).rd(p.1);
+        }
+        d.bl(0);
+        d.bl(1)
+            .bl(1)
+            .rc(2)
+            .rd(f64::MAX)
+            .rd(0.0)
+            .bd(f64::MAX)
+            .bd(0.0)
+            .bd(1.0)
+            .b(true)
+            .bl(0);
+    });
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        far,
+        lost,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    let polys: Vec<(usize, bool)> = d
+        .model
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Polyline { points, filled, .. } => Some((points.len(), *filled)),
+            _ => None,
+        })
+        .collect();
+    assert!(polys.iter().any(|(n, _)| *n > 5), "the arc is drawn: {polys:?}");
+    assert!(polys.contains(&(4, false)), "the square is not filled: {polys:?}");
     Ok(())
 }
