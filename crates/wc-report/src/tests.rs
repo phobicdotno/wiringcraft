@@ -1775,3 +1775,12 @@ fn every_csv_report_goes_through_the_guard_but_the_marker_list_keeps_its_text() 
     );
     assert!(to_smartscript_csv(&t).contains(";@x\r\n"));
 }
+
+#[test]
+fn a_csv_header_that_looks_like_a_formula_is_written_as_text_too() {
+    let mut t = Table::new("T", &["=1+2", "Tag"]);
+    t.rows.push(vec!["a".into(), "-K1".into()]);
+    assert!(t.to_csv().starts_with("'=1+2,Tag\r\n"), "{}", t.to_csv());
+    assert!(t.to_csv_with(';').starts_with("'=1+2;Tag\r\n"));
+    assert!(t.to_csv_raw_with(';').starts_with("=1+2;Tag\r\n"));
+}
