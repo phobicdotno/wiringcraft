@@ -25,7 +25,26 @@ pub fn decode(bytes: &[u8]) -> String {
     }
 }
 
-/// Split CSV text into records. Handles quotes, doubled quotes and newlines inside quotes.
+/// A field with the `'` a CSV export puts before text a spreadsheet would run as a formula
+/// (`'=A+C1-K1`, `'-K1`, see `wc_report::formula_safe`) taken off again. A `'` before anything
+/// else is part of the text and kept. A file cannot tell a guard from a `'` typed as text, so a
+/// field `'-K1` reads `-K1` from any CSV, as a spreadsheet shows it; WiringCraft's reports write
+/// a typed `'-K1` as `''-K1` (one `'` more however many it has), which reads back as `'-K1`.
+fn unguard(field: String) -> String {
+    match field.strip_prefix('\'') {
+        Some(rest)
+            if rest
+                .trim_start_matches('\'')
+                .starts_with(['=', '+', '-', '@', '\t', '\r']) =>
+        {
+            rest.to_owned()
+        }
+        _ => field,
+    }
+}
+
+/// Split CSV text into records. Handles quotes, doubled quotes and newlines inside quotes, and
+/// takes off the `'` WiringCraft's CSV reports put before cells such as `-K1` (`'-K1` reads `-K1`).
 pub fn records(text: &str, delim: char) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut row = Vec::new();
@@ -47,12 +66,12 @@ pub fn records(text: &str, delim: char) -> Vec<Vec<String>> {
         } else if c == '"' && field.is_empty() {
             quoted = true;
         } else if c == delim {
-            row.push(std::mem::take(&mut field));
+            row.push(unguard(std::mem::take(&mut field)));
         } else if c == '\n' || c == '\r' {
             if c == '\r' && chars.peek() == Some(&'\n') {
                 chars.next();
             }
-            row.push(std::mem::take(&mut field));
+            row.push(unguard(std::mem::take(&mut field)));
             if row.iter().any(|f| !f.trim().is_empty()) {
                 out.push(std::mem::take(&mut row));
             } else {
@@ -62,7 +81,7 @@ pub fn records(text: &str, delim: char) -> Vec<Vec<String>> {
             field.push(c);
         }
     }
-    row.push(field);
+    row.push(unguard(field));
     if row.iter().any(|f| !f.trim().is_empty()) {
         out.push(row);
     }
@@ -343,6 +362,50 @@ mod tests {
         assert_eq!(kind(""), None);
     }
     use super::*;
+
+    #[test]
+    fn a_csv_report_reads_back_with_the_tags_it_guarded() -> Result<()> {
+        let t = wc_report::Table {
+            title: "PLC".into(),
+            columns: vec!["Device".into(), "Address".into(), "Description".into()],
+            rows: vec![
+                vec!["-K1".into(), "%I0.0".into(), "-5".into()],
+                vec!["-X12".into(), "%I0.1".into(), "=A+C1-K1".into()],
+                vec!["+C1-K2".into(), "%I0.2".into(), "'quoted' text".into()],
+                vec!["-K3".into(), "%I0.3".into(), "'-K1".into()],
+                vec!["-K4".into(), "%I0.4".into(), "''=1".into()],
+            ],
+            ..wc_report::Table::default()
+        };
+        let csv = t.to_csv_with(';');
+        // A spreadsheet sees text, not a formula, in each tag cell...
+        assert!(csv.contains("'-K1;"), "{csv}");
+        assert!(csv.contains("'-X12;"), "{csv}");
+        assert!(csv.contains(";-5\r\n"), "{csv}");
+        assert!(csv.contains(";''-K1\r\n"), "{csv}");
+        // ...and the import reads every cell back as it was.
+        let rows = records(&csv, ';');
+        assert_eq!(rows[1..], t.rows[..]);
+        let (addresses, warnings) = plc_addresses(&csv)?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let tags: Vec<String> = addresses.iter().map(|a| a.tag.to_string()).collect();
+        assert_eq!(tags, ["-K1", "-X12", "+C1-K2", "-K3", "-K4"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_leading_apostrophe_is_a_guard_only_before_formula_characters() {
+        // Any CSV: `'-K1` is taken as a guarded `-K1`, as a spreadsheet shows it.
+        let rows = records(
+            "Order;Text
+'-K1;'-5
+''-K1;'quoted'
+",
+            ';',
+        );
+        assert_eq!(rows[1], ["-K1", "-5"]);
+        assert_eq!(rows[2], ["'-K1", "'quoted'"]);
+    }
 
     #[test]
     fn semicolon_latin1_with_quotes() -> Result<()> {

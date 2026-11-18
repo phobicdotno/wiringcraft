@@ -3519,6 +3519,50 @@ mod tests {
     }
 
     #[test]
+    fn find_says_why_a_hit_on_a_hidden_layer_is_not_selected() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let page = open.project.pages[1].id.clone();
+        open.project.pages[1].graphics.push(wc_core::Shape::Text {
+            at: Point::new(60.0, 60.0),
+            text: "Pump 7 supply".into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        // The hit comes from a real search for the free text, as the Find window makes it.
+        let mut find = crate::find_window::FindState::default();
+        find.query = "Pump 7".into();
+        find.refresh(&open.project);
+        let hit = Selection::Graphic(0);
+        assert_eq!(
+            find.hits.first().and_then(crate::find_window::go_to),
+            Some(crate::find_window::FindOutcome::Go {
+                page: page.clone(),
+                select: Some(hit.clone()),
+            }),
+            "{:?}",
+            find.hits
+        );
+        a.find = Some(find);
+        a.prefs.layers.set_shown(crate::layers::Layer::Drawings, false);
+        a.show_found(&page, Some(hit));
+        assert!(a.ed.selection.is_empty());
+        assert!(
+            a.ed.message.contains("hidden layer Drawings and notes"),
+            "{}",
+            a.ed.message
+        );
+        assert_eq!(a.find.as_ref().unwrap().message, a.ed.message);
+        // The next hit, which can be selected, clears the note in both places.
+        a.show_found(&page, Some(Selection::Symbol(id.clone())));
+        assert_eq!(a.ed.selection, vec![Selection::Symbol(id)]);
+        assert!(a.ed.message.is_empty(), "{}", a.ed.message);
+        assert!(a.find.as_ref().unwrap().message.is_empty());
+    }
+
+    #[test]
     fn undo_puts_back_a_symbol_a_command_replaced() {
         let (_tmp, mut a) = app(vec![]);
         let open = a.open.as_mut().unwrap();

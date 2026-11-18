@@ -720,6 +720,50 @@ impl Open {
         self.terminals_before = None;
     }
 
+    /// The project as it was before the latest change, from the undo history: for taking back
+    /// only part of that change (in a shared session, the part that waits here).
+    pub fn before_last_change(&self) -> Option<&Project> {
+        self.undo.last()
+    }
+
+    /// Forget the latest undo step, once its change was taken back another way.
+    pub fn forget_last_change(&mut self) {
+        if self.undo.pop().is_some() {
+            self.redo.clear();
+            self.history += 1;
+        }
+    }
+
+    /// Give page `id` the number `to` in every undo and redo step where it has `from`: the
+    /// session renumbered it from `from`, and an Undo here must not bring that number back.
+    /// A step with another number for it (one this copy set) keeps that. A step that now
+    /// changes nothing next to the one after it (this copy had set the number the session set
+    /// too) is dropped, so an Undo never takes back nothing; once the project has the
+    /// session's number too, [`Open::forget_steps_like_now`] drops the ones next to it.
+    pub fn renumber_in_history(&mut self, id: &str, from: &str, to: &str) {
+        for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if let Some(page) = step.page_mut(id)
+                && page.number == from
+            {
+                page.number = to.to_owned();
+                step.sort_pages();
+            }
+        }
+        self.undo.dedup();
+        self.redo.dedup();
+    }
+
+    /// Drop the latest undo and redo steps that `like_now` finds the same as the project now
+    /// (an Undo or Redo of them would change nothing), down to the first that is not.
+    pub fn forget_steps_like_now(&mut self, like_now: impl Fn(&Project, &Project) -> bool) {
+        while self.undo.last().is_some_and(|s| like_now(s, &self.project)) {
+            self.undo.pop();
+        }
+        while self.redo.last().is_some_and(|s| like_now(s, &self.project)) {
+            self.redo.pop();
+        }
+    }
+
     /// A mark in the undo history, for [`Open::squash_undo`].
     pub fn undo_mark(&self) -> usize {
         self.undo_dropped + self.undo.len()
