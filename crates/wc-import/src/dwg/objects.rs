@@ -388,14 +388,25 @@ fn read_entity(kind: u16) -> Option<&'static str> {
 
 /// The base point of a BLOCK_HEADER whose name has been read.
 fn block_base(o: &mut Object) -> Result<(f64, f64)> {
-    // 64-flag, xref index, xref dependent, anonymous, has attributes, is xref, overlaid xref,
-    // loaded; then the number of objects it owns.
-    o.data.b()?;
-    o.data.bs()?;
-    for _ in 0..6 {
+    // The xref flags of a table entry: 64-flag, xref index and xref dependent up to 2004, only
+    // the xref index from 2007 on.
+    if o.version == Version::R2004 {
         o.data.b()?;
+        o.data.bs()?;
+        o.data.b()?;
+    } else {
+        o.data.bs()?;
     }
-    o.data.bl()?;
+    // Anonymous, has attributes, is an xref, is an overlaid xref, xref loaded.
+    o.data.b()?;
+    o.data.b()?;
+    let xref = o.data.b()?;
+    let overlaid = o.data.b()?;
+    o.data.b()?;
+    // How many objects it owns, for a block that is not an xref.
+    if !xref && !overlaid {
+        o.data.bl()?;
+    }
     let (x, y, _) = o.data.bd3()?;
     if !(x.is_finite() && y.is_finite()) {
         return Err(bad("a block's base point is not a number"));

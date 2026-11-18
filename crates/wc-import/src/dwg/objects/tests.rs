@@ -1116,24 +1116,30 @@ pub(crate) fn model_space_dwg(items: &[TestEntity]) -> Vec<u8> {
     )
 }
 
-/// A BLOCK_HEADER with every field up to its base point.
-fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64)) -> Obj {
+/// A BLOCK_HEADER with every field up to its base point; an xref has no owned-object count.
+fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: bool) -> Obj {
     let mut o = entry(v, BLOCK_HEADER, handle, name);
-    o.data.b(false).bs(0);
-    for _ in 0..6 {
-        o.data.b(false);
+    match v {
+        Version::R2004 => o.data.b(true).bs(0).b(false),
+        Version::R2010 => o.data.bs(0),
+    };
+    o.data.b(false).b(false).b(xref).b(false).b(false);
+    if !xref {
+        o.data.bl(1);
     }
-    o.data.bl(1).bd3((base.0, base.1, 0.0));
+    o.data.bd3((base.0, base.1, 0.0));
     o
 }
 
 #[test]
 fn a_block_is_placed_by_its_base_point() -> TestResult {
     for v in [Version::R2004, Version::R2010] {
-        let objs = vec![
+        let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
-            block_header(v, 0x100, "B", (5.0, 5.0)),
+            block_header(v, 0x100, "B", (5.0, 5.0), false),
+            block_header(v, 0x101, "X", (5.0, 5.0), true),
+            line(v, 0x202, head(Some(0x101)), (5.0, 5.0), (5.0, 10.0)),
             line(v, 0x200, head(Some(0x100)), (5.0, 5.0), (10.0, 5.0)),
             {
                 let mut i = entity(v, 7, 0x201, head(None));
@@ -1142,7 +1148,17 @@ fn a_block_is_placed_by_its_base_point() -> TestResult {
                 i
             },
         ];
+        let mut x = entity(v, 7, 0x203, head(None));
+        x.data.bd3((0.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+        x.handles.h(5, 0x101);
+        objs.push(x);
         let d = drawing(&sections(v, &objs, &[]))?;
+        // An xref block, without the owned-object count, is read right too.
+        assert!(
+            has_line(&d.model, Point::new(0.0, 0.0), Point::new(0.0, -5.0)),
+            "{v:?}: {:?}",
+            d.model
+        );
         assert!(
             has_line(&d.model, Point::new(0.0, 0.0), Point::new(5.0, 0.0)),
             "{v:?}: {:?}",
