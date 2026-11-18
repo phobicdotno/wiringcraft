@@ -196,6 +196,9 @@ impl chrome::Status for StatusView<'_> {
             Action::CommentTool => self.ed.tool == Tool::Comment,
             Action::LineTool => self.ed.tool == Tool::Line,
             Action::RectTool => self.ed.tool == Tool::Rect,
+            Action::CircleTool => self.ed.tool == Tool::Circle,
+            Action::ArcTool => self.ed.tool == Tool::Arc,
+            Action::PolylineTool => self.ed.tool == Tool::Polyline,
             Action::ToggleGrid => self.prefs.show_grid,
             Action::ToggleAutoWire => self.prefs.auto_wire,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
@@ -277,7 +280,19 @@ impl App {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
         });
-        let mut shown = page.clone();
+        // The page under the canvas, also under an open panel: it is found again after the
+        // sync, and so is what was selected on it.
+        let mut shown = self
+            .open
+            .as_ref()
+            .and_then(|o| o.project.pages.get(self.ed.page))
+            .map(|p| p.id.clone());
+        // The shown page's graphics, so a selection follows its items when a merge moves them.
+        let graphics_before = self
+            .open
+            .as_ref()
+            .and_then(|o| o.project.pages.get(self.ed.page))
+            .map(|p| (p.id.clone(), p.graphics.clone()));
         if let Some(joined) = self.share.frame(self.open.as_mut(), page, busy) {
             // The joined copy replaces the open project: keep its unsaved work first.
             if let Some(o) = self.open.as_mut()
@@ -310,6 +325,13 @@ impl App {
             && self.ed.page >= o.project.pages.len()
         {
             self.ed.page = o.project.pages.len().saturating_sub(1);
+        }
+        if let Some((id, old)) = &graphics_before {
+            match self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page)) {
+                Some(p) if &p.id == id => edit::remap_graphics(&mut self.ed.selection, old, &p.graphics),
+                // The page was removed: what was selected on it is not on the page shown now.
+                _ => self.ed.selection.clear(),
+            }
         }
         self.ed.held_by = self.share.held_by_others();
         if let Some(o) = self.open.as_mut() {
@@ -476,24 +498,40 @@ impl App {
             Action::Select => {
                 self.ed.tool = Tool::Select;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
             Action::PlaceSymbol => {
                 self.ed.tool = Tool::Place;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
-            Action::DrawWire => self.ed.tool = Tool::Wire,
-            Action::TextTool | Action::LineTool | Action::RectTool | Action::CommentTool => {
+            Action::DrawWire => {
+                self.ed.tool = Tool::Wire;
+                self.ed.shape_points.clear();
+            }
+            Action::TextTool
+            | Action::LineTool
+            | Action::RectTool
+            | Action::CircleTool
+            | Action::ArcTool
+            | Action::PolylineTool
+            | Action::CommentTool => {
                 self.ed.tool = match a {
                     Action::TextTool => Tool::Text,
                     Action::CommentTool => Tool::Comment,
                     Action::LineTool => Tool::Line,
+                    Action::CircleTool => Tool::Circle,
+                    Action::ArcTool => Tool::Arc,
+                    Action::PolylineTool => Tool::Polyline,
                     _ => Tool::Rect,
                 };
                 self.ed.wire = None;
-                self.ed.shape_start = None;
+                self.ed.shape_points.clear();
                 self.ed.message = match a {
                     Action::TextTool => "Click where the text goes.",
                     Action::CommentTool => "Click where the comment goes.",
+                    Action::CircleTool => "Click the centre of the circle.",
+                    Action::ArcTool => "Click the centre of the arc.",
                     _ => "Click the first point.",
                 }
                 .into();
@@ -915,9 +953,13 @@ impl App {
                     out.push(a);
                 }
             }
+            if i.key_pressed(Key::Enter) && i.modifiers.is_none() && self.ed.tool == Tool::Polyline {
+                self.ed.finish_shape = true;
+            }
             if i.key_pressed(Key::Escape) {
-                if self.ed.shape_start.is_some() {
-                    self.ed.shape_start = None;
+                if !self.ed.shape_points.is_empty() {
+                    self.ed.shape_points.clear();
+                    self.ed.message = canvas::shape_hint(self.ed.tool, 0).into();
                 } else if self.ed.wire.is_some() {
                     self.ed.wire = None;
                 } else {
@@ -1446,12 +1488,24 @@ impl App {
                             ui.end_row();
                             ui.label("Sheet size");
                             egui::ComboBox::from_id_salt("pagesize")
-                                .selected_text(size_label(*size))
+                                .selected_text(size.label())
                                 .show_ui(ui, |ui| {
-                                    for s in [PageSize::A4, PageSize::A3, PageSize::A2] {
-                                        ui.selectable_value(size, s, size_label(s));
+                                    for s in PageSize::NAMED {
+                                        ui.selectable_value(size, s, s.label());
+                                    }
+                                    if !matches!(size, PageSize::Custom { .. }) {
+                                        ui.selectable_value(size, custom_from(*size), "Custom size…");
                                     }
                                 });
+                            if let PageSize::Custom { width, height } = size {
+                                ui.end_row();
+                                ui.label("Custom size (mm)");
+                                ui.horizontal(|ui| {
+                                    let range = PageSize::MIN_MM..=PageSize::MAX_MM;
+                                    ui.add(egui::DragValue::new(width).range(range.clone()).suffix(" wide"));
+                                    ui.add(egui::DragValue::new(height).range(range).suffix(" high"));
+                                });
+                            }
                             ui.end_row();
                             ui.label("Overview");
                             ui.checkbox(overview, "Line diagram").on_hover_text(
@@ -2103,14 +2157,6 @@ impl App {
             }
             Err(e) => self.dialog = Some(Dialog::Message(format!("Could not create the branch:\n{e}"))),
         }
-    }
-}
-
-fn size_label(s: PageSize) -> &'static str {
-    match s {
-        PageSize::A4 => "A4 landscape",
-        PageSize::A3 => "A3 landscape",
-        PageSize::A2 => "A2 landscape",
     }
 }
 
@@ -3200,6 +3246,16 @@ impl App {
     }
 }
 
+/// The custom sheet "Custom size…" starts from: the size shown, as it is drawn (A4 portrait
+/// gives 210 x 297 mm).
+fn custom_from(size: PageSize) -> PageSize {
+    let (w, h) = size.mm();
+    PageSize::Custom {
+        width: w.round() as u32,
+        height: h.round() as u32,
+    }
+}
+
 fn main() -> eframe::Result {
     // Started by Claude Code as the assistant's MCP server: pass messages to the running app.
     let mut args = std::env::args_os();
@@ -3580,7 +3636,11 @@ mod marking_tests {
             .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;NO-SUCH;")
             .replace("-X1/J1;Jumper;-X1;;;;;", "-X1/J1;Jumper;-X1;;;;EX-TB-2.5;");
         let before = o.undo_mark();
+        let pid = "example.ex-tb-2-5";
+        assert!(!o.project.lock.parts.contains_key(pid), "not pinned yet");
+        let lock = o.project.lock.clone();
         let msg = o.import_wago_configured(csv.as_bytes()).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid), "taken and pinned");
         assert!(
             msg.starts_with(
                 "WAGO configurator: 2 device(s) or jumper(s) changed, 0 row(s) already up to date, 1 not matched."
@@ -3602,6 +3662,18 @@ mod marking_tests {
             o.project.meta.jumpers[0].part.is_none(),
             "the jumper in the same undo step"
         );
+        assert_eq!(o.project.lock, lock, "and the pin");
+        o.save().unwrap();
+        assert!(!wc_core::store::load(&o.dir).unwrap().lock.parts.contains_key(pid));
+        assert!(o.redo());
+        assert!(o.project.lock.parts.contains_key(pid), "Redo brings the pin back");
+        assert_eq!(o.project.devices.get(&x11).and_then(|d| d.part.as_deref()), Some(pid));
+        // Undone again, then given by hand: the copy left behind is pinned again.
+        assert!(o.undo());
+        o.set_device_part(&x11, Some(pid)).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid));
+        assert!(o.undo());
+        assert_eq!(o.project.lock, lock, "setting a part is one undo step with its pin");
         assert!(o.import_wago_configured(b"Article\n1\n").is_err());
     }
 
@@ -3725,5 +3797,28 @@ mod marking_tests {
         let msg = export_wago_marking(&o, &options);
         assert!(msg.starts_with("Nothing exported") && msg.contains("-X1"), "{msg}");
         assert!(!o.dir.join("export").join("wago-marking--X1.csv").exists());
+    }
+}
+
+#[cfg(test)]
+mod page_size_tests {
+    use super::*;
+
+    #[test]
+    fn a_custom_sheet_starts_from_the_size_shown() {
+        assert_eq!(
+            custom_from(PageSize::A4Portrait),
+            PageSize::Custom {
+                width: 210,
+                height: 297
+            }
+        );
+        assert_eq!(
+            custom_from(PageSize::A3),
+            PageSize::Custom {
+                width: 420,
+                height: 297
+            }
+        );
     }
 }

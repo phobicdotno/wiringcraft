@@ -90,6 +90,41 @@ fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
     (syms, wires)
 }
 
+/// Point the graphics in `sel` at the same items after the page's graphics changed from `old`
+/// to `new` (a shared session merged others' changes in, which can move an item to another
+/// place in the list). An item is found by its content, repeats by their order (one to one) when
+/// the list has as many copies as before; when copies came or went, only a copy still in its own
+/// place stays selected. A selected item that is gone, or cannot be told apart from its copies,
+/// is no longer selected.
+/// Symbols and wires are left as they are.
+pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
+    if old == new {
+        return;
+    }
+    sel.retain_mut(|s| {
+        let Selection::Graphic(i) = s else {
+            return true;
+        };
+        let Some(item) = old.get(*i) else {
+            return false;
+        };
+        let copies = |list: &[Shape]| list.iter().filter(|x| *x == item).count();
+        if copies(old) != copies(new) {
+            // Copies came or went: which one is the selected one is not known.
+            return false;
+        }
+        // The how-many-th copy of this item it is, found again in the new list.
+        let nth = copies(&old[..*i]);
+        match new.iter().enumerate().filter(|(_, x)| *x == item).nth(nth) {
+            Some((j, _)) => {
+                *i = j;
+                true
+            }
+            None => false,
+        }
+    });
+}
+
 fn graphic_ids(sel: &[Selection]) -> BTreeSet<usize> {
     sel.iter()
         .filter_map(|s| match s {
@@ -132,6 +167,13 @@ pub fn graphic_bounds(g: &Shape) -> (Point, Point) {
             });
             wc_core::geom::bounds_of(&corners)
         }
+        // The drawn part of an arc, so a selection box around a quarter arc takes it.
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => wc_core::geom::bounds_of(&crate::canvas::arc_points(*center, *radius, *start, *end)),
         _ => g.bounds(),
     }
 }
@@ -183,7 +225,14 @@ pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
                 (d - radius).abs() <= tol
             }
         }
-        Shape::Arc { center, radius, .. } => (at.distance(*center) - radius).abs() <= tol,
+        // The same chords the canvas draws, so a click on the visible stroke picks it and the
+        // open part of the arc does not.
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => near_path(&crate::canvas::arc_points(*center, *radius, *start, *end)),
         Shape::Text { .. } => {
             let (a, b) = graphic_bounds(g);
             at.x >= a.x - tol && at.x <= b.x + tol && at.y >= a.y - tol && at.y <= b.y + tol
@@ -526,6 +575,65 @@ impl Open {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_graphic_selection_follows_its_item_when_the_list_is_merged() {
+        let l = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let mut sel = vec![
+            Selection::Graphic(0),
+            Selection::Symbol("s1".into()),
+            Selection::Graphic(2),
+            Selection::Graphic(3),
+        ];
+        // Item 0 moved to the end, item 1 dropped, a second copy of item 2 came in: which of
+        // the two is the selected one cannot be told, so neither is selected.
+        let old = [l(1.0), l(2.0), l(3.0), l(4.0)];
+        let new = [l(3.0), l(3.0), l(4.0), l(1.0)];
+        remap_graphics(&mut sel, &old, &new);
+        assert_eq!(
+            sel,
+            vec![
+                Selection::Graphic(3),
+                Selection::Symbol("s1".into()),
+                Selection::Graphic(2)
+            ]
+        );
+        // A selected item that is gone is dropped.
+        let mut sel = vec![Selection::Graphic(1)];
+        remap_graphics(&mut sel, &old, &new);
+        assert!(sel.is_empty());
+        // Of two copies one changed: which copy is left is not known, so neither selection
+        // stays, and the changed one is not handed to the other copy.
+        let (a, b, c) = (l(1.0), l(2.0), l(3.0));
+        let (old, new) = ([a.clone(), b.clone(), a.clone()], [c.clone(), b.clone(), a.clone()]);
+        let mut sel = vec![Selection::Graphic(2)];
+        remap_graphics(&mut sel, &old, &new);
+        assert!(sel.is_empty());
+        let mut sel = vec![Selection::Graphic(0)];
+        remap_graphics(&mut sel, &old, &new);
+        assert!(sel.is_empty());
+        // A copy came back in front of the selected one: an equal copy in its old place is
+        // not taken for it.
+        let (d, e) = (l(4.0), l(5.0));
+        let before = [b.clone(), a.clone(), d.clone()];
+        let after = [b.clone(), a.clone(), c.clone(), a.clone(), d.clone(), e.clone()];
+        let mut sel = vec![Selection::Graphic(1)];
+        remap_graphics(&mut sel, &before, &after);
+        assert!(sel.is_empty());
+        // Repeats that all moved keep their order.
+        let new = [b.clone(), a.clone(), a.clone()];
+        let mut sel = vec![Selection::Graphic(0), Selection::Graphic(2)];
+        remap_graphics(&mut sel, &old, &new);
+        assert_eq!(sel, vec![Selection::Graphic(1), Selection::Graphic(2)]);
+        // Both copies selected and moved behind another item: each lands on its own copy.
+        let (old, new) = ([a.clone(), a.clone(), b.clone()], [b.clone(), a.clone(), a.clone()]);
+        let mut sel = vec![Selection::Graphic(0), Selection::Graphic(1)];
+        remap_graphics(&mut sel, &old, &new);
+        assert_eq!(sel, vec![Selection::Graphic(1), Selection::Graphic(2)]);
+    }
     use crate::state::tests::project;
 
     #[test]

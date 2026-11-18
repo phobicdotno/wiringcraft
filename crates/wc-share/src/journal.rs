@@ -23,9 +23,10 @@ pub struct Change {
 pub trait Journal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()>;
 
-    /// Called before `record` for a change that adds symbols and parts
-    /// ([`crate::ProjectEdit::AddItems`]): store their files with the project, so the commit
-    /// holds them next to their lock entries.
+    /// Called before `record` for a change that adds or updates symbols and parts
+    /// ([`crate::ProjectEdit::AddItems`], [`crate::ProjectEdit::UpdateItems`], and an undo that
+    /// locks an earlier version again): store their files with the project, so the commit holds
+    /// them next to their lock entries.
     fn vendor(&mut self, _symbols: &[Symbol], _parts: &[Part]) -> Result<()> {
         Ok(())
     }
@@ -81,6 +82,12 @@ impl Journal for MemoryJournal {
 pub struct GitJournal {
     dir: PathBuf,
     git: Git,
+    /// The vendored files [`Journal::vendor`] wrote since the last recorded change, as they were
+    /// before (`None`: not there), so [`Journal::restore`] can put them back.
+    vendored_before: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// Files a failed [`Journal::restore`] could not put back. They are tried again before the
+    /// next change writes or records anything; a change is refused while that still fails.
+    rollback_left: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl GitJournal {
@@ -89,7 +96,12 @@ impl GitJournal {
         let dir = dir.into();
         let git = Git::new(&dir);
         git.init()?;
-        Ok(Self { dir, git })
+        Ok(Self {
+            dir,
+            git,
+            vendored_before: Vec::new(),
+            rollback_left: Vec::new(),
+        })
     }
 
     pub fn dir(&self) -> &std::path::Path {
@@ -99,17 +111,106 @@ impl GitJournal {
     pub fn git(&self) -> &Git {
         &self.git
     }
+
+    /// Put back the files of `files`; the ones that still fail go to `rollback_left`. Returns the
+    /// first failure.
+    fn put_back(&mut self, files: Vec<(PathBuf, Option<Vec<u8>>)>) -> Option<wc_core::Error> {
+        let mut failed = None;
+        for (path, was) in files {
+            let put = match &was {
+                Some(bytes) => replace_file(&path, bytes),
+                None => match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+            };
+            if let Err(source) = put {
+                failed.get_or_insert(wc_core::Error::Io {
+                    path: path.clone(),
+                    source,
+                });
+                self.rollback_left.push((path, was));
+            }
+        }
+        failed
+    }
+
+    /// Finish the rollback a failed [`Journal::restore`] left, before anything else is written.
+    fn finish_rollback(&mut self) -> Result<()> {
+        if self.rollback_left.is_empty() {
+            return Ok(());
+        }
+        let left = std::mem::take(&mut self.rollback_left);
+        match self.put_back(left) {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Replace the file at `path` with `bytes` without ever leaving it half written: the bytes go to
+/// a new file beside it, which is then renamed over it.
+fn replace_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(".restore");
+    let staging = PathBuf::from(staging);
+    // A staging file left by an earlier failure is ours to replace; never follow a link there.
+    match std::fs::remove_file(&staging) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&staging, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    written
 }
 
 impl Journal for GitJournal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()> {
+        self.finish_rollback()?;
         wc_core::store::save(&self.dir, project)?;
         self.git.commit_as(&change.message, &change.author)?;
+        self.vendored_before.clear();
         Ok(())
     }
 
     /// Write the vendored files into the project folder (`vendor/symbols`, `vendor/parts`).
     fn vendor(&mut self, symbols: &[Symbol], parts: &[Part]) -> Result<()> {
+        use wc_core::{lock::ItemKind, store::vendor_path};
+        self.finish_rollback()?;
+        let targets = symbols
+            .iter()
+            .map(|s| (ItemKind::Symbol, &s.id))
+            .chain(parts.iter().map(|p| (ItemKind::Part, &p.id)));
+        // Every file as it was first, so a failure below or in `record` puts them all back.
+        for (kind, id) in targets {
+            let path = vendor_path(&self.dir, kind, id)?;
+            if self.vendored_before.iter().any(|(p, _)| *p == path) {
+                continue;
+            }
+            let was = match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => {
+                    return Err(wc_core::Error::Io {
+                        path: path.clone(),
+                        source,
+                    }
+                    .into());
+                }
+            };
+            self.vendored_before.push((path, was));
+        }
         for s in symbols {
             wc_core::store::write_vendored_symbol(&self.dir, s)?;
         }
@@ -128,8 +229,15 @@ impl Journal for GitJournal {
     /// Save the project as it was before the change, so the folder does not keep a change
     /// whose commit failed.
     fn restore(&mut self, project: &Project) -> Result<()> {
+        // The vendored files first: their lock entries go back with the project below. Files that
+        // cannot be put back are kept for the next change to try again first.
+        let files = std::mem::take(&mut self.vendored_before);
+        let failed = self.put_back(files);
         wc_core::store::save(&self.dir, project)?;
-        Ok(())
+        match failed {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
     }
 }
 

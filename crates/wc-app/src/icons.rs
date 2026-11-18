@@ -20,6 +20,9 @@ pub enum Icon {
     Text,
     Line,
     Rect,
+    Circle,
+    Arc,
+    Polyline,
     Copy,
     Cut,
     Paste,
@@ -219,6 +222,20 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
                 st,
                 eframe::egui::StrokeKind::Inside,
             );
+        }
+        Icon::Circle => {
+            arc(12.0, 12.0, 8.5, 0.0, 360.0);
+            p.circle_filled(at(12.0, 12.0), 1.5 * s, accent);
+        }
+        Icon::Arc => {
+            arc(12.0, 14.0, 8.5, 180.0, 360.0);
+            p.circle_filled(at(12.0, 14.0), 1.5 * s, accent);
+        }
+        Icon::Polyline => {
+            poly(&[(3.0, 19.0), (8.0, 6.0), (15.0, 15.0), (21.0, 5.0)], false);
+            for (x, y) in [(3.0, 19.0), (8.0, 6.0), (15.0, 15.0), (21.0, 5.0)] {
+                p.circle_filled(at(x, y), 1.5 * s, accent);
+            }
         }
         Icon::Mirror => {
             p.line_segment([at(12.0, 2.0), at(12.0, 22.0)], thin);

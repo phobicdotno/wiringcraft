@@ -215,7 +215,8 @@ fn next_name(name: &str) -> String {
 }
 
 /// The angle (degrees, y down, as [`Shape::Arc`] uses) of `p` seen from `c`.
-fn angle(c: Point, p: Point) -> f64 {
+/// The angle of `p` seen from `c`, in degrees from 0 to 360 as [`Shape::Arc`] counts them.
+pub(crate) fn angle(c: Point, p: Point) -> f64 {
     let a = (p.y - c.y).atan2(p.x - c.x).to_degrees();
     if a < 0.0 { a + 360.0 } else { a }
 }

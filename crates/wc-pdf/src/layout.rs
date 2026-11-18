@@ -367,11 +367,7 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
     let band = template.band_height();
     let ty = y1 - band;
     line((x0, ty), (x1, ty), Ink::Thick, &mut out);
-    let boxes: Vec<_> = template
-        .boxes
-        .iter()
-        .filter_map(|b| b.resolve(x0, x1, band).map(|r| (b, r)))
-        .collect();
+    let boxes = template.boxes_on(x0, x1, band);
     // Box sides, less those on the band's outline, with overlapping pieces drawn once.
     let mut across: Vec<(f64, f64, f64)> = Vec::new();
     let mut down: Vec<(f64, f64, f64)> = Vec::new();
@@ -505,11 +501,14 @@ pub fn title_logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
     project
         .meta
         .template
-        .boxes
-        .iter()
-        .filter(|b| b.logo)
-        .filter_map(|b| b.resolve(x0, x1, band))
-        .map(|(l, t, r, b)| (Point::new(l + 1.0, ty + t + 1.0), Point::new(r - 1.0, ty + b - 1.0)))
+        .boxes_on(x0, x1, band)
+        .into_iter()
+        .filter(|(b, _)| b.logo)
+        .map(|(_, (l, t, r, b))| {
+            // 1 mm of padding, less in a box narrowed below 4 mm, so the logo keeps an area.
+            let (ix, iy) = (((r - l) / 4.0).min(1.0), ((b - t) / 4.0).min(1.0));
+            (Point::new(l + ix, ty + t + iy), Point::new(r - ix, ty + b - iy))
+        })
         .filter(|(a, b)| a.x < b.x && a.y < b.y)
         .collect()
 }
@@ -866,9 +865,24 @@ const CELL_PAD: f64 = 1.5;
 /// How many table rows fit on one report page of this size (below the heading and header row),
 /// above a title block band `band` mm high.
 pub fn rows_per_page(size: PageSize, band: f64) -> usize {
+    (report_rows(size, band).floor() as usize).max(1)
+}
+
+/// How many table rows the sheet height leaves room for, before rounding down.
+fn report_rows(size: PageSize, band: f64) -> f64 {
     let (_, h) = size.mm();
     let usable = h - 2.0 * MARGIN - HEADER - band - 14.0 - ROW_H;
-    ((usable / ROW_H).floor() as usize).max(1)
+    usable / ROW_H
+}
+
+/// The sheet report pages are printed on: `wanted` (the first schematic page's size) when it
+/// has room for its title block and at least one table row, otherwise the smallest ISO sheet
+/// that does (A3 when none does).
+pub fn report_size(wanted: PageSize, band: f64) -> PageSize {
+    std::iter::once(wanted)
+        .chain(PageSize::NAMED)
+        .find(|s| report_rows(*s, band) >= 1.0)
+        .unwrap_or(PageSize::A3)
 }
 
 /// Column widths for a table that must fit `avail` mm: natural widths, shrunk proportionally
@@ -1352,7 +1366,16 @@ mod template_tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn the_default_template_draws_the_title_block_as_before() {
-        for size in [PageSize::A4, PageSize::A3, PageSize::A2] {
+        // Every sheet wide enough for the layout draws it as before; the narrow ones are below.
+        let custom = PageSize::Custom {
+            width: 500,
+            height: 700,
+        };
+        let wide = PageSize::NAMED
+            .into_iter()
+            .chain([custom])
+            .filter(|s| s.mm().0 - 2.0 * MARGIN >= Project::new("").meta.template.needed_width());
+        for size in wide {
             for logo in [false, true] {
                 let (p, page) = demo(size, logo);
                 for date in ["", "2026-11-17"] {

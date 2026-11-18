@@ -110,6 +110,9 @@ impl SweDrawings {
         for (k, n) in read.skipped {
             *self.skipped.entry(k).or_default() += n;
         }
+        for w in &read.warnings {
+            self.warnings.push(format!("{what}: {w}"));
+        }
         // A drawing read in part is used; why the rest is missing is said once per file.
         if damaged > 0 {
             let first = read.damaged.first().map(String::as_str).unwrap_or("");
@@ -131,10 +134,46 @@ impl SweDrawings {
         budget: &mut usize,
         skipped: &mut BTreeMap<String, usize>,
     ) -> Option<Vec<Shape>> {
-        let (sx, sy) = s.scale;
-        let (sin, cos) = s.angle.to_radians().sin_cos();
-        let m = [cos * sx, -sin * sx, sin * sy, cos * sy];
-        self.mapped(&s.block, m, s.angle, budget, skipped)
+        self.mapped(&s.block, placement(s), s.angle, budget, skipped)
+    }
+
+    /// The box round block `name` placed like `s` (turned and scaled like
+    /// [`Self::symbol_graphics`]), on the page: y up, in page millimetres. `None` when the
+    /// archive has no drawing for the block, it draws nothing, its box has no width or no
+    /// height (or one too large to keep), or the drawing is larger than `budget` still allows:
+    /// a box round part of it would be too small. Used for cabinet layout footprints without a
+    /// box size (#232); the entities read count against the import's `budget`.
+    pub(crate) fn placed_extents(&self, s: &SweSymbol, budget: &mut usize) -> Option<(Point, Point)> {
+        let mut skipped = BTreeMap::new();
+        let d = self.blocks.get(&block_key(&s.block))?;
+        let (shapes, _) = dxf::draw_mapped(d, &d.entities, placement(s), s.angle, &mut skipped, budget);
+        // A drawing cut off by the limit or by blocks nested too deep would give a box round
+        // part of it.
+        if skipped.contains_key(dxf::OVER_LIMIT) || skipped.contains_key(dxf::TOO_DEEP) {
+            return None;
+        }
+        // Shapes as drawn, not rounded: a short arc whose rounded angles meet is still short.
+        let corners: Vec<Point> = shapes
+            .iter()
+            .filter(|(_, sh)| rounded(sh).is_some())
+            .flat_map(|(_, sh)| corners_of(sh))
+            .collect();
+        if corners.is_empty() {
+            return None;
+        }
+        // The symbol's frame is y down from the insertion point.
+        let (min, max) = wc_core::geom::bounds_of(&corners);
+        let (lo, hi) = (
+            Point::new(s.at.x + min.x, s.at.y - max.y),
+            Point::new(s.at.x + max.x, s.at.y - min.y),
+        );
+        // Kept in thousandths of a millimetre, so the sides must stay finite at that scale.
+        // Within a kilometre of the origin, so a panel made of several stays finite too.
+        let fits = |a: f64, b: f64| {
+            let side = ((b - a) * 1000.0).round();
+            a.abs() <= MAX_COORD && b.abs() <= MAX_COORD && side > 0.0
+        };
+        (fits(lo.x, hi.x) && fits(lo.y, hi.y)).then_some((lo, hi))
     }
 
     /// The shapes of block `name` as they are, unturned and unscaled, in the symbol's own frame:
@@ -284,6 +323,15 @@ fn kind_of(name: &str, folder: &str) -> Option<Kind> {
     if stem.is_empty() {
         return None;
     }
+    // `./Projects/4` and `Projects//4` are `Projects/4`: other zip tools write such names.
+    let plain = |path: &str| {
+        path.split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let (dir, folder) = (plain(dir), plain(folder));
+    let (dir, folder) = (dir.as_str(), folder.as_str());
     let own = !folder.is_empty()
         && dir.len() > folder.len()
         && dir.is_char_boundary(folder.len())
@@ -430,9 +478,89 @@ fn read_entry<R: Read + std::io::Seek>(
     (Ok(bytes), read)
 }
 
+/// Points that bound `shape`: for an arc only what it sweeps (its ends and the quarter points
+/// it passes), not its whole circle.
+/// How far from the page origin a footprint drawn from a block may reach, in millimetres.
+const MAX_COORD: f64 = 1e6;
+
+/// The linear map that places a symbol's block: turned by its angle, then scaled along the
+/// page axes, exactly as [`super::place`] places its points.
+fn placement(s: &SweSymbol) -> [f64; 4] {
+    let (sx, sy) = s.scale;
+    let (sin, cos) = s.angle.to_radians().sin_cos();
+    [cos * sx, -sin * sx, sin * sy, cos * sy]
+}
+
+fn corners_of(shape: &Shape) -> Vec<Point> {
+    let Shape::Arc {
+        center,
+        radius,
+        start,
+        end,
+    } = shape
+    else {
+        let (a, b) = shape.bounds();
+        return vec![a, b];
+    };
+    // The sweep is taken from the angles as given, so a tiny arc across 0° stays tiny.
+    let raw = end - start;
+    if !raw.is_finite() {
+        let (a, b) = shape.bounds();
+        return vec![a, b];
+    }
+    let mut sweep = raw.rem_euclid(360.0);
+    if sweep == 0.0 {
+        sweep = 360.0;
+    }
+    // The start is brought into one turn, so the quarter indices stay small.
+    let start = &start.rem_euclid(360.0);
+    let at = |deg: f64| {
+        let t = deg.to_radians();
+        Point::new(center.x + radius * t.cos(), center.y + radius * t.sin())
+    };
+    let mut points = vec![at(*start), at(start + sweep)];
+    let first = (start / 90.0).ceil() as i64;
+    let last = ((start + sweep) / 90.0).floor() as i64;
+    // At most one turn: a sweep never passes more than four quarter points.
+    for q in first..=last.min(first + 4) {
+        points.push(at(q as f64 * 90.0));
+    }
+    points
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arc_corners_take_any_angle_and_keep_a_short_arc_short() {
+        let arc = |start: f64, end: f64| Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            start,
+            end,
+        };
+        let span = |sh: &Shape| {
+            let (a, b) = wc_core::geom::bounds_of(&corners_of(sh));
+            (b.x - a.x, b.y - a.y)
+        };
+        // Angles far out of one turn neither overflow nor change the quarter arc.
+        let (w, h) = span(&arc(1e300, 1e300));
+        assert_eq!((w, h), (20.0, 20.0));
+        let (w, h) = span(&arc(3.6e14, 3.6e14 + 90.0));
+        assert!((w - 10.0).abs() < 1e-6 && (h - 10.0).abs() < 1e-6, "{w} x {h}");
+        // A tiny sweep across 0° is not a whole turn.
+        let (w, h) = span(&arc(-1e-14, 0.0));
+        assert!(w < 1e-6 && h < 1e-6, "{w} x {h}");
+        let (w, h) = span(&arc(720.0, 810.0));
+        assert!((w - 10.0).abs() < 1e-9 && (h - 10.0).abs() < 1e-9, "{w} x {h}");
+        // A tiny sweep stays tiny; equal angles are a whole turn.
+        let (w, h) = span(&arc(45.0001, 45.0004));
+        assert!(w < 0.01 && h < 0.01, "{w} x {h}");
+        assert_eq!(span(&arc(30.0, 30.0)), (20.0, 20.0));
+        // Angles that are not numbers fall back to the circle.
+        assert_eq!(span(&arc(f64::NAN, 90.0)), (20.0, 20.0));
+    }
 
     #[test]
     fn archive_names_are_sorted_into_blocks_and_pages() {
@@ -459,6 +587,22 @@ mod tests {
         assert_eq!(kind_of("Block/.dwg", f), None);
         assert_eq!(kind_of("Drawings/Coil.dwg", f), None);
         assert_eq!(kind_of("Projects/4/Database/x.sqlite", f), None);
+        // Names written with `./` or doubled slashes are read the same way.
+        assert_eq!(
+            kind_of("./Projects/4/Block/Coil.dwg", f),
+            Some(Kind::Block("Coil".into(), true))
+        );
+        assert_eq!(kind_of("./Projects/2/Block/Coil.dwg", f), None, "not a library block");
+        assert_eq!(
+            kind_of("./Library/Block/Coil.dwg", f),
+            Some(Kind::Block("Coil".into(), false))
+        );
+        assert_eq!(kind_of("./Projects/4/Drawings/17.ewg", f), Some(Kind::Page(17)));
+        assert_eq!(kind_of("Projects//4/./Drawings/17.ewg", f), Some(Kind::Page(17)));
+        assert_eq!(
+            kind_of("Projects/4/Drawings/17.ewg", "./Projects/4"),
+            Some(Kind::Page(17))
+        );
         // Non-ASCII names next to the folder never split a character.
         assert_eq!(kind_of("Projects/ø/Drawings/1.ewg", f), None);
     }

@@ -77,6 +77,7 @@ fn host(open: &Open) -> (Share, Log) {
             announcer: None,
             port: 0,
             dir: open.dir.clone(),
+            took_updates: Vec::new(),
         }))),
         base: Some(open.project.clone()),
         ..Default::default()
@@ -1285,6 +1286,155 @@ fn a_guest_edit_right_after_its_undo_is_kept_when_the_undo_did_not_touch_it() ->
     Ok(())
 }
 
+fn line(x: f64) -> wc_core::geom::Shape {
+    wc_core::geom::Shape::Line {
+        a: wc_core::geom::Point::new(x, 5.0),
+        b: wc_core::geom::Point::new(x, 9.0),
+    }
+}
+
+#[test]
+fn a_text_added_right_after_an_undo_that_moved_a_line_is_kept() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // A line on the page, then moved: the undo of the move puts it back.
+    guest_open
+        .project
+        .page_mut("p0003")
+        .ok_or("no page")?
+        .graphics
+        .push(line(5.0));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open.project.page_mut("p0003").ok_or("no page")?.graphics = vec![line(20.0)];
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    // Before the undo's result is in, a text is added to the same page.
+    let text = wc_core::geom::Shape::Text {
+        at: wc_core::geom::Point::new(40.0, 40.0),
+        text: "Note".into(),
+        height: 3.5,
+        align: Default::default(),
+        angle: 0.0,
+    };
+    guest_open
+        .project
+        .page_mut("p0003")
+        .ok_or("no page")?
+        .graphics
+        .push(text.clone());
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    for open in [&host_open, &guest_open] {
+        let page = open.project.page("p0003").ok_or("no page")?;
+        assert_eq!(
+            page.graphics,
+            [line(5.0), text.clone()],
+            "the line is back and the text kept"
+        );
+    }
+    assert!(!g.take_notes().iter().any(|n| n.contains("was not kept")));
+    Ok(())
+}
+
+#[test]
+fn a_line_moved_here_that_the_undo_removed_is_not_kept() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    guest_open
+        .project
+        .page_mut("p0003")
+        .ok_or("no page")?
+        .graphics
+        .push(line(5.0));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    g.undo()?;
+    // Moved before the undo, which takes the line away, is in.
+    guest_open.project.page_mut("p0003").ok_or("no page")?.graphics = vec![line(20.0)];
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    for open in [&host_open, &guest_open] {
+        assert!(open.project.page("p0003").ok_or("no page")?.graphics.is_empty());
+    }
+    assert!(g.take_notes().iter().any(|n| n.contains("was not kept")));
+    Ok(())
+}
+
+#[test]
+fn free_graphics_merge_item_by_item() {
+    use wc_core::geom::{Point, Shape};
+    let [a, b, c, d] = [1.0, 2.0, 3.0, 4.0].map(line);
+    let text = Shape::Text {
+        at: Point::new(40.0, 40.0),
+        text: "Note".into(),
+        height: 3.5,
+        align: Default::default(),
+        angle: 0.0,
+    };
+    let m = |base: &[&Shape], auth: &[&Shape], local: &[&Shape]| {
+        let own = |v: &[&Shape]| v.iter().map(|x| (*x).clone()).collect::<Vec<_>>();
+        merge_unordered(&own(base), &own(auth), &own(local), |x, y| {
+            std::mem::discriminant(x) == std::mem::discriminant(y)
+        })
+    };
+    // Added on each side: both kept, the session's order first.
+    assert_eq!(
+        m(&[&a], &[&a, &b], &[&a, &c]),
+        Some(vec![a.clone(), b.clone(), c.clone()])
+    );
+    // Removed here while the session still has it; a repeat counts once per copy.
+    assert_eq!(
+        m(&[&a, &a, &b], &[&a, &a, &b, &d], &[&a, &b]),
+        Some(vec![a.clone(), b.clone(), d.clone()])
+    );
+    // Removed on both sides, nothing added here: no clash.
+    assert_eq!(m(&[&a, &b], &[&b], &[&b]), Some(vec![b.clone()]));
+    // The same item added on both sides is there once.
+    assert_eq!(m(&[&b], &[&b, &c], &[&b, &c]), Some(vec![b.clone(), c.clone()]));
+    // Both sides made the same change (the undo put a line back where it was also moved here).
+    assert_eq!(m(&[&a, &b], &[&c, &b], &[&c, &b]), Some(vec![c.clone(), b.clone()]));
+    // Only this window changed the graphics: its list, in its order.
+    assert_eq!(m(&[&a, &b], &[&a, &b], &[&c, &b]), Some(vec![c.clone(), b.clone()]));
+    // Changed here (a to c) while the session changed it too (a to b): a clash.
+    assert_eq!(m(&[&a], &[&b], &[&c]), None);
+    // Deleted here while the session moved it (a to c): a clash, not a silent comeback.
+    assert_eq!(m(&[&a, &b], &[&c, &b], &[&b]), None);
+    // Deleted here while the session added only a text: no clash.
+    assert_eq!(m(&[&a, &b], &[&b, &text], &[&b]), Some(vec![b.clone(), text.clone()]));
+    // Deleted on both sides while a text was added here: the text cannot be the line's new
+    // version, so it is kept.
+    assert_eq!(m(&[&a, &b], &[&b], &[&b, &text]), Some(vec![b.clone(), text.clone()]));
+    // The same, but the session put a new line in its place (a moved to d): a clash.
+    assert_eq!(m(&[&a, &b], &[&b, &d], &[&b, &text]), None);
+    // The same move made on both sides (a to c) and a text added here: agreed, text kept.
+    assert_eq!(m(&[&a], &[&c], &[&c, &text]), Some(vec![c.clone(), text.clone()]));
+    // One of two copies removed on both sides, a text added here: the other copy stays.
+    assert_eq!(m(&[&a, &a], &[&a], &[&a, &text]), Some(vec![a.clone(), text.clone()]));
+    // The session kept both copies and added one: the copy removed here still goes.
+    assert_eq!(m(&[&a, &a], &[&a, &a, &b], &[&a]), Some(vec![a.clone(), b.clone()]));
+    // The session put a line back as c while it was moved to d here and a line equal to c drawn
+    // here too: the move here clashes with the session's.
+    assert_eq!(m(&[&a], &[&c], &[&d, &c]), None);
+    // The last of two copies around another line removed here while the session added a text:
+    // which copy went decides what lies on top, and the session cannot tell, so a clash.
+    assert_eq!(m(&[&a, &b, &a], &[&a, &b, &a, &text], &[&a, &b]), None);
+    // Moved to different places on the two sides, with a text added here: still a clash.
+    assert_eq!(m(&[&a], &[&c], &[&d, &text]), None);
+    // Every copy around another line removed here: only one list results, so no clash.
+    assert_eq!(
+        m(&[&a, &b, &a], &[&a, &b, &a, &text], &[&b]),
+        Some(vec![b.clone(), text.clone()])
+    );
+    // Some copies of one unbroken run removed here: which ones does not matter.
+    assert_eq!(
+        m(&[&b, &a, &a, &a], &[&b, &a, &a, &a, &text], &[&b, &a]),
+        Some(vec![b.clone(), a.clone(), text.clone()])
+    );
+}
+
 #[test]
 fn a_guest_without_the_libraries_draws_every_symbol_of_the_project() -> TestResult {
     let tmp = tempfile::tempdir()?;
@@ -1429,6 +1579,10 @@ fn a_symbol_someone_else_used_first_in_another_version_takes_the_sessions_versio
     guest_open.symbols.insert(other.id.clone(), other.clone());
     if let Some(e) = guest_open.project.lock.symbols.get_mut("wc.coil") {
         e.hash = other.hash();
+    }
+    // Taken up here before the session's version came in: not an update of it.
+    if let Some(b) = g.base.as_mut() {
+        b.lock.symbols.remove("wc.coil");
     }
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert_eq!(guest_open.symbols.get("wc.coil"), Some(&session_coil));
@@ -1632,6 +1786,10 @@ fn a_session_version_that_cannot_be_written_is_not_drawn_with_the_old_one() -> T
     guest_open.symbols.insert(other.id.clone(), other.clone());
     if let Some(e) = guest_open.project.lock.symbols.get_mut("wc.coil") {
         e.hash = other.hash();
+    }
+    // Taken up here before the session's version came in: not an update of it.
+    if let Some(b) = g.base.as_mut() {
+        b.lock.symbols.remove("wc.coil");
     }
     // The file cannot be written: a folder stands where it goes.
     let file = store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.coil")?;
@@ -2131,5 +2289,184 @@ fn a_symbol_whose_adding_was_undone_is_not_sent_again_and_is_locked_when_placed_
             .page("p0003")
             .is_some_and(|p| p.symbols.iter().any(|s| s.symbol == id))
     );
+    Ok(())
+}
+
+#[test]
+fn a_symbol_updated_in_a_session_reaches_the_host_and_an_undo_brings_the_old_one_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    guest_open.place(2, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let v1 = guest_open.symbols.get("wc.coil").cloned().ok_or("coil")?;
+    assert_eq!(
+        host_open.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone()),
+        Some(v1.hash())
+    );
+
+    // The guest updates the coil from the library.
+    let mut v2 = v1.clone();
+    v2.name = "Coil, newer".into();
+    store::write_vendored_symbol(&guest_open.dir, &v2)?;
+    guest_open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = v2.hash();
+    guest_open.symbols.insert("wc.coil".into(), v2.clone());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let hash = |o: &Open| o.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone());
+    assert_eq!(hash(&host_open), Some(v2.hash()), "{:?}", h.notes);
+    assert_eq!(host_open.symbols.get("wc.coil"), Some(&v2));
+    assert_eq!(store::read_vendored_symbol(&host_open.dir, "wc.coil")?, v2);
+    assert_eq!(hash(&guest_open), Some(v2.hash()), "the guest keeps its update");
+    assert!(
+        !g.notes.iter().any(|n| n.contains("first in another version")),
+        "{:?}",
+        g.notes
+    );
+
+    // Undone: both copies draw the old version again.
+    g.undo()?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(hash(&host_open), Some(v1.hash()), "{:?} {:?}", g.notes, h.notes);
+    assert_eq!(host_open.symbols.get("wc.coil"), Some(&v1));
+    assert_eq!(hash(&guest_open), Some(v1.hash()), "{:?}", g.notes);
+    assert_eq!(guest_open.symbols.get("wc.coil"), Some(&v1));
+    assert_eq!(store::read_vendored_symbol(&guest_open.dir, "wc.coil")?, v1);
+    Ok(())
+}
+
+#[test]
+fn an_update_undone_before_its_sender_looked_is_not_sent_again_and_others_see_no_conflict() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    guest_open.place(2, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let v1 = guest_open.symbols.get("wc.coil").cloned().ok_or("coil")?;
+    let mut v2 = v1.clone();
+    v2.name = "Coil, newer".into();
+    store::write_vendored_symbol(&guest_open.dir, &v2)?;
+    guest_open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = v2.hash();
+    guest_open.symbols.insert("wc.coil".into(), v2.clone());
+    // The guest sends the update; the host takes it and takes it back again at once, so the
+    // guest gets both answers in one look.
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    let hash = |o: &Open| o.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone());
+    assert_eq!(hash(&host_open), Some(v2.hash()), "{:?}", h.notes);
+    assert!(
+        !h.notes.iter().any(|n| n.contains("first in another version")),
+        "an update someone else made is no conflict here: {:?}",
+        h.notes
+    );
+    let Some(Role::Host(hosting)) = h.role.as_mut() else {
+        return Err("hosting".into());
+    };
+    let update = hosting.host.history().last().ok_or("recorded")?.id;
+    h.revert(update)?;
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    assert_eq!(hash(&host_open), Some(v1.hash()), "{:?}", h.notes);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // Past the wait for an answer: an update still counted as unanswered would go again now.
+    std::thread::sleep(ITEM_WAIT * 2);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(hash(&host_open), Some(v1.hash()), "the undo stays: {:?}", g.notes);
+    assert_eq!(hash(&guest_open), Some(v1.hash()), "{:?}", g.notes);
+    assert_eq!(
+        guest_open.symbols.get("wc.coil"),
+        Some(&v1),
+        "the old version is loaded"
+    );
+    assert_eq!(
+        store::read_vendored_symbol(&guest_open.dir, "wc.coil")?,
+        v1,
+        "and written back"
+    );
+    assert!(
+        !g.notes.iter().any(|n| n.contains("first in another version")),
+        "{:?}",
+        g.notes
+    );
+    Ok(())
+}
+
+#[test]
+fn a_joined_copy_takes_a_library_symbol_only_in_the_version_the_session_pinned() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let item = |id: &str, name: &str| Symbol {
+        id: id.into(),
+        name: name.into(),
+        category: String::new(),
+        letter_code: String::new(),
+        role: Default::default(),
+        graphics: vec![],
+        pins: vec![],
+        tag_at: Default::default(),
+        description: String::new(),
+    };
+    let (coil_v1, coil_v2, lamp) = (item("coil", "Coil"), item("coil", "Coil v2"), item("lamp", "Lamp"));
+    // The library here has a newer coil than the session pinned, and the lamp it pinned.
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    for s in [&coil_v2, &lamp] {
+        std::fs::write(
+            lib.join("symbols").join(format!("{}.json", s.id)),
+            serde_json::to_string(s)?,
+        )?;
+    }
+    let mut project = Project::new("Demo");
+    project.meta.libraries.push(wc_core::project::LibrarySource {
+        name: "here".into(),
+        kind: "folder".into(),
+        location: lib.to_string_lossy().into_owned(),
+        reference: None,
+    });
+    for s in [&coil_v1, &lamp] {
+        project.lock.symbols.insert(
+            s.id.clone(),
+            wc_core::LockEntry {
+                source: "here".into(),
+                hash: s.hash(),
+            },
+        );
+    }
+    let open = write_copy(&tmp.path().join("copies"), &project, &BTreeMap::new(), &BTreeMap::new())?;
+    assert_eq!(open.symbols.get("lamp"), Some(&lamp));
+    assert!(!open.symbols.contains_key("coil"), "not the library's other version");
+    assert_eq!(
+        open.project.lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(coil_v1.hash())
+    );
+    assert_eq!(
+        store::load(&open.dir)?.lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(coil_v1.hash())
+    );
+    assert!(
+        store::read_vendored_symbol(&open.dir, "coil").is_err(),
+        "no coil file written"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let entry = |hash: &str| wc_core::LockEntry {
+        source: "starter".into(),
+        hash: hash.into(),
+    };
+    // At the last sync the session had coil v1; this copy updated it to v2; the session has
+    // since taken the coil back (an undo of its add).
+    let mut base = Project::new("Demo");
+    base.lock.symbols.insert("coil".into(), entry("v1"));
+    let mut local = base.clone();
+    local.lock.symbols.insert("coil".into(), entry("v2"));
+    let auth = Project::new("Demo");
+    let out = new_items(tmp.path(), &local, &base, &auth, &Default::default());
+    assert!(out.edits.is_empty(), "{:?}", out.edits);
+    assert_eq!(out.stale, ["symbol coil"]);
+    // An item the session never had is still sent as an add (here: unreadable, so tried).
+    let mut fresh = local.clone();
+    fresh.lock.symbols.insert("lamp".into(), entry("l1"));
+    let out = new_items(tmp.path(), &fresh, &base, &auth, &Default::default());
+    assert_eq!(out.unreadable.len(), 1, "{:?}", out.unreadable);
+    assert_eq!(out.unreadable[0].0, "symbol lamp");
     Ok(())
 }
