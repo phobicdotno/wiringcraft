@@ -353,8 +353,10 @@ impl ProjectEdit {
 
     /// Which parts of the project this change touches, as keys (the values are those of
     /// `project`): what a participant that applied it at once gets back when the host refuses
-    /// it, to put its copy right. Whole-page changes and added symbols and parts are applied
-    /// only when the host sends them, so they need nothing back.
+    /// it, to put its copy right. Added symbols and parts are applied only when the host sends
+    /// them, so they need nothing back; whole-page changes are too, except a page the sender
+    /// holds, which it writes into its copy at once (see `Guest::edit_project`): their pages
+    /// come back.
     pub fn touches(&self, project: &Project) -> Parts {
         let mut keys = Parts::default();
         match self {
@@ -386,8 +388,11 @@ impl ProjectEdit {
             Self::SetMeta { .. } => keys.meta = Some(Box::new(project.meta.clone())),
             Self::Restore { parts } => keys = (**parts).clone(),
             Self::Batch { edits } => {
-                // What the parts applied at once touch.
-                for e in edits.iter().filter(|e| e.applied_at_once()) {
+                // What the parts applied at once touch, and the pages set.
+                for e in edits
+                    .iter()
+                    .filter(|e| e.applied_at_once() || matches!(e, Self::SetPages { .. }))
+                {
                     let t = e.touches(project);
                     keys.pages.extend(t.pages);
                     keys.devices.extend(t.devices);
@@ -398,7 +403,12 @@ impl ProjectEdit {
                     }
                 }
             }
-            Self::SetPages { .. } | Self::AddItems { .. } | Self::UpdateItems { .. } | Self::AddPicture { .. } => {}
+            Self::SetPages { pages, .. } => {
+                for p in pages {
+                    keys.pages.insert(p.id.clone(), None);
+                }
+            }
+            Self::AddItems { .. } | Self::UpdateItems { .. } | Self::AddPicture { .. } => {}
         }
         Parts::read(project, &keys)
     }
@@ -416,6 +426,18 @@ impl ProjectEdit {
                 | Self::Restore { .. }
                 | Self::Batch { .. }
         )
+    }
+
+    /// The pages this change sets whole ([`ProjectEdit::SetPages`], also inside a batch).
+    pub fn set_pages(&self) -> impl Iterator<Item = &Page> {
+        let edits = match self {
+            Self::Batch { edits } => edits.as_slice(),
+            e => std::slice::from_ref(e),
+        };
+        edits.iter().flat_map(|e| match e {
+            Self::SetPages { pages, .. } => pages.as_slice(),
+            _ => &[],
+        })
     }
 
     /// Whether any of this change is applied at once (for a batch: any of its edits).

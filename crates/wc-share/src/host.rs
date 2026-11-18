@@ -506,9 +506,11 @@ impl Host {
 
     /// A guest's project edit, answered: applied (its `seq` on the author's
     /// [`HostMsg::ProjectChanged`]), unchanged, or refused with what it touches as the host has
-    /// it, since the guest applied it to its copy at once.
+    /// it, since the guest applied it to its copy at once (pages it sets too: the guest writes
+    /// a page it holds at once).
     fn guest_edit_project(&mut self, from: PeerId, edit: ProjectEdit, seq: u64) -> Result<(), Refusal> {
-        let keys = edit.partly_applied_at_once().then(|| edit.touches(&self.project));
+        let keys =
+            (edit.partly_applied_at_once() || edit.set_pages().next().is_some()).then(|| edit.touches(&self.project));
         match self.do_edit_project(from, edit, Some(seq)) {
             Ok(true) => Ok(()),
             Ok(false) => {

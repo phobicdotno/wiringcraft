@@ -199,6 +199,33 @@ pub fn outgoing(
     out
 }
 
+/// One action that changed this person's own page and project records goes out as one change:
+/// the page joins the `SetPages` of the batch (made when there is none), so the host checks
+/// and applies it with the rest, all or nothing. A page edit alone stays a page edit.
+fn fold_own_page(out: &mut Outgoing, base: &Project) {
+    if !out.edits.iter().any(ProjectEdit::batchable) {
+        return;
+    }
+    let Some(page) = out.page.take() else { return };
+    let Some(was) = base.page(&page.id).cloned() else {
+        out.page = Some(page);
+        return;
+    };
+    match out.edits.iter_mut().find_map(|e| match e {
+        ProjectEdit::SetPages { pages, before } => Some((pages, before)),
+        _ => None,
+    }) {
+        Some((pages, before)) => {
+            pages.push(page);
+            before.push(was);
+        }
+        None => out.edits.push(ProjectEdit::SetPages {
+            pages: vec![page],
+            before: vec![was],
+        }),
+    }
+}
+
 /// Page `base` as both this window (`local`) and the session (`auth`) changed it: the session's
 /// page with the local changes on top, or `None` when the two touched the same thing. Symbols
 /// and wires are matched by id, title-block fields by name, the free graphics and texts (which
@@ -1452,6 +1479,24 @@ impl Role {
         }
     }
 
+    /// Whether a change that set this guest's own page is unanswered ([`Guest::own_page_waits`]).
+    /// The host's own changes are answered at once.
+    fn own_page_waits(&self) -> bool {
+        match self {
+            Role::Host(_) => false,
+            Role::Guest(j) => j.guest.own_page_waits(),
+        }
+    }
+
+    /// This person's pages whose change the session refused, taken back whole since the last
+    /// call ([`Guest::retaken`]).
+    fn retaken(&mut self) -> Vec<String> {
+        match self {
+            Role::Host(_) => Vec::new(),
+            Role::Guest(j) => std::mem::take(&mut j.guest.retaken),
+        }
+    }
+
     /// The picture files the session has, by project path.
     fn pictures(&self) -> &BTreeMap<String, Vec<u8>> {
         match self {
@@ -2565,6 +2610,36 @@ impl Share {
         if busy || role.taking_back() {
             return None;
         }
+        // The session refused an action that changed this person's own page with project
+        // records: the page takes the session's version, also over what was changed on it while
+        // the answer was on its way, so the action is not half kept.
+        let retaken = role.retaken();
+        if !retaken.is_empty()
+            && let Some(auth) = role.project()
+        {
+            let base = self.base.get_or_insert_with(|| open.project.clone());
+            for id in &retaken {
+                if let Some(page) = auth.page(id) {
+                    for p in [open.project.page_mut(id), base.page_mut(id)].into_iter().flatten() {
+                        *p = page.clone();
+                    }
+                }
+            }
+            open.dirty = true;
+            self.notes.push(format!(
+                "Your change to page {} was not kept, nor what you did on it after it.",
+                retaken
+                    .iter()
+                    .map(|id| number_of(auth, id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // While such a change is on its way, later changes wait in the window: sent now, they
+        // could not be taken back with it.
+        if role.own_page_waits() {
+            return None;
+        }
         // Open the shown page in the session; a page someone else held is asked for again once
         // they let it go.
         let free_again = page
@@ -2788,6 +2863,7 @@ impl Share {
             out.page = None;
             out.edits.clear();
         }
+        fold_own_page(&mut out, base);
         let sent = out.page.is_some() || !out.edits.is_empty();
         // One action, one change: the edits that can go together are checked and recorded by
         // the host as one batch, all or nothing.
