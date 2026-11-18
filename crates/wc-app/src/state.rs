@@ -788,31 +788,20 @@ impl Open {
         only: Option<&[String]>,
     ) -> Result<Vec<(ItemKind, String)>, String> {
         let all = wc_library::status(&self.dir, &self.project, lib);
-        // An item named on purpose whose library file is wrong stops the update, as in
-        // `wc_library::update`.
-        if let Some(ids) = only
-            && let Some(bad) = all
-                .iter()
-                .find(|s| s.state == wc_library::State::WrongId && ids.contains(&s.id))
-        {
-            return Err(format!(
-                "nothing was updated: library source {}: {}",
-                bad.library_source.clone().unwrap_or_default(),
-                bad.changes.join("; ")
-            ));
+        // An item named on purpose whose library file is wrong stops the update.
+        if let Some(bad) = wc_library::wrong_named(&all, only) {
+            return Err(bad.to_string());
         }
-        let todo: Vec<(ItemKind, String)> = all
-            .into_iter()
-            .filter(|s| s.state == wc_library::State::Changed)
-            .filter(|s| only.is_none_or(|ids| ids.contains(&s.id)))
-            .map(|s| (s.kind, s.id))
-            .collect();
+        // Exactly these versions are taken, as seen here: an item whose library file changes
+        // after this (from a wrong id to a new version, or to yet another version) is not
+        // written without a backup; it waits for the next update.
+        let todo = wc_library::changed(&all, only);
         // Checked before anything is written: a new version that drops a wired pin stops the
         // whole update.
         let mut dangling: Vec<String> = todo
             .iter()
-            .filter(|(kind, _)| *kind == ItemKind::Symbol)
-            .filter_map(|(_, id)| Some(dangling_pins(&self.project, id, &lib.symbol(id).ok()?.0)))
+            .filter(|(kind, _, _)| *kind == ItemKind::Symbol)
+            .filter_map(|(_, id, _)| Some(dangling_pins(&self.project, id, &lib.symbol(id).ok()?.0)))
             .flatten()
             .collect();
         if !dangling.is_empty() {
@@ -822,12 +811,11 @@ impl Open {
                 dangling.join(", ")
             ));
         }
-        // Undo puts back the lock and the symbol files; part files are kept here, so a write
-        // that fails halfway leaves none of them changed either.
-        let parts: Vec<(PathBuf, Option<Vec<u8>>)> = todo
+        // Every file the update may write, and the lock, are kept here: a failure puts them
+        // back directly, whatever undo can or cannot restore.
+        let files: Vec<(PathBuf, Option<Vec<u8>>)> = todo
             .iter()
-            .filter(|(kind, _)| *kind == ItemKind::Part)
-            .filter_map(|(kind, id)| store::vendor_path(&self.dir, *kind, id).ok())
+            .filter_map(|(kind, id, _)| store::vendor_path(&self.dir, *kind, id).ok())
             .map(|path| {
                 #[cfg(test)]
                 if self.unreadable.as_ref() == Some(&path) {
@@ -837,6 +825,8 @@ impl Open {
             })
             .collect::<Result<_, String>>()
             .map_err(|e| format!("nothing was updated: {e}"))?;
+        let lock = self.project.lock.clone();
+        let redo = self.redo.clone();
         #[cfg(test)]
         if let Some(path) = self.block_after_snapshot.take() {
             let _ = std::fs::remove_file(&path);
@@ -844,30 +834,15 @@ impl Open {
         }
         #[cfg(test)]
         if let Some((path, text)) = self.rewrite_after_snapshot.take() {
-            let _ = std::fs::write(&path, text);
+            std::fs::write(&path, text).map_err(|e| format!("test: {} cannot be rewritten: {e}", path.display()))?;
         }
         self.archive_symbols();
         self.checkpoint();
-        // Exactly the items looked at and snapshotted above: one whose library file changed
-        // since (from a wrong id to a new version, say) waits for the next update.
         let done = match wc_library::update_items(&self.dir, &mut self.project, lib, &todo) {
             Ok(done) => done,
             Err(e) => {
                 // Some items may have been taken already: take them back too.
-                let mut unrestored: Vec<String> = parts
-                    .iter()
-                    .filter_map(|(path, was)| {
-                        restore_file(path, was.as_deref())
-                            .err()
-                            .map(|err| format!("{} ({err})", path.display()))
-                    })
-                    .collect();
-                self.reload_symbols();
-                let undone = self.undo();
-                self.redo.clear();
-                if let (false, Some(why)) = (undone, self.take_undo_error()) {
-                    unrestored.push(why);
-                }
+                let unrestored = self.roll_back_update(&files, lock, redo);
                 return Err(if unrestored.is_empty() {
                     e.to_string()
                 } else {
@@ -890,16 +865,46 @@ impl Open {
         }
         dangling.sort();
         let wires = dangling.join(", ");
-        if !self.undo() {
-            let why = self.take_undo_error().unwrap_or_default();
+        let unrestored = self.roll_back_update(&files, lock, redo);
+        if !unrestored.is_empty() {
             return Err(format!(
-                "wires end on pins the new versions no longer have ({wires}), and the update could not be taken back: {why}"
+                "wires end on pins the new versions no longer have ({wires}), and the update could not be taken back: {}",
+                unrestored.join("; ")
             ));
         }
-        self.redo.clear();
         Err(format!(
             "nothing was updated: wires end on pins the new versions no longer have ({wires}). Move those wires first."
         ))
+    }
+
+    /// Take back a library update that failed: the files it may have written and the lock as
+    /// they were (`files`, `lock`), its undo step dropped, and the Redo list as it was before it
+    /// (`redo`). Returns what could not be put back.
+    fn roll_back_update(
+        &mut self,
+        files: &[(PathBuf, Option<Vec<u8>>)],
+        lock: wc_core::Lockfile,
+        redo: Vec<Project>,
+    ) -> Vec<String> {
+        let mut unrestored: Vec<String> = files
+            .iter()
+            .filter_map(|(path, was)| {
+                restore_file(path, was.as_deref())
+                    .err()
+                    .map(|err| format!("{} ({err})", path.display()))
+            })
+            .collect();
+        self.reload_symbols();
+        if !self.undo()
+            && let Some(why) = self.take_undo_error()
+        {
+            unrestored.push(why);
+        }
+        // Whatever undo managed, the lock is the one the files above match.
+        self.project.lock = lock;
+        self.redo = redo;
+        self.reload_symbols();
+        unrestored
     }
 
     /// Why the last Undo or Redo failed, once.
@@ -2063,6 +2068,52 @@ pub(crate) mod tests {
             "the coil it did not look at is not taken"
         );
         assert_eq!(o.project.lock.symbols["wc.coil"].hash, old.hash());
+    }
+
+    #[test]
+    fn an_update_takes_no_newer_version_than_it_looked_at_and_keeps_redo() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        // An edit undone before the update: Redo must still bring it back after a failed one.
+        o.checkpoint();
+        o.project.pages[1].title = "Renamed".into();
+        assert!(o.undo());
+        assert!(o.can_redo());
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let part_before = std::fs::read(&part_file).unwrap();
+        let mut seen = changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        // The part changes again right after the backups are taken.
+        seen.description = "Changed again".into();
+        o.rewrite_after_snapshot = Some((
+            tmp.path().join(format!("mine/parts/{pid}.json")),
+            serde_json::to_string(&seen).unwrap(),
+        ));
+        let lock = o.project.lock.clone();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(
+            err.contains("changed in the library while it was being updated"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&part_file).unwrap(),
+            part_before,
+            "the part file is as it was"
+        );
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "and the coil"
+        );
+        assert_eq!(o.project.lock, lock);
+        assert!(o.can_redo(), "the earlier Redo is kept");
+        assert!(o.redo());
+        assert_eq!(o.project.pages[1].title, "Renamed");
     }
 
     #[test]

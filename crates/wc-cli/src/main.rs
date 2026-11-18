@@ -2047,25 +2047,41 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     Kind::Dxf => {
                         let mut p = load(dir)?;
                         let id = format!("dxf-{next}");
-                        p.pages.push(Page::new(id.clone(), next.to_string(), name.clone()));
-                        p.sort_pages();
-                        save(dir, &p)?;
                         next += 1;
-                        let r = import_cmd(
-                            dir,
-                            ImportCmd::PageDxf {
-                                file: path.clone(),
-                                page: id.clone(),
-                                scale: 1.0,
-                            },
-                        );
-                        // A drawing that could not be imported leaves no blank page behind.
-                        if r.is_err() {
-                            let mut p = load(dir)?;
-                            p.pages.retain(|pg| pg.id != id);
+                        if p.page(&id).is_some() {
+                            // Never added over an earlier page: removing it again on failure
+                            // would delete that page.
+                            Err(format!(
+                                "page {id} exists; remove it or import with --first-page to number the pages from a free number"
+                            ))
+                        } else {
+                            p.pages
+                                .push(Page::new(id.clone(), (next - 1).to_string(), name.clone()));
+                            p.sort_pages();
                             save(dir, &p)?;
+                            let r = import_cmd(
+                                dir,
+                                ImportCmd::PageDxf {
+                                    file: path.clone(),
+                                    page: id.clone(),
+                                    scale: 1.0,
+                                },
+                            );
+                            // A drawing that could not be imported leaves no blank page behind.
+                            // When that fails too, the entry's own error still counts and the
+                            // other entries still come in.
+                            if r.is_err() {
+                                let remove = || -> Res<()> {
+                                    let mut p = load(dir)?;
+                                    p.pages.retain(|pg| pg.id != id);
+                                    save(dir, &p)
+                                };
+                                if let Err(why) = remove() {
+                                    eprintln!("warning: {name}: the empty page {id} could not be removed: {why}");
+                                }
+                            }
+                            r
                         }
-                        r
                     }
                     _ => {
                         let r = import_cmd(
@@ -2140,8 +2156,45 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     return Err(format!("{source}: the symbol file for {id:?} declares id {:?}", s.id));
                 }
             }
+            // What is in the vendor folder now, so a write that fails part way leaves no copy
+            // without its pin (a retry would skip a readable one).
+            let before: Vec<(PathBuf, Option<Vec<u8>>)> = needed
+                .iter()
+                .map(|id| {
+                    let path = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
+                    let was = match std::fs::read(&path) {
+                        Ok(bytes) => Some(bytes),
+                        Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(x) => return Err(format!("{}: {x}", path.display())),
+                    };
+                    Ok((path, was))
+                })
+                .collect::<Res<_>>()?;
+            let put_back = |why: String| -> String {
+                let failed: Vec<String> = before
+                    .iter()
+                    .filter_map(|(path, was)| {
+                        let r = match was {
+                            Some(bytes) => std::fs::write(path, bytes),
+                            None => std::fs::remove_file(path).or_else(|x| {
+                                if x.kind() == std::io::ErrorKind::NotFound {
+                                    Ok(())
+                                } else {
+                                    Err(x)
+                                }
+                            }),
+                        };
+                        r.err().map(|x| format!("{}: {x}", path.display()))
+                    })
+                    .collect();
+                if failed.is_empty() {
+                    why
+                } else {
+                    format!("{why}; symbol copies could not be put back: {}", failed.join("; "))
+                }
+            };
             for id in needed {
-                wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(e)?;
+                wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(|x| put_back(x.to_string()))?;
             }
             let pg = page_mut(&mut p, &page)?;
             let n_g = imported.graphics.len();
@@ -4137,6 +4190,17 @@ mod tests {
             p.pages.iter().map(|p| &p.id).collect::<Vec<_>>()
         );
         assert!(p.pages.iter().all(|p| !p.id.starts_with("dxf-")));
+
+        // A page an earlier import left under the id this one would use is never touched.
+        let mut p = load(&dir).unwrap();
+        let mut earlier = Page::new("dxf-300", "300", "Earlier drawing");
+        earlier.title_block.insert("revision".into(), "B".into());
+        p.pages.push(earlier.clone());
+        save(&dir, &p).unwrap();
+        let _ = cli(&dir, &["import", "archive", file.to_str().unwrap()]);
+        let p = load(&dir).unwrap();
+        assert_eq!(p.page("dxf-300"), Some(&earlier));
+        assert_eq!(p.pages.len(), pages + 1);
     }
 
     #[test]

@@ -398,42 +398,86 @@ pub fn update(
     lib: &Library,
     only: Option<&[String]>,
 ) -> Result<Vec<(ItemKind, String)>> {
-    let named = |s: &ItemStatus| only.is_none_or(|ids| ids.contains(&s.id));
     let all = status(project_dir, project, lib);
-    // An item named on purpose whose library file is wrong is an error, before anything is taken.
-    if only.is_some()
-        && let Some(bad) = all.iter().find(|s| s.state == State::WrongId && named(s))
-    {
-        return Err(Error::Source {
-            name: bad.library_source.clone().unwrap_or_default(),
-            message: bad.changes.join("; "),
-        });
+    if let Some(bad) = wrong_named(&all, only) {
+        return Err(bad);
     }
-    let todo: Vec<(ItemKind, String)> = all
-        .into_iter()
-        .filter(|s| s.state == State::Changed && named(s))
-        .map(|s| (s.kind, s.id))
-        .collect();
-    for (kind, id) in &todo {
-        take(project_dir, project, lib, *kind, id)?;
-    }
-    Ok(todo)
+    update_items(project_dir, project, lib, &changed(&all, only))
 }
 
-/// Take the library versions of exactly these items, in order, whatever their state is now: what
-/// a caller that looked at [`status`] first and kept copies of what it is about to replace uses,
-/// so nothing is written that it has not seen. Stops at the first item that cannot be taken
-/// (items before it are taken already). Returns the items.
+/// Of `all` (from [`status`]), an item named on purpose (`only`) whose library file declares
+/// another id, as the error an update stops with before anything is taken.
+pub fn wrong_named(all: &[ItemStatus], only: Option<&[String]>) -> Option<Error> {
+    let ids = only?;
+    let bad = all.iter().find(|s| s.state == State::WrongId && ids.contains(&s.id))?;
+    Some(Error::Source {
+        name: bad.library_source.clone().unwrap_or_default(),
+        message: bad.changes.join("; "),
+    })
+}
+
+/// Of `all` (from [`status`]), the items with a newer library version (only those named in
+/// `only`, when given), each with the hash of the version seen, for [`update_items`].
+pub fn changed(all: &[ItemStatus], only: Option<&[String]>) -> Vec<(ItemKind, String, String)> {
+    all.iter()
+        .filter(|s| s.state == State::Changed && only.is_none_or(|ids| ids.contains(&s.id)))
+        .filter_map(|s| Some((s.kind, s.id.clone(), s.library_hash.clone()?)))
+        .collect()
+}
+
+/// Take exactly these library versions, in order: each item `(kind, id, hash)` only in the
+/// version with that hash, read once and written as read. What a caller that looked at
+/// [`status`] first and kept copies of what it is about to replace uses, so nothing is written
+/// that it has not seen. An item whose library version is another one by now is an error. Stops
+/// at the first item that cannot be taken (items before it are taken already). Returns the
+/// items.
 pub fn update_items(
     project_dir: &Path,
     project: &mut Project,
     lib: &Library,
-    items: &[(ItemKind, String)],
+    items: &[(ItemKind, String, String)],
 ) -> Result<Vec<(ItemKind, String)>> {
-    for (kind, id) in items {
-        take(project_dir, project, lib, *kind, id)?;
+    for (kind, id, hash) in items {
+        take_version(project_dir, project, lib, *kind, id, hash)?;
     }
-    Ok(items.to_vec())
+    Ok(items.iter().map(|(k, id, _)| (*k, id.clone())).collect())
+}
+
+/// [`take`], only when the library's version has `hash`.
+fn take_version(
+    project_dir: &Path,
+    project: &mut Project,
+    lib: &Library,
+    kind: ItemKind,
+    id: &str,
+    hash: &str,
+) -> Result<LockEntry> {
+    let moved = |source: &str, what: &str| Error::Source {
+        name: source.to_owned(),
+        message: format!("the {what} {id} changed in the library while it was being updated; update again"),
+    };
+    let entry = match kind {
+        ItemKind::Symbol => {
+            let (s, source) = lib.symbol(id)?;
+            same_id(&source, "symbol", id, &s.id)?;
+            if s.hash() != hash {
+                return Err(moved(&source, "symbol"));
+            }
+            store::write_vendored_symbol(project_dir, &s)?;
+            LockEntry { source, hash: s.hash() }
+        }
+        ItemKind::Part => {
+            let (p, source) = lib.part(id)?;
+            same_id(&source, "part", id, &p.id)?;
+            if p.hash() != hash {
+                return Err(moved(&source, "part"));
+            }
+            store::write_vendored_part(project_dir, &p)?;
+            LockEntry { source, hash: p.hash() }
+        }
+    };
+    project.lock.map_mut(kind).insert(id.to_owned(), entry.clone());
+    Ok(entry)
 }
 
 /// Propose a project's vendored version of an item back to a library source. The file goes to
