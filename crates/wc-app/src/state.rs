@@ -352,6 +352,9 @@ impl Open {
         let (rows, mut warnings) = wc_import::wago::read_configured(bytes).map_err(|e| e.to_string())?;
         let (candidates, more) = wc_import::wago::Candidates::load(&self.dir, &self.project);
         warnings.extend(more);
+        // Jumpers follow a terminal change still in progress first, so the rows are matched to
+        // the jumpers as they will be.
+        self.follow_terminals();
         let plan = wc_import::wago::plan(
             &wc_report::Inputs {
                 project: &self.project,

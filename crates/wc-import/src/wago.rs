@@ -316,6 +316,11 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
         };
         let mut miss = |why: String| out.unmatched.push(format!("{at}: {} — {why}", row.article));
         let (tag, slot) = if row.index.is_empty() {
+            // Only accessories can be new: a jumper row needs its index to say which jumper.
+            if row.kind.eq_ignore_ascii_case("Jumper") {
+                miss("a jumper row without an index cannot be matched to a jumper; export the list again".into());
+                continue;
+            }
             match DeviceTag::parse(&row.strip) {
                 Ok(t) if strips.contains(&row.strip) => (t, Slot::NewAccessory),
                 _ if row.strip.is_empty() => {
@@ -1016,6 +1021,13 @@ mod tests {
             "{:?}",
             escaped.unmatched
         );
+
+        // A jumper row without an index is not taken as a new accessory of the strip.
+        let text = "Index;Type;Strip;Article;Connects\n;Jumper;-X1;2002-402;1, 2\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        let blank = plan(&inputs, &library(&parts), &rows);
+        assert!(blank.assignments.is_empty(), "{blank:#?}");
+        assert!(blank.unmatched[0].contains("without an index"), "{:?}", blank.unmatched);
 
         // Without a Connects column the jumper cannot be checked.
         let text = "Index;Type;Article\n-X1/J1;Jumper;2002-402\n";
