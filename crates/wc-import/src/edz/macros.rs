@@ -58,6 +58,10 @@ const BLACK_BOX: u16 = 301;
 const MAX_DEPTH: usize = 128;
 /// Most graphics and placements read from one macro.
 const MAX_ITEMS: usize = 200_000;
+/// Most representation kinds named when a macro has no multi-line representation.
+const MAX_KINDS_NAMED: usize = 8;
+/// Longest device tag letter or counting number kept; a longer one is not a tag.
+const MAX_TAG: usize = 32;
 /// Most connection points read from one macro.
 const MAX_PINS: usize = 10_000;
 /// Most connection point designations read from one placed symbol.
@@ -385,11 +389,11 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                             && let Some(letter) = attr(e, "P20013")?
                         {
                             let letter = letter.trim();
-                            if letter.chars().all(|c| c.is_alphanumeric()) {
+                            if letter.len() <= MAX_TAG && letter.chars().all(|c| c.is_alphanumeric()) {
                                 p.letter = letter.to_owned();
                                 let n = attr(e, "P20014")?.unwrap_or_default();
                                 let n = n.trim();
-                                p.number = if n.chars().all(|c| c.is_alphanumeric()) {
+                                p.number = if n.len() <= MAX_TAG && n.chars().all(|c| c.is_alphanumeric()) {
                                     n.to_owned()
                                 } else {
                                     String::new()
@@ -492,11 +496,21 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         ));
     }
     let Some(v) = multi.iter().find(|v| v.id == 0).copied() else {
+        // Each kind once, in the order first seen; only the first few are named.
+        let mut seen = std::collections::BTreeSet::new();
         let mut kinds: Vec<String> = Vec::new();
+        let mut more = 0usize;
         for k in all.iter().map(|v| representation(v.doc)) {
-            if !kinds.contains(&k) {
-                kinds.push(k);
+            if seen.insert(k.clone()) {
+                if kinds.len() < MAX_KINDS_NAMED {
+                    kinds.push(k);
+                } else {
+                    more += 1;
+                }
             }
+        }
+        if more > 0 {
+            kinds.push(format!("{more} more"));
         }
         return Err(Error::Format(if kinds.is_empty() {
             "holds no representation".into()

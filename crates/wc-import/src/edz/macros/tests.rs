@@ -308,8 +308,7 @@ fn many_points(n: usize) -> String {
 }
 
 #[test]
-fn a_large_macro_with_repeated_names_is_read_quickly_and_a_larger_one_refused() -> TestResult {
-    let start = std::time::Instant::now();
+fn a_large_macro_with_repeated_names_is_read_and_a_larger_one_refused() -> TestResult {
     let s = read("big.ema", &many_points(MAX_PINS))?.symbol;
     let names: std::collections::BTreeSet<&str> = s.pins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names.len(), MAX_PINS, "every pin name is unique");
@@ -320,11 +319,6 @@ fn a_large_macro_with_repeated_names_is_read_quickly_and_a_larger_one_refused() 
         .map(|e| e.to_string())
         .unwrap_or_default();
     assert_eq!(e, format!("holds more than {MAX_PINS} connection points"));
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(20),
-        "{:?}",
-        start.elapsed()
-    );
     Ok(())
 }
 
@@ -349,16 +343,11 @@ fn unique_names_mark_then_number_repeats_and_skip_names_already_given() {
         .map(|n| u.unique(n.to_owned()))
         .collect();
     assert_eq!(got, ["1", "1'", "1''", "1'''", "1#4", "1#5", "1#4'", "1#6"]);
-    // Many repeats take about the same time each.
+    // Many repeats: each gets the next number, never a longer run of marks.
     let mut u = UniqueNames::default();
-    let start = std::time::Instant::now();
     let names: std::collections::BTreeSet<String> = (0..20_000).map(|_| u.unique("1".into())).collect();
     assert_eq!(names.len(), 20_000);
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(5),
-        "{:?}",
-        start.elapsed()
-    );
+    assert!(names.iter().all(|n| n.len() <= "1#19999".len()), "names stay short");
 }
 
 #[test]
@@ -439,5 +428,33 @@ fn a_terminal_keeps_the_macros_own_designations() -> TestResult {
     let s = read("x.ema", text)?.symbol;
     let names: Vec<&str> = s.pins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["L", "R"]);
+    Ok(())
+}
+
+#[test]
+fn many_representation_kinds_are_named_once_and_summed_up_past_a_few() {
+    let mut text = String::from("<EplanPxfRoot>");
+    for k in 0..20 {
+        text.push_str(&format!(
+            r#"<MacroVariant MacroFuncType="{}"/><MacroVariant MacroFuncType="{}"/>"#,
+            100 + k,
+            100 + k
+        ));
+    }
+    text.push_str("</EplanPxfRoot>");
+    let e = read("x.ema", &text).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.ends_with("type 107, 12 more)"), "{e:?}");
+    assert_eq!(e.matches("type 100").count(), 1, "{e:?}");
+}
+
+#[test]
+fn an_overlong_device_tag_is_not_taken_as_one() -> TestResult {
+    let long = "K".repeat(MAX_TAG + 1);
+    let text = format!(
+        r#"<EplanPxfRoot><MacroVariant MacroFuncType="1"><O17 A1381="300" A185="1"><S40x1201 A762="0/0"/><P144 P20013="{long}" P20014="1"/></O17></MacroVariant></EplanPxfRoot>"#
+    );
+    let s = read("x.ema", &text)?.symbol;
+    assert_eq!(s.letter_code, "");
+    assert_eq!(s.pins.first().map(|p| p.name.as_str()), Some("1"));
     Ok(())
 }

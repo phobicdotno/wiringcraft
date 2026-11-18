@@ -543,3 +543,22 @@ fn only_the_macro_whose_symbol_a_part_got_reports_it() -> TestResult {
     assert_eq!(symbols, [None, Some("wc.coil")]);
     Ok(())
 }
+
+#[test]
+fn a_symbol_map_names_an_extensionless_macro_by_either_spelling() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="B.1" P_ARTICLE_MANUFACTURER="B" P_ARTICLE_MACRO="$(MD_MACROS)\B\relay"/></partsmanagement>"#;
+    let edz = zip(&[("parts.xml", xml.as_bytes()), ("relay.ema", CONTACTOR_MACRO.as_bytes())])?;
+    let got = read_all(&edz)?;
+    assert_eq!(got.parts.first().and_then(|p| p.symbol.as_deref()), Some("eplan.relay"));
+    for key in ["relay.ema", "relay"] {
+        let (mut parts, mut report) = (got.parts.clone(), got.report.clone());
+        let map: BTreeMap<String, String> = [(key.to_owned(), "wc.coil".to_owned())].into();
+        assert_eq!(apply_symbol_map(&mut parts, &map, &mut report), 1, "{key}");
+        assert_eq!(
+            parts.first().and_then(|p| p.symbol.as_deref()),
+            Some("wc.coil"),
+            "{key}"
+        );
+    }
+    Ok(())
+}

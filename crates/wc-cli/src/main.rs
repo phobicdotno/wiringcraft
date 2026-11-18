@@ -2798,7 +2798,18 @@ fn import_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>) -> Res<(usize,
         mut report,
         mut warnings,
     } = wc_import::edz::read_all(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    // The parts whose symbol the map chose.
+    let mut mapped: std::collections::BTreeSet<String> = Default::default();
     if let Some(map) = &map {
+        let mut probe: Vec<wc_core::Part> = parts
+            .iter()
+            .map(|p| wc_core::Part {
+                symbol: None,
+                ..p.clone()
+            })
+            .collect();
+        wc_import::edz::apply_symbol_map(&mut probe, map, &mut report.clone());
+        mapped = probe.into_iter().filter(|p| p.symbol.is_some()).map(|p| p.id).collect();
         wc_import::edz::apply_symbol_map(&mut parts, map, &mut report);
     }
     // Symbols first, so no part is written pointing at a symbol the library lacks. A symbol that
@@ -2811,13 +2822,22 @@ fn import_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>) -> Res<(usize,
         }
     }
     if !unwritten.is_empty() {
+        // A link the symbol map chose is kept while the library still holds a readable symbol of
+        // that id; a link to the macro's own symbol, which was not saved, is dropped.
+        let readable = |id: &str| {
+            std::fs::read_to_string(lib.join("symbols").join(format!("{id}.json")))
+                .ok()
+                .and_then(|t| serde_json::from_str::<wc_core::Symbol>(&t).ok())
+                .is_some()
+        };
+        let keep = |part: &str, id: &str| !unwritten.contains(id) || (mapped.contains(part) && readable(id));
         for p in &mut parts {
-            if p.symbol.as_ref().is_some_and(|s| unwritten.contains(s)) {
+            if p.symbol.as_deref().is_some_and(|s| !keep(&p.id, s)) {
                 p.symbol = None;
             }
         }
         for m in &mut report.part_macros {
-            if m.symbol.as_ref().is_some_and(|s| unwritten.contains(s)) {
+            if m.symbol.as_deref().is_some_and(|s| !keep(&m.part, s)) {
                 m.symbol = None;
             }
         }
@@ -5603,8 +5623,28 @@ mod tests {
         let p: wc_core::Part = serde_json::from_str(&json).unwrap();
         let id = p.symbol.unwrap();
         let json = std::fs::read_to_string(lib.join("symbols").join(format!("{id}.json"))).unwrap();
-        let s: wc_core::Symbol = serde_json::from_str(&json).unwrap();
+        let mut s: wc_core::Symbol = serde_json::from_str(&json).unwrap();
         assert_eq!(s.id, id);
+
+        // The library now holds a different, readable symbol of that id, and the new one cannot
+        // replace it (a folder blocks its staging file).
+        s.description = "kept from before".into();
+        wc_library::write_symbol(&lib, &s).unwrap();
+        std::fs::create_dir_all(lib.join("symbols").join(format!("{id}.json.tmp"))).unwrap();
+        let part_symbol = |lib: &Path| {
+            let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+            serde_json::from_str::<wc_core::Part>(&json).unwrap().symbol
+        };
+        // The macro's own link is dropped: its symbol was not saved.
+        let (_, _, warnings) = import_edz(&file, &lib, None).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("not written")), "{warnings:?}");
+        assert_eq!(part_symbol(&lib), None);
+        // A link the symbol map chose to that readable symbol is kept.
+        let map = tmp.path().join("map.txt");
+        std::fs::write(&map, format!("SIE_3RT2015 = {id}\n")).unwrap();
+        let (_, report, _) = import_edz(&file, &lib, Some(&map)).unwrap();
+        assert_eq!(part_symbol(&lib).as_deref(), Some(id.as_str()));
+        assert_eq!(report.part_macros[0].symbol.as_deref(), Some(id.as_str()));
     }
 
     #[test]

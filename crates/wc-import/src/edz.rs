@@ -147,11 +147,13 @@ fn macro_path(path: &str) -> String {
 }
 
 /// The keys a symbol map may name a macro by: its full name, its file name and its file name
-/// without `.ema`, all in lower case.
-fn macro_keys(name: &str) -> [String; 3] {
+/// without `.ema`, all in lower case. A part naming its macro without `.ema` is matched by the
+/// file name with it too, as the archive's macro is.
+fn macro_keys(name: &str) -> [String; 4] {
     let file = macro_file_name(name);
     let stem = file.strip_suffix(".ema").unwrap_or(&file).to_owned();
-    [name.trim().to_lowercase(), file, stem]
+    let with_ext = format!("{stem}.ema");
+    [name.trim().to_lowercase(), file, stem, with_ext]
 }
 
 /// Give every part whose macro `map` names (`macro = symbol.id`, as
