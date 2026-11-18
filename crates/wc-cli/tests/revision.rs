@@ -100,8 +100,28 @@ fn revision_list_escapes_control_characters_from_the_project_file() -> TestResul
     text.push_str("\n[[revision]]\nletter = \"X\\u001b[2J\"\ntext = \"two\\nlines\\tand a tab\"\nauthor = \"OP\"\n");
     std::fs::write(&file, text)?;
 
+    // A cloud whose revision a hand edit filled with control characters.
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["revision", "cloud", "p1", "10", "10", "50", "40"])?;
+    let page = dir.join("pages").join("p1.page.json");
+    let json = std::fs::read_to_string(&page)?;
+    let edited = json.replacen(
+        "\"revision\": \"X\\u001b[2J\"",
+        "\"revision\": \"Y\\u001b]0;\\u0007\"",
+        1,
+    );
+    assert_ne!(json, edited, "the cloud's revision is in the page file: {json}");
+    std::fs::write(&page, edited)?;
+
     let list = wiringcraft(&dir, &["revision", "list"])?;
-    assert!(!list.contains('\u{1b}'), "no raw ESC: {list:?}");
+    assert!(
+        !list.contains('\u{1b}') && !list.contains('\u{7}'),
+        "no raw control characters: {list:?}"
+    );
+    assert!(
+        list.contains("page p1 cloud 0: revision Y\\u{1b}]0;\\u{7} at"),
+        "{list:?}"
+    );
     let line = list.lines().next().ok_or("no revision line")?;
     assert_eq!(line.split('\t').count(), 4, "{line:?}");
     assert!(line.starts_with("X\\u{1b}[2J\t"), "{line:?}");
