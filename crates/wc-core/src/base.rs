@@ -6,9 +6,14 @@
 //! In the base project's title block and page titles, `{name}` becomes the new project's name
 //! and `{date}` its date. The project's `date` field is set to the new date, and a page's own
 //! `date` is dropped, so every page shows the new project's date.
+//!
+//! Library sources keep pointing at the same libraries: a folder source inside the base
+//! project is copied along and stays relative; a relative folder outside it (for example
+//! `../library`) is written as the absolute folder it named from the base; absolute folders
+//! and git sources are kept as they are.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use crate::store::{self, COMMENTS_DIR, PROJECT_FILE};
 use crate::{Error, Project, Result};
@@ -18,12 +23,11 @@ use crate::{Error, Project, Result};
 const SKIPPED: &[&str] = &[".git", COMMENTS_DIR];
 
 /// Create a project in `dir`, named `name` and dated `date` (as the title block shows it, for
-/// example `2026-11-18`), from the base project in `base`. Refuses a `dir` that already holds
-/// a project, and one inside the base project.
+/// example `2026-11-18`), from the base project in `base`. `dir` must not exist yet or be an
+/// empty folder, and must lie outside the base project. The project is put together in a
+/// staging folder next to `dir` and moved into place only once it is complete, so a failure
+/// leaves nothing behind and can simply be tried again.
 pub fn create_from(base: &Path, dir: &Path, name: &str, date: &str) -> Result<Project> {
-    if dir.join(PROJECT_FILE).exists() {
-        return Err(Error::Invalid(format!("{} already holds a project", dir.display())));
-    }
     if !base.join(PROJECT_FILE).is_file() {
         return Err(Error::Invalid(format!(
             "{} holds no project to start from",
@@ -31,20 +35,65 @@ pub fn create_from(base: &Path, dir: &Path, name: &str, date: &str) -> Result<Pr
         )));
     }
     let base_full = fs::canonicalize(base).map_err(|e| Error::io(base, e))?;
-    if let Some(inside) = existing_ancestor(dir)
-        && inside.starts_with(&base_full)
-    {
+    let target = resolved(dir)?;
+    if target.starts_with(&base_full) {
         return Err(Error::Invalid(format!(
             "{} is inside the base project {}; pick a folder outside it",
             dir.display(),
             base.display()
         )));
     }
+    if target.exists() {
+        let mut entries = fs::read_dir(&target).map_err(|e| Error::io(&target, e))?;
+        if entries.next().is_some() {
+            return Err(Error::Invalid(format!(
+                "{} is not empty; pick a new or empty folder",
+                dir.display()
+            )));
+        }
+    }
     let mut project = store::load(base)?;
-    copy_tree(base, dir, true)?;
     fill(&mut project, name, date);
-    store::save(dir, &project)?;
+    keep_libraries(&mut project, &base_full);
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::Invalid(format!("{} has no parent folder", dir.display())))?;
+    fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    let staging = staging_dir(&target)?;
+    let built = copy_tree(base, &staging, true)
+        .and_then(|()| fail_for_test())
+        .and_then(|()| store::save(&staging, &project).map(|_| ()));
+    let placed = built.and_then(|()| {
+        if target.exists() {
+            fs::remove_dir(&target).map_err(|e| Error::io(&target, e))?;
+        }
+        fs::rename(&staging, &target).map_err(|e| Error::io(&target, e))
+    });
+    if let Err(e) = placed {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
     Ok(project)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: fail once the files are copied, before the project is saved.
+    static FAIL_AFTER_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_for_test() -> Result<()> {
+    if FAIL_AFTER_COPY.with(|f| f.replace(false)) {
+        return Err(Error::Invalid("test failure after copying".into()));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn fail_for_test() -> Result<()> {
+    Ok(())
 }
 
 /// Give a project loaded from a base project its own name and date and drop its comments.
@@ -65,10 +114,91 @@ pub fn fill(project: &mut Project, name: &str, date: &str) {
     project.comments.clear();
 }
 
-/// The nearest folder of `dir` (itself or a parent) that exists, made absolute.
-fn existing_ancestor(dir: &Path) -> Option<std::path::PathBuf> {
-    let abs = std::path::absolute(dir).ok()?;
-    abs.ancestors().find_map(|a| fs::canonicalize(a).ok())
+/// Relative folder sources that lead out of the base project become the absolute folder they
+/// named from it; everything else already points at the same library from the new project.
+fn keep_libraries(project: &mut Project, base: &Path) {
+    for lib in &mut project.meta.libraries {
+        if lib.kind != "folder" || Path::new(&lib.location).is_absolute() {
+            continue;
+        }
+        let named = lexical(&base.join(&lib.location));
+        if !named.starts_with(base) {
+            lib.location = named.to_string_lossy().into_owned();
+        }
+    }
+}
+
+/// The relative folder sources of a project that lead out of its folder (such as
+/// `../library`): a base project fetched on its own (from a repository) cannot reach them.
+pub fn outside_libraries(project: &Project) -> Vec<String> {
+    let root = Path::new("/base");
+    project
+        .meta
+        .libraries
+        .iter()
+        .filter(|l| l.kind == "folder" && !Path::new(&l.location).is_absolute())
+        .filter(|l| !lexical(&root.join(&l.location)).starts_with(root))
+        .map(|l| l.location.clone())
+        .collect()
+}
+
+/// `p` with `.` and `..` worked out by name, without looking at the disk.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Where `dir` really is: its nearest existing folder with links resolved, and the rest of
+/// the path after it, with `..` worked out by name (a folder that does not exist yet holds
+/// no links).
+fn resolved(dir: &Path) -> Result<PathBuf> {
+    let abs = lexical(&std::path::absolute(dir).map_err(|e| Error::io(dir, e))?);
+    let mut rest = Vec::new();
+    let mut at = abs.as_path();
+    loop {
+        if let Ok(real) = fs::canonicalize(at) {
+            return Ok(rest.iter().rev().fold(real, |p, c| p.join(c)));
+        }
+        match (at.file_name(), at.parent()) {
+            (Some(n), Some(up)) => {
+                rest.push(n.to_owned());
+                at = up;
+            }
+            _ => return Ok(abs),
+        }
+    }
+}
+
+/// A new, empty folder next to `target` to put the project together in.
+fn staging_dir(target: &Path) -> Result<PathBuf> {
+    let parent = target.parent().unwrap_or(Path::new("."));
+    let stem = target
+        .file_name()
+        .map_or_else(|| "project".into(), |n| n.to_string_lossy());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    for n in 0..100u32 {
+        let p = parent.join(format!(".{stem}.new-{}-{nanos}-{n}", std::process::id()));
+        match fs::create_dir(&p) {
+            Ok(()) => return Ok(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(Error::io(&p, e)),
+        }
+    }
+    Err(Error::Invalid(format!(
+        "no staging folder could be made in {}",
+        parent.display()
+    )))
 }
 
 /// Copy the files and folders of `from` into `to`. Links are not followed or copied, so
@@ -98,12 +228,13 @@ pub fn today() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    date_of_day((secs / 86_400) as i64)
+    let (y, m, d) = civil_date((secs / 86_400) as i64);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// The calendar date `days` days after 1970-01-01, as `YYYY-MM-DD`.
-fn date_of_day(days: i64) -> String {
-    // Howard Hinnant's civil-from-days.
+/// The calendar date (year, month, day) `days` days after 1970-01-01 (Howard Hinnant's
+/// civil-from-days).
+pub fn civil_date(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -112,8 +243,7 @@ fn date_of_day(days: i64) -> String {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}")
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 #[cfg(test)]
@@ -201,6 +331,91 @@ mod tests {
         let empty = tmp.path().join("empty");
         fs::create_dir_all(&empty).unwrap();
         assert!(create_from(&empty, &tmp.path().join("y"), "Y", "2026-11-18").is_err());
+        // A detour through a folder that does not exist still lands inside the base.
+        let detour = tmp.path().join("missing").join("..").join("base").join("new");
+        assert!(create_from(&b, &detour, "X", "2026-11-18").is_err());
+        assert!(!b.join("new").exists() && !tmp.path().join("missing").exists());
+        // An empty folder is fine.
+        create_from(&b, &empty, "Into empty", "2026-11-18").unwrap();
+        assert_eq!(store::load(&empty).unwrap().meta.name, "Into empty");
+    }
+
+    #[test]
+    fn a_folder_with_other_files_is_left_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = tmp.path().join("base");
+        base(&b);
+        let busy = tmp.path().join("busy");
+        fs::create_dir_all(busy.join("pictures")).unwrap();
+        fs::write(busy.join("pictures/logo.png"), "mine").unwrap();
+        assert!(create_from(&b, &busy, "X", "2026-11-18").is_err());
+        assert_eq!(fs::read_to_string(busy.join("pictures/logo.png")).unwrap(), "mine");
+        assert!(!busy.join(PROJECT_FILE).exists());
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_nothing_and_can_be_tried_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = tmp.path().join("base");
+        base(&b);
+        let new = tmp.path().join("new");
+        FAIL_AFTER_COPY.with(|f| f.set(true));
+        assert!(create_from(&b, &new, "New", "2026-11-18").is_err());
+        assert!(!new.exists());
+        let left: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from("base")],
+            "no staging folder is left"
+        );
+        create_from(&b, &new, "New", "2026-11-18").unwrap();
+        assert_eq!(store::load(&new).unwrap().meta.name, "New");
+    }
+
+    #[test]
+    fn library_folders_keep_pointing_at_the_same_library() {
+        use crate::project::LibrarySource;
+        let tmp = tempfile::tempdir().unwrap();
+        let company = tmp.path().join("company");
+        let b = company.join("base");
+        base(&b);
+        fs::create_dir_all(company.join("library")).unwrap();
+        fs::create_dir_all(b.join("own-library")).unwrap();
+        let source = |name: &str, kind: &str, location: &str| LibrarySource {
+            name: name.into(),
+            kind: kind.into(),
+            location: location.into(),
+            reference: None,
+        };
+        let shared = tmp.path().join("shared").to_string_lossy().into_owned();
+        let mut p = store::load(&b).unwrap();
+        p.meta.libraries = vec![
+            source("company", "folder", "../library"),
+            source("own", "folder", "own-library"),
+            source("shared", "folder", &shared),
+            source("remote", "git", "https://example.com/lib.git"),
+        ];
+        store::save(&b, &p).unwrap();
+        assert_eq!(outside_libraries(&p), vec!["../library".to_owned()]);
+
+        let new = tmp.path().join("jobs").join("pump");
+        let made = create_from(&b, &new, "Pump", "2026-11-18").unwrap();
+        let libs = &made.meta.libraries;
+        let company_lib = fs::canonicalize(company.join("library")).unwrap();
+        assert_eq!(
+            Path::new(&libs[0].location),
+            company_lib,
+            "the same folder as from the base"
+        );
+        assert_eq!(libs[1].location, "own-library", "copied along, still relative");
+        assert!(new.join("own-library").is_dir());
+        assert_eq!(libs[2].location, shared, "an absolute folder is kept");
+        assert_eq!(libs[3].location, "https://example.com/lib.git");
+        assert_eq!(store::load(&new).unwrap().meta.libraries, *libs);
     }
 
     #[cfg(unix)]
@@ -218,10 +433,11 @@ mod tests {
 
     #[test]
     fn days_count_into_calendar_dates() {
-        assert_eq!(date_of_day(0), "1970-01-01");
-        assert_eq!(date_of_day(59), "1970-03-01");
-        assert_eq!(date_of_day(11_016), "2000-02-29");
-        assert_eq!(date_of_day(20_775), "2026-11-18");
+        assert_eq!(civil_date(0), (1970, 1, 1));
+        assert_eq!(civil_date(59), (1970, 3, 1));
+        assert_eq!(civil_date(11_016), (2000, 2, 29));
+        assert_eq!(civil_date(20_775), (2026, 11, 18));
+        assert_eq!(civil_date(-1), (1969, 12, 31));
         assert_eq!(today().len(), 10);
     }
 }

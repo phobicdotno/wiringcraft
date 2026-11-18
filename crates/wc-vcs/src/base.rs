@@ -22,11 +22,36 @@ pub fn create_from_base(source: &str, dir: &Path, name: &str, date: &str) -> Res
     if !is_url(source) {
         return Ok(wc_core::base::create_from(Path::new(source), dir, name, date)?);
     }
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io(std::env::temp_dir(), e))?;
+    let tmp = private_temp_dir().map_err(|e| wc_core::Error::io(std::env::temp_dir(), e))?;
     let fetched = tmp.path().join("base");
     let target = fetched.to_string_lossy().into_owned();
     Git::new(tmp.path()).run(&["clone", "-q", "--depth", "1", "--", source, &target])?;
+    // A library folder next to the repository was not fetched with it.
+    let outside = wc_core::base::outside_libraries(&wc_core::store::load(&fetched)?);
+    if !outside.is_empty() {
+        return Err(wc_core::Error::Invalid(format!(
+            "the base project at {source} uses library folders outside its repository ({}); \
+             start from a local copy of it instead, or point those sources at absolute folders or git",
+            outside.join(", ")
+        ))
+        .into());
+    }
     Ok(wc_core::base::create_from(&fetched, dir, name, date)?)
+}
+
+/// A temporary folder only this user can read: a private base project is cloned into it.
+#[cfg(unix)]
+fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
+/// A temporary folder in the user's own temporary folder.
+#[cfg(not(unix))]
+fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::tempdir()
 }
 
 #[cfg(test)]
@@ -82,5 +107,19 @@ mod tests {
         let missing = file_url(&tmp.path().join("nowhere"));
         assert!(create_from_base(&missing, &tmp.path().join("x"), "X", "2026-11-18").is_err());
         assert!(!tmp.path().join("x").exists());
+
+        // A repository whose project uses a library folder beside it is refused with why.
+        let mut p = store::load(&base).unwrap();
+        p.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "company".into(),
+            kind: "folder".into(),
+            location: "../library".into(),
+            reference: None,
+        });
+        store::save(&base, &p).unwrap();
+        Git::new(&base).commit("library beside it").unwrap();
+        let e = create_from_base(&url, &tmp.path().join("z"), "Z", "2026-11-18").unwrap_err();
+        assert!(e.to_string().contains("../library"), "{e}");
+        assert!(!tmp.path().join("z").exists());
     }
 }

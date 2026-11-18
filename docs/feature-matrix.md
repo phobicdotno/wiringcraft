@@ -78,7 +78,7 @@ For the other areas, the chapter to read in each help is:
 | Frame with column and row references (e.g. 3.C) | yes | yes | yes | done (#54) |
 | Title block shared by all pages | yes | yes | yes | done |
 | Cover page and page template editing | yes | yes | yes: cover page form, Page template form (columns and title-block boxes, kept in `project.toml`) | done (#53, #119) |
-| Project templates and base projects | yes | yes (project templates) | yes: `wiringcraft new --template <folder or git URL>` and "Start from" in New project; `{name}` and `{date}` filled in | done (#270) |
+| Project templates and base projects | yes | yes (project templates) | yes: `wiringcraft new <dir> --template <folder or git URL>` and "Start from" in New project; `{name}` and `{date}` filled in | done (#270) |
 | Project properties (customer, dates, revision ...) | yes | yes | yes | done |
 | Project archive (pack and unpack) | yes | yes (.tewzip) | yes: import of archives, projects are plain folders | done |
 | Multi-language project texts and translation dictionary | yes | yes | no | later |
