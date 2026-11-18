@@ -1623,6 +1623,11 @@ pub struct Share {
     /// changes wait while one is on its way, so a page never reaches the session before what it
     /// draws.
     items_out: BTreeMap<String, ItemOut>,
+    /// The items this copy's waiting changes wait for ([`Held`]), as of the last sync.
+    holding: Vec<String>,
+    /// Undo asked for while changes were waiting: they are taken back here at the next sync,
+    /// instead of an older change in the session.
+    drop_held: bool,
     /// Items whose file could not be read, sent or taken, and updates not sent because the
     /// session took their item back (`stale <name>`), reported once each.
     unreadable: std::collections::BTreeSet<String>,
@@ -1636,44 +1641,125 @@ pub struct Share {
     pictures_failed: BTreeMap<String, std::time::Instant>,
 }
 
-/// Changes of this copy kept back while the items they use are not in the session yet.
+/// Changes of this copy kept back while the items they use are not in the session yet: the
+/// pages, devices and project properties that use such an item for the first time. Everything
+/// else goes out as usual.
+#[derive(Debug, Default)]
 struct Held {
-    /// The held page's edit.
-    page: Option<Page>,
-    /// The project-level edits.
-    edits: Vec<ProjectEdit>,
-    /// What the copy had synced to when they were made.
-    base: Project,
-    /// The copy with them, to tell whether anything else changed.
-    local: Project,
+    /// Those targets as this copy has them.
+    now: wc_share::Parts,
+    /// The same targets as the copy had synced them.
+    was: wc_share::Parts,
+    /// The items they wait for, by [`item_name`].
+    items: Vec<String>,
 }
 
 impl Held {
-    /// Put the held changes back into `project`, which now holds the session's project. A
-    /// change whose target the session changed meanwhile is not put back; those are returned.
+    /// The targets of `local` that use, for the first time since `base`, an item named in
+    /// `waiting`.
+    fn find(local: &Project, base: &Project, waiting: &BTreeMap<String, ItemOut>) -> Held {
+        let waits = |kind: ItemKind, id: &str| waiting.contains_key(&item_name(kind, id));
+        let mut held = Held::default();
+        let mut items = std::collections::BTreeSet::new();
+        for p in &local.pages {
+            let had: std::collections::BTreeSet<(&str, &str)> = base
+                .page(&p.id)
+                .map(|b| b.symbols.iter().map(|o| (o.id.as_str(), o.symbol.as_str())).collect())
+                .unwrap_or_default();
+            let new: Vec<&str> = p
+                .symbols
+                .iter()
+                .filter(|o| !had.contains(&(o.id.as_str(), o.symbol.as_str())) && waits(ItemKind::Symbol, &o.symbol))
+                .map(|o| o.symbol.as_str())
+                .collect();
+            if !new.is_empty() {
+                items.extend(new.iter().map(|id| item_name(ItemKind::Symbol, id)));
+                held.now.pages.insert(p.id.clone(), Some(p.clone()));
+            }
+        }
+        for (tag, d) in &local.devices {
+            let had: std::collections::BTreeSet<&str> = base
+                .devices
+                .get(tag)
+                .map(|b| b.all_parts().into_iter().map(|(p, _)| p).collect())
+                .unwrap_or_default();
+            let new: Vec<String> = d
+                .all_parts()
+                .into_iter()
+                .map(|(p, _)| p)
+                .filter(|p| !had.contains(p) && waits(ItemKind::Part, p))
+                .map(str::to_owned)
+                .collect();
+            if !new.is_empty() {
+                items.extend(new.iter().map(|id| item_name(ItemKind::Part, id)));
+                held.now.devices.insert(tag.clone(), Some(d.clone()));
+            }
+        }
+        let jumper_parts: Vec<String> = local
+            .meta
+            .jumpers
+            .iter()
+            .filter(|j| !base.meta.jumpers.contains(j))
+            .filter_map(|j| j.part.clone())
+            .filter(|p| waits(ItemKind::Part, p))
+            .collect();
+        if !jumper_parts.is_empty() {
+            items.extend(jumper_parts.iter().map(|id| item_name(ItemKind::Part, id)));
+            held.now.meta = Some(Box::new(local.meta.clone()));
+        }
+        held.was = wc_share::Parts::read(base, &held.now);
+        held.items = items.into_iter().collect();
+        held
+    }
+
+    fn is_empty(&self) -> bool {
+        self.now.is_empty()
+    }
+
+    /// Put the held changes back into `project`, which now holds the session's project. A target
+    /// the session changed meanwhile keeps the session's version; those are returned. A page
+    /// counts as unchanged when only its number changed, and keeps the session's number unless
+    /// this copy renumbered it.
     fn put_back(&self, project: &mut Project) -> Vec<String> {
         let mut lost = Vec::new();
-        if let Some(page) = &self.page {
-            if self.base.page(&page.id) == project.page(&page.id)
-                && let Some(slot) = project.page_mut(&page.id)
-            {
-                let number = std::mem::take(&mut slot.number);
-                *slot = page.clone();
-                slot.number = number;
-            } else {
-                lost.push(format!("page {}", page.number));
+        let mut keep = wc_share::Parts::default();
+        for (id, now) in &self.now.pages {
+            let was = self.was.pages.get(id).cloned().flatten();
+            let (Some(now), Some(was)) = (now, was) else { continue };
+            match project.page(id) {
+                Some(session) if wc_share::same_but_number(session, &was) => {
+                    let mut page = now.clone();
+                    if now.number == was.number {
+                        page.number = session.number.clone();
+                    }
+                    keep.pages.insert(id.clone(), Some(page));
+                }
+                _ => lost.push(format!("page {}", now.number)),
             }
         }
-        for edit in &self.edits {
-            let keys = edit.touches(project);
-            if wc_share::Parts::read(&self.base, &keys) == wc_share::Parts::read(project, &keys) {
-                wc_share::apply_edit(project, edit);
+        for (tag, now) in &self.now.devices {
+            let was = self.was.devices.get(tag).cloned().flatten();
+            if project.devices.get(tag) == was.as_ref() {
+                keep.devices.insert(tag.clone(), now.clone());
             } else {
-                lost.push(edit.describe());
+                lost.push(format!("device {tag}"));
             }
         }
+        if let (Some(now), Some(was)) = (&self.now.meta, &self.was.meta) {
+            if project.meta == **was {
+                keep.meta = Some(now.clone());
+            } else {
+                lost.push("the project properties".into());
+            }
+        }
+        keep.apply(project);
         // The items they use stay locked here: `incoming` keeps entries the session lacks.
         lost
+    }
+
+    /// Take the held changes back in `project`: each target as the copy had synced it.
+    fn drop_from(&self, project: &mut Project) {
+        self.was.apply(project);
     }
 }
 
@@ -1786,6 +1872,11 @@ impl Share {
         // sent now would reach the host ahead of them and take back an older change instead.
         if role.taking_back() {
             return Err("Your last undo is still on its way to the session; try again once it has come back.".into());
+        }
+        // The latest change here never reached the session: undo it here, not an older one there.
+        if !redo && change.is_none() && !self.holding.is_empty() {
+            self.drop_held = true;
+            return Ok(());
         }
         role.take_back(redo, change, &mut self.notes)?;
         self.took_back = true;
@@ -1913,6 +2004,8 @@ impl Share {
         self.pictures_out.clear();
         self.pictures_taken.clear();
         self.pictures_failed.clear();
+        self.holding.clear();
+        self.drop_held = false;
     }
 
     /// Leave or end the session.
@@ -2153,17 +2246,31 @@ impl Share {
         // After that, only a change that uses an item the session has not taken waits, however
         // long: the session refuses a page that draws a symbol it does not have. Others' changes
         // come in meanwhile; the session never had the item, so nothing replaces its entry here.
-        let hold = {
-            let base = self.base.as_ref()?;
-            let (symbols, parts) = fresh_uses(&open.project, base);
-            symbols
-                .iter()
-                .map(|id| item_name(ItemKind::Symbol, id))
-                .chain(parts.iter().map(|id| item_name(ItemKind::Part, id)))
-                .any(|name| self.items_out.contains_key(&name))
-        };
+        let held = Held::find(&open.project, self.base.as_ref()?, &self.items_out);
+        if std::mem::take(&mut self.drop_held) && !held.is_empty() {
+            // Undo of a change that never reached the session: taken back here only.
+            held.drop_from(&mut open.project);
+            self.notes.push(format!(
+                "Your change that waited for {} was undone here; it had not reached the session.",
+                held.items.join(", ")
+            ));
+            return None;
+        }
+        self.holding = held.items.clone();
+        // Only what does not wait goes out: the waiting targets as the copy had synced them.
+        let sendable = (!held.is_empty()).then(|| {
+            let mut p = open.project.clone();
+            held.drop_from(&mut p);
+            p
+        });
         let base = self.base.get_or_insert_with(|| open.project.clone());
-        let mut out = outgoing(&open.project, base, mine, &role.locks(), me);
+        let mut out = outgoing(
+            sendable.as_ref().unwrap_or(&open.project),
+            base,
+            mine,
+            &role.locks(),
+            me,
+        );
         if !out.dropped.is_empty() {
             // One action is kept whole or not at all: a device renamed on two pages must not
             // change the device while the page someone else holds keeps the old tag.
@@ -2174,13 +2281,6 @@ impl Share {
             out.page = None;
             out.edits.clear();
         }
-        // Held changes stay in this copy, on top of what comes in from the session.
-        let held = (hold && (out.page.is_some() || !out.edits.is_empty())).then(|| Held {
-            page: out.page.take(),
-            edits: std::mem::take(&mut out.edits),
-            base: base.clone(),
-            local: open.project.clone(),
-        });
         let sent = out.page.is_some() || !out.edits.is_empty();
         // One action, one change: the edits that can go together are checked and recorded by
         // the host as one batch, all or nothing.
@@ -2212,18 +2312,24 @@ impl Share {
             base,
             auth,
         );
+        let before = (!held.is_empty()).then(|| open.project.clone());
         let mut changed = incoming(&mut open.project, auth);
-        // What this copy has synced to; held changes go on top and are found again next time.
-        let synced = held.as_ref().map(|_| open.project.clone());
-        if let Some(held) = &held {
+        // What this copy has synced to, with the session's lock; the waiting changes go on top
+        // and are found again next time.
+        let synced = before.as_ref().map(|_| {
+            let mut p = open.project.clone();
+            p.lock = auth.lock.clone();
+            p
+        });
+        if let Some(before) = &before {
             let lost = held.put_back(&mut open.project);
-            if !lost.is_empty() && self.unreadable.insert(format!("held {}", lost.join(", "))) {
+            if !lost.is_empty() {
                 self.notes.push(format!(
                     "Your waiting change to {} was not kept: the session changed it meanwhile.",
                     lost.join(", ")
                 ));
             }
-            changed = open.project != held.local;
+            changed = open.project != *before;
         }
         // The session's versions are what this copy has synced to: an item updated here later
         // differs from them ([`updated_here`]).
@@ -2509,6 +2615,12 @@ impl Share {
                             _ => format!("Joined the session at {}.", j.addr),
                         });
                     }
+                }
+                if !self.holding.is_empty() {
+                    ui.label(format!(
+                        "Your changes that use {} wait until the session has it.",
+                        self.holding.join(", ")
+                    ));
                 }
                 ui.separator();
                 ui.label(RichText::new("Participants").strong());

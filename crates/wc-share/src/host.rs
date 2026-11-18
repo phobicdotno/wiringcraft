@@ -460,22 +460,7 @@ impl Host {
             }
             return Ok(());
         }
-        // A page may not start using a symbol the project does not lock: the app sends the item
-        // first (`AddItems`), so only a broken or older guest gets here. Uses the project
-        // already had stay editable.
-        let unlocked = Parts {
-            pages: [(page.id.clone(), Some(page.clone()))].into(),
-            ..Parts::default()
-        }
-        .unlocked_uses(&self.project);
-        if !unlocked.is_empty() {
-            return Err(Refusal::Invalid {
-                reason: format!(
-                    "the page uses {} that the project's library does not have; add it to the session first",
-                    unlocked.join(", ")
-                ),
-            });
-        }
+        unlocked_placements(&self.project, Some(current), &page)?;
         // A wire may not end on a pin the locked version of its symbol lacks: an update may have
         // dropped the pin after the author drew the wire. Wires already like that may stay.
         let on_page = |p: &Page| {
@@ -558,6 +543,7 @@ impl Host {
             });
         }
         check_edit(&self.project, &self.locks, by, &edit)?;
+        check_placements(&self.project, &edit)?;
         if let ProjectEdit::AddPicture { picture } = edit {
             self.add_picture(picture)?;
             return Ok(false);
@@ -1043,5 +1029,46 @@ impl Host {
         let peers = HostMsg::Peers { peers: self.peers() };
         self.send_others(except, locks);
         self.send_others(except, peers);
+    }
+}
+
+/// A page may not start using a symbol the project does not lock: the app sends the item first
+/// (`AddItems`), so only a broken or older guest gets here. Each placement is judged on its own
+/// (by placement and symbol), so placements the page already had stay editable, also of a
+/// symbol the project never locked (older projects), while a new one of that symbol is refused.
+fn unlocked_placements(project: &Project, old: Option<&Page>, new: &Page) -> Result<(), Refusal> {
+    let had: BTreeSet<(&str, &str)> = old
+        .map(|p| p.symbols.iter().map(|o| (o.id.as_str(), o.symbol.as_str())).collect())
+        .unwrap_or_default();
+    let unlocked: BTreeSet<&str> = new
+        .symbols
+        .iter()
+        .filter(|o| !had.contains(&(o.id.as_str(), o.symbol.as_str())))
+        .map(|o| o.symbol.as_str())
+        .filter(|id| !project.lock.symbols.contains_key(*id))
+        .collect();
+    if unlocked.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = unlocked.into_iter().map(|id| format!("symbol {id}")).collect();
+    Err(Refusal::Invalid {
+        reason: format!(
+            "page {} uses {} that the project's library does not have; add it to the session first",
+            new.number,
+            names.join(", ")
+        ),
+    })
+}
+
+/// [`unlocked_placements`] for every page a project edit writes: a new page, the pages of a
+/// `SetPages`, and those in a batch (which never adds items itself).
+fn check_placements(project: &Project, edit: &ProjectEdit) -> Result<(), Refusal> {
+    match edit {
+        ProjectEdit::AddPage { page } => unlocked_placements(project, project.page(&page.id), page),
+        ProjectEdit::SetPages { pages, .. } => pages
+            .iter()
+            .try_for_each(|p| unlocked_placements(project, project.page(&p.id), p)),
+        ProjectEdit::Batch { edits } => edits.iter().try_for_each(|e| check_placements(project, e)),
+        _ => Ok(()),
     }
 }

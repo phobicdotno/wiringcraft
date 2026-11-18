@@ -2496,3 +2496,104 @@ fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestRes
     assert_eq!(out.unreadable[0].0, "symbol lamp");
     Ok(())
 }
+
+/// A session where the guest placed `wc.contact.no` on page 3 and the host refuses to store
+/// it, past the first tries: the placement waits. Returns the placement's id too.
+fn waiting_session(tmp: &Path) -> std::result::Result<(Session, String), Box<dyn std::error::Error>> {
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp)?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    let item = guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    for _ in 0..=ITEM_TRIES {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        std::thread::sleep(ITEM_WAIT);
+    }
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    Ok(((h, log, host_open, g, guest_open), item))
+}
+
+fn has_placement(o: &Open, page: &str, item: &str) -> bool {
+    o.project
+        .page(page)
+        .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+}
+
+#[test]
+fn a_waiting_placement_survives_the_session_renumbering_its_page() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(guest_open.project.page("p0003").map(|p| p.number.as_str()), Some("30"));
+    assert!(has_placement(&guest_open, "p0003", &item), "{:?}", g.notes);
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(has_placement(&host_open, "p0003", &item));
+    assert_eq!(host_open.project.page("p0003").map(|p| p.number.as_str()), Some("30"));
+    Ok(())
+}
+
+#[test]
+fn changes_that_do_not_use_the_waiting_symbol_still_go_out() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    guest_open.project.meta.name = "Pump station 2".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(host_open.project.meta.name, "Pump station 2");
+    assert!(!has_placement(&host_open, "p0003", &item));
+    assert!(has_placement(&guest_open, "p0003", &item));
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_waiting_change_takes_it_back_here_and_not_an_older_one_there() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    let history = h.role.as_ref().map(|r| r.history().len());
+    g.undo()?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(!has_placement(&guest_open, "p0003", &item), "taken back here");
+    assert_eq!(
+        h.role.as_ref().map(|r| r.history().len()),
+        history,
+        "nothing undone in the session"
+    );
+    let notes = g.take_notes();
+    assert!(
+        notes.iter().any(|n| n.contains("had not reached the session")),
+        "{notes:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    // The guest takes another version of the waiting symbol from its library.
+    let mut v2 = guest_open.symbols.get("wc.contact.no").cloned().ok_or("not loaded")?;
+    v2.name = "Contact, newer".into();
+    store::write_vendored_symbol(&guest_open.dir, &v2)?;
+    guest_open
+        .project
+        .lock
+        .symbols
+        .get_mut("wc.contact.no")
+        .ok_or("pin")?
+        .hash = v2.hash();
+    guest_open.symbols.insert(v2.id.clone(), v2.clone());
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(host_open.symbols.get("wc.contact.no"), Some(&v2), "{:?}", g.notes);
+    assert!(has_placement(&host_open, "p0003", &item));
+    Ok(())
+}

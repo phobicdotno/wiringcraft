@@ -3442,5 +3442,64 @@ fn a_page_that_already_used_an_unlocked_symbol_stays_editable() -> TestResult {
     place(&mut page, "s1", 40.0);
     host.edit_page(page)?;
     assert_eq!(host.project().page("p0002").ok_or("page")?.title, "Motor control");
+    // A new placement of that symbol is refused, on this page and on another.
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    place_symbol(&mut page, "again", 60.0, "lamp");
+    let err = host.edit_page(page).err().ok_or("refused")?;
+    assert!(err.to_string().contains("symbol lamp"), "{err}");
+    host.open(Some("p0003"))?;
+    let mut page = host.project().page("p0003").ok_or("page")?.clone();
+    place_symbol(&mut page, "s1", 10.0, "lamp");
+    assert!(host.edit_page(page).is_err());
+    Ok(())
+}
+
+#[test]
+fn pages_written_by_project_edits_may_not_start_using_a_symbol_the_session_lacks() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let mut new_page = Page::new("p0009", "9", "New");
+    place_symbol(&mut new_page, "s1", 10.0, "lamp");
+    let err = host
+        .edit_project(ProjectEdit::AddPage { page: new_page.clone() })
+        .err()
+        .ok_or("refused")?;
+    assert!(err.to_string().contains("symbol lamp"), "{err}");
+    let before = host.project().page("p0003").ok_or("page")?.clone();
+    let mut after = before.clone();
+    place_symbol(&mut after, "s1", 10.0, "lamp");
+    let set = ProjectEdit::SetPages {
+        pages: vec![after.clone()],
+        before: vec![before.clone()],
+    };
+    assert!(host.edit_project(set).is_err());
+    assert!(host.project().page("p0003").ok_or("page")?.symbols.is_empty());
+    // In a batch too.
+    let batch = ProjectEdit::Batch {
+        edits: vec![
+            ProjectEdit::Renumber {
+                numbers: vec![("p0002".into(), "20".into())],
+            },
+            ProjectEdit::SetPages {
+                pages: vec![after.clone()],
+                before: vec![before.clone()],
+            },
+        ],
+    };
+    assert!(host.edit_project(batch).is_err());
+    // Once the session has the symbol, the page is fine.
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(symbol("lamp", "Lamp"), "starter".into())],
+        parts: vec![],
+    })?;
+    host.edit_project(ProjectEdit::SetPages {
+        pages: vec![after],
+        before: vec![before],
+    })?;
+    assert_eq!(host.project().page("p0003").ok_or("page")?.symbols.len(), 1);
     Ok(())
 }
