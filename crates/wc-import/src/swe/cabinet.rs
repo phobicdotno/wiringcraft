@@ -143,6 +143,8 @@ pub fn layouts(
         .collect();
     let mut out = Layouts::default();
     let mut ids: BTreeSet<String> = BTreeSet::new();
+    // One drawing budget for every footprint sized from its drawing, on all layout pages.
+    let mut budget = p.drawings.draw_limit();
     for page in p.pages.iter().filter(|pg| pg.kind == KIND_CABINET) {
         let mut plate: Option<(Point, Point)> = None;
         // Items in page coordinates (y up), placed on the plate once its box is known.
@@ -167,8 +169,10 @@ pub fn layouts(
                 (Kind::Rail | Kind::Duct, None) => out.no_size += 1,
                 (Kind::Device, b) => {
                     let Some(tag) = tag else { continue };
+                    // A box with no width or no height sizes nothing.
+                    let b = b.filter(|(min, max)| max.x > min.x && max.y > min.y);
                     let drawn = || {
-                        let b = p.drawings.placed_extents(s);
+                        let b = p.drawings.placed_extents(s, &mut budget);
                         if b.is_some() {
                             out.from_drawing += 1;
                         }

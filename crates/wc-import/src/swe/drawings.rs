@@ -139,27 +139,26 @@ impl SweDrawings {
 
     /// The box round block `name` placed like `s` (turned and scaled like
     /// [`Self::symbol_graphics`]), on the page: y up, in page millimetres. `None` when the
-    /// archive has no drawing for the block, it draws nothing, or its box has no width or no
-    /// height. Used for cabinet layout footprints without a box size (#232). Entities the
-    /// import's limit would leave out are left out here too; nothing is counted.
-    pub(crate) fn placed_extents(&self, s: &SweSymbol) -> Option<(Point, Point)> {
-        let mut budget = self.draw_limit();
-        let shapes = self.symbol_graphics(s, &mut budget, &mut BTreeMap::new())?;
-        let corners: Vec<Point> = shapes
-            .iter()
-            .flat_map(|sh| {
-                let (a, b) = sh.bounds();
-                [a, b]
-            })
-            .collect();
+    /// archive has no drawing for the block, it draws nothing, its box has no width or no
+    /// height (or one too large to keep), or the drawing is larger than `budget` still allows:
+    /// a box round part of it would be too small. Used for cabinet layout footprints without a
+    /// box size (#232); the entities read count against the import's `budget`.
+    pub(crate) fn placed_extents(&self, s: &SweSymbol, budget: &mut usize) -> Option<(Point, Point)> {
+        let mut skipped = BTreeMap::new();
+        let shapes = self.symbol_graphics(s, budget, &mut skipped)?;
+        if skipped.contains_key(crate::dxf::OVER_LIMIT) {
+            return None;
+        }
+        let corners: Vec<Point> = shapes.iter().flat_map(corners_of).collect();
         // The symbol's frame is y down from the insertion point.
         let (min, max) = wc_core::geom::bounds_of(&corners);
         let (lo, hi) = (
             Point::new(s.at.x + min.x, s.at.y - max.y),
             Point::new(s.at.x + max.x, s.at.y - min.y),
         );
-        let ok = [lo.x, lo.y, hi.x, hi.y].iter().all(|v| v.is_finite()) && hi.x > lo.x && hi.y > lo.y;
-        ok.then_some((lo, hi))
+        // Kept in thousandths of a millimetre, so the sides must stay finite at that scale.
+        let fits = |a: f64, b: f64| b > a && ((b - a) * 1000.0).round().is_finite() && a.is_finite();
+        (fits(lo.x, hi.x) && fits(lo.y, hi.y)).then_some((lo, hi))
     }
 
     /// The shapes of block `name` as they are, unturned and unscaled, in the symbol's own frame:
@@ -487,4 +486,35 @@ mod tests {
         // Non-ASCII names next to the folder never split a character.
         assert_eq!(kind_of("Projects/ø/Drawings/1.ewg", f), None);
     }
+}
+
+/// Points that bound `shape`: for an arc only what it sweeps (its ends and the quarter points
+/// it passes), not its whole circle.
+fn corners_of(shape: &Shape) -> Vec<Point> {
+    let Shape::Arc {
+        center,
+        radius,
+        start,
+        end,
+    } = shape
+    else {
+        let (a, b) = shape.bounds();
+        return vec![a, b];
+    };
+    let mut sweep = end - start;
+    if sweep <= 0.0 {
+        sweep += 360.0;
+    }
+    let at = |deg: f64| {
+        let t = deg.to_radians();
+        Point::new(center.x + radius * t.cos(), center.y + radius * t.sin())
+    };
+    let mut points = vec![at(*start), at(start + sweep)];
+    let first = (start / 90.0).ceil() as i64;
+    let last = ((start + sweep) / 90.0).floor() as i64;
+    // At most one turn: a sweep never passes more than four quarter points.
+    for q in first..=last.min(first + 4) {
+        points.push(at(q as f64 * 90.0));
+    }
+    points
 }

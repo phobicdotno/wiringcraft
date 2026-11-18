@@ -325,3 +325,59 @@ INSERT INTO tew_symbol VALUES (40, 12, 105, 'FP_SWITCH', 300, 640, 0, 0.5, 1, NU
     assert!(!items.note.contains("catalog part"), "{}", items.note);
     assert!(!items.note.contains("estimated"), "{}", items.note);
 }
+
+#[test]
+fn a_footprint_drawing_sizes_an_arc_by_its_sweep_and_a_cut_off_drawing_sizes_nothing() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    let c = with_layout();
+    c.execute_batch(
+        "
+UPDATE tew_buildofmaterial SET bom_reference = 'FUSE-1', bom_manufacturer = 'Maker F' WHERE bom_id = 2;
+UPDATE tew_buildofmaterial SET bom_objectid = 101 WHERE bom_id = 2;
+",
+    )
+    .unwrap();
+    let mut sw = read(&c).unwrap();
+    sw.catalog = vec![Part {
+        id: Part::make_id("Maker F", "FUSE-1"),
+        manufacturer: "Maker F".into(),
+        order_number: "FUSE-1".into(),
+        properties: BTreeMap::from([
+            ("Width".to_owned(), "9".to_owned()),
+            ("Height".to_owned(), "60".to_owned()),
+        ]),
+        ..Default::default()
+    }];
+    let size = |sw: &SweProject| {
+        let (built, _, _) = build(sw, None);
+        built.panels[0]
+            .items
+            .iter()
+            .find_map(|i| match i {
+                PanelItem::Device { tag, width, height, .. } if tag.to_string().ends_with("-F1") => {
+                    Some((*width, *height))
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    // A quarter arc of radius 20 spans 20 x 20, not its whole circle.
+    let mut arc = sw.clone();
+    arc.drawings
+        .add_block("FP_FUSE", &model_space_dwg(&[E::Arc((0.0, 0.0), 20.0, 0.0, 90.0)]))
+        .unwrap();
+    assert_eq!(size(&arc), (20.0, 20.0));
+    // A drawing cut off by the limit would give a box round part of it: the part's size is used.
+    sw.drawings
+        .add_block(
+            "FP_FUSE",
+            &model_space_dwg(&[
+                E::Line((0.0, 0.0), (10.0, 0.0)),
+                E::Line((10.0, 0.0), (10.0, -10.0)),
+                E::Line((0.0, 0.0), (45.0, -80.0)),
+            ]),
+        )
+        .unwrap();
+    sw.drawings.set_draw_limit(2);
+    assert_eq!(size(&sw), (9.0, 60.0));
+}
