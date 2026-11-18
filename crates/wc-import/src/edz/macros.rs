@@ -14,7 +14,9 @@
 //!   (`A621`, points separated by `;`), `O89` a rectangle (corners `A1651`, `A1652`), `O32` an
 //!   arc or circle (centre `A555`, radius the first number of `A556`, from angle `A553` to
 //!   `A554` in radians, counter-clockwise) and `O30` a text (`A501` its point, `A511` its text in
-//!   several languages, its child `S54x505` the height `A961` and the alignment `A966`).
+//!   several languages, its child `S54x505` the height `A961` and the alignment `A966`); `O83`
+//!   is a text with the same attributes. `O88` is a location box (counted, not drawn) and `O132`
+//!   a group.
 //! - `O17`, a symbol placed from a library: library `A1261`, symbol `A1262`, variant `A1263`
 //!   (0 to 3 turn it in quarter steps, 4 to 7 also mirror it), function category `A1381` and
 //!   its refinement `A1382`, connection point designations `A185` (separated by `;`), its point
@@ -22,7 +24,8 @@
 //!   `P20014` in a property child. A macro of several devices (a circuit) leads each pin name
 //!   with its device's tag: `K1:A1`.
 //!   A black box (category 301) has its outline in the child `S89x5`: corners `A1651` and
-//!   `A1652` relative to its point.
+//!   `A1652` relative to its point. The symbol's device tag letter is the black box's, else that
+//!   of the device with the most connection points.
 //!
 //! The multi-line representation, variant A, becomes the symbol: its graphics, black box
 //! outlines, and a pin for each connection point. A placement with one connection point is a
@@ -45,7 +48,7 @@ use wc_core::symbol::{Pin, PinDir, SymbolRole};
 
 use super::pick_language;
 use crate::eplan::EplanFunction;
-use crate::eplan::drawing::{dir_index, rotation_of, symbol_for, vector};
+use crate::eplan::drawing::{UniqueNames, dir_index, rotation_of, symbol_for, vector};
 use crate::{Error, Result, id_segment};
 
 /// Representation type of a multi-line schematic.
@@ -55,6 +58,12 @@ const BLACK_BOX: u16 = 301;
 const MAX_DEPTH: usize = 128;
 /// Most graphics and placements read from one macro.
 const MAX_ITEMS: usize = 200_000;
+/// Most connection points read from one macro.
+const MAX_PINS: usize = 10_000;
+/// Most connection point designations read from one placed symbol.
+const MAX_DESIGNATIONS: usize = 512;
+/// Longest symbol id stem taken from a macro's file name; ids must stay within 128 characters.
+const MAX_STEM: usize = 100;
 /// Text height when a text gives none.
 const TEXT_HEIGHT: f64 = 2.5;
 
@@ -103,16 +112,18 @@ struct Variant {
     /// Objects of other kinds, and objects whose numbers could not be read.
     other: usize,
     damaged: usize,
+    /// Location boxes, not drawn.
+    location_boxes: usize,
 }
 
 fn attr(e: &BytesStart<'_>, name: &str) -> Result<Option<String>> {
     match e
         .try_get_attribute(name)
-        .map_err(|err| Error::Format(format!("bad attribute: {err}")))?
+        .map_err(|err| Error::Format(format!("has a bad attribute: {err}")))?
     {
         Some(a) => Ok(Some(
             a.unescape_value()
-                .map_err(|err| Error::Format(format!("bad value of {name}: {err}")))?
+                .map_err(|err| Error::Format(format!("has a bad value of {name}: {err}")))?
                 .into_owned(),
         )),
         None => Ok(None),
@@ -141,6 +152,21 @@ fn attr_number(e: &BytesStart<'_>, name: &str) -> Result<Option<f64>> {
 
 fn attr_u16(e: &BytesStart<'_>, name: &str) -> Result<Option<u16>> {
     Ok(attr(e, name)?.and_then(|s| s.trim().parse::<u16>().ok()))
+}
+
+/// A placed symbol's connection point designations (`A185`, separated by `;`).
+fn designations(s: &str) -> Result<Vec<String>> {
+    let names: Vec<String> = s
+        .split(';')
+        .take(MAX_DESIGNATIONS + 1)
+        .map(|p| p.trim().to_owned())
+        .collect();
+    if names.len() > MAX_DESIGNATIONS {
+        return Err(Error::Format(format!(
+            "places a symbol with more than {MAX_DESIGNATIONS} connection points"
+        )));
+    }
+    Ok(names)
 }
 
 /// The language EPLAN writes for a text kept the same in every language.
@@ -296,7 +322,8 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                         Some(s) => v.shapes.push(s),
                         None => v.damaged += 1,
                     },
-                    "O30" => match attr_point(e, "A501")? {
+                    // O83 is a text too, with the same attributes.
+                    "O30" | "O83" => match attr_point(e, "A501")? {
                         Some(at) => {
                             let t = Text {
                                 at,
@@ -312,7 +339,7 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                         }
                         None => v.damaged += 1,
                     },
-                    "S54x505" if parent == Some("O30") => {
+                    "S54x505" if matches!(parent, Some("O30" | "O83")) => {
                         if let Some(t) = text_item.as_mut() {
                             if let Some(h) = attr_number(e, "A961")?.filter(|h| *h > 0.0) {
                                 t.height = h;
@@ -329,7 +356,10 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                             variant: attr_u16(e, "A1263")?.map_or(0, |n| (n % 8) as u8),
                             kind: attr_u16(e, "A1381")?.unwrap_or(0),
                             detail: attr_u16(e, "A1382")?.unwrap_or(0),
-                            pins: attr(e, "A185")?.map(|s| s.split(';').map(|p| p.trim().to_owned()).collect()),
+                            pins: match attr(e, "A185")? {
+                                Some(s) => Some(designations(&s)?),
+                                None => None,
+                            },
                             ..Default::default()
                         };
                         if empty {
@@ -367,9 +397,10 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                             }
                         }
                     }
+                    "O88" => v.location_boxes += 1,
                     // Groups and pages only hold other objects; the macro's own frame (O37) is
                     // not drawn.
-                    "O4" | "O14" | "O26" | "O37" | "O76" => {}
+                    "O4" | "O14" | "O26" | "O37" | "O76" | "O132" => {}
                     t if t.starts_with('O') => v.other += 1,
                     _ => {}
                 }
@@ -392,7 +423,7 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                             }
                         }
                     }
-                    "O30" => {
+                    "O30" | "O83" => {
                         if let (Some(t), Some(v)) = (text_item.take(), current.as_mut()) {
                             v.texts.push(t);
                         }
@@ -456,8 +487,12 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     let all = variants(text)?;
     let multi: Vec<&Variant> = all.iter().filter(|v| v.doc == Some(MULTI_LINE)).collect();
     let Some(v) = multi.iter().find(|v| v.id == 0).or_else(|| multi.first()).copied() else {
-        let mut kinds: Vec<String> = all.iter().map(|v| representation(v.doc)).collect();
-        kinds.dedup();
+        let mut kinds: Vec<String> = Vec::new();
+        for k in all.iter().map(|v| representation(v.doc)) {
+            if !kinds.contains(&k) {
+                kinds.push(k);
+            }
+        }
         return Err(Error::Format(if kinds.is_empty() {
             "holds no representation".into()
         } else {
@@ -479,6 +514,16 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         v.other,
     );
     add(&mut left_out, "objects whose numbers could not be read", v.damaged);
+    add(&mut left_out, "location boxes", v.location_boxes);
+    let pin_count: usize = v
+        .placements
+        .iter()
+        .filter(|p| p.kind != BLACK_BOX)
+        .map(|p| p.pins.as_ref().map_or(0, |n| n.len().max(1)))
+        .sum();
+    if pin_count > MAX_PINS {
+        return Err(Error::Format(format!("holds more than {MAX_PINS} connection points")));
+    }
 
     // EPLAN's y axis points up; the symbol's down, with the reference point as its origin.
     let r = v.reference;
@@ -539,17 +584,18 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
 
     let mut pins: Vec<Pin> = Vec::new();
     // The device tag of each pin's placement, by pin.
-    let mut owners: Vec<String> = Vec::new();
-    let mut letter = String::new();
+    let mut owners: Vec<(String, String)> = Vec::new();
+    // The device tag letter of the black box, if it has one.
+    let mut box_letter = String::new();
     let mut drawn_kinds: Vec<SymbolRole> = Vec::new();
     let mut box_count = 0usize;
     for p in &v.placements {
         let Some(at) = p.at else { continue };
-        if letter.is_empty() && !p.letter.is_empty() {
-            letter = p.letter.clone();
-        }
         let origin = page(at);
         if p.kind == BLACK_BOX {
+            if box_letter.is_empty() {
+                box_letter = p.letter.clone();
+            }
             if let Some((a, b)) = p.outline {
                 let (a, b) = (page(at + a), page(at + b));
                 graphics.push(Shape::Rect {
@@ -557,6 +603,8 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                     max: Point::new(a.x.max(b.x), a.y.max(b.y)),
                 });
                 box_count += 1;
+            } else {
+                add(&mut left_out, "black boxes without an outline", 1);
             }
             continue;
         }
@@ -571,7 +619,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                 at: origin,
                 dir: turned(PinDir::Up, p.variant),
             });
-            owners.push(format!("{}{}", p.letter, p.number));
+            owners.push((p.letter.clone(), p.number.clone()));
             if p.library != "SPECIAL" {
                 add(&mut left_out, "library graphics of connection points (pins kept)", 1);
             }
@@ -598,7 +646,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                 at: origin + pin.at.transform(rotation, mirror),
                 dir: turned(pin.dir, p.variant),
             });
-            owners.push(format!("{}{}", p.letter, p.number));
+            owners.push((p.letter.clone(), p.number.clone()));
         }
         drawn_kinds.push(s.role);
         add(
@@ -610,22 +658,36 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
 
     // Each pin name once: blanks are numbered, and in a macro of several devices (a circuit)
     // each name is led by its device's tag, `K1:13`; repeats left are marked.
-    let devices: std::collections::BTreeSet<&str> =
-        owners.iter().map(String::as_str).filter(|t| !t.is_empty()).collect();
-    let prefix = devices.len() > 1;
-    let mut seen: Vec<String> = Vec::new();
-    for (k, pin) in pins.iter_mut().enumerate() {
-        if pin.name.is_empty() {
-            pin.name = (k + 1).to_string();
-        }
-        if prefix && let Some(tag) = owners.get(k).filter(|t| !t.is_empty()) {
-            pin.name = format!("{tag}:{}", pin.name);
-        }
-        while seen.contains(&pin.name) {
-            pin.name.push('\'');
-        }
-        seen.push(pin.name.clone());
+    let tags: Vec<String> = owners.iter().map(|(l, n)| format!("{l}{n}")).collect();
+    // Pins by device tag, and where each tag was first seen.
+    let mut per_device: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for (k, t) in tags.iter().enumerate().filter(|(_, t)| !t.is_empty()) {
+        per_device.entry(t.as_str()).or_insert((0, k)).0 += 1;
     }
+    let prefix = per_device.len() > 1;
+    let mut unique = UniqueNames::default();
+    for (k, pin) in pins.iter_mut().enumerate() {
+        let mut name = std::mem::take(&mut pin.name);
+        if name.is_empty() {
+            name = (k + 1).to_string();
+        }
+        if prefix && let Some(tag) = tags.get(k).filter(|t| !t.is_empty()) {
+            name = format!("{tag}:{name}");
+        }
+        pin.name = unique.unique(name);
+    }
+    // The symbol's letter: the black box's, else that of the device owning the most pins (the
+    // first seen of equals).
+    let letter = if box_letter.is_empty() {
+        per_device
+            .values()
+            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+            .and_then(|(_, k)| owners.get(*k))
+            .map(|(l, _)| l.clone())
+            .unwrap_or_default()
+    } else {
+        box_letter
+    };
 
     if graphics.is_empty() && pins.is_empty() {
         return Err(Error::Format("draws nothing in its multi-line representation".into()));
@@ -644,7 +706,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     };
     Ok(MacroSymbol {
         symbol: Symbol {
-            id: format!("eplan.{}", id_segment(stem)),
+            id: format!("eplan.{}", id_segment(&stem.chars().take(MAX_STEM).collect::<String>())),
             name: stem.to_owned(),
             category: "EPLAN macros".into(),
             letter_code: letter,

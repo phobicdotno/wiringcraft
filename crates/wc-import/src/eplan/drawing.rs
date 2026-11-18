@@ -144,21 +144,55 @@ fn pin(name: &str, x: f64, y: f64, dir: PinDir) -> Pin {
     }
 }
 
+/// Makes names unique in the order they come: the first of a name is kept, its repeats are
+/// marked `1'`, `1''`, `1'''` and then numbered `1#4`, `1#5`, ... Each name costs about the
+/// same however many repeats came before it.
+#[derive(Debug, Default)]
+pub(crate) struct UniqueNames {
+    used: BTreeSet<String>,
+    /// For each name, the repeat number to try next.
+    next: BTreeMap<String, usize>,
+}
+
+impl UniqueNames {
+    /// Marks the most repeats get before they are numbered.
+    const MARKS: usize = 3;
+
+    /// `name`, or the first marked or numbered form of it not given out yet.
+    pub(crate) fn unique(&mut self, name: String) -> String {
+        if self.used.insert(name.clone()) {
+            return name;
+        }
+        let mut k = self.next.get(&name).copied().unwrap_or(1);
+        loop {
+            let candidate = if k <= Self::MARKS {
+                format!("{name}{}", "'".repeat(k))
+            } else {
+                format!("{name}#{k}")
+            };
+            k += 1;
+            if self.used.insert(candidate.clone()) {
+                self.next.insert(name, k);
+                return candidate;
+            }
+        }
+    }
+}
+
 /// Pin names: Eplan's, with blanks numbered and repeats marked so each is unique.
 fn pin_names(f: &EplanFunction) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for (k, p) in f.pins.iter().enumerate() {
-        let mut name = if p.trim().is_empty() {
-            (k + 1).to_string()
-        } else {
-            p.trim().to_owned()
-        };
-        while out.contains(&name) {
-            name.push('\'');
-        }
-        out.push(name);
-    }
-    out
+    let mut names = UniqueNames::default();
+    f.pins
+        .iter()
+        .enumerate()
+        .map(|(k, p)| {
+            names.unique(if p.trim().is_empty() {
+                (k + 1).to_string()
+            } else {
+                p.trim().to_owned()
+            })
+        })
+        .collect()
 }
 
 /// A make or break contact: top pin at the origin, bottom pin `LENGTH` below.

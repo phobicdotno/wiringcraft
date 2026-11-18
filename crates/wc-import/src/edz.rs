@@ -415,10 +415,20 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
 
     let in_archive: std::collections::BTreeSet<String> =
         report.macro_files.iter().map(|f| macro_file_name(f)).collect();
+    // A part may name its macro without `.ema`.
+    let file_of = |name: &str| {
+        let file = macro_file_name(name);
+        if in_archive.contains(&file) || file.ends_with(".ema") {
+            file
+        } else {
+            format!("{file}.ema")
+        }
+    };
     for p in parts.values_mut() {
         for k in MACRO_PROPERTIES {
             if let Some(name) = p.properties.get(k) {
-                let symbol = by_file.get(&macro_file_name(name)).cloned();
+                let file = file_of(name);
+                let symbol = by_file.get(&file).cloned();
                 if p.symbol.is_none()
                     && let Some(s) = &symbol
                 {
@@ -427,7 +437,7 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
                 report.part_macros.push(PartMacro {
                     part: p.id.clone(),
                     name: name.clone(),
-                    in_archive: in_archive.contains(&macro_file_name(name)),
+                    in_archive: in_archive.contains(&file),
                     symbol,
                 });
             }

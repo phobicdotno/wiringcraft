@@ -466,3 +466,18 @@ fn a_macro_counts_towards_the_total_limit() -> TestResult {
     assert_eq!(got.report.too_large, 1);
     Ok(())
 }
+
+#[test]
+fn a_part_naming_its_macro_without_the_extension_gets_its_symbol() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="SIE.3RT2015" P_ARTICLE_MANUFACTURER="SIE" P_ARTICLE_MACRO="$(MD_MACROS)\SIE\SIE_3RT2015"/></partsmanagement>"#;
+    let edz = zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("SIE_3RT2015.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?;
+    let got = read_all(&edz)?;
+    let part = got.parts.first().ok_or("no part")?;
+    assert_eq!(part.symbol.as_deref(), Some("eplan.sie_3rt2015"));
+    let m = got.report.part_macros.first().ok_or("no part macro")?;
+    assert!(m.in_archive, "{m:?}");
+    Ok(())
+}

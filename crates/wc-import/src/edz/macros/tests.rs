@@ -296,3 +296,123 @@ fn pins_of_a_macro_with_several_devices_are_led_by_their_device_tag() -> TestRes
     assert_eq!(s.role, SymbolRole::Standalone);
     Ok(())
 }
+
+/// A macro of `n` device connection points, all named `1`.
+fn many_points(n: usize) -> String {
+    let mut text = String::from(r#"<EplanPxfRoot><MacroVariant MacroFuncType="1" ReferencePoint="0/0">"#);
+    for k in 0..n {
+        text.push_str(&format!(r#"<O17 A1381="300" A185="1"><S40x1201 A762="{k}/0"/></O17>"#));
+    }
+    text.push_str("</MacroVariant></EplanPxfRoot>");
+    text
+}
+
+#[test]
+fn a_large_macro_with_repeated_names_is_read_quickly_and_a_larger_one_refused() -> TestResult {
+    let start = std::time::Instant::now();
+    let s = read("big.ema", &many_points(MAX_PINS))?.symbol;
+    let names: std::collections::BTreeSet<&str> = s.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names.len(), MAX_PINS, "every pin name is unique");
+    let first: Vec<&str> = s.pins.iter().take(5).map(|p| p.name.as_str()).collect();
+    assert_eq!(first, ["1", "1'", "1''", "1'''", "1#4"]);
+    let e = read("big.ema", &many_points(2 * MAX_PINS))
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert_eq!(e, format!("holds more than {MAX_PINS} connection points"));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_placed_symbol_with_too_many_designations_is_refused() {
+    let many = vec!["1"; 20_000].join(";");
+    let text = format!(
+        r#"<EplanPxfRoot><MacroVariant MacroFuncType="1"><O17 A1381="200" A185="{many}"><S40x1201 A762="0/0"/></O17></MacroVariant></EplanPxfRoot>"#
+    );
+    let e = read("x.ema", &text).err().map(|e| e.to_string()).unwrap_or_default();
+    assert_eq!(
+        e,
+        format!("places a symbol with more than {MAX_DESIGNATIONS} connection points")
+    );
+}
+
+#[test]
+fn unique_names_mark_then_number_repeats_and_skip_names_already_given() {
+    let mut u = UniqueNames::default();
+    let got: Vec<String> = ["1", "1'", "1", "1", "1", "1", "1#4", "1"]
+        .into_iter()
+        .map(|n| u.unique(n.to_owned()))
+        .collect();
+    assert_eq!(got, ["1", "1'", "1''", "1'''", "1#4", "1#5", "1#4'", "1#6"]);
+    // Many repeats take about the same time each.
+    let mut u = UniqueNames::default();
+    let start = std::time::Instant::now();
+    let names: std::collections::BTreeSet<String> = (0..20_000).map(|_| u.unique("1".into())).collect();
+    assert_eq!(names.len(), 20_000);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_symbol_id_from_a_long_file_name_is_shortened() -> TestResult {
+    let name = format!("{}.ema", "x".repeat(300));
+    let text =
+        r#"<EplanPxfRoot><MacroVariant MacroFuncType="1"><O31 A531="0/0" A532="1/1"/></MacroVariant></EplanPxfRoot>"#;
+    let s = read(&name, text)?.symbol;
+    assert_eq!(s.id, format!("eplan.{}", "x".repeat(MAX_STEM)));
+    wc_core::store::check_id(&format!("{}_99", s.id))?;
+    Ok(())
+}
+
+#[test]
+fn errors_read_as_a_sentence_and_name_each_representation_once() {
+    let bad = r#"<EplanPxfRoot><MacroVariant MacroFuncType="1"><O31 A531="&bad;"/></MacroVariant></EplanPxfRoot>"#;
+    let e = read("x.ema", bad).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.starts_with("has a bad value of A531: "), "{e:?}");
+    let layouts = r#"<EplanPxfRoot><MacroVariant MacroFuncType="6"/><MacroVariant MacroFuncType="10"/>
+        <MacroVariant MacroFuncType="6" VariantId="1"/></EplanPxfRoot>"#;
+    let e = read("x.ema", layouts).err().map(|e| e.to_string()).unwrap_or_default();
+    assert_eq!(e, "has no multi-line representation (only panel layout, 3D)");
+}
+
+#[test]
+fn texts_of_the_second_kind_are_drawn_location_boxes_counted_and_groups_opened() -> TestResult {
+    let text = r#"<EplanPxfRoot><MacroVariant MacroFuncType="1" ReferencePoint="0/0">
+        <O132><O83 A501="10/-5" A511="de_DE@Not-Aus;en_US@Emergency stop;"><S54x505 A961="3" A966="10"/></O83></O132>
+        <O88 A1631="0/-48" A1632="72/0"/>
+        <O17 A1381="301"><S40x1201 A762="0/0"/><P144 P20013="A"/></O17>
+        </MacroVariant></EplanPxfRoot>"#;
+    let m = read("x.ema", text)?;
+    assert!(m.symbol.graphics.contains(&Shape::Text {
+        at: Point::new(10.0, 5.0),
+        text: "Emergency stop".into(),
+        height: 3.0,
+        align: Align::Left,
+        angle: 0.0,
+    }));
+    let want: BTreeMap<String, usize> = [("location boxes", 1), ("black boxes without an outline", 1)]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+    assert_eq!(m.left_out, want);
+    assert_eq!(m.symbol.letter_code, "A");
+    Ok(())
+}
+
+#[test]
+fn the_letter_is_that_of_the_device_with_the_most_pins() -> TestResult {
+    let text = r#"<EplanPxfRoot><MacroVariant MacroFuncType="1" ReferencePoint="0/0">
+        <O17 A1381="300" A185="PE"><S40x1201 A762="0/0"/><P144 P20013="PE" P20014="1"/></O17>
+        <O17 A1381="200" A1382="1" A185="A1;A2"><S40x1201 A762="20/0"/><P144 P20013="K" P20014="1"/></O17>
+        </MacroVariant></EplanPxfRoot>"#;
+    assert_eq!(read("circuit.ema", text)?.symbol.letter_code, "K");
+    Ok(())
+}
