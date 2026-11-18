@@ -3626,8 +3626,8 @@ fn add_built(
         None
     } else {
         // A symbol the project has no readable copy of, which the import brings, changes which
-        // placed items are terminals. Whether the jumpers' numbers were given with it or without
-        // it cannot be told, so jumpers on a strip it renumbers are not guessed at.
+        // placed items are terminals. Whether the jumpers' and rail order's numbers were given
+        // with it or without it cannot be told, so a strip it renumbers is not guessed at.
         let (own, _) = store::vendored_symbols(dir, p);
         let mut symbols = own.clone();
         for s in &built.symbols {
@@ -3646,10 +3646,9 @@ fn add_built(
                     .map(|(_, (strip, _))| strip),
             )
             .collect();
-        if let Some(strip) = strips
-            .into_iter()
-            .find(|s| p.meta.jumpers.iter().any(|j| &j.strip == *s))
-        {
+        if let Some(strip) = strips.into_iter().find(|s| {
+            p.meta.jumpers.iter().any(|j| &j.strip == *s) || p.meta.strip_layout(s).is_some_and(|l| !l.is_empty())
+        }) {
             let missing: Vec<&str> = built
                 .symbols
                 .iter()
@@ -3658,7 +3657,7 @@ fn add_built(
                 .filter(|id| p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == *id)))
                 .collect();
             return Err(format!(
-                "the jumpers of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
+                "the jumpers and rail order of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
                 missing.join(", ")
             ));
         }
@@ -5283,6 +5282,58 @@ mod tests {
         let mut p = load(&dir).unwrap();
         add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap();
         assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
+    fn an_import_that_brings_a_missing_terminal_symbol_does_not_guess_a_rail_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let term = |id: &str| wc_core::Symbol {
+            id: id.into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let placed = |id: &str, symbol: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse("-X1").ok(),
+        };
+        let mut p = load(&dir).unwrap();
+        // No jumpers, only a rail order "2, 1": c then b without the missing symbol, b then a
+        // with it.
+        store::write_vendored_symbol(&dir, &term("test.term")).unwrap();
+        p.pages[0].symbols.extend([
+            placed("a", "test.missing", 10.0),
+            placed("b", "test.term", 20.0),
+            placed("c", "test.term", 30.0),
+        ]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.set_terminal_order(&x1, &["2".into(), "1".into()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        let mut p = load(&dir).unwrap();
+        let built = || wc_import::aml::Built {
+            symbols: vec![term("test.missing")],
+            ..Default::default()
+        };
+        let err = add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap_err();
+        assert!(err.contains("rail order of -X1"), "{err}");
+        assert!(err.contains("no readable copy of test.missing"), "{err}");
+        assert!(
+            store::read_vendored_symbol(&dir, "test.missing").is_err(),
+            "nothing written"
+        );
+        let order = |p: &Project| p.meta.strip_layout(&x1).map(|l| l.order.clone());
+        assert_eq!(order(&load(&dir).unwrap()), Some(vec!["2".into(), "1".into()]));
     }
 
     #[test]
