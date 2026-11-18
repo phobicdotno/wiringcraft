@@ -2110,8 +2110,9 @@ pub struct Share {
     /// The items this copy's waiting changes wait for ([`Held`]), as of the last sync.
     holding: Vec<String>,
     /// Waiting pages the session renumbered while they waited, with the number they had
-    /// before: an Undo here keeps the session's number on them ([`latest_waiting_step`]).
-    renumbered: BTreeMap<String, String>,
+    /// before and the undo position ([`Open::undo_mark`]) then: an Undo here of an action from
+    /// before that keeps the session's number on them ([`latest_waiting_step`]).
+    renumbered: BTreeMap<String, (String, usize)>,
     /// Undo asked for while changes were waiting: they are taken back here at the next sync,
     /// instead of an older change in the session.
     drop_held: bool,
@@ -2513,13 +2514,14 @@ impl Held {
 /// What takes back the latest action here, when it changed what waits (`held`): those
 /// targets as they were before that action, from the copy's own undo history. `None` when the
 /// latest action changed nothing that waits. A page the session renumbered since that action
-/// (`renumbered`: page id to its number before) keeps the session's number, as when the
-/// waiting changes are put back; a number this copy changed is taken back like the rest.
+/// (`renumbered`: page id to its number before and the undo position then) keeps the
+/// session's number, as when the waiting changes are put back; a number this copy changed,
+/// also after the session's, is taken back like the rest.
 fn latest_waiting_step(
     open: &Open,
     base: &Project,
     held: &Held,
-    renumbered: &BTreeMap<String, String>,
+    renumbered: &BTreeMap<String, (String, usize)>,
 ) -> Option<wc_share::Parts> {
     let prev = open.before_last_change()?;
     // A new device a waiting page named before the action comes back with it, even when the
@@ -2540,10 +2542,13 @@ fn latest_waiting_step(
         .collect();
     keys.devices.extend(named_before);
     let mut step = wc_share::Parts::read(prev, &keys);
-    // A page number the session changed since is kept, before comparing, so a stale number
-    // alone is no step to take back.
+    // A page number the session changed since the action is kept, before comparing, so a
+    // stale number alone is no step to take back. Only for an action from before the session's
+    // renumbering: one after it set its number here.
+    let at = open.undo_mark().saturating_sub(1);
     for (id, page) in step.pages.iter_mut() {
-        if let (Some(page), Some(now), Some(old)) = (page.as_mut(), open.project.page(id), renumbered.get(id))
+        if let (Some(page), Some(now), Some((old, mark))) = (page.as_mut(), open.project.page(id), renumbered.get(id))
+            && at < *mark
             && page.number == *old
         {
             page.number = now.number.clone();
@@ -2615,6 +2620,15 @@ const ITEM_RETRY_LATER: std::time::Duration = if cfg!(test) {
 const ITEM_TRIES: u32 = 3;
 
 impl Share {
+    /// Undo steps taken off `open` are gone: a later step at their position is newer than any
+    /// session renumbering recorded in [`Share::renumbered`].
+    fn follow_undo_marks(&mut self, open: &Open) {
+        let mark = open.undo_mark();
+        for (_, at) in self.renumbered.values_mut() {
+            *at = (*at).min(mark);
+        }
+    }
+
     pub fn active(&self) -> bool {
         self.role.is_some()
     }
@@ -3216,6 +3230,7 @@ impl Share {
                 Some(step) => {
                     step.apply(&mut open.project);
                     open.forget_last_change();
+                    self.follow_undo_marks(open);
                 }
                 None => held.drop_from(&mut open.project),
             }
@@ -3278,11 +3293,17 @@ impl Share {
         if held.is_empty() {
             self.renumbered.clear();
         }
+        let mark = open.undo_mark();
+        for (_, at) in self.renumbered.values_mut() {
+            *at = (*at).min(mark);
+        }
         for id in held.now.pages.keys() {
             if let (Some(was), Some(now)) = (base.page(id), auth.page(id))
                 && was.number != now.number
             {
-                self.renumbered.entry(id.clone()).or_insert_with(|| was.number.clone());
+                self.renumbered
+                    .entry(id.clone())
+                    .or_insert_with(|| (was.number.clone(), mark));
             }
         }
         let conflicting = conflicts(&open.project, base, auth);
