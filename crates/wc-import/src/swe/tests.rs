@@ -2355,3 +2355,35 @@ fn reaching_the_drawing_limit_is_reported_by_the_import() {
         "1 drawn as boxes: 1 block(s) without a readable drawing in the archive; 1 drawn as boxes: the drawings' entity limit was reached"
     );
 }
+
+#[test]
+fn refused_drawing_files_count_against_the_archive_total() {
+    let small = model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]);
+    let file = small.len() as u64;
+    let big = vec![0u8; 3 * small.len()];
+    // Two files too big to keep, then one that fits: the bytes read of the two refused ones
+    // (one past the file limit each) use up the total, so the third is not read.
+    let buf = archive(&[("Block/A.dwg", &big), ("Block/B.dwg", &big), ("Block/D.dwg", &small)]);
+    let lim = drawings::Limits {
+        file,
+        total: 2 * (file + 1),
+    };
+    let drawings = drawings::drawings_within(buf, "Projects/3", lim).unwrap();
+    assert!(!drawings.has_block("D"), "{:?}", drawings.warnings);
+    assert!(
+        drawings
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("2 drawing file(s) could not be read")),
+        "{:?}",
+        drawings.warnings
+    );
+    assert!(
+        drawings
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("1 drawing file(s) were not read")),
+        "{:?}",
+        drawings.warnings
+    );
+}

@@ -278,6 +278,27 @@ fn kind_of(name: &str, folder: &str) -> Option<Kind> {
 /// too; the project's own copy of a block wins over the library's. Files that cannot be read are
 /// in [`SweDrawings::warnings`].
 pub fn drawings_from_archive<R: Read + std::io::Seek>(reader: R, folder: &str) -> Result<SweDrawings> {
+    drawings_within(reader, folder, Limits::ARCHIVE)
+}
+
+/// Byte limits on the drawing files read out of one archive.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// The most bytes one file may hold.
+    pub file: u64,
+    /// The most bytes all files may hold in all.
+    pub total: u64,
+}
+
+impl Limits {
+    const ARCHIVE: Limits = Limits {
+        file: MAX_DRAWING_BYTES,
+        total: MAX_DRAWINGS_TOTAL,
+    };
+}
+
+/// [`drawings_from_archive`] with byte limits `lim`.
+pub(crate) fn drawings_within<R: Read + std::io::Seek>(reader: R, folder: &str, lim: Limits) -> Result<SweDrawings> {
     let mut zip =
         zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
     let folder = folder.trim_end_matches('/');
@@ -295,12 +316,12 @@ pub fn drawings_from_archive<R: Read + std::io::Seek>(reader: R, folder: &str) -
     let mut left_out = 0usize;
     let mut total = 0u64;
     for (n, (i, name, kind)) in wanted.into_iter().enumerate() {
-        if n >= MAX_DRAWING_FILES || total >= MAX_DRAWINGS_TOTAL {
+        if n >= MAX_DRAWING_FILES || total >= lim.total {
             left_out += 1;
             continue;
         }
         // Every byte read counts against the total, also of a file then refused.
-        let (got, read) = read_entry(&mut zip, i, &name, MAX_DRAWINGS_TOTAL - total);
+        let (got, read) = read_entry(&mut zip, i, &name, lim, lim.total - total);
         total += read;
         let bytes = match got {
             Ok(b) => b,
@@ -333,18 +354,19 @@ pub fn drawings_from_archive<R: Read + std::io::Seek>(reader: R, folder: &str) -
     if left_out > 0 {
         out.warnings.push(format!(
             "{left_out} drawing file(s) were not read: the archive has more than {MAX_DRAWING_FILES} files or {} MB of drawings",
-            MAX_DRAWINGS_TOTAL >> 20
+            lim.total >> 20
         ));
     }
     Ok(out)
 }
 
-/// Read entry `i`, at most [`MAX_DRAWING_BYTES`] and at most `left` bytes. Returns the bytes
+/// Read entry `i`, at most `lim.file` and at most `left` bytes. Returns the bytes
 /// (or why not) and how many bytes were read either way.
 fn read_entry<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     i: usize,
     name: &str,
+    lim: Limits,
     left: u64,
 ) -> (Result<Vec<u8>>, u64) {
     let f = match zip.by_index(i) {
@@ -353,18 +375,15 @@ fn read_entry<R: Read + std::io::Seek>(
     };
     let mut bytes = Vec::new();
     // Read at most one byte past the limit, whatever the zip header claims.
-    let limit = MAX_DRAWING_BYTES.min(left);
+    let limit = lim.file.min(left);
     let got = f.take(limit + 1).read_to_end(&mut bytes);
     let read = bytes.len() as u64;
     if let Err(e) = got {
         return (Err(Error::Format(format!("{name}: {e}"))), read);
     }
-    if read > MAX_DRAWING_BYTES {
+    if read > lim.file {
         return (
-            Err(Error::Format(format!(
-                "{name} is larger than {} MB",
-                MAX_DRAWING_BYTES >> 20
-            ))),
+            Err(Error::Format(format!("{name} is larger than {} MB", lim.file >> 20))),
             read,
         );
     }
@@ -372,7 +391,7 @@ fn read_entry<R: Read + std::io::Seek>(
         return (
             Err(Error::Format(format!(
                 "{name} would take the drawings past {} MB in all",
-                MAX_DRAWINGS_TOTAL >> 20
+                lim.total >> 20
             ))),
             read,
         );
