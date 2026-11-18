@@ -72,7 +72,15 @@ pin the new version drops; undoing it puts the old version back in every copy (#
 is refused while a wire ends on a pin the version it brings back does not have, for example a
 pin the update added that has been wired since: move or remove that wire, then undo again. A
 joining copy takes a symbol the session did not send from its own libraries only in the version
-the session pinned; otherwise it reports the symbol as missing.
+the session pinned; otherwise it reports the symbol as missing. A page, device or jumper that uses
+a symbol or part the session does not have yet waits in the window until the session takes the
+item, however long that takes, and the session window says what it waits for (#198). Other changes
+go out and others' changes keep coming in meanwhile. When the session changes that same page,
+device or the project properties before it takes the item, the waiting change is dropped and a note
+says so; a change of the page's number alone keeps it. Undo while a change waits takes that change
+back here only. For the first few seconds after an item is sent, while the session answers,
+everything waits, as before. The host refuses a page that places a symbol the project does not lock
+(#286); placements a page already had stay editable.
 
 Host and guests must run builds with the same session protocol version
 (`wc_share::PROTOCOL_VERSION`, raised whenever a message changes). A guest on another version is

@@ -2075,6 +2075,47 @@ fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestRes
     Ok(())
 }
 
+#[test]
+fn a_dwg_spline_by_fit_points_is_a_smooth_curve() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        // Scenario 2: fit tolerance, start and end tangents (none given: zero), three fit points.
+        let mut fit = entity(v, 36, 0x300, head(None));
+        fit.data
+            .bl(2)
+            .bl(3)
+            .bd(1e-7)
+            .bd3((0.0, 0.0, 0.0))
+            .bd3((0.0, 0.0, 0.0))
+            .bl(3);
+        for p in [(0.0, 20.0, 0.0), (5.0, 25.0, 0.0), (10.0, 20.0, 0.0)] {
+            fit.data.bd3(p);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            fit,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        let pts = match d.model.first() {
+            Some(Shape::Polyline { points, .. }) => points.clone(),
+            other => return Err(format!("no polyline: {other:?}").into()),
+        };
+        // A curve, not two segments: many points, and above the straight segment at x = 2.5
+        // (page y is down: above means a smaller y than -22.5).
+        assert!(pts.len() > 10, "{v:?}: {pts:?}");
+        let quarter = pts
+            .iter()
+            .min_by(|a, b| (a.x - 2.5).abs().total_cmp(&(b.x - 2.5).abs()));
+        assert!(quarter.is_some_and(|q| q.y < -22.5 - 0.3), "{v:?}: {quarter:?}");
+        // And it reaches its three fit points (page y down).
+        for (x, y) in [(0.0, -20.0), (5.0, -25.0), (10.0, -20.0)] {
+            let d = pts.iter().map(|q| (q.x - x).hypot(q.y - y)).fold(f64::MAX, f64::min);
+            assert!(d < 0.05, "{v:?}: ({x}, {y}) is {d} away");
+        }
+    }
+    Ok(())
+}
+
 /// A 2004 drawing with a block named "Реле" holding the text "Пуск", both in Windows-1251.
 fn cyrillic_2004(codepage: u16) -> Sections {
     let v = Version::R2004;

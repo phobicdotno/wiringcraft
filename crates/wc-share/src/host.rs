@@ -460,6 +460,7 @@ impl Host {
             }
             return Ok(());
         }
+        unlocked_placements(&self.project, Some(current), &page)?;
         // A wire may not end on a pin the locked version of its symbol lacks: an update may have
         // dropped the pin after the author drew the wire. Wires already like that may stay.
         let on_page = |p: &Page| {
@@ -542,6 +543,7 @@ impl Host {
             });
         }
         check_edit(&self.project, &self.locks, by, &edit)?;
+        check_placements(&self.project, &edit)?;
         if let ProjectEdit::AddPicture { picture } = edit {
             self.add_picture(picture)?;
             return Ok(false);
@@ -611,14 +613,7 @@ impl Host {
     fn add_picture(&mut self, picture: crate::Picture) -> Result<(), Refusal> {
         match self.pictures.get(&picture.file) {
             Some(have) if *have == picture.data => return Ok(()),
-            Some(_) => {
-                return Err(Refusal::Invalid {
-                    reason: format!(
-                        "the session already has another picture named {}; pick the picture again to give it a new name",
-                        picture.file
-                    ),
-                });
-            }
+            Some(_) => return Err(Refusal::PictureNameTaken { file: picture.file }),
             None => {}
         }
         let (count, bytes) = self.added_pictures;
@@ -633,9 +628,14 @@ impl Host {
                 ),
             });
         }
-        self.journal
-            .picture(&picture)
-            .map_err(|e| Refusal::NotRecorded { reason: e.to_string() })?;
+        // A file of that name in the host's folder that the session does not use (an old logo) is
+        // never written over: the sender renames its picture instead.
+        self.journal.picture(&picture).map_err(|e| match e {
+            crate::Error::PictureNameTaken(_) => Refusal::PictureNameTaken {
+                file: picture.file.clone(),
+            },
+            e => Refusal::NotRecorded { reason: e.to_string() },
+        })?;
         self.added_pictures = (count + 1, bytes + picture.data.len());
         self.pictures.insert(picture.file.clone(), picture.data.clone());
         let ids: Vec<PeerId> = self.joined_guests().collect();
@@ -1027,5 +1027,55 @@ impl Host {
         let peers = HostMsg::Peers { peers: self.peers() };
         self.send_others(except, locks);
         self.send_others(except, peers);
+    }
+}
+
+/// A page may not start using a symbol the project does not lock: the app sends the item first
+/// (`AddItems`), so only a broken or older guest gets here. Each placement is judged on its own
+/// (by placement and symbol), so placements the page already had stay editable, also of a
+/// symbol the project never locked (older projects), while a new one of that symbol is refused.
+fn unlocked_placements(project: &Project, old: Option<&Page>, new: &Page) -> Result<(), Refusal> {
+    // Counted: one placement the page had keeps one placement editable, so copies of it under
+    // the same id are new uses.
+    let mut had: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for o in old.map(|p| p.symbols.as_slice()).unwrap_or_default() {
+        *had.entry((o.id.as_str(), o.symbol.as_str())).or_default() += 1;
+    }
+    let unlocked: BTreeSet<&str> = new
+        .symbols
+        .iter()
+        .filter(|o| match had.get_mut(&(o.id.as_str(), o.symbol.as_str())) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .map(|o| o.symbol.as_str())
+        .filter(|id| !project.lock.symbols.contains_key(*id))
+        .collect();
+    if unlocked.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = unlocked.into_iter().map(|id| format!("symbol {id}")).collect();
+    Err(Refusal::Invalid {
+        reason: format!(
+            "page {} uses {} that the project's library does not have; add it to the session first",
+            new.number,
+            names.join(", ")
+        ),
+    })
+}
+
+/// [`unlocked_placements`] for every page a project edit writes: a new page, the pages of a
+/// `SetPages`, and those in a batch (which never adds items itself).
+fn check_placements(project: &Project, edit: &ProjectEdit) -> Result<(), Refusal> {
+    match edit {
+        ProjectEdit::AddPage { page } => unlocked_placements(project, project.page(&page.id), page),
+        ProjectEdit::SetPages { pages, .. } => pages
+            .iter()
+            .try_for_each(|p| unlocked_placements(project, project.page(&p.id), p)),
+        ProjectEdit::Batch { edits } => edits.iter().try_for_each(|e| check_placements(project, e)),
+        _ => Ok(()),
     }
 }
