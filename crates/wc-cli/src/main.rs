@@ -4495,6 +4495,62 @@ mod tests {
         store::write_vendored_part(&dir, &relay("Relay 24 V")).unwrap();
         save(&dir, &p).unwrap();
 
+        // A file the save may write that cannot be read beforehand stops the import before
+        // anything is written: a folder stands where the new page goes.
+        let page_dir = dir
+            .join(store::PAGES_DIR)
+            .join(format!("swe-page-9{}", store::PAGE_SUFFIX));
+        let mut p = load(&dir).unwrap();
+        std::fs::create_dir_all(&page_dir).unwrap();
+        let lock_bytes = std::fs::read(dir.join(store::LOCK_FILE)).unwrap();
+        let err = add_and_save(&dir, &mut p, with_page(), "import:a.tewzip", Replace::Unchanged).unwrap_err();
+        assert!(err.contains("swe-page-9"), "{err}");
+        std::fs::remove_dir(&page_dir).unwrap();
+        assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).unwrap(), lock_bytes);
+        assert_eq!(std::fs::read(&coil_file).unwrap(), coil_bytes);
+
+        // A save that changes one comment file and then fails on the next puts the first back.
+        let comment = |page: &str, text: &str| wc_core::review::Comment {
+            id: format!("c-{page}"),
+            page: page.into(),
+            at: None,
+            author: "Ann".into(),
+            time: 0,
+            text: text.into(),
+            resolved: false,
+            replies: Vec::new(),
+        };
+        let mut p = load(&dir).unwrap();
+        let first = p.pages[0].id.clone();
+        assert!(first.as_str() < "swe-page-9", "written before the new page's comments");
+        p.comments.push(comment(&first, "old"));
+        save(&dir, &p).unwrap();
+        let first_file = dir
+            .join(store::COMMENTS_DIR)
+            .join(format!("{first}{}", store::COMMENTS_SUFFIX));
+        let first_bytes = std::fs::read(&first_file).unwrap();
+        let mut blocker = dir
+            .join(store::COMMENTS_DIR)
+            .join(format!("swe-page-9{}", store::COMMENTS_SUFFIX))
+            .into_os_string();
+        blocker.push(".tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.comments[0].text = "new".into();
+        p.comments.push(comment("swe-page-9", "on the new page"));
+        assert!(add_and_save(&dir, &mut p, with_page(), "import:a.tewzip", Replace::Unchanged).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(
+            std::fs::read(&first_file).unwrap(),
+            first_bytes,
+            "comment file put back"
+        );
+        assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).unwrap(), lock_bytes);
+        let mut p = load(&dir).unwrap();
+        assert!(p.page("swe-page-9").is_none());
+        p.comments.clear();
+        save(&dir, &p).unwrap();
+
         // A project import never replaces: its symbols may be placed on pages the project kept.
         let mut p = load(&dir).unwrap();
         let err = add_built(
