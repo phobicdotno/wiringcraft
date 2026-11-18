@@ -1121,10 +1121,10 @@ fn run(cli: Cli) -> Res<()> {
                     }
                 }
                 TemplateCmd::Reset => {
-                    if !p.meta.template.is_default() {
-                        p.meta.template = Default::default();
-                        save(dir, &p)?;
-                    }
+                    // Saved even when it already is the built-in layout: a file that spells the
+                    // built-in layout out loses its `[template]` too.
+                    p.meta.template = Default::default();
+                    save(dir, &p)?;
                 }
             }
         }
@@ -3576,13 +3576,7 @@ mod tests {
         let dir = tmp.path().join("p");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let toml_text = || std::fs::read_to_string(dir.join("project.toml")).unwrap();
-        cli(&dir, &["template", "show"]).unwrap();
-        // The built-in template, printed, reads back as itself.
-        let shown = toml::to_string_pretty(&wc_core::template::PageTemplate::default()).unwrap();
-        assert_eq!(
-            toml::from_str::<wc_core::template::PageTemplate>(&shown).unwrap(),
-            Default::default()
-        );
+        // What `template show` prints is checked by running the program, in tests/template.rs.
 
         for bad in ["0", "41"] {
             let err = cli(&dir, &["template", "columns", bad]).unwrap_err();
@@ -3596,6 +3590,17 @@ mod tests {
 
         cli(&dir, &["template", "reset"]).unwrap();
         assert!(load(&dir).unwrap().meta.template.is_default());
+        assert!(!toml_text().contains("[template]"), "{}", toml_text());
+        // A file that spells the built-in layout out loses it on reset too.
+        let spelled = toml::to_string(&std::collections::BTreeMap::from([(
+            "template",
+            wc_core::template::PageTemplate::default(),
+        )]))
+        .unwrap();
+        std::fs::write(dir.join("project.toml"), format!("{}\n{spelled}", toml_text())).unwrap();
+        assert!(toml_text().contains("[template]"));
+        assert!(load(&dir).unwrap().meta.template.is_default());
+        cli(&dir, &["template", "reset"]).unwrap();
         assert!(!toml_text().contains("[template]"), "{}", toml_text());
     }
 
