@@ -1423,8 +1423,7 @@ fn shape_tool(
         ed,
         cur,
         resp.clicked_by(egui::PointerButton::Primary),
-        // A quick repeat on the last point may count as a triple-click: it ends a polyline too.
-        resp.double_clicked_by(egui::PointerButton::Primary) || resp.triple_clicked_by(egui::PointerButton::Primary),
+        repeat_click(resp),
     );
 }
 
@@ -1436,6 +1435,12 @@ pub(crate) fn drop_draft_of_other_page(open: &Open, ed: &mut Editor) {
         ed.shape_points.clear();
         ed.message = shape_hint(ed.tool, 0).into();
     }
+}
+
+/// A quick repeat click: a double-click, or a triple-click when egui counts the click before
+/// it too (a polyline's last point clicked twice right after it was placed).
+fn repeat_click(resp: &egui::Response) -> bool {
+    resp.double_clicked_by(egui::PointerButton::Primary) || resp.triple_clicked_by(egui::PointerButton::Primary)
 }
 
 /// A primary click (`click`, and `double` when it was the second of a double-click) at `at`
@@ -1689,6 +1694,64 @@ mod tests {
             &open.project.pages[0].graphics[..],
             [Shape::Polyline { points, closed: false, .. }] if points.len() == 3
         ));
+    }
+
+    /// Click at the given x (along y = 50) at the given times through a real egui context, and
+    /// return what `repeat_click` said for each click.
+    fn egui_clicks(clicks: &[(f32, f64)]) -> Vec<bool> {
+        let ctx = egui::Context::default();
+        let mut out = Vec::new();
+        let frame = |events: Vec<egui::Event>, time: f64, out: &mut Vec<bool>, record: bool| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(400.0, 400.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (_, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
+                    if record && resp.clicked() {
+                        out.push(repeat_click(&resp));
+                    }
+                });
+            });
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        // A first frame lays out the area under the pointer.
+        frame(
+            vec![egui::Event::PointerMoved(egui::pos2(clicks[0].0, 50.0))],
+            -1.0,
+            &mut out,
+            false,
+        );
+        for &(x, t) in clicks {
+            let pos = egui::pos2(x, 50.0);
+            frame(
+                vec![egui::Event::PointerMoved(pos), button(pos, true)],
+                t,
+                &mut out,
+                false,
+            );
+            frame(vec![button(pos, false)], t + 0.02, &mut out, true);
+        }
+        out
+    }
+
+    #[test]
+    fn a_quick_repeat_counts_as_a_double_or_triple_click() {
+        // B, C, C 100 ms apart: egui calls the last a triple-click, and it still ends the line.
+        assert_eq!(
+            egui_clicks(&[(100.0, 0.0), (100.0, 0.1), (100.0, 0.2)]),
+            [false, true, true]
+        );
+        // Slow clicks are single clicks.
+        assert_eq!(egui_clicks(&[(100.0, 0.0), (100.0, 2.0)]), [false, false]);
     }
 
     #[test]
