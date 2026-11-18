@@ -1845,20 +1845,15 @@ fn a_new_placement_of_a_symbol_whose_file_the_session_lacks_waits_for_the_file()
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert!(!drawn(&guest_open), "the placement waits for the file");
     assert_eq!(h.holding, ["symbol wc.coil"]);
-    // The missing copy was looked for once, and is not read again every frame.
-    let tried = h
-        .repair_reads
-        .get("symbol wc.coil")
-        .map(|(at, _)| *at)
-        .ok_or("looked for")?;
+    // The missing copy was looked for, and is not read again within the wait (made long here,
+    // so a slow frame cannot end it).
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (at, _) = h.repair_reads.get_mut("symbol wc.coil").ok_or("looked for")?;
+    *at = later;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-    assert_eq!(h.repair_reads.get("symbol wc.coil").map(|(at, _)| *at), Some(tried));
+    assert_eq!(h.repair_reads.get("symbol wc.coil").map(|(at, _)| *at), Some(later));
     // Put back, it is found at the next look, not before.
     store::write_vendored_symbol(&host_open.dir, &coil)?;
-    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    if let Some((at, _)) = h.repair_reads.get_mut("symbol wc.coil") {
-        *at = later;
-    }
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert!(!log.messages().iter().any(|m| m == "Add wc.coil to the project"));
     assert!(!drawn(&guest_open));
