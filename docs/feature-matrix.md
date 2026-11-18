@@ -123,7 +123,7 @@ For the other areas, the chapter to read in each help is:
 | Part (article) database with manufacturer, order number, data | yes | yes (catalog) | yes | done |
 | Several parts on one device (main part plus accessories) | yes | yes | no: one part per device | todo (#106) |
 | Black box / device box for devices without a symbol | yes | yes | partly: imported, not drawable | later |
-| Part data from the maker's data portal | add-on (Data Portal) | yes (content portal) | EDZ part data (macros listed per part, symbol by `--symbol-map`) and BMEcat | done (#144) |
+| Part data from the maker's data portal | add-on (Data Portal) | yes (content portal) | EDZ part data, and macros as symbols with their connection points (multi-line, variant A; or a symbol by `--symbol-map`), and BMEcat | done (#144, #311) |
 | Manufacturer symbol and macro sources | yes | yes | listed in docs | done (#46) |
 
 ## 5. Wires, potentials and connections
@@ -216,7 +216,7 @@ For the other areas, the chapter to read in each help is:
 | PDF export with links and layers | yes | yes | yes | done |
 | DXF / SVG export | yes (DXF/DWG) | yes (DWG/DXF) | yes | done |
 | DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | yes: sampled curves, solid hatches filled | done |
-| DWG read and write | yes | yes | read: AutoCAD 2004 and 2010 drawings, for SolidWorks Electrical symbols and pages; no write | read done (#161, #162, #163); write not planned, DXF covers it |
+| DWG read and write | yes | yes | read: AutoCAD 2004, 2007 and 2010 drawings, for SolidWorks Electrical symbols and pages; no write | read done (#161, #162, #163, #215); write not planned, DXF covers it |
 | Import EPLAN projects | - | yes (some) | yes | done |
 | Import SolidWorks Electrical projects | no | - | yes | done; library parts, cable types and symbol blocks with `import swe-library` (#62); cabinet layouts as panels (#60); symbol and page graphics from the DWG files (#163); follow-ups #61, #108, #149 |
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |

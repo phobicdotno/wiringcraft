@@ -773,18 +773,138 @@ fn pages_nobody_has_open_go_out_together_as_one_change() -> TestResult {
     guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves -K1".into();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
 
-    // The device and the two pages nobody holds are one change; the guest's own page is its
-    // page edit.
-    assert_eq!(
-        log.messages()[before..],
-        ["Change device -K1; Edit 2 pages", "Edit page 3 Valves -K1"]
-    );
+    // The device, the two pages nobody holds and the guest's own page are one change.
+    assert_eq!(log.messages()[before..], ["Change device -K1; Edit 3 pages"]);
     assert!(host_open.project.devices.contains_key(&k1));
     assert_eq!(host_open.project.pages, guest_open.project.pages);
     assert_eq!(
         host_open.project.page("p0004").map(|p| p.title.as_str()),
         Some("Terminals -K1")
     );
+    Ok(())
+}
+
+/// A session whose guest holds page 3, which has a coil tagged -K1 (in the device list), with
+/// the coil's id.
+fn session_with_a_coil_on_the_guests_page(
+    tmp: &Path,
+) -> std::result::Result<(Session, String), Box<dyn std::error::Error>> {
+    let mut coil = String::new();
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp, |o| {
+        coil = o.place(2, "wc.coil", wc_core::Point::new(40.0, 120.0))?;
+        let k1 = DeviceTag::parse("-K1")?;
+        if let Some(s) = o.project.pages[2].symbols.iter_mut().find(|s| s.id == coil) {
+            s.tag = Some(k1.clone());
+        }
+        o.project.devices.insert(k1, Device::default());
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    Ok(((h, log, host_open, g, guest_open), coil))
+}
+
+/// The coil's tag and place on page 3.
+fn coil_on(o: &Open, coil: &str) -> std::result::Result<(Option<String>, wc_core::Point), Box<dyn std::error::Error>> {
+    let s = o
+        .project
+        .page("p0003")
+        .and_then(|p| p.symbols.iter().find(|s| s.id == coil))
+        .ok_or("no coil")?;
+    Ok((s.tag.as_ref().map(ToString::to_string), s.at))
+}
+
+#[test]
+fn a_rename_on_your_own_page_and_in_the_device_list_is_one_change_and_a_move_meanwhile_follows_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let before = log.messages().len();
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    let start = coil_on(&guest_open, &coil)?.1;
+
+    // The guest renames -K1 (on its page and in the device list), then moves the coil before
+    // the host has answered.
+    guest_open.project.rename_device(&k1, &k2);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    let moved = wc_core::Point::new(start.x + 10.0, start.y);
+    for s in &mut guest_open.project.page_mut("p0003").ok_or("no page")?.symbols {
+        if s.id == coil {
+            s.at = moved;
+        }
+    }
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    // The rename is one change, the move the next; the host ends with both.
+    let messages = log.messages()[before..].to_vec();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages[0].contains("-K2") && messages[0].contains("page"),
+        "{messages:?}"
+    );
+    assert!(host_open.project.devices.contains_key(&k2) && !host_open.project.devices.contains_key(&k1));
+    assert_eq!(coil_on(&host_open, &coil)?, (Some("-K2".into()), moved));
+    assert_eq!(host_open.project.pages, guest_open.project.pages);
+    assert_eq!(host_open.project.devices, guest_open.project.devices);
+    Ok(())
+}
+
+#[test]
+fn a_refused_rename_on_your_own_page_takes_back_the_page_and_a_move_made_meanwhile() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let before = log.messages().len();
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    let start = coil_on(&guest_open, &coil)?;
+
+    // The host describes -K1; before that reaches the guest, the guest renames it on its page
+    // and in the device list, then moves the coil before the host has answered.
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    guest_open.project.rename_device(&k1, &k2);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    for s in &mut guest_open.project.page_mut("p0003").ok_or("no page")?.symbols {
+        if s.id == coil {
+            s.at = wc_core::Point::new(start.1.x + 10.0, start.1.y);
+        }
+    }
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+
+    // Neither the rename nor the move is kept, on the host or in the guest's window.
+    assert_eq!(log.messages().len(), before + 1, "{:?}", log.messages());
+    assert_eq!(coil_on(&host_open, &coil)?, start);
+    assert_eq!(coil_on(&guest_open, &coil)?, start);
+    assert!(!host_open.project.devices.contains_key(&k2));
+    assert_eq!(
+        host_open.project.devices.get(&k1).map(|d| d.description.as_str()),
+        Some("Pump contactor")
+    );
+    assert_eq!(host_open.project.pages, guest_open.project.pages);
+    assert_eq!(host_open.project.devices, guest_open.project.devices);
+    assert!(g.take_notes().iter().any(|n| n.contains("nor what you did on it")));
+    Ok(())
+}
+
+#[test]
+fn a_refused_rename_on_your_own_page_is_taken_back_also_when_the_session_ends_with_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    let start = coil_on(&guest_open, &coil)?;
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    guest_open.project.rename_device(&k1, &k2);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // The host refuses, then ends the session before the guest's next frame.
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    h.stop();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(!g.active());
+    assert_eq!(coil_on(&guest_open, &coil)?, start);
+    assert!(g.take_notes().iter().any(|n| n.contains("nor what you did on it")));
     Ok(())
 }
 
@@ -848,7 +968,8 @@ fn wire_numbering_in_a_session_leaves_pages_others_hold_and_says_so() -> TestRes
     assert!(numbered(&guest_open, "p0002"));
     assert!(!numbered(&host_open, "p0003"), "the guest's page was not touched");
     assert_eq!(host_open.project.pages, guest_open.project.pages);
-    assert_eq!(log.messages()[before..], ["Edit page 1 Cover", "Edit page 2 Motor"]);
+    // The host's own page and the cover are one change.
+    assert_eq!(log.messages()[before..], ["Edit 2 pages"]);
     Ok(())
 }
 
@@ -1529,7 +1650,7 @@ fn a_page_waits_until_the_session_has_the_symbols_it_draws() -> TestResult {
     assert!(host_open.project.lock.symbols.contains_key("wc.contact.no"));
     let messages = log.messages();
     let add = messages.iter().position(|m| m == "Add wc.contact.no to the project");
-    let edit = messages.iter().position(|m| m.starts_with("Edit page 3"));
+    let edit = messages.iter().position(|m| m.contains("Edit page 3"));
     assert!(add.is_some() && add < edit, "{messages:?}");
     Ok(())
 }
@@ -3259,4 +3380,34 @@ fn a_picture_whose_rename_failed_gets_its_own_name_later_although_the_session_ha
         "the guest's file stays"
     );
     Ok(())
+}
+
+#[test]
+fn a_page_too_large_to_go_twice_in_one_message_is_not_folded_into_the_batch() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let device = ProjectEdit::SetDevice {
+        tag: wc_core::DeviceTag::parse("-K1").unwrap_or_else(|_| unreachable!()),
+        device: Some(Device::default()),
+        before: None,
+    };
+    let fold = |base: &Project, title: String| {
+        let mut page = base.pages[0].clone();
+        page.title = title;
+        let mut out = Outgoing {
+            page: Some(page),
+            edits: vec![device.clone()],
+            dropped: Vec::new(),
+        };
+        fold_own_page(&mut out, base);
+        out
+    };
+    // A small page joins the batch.
+    let out = fold(&base, "Two".into());
+    assert!(out.page.is_none() && out.edits.len() == 2);
+    // One that would not fit a session message as it is and as it was stays a page edit of its
+    // own, though either version alone fits.
+    base.pages[0].title = "x".repeat(FOLD_LIMIT / 2);
+    let out = fold(&base, "y".repeat(FOLD_LIMIT / 2));
+    assert!(out.page.is_some() && out.edits.len() == 1);
 }

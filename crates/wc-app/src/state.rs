@@ -129,11 +129,11 @@ impl WireNumbering {
     }
 }
 
-/// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
-pub(crate) struct Mark {
+/// The project and its undo history, set aside by [`Open::set_aside`] and put back whole by
+/// [`Open::put_back`]: a field added to the history belongs here, so every path that takes a
+/// change back restores it.
+struct Kept {
     project: Project,
-    symbols: std::collections::BTreeSet<String>,
-    parts: std::collections::BTreeSet<String>,
     undo: Vec<Project>,
     redo: Vec<Project>,
     undo_dropped: usize,
@@ -141,6 +141,13 @@ pub(crate) struct Mark {
     form_step: Option<u64>,
     dirty: bool,
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+}
+
+/// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
+pub(crate) struct Mark {
+    kept: Kept,
+    symbols: std::collections::BTreeSet<String>,
+    parts: std::collections::BTreeSet<String>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
 }
@@ -631,18 +638,47 @@ impl Open {
     /// for showing a form on a page someone else holds, where a field that still commits must
     /// leave no trace (no change, no undo step, redo kept, not marked as changed).
     pub(crate) fn without_changes<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let project = self.project.clone();
-        let undo = std::mem::take(&mut self.undo);
-        let redo = std::mem::take(&mut self.redo);
-        let (undo_dropped, history, form_step, dirty) = (self.undo_dropped, self.history, self.form_step, self.dirty);
-        let terminals_before = self.terminals_before.clone();
+        let kept = self.set_aside();
         let r = f(self);
+        self.put_back(kept);
+        r
+    }
+
+    /// The project as it is and its undo history: the undo and redo steps are moved out (the
+    /// history is empty after), the rest copied.
+    fn set_aside(&mut self) -> Kept {
+        Kept {
+            project: self.project.clone(),
+            undo: std::mem::take(&mut self.undo),
+            redo: std::mem::take(&mut self.redo),
+            undo_dropped: self.undo_dropped,
+            history: self.history,
+            form_step: self.form_step,
+            dirty: self.dirty,
+            terminals_before: self.terminals_before.clone(),
+        }
+    }
+
+    /// Back to the project and undo history set aside in `kept`.
+    fn put_back(&mut self, kept: Kept) {
+        let Kept {
+            project,
+            undo,
+            redo,
+            undo_dropped,
+            history,
+            form_step,
+            dirty,
+            terminals_before,
+        } = kept;
         self.project = project;
         self.undo = undo;
         self.redo = redo;
-        (self.undo_dropped, self.history, self.form_step, self.dirty) = (undo_dropped, history, form_step, dirty);
+        self.undo_dropped = undo_dropped;
+        self.history = history;
+        self.form_step = form_step;
+        self.dirty = dirty;
         self.terminals_before = terminals_before;
-        r
     }
 
     /// Take a snapshot before a change, so it can be undone.
@@ -1446,20 +1482,12 @@ impl Open {
     /// The steps set aside still count in [`Open::undo_mark`], so a mark taken in between
     /// (a form opened by the change) stays valid after [`Open::keep`].
     pub(crate) fn mark(&mut self) -> Mark {
-        let undo = std::mem::take(&mut self.undo);
-        let undo_dropped = self.undo_dropped;
-        self.undo_dropped += undo.len();
+        let kept = self.set_aside();
+        self.undo_dropped += kept.undo.len();
         Mark {
-            project: self.project.clone(),
+            kept,
             symbols: self.symbols.keys().cloned().collect(),
             parts: self.parts.keys().cloned().collect(),
-            undo,
-            redo: std::mem::take(&mut self.redo),
-            undo_dropped,
-            history: self.history,
-            form_step: self.form_step,
-            dirty: self.dirty,
-            terminals_before: self.terminals_before.clone(),
             files: vendor_names(&self.dir),
         }
     }
@@ -1467,7 +1495,7 @@ impl Open {
     /// The change since `mark` stays: its undo steps go after the earlier ones (the oldest
     /// dropped beyond the usual limit), and redo is kept only when it made no undo step.
     pub(crate) fn keep(&mut self, mark: Mark) {
-        let mut undo = mark.undo;
+        let mut undo = mark.kept.undo;
         // The set-aside steps counted as dropped while the change ran; they are back now.
         self.undo_dropped -= undo.len();
         undo.append(&mut self.undo);
@@ -1475,8 +1503,8 @@ impl Open {
         undo.drain(..over);
         self.undo_dropped += over;
         self.undo = undo;
-        if self.history == mark.history {
-            self.redo = mark.redo;
+        if self.history == mark.kept.history {
+            self.redo = mark.kept.redo;
         }
     }
 
@@ -1487,14 +1515,9 @@ impl Open {
     /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
     /// when it is next used.
     pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
-        self.project = mark.project;
+        self.put_back(mark.kept);
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
-        self.undo = mark.undo;
-        self.redo = mark.redo;
-        self.undo_dropped = mark.undo_dropped;
-        (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
-        self.terminals_before = mark.terminals_before;
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
             (Err(e), _) | (_, Err(e)) => {

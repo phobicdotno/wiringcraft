@@ -506,9 +506,11 @@ impl Host {
 
     /// A guest's project edit, answered: applied (its `seq` on the author's
     /// [`HostMsg::ProjectChanged`]), unchanged, or refused with what it touches as the host has
-    /// it, since the guest applied it to its copy at once.
+    /// it, since the guest applied it to its copy at once (pages it sets too: the guest writes
+    /// a page it holds at once).
     fn guest_edit_project(&mut self, from: PeerId, edit: ProjectEdit, seq: u64) -> Result<(), Refusal> {
-        let keys = edit.partly_applied_at_once().then(|| edit.touches(&self.project));
+        let keys =
+            (edit.partly_applied_at_once() || edit.set_pages().next().is_some()).then(|| edit.touches(&self.project));
         match self.do_edit_project(from, edit, Some(seq)) {
             Ok(true) => Ok(()),
             Ok(false) => {
@@ -552,6 +554,21 @@ impl Host {
         apply_edit(&mut self.project, &edit);
         if self.project == before {
             return Ok(false);
+        }
+        // Pages set whole, as a page edit: a wire may not newly end on a pin the locked version of
+        // its symbol lacks (an update may have dropped the pin after the author drew the wire).
+        if edit.set_pages().next().is_some() {
+            let was = self.dangling_in(&before);
+            let dangling: Vec<String> = self.dangling_in(&self.project).difference(&was).cloned().collect();
+            if !dangling.is_empty() {
+                self.project = before;
+                return Err(Refusal::Invalid {
+                    reason: format!(
+                        "wires end on pins the project's version of their symbol does not have ({}); the symbol was updated meanwhile",
+                        dangling.join(", ")
+                    ),
+                });
+            }
         }
         let message = edit.describe();
         let page = edit.page().map(str::to_owned);

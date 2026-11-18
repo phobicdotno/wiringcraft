@@ -63,6 +63,15 @@ pub struct Guest {
     /// Pages whose content here comes from an unanswered edit that added or removed them, with
     /// that edit's number: a refusal of it brings the host's page back whole.
     replaced: BTreeMap<String, u64>,
+    /// Unanswered project edits that set pages this guest holds (its own page in the same
+    /// change as the project records one action touched), by number, with those pages. Such a
+    /// page is written into this copy when the edit is sent, and no further edit of it goes out
+    /// until the host answers ([`Guest::own_page_waits`]).
+    own_pages: BTreeMap<u64, Vec<String>>,
+    /// Pages this guest holds whose change the host refused: this copy took the host's page
+    /// back whole. The window takes them too, dropping what was changed meanwhile. Taken by
+    /// whoever shows the project.
+    pub retaken: Vec<String>,
 }
 
 impl Default for Guest {
@@ -91,6 +100,8 @@ impl Guest {
             last_edit: 0,
             unanswered: BTreeMap::new(),
             replaced: BTreeMap::new(),
+            own_pages: BTreeMap::new(),
+            retaken: Vec::new(),
         }
     }
 
@@ -135,7 +146,7 @@ impl Guest {
     /// Change the open page: applied to this copy right away, then sent to the host. `None`
     /// when this guest does not hold the page's lock.
     pub fn edit_page(&mut self, page: Page) -> Option<GuestMsg> {
-        if !self.can_edit(&page.id) {
+        if !self.can_edit(&page.id) || self.waits(&page.id) {
             return None;
         }
         let current = self.project.as_mut()?.page_mut(&page.id)?;
@@ -153,6 +164,9 @@ impl Guest {
     /// when someone else changed one first, and applying them here would hide that change), as
     /// do symbols and parts (it refuses one the session has in another version, or cannot
     /// store, and this copy must not count it as taken). See [`ProjectEdit::applied_at_once`].
+    /// A page this guest holds, set by the edit (its own page in the change of one action), is
+    /// the exception: no one else can change it, so it is written here at once, and the page
+    /// waits for the answer ([`Guest::own_page_waits`]).
     pub fn edit_project(&mut self, edit: ProjectEdit) -> GuestMsg {
         let target = match &edit {
             ProjectEdit::AddPage { page } => Some(page.id.clone()),
@@ -165,6 +179,25 @@ impl Guest {
             edit.apply_at_once(p);
         }
         self.last_edit += 1;
+        let own: Vec<Page> = edit
+            .set_pages()
+            .filter(|p| self.me.is_some() && self.locks.get(&p.id) == self.me.as_ref())
+            .cloned()
+            .collect();
+        if !own.is_empty() {
+            for page in &own {
+                if let Some(current) = self.project.as_mut().and_then(|p| p.page_mut(&page.id)) {
+                    let number = std::mem::take(&mut current.number);
+                    *current = page.clone();
+                    current.number = number;
+                }
+                // Counted as an edit of the page on its way, so the answer to an older one
+                // does not replace it.
+                *self.in_flight.entry(page.id.clone()).or_default() += 1;
+            }
+            self.own_pages
+                .insert(self.last_edit, own.into_iter().map(|p| p.id).collect());
+        }
         // Only an edit that really added or removed the page here leaves content that is not
         // the host's page (adding a page that is there already changes nothing).
         let structural = target.filter(|id| before != Some(has(&self.project, id)));
@@ -176,6 +209,16 @@ impl Guest {
             edit,
             seq: self.last_edit,
         }
+    }
+
+    /// Whether a change that set a page this guest holds is unanswered: edits of that page wait
+    /// until it is, so a refusal can take the host's page back without losing them halfway.
+    pub fn own_page_waits(&self) -> bool {
+        !self.own_pages.is_empty()
+    }
+
+    fn waits(&self, page: &str) -> bool {
+        self.own_pages.values().flatten().any(|p| p == page)
     }
 
     /// How many project edits the host has not answered yet.
@@ -255,6 +298,7 @@ impl Guest {
                 self.taking_back = 0;
                 self.unanswered.clear();
                 self.replaced.clear();
+                self.own_pages.clear();
             }
             HostMsg::PageChanged { page, .. } => {
                 if self.answered(&page.id) {
@@ -323,13 +367,23 @@ impl Guest {
                 // The host's page comes back whole only while the content here is still the
                 // refused page's replacement; once one refusal put the host's page back, later
                 // edits of it are kept.
-                let whole = edit
+                let mut whole: Vec<String> = edit
                     .and_then(|seq| self.unanswered.remove(&seq))
                     .flatten()
-                    .filter(|page| self.replaced.remove(page).is_some());
-                if let Some(parts) = put_back {
-                    self.put_back(*parts, whole.as_deref());
+                    .filter(|page| self.replaced.remove(page).is_some())
+                    .into_iter()
+                    .collect();
+                // Pages of this guest's own set with the refused change come back whole too:
+                // what was written here was the refused content.
+                let own = edit.and_then(|seq| self.own_pages.remove(&seq)).unwrap_or_default();
+                for page in &own {
+                    self.answered(page);
                 }
+                whole.extend(own.iter().cloned());
+                if let Some(parts) = put_back {
+                    self.put_back(*parts, &whole);
+                }
+                self.retaken.extend(own);
                 // Only the refusal of an undo, redo or revert answers one: a refusal of an
                 // earlier edit, arriving first, must not end the wait for the restoration.
                 if take_back {
@@ -351,15 +405,16 @@ impl Guest {
 
     /// Take the host's version of what a refused project edit touched. A page this guest has
     /// open keeps its content (page edits of it may still be on their way), and takes only the
-    /// host's display number, unless the refused edit added or removed that page: then the
-    /// content here is not the host's page at all, and the host's page comes back whole.
-    fn put_back(&mut self, mut parts: crate::Parts, structural: Option<&str>) {
+    /// host's display number, unless it is in `whole`: the refused edit added or removed that
+    /// page, or set its content, so the content here is not the host's page, and the host's page
+    /// comes back whole.
+    fn put_back(&mut self, mut parts: crate::Parts, whole: &[String]) {
         let me = self.me;
         let Some(project) = self.project.as_mut() else {
             return;
         };
         for (id, host) in parts.pages.iter_mut() {
-            let held = me.is_some() && self.locks.get(id) == me.as_ref() && structural != Some(id.as_str());
+            let held = me.is_some() && self.locks.get(id) == me.as_ref() && !whole.contains(id);
             if held && let (Some(host), Some(mine)) = (host.as_mut(), project.page(id)) {
                 let number = std::mem::take(&mut host.number);
                 *host = mine.clone();
@@ -371,6 +426,9 @@ impl Guest {
 
     /// The host took (or did not need) project edit `seq`.
     fn taken(&mut self, seq: u64) {
+        for page in self.own_pages.remove(&seq).unwrap_or_default() {
+            self.answered(&page);
+        }
         if let Some(Some(page)) = self.unanswered.remove(&seq)
             && self.replaced.get(&page) == Some(&seq)
         {

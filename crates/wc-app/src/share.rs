@@ -199,6 +199,76 @@ pub fn outgoing(
     out
 }
 
+/// Pages `ids` of this person's whose change the session refused, as the session has them, in
+/// the window (and in `base`, what it last synced to), dropping what was changed on them since.
+fn take_back_pages(
+    open: &mut Open,
+    base: Option<&mut Project>,
+    auth: &Project,
+    ids: &[String],
+    notes: &mut Vec<String>,
+) {
+    let mut base = base;
+    for id in ids {
+        if let Some(page) = auth.page(id) {
+            if let Some(p) = open.project.page_mut(id) {
+                *p = page.clone();
+            }
+            if let Some(p) = base.as_deref_mut().and_then(|b| b.page_mut(id)) {
+                *p = page.clone();
+            }
+        }
+    }
+    open.dirty = true;
+    notes.push(format!(
+        "Your change to page {} was not kept, nor what you did on it after it.",
+        ids.iter().map(|id| number_of(auth, id)).collect::<Vec<_>>().join(", ")
+    ));
+}
+
+/// The most a folded batch may take as JSON: well under a session message's limit
+/// ([`net::MAX_LINE`]), leaving room for the message around it.
+const FOLD_LIMIT: usize = net::MAX_LINE / 2;
+
+/// How long `v` is as JSON (what a session message carries).
+fn json_len<T: serde::Serialize>(v: &T) -> usize {
+    serde_json::to_vec(v).map_or(usize::MAX / 4, |b| b.len())
+}
+
+/// One action that changed this person's own page and project records goes out as one change:
+/// the page joins the `SetPages` of the batch (made when there is none), so the host checks
+/// and applies it with the rest, all or nothing. A page edit alone stays a page edit.
+fn fold_own_page(out: &mut Outgoing, base: &Project) {
+    if !out.edits.iter().any(ProjectEdit::batchable) {
+        return;
+    }
+    let Some(page) = out.page.take() else { return };
+    let Some(was) = base.page(&page.id).cloned() else {
+        out.page = Some(page);
+        return;
+    };
+    // The batch goes as one message, which carries the page twice (as it is and as it was): one
+    // that would not fit a session message goes as before, the page edit apart.
+    let total = out.edits.iter().map(json_len).sum::<usize>() + json_len(&page) + json_len(&was);
+    if total > FOLD_LIMIT {
+        out.page = Some(page);
+        return;
+    }
+    match out.edits.iter_mut().find_map(|e| match e {
+        ProjectEdit::SetPages { pages, before } => Some((pages, before)),
+        _ => None,
+    }) {
+        Some((pages, before)) => {
+            pages.push(page);
+            before.push(was);
+        }
+        None => out.edits.push(ProjectEdit::SetPages {
+            pages: vec![page],
+            before: vec![was],
+        }),
+    }
+}
+
 /// Page `base` as both this window (`local`) and the session (`auth`) changed it: the session's
 /// page with the local changes on top, or `None` when the two touched the same thing. Symbols
 /// and wires are matched by id, title-block fields by name, the free graphics and texts (which
@@ -1452,6 +1522,24 @@ impl Role {
         }
     }
 
+    /// Whether a change that set this guest's own page is unanswered ([`Guest::own_page_waits`]).
+    /// The host's own changes are answered at once.
+    fn own_page_waits(&self) -> bool {
+        match self {
+            Role::Host(_) => false,
+            Role::Guest(j) => j.guest.own_page_waits(),
+        }
+    }
+
+    /// This person's pages whose change the session refused, taken back whole since the last
+    /// call ([`Guest::retaken`]).
+    fn retaken(&mut self) -> Vec<String> {
+        match self {
+            Role::Host(_) => Vec::new(),
+            Role::Guest(j) => std::mem::take(&mut j.guest.retaken),
+        }
+    }
+
     /// The picture files the session has, by project path.
     fn pictures(&self) -> &BTreeMap<String, Vec<u8>> {
         match self {
@@ -2500,9 +2588,18 @@ impl Share {
     /// One frame: move messages, then sync the open project with the session. `page` is the
     /// page shown, and `busy` is true while an action is still going on (a drag, a live form).
     /// Returns a project to open instead of the current one: a guest's copy once it joined.
-    pub fn frame(&mut self, open: Option<&mut Open>, page: Option<String>, busy: bool) -> Option<Open> {
+    pub fn frame(&mut self, mut open: Option<&mut Open>, page: Option<String>, busy: bool) -> Option<Open> {
         let role = self.role.as_mut()?;
         if !role.pump(&mut self.notes) {
+            // A refusal that came with the end of the session still takes its page back: the
+            // action is not left half kept in this copy.
+            let retaken = role.retaken();
+            if let (Some(open), Some(auth)) = (open.as_deref_mut(), role.project())
+                && !retaken.is_empty()
+                && role.dir().is_some_and(|d| d == open.dir)
+            {
+                take_back_pages(open, None, auth, &retaken, &mut self.notes);
+            }
             // A join that was turned away goes back to the Join dialog, which says why: always
             // for another version (the person has to update one side), for a plain decline only
             // while the status window is still open (the note says it otherwise).
@@ -2563,6 +2660,21 @@ impl Share {
         // Until the host's answer to an undo is here, a page built from this copy would still
         // hold what the undo puts back: changes wait in the window, unsent.
         if busy || role.taking_back() {
+            return None;
+        }
+        // The session refused an action that changed this person's own page with project
+        // records: the page takes the session's version, also over what was changed on it while
+        // the answer was on its way, so the action is not half kept.
+        let retaken = role.retaken();
+        if !retaken.is_empty()
+            && let Some(auth) = role.project()
+        {
+            let base = self.base.get_or_insert_with(|| open.project.clone());
+            take_back_pages(open, Some(base), auth, &retaken, &mut self.notes);
+        }
+        // While such a change is on its way, later changes wait in the window: sent now, they
+        // could not be taken back with it.
+        if role.own_page_waits() {
             return None;
         }
         // Open the shown page in the session; a page someone else held is asked for again once
@@ -2788,6 +2900,7 @@ impl Share {
             out.page = None;
             out.edits.clear();
         }
+        fold_own_page(&mut out, base);
         let sent = out.page.is_some() || !out.edits.is_empty();
         // One action, one change: the edits that can go together are checked and recorded by
         // the host as one batch, all or nothing.

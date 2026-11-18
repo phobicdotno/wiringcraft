@@ -514,8 +514,10 @@ enum ImportCmd {
         lib: PathBuf,
     },
     /// Parts from an EDZ file (EPLAN Data Exchange archive, 7-Zip or zip): part number, maker,
-    /// description and the EPLAN part properties. Macros are listed, with the macro each part
-    /// names and whether the archive holds it, but not drawn; pictures are counted.
+    /// description and the EPLAN part properties. Each macro's multi-line representation,
+    /// variant A, becomes a library symbol (`eplan.<macro name>`) with its connection points as
+    /// pins, and each part gets the symbol made from the macro it names; what the macros leave
+    /// out is reported. Pictures are counted.
     PartsEdz {
         file: PathBuf,
         #[arg(long)]
@@ -2790,10 +2792,55 @@ fn import_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>) -> Res<(usize,
         None => None,
     };
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
-    let (mut parts, mut report, warnings) =
-        wc_import::edz::read(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    let wc_import::edz::Edz {
+        mut parts,
+        symbols,
+        mut report,
+        mut warnings,
+    } = wc_import::edz::read_all(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    // The parts whose symbol the map chose.
+    let mut mapped: std::collections::BTreeSet<String> = Default::default();
     if let Some(map) = &map {
+        let mut probe: Vec<wc_core::Part> = parts
+            .iter()
+            .map(|p| wc_core::Part {
+                symbol: None,
+                ..p.clone()
+            })
+            .collect();
+        wc_import::edz::apply_symbol_map(&mut probe, map, &mut report.clone());
+        mapped = probe.into_iter().filter(|p| p.symbol.is_some()).map(|p| p.id).collect();
         wc_import::edz::apply_symbol_map(&mut parts, map, &mut report);
+    }
+    // Symbols first, so no part is written pointing at a symbol the library lacks. A symbol that
+    // cannot be written is skipped, and its parts are written without it.
+    let mut unwritten: std::collections::BTreeSet<String> = Default::default();
+    for s in &symbols {
+        if let Err(x) = wc_library::write_symbol(lib, s) {
+            warnings.push(format!("symbol {} not written: {x}", s.id));
+            unwritten.insert(s.id.clone());
+        }
+    }
+    if !unwritten.is_empty() {
+        // A link the symbol map chose is kept while the library still holds a readable symbol of
+        // that id; a link to the macro's own symbol, which was not saved, is dropped.
+        let readable = |id: &str| {
+            std::fs::read_to_string(lib.join("symbols").join(format!("{id}.json")))
+                .ok()
+                .and_then(|t| serde_json::from_str::<wc_core::Symbol>(&t).ok())
+                .is_some()
+        };
+        let keep = |part: &str, id: &str| !unwritten.contains(id) || (mapped.contains(part) && readable(id));
+        for p in &mut parts {
+            if p.symbol.as_deref().is_some_and(|s| !keep(&p.id, s)) {
+                p.symbol = None;
+            }
+        }
+        for m in &mut report.part_macros {
+            if m.symbol.as_deref().is_some_and(|s| !keep(&m.part, s)) {
+                m.symbol = None;
+            }
+        }
     }
     for p in &parts {
         wc_library::write_part(lib, p).map_err(e)?;
@@ -5535,6 +5582,69 @@ mod tests {
             z.finish().unwrap();
         }
         cli(&dir, &["import", "archive", only.to_str().unwrap()]).unwrap();
+    }
+
+    #[test]
+    fn an_edz_symbol_that_cannot_be_written_is_a_warning_and_its_part_is_written_without_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("contactor.edz");
+        let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="SIE.3RT2015" P_ARTICLE_MANUFACTURER="SIE" P_ARTICLE_MACRO="SIE\SIE_3RT2015.ema"/></partsmanagement>"#;
+        let ema = r#"<EplanPxfRoot><MacroVariant MacroFuncType="1"><O31 A531="0/0" A532="1/1"/></MacroVariant></EplanPxfRoot>"#;
+        let mut w = sevenz_rust2::ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file("parts.xml"), Some(xml.as_bytes()))
+            .unwrap();
+        w.push_archive_entry(
+            sevenz_rust2::ArchiveEntry::new_file("SIE_3RT2015.ema"),
+            Some(ema.as_bytes()),
+        )
+        .unwrap();
+        std::fs::write(&file, w.finish().unwrap().into_inner()).unwrap();
+        let lib = tmp.path().join("lib");
+        // A folder where the symbol's file would go makes writing it fail.
+        std::fs::create_dir_all(lib.join("symbols").join("eplan.sie_3rt2015.json")).unwrap();
+        let (n, report, warnings) = import_edz(&file, &lib, None).unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("symbol eplan.sie_3rt2015 not written")),
+            "{warnings:?}"
+        );
+        assert_eq!(report.part_macros[0].symbol, None);
+        let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+        let p: wc_core::Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(p.symbol, None);
+
+        // Once the symbol can be written, the part points at it and it loads back.
+        std::fs::remove_dir(lib.join("symbols").join("eplan.sie_3rt2015.json")).unwrap();
+        let (_, _, warnings) = import_edz(&file, &lib, None).unwrap();
+        assert!(warnings.iter().all(|w| !w.contains("not written")), "{warnings:?}");
+        let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+        let p: wc_core::Part = serde_json::from_str(&json).unwrap();
+        let id = p.symbol.unwrap();
+        let json = std::fs::read_to_string(lib.join("symbols").join(format!("{id}.json"))).unwrap();
+        let mut s: wc_core::Symbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(s.id, id);
+
+        // The library now holds a different, readable symbol of that id, and the new one cannot
+        // replace it (a folder blocks its staging file).
+        s.description = "kept from before".into();
+        wc_library::write_symbol(&lib, &s).unwrap();
+        std::fs::create_dir_all(lib.join("symbols").join(format!("{id}.json.tmp"))).unwrap();
+        let part_symbol = |lib: &Path| {
+            let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
+            serde_json::from_str::<wc_core::Part>(&json).unwrap().symbol
+        };
+        // The macro's own link is dropped: its symbol was not saved.
+        let (_, _, warnings) = import_edz(&file, &lib, None).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("not written")), "{warnings:?}");
+        assert_eq!(part_symbol(&lib), None);
+        // A link the symbol map chose to that readable symbol is kept.
+        let map = tmp.path().join("map.txt");
+        std::fs::write(&map, format!("SIE_3RT2015 = {id}\n")).unwrap();
+        let (_, report, _) = import_edz(&file, &lib, Some(&map)).unwrap();
+        assert_eq!(part_symbol(&lib).as_deref(), Some(id.as_str()));
+        assert_eq!(report.part_macros[0].symbol.as_deref(), Some(id.as_str()));
     }
 
     #[test]

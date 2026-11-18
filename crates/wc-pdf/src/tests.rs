@@ -817,6 +817,226 @@ fn long_cover_table_labels_and_values_stay_in_their_columns() -> Result<(), Stri
 }
 
 #[test]
+fn a_short_cover_keeps_its_field_table_above_the_title_block() -> Result<(), String> {
+    let mut project = wc_core::Project::new("Plant");
+    for i in 0..12 {
+        project
+            .meta
+            .title_block
+            .insert(format!("Extra {i}"), format!("value {i}"));
+    }
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = PageSize::custom(297, 100)?;
+    let (_, h) = cover.size.mm();
+    let ty = h - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let texts: Vec<(&str, f64, f64)> = marks
+        .iter()
+        .filter_map(|m| match &m.shape {
+            Shape::Text { text, at, height, .. } => Some((text.as_str(), at.y, *height)),
+            _ => None,
+        })
+        .collect();
+    let row = |t: &str| texts.iter().find(|(x, ..)| *x == t).copied();
+    // The rows that are shown sit above the title block, at a readable size.
+    let (_, y, size) = row("value 0").ok_or(format!("the first field is not shown: {texts:?}"))?;
+    assert!(y < ty && size >= 1.2, "{y} {size} {ty}");
+    // The rest are counted, not drawn into the title block.
+    let (_, more_y, _) = texts
+        .iter()
+        .find(|(t, ..)| t.ends_with(" more"))
+        .copied()
+        .ok_or(format!("no count of fields left out: {texts:?}"))?;
+    assert!(more_y < ty, "{more_y} {ty}");
+    assert!(row("value 11").is_none(), "{texts:?}");
+    // Every rule of the table, picked by its ends, stays above the title block.
+    let (x0, x1) = (wc_core::project::FRAME_MARGIN, 297.0 - wc_core::project::FRAME_MARGIN);
+    let (tx0, tx1) = ((x0 + x1) / 2.0 - 90.0, (x0 + x1) / 2.0 + 90.0);
+    let rules: Vec<f64> = marks
+        .iter()
+        .filter_map(|m| match &m.shape {
+            Shape::Line { a, b }
+                if (a.x - tx0).abs() < 1e-6 && (b.x - tx1).abs() < 1e-6 && (a.y - b.y).abs() < 1e-9 =>
+            {
+                Some(a.y)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!rules.is_empty(), "no table rules");
+    for y in &rules {
+        assert!(*y <= ty - 1.0, "rule at {y}, title block at {ty}");
+    }
+    // A tall sheet keeps today's layout: every field is listed.
+    cover.size = PageSize::A3;
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    assert!(
+        marks
+            .iter()
+            .any(|m| matches!(&m.shape, Shape::Text { text, .. } if text == "value 11"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_short_cover_moves_the_name_up_and_keeps_the_default_logo_above_it() -> Result<(), String> {
+    let mut project = wc_core::Project::new("Plant");
+    for i in 0..12 {
+        project
+            .meta
+            .title_block
+            .insert(format!("Extra {i}"), format!("value {i}"));
+    }
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = PageSize::custom(297, 170)?;
+    let (_, h) = cover.size.mm();
+    let y0 = wc_core::project::FRAME_MARGIN + 6.0;
+    let ty = h - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let (name_y, name_h) = marks
+        .iter()
+        .find_map(|m| match &m.shape {
+            Shape::Text { text, at, height, .. } if text == "Plant" && at.y < ty => Some((at.y, *height)),
+            _ => None,
+        })
+        .ok_or("no project name on the cover")?;
+    // A fifth of the way down leaves too little room for the table here: the name moves up.
+    assert!(name_y < y0 + (ty - y0) * 0.2 - 1.0, "name at {name_y}");
+    // The default logo box still ends above the name's letters.
+    let (a, b) = layout::cover_logo_default(&project, &cover);
+    assert!(a.y >= y0 && b.y - a.y >= 5.0, "{a:?} {b:?}");
+    assert!(b.y <= name_y - name_h, "logo to {}, name from {}", b.y, name_y - name_h);
+    // A sheet so short that a fifth of the way down is already near the top keeps the name
+    // low enough for the logo too.
+    cover.size = PageSize::custom(297, 100)?;
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let ty = cover.size.mm().1 - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
+    let (name_y, name_h) = marks
+        .iter()
+        .find_map(|m| match &m.shape {
+            Shape::Text { text, at, height, .. } if text == "Plant" && at.y < ty => Some((at.y, *height)),
+            _ => None,
+        })
+        .ok_or("no project name on the short cover")?;
+    let (_, b) = layout::cover_logo_default(&project, &cover);
+    assert!(b.y <= name_y - name_h, "logo to {}, name from {}", b.y, name_y - name_h);
+    Ok(())
+}
+
+#[test]
+fn a_cover_too_short_for_any_field_is_a_warning() -> Result<(), String> {
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = PageSize::custom(297, 100)?;
+    project.meta.template.height = wc_core::template::MAX_TITLE_HEIGHT;
+    project.meta.title_block.insert("customer".into(), "Acme".into());
+    project.pages = vec![cover];
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        ["page 1: the cover page is too short to list the project fields"]
+    );
+    // On a sheet with room for the table, no warning.
+    project.pages[0].size = PageSize::A4;
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    Ok(())
+}
+
+#[test]
+fn only_a_logo_in_its_default_place_takes_room_from_the_cover_table() -> Result<(), String> {
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = PageSize::custom(297, 100)?;
+    project.meta.template.height = 30.0;
+    project.meta.title_block.insert("customer".into(), "Acme".into());
+    project.pages = vec![cover];
+    let mut logo = wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    };
+    project.meta.logo = Some(logo.clone());
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(
+        report.warnings.iter().any(|w| w.contains("too short")),
+        "{:?}",
+        report.warnings
+    );
+    // Moved off to the side, the logo leaves the name where it is without one.
+    logo.cover = Some((wc_core::Point::new(200.0, 20.0), wc_core::Point::new(280.0, 40.0)));
+    project.meta.logo = Some(logo);
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("too short")),
+        "{:?}",
+        report.warnings
+    );
+    let page = &project.pages[0];
+    let marks = layout::frame_marks(&project, page, 0, 1, "2026-11-17");
+    let ty = page.size.mm().1 - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
+    assert!(
+        marks
+            .iter()
+            .any(|m| matches!(&m.shape, Shape::Text { text, at, .. } if text == "Acme" && at.y < ty)),
+        "the customer field is not on the cover"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_cover_too_short_for_its_description_leaves_it_out_of_the_title_block() -> Result<(), String> {
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = PageSize::custom(297, 100)?;
+    project
+        .meta
+        .title_block
+        .insert("description".into(), "Pump station".into());
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    let cx = cover.size.mm().0 / 2.0;
+    let descriptions = |project: &Project| -> Vec<f64> {
+        layout::frame_marks(project, &cover, 0, 1, "2026-11-17")
+            .iter()
+            .filter_map(|m| match &m.shape {
+                Shape::Text { text, at, .. } if text == "Pump station" && (at.x - cx).abs() < 0.01 => Some(at.y),
+                _ => None,
+            })
+            .collect()
+    };
+    // Title bands in 0.1 mm steps, so one puts the baseline on the rule and others within the
+    // room the letters reach below it: the description stays clear of the rule, or is left out.
+    let mut left_out = false;
+    for tenths in 300..=600 {
+        project.meta.template.height = f64::from(tenths) / 10.0;
+        let ty = cover.size.mm().1 - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
+        let found = descriptions(&project);
+        left_out |= found.is_empty();
+        assert!(
+            found.iter().all(|y| *y + 0.8 <= ty + 1e-9),
+            "band {}: description at {found:?}, title block from {ty}",
+            project.meta.template.height
+        );
+    }
+    assert!(left_out, "no band left the description out");
+    // Where it fits, it is there.
+    project.meta.template.height = 30.0;
+    assert_eq!(descriptions(&project).len(), 1);
+    Ok(())
+}
+
+#[test]
 fn text_widths_are_helvetica_advance_widths() {
     // Adobe Helvetica AFM: W 944, O 778, H 722, e 556, l 222, o 556, i 222, space 278.
     let em_mm = |units: f64| units / 1000.0 * (10.0 / 0.72);
