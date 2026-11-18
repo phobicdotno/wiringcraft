@@ -53,6 +53,9 @@ pub struct Editor {
     pub shape_page: Option<String>,
     /// Enter was pressed (and no dialog or text field took it): finish the polyline being drawn.
     pub finish_shape: bool,
+    /// Where and when (egui time, seconds) the last drawing click landed, to tell a quick
+    /// repeat on a polyline's last point (which ends it) from a slow one.
+    pub last_shape_click: Option<(Point, f64)>,
     /// The text tool was clicked here; the app asks for the text.
     pub ask_text: Option<Point>,
     /// The comment tool was clicked here; the app asks for the comment.
@@ -91,6 +94,7 @@ impl Default for Editor {
             shape_points: Vec::new(),
             shape_page: None,
             finish_shape: false,
+            last_shape_click: None,
             ask_text: None,
             ask_comment: None,
             comment: None,
@@ -948,7 +952,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
             }
         }
         Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline => {
-            shape_tool(&painter, &resp, open, ed, &xf, &t, finish)
+            shape_tool(&painter, &resp, open, ed, &xf, &t, finish, snap_step)
         }
     }
 }
@@ -1336,12 +1340,19 @@ pub(crate) fn drawn_shape(tool: Tool, pts: &[Point]) -> Option<Shape> {
             radius: c.distance(p),
             filled: false,
         }),
-        (Tool::Arc, &[c, s, e]) if c != s && c != e => Some(Shape::Arc {
-            center: c,
-            radius: c.distance(s),
-            start: crate::symbol_editor::angle(c, s),
-            end: crate::symbol_editor::angle(c, e),
-        }),
+        // An end on the start ray would make a full turn, which is a circle: not an arc.
+        (Tool::Arc, &[c, s, e])
+            if c != s
+                && c != e
+                && (crate::symbol_editor::angle(c, s) - crate::symbol_editor::angle(c, e)).abs() > 1e-9 =>
+        {
+            Some(Shape::Arc {
+                center: c,
+                radius: c.distance(s),
+                start: crate::symbol_editor::angle(c, s),
+                end: crate::symbol_editor::angle(c, e),
+            })
+        }
         (Tool::Polyline, pts) if pts.len() >= 2 => {
             // A polyline that ends where it started is closed.
             let mut points = pts.to_vec();
@@ -1390,6 +1401,7 @@ pub(crate) fn finish_shape(open: &mut Open, ed: &mut Editor) {
 /// The drawing tools: line, rectangle, circle, arc and polyline. Each click adds a point; the
 /// shape goes on the page when it has all its clicks (a polyline: on a double-click, on Enter
 /// or on a click back on its first point).
+#[allow(clippy::too_many_arguments)]
 fn shape_tool(
     painter: &egui::Painter,
     resp: &egui::Response,
@@ -1398,11 +1410,19 @@ fn shape_tool(
     xf: &Xf,
     t: &theme::Theme,
     enter: bool,
+    snap_step: f64,
 ) {
     // Enter ends a polyline wherever the pointer is.
     if enter && ed.tool == Tool::Polyline && ed.shape_points.len() >= 2 {
         finish_shape(open, ed);
         return;
+    }
+    // A click places its point where it was made (a tap on a touch screen has no hover).
+    if resp.clicked_by(egui::PointerButton::Primary)
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        let now = resp.ctx.input(|i| i.time);
+        shape_input(open, ed, snap(xf.mm(pos), snap_step), now);
     }
     let Some(cur) = ed.cursor else { return };
     let ghost = Stroke::new(1.5_f32, t.ghost);
@@ -1418,13 +1438,6 @@ fn shape_tool(
             None => {}
         }
     }
-    shape_input(
-        open,
-        ed,
-        cur,
-        resp.clicked_by(egui::PointerButton::Primary),
-        repeat_click(resp),
-    );
 }
 
 /// A drawing started on another page does not go on this one: its clicks are dropped when
@@ -1437,28 +1450,33 @@ pub(crate) fn drop_draft_of_other_page(open: &Open, ed: &mut Editor) {
     }
 }
 
-/// A quick repeat click: a double-click, or a triple-click when egui counts the click before
-/// it too (a polyline's last point clicked twice right after it was placed).
-fn repeat_click(resp: &egui::Response) -> bool {
-    resp.double_clicked_by(egui::PointerButton::Primary) || resp.triple_clicked_by(egui::PointerButton::Primary)
-}
+/// Longest time between two clicks on a polyline's last point that ends it, in seconds (egui's
+/// double-click time).
+const REPEAT_SECS: f64 = 0.3;
 
-/// A primary click (`click`, and `double` when it was the second of a double-click) at `at`
-/// with a drawing tool. A double-click ends a polyline only where its last point is, so a fast
-/// click on another point adds that point instead.
-pub(crate) fn shape_input(open: &mut Open, ed: &mut Editor, at: Point, click: bool, double: bool) {
-    if double && ed.tool == Tool::Polyline && ed.shape_points.len() >= 2 && ed.shape_points.last() == Some(&at) {
-        finish_shape(open, ed);
-    } else if click {
-        shape_click(open, ed, at);
+/// A primary click at `at` at time `now` (seconds) with a drawing tool. A second click on a
+/// polyline's last point within [`REPEAT_SECS`] ends it; a slower one does nothing, and a quick
+/// click on another point adds that point.
+pub(crate) fn shape_input(open: &mut Open, ed: &mut Editor, at: Point, now: f64) {
+    let repeat = ed.shape_points.last() == Some(&at);
+    let quick = ed
+        .last_shape_click
+        .is_some_and(|(p, t)| p == at && now - t <= REPEAT_SECS);
+    ed.last_shape_click = Some((at, now));
+    if ed.tool == Tool::Polyline && repeat {
+        if quick && ed.shape_points.len() >= 2 {
+            finish_shape(open, ed);
+        }
+        return;
     }
+    shape_click(open, ed, at);
 }
 
 /// A click at `at` with a drawing tool: add the point, and put the shape on the page when it
 /// has all its clicks (a polyline: when the click is back on its first point).
 pub(crate) fn shape_click(open: &mut Open, ed: &mut Editor, at: Point) {
-    // The second click of a double-click lands on the point just added.
-    if ed.shape_points.last() == Some(&at) {
+    // A polyline does not take the same point twice in a row (a double-click on it ends it).
+    if ed.tool == Tool::Polyline && ed.shape_points.last() == Some(&at) {
         return;
     }
     if ed.shape_points.is_empty() {
@@ -1471,8 +1489,8 @@ pub(crate) fn shape_click(open: &mut Open, ed: &mut Editor, at: Point) {
         None => n >= 4 && ed.shape_points.first() == Some(&at),
     };
     if done && drawn_shape(ed.tool, &ed.shape_points).is_none() {
-        // The last click makes no shape (an arc that ends on its centre): keep the others and
-        // ask for another point.
+        // The last click makes no shape (a line or circle of no length, an arc that ends on its
+        // centre or on its start ray): keep the others and ask for another point.
         ed.shape_points.pop();
         ed.message = "That point makes no shape; click another one (Esc cancels).".into();
     } else if done {
@@ -1674,84 +1692,29 @@ mod tests {
     }
 
     #[test]
-    fn a_polyline_ends_on_a_double_click_at_its_last_point_only() {
+    fn a_polyline_ends_on_a_quick_repeat_at_its_last_point_only() {
         let (_tmp, mut open) = project();
         let mut ed = Editor {
             tool: Tool::Polyline,
             ..Default::default()
         };
         let p = Point::new;
-        shape_input(&mut open, &mut ed, p(10.0, 10.0), true, false);
-        shape_input(&mut open, &mut ed, p(20.0, 10.0), true, false);
-        // A fast click on another point counts as a double-click by time only: it adds the point.
-        shape_input(&mut open, &mut ed, p(20.0, 20.0), true, true);
+        shape_input(&mut open, &mut ed, p(10.0, 10.0), 0.0);
+        shape_input(&mut open, &mut ed, p(20.0, 10.0), 0.08);
+        // A quick click on another point adds that point.
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.16);
+        assert_eq!(ed.shape_points.len(), 3);
+        // A slow repeat on the last point (egui may still call it a triple-click) does nothing.
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.62);
         assert_eq!(ed.shape_points.len(), 3);
         assert!(open.project.pages[0].graphics.is_empty());
-        // The second click of a real double-click, on the last point, ends it with three points.
-        shape_input(&mut open, &mut ed, p(20.0, 20.0), true, true);
+        // A quick repeat on the last point ends it with three points.
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.8);
         assert!(ed.shape_points.is_empty());
         assert!(matches!(
             &open.project.pages[0].graphics[..],
             [Shape::Polyline { points, closed: false, .. }] if points.len() == 3
         ));
-    }
-
-    /// Click at the given x (along y = 50) at the given times through a real egui context, and
-    /// return what `repeat_click` said for each click.
-    fn egui_clicks(clicks: &[(f32, f64)]) -> Vec<bool> {
-        let ctx = egui::Context::default();
-        let mut out = Vec::new();
-        let frame = |events: Vec<egui::Event>, time: f64, out: &mut Vec<bool>, record: bool| {
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(400.0, 400.0))),
-                time: Some(time),
-                events,
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let (_, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
-                    if record && resp.clicked() {
-                        out.push(repeat_click(&resp));
-                    }
-                });
-            });
-        };
-        let button = |pos, pressed| egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: Default::default(),
-        };
-        // A first frame lays out the area under the pointer.
-        frame(
-            vec![egui::Event::PointerMoved(egui::pos2(clicks[0].0, 50.0))],
-            -1.0,
-            &mut out,
-            false,
-        );
-        for &(x, t) in clicks {
-            let pos = egui::pos2(x, 50.0);
-            frame(
-                vec![egui::Event::PointerMoved(pos), button(pos, true)],
-                t,
-                &mut out,
-                false,
-            );
-            frame(vec![button(pos, false)], t + 0.02, &mut out, true);
-        }
-        out
-    }
-
-    #[test]
-    fn a_quick_repeat_counts_as_a_double_or_triple_click() {
-        // B, C, C 100 ms apart: egui calls the last a triple-click, and it still ends the line.
-        assert_eq!(
-            egui_clicks(&[(100.0, 0.0), (100.0, 0.1), (100.0, 0.2)]),
-            [false, true, true]
-        );
-        // Slow clicks are single clicks.
-        assert_eq!(egui_clicks(&[(100.0, 0.0), (100.0, 2.0)]), [false, false]);
     }
 
     #[test]
@@ -1768,6 +1731,12 @@ mod tests {
         assert_eq!(ed.shape_points.len(), 2, "centre and start stay");
         assert!(ed.message.contains("no shape"), "{}", ed.message);
         assert!(open.project.pages[0].graphics.is_empty());
+        // On the start point or further out on its ray: a full turn, refused the same way.
+        for end in [Point::new(20.0, 10.0), Point::new(30.0, 10.0)] {
+            shape_click(&mut open, &mut ed, end);
+            assert_eq!(ed.shape_points.len(), 2);
+            assert!(ed.message.contains("no shape"), "{}", ed.message);
+        }
         shape_click(&mut open, &mut ed, Point::new(10.0, 20.0));
         assert!(matches!(open.project.pages[0].graphics[..], [Shape::Arc { .. }]));
     }
@@ -1922,12 +1891,21 @@ mod tests {
             svg.contains("<polygon points=\"150,50 170,50 170,70\""),
             "the closed polyline in the SVG"
         );
+        let mut bare = again.project.clone();
+        bare.pages[0].graphics.clear();
+        let (bare_pages, _) = wc_pdf::page_drawings(&bare, &again.symbols, &wc_pdf::Options::default());
+        let bare_dxf = wc_pdf::dxf(&bare_pages[0]);
+        // One more of each than the same page without the drawings (the frame has polylines too).
         for kind in ["CIRCLE", "ARC", "POLYLINE"] {
-            assert!(
-                dxf.contains(&format!("\n{kind}\n")) || dxf.contains(&format!("\r\n{kind}\r\n")),
-                "{kind} in the DXF"
-            );
+            let count = |d: &str| d.lines().filter(|l| l.trim() == kind).count();
+            assert_eq!(count(&dxf), count(&bare_dxf) + 1, "{kind} in the DXF");
         }
+        // In the PDF: each drawing starts one more path than the page without them.
+        let paths = |p: &wc_core::Project| {
+            let (pdf, _) = wc_pdf::export(p, &again.symbols, &wc_pdf::Options::default());
+            String::from_utf8_lossy(&pdf).matches(" m\n").count()
+        };
+        assert_eq!(paths(&again.project), paths(&bare) + 3, "three more paths in the PDF");
     }
 
     #[test]

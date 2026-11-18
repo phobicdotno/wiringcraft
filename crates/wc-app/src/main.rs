@@ -498,12 +498,17 @@ impl App {
             Action::Select => {
                 self.ed.tool = Tool::Select;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
             Action::PlaceSymbol => {
                 self.ed.tool = Tool::Place;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
-            Action::DrawWire => self.ed.tool = Tool::Wire,
+            Action::DrawWire => {
+                self.ed.tool = Tool::Wire;
+                self.ed.shape_points.clear();
+            }
             Action::TextTool
             | Action::LineTool
             | Action::RectTool
