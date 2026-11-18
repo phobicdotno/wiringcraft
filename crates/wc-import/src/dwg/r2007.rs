@@ -322,9 +322,12 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
             e => return Err(bad(format!("section {name} has unknown encoding {e}"))),
         };
         let mut data = vec![0u8; size];
-        // Where each page's bytes go, by start: pages may not overlap, but a page may be
-        // listed again at the same place.
-        let mut spans: BTreeMap<usize, (u64, usize)> = BTreeMap::new();
+        // Every page listed so far, by start: a start may only be listed again for the same
+        // page with the same sizes and checksum. Empty pages are in here too.
+        let mut listed: BTreeMap<usize, PageEntry> = BTreeMap::new();
+        // The ends of the pages that hold bytes, by start, for the overlap check. Empty pages
+        // are left out, so that one inside another page cannot hide it from a later page.
+        let mut filled: BTreeMap<usize, usize> = BTreeMap::new();
         for i in 0..page_count as usize {
             let at = list + i * PAGE_DESCRIPTION;
             let page = PageEntry {
@@ -344,32 +347,48 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
                 .ok()
                 .filter(|s| *s <= size)
                 .ok_or_else(|| bad(format!("section {name}, page {number} starts past its end")))?;
+            // A start already used: the same page listed again is skipped (its bytes are
+            // there), anything else is refused before it is read or copied.
+            if let Some(other) = listed.get(&start) {
+                if other.number != number {
+                    return Err(bad(format!(
+                        "section {name}, page {number} starts where page {} does",
+                        other.number
+                    )));
+                }
+                if (other.size, other.compressed, other.checksum) != (page.size, page.compressed, page.checksum) {
+                    return Err(bad(format!(
+                        "section {name}, page {number} is listed again with other sizes or another checksum"
+                    )));
+                }
+                // A repeat costs what reading the page again would, so that repeats stay bounded.
+                let cost = usize::try_from(page.size.max(page.compressed))
+                    .unwrap_or(usize::MAX)
+                    .max(1);
+                budget = budget
+                    .checked_sub(cost)
+                    .ok_or_else(|| bad("the file's pages decompress to too much"))?;
+                continue;
+            }
             let read = data_page(bytes, address, extent, &page, interleaved, &mut budget)
                 .map_err(|e| bad(format!("section {name}, page {number}: {e}")))?;
             let end = start
                 .checked_add(read.len())
                 .filter(|e| *e <= data.len())
                 .ok_or_else(|| bad(format!("section {name}, page {number} reaches past its end")))?;
-            // Pages may not overlap; the same page may be listed again at its own start, but a
-            // different page at a start already used is refused before it is copied.
-            if let Some(&(other, other_end)) = spans.get(&start)
-                && (other != number || other_end != end)
-            {
-                return Err(bad(format!(
-                    "section {name}, page {number} starts where page {other} does"
-                )));
-            }
+            // Pages that hold bytes may not overlap.
             if end > start {
-                let before = spans.range(..start).next_back().is_some_and(|(_, (_, e))| *e > start);
-                let after = spans.range(start + 1..).next().is_some_and(|(s, _)| *s < end);
+                let before = filled.range(..start).next_back().is_some_and(|(_, e)| *e > start);
+                let after = filled.range(start + 1..).next().is_some_and(|(s, _)| *s < end);
                 if before || after {
                     return Err(bad(format!("section {name}, page {number} overlaps another page")));
                 }
+                filled.insert(start, end);
             }
             if let Some(to) = data.get_mut(start..end) {
                 to.copy_from_slice(&read);
             }
-            spans.insert(start, (number, end));
+            listed.insert(start, page);
         }
         total += size;
         sections.push(Section { name, id: index, data });

@@ -1484,6 +1484,79 @@ fn overlapping_2007_pages_are_refused() -> TestResult {
 }
 
 #[test]
+fn a_2007_page_listed_again_must_match_its_first_listing() -> TestResult {
+    let again = || {
+        vec![TestSection {
+            name: "AcDb:AcDbObjects",
+            data: noise(MAX_PAGE_DATA + 300, 37),
+            listed_again: 1,
+            ..TestSection::default()
+        }]
+    };
+    // The exact repeat is read, and the section comes out whole.
+    let file = write_dwg_2007(&again());
+    let read = read_sections(&file)?;
+    let first = read.sections.first().ok_or("no section")?;
+    assert_eq!(first.data, noise(MAX_PAGE_DATA + 300, 37));
+    // The second listing of page 1 (after the description, the name of 16 characters and a
+    // zero, and the first listing) with another stored size or another checksum.
+    let at = 0x40 + 34 + 56;
+    for field in [0x20, 0x28] {
+        let other = |m: &mut Vec<u8>| m[at + field] ^= 0x01;
+        let m = error_of(&write_dwg_2007_with(&again(), &other, &|_| {}));
+        assert!(
+            m.contains("page 1 is listed again with other sizes or another checksum"),
+            "{m}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_empty_2007_page_does_not_hide_a_page_from_the_overlap_check() -> TestResult {
+    let section = || {
+        vec![TestSection {
+            name: "AcDb:AcDbObjects",
+            data: noise(2 * MAX_PAGE_DATA + 300, 41),
+            stored: true,
+            ..TestSection::default()
+        }]
+    };
+    // The listings of pages 2 and 3, after the description and the name.
+    let second = 0x40 + 34 + 56;
+    let third = second + 56;
+    let set = |m: &mut Vec<u8>, at: usize, v: u64| m[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    // Page 2 made empty, inside page 1.
+    let empty = |m: &mut Vec<u8>| {
+        set(m, second, (MAX_PAGE_DATA / 2) as u64);
+        set(m, second + 0x18, 0);
+        set(m, second + 0x20, 0);
+        set(m, second + 0x28, u64::from(r2007::page_checksum(0, &[])));
+    };
+    // Page 3 then starts inside page 1, after the empty page: still an overlap.
+    let into = |m: &mut Vec<u8>| {
+        empty(m);
+        set(m, third, (MAX_PAGE_DATA - 0x100) as u64);
+    };
+    let m = error_of(&write_dwg_2007_with(&section(), &into, &|_| {}));
+    assert!(m.contains("page 3 overlaps another page"), "{m}");
+    // Page 3 right after page 1 is not.
+    let next_to = |m: &mut Vec<u8>| {
+        empty(m);
+        set(m, third, MAX_PAGE_DATA as u64);
+    };
+    assert!(read_sections(&write_dwg_2007_with(&section(), &next_to, &|_| {})).is_ok());
+    // A page at the empty page's start is still refused.
+    let same = |m: &mut Vec<u8>| {
+        empty(m);
+        set(m, third, (MAX_PAGE_DATA / 2) as u64);
+    };
+    let m = error_of(&write_dwg_2007_with(&section(), &same, &|_| {}));
+    assert!(m.contains("page 3 starts where page 2 does"), "{m}");
+    Ok(())
+}
+
+#[test]
 fn the_code_page_is_read_from_the_file_header() -> TestResult {
     let mut file = write_dwg(b"AC1018", &sample_sections()[..1]);
     assert_eq!(read_sections(&file)?.codepage, 0);
