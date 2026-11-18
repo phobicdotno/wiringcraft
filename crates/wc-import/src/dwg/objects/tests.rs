@@ -525,7 +525,7 @@ fn sample(v: Version) -> Vec<Obj> {
     tr.data.be((0.0, 0.0, 1.0));
     objs.push(tr);
     // Model space: RELAY with a visible and a hidden attribute, a 2D polyline of three
-    // vertices, an MTEXT, a point, an invisible line, an ellipse and a custom object.
+    // vertices, an MTEXT, a point, an invisible line, a ray (not read) and a custom object.
     // The RELAY insert has a true colour without a colour book (no colour handle).
     let mut i = entity(v, 7, 0x50, Head { extras: true, ..model });
     i.data
@@ -594,7 +594,7 @@ fn sample(v: Version) -> Vec<Obj> {
         (0.0, 0.0),
         (1.0, 1.0),
     ));
-    objs.push(entity(v, 35, 0x5B, model));
+    objs.push(entity(v, 40, 0x5B, model));
     objs.push(Obj::new(v, 0x1F3, 0x5C));
     objs
 }
@@ -754,7 +754,7 @@ fn check_sample(d: &Drawing) {
         "an invisible line is left out"
     );
 
-    assert_eq!(d.skipped.get("ELLIPSE"), Some(&1));
+    assert_eq!(d.skipped.get("RAY"), Some(&1));
     assert_eq!(d.skipped.len(), 1, "{:?}", d.skipped);
 }
 
@@ -1248,5 +1248,115 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
             d.skipped
         );
     }
+    Ok(())
+}
+
+#[test]
+fn ellipses_and_splines_are_drawn() -> TestResult {
+    use std::f64::consts::PI;
+    for v in [Version::R2004, Version::R2010] {
+        let model = head(None);
+        // Half an ellipse 20 wide and 10 high round (50, 0): from (60, 0) over the top to (40, 0).
+        let mut el = entity(v, 35, 0x300, model);
+        el.data
+            .bd3((50.0, 0.0, 0.0))
+            .bd3((10.0, 0.0, 0.0))
+            .bd3((0.0, 0.0, 1.0))
+            .bd(0.5)
+            .bd(0.0)
+            .bd(PI);
+        // A quadratic spline by control points: (0, 0), (5, 10), (10, 0).
+        let mut sp = entity(v, 36, 0x301, model);
+        sp.data
+            .bl(1)
+            .bl(2)
+            .b(false)
+            .b(false)
+            .b(false)
+            .bd(1e-7)
+            .bd(1e-7)
+            .bl(6)
+            .bl(3)
+            .b(false);
+        for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+            sp.data.bd(k);
+        }
+        for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
+            sp.data.bd3(p);
+        }
+        // A spline by fit points only.
+        let mut fit = entity(v, 36, 0x302, model);
+        fit.data
+            .bl(2)
+            .bl(3)
+            .bd(1e-7)
+            .bd3((1.0, 0.0, 0.0))
+            .bd3((1.0, 0.0, 0.0))
+            .bl(3);
+        for p in [(0.0, 20.0, 0.0), (5.0, 25.0, 0.0), (10.0, 20.0, 0.0)] {
+            fit.data.bd3(p);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            el,
+            sp,
+            fit,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(d.skipped.is_empty(), "{v:?}: {:?}", d.skipped);
+        let lines: Vec<&Vec<Point>> = d
+            .model
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline { points, .. } => Some(points),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 3, "{:?}", d.model);
+        let near = |a: &Point, x: f64, y: f64| a.distance(Point::new(x, y)) < 1e-6;
+        // The ellipse: ends on the axis, its top 5 above (y flipped on a page).
+        let el = lines[0];
+        assert!(
+            near(&el[0], 60.0, 0.0) && el.last().is_some_and(|p| near(p, 40.0, 0.0)),
+            "{el:?}"
+        );
+        assert!(el.iter().any(|p| near(p, 50.0, -5.0)), "{el:?}");
+        // The spline: from (0, 0) to (10, 0), its middle at height 5.
+        let sp = lines[1];
+        assert!(
+            near(&sp[0], 0.0, 0.0) && sp.last().is_some_and(|p| near(p, 10.0, 0.0)),
+            "{sp:?}"
+        );
+        assert!(sp.iter().any(|p| near(p, 5.0, -5.0)), "{sp:?}");
+        // The fit-point spline goes through its fit points.
+        assert!(lines[2].iter().any(|p| near(p, 5.0, -25.0)), "{:?}", lines[2]);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_spline_listing_too_much_is_a_damaged_object() -> TestResult {
+    let v = Version::R2010;
+    let mut sp = entity(v, 36, 0x301, head(None));
+    sp.data
+        .bl(1)
+        .bl(3)
+        .b(false)
+        .b(false)
+        .b(false)
+        .bd(0.0)
+        .bd(0.0)
+        .bl(50_000)
+        .bl(4)
+        .b(false);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        sp,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    assert!(d.damaged.iter().any(|r| r.contains("50000 knots")), "{:?}", d.damaged);
     Ok(())
 }
