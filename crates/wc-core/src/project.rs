@@ -43,6 +43,10 @@ pub struct ProjectMeta {
     /// The project's logo, shown on the cover page and in every title block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logo: Option<Logo>,
+    /// The frame's column count and the title block's layout, shared by every page. Only
+    /// written once it differs from the built-in layout.
+    #[serde(default, skip_serializing_if = "crate::template::PageTemplate::is_default")]
+    pub template: crate::template::PageTemplate,
 }
 
 /// The project's logo: a JPEG or PNG file in the project folder. The title block shows it in
@@ -385,6 +389,7 @@ impl ProjectMeta {
             locations: Vec::new(),
             jumpers: Vec::new(),
             logo: None,
+            template: crate::template::PageTemplate::default(),
         }
     }
 
@@ -553,15 +558,23 @@ impl PageSize {
         }
     }
 
-    /// The reference column (1-based, 1 to [`FRAME_COLUMNS`]) that `x` millimetres falls into.
+    /// The reference column (1-based, 1 to [`FRAME_COLUMNS`]) that `x` millimetres falls into,
+    /// with the built-in column count. A project's own count is [`Project::column_of`].
     pub fn column_of(self, x: f64) -> usize {
+        self.column_in(FRAME_COLUMNS, x)
+    }
+
+    /// The reference column (1-based, 1 to `columns`) that `x` millimetres falls into when the
+    /// frame is divided into `columns` columns (at least one).
+    pub fn column_in(self, columns: usize, x: f64) -> usize {
+        let columns = columns.max(1);
         let (w, _) = self.mm();
-        let col_w = (w - 2.0 * FRAME_MARGIN) / FRAME_COLUMNS as f64;
+        let col_w = (w - 2.0 * FRAME_MARGIN) / columns as f64;
         let col = ((x - FRAME_MARGIN) / col_w).floor();
         if col.is_nan() {
             return 1;
         }
-        (col as i64).saturating_add(1).clamp(1, FRAME_COLUMNS as i64) as usize
+        (col as i64).saturating_add(1).clamp(1, columns as i64) as usize
     }
 
     /// How many reference rows run down the sides of the frame: A to F on A4 and A3, A to H
@@ -870,6 +883,12 @@ impl Project {
 
     pub fn page_mut(&mut self, id: &str) -> Option<&mut Page> {
         self.pages.iter_mut().find(|p| p.id == id)
+    }
+
+    /// The reference column `x` millimetres falls into on `page`, with the column count of the
+    /// project's page template.
+    pub fn column_of(&self, page: &Page, x: f64) -> usize {
+        page.size.column_in(self.meta.template.column_count(), x)
     }
 
     /// Sort pages by their display number, comparing numeric parts as numbers.

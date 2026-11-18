@@ -114,7 +114,7 @@ pub fn number_wires(
                 let base = format!(
                     "{}.{}",
                     page.map(|p| p.number.trim()).unwrap_or(""),
-                    page.map(|p| p.size.column_of(*x)).unwrap_or(1)
+                    page.map(|p| project.column_of(p, *x)).unwrap_or(1)
                 );
                 let mut k = 1;
                 let mut candidate = base.clone();
@@ -222,6 +222,18 @@ mod tests {
         let mut p = project();
         number_wires(&mut p, Rule::Potential, false, |_| None, pos);
         assert_eq!(numbers(&p), [Some("2"), Some("2"), Some("1"), None, Some("24V")]);
+    }
+
+    #[test]
+    fn page_column_numbers_use_the_templates_columns() {
+        let mut p = project();
+        p.meta.template.columns = 20;
+        number_wires(&mut p, Rule::PageColumn, false, |_| None, pos);
+        // A3 with 20 columns of 20 mm from x = 10: not the built-in 3.8, 3.2 and 3.5.
+        assert_eq!(
+            numbers(&p),
+            [Some("3.15"), Some("3.15"), Some("3.3"), None, Some("3.10")]
+        );
     }
 
     #[test]

@@ -74,6 +74,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
         &[
             Some(Action::AddPage),
             Some(Action::CoverPage),
+            Some(Action::PageTemplate),
             Some(Action::DuplicatePage),
             Some(Action::PageProps),
             None,

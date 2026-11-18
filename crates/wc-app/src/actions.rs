@@ -29,6 +29,7 @@ pub enum Action {
     Find,
     AddPage,
     CoverPage,
+    PageTemplate,
     DuplicatePage,
     PageProps,
     PageUp,
@@ -102,6 +103,7 @@ impl Action {
         Action::Find,
         Action::AddPage,
         Action::CoverPage,
+        Action::PageTemplate,
         Action::DuplicatePage,
         Action::PageProps,
         Action::PageUp,
@@ -256,6 +258,12 @@ impl Action {
                 "Cover page",
                 "Open the cover page and edit the project's name and fields; they show on the cover and every title block",
                 Icon::Cover,
+                "",
+            ),
+            Action::PageTemplate => i(
+                "Page template",
+                "Edit the frame's reference columns and the title block's boxes, shared by every page",
+                Icon::Properties,
                 "",
             ),
             Action::DuplicatePage => i(
@@ -421,6 +429,7 @@ pub const TOOLBAR: &[&[Action]] = &[
     &[
         Action::AddPage,
         Action::CoverPage,
+        Action::PageTemplate,
         Action::DuplicatePage,
         Action::PageProps,
         Action::DeletePage,
@@ -495,6 +504,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                 &[
                     Action::AddPage,
                     Action::CoverPage,
+                    Action::PageTemplate,
                     Action::DuplicatePage,
                     Action::PageProps,
                     Action::PageUp,

@@ -78,7 +78,7 @@ For the other areas, the chapter to read in each help is:
 | Locations list with descriptions | yes | yes | yes: project properties, `wiringcraft location`, Locations report, SolidWorks and AutomationML import | done |
 | Frame with column and row references (e.g. 3.C) | yes | yes | yes | done (#54) |
 | Title block shared by all pages | yes | yes | yes | done |
-| Cover page and page template editing | yes | yes | no editor | todo (#53) |
+| Cover page and page template editing | yes | yes | yes: cover page form, Page template form (columns and title-block boxes, kept in `project.toml`) | done (#53, #119) |
 | Project templates and base projects | yes | yes (project templates) | no | later |
 | Project properties (customer, dates, revision ...) | yes | yes | yes | done |
 | Project archive (pack and unpack) | yes | yes (.tewzip) | yes: import of archives, projects are plain folders | done |

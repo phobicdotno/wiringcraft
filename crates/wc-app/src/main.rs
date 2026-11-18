@@ -19,6 +19,7 @@ mod screenshot;
 mod share;
 mod state;
 mod symbol_editor;
+mod template_form;
 mod theme;
 
 use std::path::{Path, PathBuf};
@@ -63,6 +64,15 @@ enum Dialog {
         before: state::PropsSnapshot,
         /// The project's history count the buffer last matched; when it moves without the
         /// form (an undo, the assistant), the buffer is reloaded from the project.
+        seen: u64,
+    },
+    /// The page template form: changes show on every page as they are made; `since` is the undo
+    /// mark from when it opened, so OK keeps them as one undo step and Cancel takes them back.
+    Template {
+        draft: wc_core::template::PageTemplate,
+        since: usize,
+        before: wc_core::template::PageTemplate,
+        /// The project's history count the draft last matched (see `Cover`).
         seen: u64,
     },
     PageProps {
@@ -230,7 +240,7 @@ impl App {
         // While an assistant command runs, its files are its own: nothing is sent, and a joined
         // copy waits, so the dirty project is not saved over the command's changes.
         let busy = ctx.input(|i| i.pointer.any_down())
-            || matches!(self.dialog, Some(Dialog::Cover { .. }))
+            || matches!(self.dialog, Some(Dialog::Cover { .. } | Dialog::Template { .. }))
             || self.assistant.command_running();
         self.share.set_command_running(self.assistant.command_running());
         self.sync_session_now(busy);
@@ -680,6 +690,15 @@ impl App {
                     seen: open.history_count(),
                 });
             }
+            Action::PageTemplate => {
+                let template = open.project.meta.template.clone();
+                self.dialog = Some(Dialog::Template {
+                    draft: template.clone(),
+                    since: open.start_live_form(),
+                    before: template,
+                    seen: open.history_count(),
+                });
+            }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
             Action::SaveMacro => {
                 let clip = open.copy(page, &self.ed.selection);
@@ -857,6 +876,7 @@ impl App {
             Dialog::NewProject { .. } => "New project",
             Dialog::ProjectProps { .. } => "Project properties",
             Dialog::Cover { .. } => "Cover page",
+            Dialog::Template { .. } => "Page template",
             Dialog::PageProps { .. } => "Page properties",
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
@@ -882,12 +902,12 @@ impl App {
             .min_width(if wide { (screen.width() * 0.75).min(1100.0) } else { 0.0 })
             // The cover form sits at the side, so the page it changes stays in view.
             .anchor(
-                if matches!(dialog, Dialog::Cover { .. }) {
+                if matches!(dialog, Dialog::Cover { .. } | Dialog::Template { .. }) {
                     egui::Align2::RIGHT_TOP
                 } else {
                     egui::Align2::CENTER_CENTER
                 },
-                if matches!(dialog, Dialog::Cover { .. }) {
+                if matches!(dialog, Dialog::Cover { .. } | Dialog::Template { .. }) {
                     Vec2::new(-16.0, 96.0)
                 } else {
                     Vec2::ZERO
@@ -1286,6 +1306,49 @@ impl App {
                         if ui.button("Cancel").clicked() {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_live(*since, before);
+                            }
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::Template {
+                    draft,
+                    since,
+                    before,
+                    seen,
+                } => {
+                    // A change made elsewhere (an undo, the assistant) is shown in the form.
+                    if let Some(o) = self.open.as_ref()
+                        && o.history_count() != *seen
+                    {
+                        draft.clone_from(&o.project.meta.template);
+                        *seen = o.history_count();
+                    }
+                    let keys = self
+                        .open
+                        .as_ref()
+                        .map(|o| template_form::value_keys(&o.project))
+                        .unwrap_or_default();
+                    if template_form::show(ui, draft, &keys)
+                        && let Some(o) = self.open.as_mut()
+                    {
+                        o.set_template_live(draft);
+                        *seen = o.history_count();
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Every page shows each change at once. The layout is kept in \
+                             project.toml; a project on the built-in layout leaves it out.",
+                        )
+                        .color(theme::Theme::of(ui.ctx()).faint),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            if let Some(o) = self.open.as_mut() {
+                                o.revert_template(*since, before);
                             }
                             keep = false;
                         }

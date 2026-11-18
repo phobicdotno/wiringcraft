@@ -546,13 +546,14 @@ fn pictures_that_cannot_be_read_say_why_and_links_out_of_the_project_are_refused
 }
 
 #[test]
+#[allow(clippy::unwrap_used)]
 fn a_logo_keeps_its_proportions_in_its_box() {
     let (min, max) = fit_picture((Point::new(0.0, 0.0), Point::new(30.0, 10.0)), (100, 100));
     assert_eq!((min, max), (Point::new(10.0, 0.0), Point::new(20.0, 10.0)));
     let (min, max) = fit_picture((Point::new(0.0, 0.0), Point::new(10.0, 30.0)), (200, 100));
     assert_eq!((min, max), (Point::new(0.0, 12.5), Point::new(10.0, 17.5)));
     let page = Page::new("p", "1", "x");
-    let (a, b) = title_logo_box(&page);
+    let (a, b) = title_logo_box(&Project::new("x"), &page).unwrap();
     assert!(a.x < b.x && a.y < b.y && b.x < 420.0 && b.y < 297.0);
 }
 

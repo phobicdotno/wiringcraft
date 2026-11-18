@@ -55,7 +55,6 @@ These branches can be deleted once their pull requests are merged.
 | A page's own title-block fields (revision, date, checked by) only come from an import; the app, CLI and assistant cannot edit them | #169 |
 | Wire route styles | #52 (pull request #87) |
 | Delete in the wire right-click menu | #88 |
-| Cover page and common page template editing | #53 |
 | Row letters and grid coordinates | #54 (pull request #90) |
 | Assistant runs slow tools on the window thread | #67 |
 

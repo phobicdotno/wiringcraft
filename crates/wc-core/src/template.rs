@@ -1,0 +1,323 @@
+//! The page template: the frame's reference columns and the title block's boxes, shared by
+//! every page of a project.
+//!
+//! It is kept in `project.toml` under `[template]`. A project without one draws the built-in
+//! layout ([`PageTemplate::default`]), so the section is only written once the layout is changed.
+
+use serde::{Deserialize, Serialize};
+
+use crate::geom::Align;
+
+/// Height of the title block band at the bottom of every page, in millimetres.
+pub const TITLE_HEIGHT: f64 = 24.0;
+/// The most reference columns a template can ask for.
+pub const MAX_COLUMNS: usize = 40;
+/// Padding between a title-block text and its box's sides, in millimetres.
+pub const PAD: f64 = 1.5;
+
+/// The values a title-block text can show besides the project's own title-block fields
+/// (`customer`, `revision`, ... from [`crate::project::TITLE_FIELDS`] or any other key).
+pub const SPECIAL_VALUES: &[(&str, &str)] = &[
+    (PROJECT_NAME, "Project name"),
+    (PAGE_TITLE, "Page title"),
+    (PAGE_NUMBER, "Page number"),
+    (SHEET, "Sheet (3 / 12)"),
+];
+/// The project's name.
+pub const PROJECT_NAME: &str = "project.name";
+/// The page's title.
+pub const PAGE_TITLE: &str = "page.title";
+/// The page's display number.
+pub const PAGE_NUMBER: &str = "page.number";
+/// The page's place in the document and the number of pages, as `3 / 12`.
+pub const SHEET: &str = "page.sheet";
+
+/// The layout every page is drawn on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageTemplate {
+    /// Reference columns across the frame (1 to [`MAX_COLUMNS`]). Cross-references and wire
+    /// numbers by column use the same count.
+    #[serde(default = "default_columns")]
+    pub columns: usize,
+    /// The title block's boxes, drawn in this order.
+    #[serde(default, rename = "box")]
+    pub boxes: Vec<TitleBox>,
+}
+
+fn default_columns() -> usize {
+    10
+}
+
+/// Which side of the frame a box edge is measured from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    #[default]
+    Left,
+    Right,
+}
+
+impl Side {
+    fn is_left(&self) -> bool {
+        *self == Side::Left
+    }
+}
+
+/// One box of the title block. Its sides are millimetres from the frame's left or right edge,
+/// so boxes measured from the right stay at the right on every sheet size; its top and bottom
+/// are millimetres down from the top of the title block band (0 to [`TITLE_HEIGHT`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TitleBox {
+    /// The small caption in the box's top-left corner; empty for none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    pub left: f64,
+    #[serde(default, skip_serializing_if = "Side::is_left")]
+    pub left_from: Side,
+    pub right: f64,
+    #[serde(default, skip_serializing_if = "Side::is_left")]
+    pub right_from: Side,
+    #[serde(default)]
+    pub top: f64,
+    #[serde(default = "default_bottom")]
+    pub bottom: f64,
+    /// The values written in the box.
+    #[serde(default, rename = "text", skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<BoxText>,
+    /// The project's logo goes in this box (when the project has one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub logo: bool,
+}
+
+fn default_bottom() -> f64 {
+    TITLE_HEIGHT
+}
+
+/// A value written in a title-block box. Too long a value is drawn smaller so it fits the box.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoxText {
+    /// What it shows: title-block field keys (`customer`, `revision`, ...) or the special
+    /// values in [`SPECIAL_VALUES`]. Several are joined with ` · `, leaving out empty ones.
+    pub values: Vec<String>,
+    /// Text height in millimetres.
+    pub size: f64,
+    /// Baseline, in millimetres below the box's top.
+    pub y: f64,
+    #[serde(default)]
+    pub align: Align,
+    /// Distance from the box side the text is aligned to (unused when centred).
+    #[serde(default = "default_inset")]
+    pub inset: f64,
+}
+
+fn default_inset() -> f64 {
+    PAD
+}
+
+impl BoxText {
+    pub fn new(values: &[&str], size: f64, y: f64, align: Align) -> Self {
+        Self {
+            values: values.iter().map(|v| (*v).to_owned()).collect(),
+            size,
+            y,
+            align,
+            inset: PAD,
+        }
+    }
+
+    fn inset(mut self, inset: f64) -> Self {
+        self.inset = inset;
+        self
+    }
+}
+
+impl TitleBox {
+    /// A box from `left` to `right` (each measured from the given side), `top` to `bottom`.
+    pub fn new(label: &str, left: (f64, Side), right: (f64, Side), top: f64, bottom: f64) -> Self {
+        Self {
+            label: label.to_owned(),
+            left: left.0,
+            left_from: left.1,
+            right: right.0,
+            right_from: right.1,
+            top,
+            bottom,
+            texts: Vec::new(),
+            logo: false,
+        }
+    }
+
+    fn with(mut self, text: BoxText) -> Self {
+        self.texts.push(text);
+        self
+    }
+
+    /// The box's sides on a frame running from `x0` to `x1`, clamped to the frame, and its top
+    /// and bottom below the band's top, clamped to the band. `None` when nothing is left of it.
+    pub fn resolve(&self, x0: f64, x1: f64) -> Option<(f64, f64, f64, f64)> {
+        let at = |mm: f64, from: Side| match from {
+            Side::Left => x0 + mm,
+            Side::Right => x1 - mm,
+        };
+        let clamp = |v: f64, lo: f64, hi: f64| if v.is_nan() { lo } else { v.clamp(lo, hi) };
+        let left = clamp(at(self.left, self.left_from), x0, x1);
+        let right = clamp(at(self.right, self.right_from), x0, x1);
+        let top = clamp(self.top, 0.0, TITLE_HEIGHT);
+        let bottom = clamp(self.bottom, 0.0, TITLE_HEIGHT);
+        (right - left > 1e-6 && bottom - top > 1e-6).then_some((left, top, right, bottom))
+    }
+}
+
+impl Default for PageTemplate {
+    /// The built-in layout: customer and who drew and checked it on the left, the project and
+    /// page title in the middle, revision, date, page, location, sheet and logo on the right.
+    fn default() -> Self {
+        use Side::{Left, Right};
+        let half = TITLE_HEIGHT / 2.0;
+        let full = TITLE_HEIGHT;
+        Self {
+            columns: default_columns(),
+            boxes: vec![
+                TitleBox::new("Customer", (0.0, Left), (80.0, Left), 0.0, half).with(BoxText::new(
+                    &["customer"],
+                    3.0,
+                    9.5,
+                    Align::Left,
+                )),
+                TitleBox::new("Drawn by", (0.0, Left), (40.0, Left), half, full).with(BoxText::new(
+                    &["drawn_by"],
+                    2.5,
+                    9.5,
+                    Align::Left,
+                )),
+                TitleBox::new("Checked by", (40.0, Left), (80.0, Left), half, full).with(BoxText::new(
+                    &["checked_by"],
+                    2.5,
+                    9.5,
+                    Align::Left,
+                )),
+                TitleBox::new("Project", (80.0, Left), (150.0, Right), 0.0, full)
+                    .with(BoxText::new(&[PROJECT_NAME], 4.0, 11.0, Align::Left).inset(3.0))
+                    .with(BoxText::new(&[PAGE_TITLE], 3.0, 19.5, Align::Left).inset(3.0))
+                    .with(BoxText::new(&["project_number", "plant"], 2.2, 22.0, Align::Right).inset(2.0)),
+                TitleBox::new("Revision", (150.0, Right), (60.0, Right), 0.0, half).with(BoxText::new(
+                    &["revision"],
+                    2.5,
+                    9.5,
+                    Align::Left,
+                )),
+                TitleBox::new("Date", (150.0, Right), (60.0, Right), half, full).with(BoxText::new(
+                    &["date"],
+                    2.5,
+                    9.5,
+                    Align::Left,
+                )),
+                TitleBox::new("Page", (60.0, Right), (30.0, Right), 0.0, half).with(BoxText::new(
+                    &[PAGE_NUMBER],
+                    4.0,
+                    10.5,
+                    Align::Center,
+                )),
+                TitleBox::new("Location", (60.0, Right), (30.0, Right), half, full).with(BoxText::new(
+                    &["location"],
+                    2.5,
+                    9.5,
+                    Align::Center,
+                )),
+                TitleBox::new("Sheet", (30.0, Right), (0.0, Right), 0.0, half).with(BoxText::new(
+                    &[SHEET],
+                    3.0,
+                    10.0,
+                    Align::Center,
+                )),
+                TitleBox {
+                    logo: true,
+                    ..TitleBox::new("", (30.0, Right), (0.0, Right), half, full)
+                },
+            ],
+        }
+    }
+}
+
+impl PageTemplate {
+    /// Whether this is the built-in layout (then it is not written to `project.toml`).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The column count in use: [`Self::columns`] kept within 1 to [`MAX_COLUMNS`].
+    pub fn column_count(&self) -> usize {
+        self.columns.clamp(1, MAX_COLUMNS)
+    }
+}
+
+/// The label for a value a title-block text can show: a special value's or a title-block
+/// field's label, or the key itself.
+pub fn value_label(key: &str) -> &str {
+    SPECIAL_VALUES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map_or_else(|| crate::project::title_field_label(key), |(_, l)| l)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_round_trips_and_is_not_written() {
+        let t = PageTemplate::default();
+        assert!(t.is_default());
+        let s = toml::to_string(&t).unwrap();
+        let back: PageTemplate = toml::from_str(&s).unwrap();
+        assert_eq!(back, t);
+        let meta = toml::to_string(&crate::ProjectMeta::new("x")).unwrap();
+        assert!(!meta.contains("template"), "{meta}");
+    }
+
+    #[test]
+    fn a_short_hand_written_template_reads() {
+        let t: PageTemplate = toml::from_str(
+            r#"
+            columns = 12
+            [[box]]
+            label = "Order"
+            left = 0
+            right = 50
+            right_from = "right"
+            [[box.text]]
+            values = ["order"]
+            size = 3
+            y = 9.5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(t.columns, 12);
+        let b = &t.boxes[0];
+        assert_eq!((b.top, b.bottom, b.right_from), (0.0, TITLE_HEIGHT, Side::Right));
+        assert_eq!((b.texts[0].align, b.texts[0].inset), (Align::Left, PAD));
+        assert_eq!(b.resolve(10.0, 410.0), Some((10.0, 0.0, 360.0, TITLE_HEIGHT)));
+    }
+
+    #[test]
+    fn boxes_are_clamped_to_the_frame_and_empty_ones_dropped() {
+        let b = TitleBox::new("", (-5.0, Side::Left), (500.0, Side::Left), -1.0, 99.0);
+        assert_eq!(b.resolve(10.0, 410.0), Some((10.0, 0.0, 410.0, TITLE_HEIGHT)));
+        let b = TitleBox::new("", (50.0, Side::Left), (40.0, Side::Left), 0.0, 12.0);
+        assert_eq!(b.resolve(10.0, 410.0), None);
+        let b = TitleBox::new("", (f64::NAN, Side::Left), (40.0, Side::Left), 0.0, 12.0);
+        assert_eq!(b.resolve(10.0, 410.0), Some((10.0, 0.0, 50.0, 12.0)));
+    }
+
+    #[test]
+    fn column_count_is_kept_in_range() {
+        let mut t = PageTemplate {
+            columns: 0,
+            ..Default::default()
+        };
+        assert_eq!(t.column_count(), 1);
+        t.columns = 1000;
+        assert_eq!(t.column_count(), MAX_COLUMNS);
+    }
+}
