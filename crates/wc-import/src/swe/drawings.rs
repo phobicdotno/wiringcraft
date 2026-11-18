@@ -92,6 +92,7 @@ impl SweDrawings {
     }
 
     /// Whether the archive has a drawing for block `name`.
+    #[cfg(test)]
     pub(crate) fn has_block(&self, name: &str) -> bool {
         self.blocks.contains_key(&name.to_lowercase())
     }

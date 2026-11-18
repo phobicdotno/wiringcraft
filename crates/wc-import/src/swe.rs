@@ -1472,6 +1472,19 @@ fn local_pins(s: &SweSymbol) -> Vec<(String, Point)> {
         .collect()
 }
 
+/// Draw symbol `s` from its block, and tell whether the entity limit cut its drawing short.
+fn draw_symbol(
+    p: &SweProject,
+    s: &SweSymbol,
+    budget: &mut usize,
+    skipped: &mut BTreeMap<String, usize>,
+) -> (Option<Vec<Shape>>, bool) {
+    let over_before = skipped.get(crate::dxf::OVER_LIMIT).copied().unwrap_or(0);
+    let drawn = p.drawings.symbol_graphics(s, budget, skipped);
+    let over = skipped.get(crate::dxf::OVER_LIMIT).copied().unwrap_or(0) > over_before;
+    (drawn, over)
+}
+
 /// The role a symbol's component gives it.
 fn symbol_role(p: &SweProject, s: &SweSymbol) -> SymbolRole {
     match s.component.and_then(|c| p.components.get(&c)).map(|c| c.kind) {
@@ -1876,7 +1889,7 @@ pub fn build_with(
         };
         // A symbol no library symbol fits is drawn from its block, which may reach past its
         // points: drawn here, so the sheet is chosen with room for it.
-        let mut block_drawn: BTreeMap<i64, Option<Vec<Shape>>> = BTreeMap::new();
+        let mut block_drawn: BTreeMap<i64, (Option<Vec<Shape>>, bool)> = BTreeMap::new();
         for s in &syms {
             grow(s.at);
             s.pins.iter().for_each(|q| grow(q.at));
@@ -1891,12 +1904,12 @@ pub fn build_with(
             if library_fit(choice, &s.block, symbol_role(p, s), &local).is_some() {
                 continue;
             }
-            let drawn = p.drawings.symbol_graphics(s, &mut draw_budget, &mut draw_skipped);
+            let (drawn, over) = draw_symbol(p, s, &mut draw_budget, &mut draw_skipped);
             for sh in drawn.iter().flatten() {
                 let (min, max) = sh.bounds();
                 grow(Point::new(s.at.x + max.x, s.at.y - min.y));
             }
-            block_drawn.insert(s.id, drawn);
+            block_drawn.insert(s.id, (drawn, over));
         }
         for l in &lines {
             grow(l.a);
@@ -1963,16 +1976,16 @@ pub fn build_with(
                 Some(fit) => (Vec::new(), fit.pins.clone()),
                 None => {
                     let (boxed, pins) = box_symbol(&s.block, origin, s.corner.map(flip), &pins);
-                    let drawn = match block_drawn.remove(&s.id) {
-                        Some(drawn) => drawn,
-                        None => p.drawings.symbol_graphics(s, &mut draw_budget, &mut draw_skipped),
+                    let (drawn, over) = match block_drawn.remove(&s.id) {
+                        Some(got) => got,
+                        None => draw_symbol(p, s, &mut draw_budget, &mut draw_skipped),
                     };
                     match drawn {
                         Some(drawn) => {
                             dwg_symbols += 1;
                             (drawn, pins)
                         }
-                        None if draw_budget == 0 && p.drawings.has_block(&s.block) => {
+                        None if over => {
                             over_budget_symbols += 1;
                             (boxed, pins)
                         }

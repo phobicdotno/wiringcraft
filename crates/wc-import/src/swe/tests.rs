@@ -2400,3 +2400,21 @@ fn local_pins_round_each_point_before_taking_off_the_origin() {
     assert!((local[0].1.x - 0.501).abs() < 1e-9, "{local:?}");
     assert!((local[0].1.y - 10.0).abs() < 1e-9, "y down: {local:?}");
 }
+
+#[test]
+fn an_empty_block_drawn_before_the_limit_is_not_counted_as_over_it() {
+    let mut sw = read(&sample()).unwrap();
+    // The coil's block has nothing to draw; the fuse's reaches the limit after it.
+    sw.drawings.add_block("Coil", &model_space_dwg(&[])).unwrap();
+    sw.drawings
+        .add_block("Fuse", &model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]))
+        .unwrap();
+    sw.drawings.set_draw_limit(0);
+    let (_, _, report) = build(&sw, None);
+    let c = count(&report, "DWG symbol graphics");
+    assert_eq!((c.source, c.imported), (2, 0));
+    assert_eq!(
+        c.note,
+        "1 drawn as boxes: 1 block(s) without a readable drawing in the archive; 1 drawn as boxes: the drawings' entity limit was reached"
+    );
+}
