@@ -3138,7 +3138,12 @@ fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, sourc
         .iter()
         .map(|name| dir.join(name))
         .collect();
-    for folder in [store::PAGES_DIR, store::PANELS_DIR, store::COMMENTS_DIR] {
+    // Only the names the store reads and writes: another file there is never changed by the save.
+    for (folder, suffix) in [
+        (store::PAGES_DIR, store::PAGE_SUFFIX),
+        (store::PANELS_DIR, store::PANEL_SUFFIX),
+        (store::COMMENTS_DIR, store::COMMENTS_SUFFIX),
+    ] {
         let folder = dir.join(folder);
         // A folder that cannot be listed would leave files the save may change without a copy.
         let entries = match std::fs::read_dir(&folder) {
@@ -3148,7 +3153,11 @@ fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, sourc
         };
         for entry in entries {
             let path = entry.map_err(|x| format!("{}: {x}", folder.display()))?.path();
-            if path.is_file() {
+            let ours = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(suffix));
+            if ours && path.is_file() {
                 paths.push(path);
             }
         }
