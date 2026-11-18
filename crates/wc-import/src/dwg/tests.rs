@@ -459,9 +459,28 @@ fn stored_pages_are_read_and_a_cut_off_one_is_refused() -> TestResult {
     };
     let read = read_sections(&write_dwg(b"AC1024", &[section(0)]))?;
     assert_eq!(read.get("AcDb:Classes"), Some(noise(300, 3).as_slice()));
-    // The header says the page stores more than the file holds.
+    // The header says the page stores more than its page holds.
     let message = read_sections(&write_dwg(b"AC1024", &[section(0x10_0000)])).map_err(|e| e.to_string());
-    assert!(message.as_ref().is_err_and(|m| m.contains("cut off")), "{message:?}");
+    assert!(
+        message.as_ref().is_err_and(|m| m.contains("past its page")),
+        "{message:?}"
+    );
+    // Also when another page follows, whose bytes it would otherwise take.
+    let mut first = section(0x40);
+    first.data = noise(300, 4);
+    let next = TestSection {
+        name: "AcDb:Header",
+        data: noise(300, 5),
+        stored: true,
+        ..TestSection::default()
+    };
+    let message = read_sections(&write_dwg(b"AC1024", &[first, next])).map_err(|e| e.to_string());
+    assert!(
+        message
+            .as_ref()
+            .is_err_and(|m| m.contains("AcDb:Classes") && m.contains("past its page")),
+        "{message:?}"
+    );
     Ok(())
 }
 
@@ -553,5 +572,18 @@ fn a_stored_page_listed_many_times_is_bounded_too() -> TestResult {
         message.as_ref().is_err_and(|m| m.contains("decompress to too much")),
         "{message:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn a_compressed_page_costs_what_it_gives_not_the_page_size() -> TestResult {
+    // 300 bytes in a section whose pages may hold 0x7400: fits a budget of 1000.
+    let section = TestSection {
+        name: "AcDb:Classes",
+        data: noise(300, 8),
+        ..TestSection::default()
+    };
+    let read = read_sections_with(&write_dwg(b"AC1024", &[section]), 1000)?;
+    assert_eq!(read.get("AcDb:Classes").map(<[u8]>::len), Some(300));
     Ok(())
 }

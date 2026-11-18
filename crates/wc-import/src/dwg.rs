@@ -137,7 +137,7 @@ pub fn read_sections_with(bytes: &[u8], max_total: usize) -> Result<Sections> {
     let page_map = system_page(bytes, page_map_at, PAGE_MAP, "page map")?;
     let pages = parse_page_map(&page_map, bytes.len())?;
 
-    let section_map_at = *pages.get(&section_map_id).ok_or_else(|| {
+    let (section_map_at, _) = *pages.get(&section_map_id).ok_or_else(|| {
         bad(format!(
             "the section map (page {section_map_id}) is not in the page map"
         ))
@@ -199,7 +199,7 @@ fn system_page(bytes: &[u8], at: u64, kind: u32, what: &str) -> Result<Vec<u8>> 
 }
 
 /// The address of each page, by page number, from the decompressed page map.
-fn parse_page_map(map: &[u8], file_len: usize) -> Result<BTreeMap<u32, u64>> {
+fn parse_page_map(map: &[u8], file_len: usize) -> Result<BTreeMap<u32, (u64, u64)>> {
     let r = Reader(map);
     let mut pages = BTreeMap::new();
     let mut at = PAGES_START;
@@ -214,7 +214,7 @@ fn parse_page_map(map: &[u8], file_len: usize) -> Result<BTreeMap<u32, u64>> {
         if number < 0 {
             // A gap (unused space): parent, left, right and a zero follow.
             pos += 16;
-        } else if pages.insert(number as u32, at).is_some() {
+        } else if pages.insert(number as u32, (at, size as u64)).is_some() {
             return Err(bad(format!("page {number} is listed twice in the page map")));
         }
         if pages.len() > MAX_PAGES {
@@ -234,7 +234,7 @@ fn parse_page_map(map: &[u8], file_len: usize) -> Result<BTreeMap<u32, u64>> {
 fn read_section_map(
     bytes: &[u8],
     map: &[u8],
-    pages: &BTreeMap<u32, u64>,
+    pages: &BTreeMap<u32, (u64, u64)>,
     version: Version,
     max_total: usize,
 ) -> Result<Sections> {
@@ -274,7 +274,7 @@ fn read_section_map(
             let at = list + i * 16;
             let number = r.u32(at)?;
             let start = r.u64(at + 8)?;
-            let address = *pages.get(&number).ok_or_else(|| {
+            let (address, extent) = *pages.get(&number).ok_or_else(|| {
                 bad(format!(
                     "section {name} uses page {number}, which is not in the page map"
                 ))
@@ -283,7 +283,7 @@ fn read_section_map(
                 .ok()
                 .filter(|s| *s <= size)
                 .ok_or_else(|| bad(format!("section {name}, page {number} starts past its end")))?;
-            let page = data_page(bytes, address, compressed, max_page, &mut budget)
+            let page = data_page(bytes, address, extent, compressed, max_page, &mut budget)
                 .map_err(|e| bad(format!("section {name}, page {number}: {e}")))?;
             let end = start.saturating_add(page.len()).min(size);
             if data.len() < end {
@@ -310,7 +310,14 @@ fn read_section_map(
 ///
 /// The header's word at 0x0C is the page's size in the file (header and data, rounded up to 32
 /// bytes), not what it decompresses to; it is not needed.
-fn data_page(bytes: &[u8], address: u64, compressed: u32, max_page: u32, budget: &mut usize) -> Result<Vec<u8>> {
+fn data_page(
+    bytes: &[u8],
+    address: u64,
+    extent: u64,
+    compressed: u32,
+    max_page: u32,
+    budget: &mut usize,
+) -> Result<Vec<u8>> {
     let start = offset(address, bytes.len(), "data page")?;
     let raw = bytes
         .get(start..start.saturating_add(DATA_PAGE_HEADER))
@@ -320,23 +327,28 @@ fn data_page(bytes: &[u8], address: u64, compressed: u32, max_page: u32, budget:
         return Err(bad("the page is damaged (wrong page type)"));
     }
     let data_size = to_usize(head.u32(0x08)?, MAX_PAGE, "page")?;
+    // The data stays in the page the page map gives it (only the last page's padding may be
+    // missing from the file, which the read below checks).
+    if (DATA_PAGE_HEADER + data_size) as u64 > extent {
+        return Err(bad("the page's data reaches past its page"));
+    }
     let data_at = start + DATA_PAGE_HEADER;
     let data = bytes
         .get(data_at..data_at.saturating_add(data_size))
         .ok_or_else(|| bad("the page's data is cut off"))?;
-    let gives = match compressed {
-        2 => to_usize(max_page, MAX_PAGE, "page")?,
-        _ => data_size,
-    };
-    // Reading the stored bytes costs too, even when they give little (a page listed many times).
-    *budget = budget
-        .checked_sub(gives.max(data_size))
-        .ok_or_else(|| bad("the file's pages decompress to too much"))?;
-    match compressed {
-        2 => decompress_at_most(data, gives),
-        1 => Ok(data.to_vec()),
-        c => Err(bad(format!("unknown compression {c}"))),
+    let too_much = || bad("the file's pages decompress to too much");
+    if data_size > *budget {
+        return Err(too_much());
     }
+    let page = match compressed {
+        2 => decompress_at_most(data, to_usize(max_page, MAX_PAGE, "page")?)?,
+        1 => data.to_vec(),
+        c => return Err(bad(format!("unknown compression {c}"))),
+    };
+    // What the page gave, or its stored bytes when more (reading them costs too, also for a
+    // page listed many times).
+    *budget = budget.checked_sub(page.len().max(data_size)).ok_or_else(too_much)?;
+    Ok(page)
 }
 
 /// XOR each 32-bit word of a data page header with the page's mask. Doing it twice gives the
