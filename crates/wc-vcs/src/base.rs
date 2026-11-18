@@ -122,4 +122,15 @@ mod tests {
         assert!(e.to_string().contains("../library"), "{e}");
         assert!(!tmp.path().join("z").exists());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_clone_folder_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = private_temp_dir().unwrap();
+        let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
+        // The umask can only take bits away, so no group or other bit is ever set.
+        assert_eq!(mode & 0o077, 0, "mode {mode:o}");
+        assert_eq!(mode & 0o700, 0o700, "mode {mode:o}");
+    }
 }
