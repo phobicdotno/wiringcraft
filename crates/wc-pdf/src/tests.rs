@@ -912,6 +912,20 @@ fn a_short_cover_moves_the_name_up_and_keeps_the_default_logo_above_it() -> Resu
     let (a, b) = layout::cover_logo_default(&project, &cover);
     assert!(a.y >= y0 && b.y - a.y >= 5.0, "{a:?} {b:?}");
     assert!(b.y <= name_y - name_h, "logo to {}, name from {}", b.y, name_y - name_h);
+    // A sheet so short that a fifth of the way down is already near the top keeps the name
+    // low enough for the logo too.
+    cover.size = PageSize::custom(297, 100)?;
+    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
+    let ty = cover.size.mm().1 - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
+    let (name_y, name_h) = marks
+        .iter()
+        .find_map(|m| match &m.shape {
+            Shape::Text { text, at, height, .. } if text == "Plant" && at.y < ty => Some((at.y, *height)),
+            _ => None,
+        })
+        .ok_or("no project name on the short cover")?;
+    let (_, b) = layout::cover_logo_default(&project, &cover);
+    assert!(b.y <= name_y - name_h, "logo to {}, name from {}", b.y, name_y - name_h);
     Ok(())
 }
 

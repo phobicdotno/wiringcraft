@@ -594,7 +594,7 @@ fn cover_name_y(rows: usize, logo: bool, y0: f64, y1: f64) -> f64 {
         } else {
             10.0
         };
-    ideal.min((y1 - needed).max(highest))
+    ideal.min(y1 - needed).max(highest)
 }
 
 /// How many rows of the cover's field table fit on a cover whose drawing area runs from `y0`
