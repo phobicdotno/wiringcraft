@@ -658,6 +658,7 @@ fn sections(v: Version, objs: &[Obj], extra: &[(u64, usize)]) -> Sections {
             },
         ],
         skipped: Vec::new(),
+        codepage: 30,
     }
 }
 
@@ -1248,5 +1249,62 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
             d.skipped
         );
     }
+    Ok(())
+}
+
+/// A TV of raw bytes (2004).
+fn raw_t8(w: &mut W, bytes: &[u8]) {
+    w.bs(bytes.len() as u16);
+    for b in bytes {
+        w.rc(*b);
+    }
+}
+
+/// A 2004 drawing with a block named "Реле" holding the text "Пуск", both in Windows-1251.
+fn cyrillic_2004(codepage: u16) -> Sections {
+    let v = Version::R2004;
+    let mut block = Obj::new(v, BLOCK_HEADER, 0x100);
+    block.data.bs(0).bl(0).b(true);
+    raw_t8(&mut block.data, &[0xD0, 0xE5, 0xEB, 0xE5]);
+    block.data.b(true).bs(0).b(false);
+    block
+        .data
+        .b(false)
+        .b(false)
+        .b(false)
+        .b(false)
+        .b(false)
+        .bl(0)
+        .bd3((0.0, 0.0, 0.0));
+    let mut text = entity(v, 1, 0x200, head(Some(0x100)));
+    text.data
+        .rc(0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80)
+        .rd(0.0)
+        .rd(0.0)
+        .be((0.0, 0.0, 1.0))
+        .bt(0.0)
+        .rd(2.5);
+    raw_t8(&mut text.data, &[0xCF, 0xF3, 0xF1, 0xEA]);
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        block,
+        text,
+    ];
+    let mut s = sections(v, &objs, &[]);
+    s.codepage = codepage;
+    s
+}
+
+#[test]
+fn a_2004_drawing_in_windows_1251_reads_cyrillic() -> TestResult {
+    let d = drawing(&cyrillic_2004(29))?;
+    assert!(d.blocks.contains_key("Реле"), "{:?}", d.blocks.keys());
+    assert_eq!(texts(&d.blocks["Реле"]), ["Пуск"]);
+    assert!(d.skipped.is_empty(), "{:?}", d.skipped);
+    // An unknown code page still reads, as Windows-1252, and is named in a warning.
+    let d = drawing(&cyrillic_2004(31))?;
+    assert_eq!(d.blocks.len(), 1);
+    assert!(d.skipped.keys().any(|k| k.contains("code page 31")), "{:?}", d.skipped);
     Ok(())
 }

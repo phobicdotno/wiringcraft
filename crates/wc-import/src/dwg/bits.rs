@@ -207,8 +207,9 @@ impl<'a> Bits<'a> {
         Ok(())
     }
 
-    /// T: a text of the 2004 format, a length and that many bytes in the drawing's code page.
-    pub(crate) fn t8(&mut self) -> Result<String> {
+    /// The bytes of a TV of the 2004 format, without trailing zeros, to decode in the drawing's
+    /// code page.
+    pub(crate) fn t8_bytes(&mut self) -> Result<Vec<u8>> {
         let n = self.bs()?;
         let mut bytes = Vec::with_capacity(usize::from(n));
         for _ in 0..n {
@@ -217,7 +218,7 @@ impl<'a> Bits<'a> {
         while bytes.last() == Some(&0) {
             bytes.pop();
         }
-        Ok(crate::csv::decode(&bytes))
+        Ok(bytes)
     }
 
     /// TU: a text of the 2007 and later format, a length and that many UTF-16 units.
