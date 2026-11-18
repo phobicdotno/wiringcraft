@@ -12,6 +12,7 @@ use crate::writer::{Drawn, Layer, Link, Pen, text_width_mm};
 pub use wc_core::project::FRAME_COLUMNS;
 const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
 const HEADER: f64 = 6.0;
+#[cfg(test)]
 const TITLE_H: f64 = wc_core::template::TITLE_HEIGHT;
 
 /// The column (1-based) a point falls into with the built-in column count; a project's own
@@ -363,19 +364,20 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
         );
     }
     // Title block: a full-width band at the bottom, divided into the template's boxes.
-    let ty = y1 - TITLE_H;
+    let band = template.band_height();
+    let ty = y1 - band;
     line((x0, ty), (x1, ty), Ink::Thick, &mut out);
     let boxes: Vec<_> = template
         .boxes
         .iter()
-        .filter_map(|b| b.resolve(x0, x1).map(|r| (b, r)))
+        .filter_map(|b| b.resolve(x0, x1, band).map(|r| (b, r)))
         .collect();
     // Box sides, less those on the band's outline, with overlapping pieces drawn once.
     let mut across: Vec<(f64, f64, f64)> = Vec::new();
     let mut down: Vec<(f64, f64, f64)> = Vec::new();
     for (_, (l, t, r, b)) in &boxes {
         for y in [*t, *b] {
-            if y > 1e-6 && y < TITLE_H - 1e-6 {
+            if y > 1e-6 && y < band - 1e-6 {
                 across.push((ty + y, *l, *r));
             }
         }
@@ -458,14 +460,15 @@ pub fn title_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> 
 pub fn title_logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
     let (w, h) = page.size.mm();
     let (x0, x1, y1) = (MARGIN, w - MARGIN, h - MARGIN);
-    let ty = y1 - TITLE_H;
+    let band = project.meta.template.band_height();
+    let ty = y1 - band;
     project
         .meta
         .template
         .boxes
         .iter()
         .filter(|b| b.logo)
-        .filter_map(|b| b.resolve(x0, x1))
+        .filter_map(|b| b.resolve(x0, x1, band))
         .map(|(l, t, r, b)| (Point::new(l + 1.0, ty + t + 1.0), Point::new(r - 1.0, ty + b - 1.0)))
         .filter(|(a, b)| a.x < b.x && a.y < b.y)
         .collect()
@@ -473,9 +476,10 @@ pub fn title_logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
 
 /// Where the cover page shows the logo until the user moves it: centred above the project's
 /// name.
-pub fn cover_logo_default(page: &Page) -> (Point, Point) {
+pub fn cover_logo_default(project: &Project, page: &Page) -> (Point, Point) {
     let (w, h) = page.size.mm();
-    let (x0, y0, x1, ty) = (MARGIN, MARGIN + HEADER, w - MARGIN, h - MARGIN - TITLE_H);
+    let band = project.meta.template.band_height();
+    let (x0, y0, x1, ty) = (MARGIN, MARGIN + HEADER, w - MARGIN, h - MARGIN - band);
     let cx = (x0 + x1) / 2.0;
     let name_y = y0 + (ty - y0) * 0.2;
     let top = y0 + 4.0;
@@ -496,7 +500,7 @@ pub fn cover_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> 
             Point::new(a.x.min(b.x), a.y.min(b.y)),
             Point::new(a.x.max(b.x), a.y.max(b.y)),
         ),
-        None => cover_logo_default(page),
+        None => cover_logo_default(project, page),
     })
 }
 
@@ -819,10 +823,11 @@ const TABLE_TEXT: f64 = 2.2;
 const ROW_H: f64 = 4.6;
 const CELL_PAD: f64 = 1.5;
 
-/// How many table rows fit on one report page of this size (below the heading and header row).
-pub fn rows_per_page(size: PageSize) -> usize {
+/// How many table rows fit on one report page of this size (below the heading and header row),
+/// above a title block band `band` mm high.
+pub fn rows_per_page(size: PageSize, band: f64) -> usize {
     let (_, h) = size.mm();
-    let usable = h - 2.0 * MARGIN - HEADER - TITLE_H - 14.0 - ROW_H;
+    let usable = h - 2.0 * MARGIN - HEADER - band - 14.0 - ROW_H;
     ((usable / ROW_H).floor() as usize).max(1)
 }
 
@@ -893,7 +898,11 @@ pub fn draw_table_page(
     pen.text((x0, y), 4.0, 0, &heading);
     y += 4.0;
     let widths = column_widths(table, x1 - x0);
-    let rows = table.rows.iter().skip(first).take(rows_per_page(page.size));
+    let rows = table
+        .rows
+        .iter()
+        .skip(first)
+        .take(rows_per_page(page.size, project.meta.template.band_height()));
     // Header row on a grey band.
     pen.colour(0.88, 0.89, 0.91);
     pen.fill_rect((x0, y), (x1, y + ROW_H));
@@ -974,7 +983,8 @@ pub fn draw_panel_page(
     frame(&mut pen, project, page, index, total, date);
     // Drawing area inside the frame, above the title block, with room for the caption.
     let (ax0, ay0) = (MARGIN + 10.0, MARGIN + HEADER + 10.0);
-    let (ax1, ay1) = (w - MARGIN - 10.0, h - MARGIN - TITLE_H - 14.0);
+    let band = project.meta.template.band_height();
+    let (ax1, ay1) = (w - MARGIN - 10.0, h - MARGIN - band - 14.0);
     let (pw, ph) = (panel.width.max(1.0), panel.height.max(1.0));
     let fit = ((ax1 - ax0) / pw).min((ay1 - ay0) / ph);
     // A standard reduction (1:2, 1:5, 1:10, ...) that fits.
@@ -1032,7 +1042,7 @@ pub fn draw_panel_page(
     }
     let devices = panel.device_tags().len();
     pen.text(
-        (ax0, h - MARGIN - TITLE_H - 5.0),
+        (ax0, h - MARGIN - band - 5.0),
         2.5,
         0,
         &format!(
@@ -1378,6 +1388,60 @@ mod template_tests {
         let (w, _) = page.size.mm();
         assert_eq!(p.column_of(&page, w - MARGIN - 1.0), 12);
         assert_eq!(p.column_of(&page, MARGIN + (w - 2.0 * MARGIN) / 12.0 + 0.1), 2);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_taller_title_block_moves_its_line_and_keeps_boxes_inside() {
+        let (mut p, page) = demo(PageSize::A3, true);
+        let (w, h) = page.size.mm();
+        let (x0, x1, y1) = (MARGIN, w - MARGIN, h - MARGIN);
+        let before = rows_per_page(page.size, p.meta.template.band_height());
+        let mut t = PageTemplate {
+            height: 36.0,
+            ..Default::default()
+        };
+        // A box filling the lower 12 mm the default layout leaves free.
+        t.boxes.push(TitleBox::new(
+            "Notes",
+            (0.0, Side::Left),
+            (0.0, Side::Right),
+            24.0,
+            36.0,
+        ));
+        p.meta.template = t;
+        let marks = frame_marks(&p, &page, 0, 1, "");
+        let thick: Vec<(Point, Point)> = marks
+            .iter()
+            .filter(|m| m.ink == Ink::Thick)
+            .filter_map(|m| match &m.shape {
+                Shape::Line { a, b } if (a.y - b.y).abs() < 1e-9 => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        let ty = y1 - 36.0;
+        assert!(
+            thick
+                .iter()
+                .any(|(a, b)| (a.y - ty).abs() < 1e-9 && a.x == x0 && b.x == x1),
+            "the band's top line moved up: {thick:?}"
+        );
+        // The Notes box's top side is drawn 24 mm down the band, across the frame.
+        assert!(marks.iter().any(|m| matches!(&m.shape,
+            Shape::Line { a, b } if (a.y - (ty + 24.0)).abs() < 1e-9 && (b.y - a.y).abs() < 1e-9)));
+        // Everything of the title block stays inside it.
+        for m in &marks {
+            if let Shape::Text { at, .. } = &m.shape
+                && at.y > ty
+            {
+                assert!(at.y <= y1, "{at:?}");
+            }
+        }
+        let (a, b) = title_logo_box(&p, &page).unwrap();
+        assert!(a.y > ty && b.y < y1, "the logo stays in its box: {a:?} {b:?}");
+        // Report pages fit fewer rows, and the cover logo stays above the band.
+        assert!(rows_per_page(page.size, p.meta.template.band_height()) < before);
+        assert!(cover_logo_default(&p, &page).1.y < ty);
     }
 
     fn texts(marks: &[FrameMark]) -> Vec<(String, f64)> {

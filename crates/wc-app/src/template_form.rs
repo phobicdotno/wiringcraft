@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use wc_core::geom::Align;
-use wc_core::template::{self, BoxText, MAX_COLUMNS, PageTemplate, Side, TITLE_HEIGHT, TitleBox};
+use wc_core::template::{self, BoxText, MAX_COLUMNS, MAX_TITLE_HEIGHT, MIN_TITLE_HEIGHT, PageTemplate, Side, TitleBox};
 
 /// The values a title-block text can show: the special ones, the standard title-block fields
 /// and any other field the project has, each once.
@@ -33,7 +33,7 @@ fn edge(ui: &mut egui::Ui, mm: &mut f64, from: &mut Side, salt: impl std::hash::
     changed
 }
 
-fn text_row(ui: &mut egui::Ui, t: &mut BoxText, keys: &[String], salt: (usize, usize)) -> (bool, bool) {
+fn text_row(ui: &mut egui::Ui, t: &mut BoxText, keys: &[String], band: f64, salt: (usize, usize)) -> (bool, bool) {
     let mut changed = false;
     let mut remove_text = false;
     ui.horizontal_wrapped(|ui| {
@@ -73,7 +73,7 @@ fn text_row(ui: &mut egui::Ui, t: &mut BoxText, keys: &[String], salt: (usize, u
         changed |= ui
             .add(
                 egui::DragValue::new(&mut t.y)
-                    .range(0.0..=TITLE_HEIGHT)
+                    .range(0.0..=band)
                     .speed(0.1)
                     .suffix(" mm"),
             )
@@ -110,10 +110,21 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
             .add(egui::DragValue::new(&mut draft.columns).range(1..=MAX_COLUMNS))
             .on_hover_text("Across the frame; cross-references and wire numbers by column use them too")
             .changed();
+        ui.label("Title block height");
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut draft.height)
+                    .range(MIN_TITLE_HEIGHT..=MAX_TITLE_HEIGHT)
+                    .speed(0.5)
+                    .suffix(" mm"),
+            )
+            .on_hover_text("A taller title block leaves less drawing area on every page")
+            .changed();
     });
+    let band = draft.band_height();
     ui.separator();
     ui.label(
-        "Title block boxes (sides in mm from the frame's left or right edge, top and bottom in mm down the 24 mm band)",
+        format!("Title block boxes (sides in mm from the frame's left or right edge, top and bottom in mm down the {band} mm band)"),
     );
     let mut remove = None;
     let mut raise = None;
@@ -144,12 +155,7 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
                         ui.horizontal(|ui| {
                             for v in [&mut b.top, &mut b.bottom] {
                                 changed |= ui
-                                    .add(
-                                        egui::DragValue::new(v)
-                                            .range(0.0..=TITLE_HEIGHT)
-                                            .speed(0.5)
-                                            .suffix(" mm"),
-                                    )
+                                    .add(egui::DragValue::new(v).range(0.0..=band).speed(0.5).suffix(" mm"))
                                     .changed();
                             }
                         });
@@ -160,7 +166,7 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
                     });
                 let mut drop = None;
                 for (j, t) in b.texts.iter_mut().enumerate() {
-                    let (c, r) = text_row(ui, t, keys, (i, j));
+                    let (c, r) = text_row(ui, t, keys, band, (i, j));
                     changed |= c;
                     if r {
                         drop = Some(j);
@@ -199,13 +205,7 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
     }
     ui.horizontal(|ui| {
         if ui.button("Add box").clicked() {
-            let mut b = TitleBox::new(
-                "New box",
-                (0.0, Side::Left),
-                (40.0, Side::Left),
-                0.0,
-                TITLE_HEIGHT / 2.0,
-            );
+            let mut b = TitleBox::new("New box", (0.0, Side::Left), (40.0, Side::Left), 0.0, band / 2.0);
             b.texts.push(BoxText::new(&["customer"], 2.5, 9.5, Align::Left));
             draft.boxes.push(b);
             changed = true;
