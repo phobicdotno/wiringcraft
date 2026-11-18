@@ -239,6 +239,9 @@ pub struct Open {
     /// saved it in between.
     #[cfg(test)]
     rewrite_after_snapshot: Option<(PathBuf, String)>,
+    /// Devices renamed here, old tag and new, in order; a shared session takes them
+    /// ([`Open::take_device_renames`]) to keep a rename that waits together.
+    device_renames: Vec<(DeviceTag, DeviceTag)>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
     /// Parts the last Undo or Redo could not load, with the reason, though the step was done.
@@ -289,6 +292,7 @@ impl Open {
             unreadable: None,
             #[cfg(test)]
             rewrite_after_snapshot: None,
+            device_renames: Vec::new(),
             undo_error: None,
             step_warning: None,
         };
@@ -762,6 +766,16 @@ impl Open {
         while self.redo.last().is_some_and(|s| like_now(s, &self.project)) {
             self.redo.pop();
         }
+    }
+
+    /// The devices renamed here since the last call, old tag and new, in order.
+    pub fn take_device_renames(&mut self) -> Vec<(DeviceTag, DeviceTag)> {
+        std::mem::take(&mut self.device_renames)
+    }
+
+    /// Note that device `from` was renamed to `to` here.
+    pub(crate) fn note_device_rename(&mut self, from: &DeviceTag, to: &DeviceTag) {
+        self.device_renames.push((from.clone(), to.clone()));
     }
 
     /// A mark in the undo history, for [`Open::squash_undo`].
@@ -1768,7 +1782,7 @@ impl Open {
     ) -> Result<usize, String> {
         self.follow_terminals();
         let mut project = self.project.clone();
-        let n = wc_core::find::replace(&mut project, hits, query, with, opts)?;
+        let (n, renamed) = wc_core::find::replace_renaming(&mut project, hits, query, with, opts)?;
         let held: Vec<String> = project
             .pages
             .iter()
@@ -1789,6 +1803,7 @@ impl Open {
         if n > 0 {
             self.checkpoint();
             self.project = project;
+            self.device_renames.extend(renamed);
         }
         Ok(n)
     }

@@ -4199,6 +4199,124 @@ fn a_device_removed_beside_a_waiting_rename_with_jumpers_goes_out_at_once() -> T
 }
 
 #[test]
+fn a_recorded_rename_of_a_device_nothing_draws_waits_as_a_pair() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
+    let renamed: BTreeMap<_, _> = [(k1.clone(), k2.clone())].into_iter().collect();
+    let held = Held::find_renamed(&local, &base, &parts, &renamed);
+    // The old device's removal waits with the new one: the session keeps -K1 meanwhile.
+    assert_eq!(held.now.devices.get(&k1), Some(&None));
+    assert!(held.now.devices.contains_key(&k2));
+    assert_eq!(held.renames.len(), 1);
+    assert_eq!(held.renames[0].devices, [k1.clone(), k2.clone()].into_iter().collect());
+    let mut sendable = local.clone();
+    held.drop_from(&mut sendable);
+    assert_eq!(sendable.devices, base.devices);
+    // A rename taken back here is no pair: -K1 is here again.
+    let held = Held::find_renamed(&base, &base, &parts, &renamed);
+    assert!(held.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_recorded_strip_rename_waits_while_its_jumpers_wait_for_another_part() -> TestResult {
+    let x1 = wc_core::DeviceTag::parse("-X1")?;
+    let x2 = wc_core::DeviceTag::parse("-X2")?;
+    let mut base = Project::new("Test");
+    base.meta.jumpers.push(wc_core::project::Jumper {
+        strip: x1.clone(),
+        terminals: vec!["1".into(), "2".into()],
+        part: None,
+    });
+    base.devices.insert(x1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&x1, &x2);
+    // A new jumper on the strip waits for its part; the strip's own part is in the session.
+    local.meta.jumpers.push(wc_core::project::Jumper {
+        strip: x2.clone(),
+        terminals: vec!["3".into(), "4".into()],
+        part: Some("acme.bridge".into()),
+    });
+    let parts = waiting(&[item_name(ItemKind::Part, "acme.bridge")]);
+    let renamed: BTreeMap<_, _> = [(x1.clone(), x2.clone())].into_iter().collect();
+    let held = Held::find_renamed(&local, &base, &parts, &renamed);
+    assert!(held.now.meta.is_some(), "the jumpers wait");
+    // The rename waits with them, or the session would have -X2 while its jumpers name -X1.
+    assert!(held.now.devices.contains_key(&x2));
+    assert_eq!(held.now.devices.get(&x1), Some(&None));
+    assert_eq!(held.renames.len(), 1);
+    assert!(held.renames[0].meta);
+    Ok(())
+}
+
+#[test]
+fn a_device_nothing_draws_renamed_to_a_waiting_placements_tag_stays_in_the_session_meanwhile() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    let q5 = wc_core::DeviceTag::parse("-Q5")?;
+    let q6 = wc_core::DeviceTag::parse("-Q6")?;
+    host_open.project.devices.insert(q5.clone(), wc_core::Device::default());
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(guest_open.project.devices.contains_key(&q5));
+    // The guest renames the undrawn -Q5 to -Q6 and gives the waiting placement that tag.
+    let opts = wc_core::find::FindOptions::default();
+    let hits = wc_core::find::find(&guest_open.project, "Q5", opts);
+    assert_eq!(guest_open.replace_found(&hits, "Q5", "Q6", opts), Ok(1));
+    guest_open.checkpoint();
+    let placed = guest_open
+        .project
+        .page_mut("p0003")
+        .and_then(|p| p.symbols.iter_mut().find(|s| s.id == item))
+        .ok_or("no placement")?;
+    placed.tag = Some(q6.clone());
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The rename waits with the placement: the session keeps -Q5 and has no -Q6 yet.
+    assert!(host_open.project.devices.contains_key(&q5), "{:?}", g.notes);
+    assert!(!host_open.project.devices.contains_key(&q6));
+    assert!(guest_open.project.devices.contains_key(&q6));
+    assert!(!guest_open.project.devices.contains_key(&q5));
+    Ok(())
+}
+
+#[test]
+fn renames_made_here_are_followed_to_their_last_tag_until_the_session_has_them() -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3, k5) = (tag("-K1")?, tag("-K2")?, tag("-K3")?, tag("-K5")?);
+    let mut base = Project::new("Test");
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k5.clone(), wc_core::Device::default());
+    let mut renames = BTreeMap::new();
+    note_renames(
+        &mut renames,
+        vec![(k1.clone(), k2.clone()), (k2.clone(), k3.clone())],
+        &base,
+    );
+    assert_eq!(renames, [(k1.clone(), k3.clone())].into_iter().collect());
+    // Renamed back: no rename.
+    note_renames(&mut renames, vec![(k3.clone(), k1.clone())], &base);
+    assert!(renames.is_empty());
+    // One the session has is dropped.
+    note_renames(&mut renames, vec![(k5.clone(), k2.clone())], &base);
+    assert_eq!(renames.len(), 1);
+    let mut synced = base.clone();
+    synced.devices.remove(&k5);
+    synced.devices.insert(k2.clone(), wc_core::Device::default());
+    note_renames(&mut renames, Vec::new(), &synced);
+    assert!(renames.is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_waiting_rename_lost_to_the_session_leaves_another_rename_alone() -> TestResult {
     let tag = |t: &str| wc_core::DeviceTag::parse(t);
     let (k1, k2, k3, k4) = (tag("-K1")?, tag("-K2")?, tag("-K3")?, tag("-K4")?);

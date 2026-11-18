@@ -833,6 +833,7 @@ impl Open {
             return Err(format!("{to} is already used."));
         }
         self.checkpoint();
+        self.note_device_rename(from, to);
         Ok(self.project.rename_device(from, to))
     }
 
@@ -4071,6 +4072,16 @@ mod tests {
                 .iter()
                 .all(|s| s.tag.as_ref().unwrap().to_string() == "=PUMP-K7")
         );
+        // Noted for a shared session, which keeps a rename that waits together.
+        let noted: Vec<(String, String)> = a
+            .open
+            .as_mut()
+            .unwrap()
+            .take_device_renames()
+            .into_iter()
+            .map(|(f, t)| (f.to_string(), t.to_string()))
+            .collect();
+        assert_eq!(noted, [("=PUMP-K1".to_owned(), "=PUMP-K7".to_owned())]);
     }
 
     #[test]
