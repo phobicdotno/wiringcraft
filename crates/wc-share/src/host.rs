@@ -57,6 +57,9 @@ pub struct Host {
     /// user shared ([`Host::share_files`]) and what participants added since.
     symbols: BTreeMap<String, wc_core::Symbol>,
     parts: BTreeMap<String, wc_core::Part>,
+    /// The picture files guests get (the logo, page underlays), by project path: what the
+    /// host's user shared ([`Host::share_pictures`]) and what participants added since.
+    pictures: BTreeMap<String, Vec<u8>>,
 }
 
 /// A recorded change and the parts of the project it changed, before and after.
@@ -107,6 +110,7 @@ impl Host {
             take_backs_held: None,
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
+            pictures: BTreeMap::new(),
         }
     }
 
@@ -115,6 +119,22 @@ impl Host {
     pub fn share_files(&mut self, symbols: BTreeMap<String, wc_core::Symbol>, parts: BTreeMap<String, wc_core::Part>) {
         self.symbols = symbols;
         self.parts = parts;
+    }
+
+    /// The project's picture files (the logo, page underlays) by project path, sent to every
+    /// guest that joins. Files outside the picture folders or too large are left out.
+    pub fn share_pictures(&mut self, pictures: BTreeMap<String, Vec<u8>>) {
+        self.pictures = pictures
+            .into_iter()
+            .filter(|(file, data)| {
+                crate::Picture::file_ok(file) && !data.is_empty() && data.len() <= crate::MAX_PICTURE
+            })
+            .collect();
+    }
+
+    /// The picture files guests get, by project path.
+    pub fn pictures(&self) -> &BTreeMap<String, Vec<u8>> {
+        &self.pictures
     }
 
     /// The symbol and part files guests get, by id.
@@ -208,6 +228,13 @@ impl Host {
             history: self.history(),
         };
         self.outbox.push((id, welcome));
+        for (file, data) in &self.pictures {
+            let picture = crate::Picture {
+                file: file.clone(),
+                data: data.clone(),
+            };
+            self.outbox.push((id, HostMsg::Picture { picture }));
+        }
         self.broadcast_presence_except(id);
         true
     }
@@ -473,6 +500,10 @@ impl Host {
             });
         }
         check_edit(&self.project, &self.locks, by, &edit)?;
+        if let ProjectEdit::AddPicture { picture } = edit {
+            self.add_picture(picture)?;
+            return Ok(false);
+        }
         let before = self.project.clone();
         apply_edit(&mut self.project, &edit);
         if self.project == before {
@@ -530,6 +561,37 @@ impl Host {
         }
         self.remember(by, page, message, ChangeKind::Edit, None, was, now);
         Ok(true)
+    }
+
+    /// Store a checked picture and send it to everyone. It changes no project data, so it has
+    /// no change of its own: the change that names it commits it.
+    fn add_picture(&mut self, picture: crate::Picture) -> Result<(), Refusal> {
+        match self.pictures.get(&picture.file) {
+            Some(have) if *have == picture.data => return Ok(()),
+            Some(_) => {
+                return Err(Refusal::Invalid {
+                    reason: format!(
+                        "the session already has another picture named {}; pick the picture again to give it a new name",
+                        picture.file
+                    ),
+                });
+            }
+            None => {}
+        }
+        self.journal
+            .picture(&picture)
+            .map_err(|e| Refusal::NotRecorded { reason: e.to_string() })?;
+        self.pictures.insert(picture.file.clone(), picture.data.clone());
+        let ids: Vec<PeerId> = self.joined_guests().collect();
+        for id in ids {
+            self.outbox.push((
+                id,
+                HostMsg::Picture {
+                    picture: picture.clone(),
+                },
+            ));
+        }
+        Ok(())
     }
 
     fn do_undo(&mut self, by: PeerId) -> Result<(), Refusal> {

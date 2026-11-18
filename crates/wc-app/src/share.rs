@@ -13,7 +13,10 @@
 //!
 //! Symbol and part files travel too: a guest gets the project's vendored files when it joins,
 //! and a symbol or part someone uses for the first time goes out as an `AddItems` edit with its
-//! file, so every copy can draw it and the host's folder and history keep it.
+//! file, so every copy can draw it and the host's folder and history keep it. Picture files
+//! (the logo, page underlays) do the same: a guest gets the project's pictures when it joins,
+//! and a picture someone starts using goes out as an `AddPicture` edit before the change that
+//! names it, so every copy shows it and the host's folder keeps it with that change's commit.
 
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, UdpSocket};
@@ -26,7 +29,7 @@ use wc_share::discovery::{Announcer, Beacon, Browser};
 use wc_share::net::{self, Listener};
 use wc_share::transport::{GuestLink, Hub};
 use wc_share::{ChangeInfo, ChangeKind, redo_target, undo_target};
-use wc_share::{GitJournal, Guest, GuestMsg, GuestStatus, HOST, Host, Peer, PeerId, ProjectEdit};
+use wc_share::{GitJournal, Guest, GuestMsg, GuestStatus, HOST, Host, Peer, PeerId, Picture, ProjectEdit};
 
 use crate::state::Open;
 
@@ -654,6 +657,103 @@ pub fn take_files(
     failed
 }
 
+/// The picture files `project` uses: its logo and its pages' underlays, by project path.
+pub fn used_pictures(project: &Project) -> std::collections::BTreeSet<String> {
+    project
+        .pages
+        .iter()
+        .filter_map(|p| p.underlay.as_ref().map(|u| u.file.clone()))
+        .chain(project.meta.logo.as_ref().map(|l| l.file.clone()))
+        .collect()
+}
+
+/// What [`new_pictures`] found.
+#[derive(Debug, Default)]
+pub struct NewPictures {
+    /// One edit per picture, with its file.
+    pub edits: Vec<ProjectEdit>,
+    /// The pictures looked at: sent, missing here, or unreadable. Each waits a while before it
+    /// is looked at again.
+    pub tried: Vec<String>,
+    /// Pictures that exist here but cannot be sent, with the reason.
+    pub unreadable: Vec<(String, String)>,
+}
+
+/// The pictures `local` uses that the session (`session`, by project path) does not have, read
+/// from `dir`, each as its own edit so each message stays small. Pictures named in `skip` were
+/// tried a moment ago and are left out. A picture missing here is left out silently: nobody
+/// can show it, and the window already says so.
+pub fn new_pictures(
+    dir: &Path,
+    local: &Project,
+    session: &BTreeMap<String, Vec<u8>>,
+    skip: &std::collections::BTreeSet<String>,
+) -> NewPictures {
+    let mut out = NewPictures::default();
+    for file in used_pictures(local) {
+        if session.contains_key(&file) || skip.contains(&file) {
+            continue;
+        }
+        out.tried.push(file.clone());
+        if !Picture::file_ok(&file) {
+            out.unreadable.push((
+                file,
+                format!(
+                    "only pictures in the {} and {} folders are shared",
+                    wc_core::Logo::DIR,
+                    wc_core::Underlay::DIR
+                ),
+            ));
+            continue;
+        }
+        match wc_pdf::read_picture(dir, &file) {
+            Ok(Some(data)) => {
+                let picture = Picture { file, data };
+                match picture.problem() {
+                    Some(why) => out.unreadable.push((picture.file, why)),
+                    None => out.edits.push(ProjectEdit::AddPicture { picture }),
+                }
+            }
+            Ok(None) => {}
+            Err(why) => out.unreadable.push((file, why)),
+        }
+    }
+    out
+}
+
+/// Write the session's pictures that `open` uses and has not taken yet (`taken`, by project
+/// path) into its folder, and forget what the window showed for them. `replace` lets a
+/// session's picture replace another file of the same name (a guest's copy follows the
+/// session); the host's own folder is never written over. Returns the pictures that could not
+/// be written, with the reason; they are tried again next time.
+pub fn take_pictures(
+    open: &mut Open,
+    session: &BTreeMap<String, Vec<u8>>,
+    taken: &mut std::collections::BTreeSet<String>,
+    replace: bool,
+) -> Vec<(String, String)> {
+    let mut failed = Vec::new();
+    for file in used_pictures(&open.project) {
+        if taken.contains(&file) {
+            continue;
+        }
+        let Some(data) = session.get(&file) else { continue };
+        let picture = Picture {
+            file: file.clone(),
+            data: data.clone(),
+        };
+        match wc_share::write_picture(&open.dir, &picture, replace) {
+            Ok(()) => {
+                open.underlays.remove(&file);
+                open.picture_problems.remove(&file);
+                taken.insert(file);
+            }
+            Err(e) => failed.push((file, e.to_string())),
+        }
+    }
+    failed
+}
+
 /// The project's vendored files in `dir`, as read for a session.
 struct Files {
     symbols: BTreeMap<String, Symbol>,
@@ -754,6 +854,14 @@ impl Role {
         match self {
             Role::Host(_) => false,
             Role::Guest(j) => j.guest.taking_back(),
+        }
+    }
+
+    /// The picture files the session has, by project path.
+    fn pictures(&self) -> &BTreeMap<String, Vec<u8>> {
+        match self {
+            Role::Host(h) => h.host.pictures(),
+            Role::Guest(j) => &j.guest.pictures,
         }
     }
 
@@ -1029,6 +1137,11 @@ pub struct Share {
     items_out: BTreeMap<String, ItemOut>,
     /// Items whose file could not be read, sent or taken, reported once each.
     unreadable: std::collections::BTreeSet<String>,
+    /// Pictures looked at for the session and not taken yet, by project path, with when: each
+    /// is looked at again only after [`ITEM_RETRY_LATER`]. Changes never wait for a picture.
+    pictures_out: BTreeMap<String, std::time::Instant>,
+    /// The session's pictures written into this copy (or found there already), by project path.
+    pictures_taken: std::collections::BTreeSet<String>,
 }
 
 /// One symbol or part sent to the session and not taken yet.
@@ -1199,6 +1312,19 @@ impl Share {
             ));
         }
         host.share_files(files.symbols, files.parts);
+        let pictures = wc_pdf::read_pictures(&open.dir, &open.project);
+        if !pictures.unreadable.is_empty() {
+            let names: Vec<String> = pictures
+                .unreadable
+                .iter()
+                .map(|(file, why)| format!("{file} ({why})"))
+                .collect();
+            self.notes.push(format!(
+                "These pictures cannot be shared, so guests will not see them: {}",
+                names.join(", ")
+            ));
+        }
+        host.share_pictures(pictures.files);
         self.role = Some(Role::Host(Box::new(Hosting {
             host,
             hub: Hub::new(),
@@ -1243,6 +1369,8 @@ impl Share {
     fn forget_items(&mut self) {
         self.items_out.clear();
         self.unreadable.clear();
+        self.pictures_out.clear();
+        self.pictures_taken.clear();
     }
 
     /// Leave or end the session.
@@ -1397,6 +1525,26 @@ impl Share {
             let auth = role.project()?;
             self.items_out.retain(|name, _| !session_has(auth, name));
         }
+        // Pictures used for the first time go out before the change that names them. Changes do
+        // not wait for them: without its picture a page still works, it just shows a gap.
+        let session_pictures = role.pictures();
+        self.pictures_out
+            .retain(|file, at| !session_pictures.contains_key(file) && at.elapsed() < ITEM_RETRY_LATER);
+        let skip = self.pictures_out.keys().cloned().collect();
+        let pictures = new_pictures(&open.dir, &open.project, session_pictures, &skip);
+        for file in pictures.tried {
+            self.pictures_out.insert(file, now);
+        }
+        for (file, why) in pictures.unreadable {
+            if self.unreadable.insert(format!("picture {file}")) {
+                self.notes.push(format!(
+                    "The picture {file} cannot be shared ({why}); others will not see it."
+                ));
+            }
+        }
+        for edit in pictures.edits {
+            role.edit_project(edit, &mut self.notes);
+        }
         if self.items_out.values().any(|o| !o.gave_up) {
             return None;
         }
@@ -1442,6 +1590,18 @@ impl Share {
         if !failed.is_empty() {
             self.notes.push(format!(
                 "Symbols and parts from the session could not be taken into your copy: {}",
+                failed.join(", ")
+            ));
+        }
+        let replace = matches!(role, Role::Guest(_));
+        let failed: Vec<String> = take_pictures(open, role.pictures(), &mut self.pictures_taken, replace)
+            .into_iter()
+            .filter(|(file, _)| self.unreadable.insert(format!("picture {file}")))
+            .map(|(file, why)| format!("{file} ({why})"))
+            .collect();
+        if !failed.is_empty() {
+            self.notes.push(format!(
+                "Pictures from the session could not be written into your copy: {}",
                 failed.join(", ")
             ));
         }

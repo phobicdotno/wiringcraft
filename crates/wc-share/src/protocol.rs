@@ -13,6 +13,68 @@ use crate::{ChangeInfo, Parts};
 /// A participant's number in a session. The host is always [`crate::HOST`].
 pub type PeerId = u32;
 
+/// The largest picture file a session carries (a logo or a page underlay), in bytes. It keeps
+/// each message well under the connection's line limit ([`crate::net::MAX_LINE`]).
+pub const MAX_PICTURE: usize = 16 * 1024 * 1024;
+
+/// A picture file of the project (the logo in `pictures/`, a page underlay in `underlays/`), so
+/// a participant without it can show it. Its bytes travel as base64.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Picture {
+    /// Path relative to the project folder, e.g. `pictures/logo.png`.
+    pub file: String,
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
+}
+
+impl Picture {
+    /// Whether `file` may be carried by a session: a plain relative path in the project's
+    /// picture folders ([`wc_core::Logo::DIR`], [`wc_core::Underlay::DIR`]).
+    pub fn file_ok(file: &str) -> bool {
+        wc_core::project::relative_file_is_safe(file)
+            && [wc_core::Logo::DIR, wc_core::Underlay::DIR]
+                .iter()
+                .any(|dir| file.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/')))
+    }
+
+    /// Why this picture cannot be carried, if it cannot.
+    pub fn problem(&self) -> Option<String> {
+        if !Self::file_ok(&self.file) {
+            Some(format!(
+                "picture {} is not in the project's {} or {} folder",
+                self.file,
+                wc_core::Logo::DIR,
+                wc_core::Underlay::DIR
+            ))
+        } else if self.data.is_empty() {
+            Some(format!("picture {} is empty", self.file))
+        } else if self.data.len() > MAX_PICTURE {
+            Some(format!(
+                "picture {} is larger than {} MB",
+                self.file,
+                MAX_PICTURE / (1024 * 1024)
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+mod base64_bytes {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A participant as the others see them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
@@ -119,6 +181,12 @@ pub enum ProjectEdit {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parts: Vec<(Part, String)>,
     },
+    /// Add a picture file to the project folder (a new logo, a page underlay), so every copy
+    /// can show it: what a participant sends before the change that names it. It changes no
+    /// project data; the host stores the file, which the next change's commit holds, and sends
+    /// it to everyone as [`HostMsg::Picture`]. A picture the session has under the same name with
+    /// other content is refused.
+    AddPicture { picture: Picture },
     /// Several edits made by one user action (a device renamed on its pages and in the device
     /// list), checked and applied together in order: all of them or none, as one change in the
     /// history. Only [`ProjectEdit::batchable`] edits can be in it.
@@ -202,6 +270,7 @@ impl ProjectEdit {
             },
             Self::Restore { .. } => "Put back an earlier state".to_owned(),
             Self::Batch { edits } => edits.iter().map(Self::describe).collect::<Vec<_>>().join("; "),
+            Self::AddPicture { picture } => format!("Add picture {}", picture.file),
             Self::AddItems { symbols, parts } => {
                 let names: Vec<&str> = symbols
                     .iter()
@@ -260,7 +329,7 @@ impl ProjectEdit {
                     }
                 }
             }
-            Self::SetPages { .. } | Self::AddItems { .. } => {}
+            Self::SetPages { .. } | Self::AddItems { .. } | Self::AddPicture { .. } => {}
         }
         Parts::read(project, &keys)
     }
@@ -271,7 +340,11 @@ impl ProjectEdit {
     pub fn applied_at_once(&self) -> bool {
         !matches!(
             self,
-            Self::SetPages { .. } | Self::AddItems { .. } | Self::Restore { .. } | Self::Batch { .. }
+            Self::SetPages { .. }
+                | Self::AddItems { .. }
+                | Self::AddPicture { .. }
+                | Self::Restore { .. }
+                | Self::Batch { .. }
         )
     }
 
@@ -466,6 +539,10 @@ pub enum HostMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         put_back: Option<Box<Parts>>,
     },
+    /// A picture file of the project: one for each picture the project has, right after the
+    /// [`HostMsg::Welcome`] (one message each, so a project with many underlays stays under the
+    /// line limit), and each one a participant adds with [`ProjectEdit::AddPicture`].
+    Picture { picture: Picture },
     /// The host ended the session.
     Closed,
 }
@@ -531,6 +608,8 @@ pub fn apply_edit(project: &mut Project, edit: &ProjectEdit) {
                 project.lock.parts.insert(p.id.clone(), lock_entry(source, p.hash()));
             }
         }
+        // The file is not project data: the host stores it, and each copy keeps it apart.
+        ProjectEdit::AddPicture { .. } => {}
         ProjectEdit::SetPages { pages, .. } => {
             for page in pages {
                 if let Some(p) = project.page_mut(&page.id) {
@@ -633,6 +712,10 @@ pub(crate) fn check_edit(
             Ok(())
         }
         ProjectEdit::SetMeta { .. } => Ok(()),
+        ProjectEdit::AddPicture { picture } => match picture.problem() {
+            Some(why) => invalid(why),
+            None => Ok(()),
+        },
         ProjectEdit::AddItems { symbols, parts } => {
             if symbols.is_empty() && parts.is_empty() {
                 return invalid("nothing to add".into());

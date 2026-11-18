@@ -46,6 +46,9 @@ pub struct Guest {
     /// [`ProjectEdit::AddItems`]), by id: what this guest's copy needs to draw the project.
     pub symbols: BTreeMap<String, wc_core::Symbol>,
     pub parts: BTreeMap<String, wc_core::Part>,
+    /// Picture files the session sent ([`HostMsg::Picture`]), by project path: what this
+    /// guest's copy needs to show the logo and underlays.
+    pub pictures: BTreeMap<String, Vec<u8>>,
     /// The number of the last project edit sent.
     last_edit: u64,
     /// Project edits sent and not answered yet, by number, each with the page it adds or
@@ -77,6 +80,7 @@ impl Guest {
             taking_back: 0,
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
+            pictures: BTreeMap::new(),
             last_edit: 0,
             unanswered: BTreeMap::new(),
             replaced: BTreeMap::new(),
@@ -257,6 +261,9 @@ impl Guest {
                 if let Some(p) = self.project.as_mut() {
                     apply_edit(p, &edit);
                 }
+            }
+            HostMsg::Picture { picture } => {
+                self.pictures.insert(picture.file, picture.data);
             }
             HostMsg::Recorded { change } => note(&mut self.history, change),
             HostMsg::Locks { locks } => {

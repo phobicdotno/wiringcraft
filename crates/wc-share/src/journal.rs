@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use wc_core::{Part, Project, Symbol};
 use wc_vcs::Git;
 
-use crate::{PeerId, Result};
+use crate::{PeerId, Picture, Result};
 
 /// One applied change, as recorded in the history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +30,14 @@ pub trait Journal {
         Ok(())
     }
 
+    /// Store a picture file a participant added ([`crate::ProjectEdit::AddPicture`]) with the
+    /// project, so the commit of the change that names it holds it. A file already there with
+    /// the same content is fine; one with other content must not be overwritten (an undo may
+    /// still show it) and is an error.
+    fn picture(&mut self, _picture: &Picture) -> Result<()> {
+        Ok(())
+    }
+
     /// Called when `record` failed: put back what it stored, so it holds `project` again.
     fn restore(&mut self, _project: &Project) -> Result<()> {
         Ok(())
@@ -42,6 +50,8 @@ pub struct MemoryJournal {
     pub changes: Vec<Change>,
     /// Ids of the symbols and parts handed to [`Journal::vendor`].
     pub vendored: Vec<String>,
+    /// Paths of the pictures handed to [`Journal::picture`].
+    pub pictures: Vec<String>,
 }
 
 impl Journal for MemoryJournal {
@@ -57,6 +67,11 @@ impl Journal for MemoryJournal {
                 .map(|s| s.id.clone())
                 .chain(parts.iter().map(|p| p.id.clone())),
         );
+        Ok(())
+    }
+
+    fn picture(&mut self, picture: &Picture) -> Result<()> {
+        self.pictures.push(picture.file.clone());
         Ok(())
     }
 }
@@ -104,10 +119,55 @@ impl Journal for GitJournal {
         Ok(())
     }
 
+    /// Write the picture into the project folder, never outside it and never over a file with
+    /// other content.
+    fn picture(&mut self, picture: &Picture) -> Result<()> {
+        write_picture(&self.dir, picture, false)
+    }
+
     /// Save the project as it was before the change, so the folder does not keep a change
     /// whose commit failed.
     fn restore(&mut self, project: &Project) -> Result<()> {
         wc_core::store::save(&self.dir, project)?;
         Ok(())
     }
+}
+
+/// Write `picture` into the project folder `dir`, making its folder. A file there with the same
+/// content is left as it is; one with other content is replaced only when `replace` is true (a
+/// guest's copy taking the session's picture), else it is an error. The file always lands
+/// inside the project, even when its folder is a link.
+pub fn write_picture(dir: &std::path::Path, picture: &Picture, replace: bool) -> Result<()> {
+    use std::io::{Error, ErrorKind};
+    if let Some(why) = picture.problem() {
+        return Err(Error::new(ErrorKind::InvalidInput, why).into());
+    }
+    let path = dir.join(&picture.file);
+    let folder = path.parent().unwrap_or(dir);
+    std::fs::create_dir_all(folder)?;
+    if !folder.canonicalize()?.starts_with(dir.canonicalize()?) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{} leads out of the project folder", picture.file),
+        )
+        .into());
+    }
+    match std::fs::read(&path) {
+        Ok(have) if have == picture.data => return Ok(()),
+        Ok(_) if !replace => {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!("the project already has another picture named {}", picture.file),
+            )
+            .into());
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::write(&path, &picture.data)?;
+    Ok(())
 }
