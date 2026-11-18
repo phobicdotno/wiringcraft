@@ -2528,6 +2528,96 @@ fn a_picture_the_host_replaced_in_its_folder_gets_a_name_of_its_own() -> TestRes
     Ok(())
 }
 
+/// A logo the guest picked, taken in by the host: the session, its journal and both copies, and
+/// the logo's name.
+fn session_with_a_guests_logo(tmp: &Path) -> TestResult<(Share, Log, Open, Share, Open, String)> {
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp)?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    Ok((h, log, host_open, g, guest_open, file))
+}
+
+/// The files in the folder of picture `file` in `dir`.
+fn picture_folder(dir: &Path, file: &str) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let folder = dir.join(file).parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut names: Vec<_> = std::fs::read_dir(folder)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    names.sort();
+    Ok(names)
+}
+
+#[test]
+fn a_picture_a_guest_put_back_before_the_session_refused_its_replacement_is_not_renamed() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open, file) = session_with_a_guests_logo(tmp.path())?;
+    let folder = picture_folder(&guest_open.dir, &file)?;
+    let n = log.messages().len();
+    // Replaced, and sent as a replacement in one frame of the guest's.
+    std::fs::write(guest_open.dir.join(&file), b"\x89PNG\r\n\x1a\nanother logo")?;
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(g.pictures_replaced.contains(&file), "sent as a replacement");
+    // Put back before the refusal comes in.
+    std::fs::write(guest_open.dir.join(&file), PNG)?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let named = |o: &Open| o.project.meta.logo.as_ref().map(|l| l.file.clone());
+    assert_eq!(named(&guest_open), Some(file.clone()), "not renamed");
+    assert_eq!(named(&host_open), Some(file.clone()));
+    assert_eq!(
+        picture_folder(&guest_open.dir, &file)?,
+        folder,
+        "no copy under a new name"
+    );
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    assert_eq!(log.messages().len(), n, "{:?}", log.messages());
+    assert!(!g.take_notes().iter().any(|n| n.contains("renamed")));
+    // Taken as the session's again: more frames send nothing.
+    assert!(g.pictures_replaced.is_empty());
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(named(&guest_open), Some(file));
+    assert_eq!(log.messages().len(), n);
+    Ok(())
+}
+
+#[test]
+fn a_picture_the_host_put_back_before_its_replacement_was_refused_is_not_renamed() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open, file) = session_with_a_guests_logo(tmp.path())?;
+    let folder = picture_folder(&host_open.dir, &file)?;
+    let n = log.messages().len();
+    // Replaced in the host's folder, and sent as a replacement in one frame of the host's.
+    std::fs::write(host_open.dir.join(&file), b"\x89PNG\r\n\x1a\nthe host's logo")?;
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    assert!(h.pictures_replaced.contains(&file), "sent as a replacement");
+    // Put back before the refusal is handled.
+    std::fs::write(host_open.dir.join(&file), PNG)?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let named = |o: &Open| o.project.meta.logo.as_ref().map(|l| l.file.clone());
+    assert_eq!(named(&host_open), Some(file.clone()), "not renamed");
+    assert_eq!(named(&guest_open), Some(file.clone()));
+    assert_eq!(
+        picture_folder(&host_open.dir, &file)?,
+        folder,
+        "no copy under a new name"
+    );
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, PNG);
+    assert_eq!(log.messages().len(), n, "{:?}", log.messages());
+    assert!(h.pictures_replaced.is_empty());
+    Ok(())
+}
+
 #[test]
 fn an_empty_file_put_in_place_of_a_picture_is_named_once_and_not_sent() -> TestResult {
     let tmp = tempfile::tempdir()?;

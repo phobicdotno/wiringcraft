@@ -1473,18 +1473,35 @@ fn rename_picture(open: &mut Open, file: &str) -> Result<String, String> {
     Ok(new)
 }
 
+/// The picture state of [`Share`] that [`rename_pictures`] keeps.
+struct Pictures<'a> {
+    renames_due: &'a mut BTreeMap<String, std::time::Instant>,
+    pictures_out: &'a mut BTreeMap<String, std::time::Instant>,
+    pictures_taken: &'a mut BTreeMap<String, PictureVersion>,
+    replaced: &'a mut std::collections::BTreeSet<String>,
+}
+
 /// Give the pictures in `taken`, whose names the session has for other files, a name of
 /// their own here, together with those whose rename failed a while ago. A failed rename is
 /// kept and tried again after [`ITEM_RETRY_LATER`] while the project still uses the picture,
 /// whether or not the session has the name: nothing else would bring it back. Meanwhile the
 /// picture stays in `pictures_out` (of [`Share`]), so it is not sent again under the taken name.
+/// A picture whose file here is the session's again (put back since it was sent) is not
+/// renamed: it is taken as the session's (into `pictures_taken`, no longer `replaced`), and
+/// nothing is sent.
 fn rename_pictures(
     open: &mut Open,
     taken: Vec<String>,
-    renames_due: &mut BTreeMap<String, std::time::Instant>,
-    pictures_out: &mut BTreeMap<String, std::time::Instant>,
+    session: &BTreeMap<String, Vec<u8>>,
+    pictures: Pictures<'_>,
     notes: &mut Vec<String>,
 ) {
+    let Pictures {
+        renames_due,
+        pictures_out,
+        pictures_taken,
+        replaced,
+    } = pictures;
     let used = used_pictures(&open.project);
     renames_due.retain(|file, _| used.contains(file));
     let due = renames_due
@@ -1500,6 +1517,17 @@ fn rename_pictures(
         .chain(due)
         .collect();
     for file in files {
+        if let Some(theirs) = session.get(&file)
+            && matches!(wc_pdf::read_picture(&open.dir, &file), Ok(Some(data)) if data == *theirs)
+        {
+            renames_due.remove(&file);
+            pictures_out.remove(&file);
+            replaced.remove(&file);
+            if let Some(version) = picture_version(&open.dir, &file) {
+                pictures_taken.insert(file, version);
+            }
+            continue;
+        }
         match rename_picture(open, &file) {
             Ok(new) => {
                 pictures_out.remove(&file);
@@ -3055,8 +3083,13 @@ impl Share {
         rename_pictures(
             open,
             taken,
-            &mut self.renames_due,
-            &mut self.pictures_out,
+            role.pictures(),
+            Pictures {
+                renames_due: &mut self.renames_due,
+                pictures_out: &mut self.pictures_out,
+                pictures_taken: &mut self.pictures_taken,
+                replaced: &mut self.pictures_replaced,
+            },
             &mut self.notes,
         );
         // Pictures used for the first time go out before the change that names them. Changes do
