@@ -458,9 +458,12 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
                         miss("the project has no such row now (the strip changed?); export the list again".into());
                         continue;
                     };
+                    // A terminal says which it is by its number, an accessory by its Connects
+                    // only: its Terminal cell is not the terminal it belongs to.
+                    let empty = String::new();
                     let file = match accessory {
                         None => &row.terminal,
-                        Some(_) => row.connects.as_ref().unwrap_or(&row.terminal),
+                        Some(_) => row.connects.as_ref().unwrap_or(&empty),
                     };
                     if file.is_empty() {
                         miss(format!(
@@ -700,7 +703,7 @@ fn jumper<'a>(project: &'a Project, strip: &DeviceTag, n: usize) -> Option<&'a J
 fn old_index(index: &str) -> Option<(&str, Option<&str>)> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let (terminal, accessory) = match index.rsplit_once("/A") {
-        Some((head, n)) if digits(n) && !head.ends_with("/S") => (head, Some(&index[head.len()..])),
+        Some((head, n)) if digits(n) => (head, Some(index.get(head.len()..)?)),
         _ => (index, None),
     };
     let (strip, position) = terminal.rsplit_once("/T")?;
@@ -1611,6 +1614,13 @@ mod tests {
         assert!(plan.unmatched[0].starts_with("line 3 "), "{plan:#?}");
         assert!(plan.unmatched[0].contains("older version"), "{plan:#?}");
         assert_eq!(plan.assignments.len(), 2, "{plan:#?}");
+        // An old one's Terminal cell does not stand in for Connects.
+        let rows = read_configured(b"Index;Terminal;Article;Quantity\n-X1/T2/A1;2;793-501;5\n")
+            .unwrap()
+            .0;
+        let plan = super::plan(&inputs, &library(&parts), &rows);
+        assert!(plan.assignments.is_empty(), "{plan:#?}");
+        assert!(plan.unmatched[0].contains("no Connects"), "{plan:#?}");
     }
 
     #[test]

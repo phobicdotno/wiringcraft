@@ -65,8 +65,9 @@ pub const CONFIGURATOR_COLUMNS: [&str; 19] = [
 /// is its place on the rail. It is `/J<n>` for a jumper, `/P<n>` for a plate and `/R<n>` for a
 /// rail. Accessory rows name the device slot they are: `<strip>/S` for the strip device's own
 /// part, `<strip>/A<n>` for its n-th accessory, and `<strip>/T:<terminal number>/A<n>` for the
-/// n-th accessory of the terminal device first at that terminal (`-X1/T:2/A1`). Lists written
-/// before #340 had the position in place of the terminal number (`-X1/T3`).
+/// n-th accessory of a terminal device, named by its lowest terminal number (`-X1/T:2/A1`).
+/// Lists written before #340 had the place on the rail in place of the terminal number
+/// (`-X1/T3`).
 pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
     let mut out = Configurator {
         table: Table::new("WAGO configurator", &CONFIGURATOR_COLUMNS),
@@ -246,11 +247,28 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
                 )
             }));
         }
+        // A device several terminals are drawn as (terminals tagged only with the strip) is
+        // named by its lowest terminal number, not the first on the rail, so reordering the
+        // strip leaves its accessories' indexes as they are.
+        let mut first: BTreeMap<&DeviceTag, &String> = BTreeMap::new();
+        for (number, _) in terminals {
+            if let Some((tag, _)) = device_of(number) {
+                let at = first.entry(tag).or_insert(number);
+                if natural_key(number)
+                    .cmp(&natural_key(at))
+                    .then_with(|| number.cmp(at))
+                    .is_lt()
+                {
+                    *at = number;
+                }
+            }
+        }
         let mut seen: BTreeSet<&DeviceTag> = BTreeSet::new();
         for (number, _) in terminals {
             if let Some((tag, d)) = device_of(number)
                 && seen.insert(tag)
             {
+                let number = first.get(tag).copied().unwrap_or(number);
                 accessories.extend(d.accessories.iter().enumerate().map(|(k, a)| {
                     (
                         format!("{strip}/T:{number}/A{}", k + 1),

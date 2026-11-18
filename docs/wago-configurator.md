@@ -35,7 +35,7 @@ The first column identifies each row: `<strip>/T:<terminal number>` for a termin
 a jumper, `/P<n>` for a plate and `/R<n>` for a rail, e.g. `-X1/T:3`. An accessory row names the
 device slot it is: `<strip>/S` for the strip device's own part, `<strip>/A<n>` for the strip
 device's n-th accessory, and `<strip>/T:<terminal number>/A<n>` for the n-th accessory of the
-terminal device first at that terminal (`-X1/T:2/A1`). A terminal's index goes with the terminal,
+terminal device, named by its lowest terminal number (`-X1/T:2/A1`). A terminal's index goes with the terminal,
 so reordering the strip or adding a terminal before it leaves it as it is; the `Position` column
 is its place on the rail. Adding an accessory to one device leaves the other rows' indexes as
 they are, so a list that comes back from the configurator with articles chosen can be matched to
@@ -87,8 +87,8 @@ devices and jumpers:
 
 Every row with an article that is not taken is listed with the reason: an index the project no
 longer has, or whose type, terminal number or (for an accessory) terminal in Connects changed
-(export again), a jumper whose terminals in Connects changed (export again), a terminal's
-accessory or a jumper in a file without the Connects column, a plate or rail, an article no part has (import the maker's catalogue into a library
+(export again), a jumper whose terminals in Connects changed (export again), a jumper, or
+an accessory with an index from an earlier version, in a file without the Connects column, a plate or rail, an article no part has (import the maker's catalogue into a library
 first, e.g. `import parts-bmecat`), an article several parts have, or two rows that give one
 device part different articles or quantities (neither is taken, and both are listed). Importing the same list twice changes nothing the
 second time.

@@ -1264,6 +1264,46 @@ fn a_terminal_tagged_with_only_its_strip_takes_the_strip_devices_part() {
 }
 
 #[test]
+fn an_accessory_of_terminals_drawn_as_the_strip_keeps_its_index_when_the_strip_is_reordered() {
+    use wc_core::DevicePart;
+    // Two terminals drawn with the tag of the strip itself: one device, -X2, for both.
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s7", "term", 140.0, Some("-X2")));
+    let x2 = DeviceTag::parse("-X2").unwrap();
+    p.devices.insert(
+        x2.clone(),
+        Device {
+            accessories: vec![DevicePart {
+                part: "acme.marker".into(),
+                qty: 3,
+            }],
+            ..Default::default()
+        },
+    );
+    let accessory = |p: &Project| -> Vec<(String, String)> {
+        configurator_list(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+        .table
+        .rows
+        .iter()
+        .filter(|r| r[2] == "-X2" && r[1] == "Accessory")
+        .map(|r| (r[0].clone(), r[14].clone()))
+        .collect()
+    };
+    let before = accessory(&p);
+    assert_eq!(before, [("-X2/T:1/A1".to_owned(), "1".to_owned())]);
+    assert_eq!(p.meta.set_terminal_order(&x2, &["2".into(), "1".into()]), Ok(true));
+    assert_eq!(
+        accessory(&p),
+        before,
+        "named by the lowest terminal, not the first on the rail"
+    );
+}
+
+#[test]
 fn configurator_tags_with_a_function_or_location_aspect_are_written_as_text() {
     let (mut p, s, parts) = fixture();
     p.pages[0].symbols.push(place("s9", "term", 140.0, Some("=A+C1-X9.1")));
