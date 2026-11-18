@@ -145,11 +145,25 @@ impl SweDrawings {
     /// box size (#232); the entities read count against the import's `budget`.
     pub(crate) fn placed_extents(&self, s: &SweSymbol, budget: &mut usize) -> Option<(Point, Point)> {
         let mut skipped = BTreeMap::new();
-        let shapes = self.symbol_graphics(s, budget, &mut skipped)?;
-        if skipped.contains_key(crate::dxf::OVER_LIMIT) {
+        let d = self.blocks.get(&block_key(&s.block))?;
+        let (sx, sy) = s.scale;
+        let (sin, cos) = s.angle.to_radians().sin_cos();
+        let m = [cos * sx, -sin * sx, sin * sy, cos * sy];
+        let (shapes, _) = dxf::draw_mapped(d, &d.entities, m, s.angle, &mut skipped, budget);
+        // A drawing cut off by the limit or by blocks nested too deep would give a box round
+        // part of it.
+        if skipped.contains_key(dxf::OVER_LIMIT) || skipped.contains_key(dxf::TOO_DEEP) {
             return None;
         }
-        let corners: Vec<Point> = shapes.iter().flat_map(corners_of).collect();
+        // Shapes as drawn, not rounded: a short arc whose rounded angles meet is still short.
+        let corners: Vec<Point> = shapes
+            .iter()
+            .filter(|(_, sh)| rounded(sh).is_some())
+            .flat_map(|(_, sh)| corners_of(sh))
+            .collect();
+        if corners.is_empty() {
+            return None;
+        }
         // The symbol's frame is y down from the insertion point.
         let (min, max) = wc_core::geom::bounds_of(&corners);
         let (lo, hi) = (
@@ -157,7 +171,10 @@ impl SweDrawings {
             Point::new(s.at.x + max.x, s.at.y - min.y),
         );
         // Kept in thousandths of a millimetre, so the sides must stay finite at that scale.
-        let fits = |a: f64, b: f64| b > a && ((b - a) * 1000.0).round().is_finite() && a.is_finite();
+        let fits = |a: f64, b: f64| {
+            let side = ((b - a) * 1000.0).round();
+            a.is_finite() && side.is_finite() && side > 0.0
+        };
         (fits(lo.x, hi.x) && fits(lo.y, hi.y)).then_some((lo, hi))
     }
 
@@ -467,9 +484,15 @@ fn corners_of(shape: &Shape) -> Vec<Point> {
         let (a, b) = shape.bounds();
         return vec![a, b];
     };
-    let mut sweep = end - start;
-    if sweep <= 0.0 {
-        sweep += 360.0;
+    if !(start.is_finite() && end.is_finite()) {
+        let (a, b) = shape.bounds();
+        return vec![a, b];
+    }
+    // Angles of any size are brought into one turn first, so the quarter indices stay small.
+    let start = &start.rem_euclid(360.0);
+    let mut sweep = (end - start).rem_euclid(360.0);
+    if sweep == 0.0 {
+        sweep = 360.0;
     }
     let at = |deg: f64| {
         let t = deg.to_radians();
@@ -488,6 +511,31 @@ fn corners_of(shape: &Shape) -> Vec<Point> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arc_corners_take_any_angle_and_keep_a_short_arc_short() {
+        let arc = |start: f64, end: f64| Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            start,
+            end,
+        };
+        let span = |sh: &Shape| {
+            let (a, b) = wc_core::geom::bounds_of(&corners_of(sh));
+            (b.x - a.x, b.y - a.y)
+        };
+        // Angles far out of one turn neither overflow nor change the quarter arc.
+        let (w, h) = span(&arc(1e300, 1e300 + 90.0));
+        assert!(w.is_finite() && h.is_finite() && w <= 20.0 && h <= 20.0, "{w} x {h}");
+        let (w, h) = span(&arc(720.0, 810.0));
+        assert!((w - 10.0).abs() < 1e-9 && (h - 10.0).abs() < 1e-9, "{w} x {h}");
+        // A tiny sweep stays tiny; equal angles are a whole turn.
+        let (w, h) = span(&arc(45.0001, 45.0004));
+        assert!(w < 0.01 && h < 0.01, "{w} x {h}");
+        assert_eq!(span(&arc(30.0, 30.0)), (20.0, 20.0));
+        // Angles that are not numbers fall back to the circle.
+        assert_eq!(span(&arc(f64::NAN, 90.0)), (20.0, 20.0));
+    }
 
     #[test]
     fn archive_names_are_sorted_into_blocks_and_pages() {

@@ -380,4 +380,7 @@ UPDATE tew_buildofmaterial SET bom_objectid = 101 WHERE bom_id = 2;
         .unwrap();
     sw.drawings.set_draw_limit(2);
     assert_eq!(size(&sw), (9.0, 60.0));
+    // With just enough for the whole drawing, it gives the size.
+    sw.drawings.set_draw_limit(3);
+    assert_eq!(size(&sw), (45.0, 80.0));
 }
