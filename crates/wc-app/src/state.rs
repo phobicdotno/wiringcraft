@@ -267,71 +267,7 @@ impl Open {
     /// logo, as one undo step. A different file of the same name already there is kept and the
     /// copy gets a new name, so an undo can still show the old logo. Returns the project path.
     pub fn set_logo_from(&mut self, src: &Path) -> Result<String, String> {
-        let bytes = std::fs::read(src).map_err(|e| format!("Cannot read {}: {e}", src.display()))?;
-        let ext = match image::guess_format(&bytes) {
-            Ok(image::ImageFormat::Png) => "png",
-            Ok(image::ImageFormat::Jpeg) => "jpg",
-            _ => return Err("The logo must be a PNG or JPEG picture.".into()),
-        };
-        let stem: String = src
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("logo")
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let stem = if stem.trim_matches('_').is_empty() {
-            "logo".to_owned()
-        } else {
-            stem
-        };
-        let folder = self.dir.join(wc_core::Logo::DIR);
-        std::fs::create_dir_all(&folder).map_err(|e| format!("Cannot create {}: {e}", folder.display()))?;
-        // The folder may be a link: the copy must still land inside the project.
-        let real = |p: &Path| {
-            p.canonicalize()
-                .map_err(|e| format!("Cannot find {}: {e}", p.display()))
-        };
-        if !real(&folder)?.starts_with(real(&self.dir)?) {
-            return Err(format!(
-                "{} leads out of the project folder; the logo is not copied there.",
-                folder.display()
-            ));
-        }
-        let mut n = 1;
-        let file = loop {
-            let name = if n == 1 {
-                format!("{stem}.{ext}")
-            } else {
-                format!("{stem}-{n}.{ext}")
-            };
-            let path = folder.join(&name);
-            match std::fs::read(&path) {
-                Ok(have) if have == bytes => break name,
-                Ok(_) => n += 1,
-                // Only a name nobody uses is written, and never over a file made meanwhile.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let made = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                        .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes));
-                    match made {
-                        Ok(()) => break name,
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
-                        Err(e) => return Err(format!("Cannot write {}: {e}", path.display())),
-                    }
-                }
-                Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
-            }
-        };
-        let file = format!("{}/{file}", wc_core::Logo::DIR);
+        let file = wc_core::Logo::copy_into(&self.dir, src)?;
         // A picture shown before under this name may have been another one.
         self.underlays.remove(&file);
         let cover = self.project.meta.logo.as_ref().and_then(|l| l.cover);

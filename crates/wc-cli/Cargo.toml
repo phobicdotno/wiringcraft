@@ -29,6 +29,8 @@ sevenz-rust2 = { workspace = true, features = ["compress"] }
 # Tests write a SolidWorks Electrical archive with library databases.
 rusqlite.workspace = true
 zip.workspace = true
+# Tests write a logo picture.
+image.workspace = true
 
 [lints]
 workspace = true

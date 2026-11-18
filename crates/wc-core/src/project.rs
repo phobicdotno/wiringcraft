@@ -69,6 +69,88 @@ impl Logo {
     pub fn file_is_safe(&self) -> bool {
         relative_file_is_safe(&self.file)
     }
+
+    /// The picture kind of `bytes` as a file extension: `png` or `jpg`; `None` for anything
+    /// else.
+    pub fn picture_kind(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some("png")
+        } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            Some("jpg")
+        } else {
+            None
+        }
+    }
+
+    /// Copy the PNG or JPEG picture at `src` into the [`Logo::DIR`] folder of the project in
+    /// `dir`, for use as the logo; returns its project path (`pictures/logo.png`). A file there
+    /// with the same bytes is used as it is; a different file of the same name is kept and the
+    /// copy gets a new name (`logo-2.png`), so an undo can still show the old logo. The copy
+    /// always lands inside the project, even when the folder is a link.
+    pub fn copy_into(dir: &std::path::Path, src: &std::path::Path) -> Result<String, String> {
+        use std::path::Path;
+        let bytes = std::fs::read(src).map_err(|e| format!("Cannot read {}: {e}", src.display()))?;
+        let ext = Logo::picture_kind(&bytes).ok_or("The logo must be a PNG or JPEG picture.")?;
+        let stem: String = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("logo")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let stem = if stem.trim_matches('_').is_empty() {
+            "logo".to_owned()
+        } else {
+            stem
+        };
+        let folder = dir.join(Logo::DIR);
+        std::fs::create_dir_all(&folder).map_err(|e| format!("Cannot create {}: {e}", folder.display()))?;
+        // The folder may be a link: the copy must still land inside the project.
+        let real = |p: &Path| {
+            p.canonicalize()
+                .map_err(|e| format!("Cannot find {}: {e}", p.display()))
+        };
+        if !real(&folder)?.starts_with(real(dir)?) {
+            return Err(format!(
+                "{} leads out of the project folder; the logo is not copied there.",
+                folder.display()
+            ));
+        }
+        let mut n = 1;
+        let file = loop {
+            let name = if n == 1 {
+                format!("{stem}.{ext}")
+            } else {
+                format!("{stem}-{n}.{ext}")
+            };
+            let path = folder.join(&name);
+            match std::fs::read(&path) {
+                Ok(have) if have == bytes => break name,
+                Ok(_) => n += 1,
+                // Only a name nobody uses is written, and never over a file made meanwhile.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let made = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes));
+                    match made {
+                        Ok(()) => break name,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                        Err(e) => return Err(format!("Cannot write {}: {e}", path.display())),
+                    }
+                }
+                Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
+            }
+        };
+        Ok(format!("{}/{file}", Logo::DIR))
+    }
 }
 
 /// Whether `file` is a plain relative path inside the project (no `..`, no absolute path,
@@ -1245,6 +1327,36 @@ mod tests {
         assert!(!m.remove_from_jumper(&x2, "1"));
         let plain = toml::to_string(&ProjectMeta::new("t"))?;
         assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
+    fn a_logo_is_copied_into_the_pictures_folder_without_overwriting_another()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("p");
+        std::fs::create_dir_all(&dir)?;
+        let png = b"\x89PNG\r\n\x1a\nfirst".to_vec();
+        let jpg = [0xFF, 0xD8, 0xFF, 0xE0, 1, 2].to_vec();
+        let src = tmp.path().join("My logo!.png");
+        std::fs::write(&src, &png)?;
+        assert_eq!(Logo::copy_into(&dir, &src)?, "pictures/My_logo_.png");
+        // The same picture again is used as it is; another one of that name gets a new name.
+        assert_eq!(Logo::copy_into(&dir, &src)?, "pictures/My_logo_.png");
+        std::fs::write(&src, b"\x89PNG\r\n\x1a\nsecond")?;
+        assert_eq!(Logo::copy_into(&dir, &src)?, "pictures/My_logo_-2.png");
+        assert_eq!(std::fs::read(dir.join("pictures/My_logo_.png"))?, png);
+        let j = tmp.path().join("photo.jpeg");
+        std::fs::write(&j, &jpg)?;
+        assert_eq!(Logo::copy_into(&dir, &j)?, "pictures/photo.jpg");
+        std::fs::write(&j, b"GIF89a")?;
+        assert!(
+            Logo::copy_into(&dir, &j)
+                .err()
+                .unwrap_or_default()
+                .contains("PNG or JPEG")
+        );
+        assert!(Logo::copy_into(&dir, &tmp.path().join("none.png")).is_err());
         Ok(())
     }
 
