@@ -92,9 +92,10 @@ fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
 
 /// Point the graphics in `sel` at the same items after the page's graphics changed from `old`
 /// to `new` (a shared session merged others' changes in, which can move an item to another
-/// place in the list). An item still in its place stays selected there; otherwise it is found
-/// by its content, repeats by their order when the list has as many copies as before. A selected
-/// item that is gone, or whose copies changed so it cannot be told apart, is no longer selected.
+/// place in the list). An item is found by its content, repeats by their order (one to one) when
+/// the list has as many copies as before; when copies came or went, only a copy still in its own
+/// place stays selected. A selected item that is gone, or cannot be told apart from its copies,
+/// is no longer selected.
 /// Symbols and wires are left as they are.
 pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
     if old == new {
@@ -107,12 +108,10 @@ pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
         let Some(item) = old.get(*i) else {
             return false;
         };
-        if new.get(*i) == Some(item) {
-            return true;
-        }
         let copies = |list: &[Shape]| list.iter().filter(|x| *x == item).count();
         if copies(old) != copies(new) {
-            return false;
+            // Copies came or went: only one still in its own place is known to be the same.
+            return new.get(*i) == Some(item);
         }
         // The how-many-th copy of this item it is, found again in the new list.
         let nth = copies(&old[..*i]);
@@ -605,6 +604,11 @@ mod tests {
         // Repeats that all moved keep their order.
         let new = [b.clone(), a.clone(), a.clone()];
         let mut sel = vec![Selection::Graphic(0), Selection::Graphic(2)];
+        remap_graphics(&mut sel, &old, &new);
+        assert_eq!(sel, vec![Selection::Graphic(1), Selection::Graphic(2)]);
+        // Both copies selected and moved behind another item: each lands on its own copy.
+        let (old, new) = ([a.clone(), a.clone(), b.clone()], [b.clone(), a.clone(), a.clone()]);
+        let mut sel = vec![Selection::Graphic(0), Selection::Graphic(1)];
         remap_graphics(&mut sel, &old, &new);
         assert_eq!(sel, vec![Selection::Graphic(1), Selection::Graphic(2)]);
     }
