@@ -1381,8 +1381,44 @@ fn a_hatch_listing_too_much_is_a_damaged_object() -> TestResult {
                 .bl(1);
         }),
     ];
+    let mut objs = objs;
+    // A radius that is not a number, and an arc angle too large to be degrees.
+    objs.push(hatch_obj(v, 0x304, "SOLID", true, 1, |d| {
+        d.bl(1)
+            .bl(1)
+            .rc(2)
+            .rd(0.0)
+            .rd(0.0)
+            .bd(f64::NAN)
+            .bd(0.0)
+            .bd(1.0)
+            .b(true)
+            .bl(0);
+    }));
+    objs.push(hatch_obj(v, 0x305, "SOLID", true, 1, |d| {
+        d.bl(1)
+            .bl(1)
+            .rc(2)
+            .rd(0.0)
+            .rd(0.0)
+            .bd(1.0)
+            .bd(f64::MAX)
+            .bd(0.0)
+            .b(true)
+            .bl(0);
+    }));
     let d = drawing(&sections(v, &objs, &[]))?;
-    assert_eq!(d.skipped.get(DAMAGED), Some(&4), "{:?}", d.skipped);
+    assert_eq!(d.skipped.get(DAMAGED), Some(&6), "{:?}", d.skipped);
+    assert!(
+        d.damaged.iter().any(|r| r.contains("boundary value is not a number")),
+        "{:?}",
+        d.damaged
+    );
+    assert!(
+        d.damaged.iter().any(|r| r.contains("edge angle is too large")),
+        "{:?}",
+        d.damaged
+    );
     assert!(d.damaged.iter().any(|r| r.contains("not a number")), "{:?}", d.damaged);
     assert!(
         d.damaged.iter().any(|r| r.contains("50000 boundary paths")),
@@ -1477,5 +1513,32 @@ fn hatch_edges_of_every_kind_and_a_mirrored_hatch_are_read() -> TestResult {
         let (tri, _) = polys[2];
         assert!(tri.iter().all(|p| p.x <= -100.0 + 1e-9), "{tri:?}");
     }
+    Ok(())
+}
+
+#[test]
+fn a_hatch_loop_that_overflows_is_left_out_and_counted() -> TestResult {
+    // An arc of a finite but huge radius: its points overflow to infinity when sampled.
+    let v = Version::R2010;
+    let huge = hatch_obj(v, 0x300, "SOLID", true, 1, |d| {
+        d.bl(1)
+            .bl(1)
+            .rc(2)
+            .rd(f64::MAX)
+            .rd(0.0)
+            .bd(f64::MAX)
+            .bd(0.0)
+            .bd(1.0)
+            .b(true)
+            .bl(0);
+    });
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        huge,
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert!(d.model.is_empty(), "{:?}", d.model);
+    assert!(d.skipped.keys().any(|k| k.contains("not numbers")), "{:?}", d.skipped);
     Ok(())
 }

@@ -467,6 +467,16 @@ fn hatch_point(o: &mut Object) -> Result<(f64, f64)> {
     Ok((x, y))
 }
 
+/// Two edge angles in degrees: numbers still after the conversion (a huge angle in radians is
+/// no number of degrees).
+fn hatch_degrees(a0: f64, a1: f64) -> Result<(f64, f64)> {
+    let (d0, d1) = (a0.to_degrees(), a1.to_degrees());
+    if !(d0.is_finite() && d1.is_finite()) {
+        return Err(bad("a hatch edge angle is too large"));
+    }
+    Ok((d0, d1))
+}
+
 /// A value of a HATCH boundary (radius, angle, ratio, knot, weight): a number.
 fn hatch_value(o: &mut Object) -> Result<f64> {
     let v = o.data.bd()?;
@@ -522,7 +532,8 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
                         let (a0, a1) = (hatch_value(o)?, hatch_value(o)?);
                         let ccw = o.data.b()?;
                         e.f(10, c.0).f(20, c.1).f(40, r);
-                        e.f(50, a0.to_degrees()).f(51, a1.to_degrees()).i(73, i64::from(ccw));
+                        let (d0, d1) = hatch_degrees(a0, a1)?;
+                        e.f(50, d0).f(51, d1).i(73, i64::from(ccw));
                     }
                     3 => {
                         let (c, m) = (hatch_point(o)?, hatch_point(o)?);
@@ -530,7 +541,8 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
                         let (a0, a1) = (hatch_value(o)?, hatch_value(o)?);
                         let ccw = o.data.b()?;
                         e.f(10, c.0).f(20, c.1).f(11, m.0).f(21, m.1).f(40, ratio);
-                        e.f(50, a0.to_degrees()).f(51, a1.to_degrees()).i(73, i64::from(ccw));
+                        let (d0, d1) = hatch_degrees(a0, a1)?;
+                        e.f(50, d0).f(51, d1).i(73, i64::from(ccw));
                     }
                     4 => {
                         let degree = o.data.bl()?;

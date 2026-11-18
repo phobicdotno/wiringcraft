@@ -390,7 +390,13 @@ fn shapes(
             }
             "HATCH" => {
                 let solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
-                let loops = hatch_loops(e);
+                // A loop whose points are not all numbers (a huge radius) is left out and counted.
+                let (loops, bad): (Vec<_>, Vec<_>) = hatch_loops(e)
+                    .into_iter()
+                    .partition(|lp| lp.iter().all(|(x, y)| x.is_finite() && y.is_finite()));
+                if !bad.is_empty() {
+                    *skipped.entry(HATCH_NOT_NUMBERS.to_owned()).or_default() += 1;
+                }
                 // Islands inside a solid fill stay open: each is cut into the loop around it.
                 // Style (75): 0 fills every other level, 1 only the outermost area, 2 ignores
                 // islands.
@@ -614,6 +620,9 @@ const HATCH_BRIDGE_WORK: usize = 20_000_000;
 
 /// The `skipped` key of a solid hatch drawn as its boundaries because its holes could not be cut.
 const HATCH_UNFILLED: &str = "solid HATCH (holes too complex)";
+
+/// The key under which hatches with a boundary that is not all numbers are counted.
+const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -1043,6 +1052,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
                 format!(
                     "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
                 )
+            } else if kind == HATCH_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "es" };
+                format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
             } else if kind == HATCH_UNFILLED {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
