@@ -446,7 +446,12 @@ impl Open {
             // No copy of a pinned part: put back from the library only in the version it pins,
             // the very part checked, and the pin kept as it is.
             (Some(pin), false) => {
-                let (p, _) = lib()?.part(id).map_err(|e| e.to_string())?;
+                // The source the pin names first: another one may come first with another version.
+                let lib = lib()?;
+                let p = match lib.part_in(&pin.source, id) {
+                    Ok(p) => p,
+                    Err(_) => lib.part(id).map_err(|e| e.to_string())?.0,
+                };
                 if p.hash() != pin.hash || p.id != id {
                     return Err(format!(
                         "part {id}: its copy in the project is missing and the library has another version than the project pins; put the copy back or update the part from the library"
@@ -459,18 +464,31 @@ impl Open {
                 let lib = lib()?;
                 wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
             }
-            // A pinned copy: used as it is (a broken one is reported below).
-            (Some(_), true) => {}
+            // A pinned copy: used only when it is the version the pin names.
+            (Some(pin), true) => {
+                let copy = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
+                if copy.hash() != pin.hash || copy.id != id {
+                    return Err(format!(
+                        "part {id}: its copy in the project is not the version the project pins; put the pinned copy back or update the part from the library"
+                    ));
+                }
+            }
             // A copy without its pin (an undone change took the pin back): pinned again as it
             // is, never replaced by a newer library version, to the library that has the part.
             (None, true) => {
                 let copy = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
-                let (_, source) = lib()?.part(id).map_err(|e| match e {
+                let (found, source) = lib()?.part(id).map_err(|e| match e {
                     wc_library::Error::NotFound { .. } => {
                         format!("part {id} has a copy in the project but no pin, and no library has it to pin it to")
                     }
                     e => format!("part {id} has a copy in the project but no pin, and its library file cannot be read to pin it: {e}"),
                 })?;
+                if found.id != id {
+                    return Err(format!(
+                        "part {id} has a copy in the project but no pin, and the library file for it ({source}) declares id {:?}",
+                        found.id
+                    ));
+                }
                 self.project.lock.parts.insert(
                     id.to_owned(),
                     wc_core::LockEntry {
@@ -2113,13 +2131,26 @@ pub(crate) mod tests {
         assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), copy);
         assert_eq!(o.project.lock.parts[pid], pin);
 
+        // A copy that is not the pinned version is not used.
+        let mut edited = copy.clone();
+        edited.description = "Edited by hand".into();
+        store::write_vendored_part(&o.dir, &edited).unwrap();
+        o.parts.remove(pid);
+        let fifth = DeviceTag::parse("-K5").unwrap();
+        let err = o.set_device_part(&fifth, Some(pid)).unwrap_err();
+        assert!(err.contains("not the version the project pins"), "{err}");
+        store::write_vendored_part(&o.dir, &copy).unwrap();
+
         // A copy without its pin whose library file cannot be read says why.
         o.project.lock.parts.remove(pid);
         o.parts.remove(pid);
         std::fs::write(tmp.path().join(format!("mine/parts/{pid}.json")), "{ not json").unwrap();
         let fourth = DeviceTag::parse("-K4").unwrap();
         let err = o.set_device_part(&fourth, Some(pid)).unwrap_err();
-        assert!(err.contains("cannot be read"), "{err}");
+        assert!(
+            err.contains("cannot be read") && err.contains("line 1"),
+            "the parse error is kept: {err}"
+        );
     }
 
     #[test]

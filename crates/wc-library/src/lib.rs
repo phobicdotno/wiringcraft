@@ -87,6 +87,21 @@ impl Library {
         Ok((p, loc.source))
     }
 
+    /// Part `id` as source `source` has it (not necessarily the source that wins for it).
+    pub fn part_in(&self, source: &str, id: &str) -> Result<Part> {
+        store::check_id(id)?;
+        let not_found = || Error::NotFound {
+            kind: ItemKind::Part,
+            id: id.into(),
+        };
+        let s = self.sources.iter().find(|s| s.name == source).ok_or_else(not_found)?;
+        let path = s.root.join(ItemKind::Part.dir()).join(format!("{id}.json"));
+        if !path.is_file() {
+            return Err(not_found());
+        }
+        Ok(store::read_json(&path)?)
+    }
+
     /// Every item id per kind, with the source that wins for it.
     pub fn index(&self, kind: ItemKind) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();

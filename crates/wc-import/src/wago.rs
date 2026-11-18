@@ -176,6 +176,12 @@ impl Candidates {
                     continue;
                 }
                 match lib.part(&id) {
+                    // A file that holds another part is no candidate: matched by article, it
+                    // would stand for a part it is not.
+                    Ok((part, _)) if part.id != id => warnings.push(format!(
+                        "library part {id} cannot be used: its file declares id {:?}",
+                        part.id
+                    )),
                     Ok((part, _)) => {
                         out.sources.insert(id.clone(), n);
                         out.library.insert(id, part);
@@ -189,11 +195,28 @@ impl Candidates {
         // replaced by a newer library version.
         let mut ids: std::collections::BTreeSet<String> = project.lock.parts.keys().cloned().collect();
         ids.extend(project.used_parts());
-        if let Ok(entries) = std::fs::read_dir(dir.join(store::VENDOR_DIR).join(ItemKind::Part.dir())) {
-            ids.extend(entries.filter_map(|e| {
-                let name = e.ok()?.file_name().into_string().ok()?;
-                name.strip_suffix(".json").map(str::to_owned)
-            }));
+        let folder = dir.join(store::VENDOR_DIR).join(ItemKind::Part.dir());
+        match std::fs::read_dir(&folder) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(e) => {
+                            if let Some(id) = e.file_name().to_str().and_then(|n| n.strip_suffix(".json")) {
+                                ids.insert(id.to_owned());
+                            }
+                        }
+                        Err(why) => warnings.push(format!(
+                            "the project's part copies cannot all be listed ({}): {why}",
+                            folder.display()
+                        )),
+                    }
+                }
+            }
+            Err(why) if why.kind() == std::io::ErrorKind::NotFound => {}
+            Err(why) => warnings.push(format!(
+                "the project's part copies cannot be listed ({}): {why}",
+                folder.display()
+            )),
         }
         for id in ids {
             let pinned = project.lock.parts.contains_key(&id);
@@ -205,8 +228,15 @@ impl Candidates {
                     continue;
                 }
             };
-            match std::fs::symlink_metadata(&path) {
+            // Only a plain file is read: anything else (a folder, a pipe) could block or fail.
+            match std::fs::metadata(&path) {
                 Err(why) if why.kind() == std::io::ErrorKind::NotFound && !pinned => continue,
+                Ok(m) if !m.is_file() => {
+                    let why = "it is not a file".to_owned();
+                    warnings.push(format!("the project's copy of part {id} cannot be read: {why}"));
+                    out.unreadable.insert(id, why);
+                    continue;
+                }
                 _ => {}
             }
             match store::read_vendored_part(dir, &id) {
@@ -1320,7 +1350,12 @@ mod tests {
         let path = wc_library::write_part(&lib, &other).unwrap();
         std::fs::rename(&path, lib.join("parts").join("wago.renamed.json")).unwrap();
         let (c, warnings) = Candidates::load(&dir, &p);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("wago.renamed") && warnings[0].contains("declares id"));
+        assert!(
+            !c.library.contains_key("wago.renamed"),
+            "no candidate under a name it is not"
+        );
         assert_eq!(
             c.project.get("wago.2002-1201"),
             Some(&v1),
@@ -1329,8 +1364,7 @@ mod tests {
         c.take(&dir, &mut p, "wago.2002-1201").unwrap();
         assert_eq!(store::read_vendored_part(&dir, "wago.2002-1201").unwrap(), v1, "kept");
         assert_eq!(p.lock.parts["wago.2002-1201"].hash, v1.hash());
-        let err = c.take(&dir, &mut p, "wago.renamed").unwrap_err();
-        assert!(err.contains("declares id"), "{err}");
+        assert!(c.take(&dir, &mut p, "wago.renamed").is_err());
         assert!(
             store::read_vendored_part(&dir, "wago.other").is_err(),
             "nothing written"

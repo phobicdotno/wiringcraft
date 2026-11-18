@@ -2553,8 +2553,9 @@ struct WagoImported {
 
 /// Write the articles of a configured WAGO configurator list onto the project in `dir` (see
 /// [`wc_import::wago`]). Articles are looked up among the project's own parts first, then its
-/// libraries; a library part that is used is taken into the project. Nothing is saved when
-/// nothing changes.
+/// libraries; a library part that is used is taken into the project. A part the project uses
+/// without a pin, named by a row or not, is pinned too (only the lock is written for that).
+/// Nothing is saved when nothing changes.
 fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
     let (rows, mut warnings) = wc_import::wago::read_configured(&bytes).map_err(e)?;
@@ -4557,11 +4558,16 @@ mod tests {
         wc_library::write_part(&tmp.path().join("lib"), &newer).unwrap();
         let copy_file = store::vendor_path(&dir, ItemKind::Part, "wago.2002-1201").unwrap();
         let copy = std::fs::read(&copy_file).unwrap();
-        let devices = std::fs::metadata(dir.join(store::DEVICES_FILE))
-            .unwrap()
-            .modified()
-            .unwrap();
+        // A full save would rewrite devices.json written by hand like this, and its write fails.
+        let devices_file = dir.join(store::DEVICES_FILE);
+        let by_hand = format!("{}\n\n", std::fs::read_to_string(&devices_file).unwrap().trim_end());
+        std::fs::write(&devices_file, &by_hand).unwrap();
+        let devices_tmp = dir.join(format!("{}.tmp", store::DEVICES_FILE));
+        std::fs::create_dir(&devices_tmp).unwrap();
+        let devices = std::fs::metadata(&devices_file).unwrap().modified().unwrap();
         let again = run_import_wago(&dir, &out);
+        assert_eq!(std::fs::read_to_string(&devices_file).unwrap(), by_hand);
+        std::fs::remove_dir(&devices_tmp).unwrap();
         assert_eq!(again.changed, 0, "{:?}", again.unmatched);
         assert_eq!(std::fs::read(&copy_file).unwrap(), copy, "the copy is kept");
         assert_eq!(
