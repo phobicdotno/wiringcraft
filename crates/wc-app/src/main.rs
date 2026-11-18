@@ -783,7 +783,17 @@ impl App {
             Action::ImportSymbols => match wc_library::Library::open(&open.dir, &open.project) {
                 Ok(lib) => {
                     self.dialog = Some(Dialog::ImportSymbols {
-                        targets: import_symbols::targets(&open.dir, folder_targets(&lib, open)),
+                        targets: import_symbols::targets(
+                            &open.dir,
+                            folder_targets(&lib, open),
+                            &open
+                                .project
+                                .meta
+                                .libraries
+                                .iter()
+                                .map(|l| l.name.clone())
+                                .collect::<Vec<_>>(),
+                        ),
                         chosen: 0,
                         replace: false,
                     });

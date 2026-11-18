@@ -36,8 +36,10 @@ impl ImportTarget {
 
 /// Where symbols can be imported: the project's own library folder (`library/` in the project)
 /// first, then the project's other library folders (`folders`, as (name, root) in the project's
-/// order). The own folder is offered even when the project does not list it yet.
-pub fn targets(project_dir: &Path, folders: Vec<(String, PathBuf)>) -> Vec<ImportTarget> {
+/// order). The own folder is offered even when the project does not list it yet; it is then
+/// named so that it shares no name with any declared source (`taken`, git sources too), since
+/// library proposals find their destination by name.
+pub fn targets(project_dir: &Path, folders: Vec<(String, PathBuf)>, taken: &[String]) -> Vec<ImportTarget> {
     let own = project_dir.join(PROJECT_LIBRARY);
     let same = |root: &Path| {
         root == own
@@ -55,7 +57,7 @@ pub fn targets(project_dir: &Path, folders: Vec<(String, PathBuf)>) -> Vec<Impor
         });
     } else {
         let mut name = "project".to_owned();
-        while folders.iter().any(|(n, _)| *n == name) {
+        while folders.iter().any(|(n, _)| *n == name) || taken.contains(&name) {
             name.push('_');
         }
         out.push(ImportTarget {
@@ -363,7 +365,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let starter = ("starter".to_owned(), PathBuf::from("/opt/wc/library"));
         // A new project lists only the starter library: its own folder comes first, to be added.
-        let t = targets(dir.path(), vec![starter.clone()]);
+        let t = targets(dir.path(), vec![starter.clone()], &[]);
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].root, dir.path().join("library"));
         let source = t[0].declare.as_ref().unwrap();
@@ -372,12 +374,17 @@ mod tests {
         assert!(t[1].declare.is_none());
         // Once listed (anywhere), it is first and not added again.
         let own = ("mine".to_owned(), dir.path().join("library"));
-        let t = targets(dir.path(), vec![starter.clone(), own]);
+        let t = targets(dir.path(), vec![starter.clone(), own], &[]);
         assert_eq!(t[0].name, "mine");
         assert!(t[0].declare.is_none());
         assert_eq!(t.len(), 2);
         // A source already called `project` elsewhere keeps its name.
-        let t = targets(dir.path(), vec![("project".to_owned(), PathBuf::from("/x"))]);
+        let t = targets(dir.path(), vec![("project".to_owned(), PathBuf::from("/x"))], &[]);
         assert_eq!(t[0].name, "project_");
+        // So does a git source called `project`, which is not offered as a target itself.
+        let t = targets(dir.path(), vec![starter.clone()], &["starter".into(), "project".into()]);
+        assert_eq!(t[0].name, "project_");
+        assert_eq!(t[0].declare.as_ref().unwrap().name, "project_");
+        assert_eq!(t.len(), 2);
     }
 }

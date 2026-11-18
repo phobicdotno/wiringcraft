@@ -550,6 +550,11 @@ impl Open {
                     self.undo_error = Some(e);
                     return false;
                 }
+                // A library source added or removed: symbols of a source that is gone are no longer
+                // offered, and those of one that came back are.
+                if self.redo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries) {
+                    self.refresh_library();
+                }
                 self.dirty = true;
                 self.history += 1;
                 true
@@ -570,6 +575,9 @@ impl Open {
                     }
                     self.undo_error = Some(e);
                     return false;
+                }
+                if self.undo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries) {
+                    self.refresh_library();
                 }
                 self.dirty = true;
                 self.history += 1;
@@ -3134,5 +3142,44 @@ pub(crate) mod tests {
         assert!(o.project.meta.locations.is_empty());
         assert!(o.undo());
         assert_eq!(o.project.meta.locations.len(), 2);
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_new_library_source_update_the_library_list() {
+        let (_tmp, mut o) = project();
+        let root = o.dir.join("library");
+        let sym = wc_core::Symbol {
+            id: "test.imported".into(),
+            name: "Imported".into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role: wc_core::symbol::SymbolRole::Standalone,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        wc_library::write_symbol(&root, &sym).unwrap();
+        let listed = |o: &Open| o.library.iter().any(|(id, _)| id == "test.imported");
+        o.refresh_library();
+        assert!(!listed(&o), "the folder is not a source yet");
+
+        // As Library -> Import symbols does the first time it writes into the project's folder.
+        o.checkpoint();
+        o.project.meta.libraries.insert(
+            0,
+            LibrarySource {
+                name: "project".into(),
+                kind: "folder".into(),
+                location: "library".into(),
+                reference: None,
+            },
+        );
+        o.refresh_library();
+        assert!(listed(&o));
+        assert!(o.undo());
+        assert!(!listed(&o), "undo removed the source, so its symbols go");
+        assert!(o.redo());
+        assert!(listed(&o), "redo brings them back");
     }
 }
