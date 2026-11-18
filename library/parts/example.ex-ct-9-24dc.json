@@ -1,4 +1,8 @@
 {
+  "contacts": {
+    "main": 3,
+    "no": 1
+  },
   "description": "Contactor 3-pole 9 A, 1 NO auxiliary, 24 V DC coil (example data)",
   "id": "example.ex-ct-9-24dc",
   "manufacturer": "Example",

@@ -1616,3 +1616,67 @@ fn a_terminal_whose_symbol_is_missing_is_counted_the_same_everywhere() {
         out.warnings
     );
 }
+
+#[test]
+fn check_finds_a_device_that_draws_more_contacts_than_its_parts_have() {
+    let (mut p, mut s, mut parts) = fixture();
+    s.insert("nc".into(), sym("nc", SymbolRole::Auxiliary, &["21", "22"]));
+    let k1 = DeviceTag::parse("=A+C1-K1").unwrap();
+    let overflow = |p: &Project, s: &BTreeMap<String, Symbol>, parts: &BTreeMap<String, Part>| -> Vec<Finding> {
+        let i = Inputs {
+            project: p,
+            symbols: s,
+            parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("too many"))
+            .collect()
+    };
+    // The relay's part does not list its contacts: nothing to compare with.
+    p.pages[0].symbols.push(place("s7", "no", 90.0, Some("=A+C1-K1")));
+    assert!(overflow(&p, &s, &parts).is_empty());
+
+    // One NO listed, two drawn: both drawings are named.
+    parts.get_mut("acme.r24").unwrap().contacts = Some(wc_core::Contacts {
+        no: 1,
+        ..Default::default()
+    });
+    let found = overflow(&p, &s, &parts);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(
+        found[0].message,
+        "=A+C1-K1 draws 2 NO contacts, its parts have 1 NO (1 NO too many)"
+    );
+    assert_eq!(found[0].severity, Severity::Warning);
+
+    // An auxiliary block fitted twice adds a NO and an NC each.
+    let block = Part {
+        id: "acme.aux11".into(),
+        contacts: Some(wc_core::Contacts {
+            no: 1,
+            nc: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    parts.insert(block.id.clone(), block);
+    p.devices.get_mut(&k1).unwrap().accessories.push(wc_core::DevicePart {
+        part: "acme.aux11".into(),
+        qty: 2,
+    });
+    p.pages[0].symbols.push(place("s8", "nc", 100.0, Some("=A+C1-K1")));
+    p.pages[0].symbols.push(place("s9", "nc", 105.0, Some("=A+C1-K1")));
+    assert!(overflow(&p, &s, &parts).is_empty());
+    p.pages[0].symbols.push(place("s10", "nc", 106.0, Some("=A+C1-K1")));
+    let found = overflow(&p, &s, &parts);
+    assert!(found[0].message.ends_with("(1 NC too many)"), "{found:?}");
+
+    // A contact repeated on an overview page does not count.
+    p.pages[0].symbols.pop();
+    let mut overview = Page::new("p9", "9", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("s30", "nc", 10.0, Some("=A+C1-K1")));
+    p.pages.push(overview);
+    assert!(overflow(&p, &s, &parts).is_empty());
+}

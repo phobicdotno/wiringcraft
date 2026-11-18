@@ -144,7 +144,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | Coil to contact cross-references with page/column | yes | yes | yes, clickable | done |
 | Contact image under the coil (list of contacts and pins) | yes | yes | yes (texts with pins and locations) | done |
-| Contact overflow check (more contacts drawn than the part has) | yes | yes | no: parts do not list their contacts yet | later (after #106) |
+| Contact overflow check (more contacts drawn than the part has) | yes | yes | yes: parts list their contacts (`contacts` in the part file), `check` warns | done |
 
 ## 7. Terminals
 
