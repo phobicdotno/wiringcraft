@@ -1860,7 +1860,18 @@ fn a_pinned_copy_the_host_puts_back_during_a_session_reaches_the_guests() -> Tes
     match h.role.as_ref() {
         Some(Role::Host(hosting)) => {
             assert_eq!(hosting.host.files().0.get("wc.coil").cloned(), coil);
-            assert_eq!(hosting.host.history().len(), steps + 1, "only the page edit");
+            // The device the placement made (it does not wait for the file) and the page
+            // edit; the file alone is no step to undo.
+            assert_eq!(hosting.host.history().len(), steps + 2, "{:?}", log.messages());
+            assert!(
+                hosting
+                    .host
+                    .history()
+                    .iter()
+                    .all(|c| !c.message.starts_with("Add wc.coil")),
+                "{:?}",
+                log.messages()
+            );
         }
         _ => return Err("still hosting".into()),
     }
