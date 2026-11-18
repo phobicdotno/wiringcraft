@@ -500,8 +500,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "open_project",
-            "Open a project folder, or create a new one (a git repository with the starter library).",
-            json!({"path": {"type": "string"}, "create": {"type": "boolean"}, "name": {"type": "string"}}),
+            "Open a project folder, or create a new one (a git repository with the starter library, or a copy of a base project when base is given).",
+            json!({"path": {"type": "string"}, "create": {"type": "boolean"}, "name": {"type": "string"}, "base": {"type": "string", "description": "create: a base project folder or git URL to start from (its pages, settings, title block and libraries)."}}),
             &["path"],
         ),
         tool(
@@ -1582,7 +1582,7 @@ impl App {
             "open_project" => {
                 let path = PathBuf::from(need_s(v, "path")?);
                 if v.get("create").and_then(Value::as_bool).unwrap_or(false) {
-                    self.new_project(&path, s(v, "name").unwrap_or_default());
+                    self.new_project(&path, s(v, "name").unwrap_or_default(), s(v, "base"));
                 } else {
                     let mut prefs = std::mem::take(&mut self.prefs);
                     self.open_dir(&path, &mut prefs);
@@ -4515,6 +4515,31 @@ mod tests {
             open.project,
             wc_core::store::load(&other).unwrap(),
             "nothing of the old project in it"
+        );
+    }
+
+    #[test]
+    fn a_new_project_can_start_from_a_base_project() {
+        let (tmp, mut a) = app(vec![]);
+        let base = a.open.as_ref().unwrap().dir.clone();
+        let mut p = wc_core::store::load(&base).unwrap();
+        p.meta.title_block.insert("customer".into(), "ACME".into());
+        wc_core::store::save(&base, &p).unwrap();
+        let new = tmp.path().join("from-base");
+        let r = call(
+            &mut a,
+            "open_project",
+            json!({"path": new.to_string_lossy(), "create": true, "name": "From base", "base": base.to_string_lossy()}),
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.dir, new);
+        assert_eq!(open.project.meta.name, "From base");
+        assert_eq!(open.project.meta.title_block["customer"], "ACME");
+        assert_eq!(open.project.pages.len(), p.pages.len());
+        assert_eq!(
+            open.project.meta.libraries, p.meta.libraries,
+            "the base project's library sources, no starter library added"
         );
     }
 }

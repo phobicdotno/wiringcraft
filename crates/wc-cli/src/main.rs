@@ -31,6 +31,12 @@ enum Cmd {
         /// Do not make it a git repository.
         #[arg(long)]
         no_git: bool,
+        /// Start from a base project: a project folder or a git repository URL. Its pages,
+        /// settings, title block, library sources and pictures are copied (not its review
+        /// comments or history); `{name}` and `{date}` in its title block and page titles
+        /// become the new project's name and today's date.
+        #[arg(long, value_name = "FOLDER_OR_URL")]
+        template: Option<String>,
     },
     /// Pages.
     #[command(subcommand)]
@@ -886,6 +892,7 @@ fn run(cli: Cli) -> Res<()> {
             dir: new_dir,
             name,
             no_git,
+            template,
         } => {
             let name = name.unwrap_or_else(|| {
                 new_dir
@@ -893,7 +900,14 @@ fn run(cli: Cli) -> Res<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Project".into())
             });
-            store::create(&new_dir, &name).map_err(e)?;
+            match template {
+                Some(t) => {
+                    wc_vcs::base::create_from_base(&t, &new_dir, &name, &wc_core::base::today()).map_err(e)?;
+                }
+                None => {
+                    store::create(&new_dir, &name).map_err(e)?;
+                }
+            }
             if !no_git {
                 wc_vcs::Git::new(&new_dir).init().map_err(e)?;
             }
@@ -4138,6 +4152,48 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn new_starts_from_a_base_project_with_its_own_name_and_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        run(Cli::try_parse_from([
+            "wiringcraft",
+            "new",
+            base.to_str().unwrap(),
+            "--no-git",
+            "--name",
+            "Base",
+        ])
+        .unwrap())
+        .unwrap();
+        cli(&base, &["page", "add", "legend", "--number", "2", "--title", "Legend"]).unwrap();
+        let mut p = store::load(&base).unwrap();
+        p.meta.title_block.insert("customer".into(), "ACME".into());
+        p.meta.title_block.insert("project_title".into(), "{name}".into());
+        store::save(&base, &p).unwrap();
+
+        let new = tmp.path().join("pump");
+        run(Cli::try_parse_from([
+            "wiringcraft",
+            "new",
+            new.to_str().unwrap(),
+            "--name",
+            "Pump station",
+            "--template",
+            base.to_str().unwrap(),
+        ])
+        .unwrap())
+        .unwrap();
+        let made = store::load(&new).unwrap();
+        assert_eq!(made.meta.name, "Pump station");
+        assert_eq!(made.meta.title_block["customer"], "ACME");
+        assert_eq!(made.meta.title_block["project_title"], "Pump station");
+        assert_eq!(made.meta.title_block["date"], wc_core::base::today());
+        assert_eq!(made.pages.len(), 2);
+        assert!(made.page("legend").is_some());
+        assert!(new.join(".git").exists(), "the new project gets its own history");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! diffed, merged and recovered with ordinary tools.
 
 pub mod autowire;
+pub mod base;
 pub mod connectivity;
 pub mod error;
 pub mod find;

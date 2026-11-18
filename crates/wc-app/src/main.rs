@@ -45,6 +45,9 @@ enum Dialog {
         /// The folder the project folder goes in.
         location: prefs::FolderField,
         name: String,
+        /// A base project to start from: a project folder or a git repository URL. Empty for
+        /// a blank project.
+        base: String,
         /// Why the last Browse could not be used.
         error: Option<String>,
     },
@@ -472,6 +475,7 @@ impl App {
                 self.dialog = Some(Dialog::NewProject {
                     location: field,
                     name: String::new(),
+                    base: String::new(),
                     error,
                 });
             }
@@ -1217,7 +1221,12 @@ impl App {
                         }
                     });
                 }
-                Dialog::NewProject { location, name, error } => {
+                Dialog::NewProject {
+                    location,
+                    name,
+                    base,
+                    error,
+                } => {
                     egui::Grid::new("newproj")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
@@ -1241,6 +1250,25 @@ impl App {
                                 }
                             });
                             ui.end_row();
+                            ui.label("Start from");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(base)
+                                        .hint_text("blank, or a base project folder or git URL")
+                                        .desired_width(300.0),
+                                );
+                                if ui.button("Browse…").clicked() {
+                                    match pick_folder("Base project to start from", base) {
+                                        Picked::Folder(d) => match d.to_str() {
+                                            Some(t) => *base = t.to_owned(),
+                                            None => *error = Some("That folder's name is not text.".into()),
+                                        },
+                                        Picked::Failed(e) => *error = Some(e),
+                                        Picked::Cancelled => {}
+                                    }
+                                }
+                            });
+                            ui.end_row();
                         });
                     // The folder follows the name and the location, whichever is typed last.
                     let target = location.path().and_then(|l| prefs::new_project_dir(&l, name));
@@ -1253,7 +1281,14 @@ impl App {
                         Err(e) => ui.label(RichText::new(e.as_str()).color(t.error)),
                     };
                     ui.label(
-                        RichText::new("A new folder with one cover page, recorded as a git repository.").color(t.faint),
+                        RichText::new(if base.trim().is_empty() {
+                            "A new folder with one cover page, recorded as a git repository."
+                        } else {
+                            "A new folder with the base project's pages, settings, title block and libraries \
+                             (not its comments or history), recorded as a git repository. {name} and {date} in \
+                             its title block and page titles become this project's name and today's date."
+                        })
+                        .color(t.faint),
                     );
                     ui.horizontal(|ui| {
                         if let Ok(d) = target
@@ -1262,7 +1297,8 @@ impl App {
                                 .clicked()
                         {
                             let n = name.trim().to_owned();
-                            then = Some(Box::new(move |app: &mut App| app.new_project(&d, &n)));
+                            let b = Some(base.trim().to_owned()).filter(|b| !b.is_empty());
+                            then = Some(Box::new(move |app: &mut App| app.new_project(&d, &n, b.as_deref())));
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() {
@@ -2102,7 +2138,8 @@ impl App {
         }
     }
 
-    fn new_project(&mut self, dir: &std::path::Path, name: &str) {
+    /// Create a project in `dir`: blank, or from the base project (folder or git URL) `base`.
+    fn new_project(&mut self, dir: &std::path::Path, name: &str, base: Option<&str>) {
         let name = if name.is_empty() {
             dir.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -2110,15 +2147,23 @@ impl App {
         } else {
             name.to_owned()
         };
-        if let Err(e) = wc_core::store::create(dir, &name) {
+        let made = match base {
+            Some(b) => {
+                wc_vcs::base::create_from_base(b, dir, &name, &wc_core::base::today()).map_err(|e| e.to_string())
+            }
+            None => wc_core::store::create(dir, &name).map_err(|e| e.to_string()),
+        };
+        if let Err(e) = made {
             self.dialog = Some(Dialog::Message(format!(
                 "Could not create the project in\n{}:\n{e}",
                 dir.display()
             )));
             return;
         }
-        // A starter library next to the app, when there is one, so the symbol picker is not empty.
-        if let Some(lib) = starter_library()
+        // A starter library next to the app, when there is one, so the symbol picker is not
+        // empty. A base project brings its own library sources.
+        if base.is_none()
+            && let Some(lib) = starter_library()
             && let Ok(mut p) = wc_core::store::load(dir)
         {
             p.meta.libraries.push(wc_core::project::LibrarySource {
