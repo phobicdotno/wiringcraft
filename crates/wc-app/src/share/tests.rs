@@ -1574,6 +1574,43 @@ fn a_guest_without_the_libraries_draws_every_symbol_of_the_project() -> TestResu
 }
 
 #[test]
+fn a_pinned_copy_the_host_puts_back_during_a_session_reaches_the_guests() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+        o.save()?;
+        // Shared with the coil pinned and its copy gone.
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil")?)?;
+        o.symbols.remove("wc.coil");
+        Ok(())
+    })?;
+    // A guest that has no copy either (it took one from the library as it joined).
+    std::fs::remove_file(store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.coil")?)?;
+    guest_open.symbols.remove("wc.coil");
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(store::read_vendored_symbol(&guest_open.dir, "wc.coil").is_err());
+    // Placed again: the host puts the pinned version back from the library, and the guests
+    // get its file though the pin did not change.
+    host_open.place(1, "wc.coil", wc_core::Point::new(60.0, 120.0))?;
+    let coil = host_open.symbols.get("wc.coil").cloned();
+    assert!(coil.is_some());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The file goes in before the page that draws it.
+    assert_eq!(
+        log.messages().first().map(String::as_str),
+        Some("Add wc.coil to the project")
+    );
+    assert_eq!(store::read_vendored_symbol(&guest_open.dir, "wc.coil").ok(), coil);
+    assert_eq!(guest_open.symbols.get("wc.coil").cloned(), coil);
+    // Sent once.
+    match h.role.as_ref() {
+        Some(Role::Host(hosting)) => assert_eq!(hosting.host.files().0.get("wc.coil").cloned(), coil),
+        _ => return Err("still hosting".into()),
+    }
+    Ok(())
+}
+
+#[test]
 fn a_symbol_used_for_the_first_time_reaches_the_host_with_its_file() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
@@ -2693,6 +2730,7 @@ fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestRes
         &auth,
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     );
     assert!(out.edits.is_empty(), "{:?}", out.edits);
     assert_eq!(out.stale, ["symbol coil"]);
@@ -2704,6 +2742,7 @@ fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestRes
         &fresh,
         &base,
         &auth,
+        &Default::default(),
         &Default::default(),
         &Default::default(),
     );
@@ -3228,7 +3267,7 @@ fn items_sent_before_and_not_taken_go_each_in_an_edit_of_its_own() -> TestResult
             .collect()
     };
     let none = Default::default();
-    let out = new_items(&open.dir, &open.project, &before, &before, &none, &none);
+    let out = new_items(&open.dir, &open.project, &before, &before, &none, &none, &none);
     assert_eq!(
         added(&out.edits),
         [vec!["wc.coil", "wc.contact.no"]],
@@ -3237,7 +3276,7 @@ fn items_sent_before_and_not_taken_go_each_in_an_edit_of_its_own() -> TestResult
     // The contact was sent before and the session did not take it: it goes alone, so the coil
     // gets in even when the session cannot store the contact.
     let apart = [item_name(ItemKind::Symbol, "wc.contact.no")].into();
-    let out = new_items(&open.dir, &open.project, &before, &before, &none, &apart);
+    let out = new_items(&open.dir, &open.project, &before, &before, &none, &apart, &none);
     assert_eq!(added(&out.edits), [vec!["wc.contact.no"], vec!["wc.coil"]]);
     Ok(())
 }

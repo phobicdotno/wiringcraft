@@ -517,7 +517,7 @@ impl Open {
             (Some(pin), false) => {
                 // The source the pin names first, then every other: any may still have the
                 // pinned version when the named source has moved on.
-                let fits = |p: &Part| p.hash() == pin.hash && p.id == id;
+                let fits = |p: &Part| version_fits(&p.id, &p.hash(), id, &pin.hash);
                 let p = lib()?
                     .find_version(ItemKind::Part, id, &pin.source, fits)
                     .map_err(|why| {
@@ -1154,12 +1154,26 @@ impl Open {
     pub fn ensure_symbol(&mut self, id: &str) -> Result<(), String> {
         if let Some(loaded) = self.symbols.get(id) {
             // Loaded at open from its file, which may hold another version than the pin names.
-            return match self.project.lock.symbols.get(id) {
-                Some(pin) if loaded.hash() != pin.hash => Err(format!(
-                    "symbol {id}: its copy in the project is not the version the project pins; put the pinned copy back or update the symbol from the library"
-                )),
-                _ => Ok(()),
+            let Some(pin) = self
+                .project
+                .lock
+                .symbols
+                .get(id)
+                .filter(|pin| loaded.hash() != pin.hash)
+            else {
+                return Ok(());
             };
+            // The pinned copy may have been put back since: the file is read again.
+            let fixed = store::read_vendored_symbol(&self.dir, id)
+                .ok()
+                .filter(|s| version_fits(&s.id, &s.hash(), id, &pin.hash).is_ok());
+            let Some(fixed) = fixed else {
+                return Err(format!(
+                    "symbol {id}: its copy in the project is not the version the project pins; put the pinned copy back or update the symbol from the library"
+                ));
+            };
+            self.symbols.insert(id.to_owned(), fixed);
+            return Ok(());
         }
         let lib = || wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string());
         let s = match self.project.lock.symbols.get(id).cloned() {
@@ -1168,10 +1182,10 @@ impl Open {
                 let exists = vendored
                     .try_exists()
                     .map_err(|e| format!("symbol {id}: {} cannot be checked: {e}", vendored.display()))?;
-                let fits = |s: &Symbol| s.hash() == pin.hash && s.id == id;
+                let fits = |s: &Symbol| version_fits(&s.id, &s.hash(), id, &pin.hash);
                 if exists {
                     let copy = store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?;
-                    if !fits(&copy) {
+                    if fits(&copy).is_err() {
                         return Err(format!(
                             "symbol {id}: its copy in the project is not the version the project pins; put the pinned copy back or update the symbol from the library"
                         ));
@@ -2233,6 +2247,18 @@ fn restore_file(path: &Path, was: Option<&[u8]>) -> std::io::Result<()> {
     }
 }
 
+/// Whether a library item read for `id` is the version pinned as `pin` (its hash), or why
+/// not: a file that holds another item than its name says, or another version.
+fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), String> {
+    if item_id != id {
+        Err(format!("its file holds {item_id}"))
+    } else if hash != pin {
+        Err("another version".into())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
@@ -2355,7 +2381,8 @@ pub(crate) mod tests {
     #[test]
     fn a_pinned_symbol_loaded_in_another_version_is_not_placed() {
         let (_tmp, mut o) = project();
-        o.ensure_symbol("wc.coil").unwrap();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
         let old = o.symbols["wc.coil"].clone();
         o.save().unwrap();
         // The file is changed outside the app: the project still pins the old version.
@@ -2366,6 +2393,68 @@ pub(crate) mod tests {
         assert_eq!(o.symbols["wc.coil"], new, "loaded as the file has it");
         let err = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap_err();
         assert!(err.contains("not the version the project pins"), "{err}");
+        // Nor pasted, or inserted from a macro.
+        let before = o.project.clone();
+        let err = o.paste(1, &clip, Point::new(80.0, 80.0)).unwrap_err();
+        assert!(err.contains("not the version the project pins"), "{err}");
+        assert_eq!(o.project, before);
+        // The pinned copy put back: placed with it, without opening the project again.
+        store::write_vendored_symbol(&o.dir, &old).unwrap();
+        o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+    }
+
+    #[test]
+    fn a_pinned_symbol_is_put_back_from_the_second_of_two_libraries_with_one_name() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        library_first(&mut o, tmp.path(), &new);
+        // A second folder also named "mine", after it, with the pinned version.
+        let second = tmp.path().join("mine2");
+        std::fs::create_dir_all(second.join("symbols")).unwrap();
+        std::fs::write(
+            second.join("symbols/wc.coil.json"),
+            serde_json::to_string(&old).unwrap(),
+        )
+        .unwrap();
+        o.project.meta.libraries.retain(|l| l.name == "mine");
+        o.project.meta.libraries.push(LibrarySource {
+            name: "mine".into(),
+            kind: "folder".into(),
+            location: second.display().to_string(),
+            reference: None,
+        });
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().source = "mine".into();
+        o.ensure_symbol("wc.coil").unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+    }
+
+    #[test]
+    fn a_library_file_holding_another_symbol_is_named_as_such() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut wrong = old.clone();
+        wrong.id = "wc.other".into();
+        library_first(&mut o, tmp.path(), &old);
+        std::fs::write(
+            tmp.path().join("mine/symbols/wc.coil.json"),
+            serde_json::to_string(&wrong).unwrap(),
+        )
+        .unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().source = "mine".into();
+        o.project.meta.libraries.retain(|l| l.name == "mine");
+        let err = o.ensure_symbol("wc.coil").unwrap_err();
+        assert!(err.contains("mine: its file holds wc.other"), "{err}");
     }
 
     #[test]

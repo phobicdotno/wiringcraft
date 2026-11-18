@@ -502,14 +502,10 @@ impl Open {
         if clip.is_empty() || self.project.pages.get(page).is_none() || self.held_reason(page).is_some() {
             return Ok(Vec::new());
         }
-        // Symbols copied from another project are taken from the library when possible.
-        let missing: Vec<&str> = clip
-            .symbols
-            .iter()
-            .map(|s| s.symbol.as_str())
-            .filter(|id| !self.symbols.contains_key(*id))
-            .collect();
-        self.ensure_symbols(missing)?;
+        // Every symbol it uses, checked against its pin (a loaded copy may be another version);
+        // those copied from another project are taken from the library when possible.
+        let ids: std::collections::BTreeSet<&str> = clip.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        self.ensure_symbols(ids)?;
         self.checkpoint();
         let d = Point::new(at.x - clip.anchor.x, at.y - clip.anchor.y);
         let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();

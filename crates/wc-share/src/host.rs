@@ -550,9 +550,22 @@ impl Host {
             self.add_picture(picture)?;
             return Ok(false);
         }
+        // An item the session locks in that version but has no file of (the host shared with
+        // the copy missing) still goes in: its file is what guests lack.
+        let fills = match &edit {
+            ProjectEdit::AddItems { symbols, parts } => {
+                symbols
+                    .iter()
+                    .any(|(s, _)| self.symbols.get(&s.id).is_none_or(|have| have.hash() != s.hash()))
+                    || parts
+                        .iter()
+                        .any(|(p, _)| self.parts.get(&p.id).is_none_or(|have| have.hash() != p.hash()))
+            }
+            _ => false,
+        };
         let before = self.project.clone();
         apply_edit(&mut self.project, &edit);
-        if self.project == before {
+        if self.project == before && !fills {
             return Ok(false);
         }
         // Pages set whole, as a page edit: a wire may not newly end on a pin the locked version of

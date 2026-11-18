@@ -941,6 +941,26 @@ fn updated_here(local: &Project, base: &Project, auth: &Project, kind: ItemKind,
 }
 
 /// An item as messages name it: `symbol wc.coil`, `part acme.relay`.
+/// The items `auth` locks that are not among the session's `files` in that version.
+fn missing_files(
+    auth: &Project,
+    (symbols, parts): (&BTreeMap<String, Symbol>, &BTreeMap<String, wc_core::Part>),
+) -> std::collections::BTreeSet<String> {
+    let symbols = auth
+        .lock
+        .symbols
+        .iter()
+        .filter(|(id, e)| symbols.get(*id).is_none_or(|s| s.hash() != e.hash))
+        .map(|(id, _)| item_name(ItemKind::Symbol, id));
+    let parts = auth
+        .lock
+        .parts
+        .iter()
+        .filter(|(id, e)| parts.get(*id).is_none_or(|p| p.hash() != e.hash))
+        .map(|(id, _)| item_name(ItemKind::Part, id));
+    symbols.chain(parts).collect()
+}
+
 fn item_name(kind: ItemKind, id: &str) -> String {
     match kind {
         ItemKind::Symbol => format!("symbol {id}"),
@@ -1012,7 +1032,9 @@ pub struct NewItems {
 /// names the version the session has. Items named in `skip` (sent and not answered yet) are
 /// left out. Items named in `apart` (sent before and not taken) go each in an edit of its own,
 /// so one the session cannot store does not keep the others out. An item whose file cannot be
-/// read is not sent; it is returned with the reason and tried again next time.
+/// read is not sent; it is returned with the reason and tried again next time. Items named in
+/// `repair` the session locks in the same version but has no file of (a host that started the
+/// session with the copy missing): they are sent again as an add, so guests get the file.
 pub fn new_items(
     dir: &Path,
     local: &Project,
@@ -1020,6 +1042,7 @@ pub fn new_items(
     auth: &Project,
     skip: &std::collections::BTreeSet<String>,
     apart: &std::collections::BTreeSet<String>,
+    repair: &std::collections::BTreeSet<String>,
 ) -> NewItems {
     let mut out = NewItems::default();
     // (id, source, hash here, the session's hash when it is an update)
@@ -1035,6 +1058,9 @@ pub fn new_items(
                 None => Some((id.clone(), e.source.clone(), e.hash.clone(), None)),
                 Some(a) if updated_here(local, base, auth, kind, id) => {
                     Some((id.clone(), e.source.clone(), e.hash.clone(), Some(a.hash.clone())))
+                }
+                Some(a) if a.hash == e.hash && repair.contains(&item_name(kind, id)) => {
+                    Some((id.clone(), e.source.clone(), e.hash.clone(), None))
                 }
                 Some(_) => None,
             })
@@ -1063,6 +1089,8 @@ pub fn new_items(
                     Some(before) => new_symbols.push((s, source, before)),
                 }
             }
+            // A repair whose file is not back here yet waits quietly: the session works as is.
+            Err(_) if before.is_none() && auth.lock.symbols.contains_key(&id) => {}
             Err(e) => out.unreadable.push((item_name(ItemKind::Symbol, &id), e)),
         }
     }
@@ -1076,6 +1104,7 @@ pub fn new_items(
                     Some(before) => new_parts.push((p, source, before)),
                 }
             }
+            Err(_) if before.is_none() && auth.lock.parts.contains_key(&id) => {}
             Err(e) => out.unreadable.push((item_name(ItemKind::Part, &id), e)),
         }
     }
@@ -2749,7 +2778,12 @@ impl Share {
         // An item sent before and not taken goes alone, so one the session cannot store does
         // not keep out the others it was sent with.
         let apart = self.items_out.keys().cloned().collect();
-        let items = new_items(&open.dir, &open.project, base, auth, &skip, &apart);
+        // The host's session files: one it locks but has no file of goes out again from here.
+        let repair = match &*role {
+            Role::Host(h) => missing_files(auth, h.host.files()),
+            Role::Guest(_) => Default::default(),
+        };
+        let items = new_items(&open.dir, &open.project, base, auth, &skip, &apart, &repair);
         let now = std::time::Instant::now();
         for (name, why) in &items.unreadable {
             // A file that cannot be read counts as a try: the changes that may draw the item
