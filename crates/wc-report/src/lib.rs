@@ -538,6 +538,46 @@ pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
         .collect()
 }
 
+/// The level of each terminal of `strip` that has one: its own valid [`LEVEL_PROPERTY`], or 1
+/// for a terminal with no `Level` of its own right below one at level 2 or more. `drawn` is the
+/// strip's drawn terminals in the usual (number) order, each once.
+///
+/// Levels are inferred in that order, so moving terminals on the rail never changes a terminal's
+/// level or which block it is in. The strip's spares count only when they have a valid level of
+/// their own, so adding one never splits a block. This is what the terminal plan's Level column
+/// shows; the terminal strip editor shows it too.
+pub fn strip_levels(project: &wc_core::Project, strip: &str, drawn: Vec<String>) -> BTreeMap<String, u32> {
+    let mut usual = drawn;
+    let layout = project.meta.strips.iter().find(|l| l.strip.to_string() == strip);
+    for spare in layout.iter().flat_map(|l| &l.spares) {
+        // Only a valid level of its own counts; a bad value is reported by level_warnings.
+        if usual.contains(spare) || terminal_level(project, strip, spare).is_none() {
+            continue;
+        }
+        let key = (natural_key(spare), spare.clone());
+        let at = usual.partition_point(|n| (natural_key(n), n.clone()) < key);
+        usual.insert(at, spare.clone());
+    }
+    let mut by_number = BTreeMap::new();
+    for (k, n) in usual.iter().enumerate() {
+        let own = terminal_level(project, strip, n);
+        // The bottom level of a block needs no property of its own: the level above says so.
+        // A bad value is not missing: that terminal stays single-level, as its warning says.
+        let missing = level_value(project, strip, n).is_none();
+        let below = || {
+            usual
+                .get(k + 1)
+                .and_then(|up| terminal_level(project, strip, up))
+                .filter(|l| missing && *l >= 2)
+                .map(|_| 1)
+        };
+        if let Some(l) = own.or_else(below) {
+            by_number.insert(n.clone(), l);
+        }
+    }
+    by_number
+}
+
 /// What the terminal plan's Page column says for a spare terminal, which no page draws.
 pub const SPARE_PAGE: &str = "spare";
 
@@ -702,20 +742,9 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
         // The rail order and spares the terminal strip editor set: a terminal drawn twice
         // stays together, a spare gets a row of its own with nothing connected.
         let layout = i.project.meta.strips.iter().find(|l| l.strip.to_string() == strip);
-        // Levels are inferred in the usual order (by number), so moving terminals on the rail
-        // never changes a terminal's level or which block it is in. Spares only count when they
-        // have a level of their own, so adding one never splits a block.
         let mut usual: Vec<String> = numbered.iter().map(|(_, n)| n.clone()).collect();
         usual.dedup();
-        for spare in layout.iter().flat_map(|l| &l.spares) {
-            // Only a valid level of its own counts; a bad value is reported by level_warnings.
-            if usual.contains(spare) || terminal_level(i.project, &strip, spare).is_none() {
-                continue;
-            }
-            let key = (natural_key(spare), spare.clone());
-            let at = usual.partition_point(|n| (natural_key(n), n.clone()) < key);
-            usual.insert(at, spare.clone());
-        }
+        let by_number = strip_levels(i.project, &strip, usual);
         let numbered: Vec<(Option<Term>, String)> = match layout {
             None => numbered.into_iter().map(|(t, n)| (Some(t), n)).collect(),
             Some(layout) => {
@@ -739,25 +768,6 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
                 out
             }
         };
-        // Levels are inferred over distinct terminals: a terminal drawn twice has one level.
-        let distinct: Vec<&str> = usual.iter().map(String::as_str).collect();
-        let mut by_number: BTreeMap<&str, u32> = BTreeMap::new();
-        for (k, n) in distinct.iter().enumerate() {
-            let own = terminal_level(i.project, &strip, n);
-            // The bottom level of a block needs no property of its own: the level above says so.
-            // A bad value is not missing: that terminal stays single-level, as its warning says.
-            let missing = level_value(i.project, &strip, n).is_none();
-            let below = || {
-                distinct
-                    .get(k + 1)
-                    .and_then(|up| terminal_level(i.project, &strip, up))
-                    .filter(|l| missing && *l >= 2)
-                    .map(|_| 1)
-            };
-            if let Some(l) = own.or_else(below) {
-                by_number.insert(n, l);
-            }
-        }
         let levels: Vec<Option<u32>> = numbered
             .iter()
             .map(|(_, n)| by_number.get(n.as_str()).copied())

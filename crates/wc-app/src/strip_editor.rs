@@ -24,6 +24,8 @@ pub struct StripEditor {
     pub strip: Option<DeviceTag>,
     /// The strip tag typed for a first spare, when the project has no strips yet.
     pub new_strip: String,
+    /// True while the user starts another strip with its first spare ("New strip…").
+    pub starting: bool,
     /// The number typed for a new spare terminal.
     pub spare: String,
     /// The terminal a new spare goes after; `None` puts it at the end.
@@ -76,6 +78,10 @@ impl StripEditor {
 
     fn contents(&mut self, ui: &mut egui::Ui, open: &mut Open) {
         let strips = open.strip_terminals();
+        if self.starting && !strips.is_empty() {
+            self.first_spare(ui, open);
+            return;
+        }
         let Some(strip) = (match &self.strip {
             Some(s) if strips.contains_key(s) => Some(s.clone()),
             _ => strips.keys().next().cloned(),
@@ -96,6 +102,14 @@ impl StripEditor {
                             picked = Some(s.clone());
                         }
                     }
+                    ui.separator();
+                    if ui
+                        .selectable_label(false, NEW_STRIP)
+                        .on_hover_text("Start another strip with a spare terminal")
+                        .clicked()
+                    {
+                        self.starting = true;
+                    }
                 });
             if let Some(s) = picked {
                 self.pick(s);
@@ -114,6 +128,7 @@ impl StripEditor {
             }
         });
         let rail = strips.get(&strip).cloned().unwrap_or_default();
+        let levels = rail_levels(open, &strip, &rail);
         self.ticked.retain(|t| rail.iter().any(|(n, _)| n == t));
         ui.weak("Drag a terminal by its handle, or use the arrows, to change the order on the rail. Tick terminals to jumper them.");
         ui.separator();
@@ -160,7 +175,7 @@ impl StripEditor {
                                 action = Some(change);
                             }
                         }
-                        if let Some(level) = level_picker(ui, open, &strip, number) {
+                        if let Some(level) = level_picker(ui, open, &strip, number, levels.get(number).copied()) {
                             action = Some(Change::Level(number.clone(), level));
                         }
                         let with = jumpered_with(open, &strip, number);
@@ -257,7 +272,12 @@ impl StripEditor {
 
     /// With no strip in the project yet: a strip tag and a number for its first spare.
     fn first_spare(&mut self, ui: &mut egui::Ui, open: &mut Open) {
-        ui.label("No terminal strips yet. Place terminals tagged like -X1.1 on a page, or start a strip with a spare terminal:");
+        let another = self.starting && !open.strip_terminals().is_empty();
+        if another {
+            ui.label("Start a new strip with a spare terminal:");
+        } else {
+            ui.label("No terminal strips yet. Place terminals tagged like -X1.1 on a page, or start a strip with a spare terminal:");
+        }
         let mut add = false;
         ui.horizontal(|ui| {
             ui.label("Strip");
@@ -278,6 +298,10 @@ impl StripEditor {
                     egui::Button::new("Add spare"),
                 )
                 .clicked();
+            if another && ui.button("Cancel").clicked() {
+                self.starting = false;
+                self.message.clear();
+            }
         });
         if add {
             self.add_first_spare(open);
@@ -294,7 +318,8 @@ impl StripEditor {
                 self.apply(open, &strip, Change::AddSpare(spare, None));
                 if self.message.is_empty() {
                     self.new_strip.clear();
-                    self.strip = Some(strip);
+                    self.starting = false;
+                    self.pick(strip);
                 }
             }
             Err(e) => self.message = e.to_string(),
@@ -363,6 +388,23 @@ fn drop_on(strip: &DeviceTag, rail: &[(String, bool)], from: &Dragged, to: usize
     (from.0 == *strip && rail.iter().any(|(t, _)| *t == from.1)).then(|| Change::Move(from.1.clone(), to))
 }
 
+/// The picker entry that starts another strip.
+const NEW_STRIP: &str = "New strip…";
+
+/// The level of each terminal on `rail` as the terminal plan shows it, inferred levels included
+/// ([`wc_report::strip_levels`]): over the drawn terminals in number order, whatever the rail
+/// order.
+fn rail_levels(open: &Open, strip: &DeviceTag, rail: &[(String, bool)]) -> std::collections::BTreeMap<String, u32> {
+    let mut drawn: Vec<String> = rail
+        .iter()
+        .filter(|(_, spare)| !spare)
+        .map(|(n, _)| n.clone())
+        .collect();
+    drawn.sort_by(|a, b| (wc_report::natural_key(a), a).cmp(&(wc_report::natural_key(b), b)));
+    drawn.dedup();
+    wc_report::strip_levels(&open.project, &strip.to_string(), drawn)
+}
+
 /// The device tag of terminal `number` of `strip` (`-X1.3`).
 fn terminal_tag(strip: &DeviceTag, number: &str) -> Result<DeviceTag, String> {
     DeviceTag::parse(&format!("{strip}.{number}")).map_err(|e| e.to_string())
@@ -378,7 +420,7 @@ pub fn set_level(open: &mut Open, strip: &DeviceTag, number: &str, level: &str) 
 
 /// The level picker of terminal `number` of `strip`: its device's own `Level` property, from a
 /// short list. Returns the level picked in this frame, if any.
-fn level_picker(ui: &mut egui::Ui, open: &Open, strip: &DeviceTag, number: &str) -> Option<String> {
+fn level_picker(ui: &mut egui::Ui, open: &Open, strip: &DeviceTag, number: &str, shown: Option<u32>) -> Option<String> {
     let Ok(tag) = terminal_tag(strip, number) else {
         ui.label("");
         return None;
@@ -392,8 +434,8 @@ fn level_picker(ui: &mut egui::Ui, open: &Open, strip: &DeviceTag, number: &str)
         .unwrap_or_default();
     let mut picked = current.clone();
     egui::ComboBox::from_id_salt(("strip editor level", strip, number))
-        .width(50.0)
-        .selected_text(if current.is_empty() { "–" } else { current.as_str() })
+        .width(90.0)
+        .selected_text(level_text(&current, shown))
         .show_ui(ui, |ui| {
             for l in LEVELS {
                 ui.selectable_value(&mut picked, (*l).to_owned(), if l.is_empty() { "–" } else { l });
@@ -401,9 +443,19 @@ fn level_picker(ui: &mut egui::Ui, open: &Open, strip: &DeviceTag, number: &str)
         })
         .response
         .on_hover_text(
-            "The terminal's own level on a multi-level terminal (1 is the bottom). – sets none of its own. Levels are inferred in number order, not rail order: a terminal whose next number up has level 2 or more is still level 1 in the terminal plan.",
+            "The terminal's own level on a multi-level terminal (1 is the bottom). – clears its own level; \"(inferred)\" is the level the terminal plan still gives it. Levels are inferred in number order, not rail order: a terminal without a level of its own whose next number up has level 2 or more is level 1.",
         );
     (picked != current).then_some(picked)
+}
+
+/// What the level picker shows: the terminal's own `Level`, else the level the terminal plan
+/// infers for it, marked as such, else – for none.
+fn level_text(own: &str, shown: Option<u32>) -> String {
+    match (own.is_empty(), shown) {
+        (false, _) => own.to_owned(),
+        (true, Some(l)) => format!("{l} (inferred)"),
+        (true, None) => "–".to_owned(),
+    }
 }
 
 /// The other terminals of the jumper that holds terminal `number` of `strip`, e.g. `3, 5`.
@@ -603,6 +655,77 @@ mod tests {
         let x2 = DeviceTag::parse("-X2")?;
         assert!(drop_on(&x1, &before.0, &Dragged(x2, "1".into()), 0).is_none());
         assert_eq!((rail(&o), o.undo_mark()), before);
+        Ok(())
+    }
+
+    #[test]
+    fn the_editor_shows_inferred_levels_and_starts_another_strip() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let x1 = DeviceTag::parse("-X1")?;
+        for (k, tag) in ["-X1.1", "-X1.2"].into_iter().enumerate() {
+            let id = o.place(
+                1,
+                "wc.terminal",
+                wc_core::geom::Point::new(20.0 + 20.0 * k as f64, 20.0),
+            )?;
+            let s = o.project.pages[1]
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or("not placed")?;
+            s.tag = Some(DeviceTag::parse(tag)?);
+        }
+        set_level(&mut o, &x1, "2", "2")?;
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut ed = StripEditor::for_project(&o);
+        let texts = |ed: &mut StripEditor, o: &mut Open| -> Vec<String> {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                ed.show(ctx, o);
+            });
+            ctx.run(egui::RawInput::default(), |ctx| {
+                ed.show(ctx, o);
+            })
+            .shapes
+            .into_iter()
+            .filter_map(|s| match s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+        };
+        // Terminal 1 has no level of its own, but sits right below level 2: the plan says 1.
+        let shown = texts(&mut ed, &mut o);
+        assert!(shown.iter().any(|t| t == "1 (inferred)"), "{shown:?}");
+        assert!(shown.iter().any(|t| t == "2"), "{shown:?}");
+        // Moving it on the rail does not change that.
+        o.move_terminal(&x1, "2", 0)?;
+        let shown = texts(&mut ed, &mut o);
+        assert!(shown.iter().any(|t| t == "1 (inferred)"), "{shown:?}");
+        // Without the level above, it shows none.
+        set_level(&mut o, &x1, "2", "")?;
+        let shown = texts(&mut ed, &mut o);
+        assert!(!shown.iter().any(|t| t.contains("(inferred)")), "{shown:?}");
+        assert_eq!(level_text("", None), "–");
+
+        // New strip… in the picker opens the first-spare form beside the existing strip.
+        ed.starting = true;
+        let shown = texts(&mut ed, &mut o);
+        assert!(
+            shown.iter().any(|t| t == "Start a new strip with a spare terminal:"),
+            "{shown:?}"
+        );
+        assert!(shown.iter().any(|t| t == "Cancel"), "{shown:?}");
+        ed.new_strip = "-X5".into();
+        ed.spare = "50".into();
+        ed.add_first_spare(&mut o);
+        assert!(ed.message.is_empty(), "{}", ed.message);
+        assert!(!ed.starting);
+        let x5 = DeviceTag::parse("-X5")?;
+        assert_eq!(ed.strip.as_ref(), Some(&x5));
+        let shown = texts(&mut ed, &mut o);
+        assert!(shown.iter().any(|t| t == "50 (spare)"), "{shown:?}");
+        assert!(!shown.iter().any(|t| t == "1 (inferred)"), "{shown:?}");
         Ok(())
     }
 }
