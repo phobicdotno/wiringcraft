@@ -834,46 +834,67 @@ fn edits_page(name: &str, v: &Value) -> bool {
     }
 }
 
-/// What [`AppTools::held_check`] checks a tool's change against.
+/// What [`AppTools::held_check`] checks a tool's change against, and what it puts back.
 struct HeldGuard {
     dir: PathBuf,
     held: Vec<Page>,
     mark: crate::state::Mark,
+    page: usize,
+    selection: Vec<Selection>,
 }
 
 impl AppTools<'_> {
     /// In a shared session, what a tool's change is checked against: the pages someone else
-    /// holds, and the state to go back to. `None` when nobody holds a page, for `undo`, which
-    /// the session's host carries out and checks itself, and for `open_project`, which
-    /// replaces the project instead of changing it.
-    fn held_guard(&self, name: &str) -> Option<HeldGuard> {
-        let open = self.0.open.as_ref()?;
+    /// holds, and the state to go back to. `None` when nobody holds a page; for undo and redo
+    /// (the tool, or the action), which the session's host carries out and checks itself; and
+    /// for `open_project`, which replaces the project instead of changing it.
+    fn held_guard(&mut self, name: &str, input: &Value) -> Option<HeldGuard> {
+        let undoes = match name {
+            "undo" | "open_project" => true,
+            "run_action" => s(input, "action").is_some_and(|a| {
+                [Action::Undo, Action::Redo]
+                    .iter()
+                    .any(|u| u.name().eq_ignore_ascii_case(a))
+            }),
+            _ => false,
+        };
+        let (page, selection) = (self.0.ed.page, self.0.ed.selection.clone());
+        let open = self.0.open.as_mut()?;
         let held = open.held_pages();
-        (!held.is_empty() && !matches!(name, "undo" | "open_project")).then(|| HeldGuard {
+        (!held.is_empty() && !undoes).then(|| HeldGuard {
             dir: open.dir.clone(),
             held,
             mark: open.mark(),
+            page,
+            selection,
         })
     }
 
     /// A page someone else holds is read-only here, whatever the tool did: a change that
     /// reached one (a rename that also renames symbols there, a cover flag moved off it) is
-    /// taken back as a whole and refused with who holds the page, as the host would refuse it.
+    /// taken back as a whole, with the page shown and the selection, and refused with who
+    /// holds the page, as the host would refuse it. The tool's own error, if any, is kept.
     fn held_check(&mut self, guard: Option<HeldGuard>, r: Result<String, String>) -> Result<String, String> {
-        // Another project opened in between (open_project) is not this project's change.
-        let (Some(g), Some(open)) = (guard, self.0.open.as_mut()) else {
+        let Some(g) = guard else {
             return r;
         };
+        let Some(open) = self.0.open.as_mut() else {
+            return r;
+        };
+        // Another project opened in between is not this project's change.
         if open.dir != g.dir {
             return r;
         }
-        match open.held_change(&g.held) {
-            Some(why) => {
-                open.back_to(g.mark);
-                Err(format!("Not done: {why}"))
-            }
-            None => r,
-        }
+        let Some(why) = open.held_change(&g.held) else {
+            open.keep(g.mark);
+            return r;
+        };
+        open.back_to(g.mark);
+        (self.0.ed.page, self.0.ed.selection) = (g.page, g.selection);
+        Err(match r {
+            Ok(_) => format!("Not done: {why}"),
+            Err(e) => format!("Not done: {why} The tool also said: {e}"),
+        })
     }
 }
 
@@ -887,7 +908,7 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
-        let guard = self.held_guard(name);
+        let guard = self.held_guard(name, input);
         let r = self.0.agent_tool(name, input);
         let r = self.held_check(guard, r);
         // Items the assistant removed must not stay selected.
@@ -900,7 +921,7 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
-        let guard = self.held_guard(name);
+        let guard = self.held_guard(name, input);
         match self.0.agent_start(name, input) {
             Started::Done(r) => {
                 let r = self.held_check(guard, r);
@@ -4101,7 +4122,20 @@ mod tests {
             .unwrap()
             .held_by_others
             .insert("p0002".into(), "Ola".into());
+        // A refused change keeps what can be redone and the page shown.
+        call(&mut a, "add_page", json!({})).unwrap();
+        call(&mut a, "undo", json!({})).unwrap();
+        assert!(a.open.as_ref().unwrap().can_redo());
+        let shown = a.ed.page;
         let before = page2(&a).clone();
+        let r = call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 1, "y": 1}, "text": "x"}}),
+        );
+        assert!(r.is_err(), "{r:?}");
+        assert!(a.open.as_ref().unwrap().can_redo(), "redo survives a refusal");
+        assert_eq!(a.ed.page, shown);
         let line = json!({"kind": "line", "a": {"x": 0, "y": 0}, "b": {"x": 5, "y": 0}});
         let edits = [
             (

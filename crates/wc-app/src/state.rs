@@ -126,11 +126,16 @@ impl WireNumbering {
     }
 }
 
-/// What [`Open::back_to`] goes back to.
+/// How many undo steps a window keeps.
+const UNDO_LIMIT: usize = 200;
+
+/// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
 pub(crate) struct Mark {
     project: Project,
-    undo_len: usize,
-    undo_dropped: usize,
+    symbols: std::collections::BTreeSet<String>,
+    parts: std::collections::BTreeSet<String>,
+    undo: Vec<Project>,
+    redo: Vec<Project>,
     history: u64,
     form_step: Option<u64>,
     dirty: bool,
@@ -494,7 +499,7 @@ impl Open {
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
         self.undo.push(self.project.clone());
-        if self.undo.len() > 200 {
+        if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
             self.undo_dropped += 1;
         }
@@ -1149,13 +1154,17 @@ impl Open {
         })
     }
 
-    /// Where the project and its undo history are now, for taking a refused change back with
-    /// [`Open::back_to`]. Redo is not kept: the change in between must not undo or redo.
-    pub(crate) fn mark(&self) -> Mark {
+    /// Start a change that may be refused as a whole: the project and the symbols and parts
+    /// loaded now are kept, and the undo history is set aside, so the change's own undo steps
+    /// collect apart from it. [`Open::keep`] or [`Open::back_to`] ends it. Undo and redo
+    /// must not run in between.
+    pub(crate) fn mark(&mut self) -> Mark {
         Mark {
             project: self.project.clone(),
-            undo_len: self.undo.len(),
-            undo_dropped: self.undo_dropped,
+            symbols: self.symbols.keys().cloned().collect(),
+            parts: self.parts.keys().cloned().collect(),
+            undo: std::mem::take(&mut self.undo),
+            redo: std::mem::take(&mut self.redo),
             history: self.history,
             form_step: self.form_step,
             dirty: self.dirty,
@@ -1163,16 +1172,28 @@ impl Open {
         }
     }
 
-    /// Take back everything changed since `mark`: the project, the undo step the change added
-    /// and the change marks.
+    /// The change since `mark` stays: its undo steps go after the earlier ones (the oldest
+    /// dropped beyond the usual limit), and redo is kept only when it made no undo step.
+    pub(crate) fn keep(&mut self, mark: Mark) {
+        let mut undo = mark.undo;
+        undo.append(&mut self.undo);
+        let over = undo.len().saturating_sub(UNDO_LIMIT);
+        undo.drain(..over);
+        self.undo_dropped += over;
+        self.undo = undo;
+        if self.history == mark.history {
+            self.redo = mark.redo;
+        }
+    }
+
+    /// Take back everything changed since `mark`: the project, the symbols and parts it
+    /// loaded, its undo steps, and the change marks; the undo and redo history are as before.
     pub(crate) fn back_to(&mut self, mark: Mark) {
         self.project = mark.project;
-        if self.undo_dropped == mark.undo_dropped {
-            self.undo.truncate(mark.undo_len);
-        } else {
-            // A full history dropped its oldest step to make room; only the new one goes.
-            self.undo.pop();
-        }
+        self.symbols.retain(|id, _| mark.symbols.contains(id));
+        self.parts.retain(|id, _| mark.parts.contains(id));
+        self.undo = mark.undo;
+        self.redo = mark.redo;
         (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
         self.terminals_before = mark.terminals_before;
     }
