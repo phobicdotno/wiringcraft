@@ -34,6 +34,9 @@ pub enum Tool {
     Text,
     Line,
     Rect,
+    Circle,
+    Arc,
+    Polyline,
     Comment,
 }
 

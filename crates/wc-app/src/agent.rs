@@ -2927,6 +2927,9 @@ mod tests {
             Action::TextTool,
             Action::LineTool,
             Action::RectTool,
+            Action::CircleTool,
+            Action::ArcTool,
+            Action::PolylineTool,
             Action::PageProps,
         ];
         for act in editing {

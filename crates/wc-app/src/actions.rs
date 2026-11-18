@@ -19,6 +19,9 @@ pub enum Action {
     TextTool,
     LineTool,
     RectTool,
+    CircleTool,
+    ArcTool,
+    PolylineTool,
     Delete,
     Rotate,
     Mirror,
@@ -91,6 +94,9 @@ impl Action {
                 | Action::TextTool
                 | Action::LineTool
                 | Action::RectTool
+                | Action::CircleTool
+                | Action::ArcTool
+                | Action::PolylineTool
                 | Action::Delete
                 | Action::Rotate
                 | Action::Mirror
@@ -124,6 +130,9 @@ impl Action {
         Action::TextTool,
         Action::LineTool,
         Action::RectTool,
+        Action::CircleTool,
+        Action::ArcTool,
+        Action::PolylineTool,
         Action::Delete,
         Action::Rotate,
         Action::Mirror,
@@ -269,6 +278,24 @@ impl Action {
             ),
             Action::LineTool => i("Line", "Draw a line: click both ends", Icon::Line, "L"),
             Action::RectTool => i("Rectangle", "Draw a rectangle: click two corners", Icon::Rect, ""),
+            Action::CircleTool => i(
+                "Circle",
+                "Draw a circle: click the centre, then a point on it",
+                Icon::Circle,
+                "",
+            ),
+            Action::ArcTool => i(
+                "Arc",
+                "Draw an arc: click the centre, the start and the end (it runs clockwise)",
+                Icon::Arc,
+                "",
+            ),
+            Action::PolylineTool => i(
+                "Polyline",
+                "Draw a polyline: click each point; double-click or Enter ends it, a click on the first point closes it",
+                Icon::Polyline,
+                "",
+            ),
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
             Action::Rotate => i("Rotate", "Rotate the selected symbols 90°", Icon::Rotate, "R"),
             Action::Mirror => i("Mirror", "Mirror the selected symbols left to right", Icon::Mirror, "M"),
@@ -477,7 +504,14 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::Mirror,
         Action::Delete,
     ],
-    &[Action::TextTool, Action::LineTool, Action::RectTool],
+    &[
+        Action::TextTool,
+        Action::LineTool,
+        Action::RectTool,
+        Action::CircleTool,
+        Action::ArcTool,
+        Action::PolylineTool,
+    ],
     &[
         Action::AddPage,
         Action::CoverPage,
@@ -547,7 +581,17 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::Mirror,
                 ],
             ),
-            ("Graphics", &[Action::TextTool, Action::LineTool, Action::RectTool]),
+            (
+                "Graphics",
+                &[
+                    Action::TextTool,
+                    Action::LineTool,
+                    Action::RectTool,
+                    Action::CircleTool,
+                    Action::ArcTool,
+                    Action::PolylineTool,
+                ],
+            ),
         ],
     ),
     (

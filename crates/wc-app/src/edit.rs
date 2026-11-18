@@ -218,7 +218,27 @@ pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
                 (d - radius).abs() <= tol
             }
         }
-        Shape::Arc { center, radius, .. } => (at.distance(*center) - radius).abs() <= tol,
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => {
+            // On the circle, and within the sweep (or near an end): the open part of the arc
+            // does not pick it.
+            let on_circle = (at.distance(*center) - radius).abs() <= tol;
+            let a = (at.y - center.y).atan2(at.x - center.x).to_degrees();
+            let sweep = (end - start).rem_euclid(360.0);
+            let sweep = if sweep == 0.0 { 360.0 } else { sweep };
+            let end_pt = |deg: f64| {
+                let r = deg.to_radians();
+                Point::new(center.x + radius * r.cos(), center.y + radius * r.sin())
+            };
+            on_circle
+                && ((a - start).rem_euclid(360.0) <= sweep
+                    || at.distance(end_pt(*start)) <= tol
+                    || at.distance(end_pt(*end)) <= tol)
+        }
         Shape::Text { .. } => {
             let (a, b) = graphic_bounds(g);
             at.x >= a.x - tol && at.x <= b.x + tol && at.y >= a.y - tol && at.y <= b.y + tol
