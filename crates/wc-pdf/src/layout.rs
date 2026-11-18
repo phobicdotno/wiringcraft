@@ -804,6 +804,19 @@ pub fn draw_page(
                 "page {}: a cloud carries revision {}, which the project does not list",
                 page.number, c.revision
             ));
+        } else if !c.revision.chars().all(wc_core::font::pdf_prints) {
+            warnings.push(format!(
+                "page {}: the PDF cannot print revision {} on a cloud; its letter comes out as ?",
+                page.number, c.revision
+            ));
+        }
+    }
+    if page.revision_table.is_some() {
+        for letter in project.unprintable_revisions() {
+            warnings.push(format!(
+                "page {}: the PDF cannot print revision {letter} in the revision table; its letter comes out as ?",
+                page.number
+            ));
         }
     }
 

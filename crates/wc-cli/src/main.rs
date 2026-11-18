@@ -1672,7 +1672,7 @@ fn run(cli: Cli) -> Res<()> {
             );
             std::fs::write(&out, bytes).map_err(e)?;
             for w in &report.warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
         }
@@ -1722,7 +1722,7 @@ fn run(cli: Cli) -> Res<()> {
                 std::fs::write(out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
             }
             for w in &report.warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             println!("wrote {} {ext} file(s) to {}", drawings.len(), out.display());
         }
@@ -1787,7 +1787,7 @@ fn run(cli: Cli) -> Res<()> {
                     .and_then(|id| p.page(id))
                     .map(|pg| format!("page {}: ", pg.number))
                     .unwrap_or_default();
-                println!("{:<7} {page}{}", f.severity.label(), f.message);
+                println!("{:<7} {page}{}", f.severity.label(), escape_field(&f.message));
             }
             let (errors, warnings, notes) = (
                 count(wc_report::Severity::Error),
@@ -1838,14 +1838,14 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Export(ExportCmd::WagoMarking { out, args }) => {
             let done = export_wago_marking(dir, &out, &args)?;
             for w in &done.warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             println!("wrote {} ({} markers)", out.display(), done.markers);
         }
         Cmd::Export(ExportCmd::WagoConfigurator { out }) => {
             let done = export_wago_configurator(dir, &out)?;
             for w in &done.warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             println!("wrote {} ({} rows)", out.display(), done.markers);
         }
@@ -2008,7 +2008,7 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
             let left = wc_library::lock_missing(dir, &mut p, &lib).map_err(e)?;
             save(dir, &p)?;
             for w in lock_warnings(&left) {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(&w));
             }
         }
         LibCmd::Search { query } => {
@@ -2047,7 +2047,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let (mut s, warnings) =
                 wc_import::dxf::symbol_with_warnings(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
             for w in &warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             s.category = category;
             s.letter_code = letter_code;
@@ -2109,7 +2109,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         ImportCmd::Wago { file } => {
             let done = import_wago(dir, &file)?;
             for w in &done.warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             println!(
                 "WAGO configurator: {} device(s) or jumper(s) changed, {} row(s) already up to date, {} not matched",
@@ -2128,7 +2128,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 .and_then(|rows| wc_import::csv::plc_addresses_from_rows(&rows))
                 .map_err(e)?;
             for w in warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(&w));
             }
             let applied = wc_import::csv::apply_plc_addresses(&mut p, &rows);
             for t in &applied.unknown {
@@ -2147,14 +2147,14 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         ImportCmd::PartsBmecat { file, lib } => {
             let (n, warnings) = import_bmecat(&file, &lib)?;
             for w in warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(&w));
             }
             println!("imported {n} part(s) into {}", lib.display());
         }
         ImportCmd::PartsEdz { file, lib, symbol_map } => {
             let (n, report, warnings) = import_edz(&file, &lib, symbol_map.as_deref())?;
             for w in warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(&w));
             }
             for line in report.lines() {
                 println!("{line}");
@@ -2170,7 +2170,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 wc_library::write_part(&lib, p).map_err(e)?;
             }
             for w in warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(&w));
             }
             println!("imported {} part(s) into {}", parts.len(), lib.display());
         }
@@ -2187,7 +2187,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let ep = wc_import::eplan::read(&tables).map_err(e)?;
             let (built, warnings) = wc_import::eplan::build(&ep, first_page);
             for w in ep.warnings.iter().chain(&warnings) {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             let source = format!(
                 "import:{}",
@@ -2252,7 +2252,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 }
                 let info_warnings = got.info.iter().flat_map(|i| &i.warnings);
                 for w in got.info_warning.iter().chain(info_warnings) {
-                    eprintln!("warning: {w}");
+                    eprintln!("warning: {}", escape_field(w));
                 }
                 (got.bytes, got.info, Some(got.folder))
             };
@@ -2262,7 +2262,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             sw.info = info;
             let choice = swe_symbol_choice(dir, &p, symbol_map.as_deref())?;
             for w in &choice.2 {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             // The archive's catalog: devices that name one of its parts are linked to it, the part
             // comes along, and its size is used for layout footprints the source gives no box.
@@ -2300,7 +2300,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             let (built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);
             for w in sw.warnings.iter().chain(&warnings) {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             let linked = (catalog_read && !sw.catalog.is_empty())
                 .then(|| built.devices.values().filter(|d| d.part.is_some()).count());
@@ -2338,7 +2338,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             );
             let (report, warnings) = import_swe_library(dir, &path, lib.as_deref(), &source)?;
             for w in warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(&w));
             }
             for line in report.lines() {
                 println!("{line}");
@@ -2353,7 +2353,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let text = std::fs::read(&file).map_err(e)?;
             let imp = wc_import::aml::parse(&String::from_utf8_lossy(&text)).map_err(e)?;
             for w in &imp.warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             let built = wc_import::aml::build(&imp, first_page);
             let source = format!(
@@ -2570,7 +2570,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let text = std::fs::read(&file).map_err(e)?;
             let imported = wc_import::dxf::page(&String::from_utf8_lossy(&text), scale, &known).map_err(e)?;
             for w in &imported.warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(w));
             }
             // The page must be there before anything is taken (a retry would skip the copies).
             page_mut(&mut p, &page)?;
@@ -3340,7 +3340,7 @@ fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str
 fn read_kicad(text: &str, prefix: &str, scale: f64) -> Res<Vec<wc_import::kicad::Imported>> {
     let (symbols, warnings) = wc_import::kicad::symbols(text, prefix, scale).map_err(e)?;
     for w in warnings {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", escape_field(&w));
     }
     Ok(symbols)
 }

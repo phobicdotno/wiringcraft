@@ -55,7 +55,9 @@ pub const TABLE_ROW: f64 = 5.0;
 /// A one-line field as kept: trimmed, without control characters, not overlong.
 fn field(s: &str, max: usize) -> String {
     let kept: String = s.chars().filter(|c| !c.is_control()).collect();
-    kept.trim().chars().take(max).collect()
+    let cut: String = kept.trim().chars().take(max).collect();
+    // A cut can end at a space; trim again so lookups by the trimmed key find it.
+    cut.trim_end().to_owned()
 }
 
 /// The text height at which `s` fits `width` millimetres in the PDF's font: `max` when it
@@ -78,9 +80,17 @@ fn fit(s: &str, width: f64) -> String {
     if crate::font::text_width_mm(s, TEXT) <= room {
         return s.to_owned();
     }
-    let mut out: String = s.to_owned();
-    while !out.is_empty() && crate::font::text_width_mm(&format!("{out}..."), TEXT) > room {
-        out.pop();
+    // Widths add up character by character, so one pass finds the longest prefix that fits.
+    let budget = room - crate::font::text_width_mm("...", TEXT);
+    let mut used = 0.0;
+    let mut out = String::new();
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        used += crate::font::text_width_mm(c.encode_utf8(&mut buf), TEXT);
+        if used > budget {
+            break;
+        }
+        out.push(c);
     }
     format!("{out}...")
 }
@@ -100,8 +110,20 @@ impl RevisionCloud {
         [self.min.x, self.min.y, self.max.x, self.max.y]
             .iter()
             .all(|v| v.is_finite())
+            && (self.max.x - self.min.x).is_finite()
+            && (self.max.y - self.min.y).is_finite()
             && self.max.x > self.min.x
             && self.max.y > self.min.y
+    }
+
+    /// How far the top side's scallops reach above the rectangle: their radius.
+    fn top_reach(&self) -> f64 {
+        side_scallops(self.max.x - self.min.x).1
+    }
+
+    /// The bottom of the tag's triangle: just above the top side's scallops.
+    fn tag_base(&self) -> f64 {
+        self.min.y - self.top_reach() - 0.5
     }
 
     /// The cloud's outline: half circles bulging outwards along each side, clockwise on paper
@@ -120,11 +142,9 @@ impl RevisionCloud {
         let mut out = Vec::new();
         let next = corners.iter().cycle().skip(1);
         for (&p, &q) in corners.iter().zip(next) {
-            let len = p.distance(q);
-            // At most 500 scallops a side, so a huge cloud stays cheap to draw.
-            let n = ((len / SCALLOP).round() as usize).clamp(1, 500);
+            // The sides are axis-aligned, so their length needs no squares that could overflow.
+            let (n, radius) = side_scallops((q.x - p.x).abs() + (q.y - p.y).abs());
             let (dx, dy) = ((q.x - p.x) / n as f64, (q.y - p.y) / n as f64);
-            let radius = len / n as f64 / 2.0;
             // Going clockwise on paper, the outside is on the left of the travel direction, and
             // an arc from the start point's angle sweeping 180 degrees (clockwise on paper) bulges
             // to that side.
@@ -149,8 +169,7 @@ impl RevisionCloud {
             return Vec::new();
         }
         let height = TAG_SIZE * 3f64.sqrt() / 2.0;
-        // The scallops reach at most half a scallop outside the rectangle.
-        let base = self.min.y - SCALLOP / 2.0 - 0.5;
+        let base = self.tag_base();
         let mid = self.max.x;
         vec![
             Shape::Polyline {
@@ -184,20 +203,44 @@ impl RevisionCloud {
         if !self.is_valid() {
             return false;
         }
-        let reach = SCALLOP / 2.0 + tol;
-        let inside_outer = at.x >= self.min.x - reach
-            && at.x <= self.max.x + reach
-            && at.y >= self.min.y - reach
-            && at.y <= self.max.y + reach;
-        let inside_inner = at.x > self.min.x + reach
-            && at.x < self.max.x - reach
-            && at.y > self.min.y + reach
-            && at.y < self.max.y - reach;
+        let on_outline = self.scallops().iter().any(|s| match s {
+            Shape::Arc {
+                center,
+                radius,
+                start,
+                end,
+            } => arc_distance(at, *center, *radius, *start, *end) <= tol,
+            _ => false,
+        });
         let height = TAG_SIZE * 3f64.sqrt() / 2.0;
-        let base = self.min.y - SCALLOP / 2.0 - 0.5;
+        let base = self.tag_base();
         let on_tag =
             (at.x - self.max.x).abs() <= TAG_SIZE / 2.0 + tol && at.y <= base + tol && at.y >= base - height - tol;
-        (inside_outer && !inside_inner) || on_tag
+        on_outline || on_tag
+    }
+}
+
+/// How a side of `len` millimetres is split into scallops: their count and radius. At most 500
+/// scallops a side, so a huge cloud stays cheap to draw.
+fn side_scallops(len: f64) -> (usize, f64) {
+    let n = ((len / SCALLOP).round() as usize).clamp(1, 500);
+    (n, len / n as f64 / 2.0)
+}
+
+/// The distance from `at` to a half-circle arc as [`Shape::Arc`] draws it (angles in degrees,
+/// a point at angle `a` is `center + radius * (cos a, sin a)` on the y-down page).
+fn arc_distance(at: Point, center: Point, radius: f64, start: f64, end: f64) -> f64 {
+    let point = |deg: f64| {
+        let r = deg.to_radians();
+        Point::new(center.x + radius * r.cos(), center.y + radius * r.sin())
+    };
+    let mid = ((start + end) / 2.0).to_radians();
+    let (vx, vy) = (at.x - center.x, at.y - center.y);
+    // A half circle: the points on its side of the chord are nearest to the curve itself.
+    if vx * mid.cos() + vy * mid.sin() >= 0.0 {
+        ((vx * vx + vy * vy).sqrt() - radius).abs()
+    } else {
+        at.distance(point(start)).min(at.distance(point(end)))
     }
 }
 
@@ -286,6 +329,11 @@ impl Project {
         if letter.is_empty() {
             return Err(Error::Invalid("a revision needs a letter".into()));
         }
+        if !letter.chars().all(crate::font::pdf_prints) {
+            return Err(Error::Invalid(format!(
+                "revision letter {letter} has characters the PDF cannot print; use letters and digits from Latin-1"
+            )));
+        }
         if self.revision(&letter).is_some() {
             return Err(Error::Invalid(format!("revision {letter} is already there")));
         }
@@ -329,7 +377,7 @@ impl Project {
         if let Some(p) = self
             .pages
             .iter()
-            .find(|p| p.clouds.iter().any(|c| c.revision == letter))
+            .find(|p| p.clouds.iter().any(|c| c.revision.trim() == letter))
         {
             return Err(Error::Invalid(format!(
                 "page {} has a cloud of revision {letter}; remove it first",
@@ -382,6 +430,17 @@ impl Project {
         let changed = p.revision_table != at;
         p.revision_table = at;
         Ok(changed)
+    }
+
+    /// The listed revision letters the PDF cannot print as they are (saved before such letters
+    /// were refused, or written by hand): they would read alike in the PDF.
+    pub fn unprintable_revisions(&self) -> Vec<String> {
+        self.meta
+            .revisions
+            .iter()
+            .filter(|r| !r.letter.chars().all(crate::font::pdf_prints))
+            .map(|r| r.letter.clone())
+            .collect()
     }
 
     /// The clouds that carry a revision the project does not list, as (page number, letter).
@@ -620,8 +679,8 @@ mod tests {
 
     #[test]
     fn revisions_clouds_and_tables_survive_a_save() {
-        let dir = std::env::temp_dir().join(format!("wc-revision-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("project");
         let mut p = project();
         p.add_revision("A", "2026-11-01", "First issue", "OP").unwrap();
         p.add_cloud("p1", Point::new(10.0, 10.0), Point::new(40.0, 30.0), None)
@@ -633,6 +692,91 @@ mod tests {
         assert_eq!(back.page("p1").unwrap().clouds, p.page("p1").unwrap().clouds);
         assert_eq!(back.page("p1").unwrap().revision_table, Some(Point::new(200.0, 20.0)));
         assert!(back.clouds_without_revision().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_letter_cut_at_a_space_is_found_and_not_added_twice() {
+        let mut p = project();
+        p.add_revision("ABCDEFG H", "", "", "").unwrap();
+        assert_eq!(p.meta.revisions[0].letter, "ABCDEFG");
+        assert!(p.revision("ABCDEFG").is_some());
+        assert!(
+            p.add_revision("ABCDEFG H", "", "", "").is_err(),
+            "the same input is a duplicate"
+        );
+        assert!(p.edit_revision("ABCDEFG", "2026-11-18", "", "").unwrap());
+        p.remove_revision("ABCDEFG").unwrap();
+    }
+
+    #[test]
+    fn a_huge_saved_text_is_cut_to_fit() {
+        let long = "x".repeat(100_000);
+        let out = fit(&long, 80.0);
+        assert!(out.ends_with("..."));
+        assert!(crate::font::text_width_mm(&out, TEXT) <= 78.0 + 1e-9);
+        // One more character would not fit.
+        let longer = format!("{}x...", out.trim_end_matches("..."));
+        assert!(crate::font::text_width_mm(&longer, TEXT) > 78.0);
+        // Ten narrow accented letters fit the By column uncut.
+        assert_eq!(fit(&"ì".repeat(10), TABLE_COLUMNS[3].1), "ì".repeat(10));
+    }
+
+    #[test]
+    fn a_cloud_with_an_overflowing_span_is_refused() {
+        let c = RevisionCloud::new(Point::new(-1e308, 0.0), Point::new(1e308, 10.0), "A");
+        assert!(!c.is_valid());
+        assert!(c.scallops().is_empty());
+        // A wide but finite span draws arcs of finite radius.
+        let c = RevisionCloud::new(Point::new(0.0, 0.0), Point::new(1e155, 10.0), "A");
+        assert!(c.is_valid());
+        for s in c.scallops() {
+            let Shape::Arc { radius, .. } = s else { unreachable!() };
+            assert!(radius.is_finite());
+        }
+    }
+
+    #[test]
+    fn the_tag_clears_a_short_top_side_and_the_outline_is_hit_on_its_arcs() {
+        // An 8.8 mm top side gets one scallop of 4.4 mm radius.
+        let c = RevisionCloud::new(Point::new(10.0, 20.0), Point::new(18.8, 32.0), "A");
+        let top = 20.0 - 4.4;
+        let Shape::Polyline { points, .. } = &c.tag()[0] else {
+            unreachable!()
+        };
+        assert!(points.iter().all(|q| q.y < top), "the tag stands above the scallop");
+        assert!(c.hit(Point::new(18.8, points[0].y), 0.2), "the tag's base is hit");
+        // The top of the scallop is on the outline.
+        assert!(c.hit(Point::new(14.4, top), 0.2));
+        assert!(!c.hit(Point::new(14.4, 26.0), 0.2), "the middle is not");
+    }
+
+    #[test]
+    fn a_cloud_with_spaces_around_its_letter_still_holds_its_revision() {
+        let mut p = project();
+        p.add_revision("A", "", "", "").unwrap();
+        p.add_cloud("p1", Point::new(0.0, 0.0), Point::new(20.0, 20.0), None)
+            .unwrap();
+        p.pages[0].clouds[0].revision = " A ".into();
+        assert!(p.clouds_without_revision().is_empty());
+        assert!(p.remove_revision("A").is_err(), "the cloud still uses A");
+        p.pages[0].clouds.clear();
+        p.remove_revision("A").unwrap();
+    }
+
+    #[test]
+    fn letters_the_pdf_cannot_print_are_refused_and_saved_ones_reported() {
+        let mut p = project();
+        assert!(p.add_revision("Д", "", "", "").is_err());
+        for l in ["A", "01", "P1", "Å"] {
+            p.add_revision(l, "", "", "").unwrap();
+        }
+        assert!(p.unprintable_revisions().is_empty());
+        p.meta.revisions.push(Revision {
+            letter: "Ж".into(),
+            date: String::new(),
+            text: String::new(),
+            author: String::new(),
+        });
+        assert_eq!(p.unprintable_revisions(), ["Ж"]);
     }
 }

@@ -72,6 +72,16 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
         }
     }
 
+    // Revision letters the PDF cannot print: they come out as `?` and read alike.
+    for letter in p.unprintable_revisions() {
+        out.push(Finding {
+            severity: Severity::Warning,
+            page_id: None,
+            item: None,
+            message: format!("revision {letter} has characters the PDF prints as ?; give it a Latin-1 letter"),
+        });
+    }
+
     // Symbols missing from the project's library copy, and wires on missing symbols or pins.
     for page in &p.pages {
         for s in &page.symbols {

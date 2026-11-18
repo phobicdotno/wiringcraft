@@ -1489,6 +1489,11 @@ fn revision_clouds_and_the_revision_table_are_drawn() -> Result<(), String> {
     project
         .add_cloud("p1", Point::new(50.0, 50.0), Point::new(110.0, 80.0), None)
         .map_err(|e| e.to_string())?;
+    // Without the table, only the cloud's tag can print its revision letter.
+    let tag = format!("{} Tj", writer::pdf_text("B"));
+    assert!(!plain.contains(&tag));
+    let cloud_only = String::from_utf8_lossy(&export(&project, &BTreeMap::new(), &Options::default()).0).into_owned();
+    assert!(cloud_only.contains(&tag), "the cloud's tag prints B");
     project
         .set_revision_table("p1", Some(Point::new(200.0, 30.0)))
         .map_err(|e| e.to_string())?;
@@ -1500,10 +1505,26 @@ fn revision_clouds_and_the_revision_table_are_drawn() -> Result<(), String> {
             "{text} is printed"
         );
     }
-    // The cloud's tag carries its revision letter, and its scallops add curves.
-    assert!(pdf.contains(&format!("{} Tj", writer::pdf_text("B"))));
+    // The cloud's scallops add curves.
     assert!(pdf.matches(" c\n").count() > plain.matches(" c\n").count() + 20);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    // A letter saved by hand that the PDF cannot print is reported for the cloud and the table.
+    project.meta.revisions[1].letter = "Ж".into();
+    project.pages[0].clouds[0].revision = "Ж".into();
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("cannot print revision Ж"))
+            .count(),
+        2,
+        "{:?}",
+        report.warnings
+    );
+    project.meta.revisions[1].letter = "B".into();
+    project.pages[0].clouds[0].revision = "B".into();
 
     // A cloud of a revision the project no longer lists is reported.
     project.meta.revisions.pop();
