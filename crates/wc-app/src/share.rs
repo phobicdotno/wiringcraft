@@ -1795,23 +1795,32 @@ impl Held {
             return;
         }
         let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
-        // Only a device gone since `base` whose drawings now name a new tag instead is the old
-        // side of a rename; other devices removed here go out as usual.
+        // Only a device gone since `base` whose placements or cables now name a new tag instead
+        // is the old side of a rename; other devices removed here go out as usual.
         let renamed_from = |old: &wc_core::DeviceTag| {
             let was = |t: &wc_core::DeviceTag| t == old;
-            base.pages
-                .iter()
-                .any(|b| page_mentions(b, &was) && local.page(&b.id).is_some_and(|l| page_mentions(l, &named)))
-                || base.panels.iter().any(|b| {
-                    panel_mentions(b, &was)
-                        && local
-                            .panels
+            base.pages.iter().any(|b| {
+                let Some(l) = local.page(&b.id) else { return false };
+                b.symbols.iter().any(|s| {
+                    s.tag.as_ref().is_some_and(was)
+                        && l.symbols
                             .iter()
-                            .find(|l| l.id == b.id)
-                            .is_some_and(|l| panel_mentions(l, &named))
+                            .any(|n| n.id == s.id && n.tag.as_ref().is_some_and(named))
+                }) || b.wires.iter().any(|w| {
+                    w.cable.as_ref().is_some_and(|c| was(&c.cable))
+                        && l.wires
+                            .iter()
+                            .any(|n| n.id == w.id && n.cable.as_ref().is_some_and(|c| named(&c.cable)))
                 })
-                || (base.meta.jumpers.iter().any(|j| was(&j.strip))
-                    && local.meta.jumpers.iter().any(|j| named(&j.strip)))
+            }) || base.panels.iter().any(|b| {
+                panel_mentions(b, &was)
+                    && local
+                        .panels
+                        .iter()
+                        .find(|l| l.id == b.id)
+                        .is_some_and(|l| panel_mentions(l, &named))
+            }) || (base.meta.jumpers.iter().any(|j| was(&j.strip))
+                && local.meta.jumpers.iter().any(|j| named(&j.strip)))
         };
         for tag in base
             .devices
@@ -2449,7 +2458,12 @@ impl Share {
         let held = Held::find(&open.project, self.base.as_ref()?, &waiting);
         if undo && !held.is_empty() {
             // Undo of a change that never reached the session: taken back here only.
+            let before = open.project.clone();
             held.drop_from(&mut open.project);
+            if open.project != before {
+                // Also after a save: the copy on disk still has the change.
+                open.dirty = true;
+            }
             self.holding.clear();
             self.notes.push(format!(
                 "Your change that waited for {} was undone here; it had not reached the session.",

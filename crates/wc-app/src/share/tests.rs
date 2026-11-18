@@ -2569,8 +2569,11 @@ fn undo_of_a_waiting_change_takes_it_back_here_and_not_an_older_one_there() -> T
     let tmp = tempfile::tempdir()?;
     let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
     let history = h.role.as_ref().map(|r| r.history().len());
+    // Saved while it waited: the undo must leave the copy to be saved again.
+    guest_open.dirty = false;
     g.undo()?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(guest_open.dirty, "the copy on disk still has the placement");
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert!(!has_placement(&guest_open, "p0003", &item), "taken back here");
     assert_eq!(
@@ -2683,6 +2686,11 @@ fn a_device_removed_beside_a_waiting_rename_goes_out_at_once() -> TestResult {
     page.symbols.push(wc_core::PlacedSymbol {
         tag: Some(k1.clone()),
         ..symbol("s1", 10.0)
+    });
+    // -K9 is drawn on the same page, and stays drawn there.
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k9.clone()),
+        ..symbol("s9", 30.0)
     });
     base.pages.push(page);
     base.devices.insert(k1.clone(), wc_core::Device::default());
