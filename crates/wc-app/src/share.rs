@@ -1057,18 +1057,15 @@ pub struct NewItems {
     pub unsent_repairs: Vec<(String, String)>,
 }
 
-/// The items the host's session locks but has no file of ([`wc_share::Host::files_missing`]),
-/// as [`item_name`] names them; none for a guest.
+/// The items the session locks but has no file of, as [`item_name`] names them: for a host
+/// [`wc_share::Host::files_missing`], for a guest the files the session did not send it
+/// ([`wc_share::Guest::files_missing`]), as every guest gets them all.
 fn repairs_due(role: &Role) -> std::collections::BTreeSet<String> {
-    match role {
-        Role::Host(h) => h
-            .host
-            .files_missing()
-            .into_iter()
-            .map(|(kind, id)| item_name(kind, &id))
-            .collect(),
-        Role::Guest(_) => Default::default(),
-    }
+    let missing = match role {
+        Role::Host(h) => h.host.files_missing(),
+        Role::Guest(j) => j.guest.files_missing(),
+    };
+    missing.into_iter().map(|(kind, id)| item_name(kind, &id)).collect()
 }
 
 /// The symbols and parts locked in `local` and not in the session's project `auth`, with their
@@ -3125,8 +3122,19 @@ impl Share {
             role.edit_project(edit, &mut self.notes);
         }
         // While an item is on its way (a few tries, seconds at most) everything waits: what
-        // comes in would put the session's lock entry back over an update sent from here.
-        if self.items_out.values().any(|o| !o.gave_up) {
+        // comes in would put the session's lock entry back over an update sent from here. A
+        // missing file sent again in the session's own version is no such item (the session's
+        // entry is the one sent), so only the changes that use it wait for it, below. An update
+        // of an item whose file the session lacks still holds everything.
+        let repair = repairs_due(role);
+        let auth = role.project()?;
+        let only_repair =
+            |name: &String, o: &ItemOut| repair.contains(name) && o.hash.is_some() && o.hash == local_hash(auth, name);
+        if self
+            .items_out
+            .iter()
+            .any(|(name, o)| !o.gave_up && !only_repair(name, o))
+        {
             return None;
         }
         // After that, only a change that uses an item the session has not taken waits, however

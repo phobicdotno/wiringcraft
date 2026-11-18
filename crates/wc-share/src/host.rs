@@ -151,18 +151,7 @@ impl Host {
     /// The items the session locks that it has no file of in that version (a host that shared
     /// the project with a copy missing): kind and id.
     pub fn files_missing(&self) -> Vec<(wc_core::lock::ItemKind, String)> {
-        use wc_core::lock::ItemKind;
-        [ItemKind::Symbol, ItemKind::Part]
-            .into_iter()
-            .flat_map(|kind| {
-                self.project
-                    .lock
-                    .map(kind)
-                    .iter()
-                    .filter(move |(id, e)| self.file_hashes.get(&(kind, (*id).clone())) != Some(&e.hash))
-                    .map(move |(id, _)| (kind, id.clone()))
-            })
-            .collect()
+        crate::files_missing(&self.project.lock, &self.file_hashes)
     }
 
     /// The project's picture files (the logo, page underlays) by project path, sent to every
