@@ -228,6 +228,11 @@ fn a_library_file_declaring_another_id_is_not_taken() -> std::result::Result<(),
         .ok_or("taken")?;
     assert!(err.to_string().contains("declares id \"other\""), "{err}");
     assert!(!f.project.lock.symbols.contains_key("fake"), "not pinned");
+    assert!(is_wrong_id(&err), "lock_missing reports it and goes on: {err:?}");
+    let missing = take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "nope")
+        .err()
+        .ok_or("taken")?;
+    assert!(!is_wrong_id(&missing), "{missing:?}");
     assert_eq!(
         std::fs::read(store::vendor_path(&f.proj, ItemKind::Symbol, "other")?)?,
         kept

@@ -324,8 +324,16 @@ fn same_id(source: &str, kind: &str, wanted: &str, inside: &str) -> Result<()> {
     }
     Err(Error::Source {
         name: source.to_owned(),
-        message: format!("the {kind} file for {wanted:?} declares id {inside:?}"),
+        message: format!("the {kind} file for {wanted:?}{DECLARES}{inside:?}"),
     })
+}
+
+/// The part of [`same_id`]'s message that marks it.
+const DECLARES: &str = " declares id ";
+
+/// Whether `take` refused a library file because it declares another id.
+fn is_wrong_id(e: &Error) -> bool {
+    matches!(e, Error::Source { message, .. } if message.contains(DECLARES))
 }
 
 /// What [`lock_missing`] could not pin.
@@ -359,6 +367,11 @@ pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) ->
         match take(project_dir, project, lib, kind, &id) {
             Ok(_) => {}
             Err(Error::NotFound { .. }) => left.missing.push((kind, id)),
+            // The file changed since `status` read it: report it like the others and pin the rest.
+            Err(e) if is_wrong_id(&e) => {
+                let why = e.to_string();
+                left.wrong_id.push((kind, id, why));
+            }
             Err(e) => return Err(e),
         }
     }

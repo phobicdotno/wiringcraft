@@ -1563,11 +1563,8 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
             let lib = wc_library::Library::open(dir, &p).map_err(e)?;
             let left = wc_library::lock_missing(dir, &mut p, &lib).map_err(e)?;
             save(dir, &p)?;
-            for (k, id) in left.missing {
-                eprintln!("warning: {k:?} {id} is in no library source");
-            }
-            for (k, id, why) in left.wrong_id {
-                eprintln!("warning: {k:?} {id} is not pinned: {why}");
+            for w in lock_warnings(&left) {
+                eprintln!("warning: {w}");
             }
         }
         LibCmd::Search { query } => {
@@ -2120,6 +2117,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             for w in &imported.warnings {
                 eprintln!("warning: {w}");
             }
+            // The page must be there before anything is taken (a retry would skip the copies).
+            page_mut(&mut p, &page)?;
             let needed: std::collections::BTreeSet<&str> = imported
                 .symbols
                 .iter()
@@ -2150,6 +2149,20 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// What `lib lock` could not pin, one line each.
+fn lock_warnings(left: &wc_library::Unpinned) -> Vec<String> {
+    let kind = |k: &ItemKind| if *k == ItemKind::Symbol { "symbol" } else { "part" };
+    left.missing
+        .iter()
+        .map(|(k, id)| format!("{} {id} is in no library source", kind(k)))
+        .chain(
+            left.wrong_id
+                .iter()
+                .map(|(k, id, why)| format!("{} {id} is not pinned: {why}", kind(k))),
+        )
+        .collect()
 }
 
 /// `import page-dwg`: convert `file` with the converter (`template`, see [`dwg_to_dxf`]) and
@@ -3398,6 +3411,61 @@ mod tests {
     }
 
     #[test]
+    fn lib_lock_warns_about_a_library_file_declaring_another_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        let mut p = load(&dir).unwrap();
+        p.meta.libraries.push(LibrarySource {
+            name: "starter".into(),
+            kind: "folder".into(),
+            location: starter.to_string_lossy().into_owned(),
+            reference: None,
+        });
+        let (coil, _) = wc_library::Library::open(&dir, &p).unwrap().symbol("wc.coil").unwrap();
+        // `bad.json` declares `other`.
+        let lib = tmp.path().join("lib");
+        let bad = wc_library::write_symbol(
+            &lib,
+            &wc_core::Symbol {
+                id: "other".into(),
+                ..coil
+            },
+        )
+        .unwrap();
+        std::fs::rename(&bad, lib.join("symbols").join("bad.json")).unwrap();
+        p.meta.libraries = vec![LibrarySource {
+            name: "lib".into(),
+            kind: "folder".into(),
+            location: lib.to_string_lossy().into_owned(),
+            reference: None,
+        }];
+        p.pages[0].symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "bad".into(),
+            at: wc_core::Point::new(10.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        });
+        let opened = wc_library::Library::open(&dir, &p).unwrap();
+        let left = wc_library::lock_missing(&dir, &mut p, &opened).unwrap();
+        let warnings = lock_warnings(&left);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("symbol bad is not pinned: "), "{warnings:?}");
+        assert!(warnings[0].contains("declares id \"other\""), "{warnings:?}");
+        assert!(!warnings[0].contains("no library source"), "{warnings:?}");
+        assert_eq!(
+            lock_warnings(&wc_library::Unpinned {
+                missing: vec![(ItemKind::Part, "gone".into())],
+                wrong_id: Vec::new(),
+            }),
+            ["part gone is in no library source"]
+        );
+    }
+
+    #[test]
     fn a_dxf_import_refused_for_a_wrong_library_file_takes_nothing_and_a_retry_pins_all() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -3443,8 +3511,23 @@ mod tests {
             "no copy left behind without its pin"
         );
 
-        // With the library file fixed, the retry pins both.
+        // With the library file fixed, a page that is not there takes nothing either.
         wc_library::write_symbol(&lib, &with_id("zz.bad")).unwrap();
+        let err = cli(
+            &dir,
+            &[
+                "import",
+                "page-dxf",
+                drawing.to_str().unwrap(),
+                "--page",
+                "no-such-page",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("no-such-page"), "{err}");
+        assert!(store::read_vendored_symbol(&dir, "aa.good").is_err());
+
+        // And the retry pins both.
         cli(&dir, &args).unwrap();
         let p = load(&dir).unwrap();
         assert!(p.lock.symbols.contains_key("aa.good"));
