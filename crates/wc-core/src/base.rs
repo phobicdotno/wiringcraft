@@ -130,8 +130,8 @@ fn keep_libraries(project: &mut Project, base: &Path) -> Result<()> {
         }
         // Where the folder really is, with links followed before `..` as the library loader
         // does when it opens the path.
-        let full = base.join(&lib.location);
-        let named = resolved(&full).map_err(|e| {
+        let parts = || base.components().chain(written_parts(&lib.location));
+        let named = walk(parts()).map_err(|e| {
             Error::Invalid(format!(
                 "the library \"{}\" points at {}, which cannot be reached: {e}",
                 lib.name, lib.location
@@ -141,7 +141,7 @@ fn keep_libraries(project: &mut Project, base: &Path) -> Result<()> {
             Err(_) => lib.location = named.to_string_lossy().into_owned(),
             // Inside the base, but reached through a link: links are not copied, so point
             // at the folder the link leads to, which is.
-            Ok(rel) if named != lexical(&full) => {
+            Ok(rel) if named != lexical(parts()) => {
                 let parts: Vec<_> = rel.iter().map(|c| c.to_string_lossy()).collect();
                 lib.location = parts.join("/");
             }
@@ -160,15 +160,15 @@ pub fn outside_libraries(project: &Project) -> Vec<String> {
         .libraries
         .iter()
         .filter(|l| l.kind == "folder" && !Path::new(&l.location).is_absolute())
-        .filter(|l| !lexical(&root.join(&l.location)).starts_with(root))
+        .filter(|l| !lexical(root.components().chain(written_parts(&l.location))).starts_with(root))
         .map(|l| l.location.clone())
         .collect()
 }
 
-/// `p` with `.` and `..` worked out by name, without looking at the disk.
-fn lexical(p: &Path) -> PathBuf {
+/// The parts with `.` and `..` worked out by name, without looking at the disk.
+fn lexical<'a>(parts: impl IntoIterator<Item = Component<'a>>) -> PathBuf {
     let mut out = PathBuf::new();
-    for c in p.components() {
+    for c in parts {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -192,9 +192,25 @@ fn resolved(dir: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir().map_err(|e| Error::io(dir, e))?.join(dir)
     };
+    walk(abs.components())
+}
+
+/// The parts of a relative path written in a project file, split on `/` and `\\` alike.
+/// Kept apart from the folder they are relative to: joining them onto a Windows `\\?\` path
+/// would work out `..` by name before the disk is asked.
+fn written_parts(rel: &str) -> impl Iterator<Item = Component<'_>> {
+    rel.split(['/', '\\']).filter(|p| !p.is_empty()).map(|p| match p {
+        "." => Component::CurDir,
+        ".." => Component::ParentDir,
+        other => Component::Normal(std::ffi::OsStr::new(other)),
+    })
+}
+
+/// Follow `parts` from the root as [`resolved`] describes.
+fn walk<'a>(parts: impl Iterator<Item = Component<'a>>) -> Result<PathBuf> {
     let mut real = PathBuf::new();
     let mut missing: Vec<std::ffi::OsString> = Vec::new();
-    for c in abs.components() {
+    for c in parts {
         match c {
             Component::Prefix(_) | Component::RootDir => real.push(c),
             Component::CurDir => {}
