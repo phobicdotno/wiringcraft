@@ -1146,14 +1146,56 @@ impl Open {
         Ok(n)
     }
 
-    /// Make sure a library symbol is vendored and pinned before it is placed.
+    /// Make sure a library symbol is vendored and pinned before it is placed. A symbol the
+    /// project already pins (one no page uses is not loaded at open) is placed in the version
+    /// it pins: its copy in the project, or that version put back from the library. Only a
+    /// symbol with no pin is taken from the library as it is now.
     pub fn ensure_symbol(&mut self, id: &str) -> Result<(), String> {
         if self.symbols.contains_key(id) {
             return Ok(());
         }
-        let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
-        wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Symbol, id).map_err(|e| e.to_string())?;
-        let s = store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?;
+        let lib = || wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string());
+        let s = match self.project.lock.symbols.get(id).cloned() {
+            Some(pin) => {
+                let vendored = store::vendor_path(&self.dir, ItemKind::Symbol, id).map_err(|e| e.to_string())?;
+                let exists = vendored
+                    .try_exists()
+                    .map_err(|e| format!("symbol {id}: {} cannot be checked: {e}", vendored.display()))?;
+                let fits = |s: &Symbol| s.hash() == pin.hash && s.id == id;
+                if exists {
+                    let copy = store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?;
+                    if !fits(&copy) {
+                        return Err(format!(
+                            "symbol {id}: its copy in the project is not the version the project pins; put the pinned copy back or update the symbol from the library"
+                        ));
+                    }
+                    copy
+                } else {
+                    // The source the pin names first, then the one that wins for the id: either
+                    // may still have the pinned version.
+                    let lib = lib()?;
+                    let s = match lib.symbol_in(&pin.source, id) {
+                        Ok(s) if fits(&s) => s,
+                        _ => match lib.symbol(id) {
+                            Ok((s, _)) if fits(&s) => s,
+                            _ => {
+                                return Err(format!(
+                                    "symbol {id}: its copy in the project is missing and the library has another version than the project pins; put the copy back or update the symbol from the library"
+                                ));
+                            }
+                        },
+                    };
+                    store::write_vendored_symbol(&self.dir, &s).map_err(|e| e.to_string())?;
+                    s
+                }
+            }
+            None => {
+                let lib = lib()?;
+                wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Symbol, id)
+                    .map_err(|e| e.to_string())?;
+                store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?
+            }
+        };
         self.symbols.insert(id.to_owned(), s);
         Ok(())
     }
@@ -2286,6 +2328,50 @@ pub(crate) mod tests {
         assert_eq!(o.symbols["wc.coil"], new);
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
         assert_eq!(o.project.lock.symbols["wc.coil"].hash, new.hash());
+    }
+
+    #[test]
+    fn a_pinned_symbol_whose_copy_is_gone_is_put_back_in_the_version_it_pins() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        // Its copy gone when the project is opened: pinned, but not loaded.
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert!(!o.symbols.contains_key("wc.coil"));
+        // A newer version wins for the id; the source the pin names still has the old one.
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old, "placed in the version pinned");
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+        assert_eq!(o.project.lock.symbols["wc.coil"].hash, old.hash());
+    }
+
+    #[test]
+    fn a_pinned_symbol_no_library_has_in_its_version_is_not_placed() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        library_first(&mut o, tmp.path(), &new);
+        // The pin names the newer library only: nowhere has the pinned version.
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().source = "mine".into();
+        o.project.meta.libraries.retain(|l| l.name == "mine");
+        let lock = o.project.lock.clone();
+        assert!(o.place(1, "wc.coil", Point::new(20.0, 20.0)).is_err());
+        assert_eq!(o.project.lock, lock, "the pin is kept");
+        assert!(
+            !store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil")
+                .unwrap()
+                .exists()
+        );
     }
 
     /// A library folder named "mine", put ahead of the others, holding `sym`.

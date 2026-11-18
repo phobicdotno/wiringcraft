@@ -92,13 +92,19 @@ impl Library {
 
     /// Part `id` as source `source` has it (not necessarily the source that wins for it).
     pub fn part_in(&self, source: &str, id: &str) -> Result<Part> {
+        self.item_in(ItemKind::Part, source, id)
+    }
+
+    /// Symbol `id` as source `source` has it (not necessarily the source that wins for it).
+    pub fn symbol_in(&self, source: &str, id: &str) -> Result<Symbol> {
+        self.item_in(ItemKind::Symbol, source, id)
+    }
+
+    fn item_in<T: serde::de::DeserializeOwned>(&self, kind: ItemKind, source: &str, id: &str) -> Result<T> {
         store::check_id(id)?;
-        let not_found = || Error::NotFound {
-            kind: ItemKind::Part,
-            id: id.into(),
-        };
+        let not_found = || Error::NotFound { kind, id: id.into() };
         let s = self.sources.iter().find(|s| s.name == source).ok_or_else(not_found)?;
-        let path = s.root.join(ItemKind::Part.dir()).join(format!("{id}.json"));
+        let path = s.root.join(kind.dir()).join(format!("{id}.json"));
         // An entry that is there but cannot be followed (a link to nothing) says so.
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
