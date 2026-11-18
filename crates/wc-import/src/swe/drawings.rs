@@ -454,6 +454,37 @@ fn read_entry<R: Read + std::io::Seek>(
     (Ok(bytes), read)
 }
 
+/// Points that bound `shape`: for an arc only what it sweeps (its ends and the quarter points
+/// it passes), not its whole circle.
+fn corners_of(shape: &Shape) -> Vec<Point> {
+    let Shape::Arc {
+        center,
+        radius,
+        start,
+        end,
+    } = shape
+    else {
+        let (a, b) = shape.bounds();
+        return vec![a, b];
+    };
+    let mut sweep = end - start;
+    if sweep <= 0.0 {
+        sweep += 360.0;
+    }
+    let at = |deg: f64| {
+        let t = deg.to_radians();
+        Point::new(center.x + radius * t.cos(), center.y + radius * t.sin())
+    };
+    let mut points = vec![at(*start), at(start + sweep)];
+    let first = (start / 90.0).ceil() as i64;
+    let last = ((start + sweep) / 90.0).floor() as i64;
+    // At most one turn: a sweep never passes more than four quarter points.
+    for q in first..=last.min(first + 4) {
+        points.push(at(q as f64 * 90.0));
+    }
+    points
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,35 +517,4 @@ mod tests {
         // Non-ASCII names next to the folder never split a character.
         assert_eq!(kind_of("Projects/ø/Drawings/1.ewg", f), None);
     }
-}
-
-/// Points that bound `shape`: for an arc only what it sweeps (its ends and the quarter points
-/// it passes), not its whole circle.
-fn corners_of(shape: &Shape) -> Vec<Point> {
-    let Shape::Arc {
-        center,
-        radius,
-        start,
-        end,
-    } = shape
-    else {
-        let (a, b) = shape.bounds();
-        return vec![a, b];
-    };
-    let mut sweep = end - start;
-    if sweep <= 0.0 {
-        sweep += 360.0;
-    }
-    let at = |deg: f64| {
-        let t = deg.to_radians();
-        Point::new(center.x + radius * t.cos(), center.y + radius * t.sin())
-    };
-    let mut points = vec![at(*start), at(start + sweep)];
-    let first = (start / 90.0).ceil() as i64;
-    let last = ((start + sweep) / 90.0).floor() as i64;
-    // At most one turn: a sweep never passes more than four quarter points.
-    for q in first..=last.min(first + 4) {
-        points.push(at(q as f64 * 90.0));
-    }
-    points
 }
