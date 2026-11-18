@@ -1155,7 +1155,12 @@ fn run(cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
-            let pictures = wc_pdf::read_pictures(dir, &p);
+            // Only SVG shows pictures; a DXF export does not read them.
+            let pictures = if ext == "svg" {
+                wc_pdf::read_pictures(dir, &p)
+            } else {
+                wc_pdf::Pictures::default()
+            };
             let (drawings, report) = wc_pdf::page_drawings(
                 &p,
                 &symbols,

@@ -141,20 +141,18 @@ pub fn page_drawings(
 /// Standard base64 with padding.
 pub(crate) fn base64(bytes: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let sextet = |n: u32| ABC.get(n as usize & 63).map_or('=', |c| char::from(*c));
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        let (a, b, c, used) = match *chunk {
+            [a, b, c] => (a, b, c, 4),
+            [a, b] => (a, b, 0, 3),
+            [a] => (a, 0, 0, 2),
+            _ => continue,
+        };
+        let n = (u32::from(a) << 16) | (u32::from(b) << 8) | u32::from(c);
         for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
-            if i <= chunk.len() {
-                out.push(char::from(ABC[(n >> shift) as usize & 63]));
-            } else {
-                out.push('=');
-            }
+            out.push(if i < used { sextet(n >> shift) } else { '=' });
         }
     }
     out
