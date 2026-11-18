@@ -137,7 +137,8 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     let mut warnings = Vec::new();
     if sections.version == Version::R2004 && !known {
         warnings.push(format!(
-            "its texts are in {}, which is not supported: read as Windows-1252",
+            "its texts are in {}, which is not supported: read with the legacy decoder (UTF-8 \
+             when they are, else Windows-1252)",
             Decoding::name(sections.codepage)
         ));
     }

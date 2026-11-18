@@ -156,7 +156,7 @@ pub fn read_sections_with(bytes: &[u8], max_total: usize) -> Result<Sections> {
         &format!("section map (page {section_map_id})"),
     )?;
     let mut read = read_section_map(bytes, &section_map, &pages, version, max_total)?;
-    read.codepage = bytes.get(0x13..0x15).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+    read.codepage = Reader(bytes).bytes::<2>(0x13).map_or(0, u16::from_le_bytes);
     Ok(read)
 }
 

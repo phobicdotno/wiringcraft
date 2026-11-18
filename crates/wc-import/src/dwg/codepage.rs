@@ -1,11 +1,24 @@
-//! The single-byte Windows code pages an AutoCAD 2004 drawing may store its texts in, by the
-//! code page number of the file header (byte 0x13), as LibreDWG's `codepages.h` numbers them.
-//! Bytes below 0x80 are ASCII in all of them; each table gives the characters of 0x80 to 0xFF
-//! (U+FFFD where the code page has none), as the Windows code page definitions give them
-//! (the same as Python's `cpNNNN` codecs, from which they were written out).
+//! The single-byte code pages an AutoCAD 2004 drawing may store its texts in, by the code page
+//! number of the file header (byte 0x13), numbered as the DWG format numbers them (30 is
+//! Windows-1252). Bytes below 0x80 are ASCII in all of them; each table gives the characters of
+//! 0x80 to 0xFF (U+FFFD where the code page has none), as the code page definitions give them
+//! (the same as Python's codecs, from which they were written out).
 
 /// The characters of bytes 0x80 to 0xFF of a code page.
 type Upper = [u16; 128];
+/// ISO 8859-1, Western European (ISO).
+const ISO_8859_1: Upper = [
+    0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087, 0x0088, 0x0089, 0x008A, 0x008B, 0x008C, 0x008D,
+    0x008E, 0x008F, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095, 0x0096, 0x0097, 0x0098, 0x0099, 0x009A, 0x009B,
+    0x009C, 0x009D, 0x009E, 0x009F, 0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7, 0x00A8, 0x00A9,
+    0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF, 0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
+    0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF, 0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5,
+    0x00C6, 0x00C7, 0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF, 0x00D0, 0x00D1, 0x00D2, 0x00D3,
+    0x00D4, 0x00D5, 0x00D6, 0x00D7, 0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF, 0x00E0, 0x00E1,
+    0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7, 0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,
+    0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7, 0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD,
+    0x00FE, 0x00FF,
+];
 /// Windows-1250, Central and Eastern European.
 const CP1250: Upper = [
     0x20AC, 0xFFFD, 0x201A, 0xFFFD, 0x201E, 0x2026, 0x2020, 0x2021, 0xFFFD, 0x2030, 0x0160, 0x2039, 0x015A, 0x0164,
@@ -31,6 +44,19 @@ const CP1251: Upper = [
     0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437, 0x0438, 0x0439, 0x043A, 0x043B, 0x043C, 0x043D, 0x043E, 0x043F,
     0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447, 0x0448, 0x0449, 0x044A, 0x044B, 0x044C, 0x044D,
     0x044E, 0x044F,
+];
+/// Windows-1252, Western European.
+const CP1252: Upper = [
+    0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0xFFFD,
+    0x017D, 0xFFFD, 0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A,
+    0x0153, 0xFFFD, 0x017E, 0x0178, 0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7, 0x00A8, 0x00A9,
+    0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF, 0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
+    0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF, 0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5,
+    0x00C6, 0x00C7, 0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF, 0x00D0, 0x00D1, 0x00D2, 0x00D3,
+    0x00D4, 0x00D5, 0x00D6, 0x00D7, 0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF, 0x00E0, 0x00E1,
+    0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7, 0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,
+    0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7, 0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD,
+    0x00FE, 0x00FF,
 ];
 /// Windows-1253, Greek.
 const CP1253: Upper = [
@@ -123,12 +149,13 @@ const CP1258: Upper = [
     0x0111, 0x00F1, 0x0323, 0x00F3, 0x00F4, 0x01A1, 0x00F6, 0x00F7, 0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x01B0,
     0x20AB, 0x00FF,
 ];
-/// The upper half of code page number `n`, and its Windows name, for the single-byte pages
-/// other than Windows-1252 (which the reader already decodes).
+/// The upper half of code page number `n` and its name.
 fn table(n: u16) -> Option<(&'static Upper, &'static str)> {
     Some(match n {
+        2 => (&ISO_8859_1, "ISO 8859-1"),
         28 => (&CP1250, "Windows-1250"),
         29 => (&CP1251, "Windows-1251"),
+        30 => (&CP1252, "Windows-1252"),
         32 => (&CP1253, "Windows-1253"),
         33 => (&CP1254, "Windows-1254"),
         34 => (&CP1255, "Windows-1255"),
@@ -143,9 +170,9 @@ fn table(n: u16) -> Option<(&'static Upper, &'static str)> {
 /// How the texts of a drawing with code page number `n` are decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decoding {
-    /// UTF-8 when the bytes are, else Windows-1252: code pages 0 (UTF-8), 1 (ASCII), 30
-    /// (Windows-1252) and the ISO 8859-1 page, and the fallback for an unknown one.
-    Western,
+    /// The reader's legacy text decoder: UTF-8 when the bytes are, else Windows-1252. For code
+    /// pages 0 (UTF-8) and 1 (ASCII), and the fallback for a page this reader does not know.
+    Legacy,
     /// A single-byte page of [`table`].
     Page(u16),
 }
@@ -154,16 +181,16 @@ impl Decoding {
     /// The decoding for code page number `n`, and whether it is known.
     pub fn of(n: u16) -> (Decoding, bool) {
         match n {
-            0..=2 | 30 => (Decoding::Western, true),
+            0 | 1 => (Decoding::Legacy, true),
             n if table(n).is_some() => (Decoding::Page(n), true),
-            _ => (Decoding::Western, false),
+            _ => (Decoding::Legacy, false),
         }
     }
 
     /// The text of `bytes`.
     pub fn decode(self, bytes: &[u8]) -> String {
         match self {
-            Decoding::Western => crate::csv::decode(bytes),
+            Decoding::Legacy => crate::csv::decode(bytes),
             Decoding::Page(n) => match table(n) {
                 Some((upper, _)) => bytes
                     .iter()
@@ -183,12 +210,9 @@ impl Decoding {
         }
     }
 
-    /// The name of the code page, for messages.
+    /// The name of code page `n`, for messages.
     pub fn name(n: u16) -> String {
-        match n {
-            30 => "Windows-1252".to_owned(),
-            n => table(n).map_or_else(|| format!("code page {n}"), |(_, name)| name.to_owned()),
-        }
+        table(n).map_or_else(|| format!("code page {n}"), |(_, name)| name.to_owned())
     }
 }
 
@@ -197,18 +221,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cyrillic_and_others_decode() {
-        let (d, known) = Decoding::of(29);
-        assert!(known);
-        // "Реле" (relay) and an A in Windows-1251.
+    fn every_page_decodes_its_own_letters() {
+        let cases: [(u16, u8, &str); 11] = [
+            (2, 0xE9, "é"),
+            (28, 0x8A, "Š"),
+            (29, 0xC0, "А"),
+            (30, 0x92, "\u{2019}"),
+            (32, 0xC1, "Α"),
+            (33, 0xF0, "ğ"),
+            (34, 0xE0, "א"),
+            (35, 0xC7, "ا"),
+            (36, 0xC0, "Ą"),
+            (37, 0xA1, "ก"),
+            (44, 0xD2, "\u{0309}"),
+        ];
+        for (page, byte, want) in cases {
+            let (d, known) = Decoding::of(page);
+            assert!(known, "{page}");
+            assert_eq!(d.decode(&[b'a', byte]), format!("a{want}"), "page {page}");
+        }
+    }
+
+    #[test]
+    fn cyrillic_unknown_and_legacy_pages() {
+        let d = Decoding::of(29).0;
+        // "Реле А" in Windows-1251.
         assert_eq!(d.decode(&[0xD0, 0xE5, 0xEB, 0xE5, b' ', 0xC0]), "Реле А");
-        assert_eq!(Decoding::of(28).0.decode(&[0x8A]), "Š");
-        assert_eq!(Decoding::of(32).0.decode(&[0xC1]), "Α");
         // A byte a page has no character for.
-        assert_eq!(Decoding::of(29).0.decode(&[0x98]), "\u{FFFD}");
-        // Western pages keep the old decoding; an unknown page falls back to it and says so.
-        assert_eq!(Decoding::of(30), (Decoding::Western, true));
-        assert_eq!(Decoding::of(31), (Decoding::Western, false));
+        assert_eq!(d.decode(&[0x98]), "\u{FFFD}");
+        // UTF-8 and ASCII keep the legacy decoder; an unknown page falls back to it, unknown.
+        assert_eq!(Decoding::of(0), (Decoding::Legacy, true));
+        assert_eq!(Decoding::of(31), (Decoding::Legacy, false));
         assert_eq!(Decoding::name(31), "code page 31");
         assert_eq!(Decoding::name(29), "Windows-1251");
     }
