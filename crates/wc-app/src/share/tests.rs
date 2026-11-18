@@ -222,10 +222,17 @@ fn a_guest_on_another_version_is_told_both_versions_instead_of_a_dropped_connect
     assert!(!g.active());
     let notes = g.take_notes();
     let told = notes.iter().find(|n| n.contains("cannot join")).ok_or("no note")?;
-    assert!(
-        told.contains(&format!("version {}", wc_share::PROTOCOL_VERSION)) && told.contains(&format!("version {other}")),
-        "{told}"
+    // Each version next to its side, so swapping them fails.
+    let host_says = format!(
+        "host's WiringCraft uses session protocol version {}",
+        wc_share::PROTOCOL_VERSION
     );
+    let guest_says = format!("guest's uses version {other}");
+    assert!(told.contains(&host_says) && told.contains(&guest_says), "{told}");
+    // The Join dialog is shown again with the same reason, the typed values kept.
+    assert!(g.view == View::Join);
+    let form = g.form.as_ref().ok_or("no form")?;
+    assert_eq!(form.error.as_deref(), Some(told.as_str()));
     assert!(!notes.iter().any(|n| n.contains("connection")), "{notes:?}");
     assert_eq!(host_open.project, before);
     assert!(log.messages().is_empty());

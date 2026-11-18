@@ -970,7 +970,14 @@ impl Role {
             Role::Guest(j) => {
                 loop {
                     match j.link.try_recv() {
-                        Ok(Some(msg)) => j.guest.handle(msg),
+                        Ok(Some(msg)) => {
+                            j.guest.handle(msg);
+                            // Nothing after a welcome from another version can be read safely,
+                            // and a close behind it would hide why.
+                            if matches!(j.guest.status, GuestStatus::WrongVersion(_)) {
+                                break;
+                            }
+                        }
                         Ok(None) => break,
                         Err(_) => {
                             // A host that declined or ended the session closes the connection
@@ -1410,9 +1417,24 @@ impl Share {
     pub fn frame(&mut self, open: Option<&mut Open>, page: Option<String>, busy: bool) -> Option<Open> {
         let role = self.role.as_mut()?;
         if !role.pump(&mut self.notes) {
+            // A join that was turned away goes back to the Join dialog, which says why.
+            let refused = match role {
+                Role::Guest(j) => match &j.guest.status {
+                    GuestStatus::WrongVersion(v) => Some(format!("You cannot join this session: {v}.")),
+                    GuestStatus::Declined => Some("The host declined your request to join.".to_owned()),
+                    _ => None,
+                },
+                Role::Host(_) => None,
+            };
             self.role = None;
             self.base = None;
             self.forget_items();
+            if let Some(why) = refused {
+                self.show_join();
+                if let Some(f) = self.form.as_mut() {
+                    f.error = Some(why);
+                }
+            }
             return None;
         }
 

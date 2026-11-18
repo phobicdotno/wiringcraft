@@ -69,9 +69,9 @@ people hold as they are and says which. Still open: undo per change (#78). #43 t
 
 Host and guests must run builds with the same session protocol version
 (`wc_share::PROTOCOL_VERSION`, raised whenever a message changes). A guest on another version is
-turned away when it asks to join, with a message naming both versions, and Join session marks
-announced sessions on another version (#201). Builds from before versions were sent count as
-version 0.
+turned away when it asks to join (#201). A guest from this build on shows a message naming both
+versions in Join session, and marks announced sessions on another version; a guest from before
+versions were sent (counted as version 0) only shows that the host declined.
 
 ## Planning and integrations
 

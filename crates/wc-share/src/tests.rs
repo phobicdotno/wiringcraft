@@ -1550,7 +1550,40 @@ mod discovery {
         Announcer::start_to(at_limit, to, EVERY)?.stop();
         let over = beacon(&"P".repeat(MAX_BEACON - fixed + 1), "Ola", 7001);
         let err = Announcer::start_to(over, to, EVERY).err().ok_or("accepted")?;
-        assert!(err.to_string().contains("2048"), "{err}");
+        assert!(err.to_string().contains(&MAX_BEACON.to_string()), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn names_that_fit_before_the_version_was_announced_still_fit() -> TestResult {
+        // The beacon as it was written before the version field: 2048 bytes at most.
+        #[derive(serde::Serialize)]
+        struct Old<'a> {
+            magic: &'a str,
+            project: &'a str,
+            host: &'a str,
+            port: u16,
+        }
+        let old_len = |project: &str| -> std::result::Result<usize, serde_json::Error> {
+            Ok(serde_json::to_vec(&Old {
+                magic: "wiringcraft-session",
+                project,
+                host: "Ola",
+                port: 65535,
+            })?
+            .len())
+        };
+        let room = 2048 - old_len("")?;
+        let project = "P".repeat(room);
+        assert_eq!(old_len(&project)?, 2048);
+        let b = Beacon {
+            port: 65535,
+            protocol: u32::MAX,
+            ..beacon(&project, "Ola", 1)
+        };
+        assert!(b.encode().len() <= MAX_BEACON, "{}", b.encode().len());
+        let to: SocketAddr = "127.0.0.1:9".parse()?;
+        Announcer::start_to(b, to, EVERY)?.stop();
         Ok(())
     }
 
