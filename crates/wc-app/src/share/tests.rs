@@ -943,6 +943,33 @@ fn a_refused_rename_on_your_own_page_is_taken_back_also_when_the_session_ends_wi
 }
 
 #[test]
+fn a_page_renumbered_with_a_refused_change_of_your_own_page_gets_its_number_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), _coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    let number = guest_open.project.page("p0001").ok_or("no page")?.number.clone();
+    let title = guest_open.project.page("p0001").ok_or("no page")?.title.clone();
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    // One action: the guest renames -K1 on its page and renumbers the cover, all refused.
+    guest_open.project.rename_device(&k1, &k2);
+    guest_open.project.page_mut("p0001").ok_or("no page")?.number = "90".into();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // The session ends before the guest's next sync.
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    h.stop();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(!g.active());
+    // The cover has its number back, and keeps the rest as it was.
+    let cover = guest_open.project.page("p0001").ok_or("no page")?;
+    assert_eq!(cover.number, number);
+    assert_eq!(cover.title, title);
+    assert!(!guest_open.project.devices.contains_key(&k2));
+    Ok(())
+}
+
+#[test]
 fn a_change_to_a_free_page_made_before_someone_elses_change_arrived_is_not_kept() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;

@@ -3688,12 +3688,13 @@ fn a_page_edit_or_undo_adding_a_second_end_on_a_missing_pin_is_refused() -> Test
     assert!(err.to_string().contains("k1:A2"), "{err}");
     assert_eq!(host.project(), &before);
 
-    // Brought back by undoing its removal: refused too, the history left as it is.
-    let history: Vec<u64> = host.history().iter().map(|e| e.id).collect();
+    // Brought back by undoing its removal: refused too, the history left as it is (no entry
+    // marked undone either).
+    let history = host.history();
     let err = host.undo().err().ok_or("refused")?;
     assert!(err.to_string().contains("k1:A2"), "{err}");
     assert_eq!(host.project(), &before);
-    assert_eq!(host.history().iter().map(|e| e.id).collect::<Vec<_>>(), history);
+    assert_eq!(host.history(), history);
     assert_eq!(host.project().page("p0002"), Some(&one));
     Ok(())
 }
