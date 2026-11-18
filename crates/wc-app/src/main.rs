@@ -2785,10 +2785,13 @@ impl eframe::App for App {
             .frame(side(t.toolbar_bg).inner_margin(egui::Margin::symmetric(10, 4)))
             .show_separator_line(false)
             .show(ctx, |ui| {
-                let live = self
-                    .prefs
-                    .live_check
-                    .then(|| (self.live.status(), self.live.busy(), self.live.failed.is_some()));
+                let live = self.prefs.live_check.then(|| {
+                    (
+                        self.live.status(&self.ed.live),
+                        self.live.busy(),
+                        self.live.failed.is_some(),
+                    )
+                });
                 if panels::status_bar(ui, self.open.as_ref(), &self.ed, live) {
                     self.dialog = Some(Dialog::Check(self.ed.live.clone()));
                 }

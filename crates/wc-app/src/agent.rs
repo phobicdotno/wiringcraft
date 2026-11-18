@@ -2650,6 +2650,11 @@ mod tests {
         a.ed = crate::canvas::Editor::default();
         a.live_check(&ctx);
         assert!(a.ed.live.is_empty(), "{:?}", a.ed.live);
+        assert_eq!(
+            a.live.status(&a.ed.live),
+            "Check: checking",
+            "no counts of the first project"
+        );
         // Turned off: nothing is shown.
         a.prefs.live_check = false;
         a.live_check(&ctx);

@@ -171,11 +171,15 @@ impl LiveCheck {
         (!self.busy()).then_some(self.findings.as_slice())
     }
 
-    /// The status bar text: errors and warnings, that all is well, or why the check failed.
-    pub fn status(&self) -> String {
+    /// The status bar text for the findings `shown` on the canvas: their errors and warnings,
+    /// that all is well, why the check failed, or that a check is on its way when nothing is
+    /// shown yet (a project just opened). It never counts findings that are not shown, so it
+    /// always matches the markers and the list it opens.
+    pub fn status(&self, shown: &[Finding]) -> String {
         match &self.failed {
             Some(why) => format!("Check: not run, {why}"),
-            None => summary(&self.findings),
+            None if self.busy() && shown.is_empty() => "Check: checking".into(),
+            None => summary(shown),
         }
     }
 }
@@ -331,9 +335,11 @@ mod tests {
         let mut now = Instant::now();
         settle(&mut live, &a, &mut now);
         assert!(duplicate_tag_errors(live.settled().unwrap()) > 0);
-        // Project B is opened: until its own check is done, A's findings are not shown for it.
+        // Project B is opened: until its own check is done, A's findings are not shown for it,
+        // and the status bar does not count them.
         live.poll(&b.project, &b.symbols, &b.parts, false, now);
         assert!(live.settled().is_none());
+        assert_eq!(live.status(&[]), "Check: checking");
         now += SETTLE;
         settle(&mut live, &b, &mut now);
         assert_eq!(duplicate_tag_errors(live.settled().unwrap()), 0);
@@ -363,10 +369,10 @@ mod tests {
             findings: vec![f(Severity::Error)],
             ..LiveCheck::default()
         };
-        assert_eq!(live.status(), "Check: 1 error");
+        assert_eq!(live.status(&live.findings), "Check: 1 error");
         live.failed = Some("the check could not be started: no threads".into());
         assert_eq!(
-            live.status(),
+            live.status(&live.findings),
             "Check: not run, the check could not be started: no threads",
             "a failure is not shown as a clean result"
         );
