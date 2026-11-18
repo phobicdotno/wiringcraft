@@ -1191,6 +1191,10 @@ impl Open {
         if other >= self.project.pages.len() || page >= self.project.pages.len() {
             return None;
         }
+        // Both pages get a new number: refused when someone else has either open.
+        if self.held_reason(page).is_some() || self.held_reason(other).is_some() {
+            return None;
+        }
         self.checkpoint();
         let id = self.project.pages[page].id.clone();
         let a = self.project.pages[page].number.clone();
@@ -1241,6 +1245,9 @@ impl Open {
     /// Insert a macro on a page where it was drawn (its anchor), like a paste. Returns the
     /// inserted items, selected so they can be moved into place.
     pub fn insert_macro(&mut self, page: usize, path: &Path) -> Result<Vec<Selection>, String> {
+        if let Some(why) = self.held_reason(page) {
+            return Err(why);
+        }
         let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
         let clip = crate::edit::Clipboard::from(m);
         let at = clip.anchor;
@@ -2835,6 +2842,15 @@ pub(crate) mod tests {
         assert!(o.delete_page(1).is_err_and(|e| e.contains("Ola")));
         assert!(o.add_graphic(1, text.clone()).is_none());
         assert!(o.held_reason(1).is_some_and(|e| e.contains("Ola")));
+        // Nor renumbered by moving its neighbour past it, nor given a macro or a paste.
+        assert_eq!(o.move_page(0, false), None);
+        let path = o.dir.join("missing.wcmacro");
+        assert!(o.insert_macro(1, &path).is_err_and(|e| e.contains("Ola")));
+        let clip = crate::edit::Clipboard {
+            graphics: vec![text.clone()],
+            ..Default::default()
+        };
+        assert!(o.paste(1, &clip, wc_core::geom::Point::new(0.0, 0.0)).is_empty());
         assert_eq!(o.project, before);
         assert!(!o.can_undo(), "nothing was recorded");
         // The other page is not held.

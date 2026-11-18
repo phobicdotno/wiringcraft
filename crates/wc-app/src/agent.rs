@@ -2446,9 +2446,26 @@ mod tests {
 
         // Held too, the second page cannot move up past the first: both numbers stay.
         let second = a.open.as_ref().unwrap().project.pages[1].id.clone();
-        a.ed.held_by.insert(second, "Ola".into());
+        a.ed.held_by.insert(second.clone(), "Ola".into());
         assert!(!status(&a, Action::PageUp));
         a.run(Action::PageUp);
+        assert_eq!(numbers(&a), before_numbers);
+
+        // Only the neighbour held: the first page cannot move down past it either, as that
+        // would renumber the held page.
+        a.ed.held_by.clear();
+        a.ed.held_by.insert(second, "Ola".into());
+        a.open.as_mut().unwrap().held_by_others = a.ed.held_by.clone();
+        a.ed.page = 0;
+        assert!(!status(&a, Action::PageDown));
+        a.run(Action::PageDown);
+        assert_eq!(numbers(&a), before_numbers);
+        assert!(a.ed.message.contains("Ola"), "{}", a.ed.message);
+        assert_eq!(
+            a.open.as_mut().unwrap().move_page(0, false),
+            None,
+            "refused below the menu too"
+        );
         assert_eq!(numbers(&a), before_numbers);
     }
 

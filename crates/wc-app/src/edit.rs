@@ -449,7 +449,7 @@ impl Open {
     /// Paste so the clipboard's anchor lands on `at`. Pasted symbols get fresh ids and the next
     /// free device tags (one new device per copied device). Returns the pasted items.
     pub fn paste(&mut self, page: usize, clip: &Clipboard, at: Point) -> Vec<Selection> {
-        if clip.is_empty() || self.project.pages.get(page).is_none() {
+        if clip.is_empty() || self.project.pages.get(page).is_none() || self.held_reason(page).is_some() {
             return Vec::new();
         }
         for s in &clip.symbols {

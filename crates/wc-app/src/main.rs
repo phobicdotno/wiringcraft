@@ -2943,7 +2943,16 @@ fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String
         ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Rotate | Action::Mirror);
     let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
-        ed.held_by.get(&page.id).map(String::as_str)
+        // Moving a page up or down renumbers its neighbour too.
+        let neighbour = match a {
+            Action::PageUp => ed.page.checked_sub(1).and_then(|i| project.pages.get(i)),
+            Action::PageDown => project.pages.get(ed.page + 1),
+            _ => None,
+        };
+        ed.held_by
+            .get(&page.id)
+            .or_else(|| neighbour.and_then(|n| ed.held_by.get(&n.id)))
+            .map(String::as_str)
     } else if a.edits_page() {
         ed.held_page(project)
     } else {
