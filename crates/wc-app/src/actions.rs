@@ -81,7 +81,7 @@ pub struct Info {
 
 impl Action {
     /// True for actions that change the page shown: on a page someone else in a shared
-    /// session holds they are greyed out and do nothing.
+    /// session holds they are greyed out and do nothing (see [`Action::edits_page_itself`]).
     pub fn edits_page(self) -> bool {
         matches!(
             self,
@@ -96,8 +96,15 @@ impl Action {
                 | Action::Mirror
                 | Action::Cut
                 | Action::Paste
-                | Action::PageProps
-                | Action::DeletePage
+        ) || self.edits_page_itself()
+    }
+
+    /// True for actions on the current page as a whole (its properties, deleting it, moving it
+    /// up or down), which a panel shown in its place does not change.
+    pub fn edits_page_itself(self) -> bool {
+        matches!(
+            self,
+            Action::PageProps | Action::DeletePage | Action::PageUp | Action::PageDown
         )
     }
 

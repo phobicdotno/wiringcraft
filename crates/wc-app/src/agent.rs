@@ -2389,6 +2389,35 @@ mod tests {
         assert!(a.ed.message.contains("Ola"), "{}", a.ed.message);
         assert!(a.dialog.is_none(), "no page properties dialog");
 
+        // Moving the held page up or down is refused too: both page numbers stay.
+        a.ed.page = 0;
+        let numbers = |a: &App| -> Vec<String> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .pages
+                .iter()
+                .map(|p| p.number.clone())
+                .collect()
+        };
+        let before_numbers = numbers(&a);
+        assert!(!status(&a, Action::PageDown));
+        a.run(Action::PageDown);
+        assert_eq!(numbers(&a), before_numbers);
+
+        // With a panel shown instead of the held page, the page's own actions stay refused,
+        // while the panel's are not affected.
+        a.ed.panel = Some(0);
+        for act in [Action::PageProps, Action::DeletePage, Action::PageDown] {
+            assert!(!status(&a, act), "{act:?} is still about the held page");
+            a.run(act);
+        }
+        assert!(a.dialog.is_none());
+        assert_eq!(numbers(&a), before_numbers);
+        assert!(status(&a, Action::ArrangePanel), "the panel's own actions work");
+        a.ed.panel = None;
+
         // On another page everything works as before.
         a.ed.page = 1;
         assert!(status(&a, Action::DrawWire));

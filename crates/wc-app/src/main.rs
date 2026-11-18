@@ -201,7 +201,7 @@ impl chrome::Status for StatusView<'_> {
 
     fn enabled(&self, a: Action) -> bool {
         let has = self.open.is_some();
-        if a.edits_page() && self.open.is_some_and(|o| self.ed.held_page(&o.project).is_some()) {
+        if self.open.is_some_and(|o| held_for(a, self.ed, &o.project).is_some()) {
             return false;
         }
         match a {
@@ -239,12 +239,6 @@ impl chrome::Status for StatusView<'_> {
 }
 
 impl App {
-    /// Who holds the page shown, in a shared session (it is read-only here then).
-    fn held_page(&self) -> Option<String> {
-        let o = self.open.as_ref()?;
-        self.ed.held_page(&o.project).map(str::to_owned)
-    }
-
     /// Keep the open project in step with the shared session, at the end of the frame so this
     /// frame's change goes out. Nothing goes out while a button is held or the live cover form
     /// is open, so one action is one change.
@@ -377,9 +371,7 @@ impl App {
     fn run(&mut self, a: Action) {
         let page = self.ed.page;
         applog::info(&format!("command {a:?}"));
-        if a.edits_page()
-            && let Some(name) = self.held_page()
-        {
+        if let Some(name) = self.open.as_ref().and_then(|o| held_for(a, &self.ed, &o.project)) {
             self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
             return;
         }
@@ -2684,11 +2676,7 @@ impl eframe::App for App {
                     ui.separator();
                     egui::ScrollArea::vertical().id_salt("properties").show(ui, |ui| {
                         ui.set_max_width(ui.available_width());
-                        // A page someone else holds: values are shown, not edited.
-                        let held = self.ed.held_page(&open.project).is_some();
-                        ui.add_enabled_ui(!held, |ui| {
-                            panels::properties(ui, open, &mut self.ed, &mut self.panels);
-                        });
+                        panels::properties(ui, open, &mut self.ed, &mut self.panels);
                     });
                 });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
@@ -2910,6 +2898,22 @@ impl App {
 }
 
 /// A note across the top of the canvas: someone else has this page open, so it is read-only.
+/// Who holds the page action `a` would change, in a shared session: then it is refused. Page
+/// actions (properties, delete, move up or down) are about the current page even while a panel
+/// is shown; canvas actions only when the page itself is shown, as in the panel view they work
+/// on the panel.
+fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
+    let name = if a.edits_page_itself() {
+        let page = project.pages.get(ed.page)?;
+        ed.held_by.get(&page.id).map(String::as_str)
+    } else if a.edits_page() {
+        ed.held_page(project)
+    } else {
+        None
+    };
+    name.map(str::to_owned)
+}
+
 fn read_only_banner(ui: &egui::Ui, t: &theme::Theme, name: &str) {
     let p = ui.painter();
     let galley = p.layout_no_wrap(

@@ -939,6 +939,11 @@ fn select_tool(
     {
         ed.drag = Some(drag_start(open, ed, page, at, tol, snap_step, shift, held));
     }
+    // The page became held during a move: the move stops where it is, and its release does
+    // nothing more (no wiring of pins that now line up).
+    if held && matches!(ed.drag, Some(Drag::Move { .. } | Drag::Logo { .. })) {
+        ed.drag = None;
+    }
     match ed.drag {
         Some(Drag::Logo {
             from,
