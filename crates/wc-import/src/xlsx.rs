@@ -5,7 +5,7 @@
 //! Cells keep the text the workbook stores: shared and inline strings as written, numbers in
 //! their shortest form rounded to the 15 digits a spreadsheet program shows (`1492`, `0.3`),
 //! booleans as `TRUE`/`FALSE`, and a formula as its last calculated value. Two kinds of number
-//! format are applied, as [`Shown`] describes: dates and times read as ISO text (`2024-11-18`,
+//! format are applied: dates and times read as ISO text (`2024-11-18`,
 //! `2024-11-18 14:30`, `14:30:05`), and a format of only zeros (`00000`) pads the number with
 //! leading zeros the way the workbook shows it (`00042`). Other formats (currency, thousands
 //! separators, percentages, fractions) are not applied. The old binary `.xls` format is not read.
