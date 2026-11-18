@@ -124,6 +124,9 @@ pub struct Candidates {
     /// Parts the project locks whose copy cannot be read, with the reason: never assigned, so
     /// a device does not get a part the project cannot show.
     pub unreadable: BTreeMap<String, String>,
+    /// For each library part, the position of the library it was read from in the project's
+    /// list, so it is taken from that library alone (another may not open).
+    pub sources: BTreeMap<String, usize>,
 }
 
 impl Candidates {
@@ -133,7 +136,7 @@ impl Candidates {
     pub fn load(dir: &Path, project: &Project) -> (Self, Vec<String>) {
         let mut out = Self::default();
         let mut warnings = Vec::new();
-        for source in &project.meta.libraries {
+        for (n, source) in project.meta.libraries.iter().enumerate() {
             let mut one = project.clone();
             one.meta.libraries = vec![source.clone()];
             let lib = match wc_library::Library::open(dir, &one) {
@@ -150,6 +153,7 @@ impl Candidates {
                 }
                 match lib.part(&id) {
                     Ok((part, _)) => {
+                        out.sources.insert(id.clone(), n);
                         out.library.insert(id, part);
                     }
                     Err(why) => warnings.push(format!("library part {id} cannot be read: {why}")),
@@ -168,6 +172,23 @@ impl Candidates {
             }
         }
         (out, warnings)
+    }
+
+    /// Make sure the project in `dir` holds part `id`: a library part is taken (copied and
+    /// locked) from the one library it was read from.
+    pub fn take(&self, dir: &Path, project: &mut Project, id: &str) -> std::result::Result<(), String> {
+        if self.project.contains_key(id) || project.lock.parts.contains_key(id) {
+            return Ok(());
+        }
+        let Some(source) = self.sources.get(id).and_then(|&n| project.meta.libraries.get(n)) else {
+            return Err(format!("no library has part {id}"));
+        };
+        let mut one = project.clone();
+        one.meta.libraries = vec![source.clone()];
+        let lib = wc_library::Library::open(dir, &one).map_err(|e| e.to_string())?;
+        wc_library::take(dir, project, &lib, ItemKind::Part, id)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Every part, the project's copy first for an id both have.
@@ -247,7 +268,7 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
 
     let mut out = Plan::default();
     // (tag, slot) → (part, quantity, line) already planned, to catch two rows that disagree.
-    let mut taken: BTreeMap<(DeviceTag, Slot), (String, u32, usize)> = BTreeMap::new();
+    let mut taken: BTreeMap<(DeviceTag, Slot), Taken> = BTreeMap::new();
     let mut conflicted: BTreeSet<(DeviceTag, Slot)> = BTreeSet::new();
     for row in rows {
         if row.article.is_empty() {
@@ -352,21 +373,43 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
             _ => row.quantity.unwrap_or(now_qty).max(1),
         };
         if slot != Slot::NewAccessory {
-            if let Some((other, other_qty, line)) = taken.get(&(tag.clone(), slot.clone())) {
-                if *other != part {
-                    miss(format!(
-                        "line {line} gives {tag} part {other}; neither is taken, choose one in the configurator"
+            let key = (tag.clone(), slot.clone());
+            if let Some(first) = taken.get(&key) {
+                let (why, choose) = if first.part != part {
+                    (format!("line {} gives {tag} part {}", first.line, first.part), "one")
+                } else if first.qty != qty {
+                    (
+                        format!("line {} gives {tag} {} {} times", first.line, first.part, first.qty),
+                        "one quantity",
+                    )
+                } else {
+                    continue;
+                };
+                miss(format!("{why}; neither is taken, choose {choose} in the configurator"));
+                // The first row is not taken either: listed once, with the row it clashes with.
+                if conflicted.insert(key) {
+                    if first.unchanged {
+                        out.unchanged -= 1;
+                    }
+                    out.unmatched.push(format!(
+                        "{}: {} — line {} disagrees; neither is taken, choose {choose} in the configurator",
+                        first.at, first.article, row.line
                     ));
-                    conflicted.insert((tag.clone(), slot.clone()));
-                } else if *other_qty != qty {
-                    miss(format!(
-                        "line {line} gives {tag} {other} {other_qty} times; neither is taken, choose one quantity in the configurator"
-                    ));
-                    conflicted.insert((tag.clone(), slot.clone()));
                 }
                 continue;
             }
-            taken.insert((tag.clone(), slot.clone()), (part.clone(), qty, row.line));
+            let unchanged = now_part.as_deref() == Some(part.as_str()) && qty == now_qty;
+            taken.insert(
+                key,
+                Taken {
+                    part: part.clone(),
+                    qty,
+                    line: row.line,
+                    at: at.clone(),
+                    article: row.article.clone(),
+                    unchanged,
+                },
+            );
         }
         if now_part.as_deref() == Some(part.as_str()) && qty == now_qty {
             out.unchanged += 1;
@@ -384,6 +427,18 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
     out.assignments
         .retain(|a| !conflicted.contains(&(a.tag.clone(), a.slot.clone())));
     out
+}
+
+/// The first row [`plan`] found for a device slot.
+struct Taken {
+    part: String,
+    qty: u32,
+    line: usize,
+    /// Where the row is, as the reasons name it.
+    at: String,
+    article: String,
+    /// It already was the device's part.
+    unchanged: bool,
 }
 
 /// The part `article` names among `candidates`: by id, or by order number (ignoring case and
@@ -404,12 +459,20 @@ fn find_part(candidates: &Candidates, article: &str, manufacturer: &str) -> std:
         return Ok(article.to_owned());
     }
     let matches = |p: &&Part| p.order_number.trim().eq_ignore_ascii_case(article);
-    let mut hits: Vec<&Part> = candidates.project.values().filter(matches).collect();
+    // The project's own parts (not from a library) first. A part the project took from a
+    // library is looked up together with the library's other parts, so a list imported again
+    // after a part was taken gets the same answer as the first time.
+    let mut hits: Vec<&Part> = candidates
+        .project
+        .values()
+        .filter(|p| !candidates.library.contains_key(&p.id))
+        .filter(matches)
+        .collect();
     if hits.is_empty() {
         hits = candidates
             .library
-            .values()
-            .filter(|p| !candidates.project.contains_key(&p.id))
+            .keys()
+            .map(|id| candidates.project.get(id).unwrap_or(&candidates.library[id]))
             .filter(matches)
             .collect();
     }
@@ -652,7 +715,7 @@ mod tests {
         assert!(warnings[0].contains("invalid digit"), "the reason: {warnings:?}");
         let plan = plan(&inputs, &library(&parts), &rows);
         assert_eq!(plan.unchanged, 1, "the marker: {plan:?}");
-        assert_eq!(plan.unmatched.len(), 4, "{:#?}", plan.unmatched);
+        assert_eq!(plan.unmatched.len(), 5, "{:#?}", plan.unmatched);
         for (n, why) in [
             "jumpers have no part",
             "neither is taken",
@@ -746,6 +809,31 @@ mod tests {
     }
 
     #[test]
+    fn an_ambiguous_article_stays_ambiguous_when_the_list_is_imported_again() {
+        let (p, symbols) = project();
+        let parts = candidates();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let mut c = library(&parts);
+        for (id, part) in [part("dup.a", "", "DUP-1"), part("dup.b", "", "DUP-1")] {
+            c.library.insert(id, part);
+        }
+        let rows = read_configured(b"Index;Article\n-X1/T3;dup.a\n-X1/T2;DUP-1\n")
+            .unwrap()
+            .0;
+        let first = plan(&inputs, &c, &rows);
+        assert_eq!(first.assignments.len(), 1, "{first:#?}");
+        assert!(first.unmatched[0].contains("several parts"), "{first:#?}");
+        // The first import took dup.a into the project; the same list gives the same answer.
+        c.project.insert("dup.a".into(), c.library["dup.a"].clone());
+        let again = plan(&inputs, &c, &rows);
+        assert_eq!(again.unmatched, first.unmatched);
+    }
+
+    #[test]
     fn two_rows_with_different_quantities_for_one_accessory_take_neither() {
         let (p, symbols) = project();
         let parts = candidates();
@@ -761,9 +849,22 @@ mod tests {
             let rows = read_configured(text.as_bytes()).unwrap().0;
             let plan = plan(&inputs, &library(&parts), &rows);
             assert!(plan.assignments.is_empty(), "{text}: {plan:#?}");
-            assert_eq!(plan.unmatched.len(), 1);
-            assert!(plan.unmatched[0].contains("choose one quantity"), "{plan:#?}");
+            // Both rows are listed.
+            assert_eq!(plan.unmatched.len(), 2, "{plan:#?}");
+            assert!(
+                plan.unmatched.iter().all(|u| u.contains("choose one quantity")),
+                "{plan:#?}"
+            );
+            assert!(plan.unmatched.iter().any(|u| u.starts_with("line 2 ")), "{plan:#?}");
+            assert!(plan.unmatched.iter().any(|u| u.starts_with("line 3 ")), "{plan:#?}");
         }
+        // A third row that disagrees too is listed, and the first is still listed only once.
+        let text = "Index;Article;Quantity\n-X1/A1;2002-1291;3\n-X1/A1;2002-1291;4\n-X1/A1;2002-1291;5\n";
+        let rows = read_configured(text.as_bytes()).unwrap().0;
+        let plan = plan(&inputs, &library(&parts), &rows);
+        assert!(plan.assignments.is_empty(), "{plan:#?}");
+        assert_eq!(plan.unmatched.len(), 3, "{plan:#?}");
+        assert_eq!(plan.unmatched.iter().filter(|u| u.starts_with("line 2 ")).count(), 1);
         // A quantity too large for a count is reported with the reason.
         let (_, warnings) = read_configured(b"Index;Article;Quantity\n-X1/A1;2002-1291;4294967296\n").unwrap();
         assert!(warnings[0].contains("too large"), "{warnings:?}");

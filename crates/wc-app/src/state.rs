@@ -436,7 +436,10 @@ impl Open {
         let mut unmatched = plan.unmatched.clone();
         let mut taken = plan.clone();
         for id in plan.parts() {
-            if let Err(why) = self.ensure_part(id) {
+            let r = candidates
+                .take(&self.dir, &mut self.project, id)
+                .and_then(|()| self.ensure_part(id));
+            if let Err(why) = r {
                 for a in plan.assignments.iter().filter(|a| a.part == id) {
                     unmatched.push(format!(
                         "line {}: part {id} cannot be taken into the project: {why}",

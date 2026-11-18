@@ -2394,10 +2394,9 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
         if candidates.project.contains_key(id) {
             continue;
         }
-        let r = wc_library::Library::open(dir, &p)
-            .and_then(|lib| wc_library::take(dir, &mut p, &lib, ItemKind::Part, id))
-            .map_err(e);
-        if let Err(why) = r {
+        // Taken from the library it was read from: another library that cannot be opened
+        // does not stop it.
+        if let Err(why) = candidates.take(dir, &mut p, id) {
             // Its rows are listed, not written with a part the project cannot hold.
             for a in plan.assignments.iter().filter(|a| a.part == id) {
                 unmatched.push(format!(
@@ -3823,6 +3822,13 @@ mod tests {
             name: "wago".into(),
             kind: "folder".into(),
             location: lib.to_string_lossy().into_owned(),
+            reference: None,
+        });
+        // A second library that cannot be opened does not stop the first one's parts.
+        p.meta.libraries.push(LibrarySource {
+            name: "broken".into(),
+            kind: "nowhere".into(),
+            location: String::new(),
             reference: None,
         });
         let term = wc_core::Symbol {
