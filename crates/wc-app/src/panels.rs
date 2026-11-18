@@ -675,17 +675,21 @@ fn shape_rows(
     set_shape_fields(&mut shape, &draft);
     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
     // Text typed, pasted or deleted, or a value stepped with an arrow key, this frame (it goes
-    // to the field with focus). A field left
-    // without any is no entry, even when egui reads its rounded text back as another number.
+    // to the field with focus; egui steps a value only for an arrow with no modifier). A field
+    // left without any is no entry, even when egui reads its rounded text back as another number.
     let typing = ui.input(|i| {
         i.events.iter().any(|e| match e {
             egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut => true,
-            egui::Event::Key { key, pressed: true, .. } => {
-                matches!(
-                    key,
-                    egui::Key::Backspace | egui::Key::Delete | egui::Key::ArrowUp | egui::Key::ArrowDown
-                )
-            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => match key {
+                egui::Key::Backspace | egui::Key::Delete => true,
+                egui::Key::ArrowUp | egui::Key::ArrowDown => modifiers.is_none(),
+                _ => false,
+            },
             _ => false,
         })
     });
@@ -2662,6 +2666,37 @@ mod tests {
         p.frame(vec![key(egui::Key::ArrowUp), key(egui::Key::Enter)]);
         assert_ne!(p.drawing(0), circle(100.0, 5.0), "the arrow key stepped the radius");
         assert!(p.ps.shape_error.is_none(), "{:?}", p.ps.shape_error);
+        Ok(())
+    }
+
+    #[test]
+    fn a_modified_arrow_key_as_a_field_is_left_is_no_entry() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 7.123456789)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        p.tab(n);
+        // Ctrl+ArrowUp steps nothing; egui reads the shown 7.123457 back as Enter ends the field.
+        p.frame(vec![
+            egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            },
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+        ]);
+        assert!(p.ps.shape_error.is_some(), "no value was entered: still shown");
+        assert_eq!(p.drawing(0), circle(100.0, 7.123456789));
         Ok(())
     }
 
