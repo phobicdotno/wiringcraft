@@ -3084,8 +3084,15 @@ impl Share {
             role.edit_project(edit, &mut self.notes);
         }
         // While an item is on its way (a few tries, seconds at most) everything waits: what
-        // comes in would put the session's lock entry back over an update sent from here.
-        if self.items_out.values().any(|o| !o.gave_up) {
+        // comes in would put the session's lock entry back over an update sent from here. A
+        // missing file sent again is no such item (the session's entry is the one sent), so
+        // only the changes that use it wait for it, below.
+        let repair = repairs_due(role);
+        if self
+            .items_out
+            .iter()
+            .any(|(name, o)| !o.gave_up && !repair.contains(name))
+        {
             return None;
         }
         // After that, only a change that uses an item the session has not taken waits, however

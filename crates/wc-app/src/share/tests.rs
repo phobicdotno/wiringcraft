@@ -1978,9 +1978,13 @@ fn a_guests_new_placement_of_a_symbol_whose_file_the_session_lacks_reaches_other
             .page("p0003")
             .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
     };
+    // An unrelated change of the guest's goes on meanwhile.
+    let k9 = DeviceTag::parse("-K9")?;
+    guest_open.project.devices.insert(k9.clone(), Device::default());
     run(&mut h, &mut host_open, &mut g, &mut guest_open, &mut g2, &mut kari_open);
     assert!(drawn(&guest_open), "the guest's own copy keeps it");
     assert!(!drawn(&kari_open), "the placement waits for the file");
+    assert!(kari_open.project.devices.contains_key(&k9), "unrelated changes go on");
     // The session can store it again: the next try gets the file in, and the page follows.
     log.fail_vendor(false);
     retry_due(&mut g);
