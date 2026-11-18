@@ -126,6 +126,54 @@ impl WireNumbering {
     }
 }
 
+/// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
+pub(crate) struct Mark {
+    project: Project,
+    symbols: std::collections::BTreeSet<String>,
+    parts: std::collections::BTreeSet<String>,
+    undo: Vec<Project>,
+    redo: Vec<Project>,
+    undo_dropped: usize,
+    history: u64,
+    form_step: Option<u64>,
+    dirty: bool,
+    terminals_before: Option<wc_core::project::TerminalNumbers>,
+    /// The vendored symbol and part files there were, or why that is not known.
+    files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
+}
+
+/// The vendored symbol and part files by kind and id (plain files only, not links), from folders
+/// inside the project folder. Only names are read. An error (with its reason) when a folder that
+/// may be there cannot be checked or listed, or lies outside the project: then nothing is known
+/// to be new.
+fn vendor_names(dir: &Path) -> Result<std::collections::BTreeSet<(ItemKind, String)>, String> {
+    let root = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut out = std::collections::BTreeSet::new();
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        let folder = dir.join(store::VENDOR_DIR).join(kind.dir());
+        let at = |e: std::io::Error| format!("{}: {e}", folder.display());
+        // Only a folder known to be missing is skipped; one that cannot be checked is unknown.
+        if !folder.try_exists().map_err(at)? {
+            continue;
+        }
+        let real = folder.canonicalize().map_err(at)?;
+        if !real.starts_with(&root) {
+            return Err(format!("{} lies outside the project", folder.display()));
+        }
+        for e in std::fs::read_dir(real).map_err(at)? {
+            let e = e.map_err(at)?;
+            let path = e.path();
+            if e.file_type().map_err(at)?.is_file()
+                && path.extension().is_some_and(|x| x == "json")
+                && let Some(id) = path.file_stem().and_then(|s| s.to_str())
+            {
+                out.insert((kind, id.to_owned()));
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
@@ -1282,6 +1330,123 @@ impl Open {
             .map(|name| format!("{name} has this page open; it is read-only here until they leave it."))
     }
 
+    /// The pages someone else holds, as they are now: what [`Open::held_change`] compares with.
+    pub fn held_pages(&self) -> Vec<Page> {
+        self.project
+            .pages
+            .iter()
+            .filter(|p| self.held_by_others.contains_key(&p.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Why a change is refused: it changed or removed one of the pages someone else held when
+    /// [`Open::held_pages`] gave `before`.
+    pub fn held_change(&self, before: &[Page]) -> Option<String> {
+        before.iter().find_map(|old| {
+            let who = self.held_by_others.get(&old.id).map_or("Someone", String::as_str);
+            match self.project.pages.iter().position(|p| p.id == old.id) {
+                None => Some(format!(
+                    "it would remove page {}, which {who} has open; it is read-only here until they leave it.",
+                    old.number
+                )),
+                Some(i) if self.project.pages[i] != *old => Some(format!(
+                    "it would change page {}, which {who} has open; it is read-only here until they leave it.",
+                    old.number
+                )),
+                Some(_) => None,
+            }
+        })
+    }
+
+    /// Start a change that may be refused as a whole: the project and the symbols and parts
+    /// loaded now are kept, and the undo history is set aside, so the change's own undo steps
+    /// collect apart from it. [`Open::keep`] or [`Open::back_to`] ends it. Undo and redo
+    /// must not run in between.
+    /// The steps set aside still count in [`Open::undo_mark`], so a mark taken in between
+    /// (a form opened by the change) stays valid after [`Open::keep`].
+    pub(crate) fn mark(&mut self) -> Mark {
+        let undo = std::mem::take(&mut self.undo);
+        let undo_dropped = self.undo_dropped;
+        self.undo_dropped += undo.len();
+        Mark {
+            project: self.project.clone(),
+            symbols: self.symbols.keys().cloned().collect(),
+            parts: self.parts.keys().cloned().collect(),
+            undo,
+            redo: std::mem::take(&mut self.redo),
+            undo_dropped,
+            history: self.history,
+            form_step: self.form_step,
+            dirty: self.dirty,
+            terminals_before: self.terminals_before.clone(),
+            files: vendor_names(&self.dir),
+        }
+    }
+
+    /// The change since `mark` stays: its undo steps go after the earlier ones (the oldest
+    /// dropped beyond the usual limit), and redo is kept only when it made no undo step.
+    pub(crate) fn keep(&mut self, mark: Mark) {
+        let mut undo = mark.undo;
+        // The set-aside steps counted as dropped while the change ran; they are back now.
+        self.undo_dropped -= undo.len();
+        undo.append(&mut self.undo);
+        let over = undo.len().saturating_sub(UNDO_STEPS);
+        undo.drain(..over);
+        self.undo_dropped += over;
+        self.undo = undo;
+        if self.history == mark.history {
+            self.redo = mark.redo;
+        }
+    }
+
+    /// Take back everything changed since `mark`: the project, the symbols and parts it
+    /// loaded, its undo steps, and the change marks; the undo and redo history are as before.
+    /// A symbol or part file the change added (there was none, and the project as it was does
+    /// not pin it) is removed; files that were there are never touched, nor rewritten. One that
+    /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
+    /// when it is next used.
+    pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
+        self.project = mark.project;
+        self.symbols.retain(|id, _| mark.symbols.contains(id));
+        self.parts.retain(|id, _| mark.parts.contains(id));
+        self.undo = mark.undo;
+        self.redo = mark.redo;
+        self.undo_dropped = mark.undo_dropped;
+        (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
+        self.terminals_before = mark.terminals_before;
+        let (before, now) = match (mark.files, vendor_names(&self.dir)) {
+            (Ok(before), Ok(now)) => (before, now),
+            (Err(e), _) | (_, Err(e)) => {
+                return Err(format!("Library files it may have added were not checked: {e}"));
+            }
+        };
+        let lock = &self.project.lock;
+        let mut failed = Vec::new();
+        for (kind, id) in now.difference(&before) {
+            let pinned = match kind {
+                ItemKind::Symbol => lock.symbols.contains_key(id),
+                ItemKind::Part => lock.parts.contains_key(id),
+            };
+            if pinned {
+                continue;
+            }
+            if let Ok(path) = store::vendor_path(&self.dir, *kind, id)
+                && let Err(e) = std::fs::remove_file(&path)
+            {
+                failed.push(format!("{}: {e}", path.display()));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Library files it added could not be removed: {}",
+                failed.join("; ")
+            ))
+        }
+    }
+
     /// Delete a page. The last page of a project cannot be deleted. Returns the page to show next.
     pub fn delete_page(&mut self, page: usize) -> Result<usize, String> {
         if self.project.pages.len() <= 1 {
@@ -1548,6 +1713,19 @@ impl Open {
         Ok(())
     }
 
+    /// Whether [`Open::cover_page`] would mark the first page as the cover: no page is marked
+    /// yet, and the first one is an empty page titled Cover.
+    pub fn cover_marks_first(&self) -> bool {
+        self.project.cover_page().is_none()
+            && self.project.pages.first().is_some_and(|first| {
+                first.title.trim().eq_ignore_ascii_case("cover")
+                    && first.symbols.is_empty()
+                    && first.wires.is_empty()
+                    && first.graphics.is_empty()
+                    && first.underlay.is_none()
+            })
+    }
+
     /// The cover page's index. A project without one gets one: an empty first page titled
     /// "Cover" (as new projects started) is marked as the cover, otherwise a new cover page
     /// numbered `0` goes in front of the others. Creating or marking it is one undo step. Fails,
@@ -1556,13 +1734,7 @@ impl Open {
         if let Some(i) = self.project.cover_page() {
             return Ok(i);
         }
-        if let Some(first) = self.project.pages.first()
-            && first.title.trim().eq_ignore_ascii_case("cover")
-            && first.symbols.is_empty()
-            && first.wires.is_empty()
-            && first.graphics.is_empty()
-            && first.underlay.is_none()
-        {
+        if self.cover_marks_first() {
             self.checkpoint();
             if let Some(first) = self.project.pages.first_mut() {
                 first.cover = true;
@@ -2290,6 +2462,65 @@ pub(crate) mod tests {
             "the part file is untouched"
         );
         assert_eq!(o.project.lock, lock);
+    }
+
+    #[test]
+    fn a_change_taken_back_leaves_no_part_file_and_keeps_undo_marks_in_step() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let (undo_mark, can_undo) = (o.undo_mark(), o.can_undo());
+        let pid = "example.ex-ct-9-24dc";
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        // A refused change that took a part from the library: its file goes with it.
+        let mark = o.mark();
+        assert_eq!(o.undo_mark(), undo_mark, "the set-aside steps still count");
+        o.ensure_part(pid).unwrap();
+        o.checkpoint();
+        assert!(part_file.exists());
+        o.back_to(mark).unwrap();
+        assert!(!part_file.exists(), "no unpinned part file is left");
+        assert!(!o.project.lock.parts.contains_key(pid));
+        assert_eq!((o.undo_mark(), o.can_undo()), (undo_mark, can_undo));
+        // Taken again later, it is pinned (and so sent to the session).
+        o.ensure_part(pid).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid));
+        // A file that was there before stays, even when the change only read it.
+        o.parts.remove(pid);
+        let mark = o.mark();
+        o.ensure_part(pid).unwrap();
+        o.back_to(mark).unwrap();
+        assert!(part_file.exists(), "a file that was there before stays");
+        // An unpinned copy left behind (a failed removal) is pinned when it is next used.
+        o.project.lock.parts.remove(pid);
+        o.parts.remove(pid);
+        o.ensure_part(pid).unwrap();
+        assert!(
+            o.project.lock.parts.contains_key(pid),
+            "the leftover copy is pinned again"
+        );
+        // A vendor folder that cannot be checked (here: a link out of the project) is reported,
+        // and nothing in it is removed.
+        #[cfg(unix)]
+        {
+            let parts = o.dir.join(store::VENDOR_DIR).join(ItemKind::Part.dir());
+            let outside = _tmp.path().join("outside-parts");
+            std::fs::rename(&parts, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, &parts).unwrap();
+            let mark = o.mark();
+            let err = o.back_to(mark).unwrap_err();
+            assert!(
+                err.contains("not checked") && err.contains("outside the project"),
+                "{err}"
+            );
+            assert!(part_file.exists(), "nothing removed");
+            std::fs::remove_file(&parts).unwrap();
+            std::fs::rename(&outside, &parts).unwrap();
+        }
+        // A mark taken inside a kept change (a form it opened) means the same step afterwards.
+        let mark = o.mark();
+        let inside = o.start_live_form();
+        o.keep(mark);
+        assert_eq!(inside, o.undo_mark());
     }
 
     #[test]
