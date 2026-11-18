@@ -658,6 +658,7 @@ fn sections(v: Version, objs: &[Obj], extra: &[(u64, usize)]) -> Sections {
             },
         ],
         skipped: Vec::new(),
+        maint: 0,
     }
 }
 
@@ -1247,6 +1248,102 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
             "only the one without its block: {:?}",
             d.skipped
         );
+    }
+    Ok(())
+}
+
+/// An `AcDb:Classes` section listing `classes` (number, DXF name, entity?) as AutoCAD 2004 or
+/// 2010 (maintenance release 6) writes it.
+fn classes_section(v: Version, classes: &[(u16, &str, bool)]) -> Vec<u8> {
+    const SENTINEL: [u8; 16] = [
+        0x8D, 0xA1, 0xC4, 0xB8, 0xC4, 0xA9, 0xF8, 0xC5, 0xC0, 0xDC, 0xF4, 0x5F, 0xE7, 0xCF, 0xB6, 0x8A,
+    ];
+    let max = classes.iter().map(|c| c.0).max().unwrap_or(499);
+    let mut data = W::default();
+    let mut strings = W::default();
+    data.bs(max).rc(0).rc(0).b(true);
+    for &(number, name, entity) in classes {
+        data.bs(number).bs(0);
+        match v {
+            Version::R2004 => {
+                data.t8("ObjectDBX Classes").t8("AcDbThing").t8(name);
+            }
+            Version::R2010 => {
+                strings.tu("ObjectDBX Classes").tu("AcDbThing").tu(name);
+            }
+        }
+        data.b(false).bs(if entity { 0x1F2 } else { 0x1F3 });
+        data.bl(1).bl(0).bl(0).bl(0).bl(0);
+    }
+    let mut out = W::default();
+    for b in SENTINEL {
+        out.rc(b);
+    }
+    match v {
+        Version::R2004 => {
+            out.rl(data.bytes().len() as u32).append(&data);
+        }
+        Version::R2010 => {
+            // Data, texts, their size and the flag; the flag sits `bitsize` after bit 191.
+            let mut body = W::default();
+            body.append(&data).append(&strings);
+            body.rs(strings.0.len() as u16).b(true);
+            let flag_at = 28 * 8 + body.0.len() - 1;
+            out.rl(data.bytes().len() as u32)
+                .rl(0)
+                .rl((flag_at - 191) as u32)
+                .append(&body);
+        }
+    }
+    out.bytes()
+}
+
+/// `sections` plus a class section, maintenance release 6.
+fn sections_with_classes(v: Version, objs: &[Obj], classes: Vec<u8>) -> Sections {
+    let mut s = sections(v, objs, &[]);
+    s.sections.push(Section {
+        name: "AcDb:Classes".into(),
+        id: 3,
+        data: classes,
+    });
+    s.maint = 6;
+    s
+}
+
+#[test]
+fn custom_entities_are_counted_by_their_class_name_and_custom_objects_not() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        let classes = classes_section(v, &[(500, "WIPEOUT", true), (501, "ACDBDICTIONARYWDFLT", false)]);
+        let mut wipeout = entity(v, 500, 0x300, head(None));
+        wipeout.data.bd(0.0);
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            wipeout,
+            Obj::new(v, 501, 0x301),
+        ];
+        let d = drawing(&sections_with_classes(v, &objs, classes))?;
+        assert_eq!(d.skipped.get("WIPEOUT"), Some(&1), "{v:?}: {:?}", d.skipped);
+        assert_eq!(d.skipped.len(), 1, "nothing for the object: {:?}", d.skipped);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_damaged_class_section_is_named_and_the_rest_read() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+    ];
+    for bad in [
+        vec![0u8; 40],
+        classes_section(v, &[(500, "WIPEOUT", true)])[..30].to_vec(),
+    ] {
+        let d = drawing(&sections_with_classes(v, &objs, bad))?;
+        assert_eq!(d.model.len(), 1, "the drawing is still read");
+        assert!(d.damaged.iter().any(|r| r.contains("AcDb:Classes")), "{:?}", d.damaged);
     }
     Ok(())
 }

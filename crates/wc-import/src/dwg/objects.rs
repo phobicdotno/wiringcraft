@@ -13,7 +13,8 @@
 //! the block whose BLOCK_HEADER owns it, or to model space; vertices belong to their polyline
 //! and attributes to their INSERT. The entities become the same entities the DXF reader works
 //! with, so a DWG drawing is drawn exactly like a DXF one: y flipped, block references expanded.
-//! Other entity types, and objects that cannot be decoded, are counted and skipped.
+//! Other entity types (custom ones, numbered 500 and up, under the DXF name their class in
+//! `AcDb:Classes` gives), and objects that cannot be decoded, are counted and skipped.
 //!
 //! Written from the published Open Design Specification for .dwg files only, and checked with
 //! objects the tests write themselves. Input is treated as hostile: every read is checked, and a
@@ -24,6 +25,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use wc_core::geom::{Point, Shape};
 
 use super::bits::{Bits, modular_char, modular_short};
+use super::classes::{Class, read_classes};
 use super::{Sections, Version, bad, read_sections};
 use crate::Result;
 use crate::dxf::{self, Entity};
@@ -124,8 +126,25 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     let mut skipped = BTreeMap::new();
     let mut decoded = Decoded::default();
     let mut damaged = Vec::new();
+    // The classes name the custom types (500 and up); without them those are not counted.
+    let classes = match sections.get("AcDb:Classes") {
+        None => HashMap::new(),
+        Some(data) => read_classes(data, sections.version, sections.maint).unwrap_or_else(|e| {
+            *skipped.entry(DAMAGED.to_owned()).or_default() += 1;
+            damaged.push(e.to_string());
+            HashMap::new()
+        }),
+    };
     for (handle, at) in map {
-        if let Err(e) = decode(objects, at, handle, sections.version, &mut decoded, &mut skipped) {
+        if let Err(e) = decode(
+            objects,
+            at,
+            handle,
+            sections.version,
+            &classes,
+            &mut decoded,
+            &mut skipped,
+        ) {
             *skipped.entry(DAMAGED.to_owned()).or_default() += 1;
             if damaged.len() < MAX_REASONS {
                 damaged.push(format!("object {handle:X} at {at}: {e}"));
@@ -287,7 +306,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
 
 /// The string stream of a 2010 object whose data ends at bit `end`: a flag in the last bit, a
 /// size before it (in one or two 16-bit parts), and the texts before that.
-fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>> {
+pub(crate) fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>> {
     let all = Bits::new(bytes, 0, end);
     let Some(flag_at) = end.checked_sub(1) else {
         return Ok(None);
@@ -434,6 +453,7 @@ fn decode(
     at: usize,
     handle: u64,
     version: Version,
+    classes: &HashMap<u16, Class>,
     out: &mut Decoded,
     skipped: &mut BTreeMap<String, usize>,
 ) -> Result<()> {
@@ -461,6 +481,16 @@ fn decode(
                     .push(format!("base point of block {name} (object {handle:X}): {e}")),
             }
             out.blocks.insert(handle, name);
+        }
+        return Ok(());
+    }
+    // A custom type: an entity of its class is counted under the class's DXF name; a custom
+    // object (dictionary entries, layouts and the like) draws nothing and is not counted.
+    if o.kind >= 500 {
+        if let Some(class) = classes.get(&o.kind)
+            && class.entity
+        {
+            *skipped.entry(class.dxf_name.clone()).or_default() += 1;
         }
         return Ok(());
     }

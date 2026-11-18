@@ -1,0 +1,114 @@
+//! The classes of a DWG drawing (`AcDb:Classes`): the object types numbered 500 and up, each
+//! with its DXF name and whether it is an entity. The reader uses them to name and count the
+//! custom entities it does not draw (WIPEOUT, IMAGE, proxy entities), and to tell them from
+//! custom non-graphic objects, which are not counted.
+//!
+//! Layout as LibreDWG's `read_2004_section_classes` reads it: a 16-byte sentinel, the size of
+//! the class data (RL), for 2010 drawings of maintenance release 4 and later a second size (RL),
+//! from 2007 the data's size in bits (RL); then the highest class number (BS), two bytes and a
+//! bit, and for each class its number (BS), proxy flags (BS), application, C++ and DXF names,
+//! whether it was a zombie (B), its item class id (BS: 0x1F2 entity, 0x1F3 object), the number
+//! of instances, two version numbers and two unknown numbers (BL each). Names are TV in the data
+//! (2004) or TU in a string stream at the end of the data (2010).
+
+use std::collections::HashMap;
+
+use super::bits::Bits;
+use super::objects::string_stream;
+use super::{Version, bad};
+use crate::Result;
+
+/// The sentinel the class data starts with.
+const SENTINEL: [u8; 16] = [
+    0x8D, 0xA1, 0xC4, 0xB8, 0xC4, 0xA9, 0xF8, 0xC5, 0xC0, 0xDC, 0xF4, 0x5F, 0xE7, 0xCF, 0xB6, 0x8A,
+];
+
+/// The item class id of a class whose objects are entities.
+const ENTITY: u16 = 0x1F2;
+
+/// The most classes a drawing may define.
+const MAX_CLASSES: usize = 10_000;
+
+/// One class: its DXF name and whether its objects are entities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Class {
+    pub(crate) dxf_name: String,
+    pub(crate) entity: bool,
+}
+
+/// The classes by number, read from the `AcDb:Classes` section `data` of a drawing of `version`
+/// and maintenance release `maint` (byte 0x0B of the file header).
+pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<HashMap<u16, Class>> {
+    let damaged = |why: &str| bad(format!("the class section (AcDb:Classes) is damaged: {why}"));
+    if !data.starts_with(&SENTINEL) {
+        return Err(damaged("it does not start with its sentinel"));
+    }
+    let r2010 = version == Version::R2010;
+    let mut head = Bits::new(data, SENTINEL.len() * 8, data.len() * 8);
+    let size = head.rl().map_err(|e| damaged(&e.to_string()))? as usize;
+    let mut strings = None;
+    let data_end;
+    if r2010 {
+        if maint > 3 {
+            head.rl().map_err(|e| damaged(&e.to_string()))?;
+        }
+        let bits = head.rl().map_err(|e| damaged(&e.to_string()))? as usize;
+        // The flag bit of the string stream lies `bits` after bit 191 (159 before release 3).
+        let flag_at = bits
+            .checked_add(if maint < 3 { 159 } else { 191 })
+            .filter(|f| *f < data.len() * 8)
+            .ok_or_else(|| damaged("its texts lie past its end"))?;
+        let s = string_stream(data, flag_at + 1).map_err(|e| damaged(&e.to_string()))?;
+        data_end = s.as_ref().map_or(flag_at, Bits::pos);
+        strings = s;
+    } else {
+        data_end = (SENTINEL.len() + 4)
+            .checked_add(size)
+            .map(|e| e * 8)
+            .filter(|e| *e <= data.len() * 8)
+            .ok_or_else(|| damaged("its size is past its end"))?;
+    }
+    let mut d = Bits::new(data, head.pos(), data_end);
+    let mut read = || -> Result<HashMap<u16, Class>> {
+        let max = d.bs()?;
+        d.rc()?;
+        d.rc()?;
+        d.b()?;
+        let count = usize::from(max).saturating_sub(499);
+        if max < 500 && max != 0 || count > MAX_CLASSES {
+            return Err(bad(format!("it says the highest class is {max}")));
+        }
+        let mut classes = HashMap::new();
+        for _ in 0..count {
+            let number = d.bs()?;
+            d.bs()?;
+            let dxf_name = match strings.as_mut() {
+                Some(s) => {
+                    s.tu()?;
+                    s.tu()?;
+                    s.tu()?
+                }
+                None if r2010 => return Err(bad("its texts are missing")),
+                None => {
+                    d.t8()?;
+                    d.t8()?;
+                    d.t8()?
+                }
+            };
+            d.b()?;
+            let id = d.bs()?;
+            for _ in 0..5 {
+                d.bl()?;
+            }
+            classes.insert(
+                number,
+                Class {
+                    dxf_name,
+                    entity: id == ENTITY,
+                },
+            );
+        }
+        Ok(classes)
+    };
+    read().map_err(|e| damaged(&e.to_string()))
+}

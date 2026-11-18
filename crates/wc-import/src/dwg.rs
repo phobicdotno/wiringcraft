@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use crate::{Error, Result};
 
 mod bits;
+mod classes;
 pub mod objects;
 
 pub use objects::{Drawing, read_drawing};
@@ -88,6 +89,9 @@ pub struct Sections {
     pub sections: Vec<Section>,
     /// Names of sections not read because they are stored encrypted.
     pub skipped: Vec<String>,
+    /// The maintenance release of the file (byte 0x0B of the file header), which moves a few
+    /// fields of 2010 drawings.
+    pub maint: u8,
 }
 
 impl Sections {
@@ -151,7 +155,9 @@ pub fn read_sections_with(bytes: &[u8], max_total: usize) -> Result<Sections> {
         SECTION_MAP,
         &format!("section map (page {section_map_id})"),
     )?;
-    read_section_map(bytes, &section_map, &pages, version, max_total)
+    let mut read = read_section_map(bytes, &section_map, &pages, version, max_total)?;
+    read.maint = bytes.get(0x0B).copied().unwrap_or(0);
+    Ok(read)
 }
 
 /// Unscramble the second header and check it is one.
@@ -374,6 +380,7 @@ fn read_section_map(
         version,
         sections,
         skipped,
+        maint: 0,
     })
 }
 
