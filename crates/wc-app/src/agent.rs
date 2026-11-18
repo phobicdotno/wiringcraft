@@ -33,8 +33,9 @@ one Undo (Ctrl+Z) takes back everything you changed in a turn.
 
 How the drawing works:
 - Coordinates are millimetres on the sheet, origin at the top-left corner, x to the right, y DOWN. Sheets are \
-landscape: A4 297x210, A3 420x297 (default), A2 594x420. The frame is 10 mm in from the edge and divided into 10 \
-reference columns (1-10 along the top) and rows (A-F on A4 and A3, A-H on A2, down both sides); cross-references \
+A4 to A0, landscape (A4 297x210, A3 420x297 is the default, A2 594x420) or portrait (A4 portrait 210x297), or a \
+custom size; get_page gives the page's size_mm, which is the sheet to place things on. The frame is 10 mm in from the edge and divided into 10 \
+reference columns (1-10 along the top) and rows (A-F up to 297 mm high, more on taller sheets, down both sides); cross-references \
 give page, column and row, such as 12/3.C. The title block sits at the bottom. Keep drawings inside roughly x 20..(width-20), y 20..(height-45).
 - Put symbols and wire bends on a 5 mm grid (the editor snaps to 2.5 mm). Leave room: about 20-30 mm between \
 neighbouring symbols, current paths drawn as vertical columns from a top supply rail down to a bottom rail.
@@ -332,13 +333,13 @@ pub fn specs() -> Vec<Value> {
         tool(
             "add_page",
             "Add a schematic page and show it. Returns its id and number.",
-            json!({"number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}}),
+            json!({"number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "description": "A4, A3, A2, A1 or A0 (landscape), the same with -portrait (A4-portrait), or WIDTHxHEIGHT in millimetres (500x700)"}}),
             &[],
         ),
         tool(
             "update_page",
             "Change a page's number, title or sheet size, mark it as an overview (a line diagram: its devices do not count as drawings in the project check), make it the project's cover page (it shows the project's name and fields; any other cover page loses the mark), or set the page's own title-block fields (get_page lists them).",
-            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}, "overview": {"type": "boolean"}, "cover": {"type": "boolean"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "The page's own title-block fields to change, such as revision, date, drawn_by, checked_by. They win over the project's on this page. An empty text or null clears a field so the project's shows again; fields left out are kept."}}),
+            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "description": "A4, A3, A2, A1 or A0 (landscape), the same with -portrait (A4-portrait), or WIDTHxHEIGHT in millimetres (500x700)"}, "overview": {"type": "boolean"}, "cover": {"type": "boolean"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "The page's own title-block fields to change, such as revision, date, drawn_by, checked_by. They win over the project's on this page. An empty text or null clears a field so the project's shows again; fields left out are kept."}}),
             &[],
         ),
         tool(
@@ -607,12 +608,7 @@ fn rotation(v: &Value) -> Result<Option<Rotation>, String> {
 fn page_size(v: &Value) -> Result<Option<PageSize>, String> {
     match s(v, "size") {
         None => Ok(None),
-        Some(t) => match t.to_ascii_uppercase().as_str() {
-            "A4" => Ok(Some(PageSize::A4)),
-            "A3" => Ok(Some(PageSize::A3)),
-            "A2" => Ok(Some(PageSize::A2)),
-            _ => Err(format!("size {t} is not A4, A3 or A2")),
-        },
+        Some(t) => PageSize::parse(t).map(Some),
     }
 }
 
@@ -2625,6 +2621,52 @@ mod tests {
         (tmp, app)
     }
 
+    #[test]
+    fn enter_ends_a_polyline_only_without_a_dialog_or_a_focused_field() {
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.tool = crate::state::Tool::Polyline;
+        let ctx = egui::Context::default();
+        let enter = || egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // A frame (focusing a text field first when asked), then one with Enter pressed.
+        let press = |a: &mut App, field: bool| -> bool {
+            a.ed.finish_shape = false;
+            let id = egui::Id::new("field");
+            for events in [vec![], vec![enter()]] {
+                let enter_frame = !events.is_empty();
+                let raw = egui::RawInput {
+                    events,
+                    ..Default::default()
+                };
+                let _ = ctx.run(raw, |ctx| {
+                    if field {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let mut s = String::new();
+                            ui.add(egui::TextEdit::singleline(&mut s).id(id));
+                        });
+                        ctx.memory_mut(|m| m.request_focus(id));
+                    }
+                    if enter_frame {
+                        let _ = a.shortcuts(ctx);
+                    }
+                });
+            }
+            a.ed.finish_shape
+        };
+        assert!(press(&mut a, false), "Enter ends the polyline");
+        a.dialog = Some(crate::Dialog::Message("Busy".into()));
+        assert!(!press(&mut a, false), "not under a dialog");
+        a.dialog = None;
+        assert!(!press(&mut a, true), "not while a text field has the keys");
+        a.ed.tool = crate::state::Tool::Line;
+        assert!(!press(&mut a, false), "only with the polyline tool");
+    }
+
     fn call(app: &mut App, name: &str, input: Value) -> Result<String, String> {
         wc_agent::Tools::run(&mut AppTools(app), name, &input)
     }
@@ -2927,6 +2969,9 @@ mod tests {
             Action::TextTool,
             Action::LineTool,
             Action::RectTool,
+            Action::CircleTool,
+            Action::ArcTool,
+            Action::PolylineTool,
             Action::PageProps,
         ];
         for act in editing {
@@ -3825,6 +3870,26 @@ mod tests {
         let p = open.project.pages.iter().find(|p| p.title == "Motors").unwrap();
         assert_eq!(p.size, PageSize::A2);
         assert_eq!(a.ed.page, open.find_page(&p.number).unwrap());
+        // Upright and custom sheets come through the tools too.
+        call(&mut a, "add_page", json!({"title": "Upright", "size": "A4-portrait"})).unwrap();
+        let size_of = |a: &App, title: &str| {
+            let open = a.open.as_ref().unwrap();
+            open.project
+                .pages
+                .iter()
+                .find(|p| p.title == title)
+                .map(|p| (p.size, p.number.clone()))
+        };
+        let (size, number) = size_of(&a, "Upright").unwrap();
+        assert_eq!(size, PageSize::A4Portrait);
+        call(&mut a, "update_page", json!({"page": number, "size": "500x700"})).unwrap();
+        assert_eq!(
+            size_of(&a, "Upright").map(|(s, _)| s),
+            Some(PageSize::Custom {
+                width: 500,
+                height: 700
+            })
+        );
 
         call(
             &mut a,

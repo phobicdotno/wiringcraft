@@ -661,22 +661,211 @@ impl ProjectMeta {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// A page's sheet: an ISO A size, landscape or portrait, or a size of its own. Stored by
+/// name (`A3`, `A4Portrait`) or as `{ Custom = { width, height } }`. A stored custom size
+/// outside [`PageSize::MIN_MM`] to [`PageSize::MAX_MM`] is refused when read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(try_from = "StoredPageSize")]
 pub enum PageSize {
     A4,
     #[default]
     A3,
     A2,
+    A1,
+    A0,
+    A4Portrait,
+    A3Portrait,
+    A2Portrait,
+    A1Portrait,
+    A0Portrait,
+    /// Width and height in whole millimetres, each from [`PageSize::MIN_MM`] to
+    /// [`PageSize::MAX_MM`].
+    Custom {
+        width: u32,
+        height: u32,
+    },
+}
+
+/// [`PageSize`] as stored, before a custom size is checked.
+#[derive(Deserialize)]
+enum StoredPageSize {
+    A4,
+    A3,
+    A2,
+    A1,
+    A0,
+    A4Portrait,
+    A3Portrait,
+    A2Portrait,
+    A1Portrait,
+    A0Portrait,
+    Custom { width: u32, height: u32 },
+}
+
+impl TryFrom<StoredPageSize> for PageSize {
+    type Error = String;
+
+    fn try_from(stored: StoredPageSize) -> Result<Self, String> {
+        Ok(match stored {
+            StoredPageSize::A4 => PageSize::A4,
+            StoredPageSize::A3 => PageSize::A3,
+            StoredPageSize::A2 => PageSize::A2,
+            StoredPageSize::A1 => PageSize::A1,
+            StoredPageSize::A0 => PageSize::A0,
+            StoredPageSize::A4Portrait => PageSize::A4Portrait,
+            StoredPageSize::A3Portrait => PageSize::A3Portrait,
+            StoredPageSize::A2Portrait => PageSize::A2Portrait,
+            StoredPageSize::A1Portrait => PageSize::A1Portrait,
+            StoredPageSize::A0Portrait => PageSize::A0Portrait,
+            StoredPageSize::Custom { width, height } => PageSize::custom(width, height)?,
+        })
+    }
 }
 
 impl PageSize {
-    /// Landscape width and height in millimetres.
+    /// The named sizes, in the order lists offer them.
+    pub const NAMED: [PageSize; 10] = [
+        PageSize::A4,
+        PageSize::A4Portrait,
+        PageSize::A3,
+        PageSize::A3Portrait,
+        PageSize::A2,
+        PageSize::A2Portrait,
+        PageSize::A1,
+        PageSize::A1Portrait,
+        PageSize::A0,
+        PageSize::A0Portrait,
+    ];
+    /// The smallest side of a custom sheet, in millimetres.
+    pub const MIN_MM: u32 = 100;
+    /// The largest side of a custom sheet, in millimetres (a little over A0's long side).
+    pub const MAX_MM: u32 = 2000;
+
+    /// Width and height in millimetres, as the sheet is drawn.
     pub fn mm(self) -> (f64, f64) {
+        let landscape = |(w, h): (f64, f64)| (w, h);
+        let portrait = |(w, h): (f64, f64)| (h, w);
         match self {
-            PageSize::A4 => (297.0, 210.0),
-            PageSize::A3 => (420.0, 297.0),
-            PageSize::A2 => (594.0, 420.0),
+            PageSize::A4 => landscape((297.0, 210.0)),
+            PageSize::A3 => landscape((420.0, 297.0)),
+            PageSize::A2 => landscape((594.0, 420.0)),
+            PageSize::A1 => landscape((841.0, 594.0)),
+            PageSize::A0 => landscape((1189.0, 841.0)),
+            PageSize::A4Portrait => portrait((297.0, 210.0)),
+            PageSize::A3Portrait => portrait((420.0, 297.0)),
+            PageSize::A2Portrait => portrait((594.0, 420.0)),
+            PageSize::A1Portrait => portrait((841.0, 594.0)),
+            PageSize::A0Portrait => portrait((1189.0, 841.0)),
+            PageSize::Custom { width, height } => (f64::from(width), f64::from(height)),
         }
+    }
+
+    pub fn is_portrait(self) -> bool {
+        let (w, h) = self.mm();
+        h > w
+    }
+
+    /// The name people read: `A4 landscape`, `A3 portrait`, `500 x 700 mm`.
+    pub fn label(self) -> String {
+        let iso = |n: &str, portrait: bool| format!("{n} {}", if portrait { "portrait" } else { "landscape" });
+        match self {
+            PageSize::A4 => iso("A4", false),
+            PageSize::A3 => iso("A3", false),
+            PageSize::A2 => iso("A2", false),
+            PageSize::A1 => iso("A1", false),
+            PageSize::A0 => iso("A0", false),
+            PageSize::A4Portrait => iso("A4", true),
+            PageSize::A3Portrait => iso("A3", true),
+            PageSize::A2Portrait => iso("A2", true),
+            PageSize::A1Portrait => iso("A1", true),
+            PageSize::A0Portrait => iso("A0", true),
+            PageSize::Custom { width, height } => format!("{width} x {height} mm"),
+        }
+    }
+
+    /// The short name commands take: `A4`, `A4-portrait`, `500x700`.
+    pub fn code(self) -> String {
+        match self {
+            PageSize::Custom { width, height } => format!("{width}x{height}"),
+            named => {
+                let label = named.label();
+                let (name, way) = label.split_once(' ').unwrap_or((label.as_str(), ""));
+                if way == "portrait" {
+                    format!("{name}-portrait")
+                } else {
+                    name.to_owned()
+                }
+            }
+        }
+    }
+
+    /// Read a size as people type it: `A4`, `a4 portrait`, `A4-portrait`, `A4P`, `A3
+    /// landscape`, or a custom `500x700` (millimetres, width first). The error says what is
+    /// accepted.
+    pub fn parse(text: &str) -> Result<PageSize, String> {
+        let lower = text.trim().to_ascii_lowercase();
+        // Hyphens join the words of a name (`A4-portrait`); a custom size keeps its signs.
+        let t = lower.replace(['-', '_'], " ");
+        let words: Vec<&str> = t.split_whitespace().collect();
+        let (name, portrait) = match words.as_slice() {
+            [one] => match one.strip_suffix('p') {
+                Some(prefix) if prefix.starts_with('a') => (prefix, true),
+                _ => (*one, false),
+            },
+            [one, "portrait"] => (*one, true),
+            [one, "landscape"] => (*one, false),
+            _ => ("", false),
+        };
+        let named = match (name, portrait) {
+            ("a4", false) => Some(PageSize::A4),
+            ("a3", false) => Some(PageSize::A3),
+            ("a2", false) => Some(PageSize::A2),
+            ("a1", false) => Some(PageSize::A1),
+            ("a0", false) => Some(PageSize::A0),
+            ("a4", true) => Some(PageSize::A4Portrait),
+            ("a3", true) => Some(PageSize::A3Portrait),
+            ("a2", true) => Some(PageSize::A2Portrait),
+            ("a1", true) => Some(PageSize::A1Portrait),
+            ("a0", true) => Some(PageSize::A0Portrait),
+            _ => None,
+        };
+        if let Some(size) = named {
+            return Ok(size);
+        }
+        let bad = || {
+            format!(
+                "size {text:?} is not A4, A3, A2, A1 or A0 (add \"portrait\" for an upright sheet) or a custom WIDTHxHEIGHT in millimetres"
+            )
+        };
+        // Spaces around `x` and before `mm` are fine; inside a number they are not.
+        let dims = lower.strip_suffix("mm").unwrap_or(&lower);
+        let (w, h) = dims.split_once('x').ok_or_else(bad)?;
+        let side = |name: &str, v: &str| {
+            v.trim().parse::<u32>().map_err(|e| {
+                format!(
+                    "size {text:?}: the {name} {:?} is not a whole number of millimetres ({e}); each side is {} to {} mm",
+                    v.trim(),
+                    Self::MIN_MM,
+                    Self::MAX_MM
+                )
+            })
+        };
+        let (width, height) = (side("width", w)?, side("height", h)?);
+        PageSize::custom(width, height)
+    }
+
+    /// A sheet of its own size, in whole millimetres.
+    pub fn custom(width: u32, height: u32) -> Result<PageSize, String> {
+        for side in [width, height] {
+            if !(Self::MIN_MM..=Self::MAX_MM).contains(&side) {
+                return Err(format!(
+                    "a sheet side of {side} mm is outside {} to {} mm",
+                    Self::MIN_MM,
+                    Self::MAX_MM
+                ));
+            }
+        }
+        Ok(PageSize::Custom { width, height })
     }
 
     /// The reference column (1-based, 1 to [`FRAME_COLUMNS`]) that `x` millimetres falls into,
@@ -698,12 +887,19 @@ impl PageSize {
         (col as i64).saturating_add(1).clamp(1, columns as i64) as usize
     }
 
-    /// How many reference rows run down the sides of the frame: A to F on A4 and A3, A to H
-    /// on A2. Fixed per sheet size, so a reference never moves.
+    /// How many reference rows run down the sides of the frame, by the sheet's height: A to F
+    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to K up to A1
+    /// landscape (594 mm), A to M above. Fixed per sheet size, so a reference never moves.
     pub fn frame_rows(self) -> usize {
-        match self {
-            PageSize::A4 | PageSize::A3 => 6,
-            PageSize::A2 => 8,
+        let (_, h) = self.mm();
+        if h <= 297.0 {
+            6
+        } else if h <= 420.0 {
+            8
+        } else if h <= 594.0 {
+            10
+        } else {
+            12
         }
     }
 
@@ -1254,8 +1450,125 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)]
+    fn sheet_sizes_read_write_and_measure() {
+        assert_eq!(PageSize::A1.mm(), (841.0, 594.0));
+        assert_eq!(PageSize::A0.mm(), (1189.0, 841.0));
+        assert_eq!(PageSize::A4Portrait.mm(), (210.0, 297.0));
+        assert!(PageSize::A4Portrait.is_portrait() && !PageSize::A4.is_portrait());
+        for (text, want) in [
+            ("A4", PageSize::A4),
+            ("a3", PageSize::A3),
+            ("A4-portrait", PageSize::A4Portrait),
+            ("a4 portrait", PageSize::A4Portrait),
+            ("A4P", PageSize::A4Portrait),
+            ("A1 landscape", PageSize::A1),
+            ("A0_portrait", PageSize::A0Portrait),
+            (
+                "500x700",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+            (
+                "500 x 700 mm",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+        ] {
+            assert_eq!(PageSize::parse(text), Ok(want), "{text}");
+        }
+        for bad in [
+            "A5",
+            "B4",
+            "50x700",
+            "500x9000",
+            "500x",
+            "x",
+            "",
+            "-500x700",
+            "500x-700",
+            "ap",
+            "a4pp",
+            "50 0 x 700 mm",
+        ] {
+            assert!(PageSize::parse(bad).is_err(), "{bad}");
+        }
+        // The error says which side is wrong and why.
+        let err = PageSize::parse("5 00x700").unwrap_err();
+        assert!(
+            err.contains("the width \"5 00\"") && err.contains("100 to 2000 mm"),
+            "{err}"
+        );
+        let err = PageSize::parse("500x9000").unwrap_err();
+        assert!(err.contains("9000 mm is outside 100 to 2000 mm"), "{err}");
+        for size in PageSize::NAMED.into_iter().chain([PageSize::Custom {
+            width: 500,
+            height: 700,
+        }]) {
+            assert_eq!(PageSize::parse(&size.code()), Ok(size), "{}", size.code());
+        }
+        assert_eq!(PageSize::A3Portrait.label(), "A3 portrait");
+        assert_eq!(
+            PageSize::Custom {
+                width: 500,
+                height: 700
+            }
+            .label(),
+            "500 x 700 mm"
+        );
+        // Pages keep their old file form; the new sizes have their own.
+        let page = |size: PageSize| {
+            let mut p = Page::new("p1", "1", "One");
+            p.size = size;
+            p
+        };
+        let old = serde_json::to_value(page(PageSize::A2)).unwrap();
+        assert_eq!(old["size"], "A2");
+        assert_eq!(serde_json::from_value::<Page>(old).unwrap().size, PageSize::A2);
+        for size in [
+            PageSize::A0Portrait,
+            PageSize::Custom {
+                width: 500,
+                height: 700,
+            },
+        ] {
+            let text = serde_json::to_string(&page(size)).unwrap();
+            assert_eq!(serde_json::from_str::<Page>(&text).unwrap().size, size, "{text}");
+        }
+        // A custom size outside the allowed range is refused when read, as when typed.
+        let mut text = serde_json::to_value(page(PageSize::Custom {
+            width: 500,
+            height: 700,
+        }))
+        .unwrap();
+        text["size"]["Custom"]["width"] = 0.into();
+        let err = serde_json::from_value::<Page>(text).unwrap_err().to_string();
+        assert!(err.contains("outside 100 to 2000 mm"), "{err}");
+    }
+
+    #[test]
     fn rows_cover_the_frame_height_for_each_sheet_size() {
-        for (size, rows) in [(PageSize::A4, 6), (PageSize::A3, 6), (PageSize::A2, 8)] {
+        for (size, rows) in [
+            (PageSize::A4, 6),
+            (PageSize::A3, 6),
+            (PageSize::A2, 8),
+            (PageSize::A1, 10),
+            (PageSize::A0, 12),
+            (PageSize::A4Portrait, 6),
+            (PageSize::A3Portrait, 8),
+            (PageSize::A0Portrait, 12),
+            (
+                PageSize::Custom {
+                    width: 500,
+                    height: 300,
+                },
+                8,
+            ),
+        ] {
             let (_, h) = size.mm();
             assert_eq!(size.frame_rows(), rows);
             assert_eq!(size.row_of(0.0), 1, "above the frame is row A");

@@ -196,6 +196,9 @@ impl chrome::Status for StatusView<'_> {
             Action::CommentTool => self.ed.tool == Tool::Comment,
             Action::LineTool => self.ed.tool == Tool::Line,
             Action::RectTool => self.ed.tool == Tool::Rect,
+            Action::CircleTool => self.ed.tool == Tool::Circle,
+            Action::ArcTool => self.ed.tool == Tool::Arc,
+            Action::PolylineTool => self.ed.tool == Tool::Polyline,
             Action::ToggleGrid => self.prefs.show_grid,
             Action::ToggleAutoWire => self.prefs.auto_wire,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
@@ -495,24 +498,40 @@ impl App {
             Action::Select => {
                 self.ed.tool = Tool::Select;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
             Action::PlaceSymbol => {
                 self.ed.tool = Tool::Place;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
-            Action::DrawWire => self.ed.tool = Tool::Wire,
-            Action::TextTool | Action::LineTool | Action::RectTool | Action::CommentTool => {
+            Action::DrawWire => {
+                self.ed.tool = Tool::Wire;
+                self.ed.shape_points.clear();
+            }
+            Action::TextTool
+            | Action::LineTool
+            | Action::RectTool
+            | Action::CircleTool
+            | Action::ArcTool
+            | Action::PolylineTool
+            | Action::CommentTool => {
                 self.ed.tool = match a {
                     Action::TextTool => Tool::Text,
                     Action::CommentTool => Tool::Comment,
                     Action::LineTool => Tool::Line,
+                    Action::CircleTool => Tool::Circle,
+                    Action::ArcTool => Tool::Arc,
+                    Action::PolylineTool => Tool::Polyline,
                     _ => Tool::Rect,
                 };
                 self.ed.wire = None;
-                self.ed.shape_start = None;
+                self.ed.shape_points.clear();
                 self.ed.message = match a {
                     Action::TextTool => "Click where the text goes.",
                     Action::CommentTool => "Click where the comment goes.",
+                    Action::CircleTool => "Click the centre of the circle.",
+                    Action::ArcTool => "Click the centre of the arc.",
                     _ => "Click the first point.",
                 }
                 .into();
@@ -934,9 +953,13 @@ impl App {
                     out.push(a);
                 }
             }
+            if i.key_pressed(Key::Enter) && i.modifiers.is_none() && self.ed.tool == Tool::Polyline {
+                self.ed.finish_shape = true;
+            }
             if i.key_pressed(Key::Escape) {
-                if self.ed.shape_start.is_some() {
-                    self.ed.shape_start = None;
+                if !self.ed.shape_points.is_empty() {
+                    self.ed.shape_points.clear();
+                    self.ed.message = canvas::shape_hint(self.ed.tool, 0).into();
                 } else if self.ed.wire.is_some() {
                     self.ed.wire = None;
                 } else {
@@ -1465,12 +1488,24 @@ impl App {
                             ui.end_row();
                             ui.label("Sheet size");
                             egui::ComboBox::from_id_salt("pagesize")
-                                .selected_text(size_label(*size))
+                                .selected_text(size.label())
                                 .show_ui(ui, |ui| {
-                                    for s in [PageSize::A4, PageSize::A3, PageSize::A2] {
-                                        ui.selectable_value(size, s, size_label(s));
+                                    for s in PageSize::NAMED {
+                                        ui.selectable_value(size, s, s.label());
+                                    }
+                                    if !matches!(size, PageSize::Custom { .. }) {
+                                        ui.selectable_value(size, custom_from(*size), "Custom size…");
                                     }
                                 });
+                            if let PageSize::Custom { width, height } = size {
+                                ui.end_row();
+                                ui.label("Custom size (mm)");
+                                ui.horizontal(|ui| {
+                                    let range = PageSize::MIN_MM..=PageSize::MAX_MM;
+                                    ui.add(egui::DragValue::new(width).range(range.clone()).suffix(" wide"));
+                                    ui.add(egui::DragValue::new(height).range(range).suffix(" high"));
+                                });
+                            }
                             ui.end_row();
                             ui.label("Overview");
                             ui.checkbox(overview, "Line diagram").on_hover_text(
@@ -2122,14 +2157,6 @@ impl App {
             }
             Err(e) => self.dialog = Some(Dialog::Message(format!("Could not create the branch:\n{e}"))),
         }
-    }
-}
-
-fn size_label(s: PageSize) -> &'static str {
-    match s {
-        PageSize::A4 => "A4 landscape",
-        PageSize::A3 => "A3 landscape",
-        PageSize::A2 => "A2 landscape",
     }
 }
 
@@ -3219,6 +3246,16 @@ impl App {
     }
 }
 
+/// The custom sheet "Custom size…" starts from: the size shown, as it is drawn (A4 portrait
+/// gives 210 x 297 mm).
+fn custom_from(size: PageSize) -> PageSize {
+    let (w, h) = size.mm();
+    PageSize::Custom {
+        width: w.round() as u32,
+        height: h.round() as u32,
+    }
+}
+
 fn main() -> eframe::Result {
     // Started by Claude Code as the assistant's MCP server: pass messages to the running app.
     let mut args = std::env::args_os();
@@ -3760,5 +3797,28 @@ mod marking_tests {
         let msg = export_wago_marking(&o, &options);
         assert!(msg.starts_with("Nothing exported") && msg.contains("-X1"), "{msg}");
         assert!(!o.dir.join("export").join("wago-marking--X1.csv").exists());
+    }
+}
+
+#[cfg(test)]
+mod page_size_tests {
+    use super::*;
+
+    #[test]
+    fn a_custom_sheet_starts_from_the_size_shown() {
+        assert_eq!(
+            custom_from(PageSize::A4Portrait),
+            PageSize::Custom {
+                width: 210,
+                height: 297
+            }
+        );
+        assert_eq!(
+            custom_from(PageSize::A3),
+            PageSize::Custom {
+                width: 420,
+                height: 297
+            }
+        );
     }
 }
