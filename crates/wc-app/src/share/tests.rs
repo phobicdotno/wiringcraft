@@ -1153,5 +1153,14 @@ fn a_symbol_whose_file_becomes_unreadable_stops_holding_the_session() -> TestRes
         notes.iter().any(|n| n.contains("did not take symbol wc.contact.no")),
         "{notes:?}"
     );
+
+    // Once the file can be read and the host can store it, the symbol still gets in.
+    log.fail_vendor(false);
+    let sym = guest_open.symbols.get("wc.contact.no").cloned().ok_or("not loaded")?;
+    store::write_vendored_symbol(&guest_open.dir, &sym)?;
+    std::thread::sleep(ITEM_RETRY_LATER);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(host_open.symbols.get("wc.contact.no"), Some(&sym), "sent again later");
+    assert!(g.items_out.is_empty());
     Ok(())
 }

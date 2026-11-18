@@ -912,7 +912,8 @@ pub struct Share {
 struct ItemOut {
     at: std::time::Instant,
     tries: u32,
-    /// Not taken after [`ITEM_TRIES`] tries: no longer sent, and changes no longer wait for it.
+    /// Not taken after [`ITEM_TRIES`] tries: changes no longer wait for it, and it is sent again
+    /// only every [`ITEM_RETRY_LATER`].
     gave_up: bool,
 }
 
@@ -921,6 +922,12 @@ const ITEM_WAIT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(100)
 } else {
     std::time::Duration::from_secs(5)
+};
+/// How long a given-up item waits before it is sent again.
+const ITEM_RETRY_LATER: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(300)
+} else {
+    std::time::Duration::from_secs(30)
 };
 /// How often an item is sent before changes stop waiting for it.
 const ITEM_TRIES: u32 = 3;
@@ -1224,7 +1231,9 @@ impl Share {
         let skip = self
             .items_out
             .iter()
-            .filter(|(_, o)| o.gave_up || o.at.elapsed() < ITEM_WAIT)
+            // One given up is still sent now and then, so it gets in once its file can be read
+            // or the session can store it; changes no longer wait for it.
+            .filter(|(_, o)| o.at.elapsed() < if o.gave_up { ITEM_RETRY_LATER } else { ITEM_WAIT })
             .map(|(n, _)| n.clone())
             .collect();
         let items = new_items(&open.dir, &open.project, auth, &skip);
