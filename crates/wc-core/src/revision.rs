@@ -220,6 +220,20 @@ impl RevisionCloud {
     }
 }
 
+/// A revision letter as kept: a no-break space and a soft hyphen become a plain space and
+/// hyphen (the PDF prints them alike, so two letters never read alike), then as [`field`].
+fn plain_letter(s: &str) -> String {
+    let plain: String = s
+        .chars()
+        .map(|c| match c {
+            '\u{a0}' => ' ',
+            '\u{ad}' => '-',
+            c => c,
+        })
+        .collect();
+    field(&plain, MAX_LETTER)
+}
+
 /// Whether the PDF prints a revision letter so that it reads apart from every other letter:
 /// only characters it prints as themselves, and no no-break space or soft hyphen, which print
 /// like a space and a hyphen.
@@ -324,7 +338,18 @@ pub fn table_size(rows: usize) -> (f64, f64) {
 impl Project {
     /// The revision with this letter.
     pub fn revision(&self, letter: &str) -> Option<&Revision> {
-        self.meta.revisions.iter().find(|r| r.letter == letter.trim())
+        self.revision_index(letter).and_then(|i| self.meta.revisions.get(i))
+    }
+
+    /// Where the revision with this letter is in the list: the letter as saved (trimmed) first,
+    /// so letters saved by hand stay reachable, else the letter as [`Project::add_revision`]
+    /// would store it.
+    fn revision_index(&self, letter: &str) -> Option<usize> {
+        let revisions = &self.meta.revisions;
+        revisions.iter().position(|r| r.letter == letter.trim()).or_else(|| {
+            let plain = plain_letter(letter);
+            revisions.iter().position(|r| r.letter == plain)
+        })
     }
 
     /// The latest revision: the last one added.
@@ -334,17 +359,7 @@ impl Project {
 
     /// Add a revision after the others. Refused when the letter is empty or already used.
     pub fn add_revision(&mut self, letter: &str, date: &str, text: &str, author: &str) -> Result<()> {
-        // The PDF prints a no-break space and a soft hyphen like a space and a hyphen, so the
-        // letter keeps the plain ones and two letters never read alike.
-        let plain: String = letter
-            .chars()
-            .map(|c| match c {
-                '\u{a0}' => ' ',
-                '\u{ad}' => '-',
-                c => c,
-            })
-            .collect();
-        let letter = field(&plain, MAX_LETTER);
+        let letter = plain_letter(letter);
         if letter.is_empty() {
             return Err(Error::Invalid("a revision needs a letter".into()));
         }
@@ -367,11 +382,13 @@ impl Project {
 
     /// Change a revision's date, description and author. Returns whether anything changed.
     pub fn edit_revision(&mut self, letter: &str, date: &str, text: &str, author: &str) -> Result<bool> {
+        let i = self
+            .revision_index(letter)
+            .ok_or_else(|| Error::Invalid(format!("no revision {}", letter.trim())))?;
         let r = self
             .meta
             .revisions
-            .iter_mut()
-            .find(|r| r.letter == letter.trim())
+            .get_mut(i)
             .ok_or_else(|| Error::Invalid(format!("no revision {}", letter.trim())))?;
         let new = Revision {
             letter: r.letter.clone(),
@@ -386,21 +403,19 @@ impl Project {
 
     /// Remove a revision. Refused while a cloud on some page still carries its letter.
     pub fn remove_revision(&mut self, letter: &str) -> Result<()> {
-        let letter = letter.trim();
         let i = self
-            .meta
-            .revisions
-            .iter()
-            .position(|r| r.letter == letter)
-            .ok_or_else(|| Error::Invalid(format!("no revision {letter}")))?;
+            .revision_index(letter)
+            .ok_or_else(|| Error::Invalid(format!("no revision {}", letter.trim())))?;
+        // A cloud holds the revision its letter resolves to, by the same rule as every lookup.
         if let Some(p) = self
             .pages
             .iter()
-            .find(|p| p.clouds.iter().any(|c| c.revision.trim() == letter))
+            .find(|p| p.clouds.iter().any(|c| self.revision_index(&c.revision) == Some(i)))
         {
             return Err(Error::Invalid(format!(
-                "page {} has a cloud of revision {letter}; remove it first",
-                p.number
+                "page {} has a cloud of revision {}; remove it first",
+                p.number,
+                letter.trim()
             )));
         }
         self.meta.revisions.remove(i);
@@ -817,6 +832,15 @@ mod tests {
         );
         p.add_revision("E\u{a0}F", "", "", "").unwrap();
         assert_eq!(p.meta.revisions[2].letter, "E F");
+        // The input as typed still finds the revision it made.
+        assert!(p.revision("E\u{a0}F").is_some());
+        p.add_cloud("p1", Point::new(0.0, 0.0), Point::new(20.0, 20.0), Some("E\u{a0}F"))
+            .unwrap();
+        assert_eq!(p.pages[0].clouds[0].revision, "E F");
+        assert!(p.edit_revision("E\u{a0}F", "2026-11-18", "", "").unwrap());
+        assert!(p.remove_revision("E\u{a0}F").is_err(), "a cloud still uses it");
+        p.pages[0].clouds.clear();
+        p.remove_revision("E\u{a0}F").unwrap();
         assert!(p.unprintable_revisions().is_empty());
         // Saved by hand, they are reported.
         p.meta.revisions[0].letter = "A\u{ad}B".into();
