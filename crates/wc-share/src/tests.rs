@@ -13,13 +13,26 @@ fn demo() -> Project {
     p.pages.push(Page::new("p0001", "1", "Cover"));
     p.pages.push(Page::new("p0002", "2", "Motor"));
     p.pages.push(Page::new("p0003", "3", "Pump"));
+    // The symbol `place` draws: the project has it, as a page may only use what it locks.
+    p.lock.symbols.insert(
+        "relay".into(),
+        wc_core::lock::LockEntry {
+            source: "test".into(),
+            hash: "relay-v1".into(),
+        },
+    );
     p
 }
 
+/// Place the symbol `relay`, which [`demo`] locks.
 fn place(page: &mut Page, id: &str, x: f64) {
+    place_symbol(page, id, x, "relay");
+}
+
+fn place_symbol(page: &mut Page, id: &str, x: f64, symbol: &str) {
     page.symbols.push(PlacedSymbol {
         id: id.into(),
-        symbol: "coil".into(),
+        symbol: symbol.into(),
         at: Point::new(x, 50.0),
         rotation: Default::default(),
         mirror: false,
@@ -525,6 +538,7 @@ fn every_change_is_a_commit_by_its_author_and_can_be_reverted() -> TestResult {
     let dir = tmp.path();
     let mut project = store::create(dir, "Demo")?;
     project.pages.push(Page::new("p0002", "2", "Motor"));
+    project.lock = demo().lock;
     store::save(dir, &project)?;
     let journal = GitJournal::open(dir)?;
     let git = journal.git().clone();
@@ -2284,7 +2298,7 @@ fn undoing_an_added_item_takes_back_its_lock_entry() -> TestResult {
         .and_then(|p| p.page("p0002"))
         .cloned()
         .ok_or("page")?;
-    place(&mut page, "s1", 10.0);
+    place_symbol(&mut page, "s1", 10.0, "coil");
     link_b.send(b.edit_page(page).ok_or("lock")?)?;
     s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
     let changes = s.log.0.borrow().len();
@@ -2339,7 +2353,7 @@ fn bringing_back_a_page_that_uses_a_symbol_taken_back_since_is_refused() -> Test
     let added = s.host.history().last().map(|c| c.id).ok_or("added")?;
     s.host.open(Some("p0003"))?;
     let mut page = s.host.project().page("p0003").cloned().ok_or("page")?;
-    place(&mut page, "s1", 10.0);
+    place_symbol(&mut page, "s1", 10.0, "coil");
     s.host.edit_page(page)?;
     s.host.open(None)?;
     s.host.edit_project(ProjectEdit::RemovePage { id: "p0003".into() })?;
@@ -3191,8 +3205,8 @@ fn coil_with(pins: &[&str]) -> wc_core::Symbol {
 
 /// Two coils `k1` and `k2` on `page`, wired from pin `pin` to pin `pin`.
 fn wired(page: &mut Page, pin: &str) {
-    place(page, "k1", 10.0);
-    place(page, "k2", 50.0);
+    place_symbol(page, "k1", 10.0, "coil");
+    place_symbol(page, "k2", 50.0, "coil");
     let end = |item: &str| wc_core::Endpoint::Pin {
         item: item.into(),
         pin: pin.into(),
@@ -3390,5 +3404,120 @@ fn a_git_journal_puts_vendored_files_back_when_a_change_is_not_recorded() -> Tes
         !store::vendor_path(dir, wc_core::lock::ItemKind::Symbol, "lamp")?.exists(),
         "a file that was not there is gone again"
     );
+    Ok(())
+}
+
+#[test]
+fn a_page_edit_that_places_a_symbol_the_session_does_not_have_is_refused() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    link_a.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&link_a, &mut a)]);
+    let mut page = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place_symbol(&mut page, "s1", 10.0, "lamp");
+    link_a.send(a.edit_page(page).ok_or("lock")?)?;
+    s.pump(&mut [(&link_a, &mut a)]);
+    let refused: Vec<String> = a.refusals.iter().map(ToString::to_string).collect();
+    let refused = refused.join("\n");
+    assert!(refused.contains("symbol lamp"), "{refused}");
+    assert!(s.host.project().page("p0002").ok_or("page")?.symbols.is_empty());
+    // The guest's copy gets the page as the host has it back.
+    assert_eq!(
+        a.project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .map(|p| p.symbols.len()),
+        Some(0)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_page_that_already_used_an_unlocked_symbol_stays_editable() -> TestResult {
+    // An older project placed `lamp` without a lock entry.
+    let mut project = demo();
+    if let Some(page) = project.page_mut("p0002") {
+        place_symbol(page, "old", 10.0, "lamp");
+    }
+    let mut host = Host::new(
+        project,
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    host.open(Some("p0002"))?;
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    page.title = "Motor control".into();
+    place(&mut page, "s1", 40.0);
+    host.edit_page(page)?;
+    assert_eq!(host.project().page("p0002").ok_or("page")?.title, "Motor control");
+    // A new placement of that symbol is refused, on this page and on another.
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    place_symbol(&mut page, "again", 60.0, "lamp");
+    let err = host.edit_page(page).err().ok_or("refused")?;
+    assert!(err.to_string().contains("symbol lamp"), "{err}");
+    // So is a copy of the old placement under its id.
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    place_symbol(&mut page, "old", 80.0, "lamp");
+    assert!(host.edit_page(page).is_err());
+    host.open(Some("p0003"))?;
+    let mut page = host.project().page("p0003").ok_or("page")?.clone();
+    place_symbol(&mut page, "s1", 10.0, "lamp");
+    assert!(host.edit_page(page).is_err());
+    Ok(())
+}
+
+#[test]
+fn pages_written_by_project_edits_may_not_start_using_a_symbol_the_session_lacks() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let mut new_page = Page::new("p0009", "9", "New");
+    place_symbol(&mut new_page, "s1", 10.0, "lamp");
+    let err = host
+        .edit_project(ProjectEdit::AddPage { page: new_page.clone() })
+        .err()
+        .ok_or("refused")?;
+    assert!(err.to_string().contains("symbol lamp"), "{err}");
+    let before = host.project().page("p0003").ok_or("page")?.clone();
+    let mut after = before.clone();
+    place_symbol(&mut after, "s1", 10.0, "lamp");
+    let set = ProjectEdit::SetPages {
+        pages: vec![after.clone()],
+        before: vec![before.clone()],
+    };
+    assert!(host.edit_project(set).is_err());
+    assert!(host.project().page("p0003").ok_or("page")?.symbols.is_empty());
+    // In a batch too.
+    let batch = ProjectEdit::Batch {
+        edits: vec![
+            ProjectEdit::Renumber {
+                numbers: vec![("p0002".into(), "20".into())],
+            },
+            ProjectEdit::SetPages {
+                pages: vec![after.clone()],
+                before: vec![before.clone()],
+            },
+        ],
+    };
+    assert!(host.edit_project(batch).is_err());
+    // Once the session has the symbol, the page is fine.
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(symbol("lamp", "Lamp"), "starter".into())],
+        parts: vec![],
+    })?;
+    host.edit_project(ProjectEdit::SetPages {
+        pages: vec![after],
+        before: vec![before],
+    })?;
+    assert_eq!(host.project().page("p0003").ok_or("page")?.symbols.len(), 1);
     Ok(())
 }
