@@ -17,7 +17,7 @@ pub type PeerId = u32;
 /// before versions were sent counts as 0), since a message one side does not know cannot be
 /// read by the other. Raise it whenever a message, edit or field is added or changed in a way
 /// an older build cannot read.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The session protocol versions of a host and a guest that cannot work together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
