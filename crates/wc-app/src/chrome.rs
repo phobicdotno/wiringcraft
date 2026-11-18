@@ -208,6 +208,9 @@ fn icon_button_rect(
     let info = a.info();
     let enabled = status.enabled(a);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
+    // Whether the button had keyboard focus as the frame's keys were handed out: a press
+    // elsewhere later in the same frame may take it away, after Enter already counted.
+    let had_focus = id.is_some_and(|id| ui.memory(|m| m.has_focus(id)));
     let (rect, resp) = match id {
         Some(id) => {
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
@@ -245,11 +248,13 @@ fn icon_button_rect(
         format!("{} ({})\n{}", info.label, info.shortcut, info.tip)
     };
     // A pointer release counts only over the button where it is now: egui hit-tests against the
-    // last frame, where a button that has moved since still looks to be under the pointer. Where
-    // the release happened counts, not where the pointer went after it in the same frame. Enter
-    // or Space on the focused button is no pointer click, and counts wherever the pointer is.
+    // last frame, where a button with an id (a ribbon button) that has moved since still looks to
+    // be under the pointer. A button without one is laid out in the same place every frame, and
+    // keeps egui's own rule. Where the release that made the click happened counts (the frame's
+    // first: egui clicks on it), not where the pointer went after it in the same frame. Enter or
+    // Space on the focused button is no pointer click, and counts wherever the pointer is.
     let (released_off, keyed) = ui.input(|i| {
-        let release = i.events.iter().rev().find_map(|e| match e {
+        let release = i.events.iter().find_map(|e| match e {
             egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
@@ -259,11 +264,11 @@ fn icon_button_rect(
             _ => None,
         });
         (
-            release.is_some_and(|p| !rect.contains(p)),
+            id.is_some() && release.is_some_and(|p| !rect.contains(p)),
             i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
         )
     });
-    let keyed = keyed && resp.has_focus();
+    let keyed = keyed && (had_focus || resp.has_focus());
     (resp.on_hover_text(tip).clicked() && (keyed || !released_off), rect)
 }
 
@@ -705,6 +710,60 @@ mod tests {
         );
         frame(vec![key(false)], &mut out);
         assert_eq!(out, [Action::Undo]);
+        // The same, with a press on blank space after Enter in that frame, which takes the
+        // focus away: Enter counted before it did.
+        out.clear();
+        ctx.memory_mut(|m| m.request_focus(ribbon_id("Edit", Action::Undo)));
+        frame(Vec::new(), &mut out);
+        frame(vec![egui::Event::PointerMoved(at)], &mut out);
+        frame(vec![button(at, true)], &mut out);
+        frame(
+            vec![
+                egui::Event::PointerMoved(off),
+                button(off, false),
+                key(true),
+                button(off, true),
+            ],
+            &mut out,
+        );
+        frame(vec![key(false), button(off, false)], &mut out);
+        assert_eq!(out, [Action::Undo]);
+    }
+
+    #[test]
+    fn a_ribbon_click_is_judged_by_the_release_that_made_it() {
+        let start = RIBBON[0].1;
+        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
+        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
+        let (narrow, wide) = (1210.0, 1220.0);
+        let at = ribbon_icons(0, narrow)[undo].center();
+        let now = ribbon_icons(0, wide)[undo].center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Released where Undo was (the click), then pressed again and released over where it
+        // is now, all in one frame: the first release is off Undo.
+        let (_, out) = ribbon_frames(
+            0,
+            &[
+                (narrow, Vec::new()),
+                (narrow, vec![egui::Event::PointerMoved(at)]),
+                (narrow, vec![button(at, true)]),
+                (
+                    wide,
+                    vec![
+                        button(at, false),
+                        egui::Event::PointerMoved(now),
+                        button(now, true),
+                        button(now, false),
+                    ],
+                ),
+            ],
+        );
+        assert!(!out.contains(&Action::Undo), "{out:?}");
     }
 
     #[test]
