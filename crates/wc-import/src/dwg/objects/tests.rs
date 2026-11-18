@@ -1250,3 +1250,86 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
     }
     Ok(())
 }
+
+/// A HATCH in model space: no gradient, pattern `name`, the paths written by `paths`.
+fn hatch_obj(v: Version, handle: u64, name: &str, solid: bool, count: u32, paths: impl Fn(&mut W)) -> Obj {
+    let mut o = entity(v, 78, handle, head(None));
+    o.data.bl(0).bl(0).bd(0.0).bd(0.0).bl(0).bd(0.0).bl(0);
+    o.text("");
+    o.data.bd(0.0).bd3((0.0, 0.0, 1.0));
+    o.text(name);
+    o.data.b(solid).b(false).bl(count);
+    paths(&mut o.data);
+    o.data.bs(0).bs(1);
+    o
+}
+
+#[test]
+fn hatches_become_filled_and_unfilled_outlines() -> TestResult {
+    for v in [Version::R2004, Version::R2010] {
+        // A solid square: a polyline path without bulges.
+        let solid = hatch_obj(v, 0x300, "SOLID", true, 1, |d| {
+            d.bl(2).b(false).b(true).bl(4);
+            for p in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)] {
+                d.rd(p.0).rd(p.1);
+            }
+            d.bl(0);
+        });
+        // A pattern: an edge path of a line and a half circle over it.
+        let pattern = hatch_obj(v, 0x301, "ANSI31", false, 1, |d| {
+            d.bl(1).bl(2);
+            d.rc(1).rd(20.0).rd(0.0).rd(30.0).rd(0.0);
+            d.rc(2)
+                .rd(25.0)
+                .rd(0.0)
+                .bd(5.0)
+                .bd(0.0)
+                .bd(std::f64::consts::PI)
+                .b(true);
+            d.bl(0);
+        });
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            solid,
+            pattern,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(!d.skipped.contains_key("HATCH"), "{v:?}: {:?}", d.skipped);
+        let polylines: Vec<(usize, bool)> = d
+            .model
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline { points, filled, .. } => Some((points.len(), *filled)),
+                _ => None,
+            })
+            .collect();
+        assert!(polylines.contains(&(4, true)), "{v:?}: {polylines:?}");
+        // The half circle's points plus the line's start: well over 3, and not filled.
+        assert!(polylines.iter().any(|(n, f)| *n > 5 && !f), "{v:?}: {polylines:?}");
+        assert_eq!(polylines.len(), 2, "{:?}", d.model);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_hatch_listing_too_much_is_a_damaged_object() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        hatch_obj(v, 0x300, "SOLID", true, 50_000, |_| {}),
+        hatch_obj(v, 0x301, "SOLID", true, 1, |d| {
+            // An edge of unknown type.
+            d.bl(1).bl(1).rc(9);
+        }),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&2), "{:?}", d.skipped);
+    assert!(
+        d.damaged.iter().any(|r| r.contains("50000 boundary paths")),
+        "{:?}",
+        d.damaged
+    );
+    Ok(())
+}
