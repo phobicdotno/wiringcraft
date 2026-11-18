@@ -2314,3 +2314,44 @@ fn the_drawing_limit_is_reported_apart_from_missing_drawings() {
     assert!(skipped.contains_key(crate::dxf::OVER_LIMIT), "{skipped:?}");
     assert!(d.has_block("COIL"));
 }
+
+#[test]
+fn a_symbol_drawing_that_needs_a_bigger_sheet_gets_one() {
+    let mut sw = read(&sample()).unwrap();
+    // The coil's block reaches 250 mm right of and 150 mm above the symbol: past A3 (420 x 297)
+    // although its points fit on it.
+    sw.drawings
+        .add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (250.0, 150.0))]))
+        .unwrap();
+    let coil = sw.symbols.iter().find(|s| s.id == 1).unwrap();
+    let reach = Point::new(coil.at.x + 250.0, coil.at.y + 150.0);
+    assert!(reach.y > 297.0, "{reach:?}");
+    let (built, _, _) = build(&sw, None);
+    let (w, h) = page(&built, "01").size.mm();
+    assert!(w >= reach.x && h >= reach.y, "{w} x {h} for {reach:?}");
+}
+
+#[test]
+fn reaching_the_drawing_limit_is_reported_by_the_import() {
+    let mut sw = read(&sample()).unwrap();
+    sw.drawings
+        .add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]))
+        .unwrap();
+    sw.drawings.set_draw_limit(0);
+    let (built, warnings, report) = build(&sw, None);
+    // The coil is boxed, and counted apart from blocks without a drawing.
+    let k1 = symbol_of(&built, "01", "s1");
+    assert!(matches!(k1.graphics[..], [Shape::Rect { .. }]), "{:?}", k1.graphics);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("the symbol and page drawings reached the limit of 0 entities")),
+        "{warnings:?}"
+    );
+    let c = count(&report, "DWG symbol graphics");
+    assert_eq!((c.source, c.imported), (2, 0));
+    assert_eq!(
+        c.note,
+        "1 drawn as boxes: 1 block(s) without a readable drawing in the archive; 1 drawn as boxes: the drawings' entity limit was reached"
+    );
+}

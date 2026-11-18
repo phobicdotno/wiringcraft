@@ -1457,6 +1457,15 @@ struct LibraryFit<'a> {
 /// terminal, an interruption for an arrow), as many pins, each pin named like a point and within
 /// [`JOIN`] of it once the symbol is turned by a quarter step and maybe mirrored (blocks drawn
 /// turned, as in horizontal circuits). `pins` are the points relative to the symbol's origin.
+/// The role a symbol's component gives it.
+fn symbol_role(p: &SweProject, s: &SweSymbol) -> SymbolRole {
+    match s.component.and_then(|c| p.components.get(&c)).map(|c| c.kind) {
+        Some(COMPONENT_ARROW) => SymbolRole::Interruption,
+        Some(COMPONENT_TERMINAL) => SymbolRole::Terminal,
+        _ => SymbolRole::Standalone,
+    }
+}
+
 fn library_fit<'a>(
     choice: &'a SymbolChoice,
     block: &str,
@@ -1808,7 +1817,7 @@ pub fn build_with(
     let mut fallback_blocks: BTreeSet<String> = BTreeSet::new();
     let mut pages_with_drawing = 0usize;
     // One budget for every drawing of the import, like the DWG reader's own.
-    let mut draw_budget = crate::dxf::MAX_DRAWN;
+    let mut draw_budget = p.drawings.draw_limit();
     // Entities of the drawings left out while drawing, and symbols that fell back to boxes
     // only because that budget ran out.
     let mut draw_skipped: BTreeMap<String, usize> = BTreeMap::new();
@@ -1850,12 +1859,38 @@ pub fn build_with(
             extent.x = extent.x.max(q.x);
             extent.y = extent.y.max(q.y);
         };
+        // A symbol no library symbol fits is drawn from its block, which may reach past its
+        // points: drawn here, so the sheet is chosen with room for it.
+        let mut block_drawn: BTreeMap<i64, Option<Vec<Shape>>> = BTreeMap::new();
         for s in &syms {
             grow(s.at);
             s.pins.iter().for_each(|q| grow(q.at));
             if let Some(c) = s.corner {
                 grow(c);
             }
+            if s.pins.is_empty() && s.corner.is_none() {
+                continue;
+            }
+            // The points around the symbol's origin, y down, as the build below gives them.
+            let local: Vec<(String, Point)> = s
+                .pins
+                .iter()
+                .map(|q| {
+                    (
+                        q.name.clone(),
+                        Point::new(round(q.at.x - s.at.x), round(s.at.y - q.at.y)),
+                    )
+                })
+                .collect();
+            if library_fit(choice, &s.block, symbol_role(p, s), &local).is_some() {
+                continue;
+            }
+            let drawn = p.drawings.symbol_graphics(s, &mut draw_budget, &mut draw_skipped);
+            for sh in drawn.iter().flatten() {
+                let (min, max) = sh.bounds();
+                grow(Point::new(s.at.x + max.x, s.at.y - min.y));
+            }
+            block_drawn.insert(s.id, drawn);
         }
         for l in &lines {
             grow(l.a);
@@ -1914,11 +1949,7 @@ pub fn build_with(
             if s.component.is_some() && component.is_none() {
                 unknown_component += 1;
             }
-            let role = match component.map(|c| c.kind) {
-                Some(COMPONENT_ARROW) => SymbolRole::Interruption,
-                Some(COMPONENT_TERMINAL) => SymbolRole::Terminal,
-                _ => SymbolRole::Standalone,
-            };
+            let role = symbol_role(p, s);
             let local: Vec<(String, Point)> = pins
                 .iter()
                 .map(|(n, at)| (n.clone(), Point::new(at.x - origin.x, at.y - origin.y)))
@@ -1929,7 +1960,11 @@ pub fn build_with(
                 Some(fit) => (Vec::new(), fit.pins.clone()),
                 None => {
                     let (boxed, pins) = box_symbol(&s.block, origin, s.corner.map(flip), &pins);
-                    match p.drawings.symbol_graphics(s, &mut draw_budget, &mut draw_skipped) {
+                    let drawn = match block_drawn.remove(&s.id) {
+                        Some(drawn) => drawn,
+                        None => p.drawings.symbol_graphics(s, &mut draw_budget, &mut draw_skipped),
+                    };
+                    match drawn {
                         Some(drawn) => {
                             dwg_symbols += 1;
                             (drawn, pins)
@@ -2387,7 +2422,7 @@ pub fn build_with(
     if let Some(n) = draw_skipped.get(crate::dxf::OVER_LIMIT) {
         warnings.push(format!(
             "the symbol and page drawings reached the limit of {} entities; {n} more were left out",
-            crate::dxf::MAX_DRAWN
+            p.drawings.draw_limit()
         ));
     }
     if unknown_component > 0 {

@@ -46,9 +46,22 @@ pub struct SweDrawings {
     pub skipped: BTreeMap<String, usize>,
     /// Files that could not be read, and why.
     pub warnings: Vec<String>,
+    /// Entities all drawings of one import may expand to; [`dxf::MAX_DRAWN`] when unset.
+    limit: Option<usize>,
 }
 
 impl SweDrawings {
+    /// Entities all drawings of one import may expand to.
+    pub(crate) fn draw_limit(&self) -> usize {
+        self.limit.unwrap_or(dxf::MAX_DRAWN)
+    }
+
+    /// Lower the entity limit, so a test reaches it with a small drawing.
+    #[cfg(test)]
+    pub(crate) fn set_draw_limit(&mut self, n: usize) {
+        self.limit = Some(n);
+    }
+
     /// Read a symbol's block file (DWG bytes) for block `name`. A second file for the same
     /// name (ignoring case) replaces the first.
     pub fn add_block(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
