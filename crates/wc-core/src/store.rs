@@ -33,11 +33,11 @@ pub const DEVICES_FILE: &str = "devices.json";
 pub const LOCK_FILE: &str = "library.lock";
 pub const PAGES_DIR: &str = "pages";
 pub const VENDOR_DIR: &str = "vendor";
-const PAGE_SUFFIX: &str = ".page.json";
+pub const PAGE_SUFFIX: &str = ".page.json";
 pub const PANELS_DIR: &str = "panels";
-const PANEL_SUFFIX: &str = ".panel.json";
+pub const PANEL_SUFFIX: &str = ".panel.json";
 pub const COMMENTS_DIR: &str = "comments";
-const COMMENTS_SUFFIX: &str = ".comments.json";
+pub const COMMENTS_SUFFIX: &str = ".comments.json";
 
 /// Ids become file names, so they are restricted to a portable set.
 pub fn check_id(id: &str) -> Result<()> {
@@ -105,8 +105,21 @@ pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, content).map_err(|e| Error::io(&tmp, e))?;
-    fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    // A staging file left by a failed write or rename is removed again (a folder in its way is
+    // not ours to remove).
+    let drop_tmp = || {
+        if fs::symlink_metadata(&tmp).is_ok_and(|m| m.is_file()) {
+            let _ = fs::remove_file(&tmp);
+        }
+    };
+    if let Err(e) = fs::write(&tmp, content) {
+        drop_tmp();
+        return Err(Error::io(&tmp, e));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        drop_tmp();
+        return Err(Error::io(path, e));
+    }
     Ok(true)
 }
 
