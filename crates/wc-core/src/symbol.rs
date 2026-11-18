@@ -87,3 +87,155 @@ impl Symbol {
         bounds_of(&pts)
     }
 }
+
+/// The edge of a black box a connection point sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxSide {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl BoxSide {
+    /// `left`, `right`, `top` or `bottom` (also `l`, `r`, `t`, `b`), any case.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "top" | "t" | "up" => Some(BoxSide::Top),
+            "bottom" | "b" | "down" => Some(BoxSide::Bottom),
+            "left" | "l" => Some(BoxSide::Left),
+            "right" | "r" => Some(BoxSide::Right),
+            _ => None,
+        }
+    }
+}
+
+/// A connection point of a black box: its name, the edge it sits on and how far along that
+/// edge, in mm from the edge's left or top end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoxPin {
+    pub name: String,
+    pub side: BoxSide,
+    pub offset: f64,
+}
+
+/// A black box (device box): a rectangle `width` by `height` mm with its top-left corner at
+/// the origin and connection points on its edges, for a device that has no symbol of its own.
+/// Wires leave each point away from the box. Refuses a box without area, a point off its edge,
+/// a point without a name, two points of one name and two points at one place.
+pub fn black_box(id: &str, name: &str, width: f64, height: f64, pins: &[BoxPin]) -> crate::Result<Symbol> {
+    let bad = |why: String| Err(crate::Error::Invalid(why));
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return bad(format!(
+            "a black box needs a width and height above zero, not {width} by {height}"
+        ));
+    }
+    let mut out: Vec<Pin> = Vec::new();
+    for p in pins {
+        let pin_name = p.name.trim();
+        if pin_name.is_empty() {
+            return bad("a connection point of a black box needs a name".into());
+        }
+        let length = match p.side {
+            BoxSide::Top | BoxSide::Bottom => width,
+            BoxSide::Left | BoxSide::Right => height,
+        };
+        if !(p.offset.is_finite() && (0.0..=length).contains(&p.offset)) {
+            return bad(format!(
+                "connection point {pin_name}: {} mm is off its edge, which is {length} mm long",
+                p.offset
+            ));
+        }
+        let (at, dir) = match p.side {
+            BoxSide::Top => (Point::new(p.offset, 0.0), PinDir::Up),
+            BoxSide::Bottom => (Point::new(p.offset, height), PinDir::Down),
+            BoxSide::Left => (Point::new(0.0, p.offset), PinDir::Left),
+            BoxSide::Right => (Point::new(width, p.offset), PinDir::Right),
+        };
+        if out.iter().any(|q| q.name == pin_name) {
+            return bad(format!("two connection points are named {pin_name}"));
+        }
+        if let Some(q) = out.iter().find(|q| q.at.distance(at) < 1e-6) {
+            return bad(format!(
+                "connection points {} and {pin_name} are at the same place",
+                q.name
+            ));
+        }
+        out.push(Pin {
+            name: pin_name.to_owned(),
+            at,
+            dir,
+        });
+    }
+    Ok(Symbol {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        category: "Black box".into(),
+        letter_code: String::new(),
+        role: SymbolRole::Standalone,
+        graphics: vec![Shape::Rect {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(width, height),
+        }],
+        pins: out,
+        tag_at: Point::new(0.0, -2.0),
+        description: String::new(),
+    })
+}
+
+#[cfg(test)]
+mod black_box_tests {
+    use super::*;
+
+    fn pin(name: &str, side: BoxSide, offset: f64) -> BoxPin {
+        BoxPin {
+            name: name.into(),
+            side,
+            offset,
+        }
+    }
+
+    #[test]
+    fn points_sit_on_their_edges_facing_out() -> crate::Result<()> {
+        let s = black_box(
+            "box.a1",
+            "-A1",
+            40.0,
+            20.0,
+            &[
+                pin("1", BoxSide::Left, 5.0),
+                pin("2", BoxSide::Right, 15.0),
+                pin("PE", BoxSide::Bottom, 40.0),
+                pin("X", BoxSide::Top, 0.0),
+            ],
+        )?;
+        let at = |n: &str| s.pin(n).map(|p| (p.at, p.dir));
+        assert_eq!(at("1"), Some((Point::new(0.0, 5.0), PinDir::Left)));
+        assert_eq!(at("2"), Some((Point::new(40.0, 15.0), PinDir::Right)));
+        assert_eq!(at("PE"), Some((Point::new(40.0, 20.0), PinDir::Down)));
+        assert_eq!(at("X"), Some((Point::new(0.0, 0.0), PinDir::Up)));
+        assert_eq!(s.graphics.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_flat_box_and_points_that_do_not_fit() {
+        assert!(black_box("b", "", 0.0, 10.0, &[]).is_err());
+        assert!(black_box("b", "", 10.0, f64::NAN, &[]).is_err());
+        assert!(black_box("b", "", 10.0, 10.0, &[pin("1", BoxSide::Left, 10.5)]).is_err());
+        assert!(black_box("b", "", 10.0, 10.0, &[pin("1", BoxSide::Left, -1.0)]).is_err());
+        assert!(black_box("b", "", 10.0, 10.0, &[pin(" ", BoxSide::Left, 1.0)]).is_err());
+        let twice = [pin("1", BoxSide::Left, 1.0), pin("1", BoxSide::Right, 1.0)];
+        assert!(black_box("b", "", 10.0, 10.0, &twice).is_err());
+        // The top-left corner is on the top and the left edge.
+        let corner = [pin("1", BoxSide::Left, 0.0), pin("2", BoxSide::Top, 0.0)];
+        assert!(black_box("b", "", 10.0, 10.0, &corner).is_err());
+    }
+
+    #[test]
+    fn sides_parse_in_short_and_long_form() {
+        assert_eq!(BoxSide::parse("Left"), Some(BoxSide::Left));
+        assert_eq!(BoxSide::parse("b"), Some(BoxSide::Bottom));
+        assert_eq!(BoxSide::parse("middle"), None);
+    }
+}

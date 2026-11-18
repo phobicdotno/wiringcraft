@@ -54,6 +54,27 @@ enum Cmd {
         #[arg(long)]
         mirror: bool,
     },
+    /// Draw a black box (device box) for a device without a symbol: a rectangle with its
+    /// top-left corner at `--at`, and connection points on its edges that wires attach to like
+    /// symbol pins. It is stored as a symbol of the project (`box.<page>.<id>`), so it carries a
+    /// device tag and part and shows in the reports and checks like any symbol. Prints its id.
+    Box {
+        page: String,
+        /// Top-left corner in mm, `x,y`.
+        #[arg(long, value_parser = parse_point)]
+        at: Point,
+        /// Width and height in mm, `w,h`.
+        #[arg(long, value_parser = parse_point)]
+        size: Point,
+        /// Device tag, e.g. `-A1` (taken as a value, though it starts with `-`).
+        #[arg(long, allow_hyphen_values = true)]
+        tag: Option<String>,
+        /// A connection point, `name:side:offset`: side `left`, `right`, `top` or `bottom`, and
+        /// the offset in mm along that edge from its left or top end, e.g. `L1:top:10`. Repeat
+        /// for each point.
+        #[arg(long = "pin")]
+        pins: Vec<String>,
+    },
     /// Number the wires by rule. Every wire of one connection gets the same number.
     /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
     /// where the connection starts) or `potential` (the potential's name, else sequential).
@@ -741,6 +762,26 @@ fn parse_end(page: &Page, s: &str) -> Res<Endpoint> {
     })
 }
 
+/// A black box's connection point from `name:side:offset` (`L1:top:10`); the name may itself
+/// hold a colon.
+fn parse_box_pin(s: &str) -> Res<wc_core::BoxPin> {
+    let mut parts = s.rsplitn(3, ':');
+    let (Some(offset), Some(side), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(format!("{s:?}: expected name:side:offset, e.g. L1:top:10"));
+    };
+    let side =
+        wc_core::BoxSide::parse(side).ok_or_else(|| format!("{s:?}: the side must be left, right, top or bottom"))?;
+    let offset = offset
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("{s:?}: the offset must be a number of mm"))?;
+    Ok(wc_core::BoxPin {
+        name: name.to_owned(),
+        side,
+        offset,
+    })
+}
+
 fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
@@ -1074,6 +1115,88 @@ fn run(cli: Cli) -> Res<()> {
                 tag,
             });
             save(dir, &p)?;
+            println!("{id}");
+        }
+        Cmd::Box {
+            page,
+            at,
+            size,
+            tag,
+            pins,
+        } => {
+            let mut p = load(dir)?;
+            let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
+            let pins = pins.iter().map(|s| parse_box_pin(s)).collect::<Res<Vec<_>>>()?;
+            let lock = p.lock.symbols.clone();
+            let pg = page_mut(&mut p, &page)?;
+            // The first item id whose box symbol is free too: a box deleted from the page keeps
+            // its symbol file and lock entry, and its id must not be taken over.
+            let (id, symbol_id, symbol_path) = {
+                let mut n = 1usize;
+                loop {
+                    let id = format!("s{n}");
+                    n += 1;
+                    if pg.symbol(&id).is_some() || pg.wires.iter().any(|w| w.id == id) {
+                        continue;
+                    }
+                    let symbol_id = format!("box.{}.{id}", pg.id);
+                    if symbol_id.len() > 128 {
+                        return Err(format!(
+                            "page id {:?} is too long to name a box symbol (box.<page>.<id> must stay within 128 characters)",
+                            pg.id
+                        ));
+                    }
+                    let path = store::vendor_path(dir, ItemKind::Symbol, &symbol_id).map_err(e)?;
+                    if !lock.contains_key(&symbol_id) && !path.exists() {
+                        break (id, symbol_id, path);
+                    }
+                }
+            };
+            let name = tag
+                .as_ref()
+                .map_or_else(|| "Black box".to_owned(), |t| format!("Black box {t}"));
+            let symbol = wc_core::black_box(&symbol_id, &name, size.x, size.y, &pins).map_err(e)?;
+            pg.symbols.push(PlacedSymbol {
+                id: id.clone(),
+                symbol: symbol_id.clone(),
+                at,
+                rotation: Rotation::R0,
+                mirror: false,
+                tag: tag.clone(),
+            });
+            if let Some(t) = &tag {
+                p.devices.entry(t.clone()).or_default();
+            }
+            p.lock.symbols.insert(
+                symbol_id.clone(),
+                wc_core::LockEntry {
+                    source: "project".into(),
+                    hash: symbol.hash(),
+                },
+            );
+            // Every project file the save may change, read first: a save that fails half way is
+            // put back, so no lock entry or placement is left pointing at the symbol file.
+            let before = snapshot_project(dir, &[], &[])?;
+            store::write_vendored_symbol(dir, &symbol).map_err(e)?;
+            if let Err(err) = save(dir, &p) {
+                let failed = put_files_back(&before);
+                if !failed.is_empty() {
+                    // A page or the lock may still name the box: keep its symbol file.
+                    return Err(format!(
+                        "{err}; putting back the project files failed too, so the box's symbol {} is kept: {}",
+                        symbol_path.display(),
+                        failed.join("; ")
+                    ));
+                }
+                return match std::fs::remove_file(&symbol_path) {
+                    Ok(()) => Err(err),
+                    Err(x) if x.kind() == std::io::ErrorKind::NotFound => Err(err),
+                    Err(x) => Err(format!(
+                        "{err}; removing the box's symbol {} failed too: {x}",
+                        symbol_path.display()
+                    )),
+                };
+            }
             println!("{id}");
         }
         Cmd::Wire {
@@ -3398,6 +3521,30 @@ fn add_and_save_with(
     replace: Replace,
     finish: impl FnOnce(&mut Project),
 ) -> Res<usize> {
+    let pages: Vec<&str> = built.pages.iter().map(|pg| pg.id.as_str()).collect();
+    let panels: Vec<&str> = built.panels.iter().map(|n| n.id.as_str()).collect();
+    let project_files = snapshot_project(dir, &pages, &panels)?;
+    let (written, joined) = add_built(dir, p, built, source, replace)?;
+    finish(p);
+    if let Err(err) = save_imported(dir, p) {
+        let mut failed = put_files_back(&project_files);
+        failed.extend(put_files_back(&written));
+        if failed.is_empty() {
+            return Err(err);
+        }
+        return Err(format!(
+            "{err}; putting back the vendored files failed too: {}",
+            failed.join("; ")
+        ));
+    }
+    Ok(joined)
+}
+
+/// Every file a save of the project may write or remove, with its bytes before (`None` when it
+/// does not exist yet): the project's own files, every file in its page, panel and comment
+/// folders, and the files of the pages and panels about to be added. [`put_files_back`] restores
+/// them when a save fails half way.
+fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> Res<Written> {
     // Every file the save may write or remove, read before anything is written: the project's
     // own files, every file in its page, panel and comment folders, and the files the new pages
     // and panels will get.
@@ -3429,17 +3576,11 @@ fn add_and_save_with(
             }
         }
     }
-    for page in &built.pages {
-        paths.push(
-            dir.join(store::PAGES_DIR)
-                .join(format!("{}{}", page.id, store::PAGE_SUFFIX)),
-        );
+    for id in new_pages {
+        paths.push(dir.join(store::PAGES_DIR).join(format!("{id}{}", store::PAGE_SUFFIX)));
     }
-    for panel in &built.panels {
-        paths.push(
-            dir.join(store::PANELS_DIR)
-                .join(format!("{}{}", panel.id, store::PANEL_SUFFIX)),
-        );
+    for id in new_panels {
+        paths.push(dir.join(store::PANELS_DIR).join(format!("{id}{}", store::PANEL_SUFFIX)));
     }
     paths.sort();
     paths.dedup();
@@ -3452,20 +3593,7 @@ fn add_and_save_with(
         };
         project_files.push((path, before));
     }
-    let (written, joined) = add_built(dir, p, built, source, replace)?;
-    finish(p);
-    if let Err(err) = save_imported(dir, p) {
-        let mut failed = put_files_back(&project_files);
-        failed.extend(put_files_back(&written));
-        if failed.is_empty() {
-            return Err(err);
-        }
-        return Err(format!(
-            "{err}; putting back the vendored files failed too: {}",
-            failed.join("; ")
-        ));
-    }
-    Ok(joined)
+    Ok(project_files)
 }
 
 /// Wire ends in `p` on pins of the symbol `symbol.id` that `symbol` does not have:
@@ -5767,6 +5895,172 @@ mod tests {
             z.finish().unwrap();
         }
         cli(&dir, &["import", "archive", only.to_str().unwrap()]).unwrap();
+    }
+
+    #[test]
+    fn a_black_box_is_drawn_wired_tagged_listed_and_reloaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        let boxed = |args: &[&str]| {
+            let mut all = vec!["box", "p1"];
+            all.extend_from_slice(args);
+            cli(&dir, &all)
+        };
+        boxed(&[
+            "--at",
+            "50,50",
+            "--size",
+            "40,20",
+            "--tag",
+            "-A1",
+            "--pin",
+            "1:left:5",
+            "--pin",
+            "2:right:15",
+        ])
+        .unwrap();
+        boxed(&[
+            "--at",
+            "150,50",
+            "--size",
+            "20,20",
+            "--tag",
+            "-A2",
+            "--pin",
+            "X1:1:left:15",
+        ])
+        .unwrap();
+        // Refused before anything is written: a point off its edge, a side that is not one.
+        assert!(boxed(&["--at", "0,0", "--size", "10,10", "--pin", "1:left:11"]).is_err());
+        assert!(boxed(&["--at", "0,0", "--size", "10,10", "--pin", "1:middle:1"]).is_err());
+        assert!(boxed(&["--at", "0,0", "--size", "0,10"]).is_err());
+
+        let p = load(&dir).unwrap();
+        let page = p.page("p1").unwrap();
+        assert_eq!(page.symbols.len(), 2);
+        let (a1, a2) = (page.symbols[0].id.clone(), page.symbols[1].id.clone());
+        assert_eq!(page.symbols[0].symbol, format!("box.p1.{a1}"));
+        assert_eq!(p.lock.symbols[&page.symbols[0].symbol].source, "project");
+        let symbol = store::read_vendored_symbol(&dir, &page.symbols[1].symbol).unwrap();
+        assert_eq!(symbol.pins[0].name, "X1:1");
+        assert_eq!(symbol.pins[0].at, Point::new(0.0, 15.0));
+
+        // A box deleted from the page keeps its symbol file: its id is not taken over.
+        let stale = wc_core::black_box("box.p1.s3", "old", 5.0, 5.0, &[]).unwrap();
+        store::write_vendored_symbol(&dir, &stale).unwrap();
+        boxed(&["--at", "100,100", "--size", "10,10"]).unwrap();
+        let p = load(&dir).unwrap();
+        let third = &p.page("p1").unwrap().symbols[2];
+        assert_eq!((third.id.as_str(), third.symbol.as_str()), ("s4", "box.p1.s4"));
+        assert_eq!(store::read_vendored_symbol(&dir, "box.p1.s3").unwrap(), stale);
+
+        cli(&dir, &["wire", "p1", &format!("{a1}:2"), &format!("{a2}:X1:1")]).unwrap();
+        let part = wc_core::Part {
+            id: "acme.ctrl".into(),
+            manufacturer: "Acme".into(),
+            order_number: "CTRL-1".into(),
+            description: "Controller".into(),
+            ..wc_core::Part::default()
+        };
+        store::write_vendored_part(&dir, &part).unwrap();
+        cli(&dir, &["device", "--part", "acme.ctrl", "--", "-A1"]).unwrap();
+
+        let p = load(&dir).unwrap();
+        let (symbols, missing) = store::vendored_symbols(&dir, &p);
+        assert!(missing.is_empty(), "{missing:?}");
+        let parts = vendored_parts(&dir, &p);
+        let inputs = wc_report::Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let bom = wc_report::build(wc_report::Kind::Parts, &inputs).to_csv();
+        assert!(bom.contains("CTRL-1"), "{bom}");
+        let wires = wc_report::build(wc_report::Kind::Wires, &inputs).to_csv();
+        assert!(wires.contains("-A1:2") && wires.contains("-A2:X1:1"), "{wires}");
+        let devices = wc_report::build(wc_report::Kind::Devices, &inputs).to_csv();
+        assert!(devices.contains("-A1") && devices.contains("-A2"), "{devices}");
+        // Nothing in the project check about the boxes' symbols.
+        let found = wc_report::check(&inputs);
+        assert!(
+            !found.iter().any(|f| f.message.contains("box.p1")),
+            "{:?}",
+            found.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_box_whose_save_fails_puts_the_project_back_and_goes_through_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        let args = [
+            "box",
+            "p1",
+            "--at",
+            "10,10",
+            "--size",
+            "20,10",
+            "--tag=-A1",
+            "--pin",
+            "1:left:5",
+        ];
+        let files = || {
+            let mut out: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+            for folder in [dir.clone(), dir.join(store::PAGES_DIR)] {
+                for entry in std::fs::read_dir(folder).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_file() {
+                        out.push((path.clone(), std::fs::read(&path).unwrap()));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+        let before = files();
+        // The page file cannot be written: the lock and devices are written before it.
+        let mut blocker = dir
+            .join(store::PAGES_DIR)
+            .join(format!("p1{}", store::PAGE_SUFFIX))
+            .into_os_string();
+        blocker.push(".tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        assert!(cli(&dir, &args).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(files(), before, "project files put back");
+        assert!(
+            store::read_vendored_symbol(&dir, "box.p1.s1").is_err(),
+            "symbol file removed"
+        );
+        cli(&dir, &args).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.page("p1").unwrap().symbols[0].symbol, "box.p1.s1");
+        assert!(p.lock.symbols.contains_key("box.p1.s1"));
+        assert!(store::read_vendored_symbol(&dir, "box.p1.s1").is_ok());
+    }
+
+    #[test]
+    fn a_page_id_too_long_for_a_box_symbol_is_refused_before_anything_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // `box.` + page + `.s1`: 121 characters fit in 128, 122 do not.
+        for (len, fits) in [(121, true), (122, false)] {
+            let page = "p".repeat(len);
+            cli(&dir, &["page", "add", &page, "--number", &len.to_string()]).unwrap();
+            let lock = std::fs::read(dir.join(store::LOCK_FILE)).ok();
+            let r = cli(&dir, &["box", &page, "--at", "0,0", "--size", "10,10"]);
+            assert_eq!(r.is_ok(), fits, "{len}: {r:?}");
+            if !fits {
+                assert!(r.unwrap_err().contains("too long"));
+                assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).ok(), lock);
+                assert!(load(&dir).unwrap().page(&page).unwrap().symbols.is_empty());
+            }
+        }
     }
 
     #[test]

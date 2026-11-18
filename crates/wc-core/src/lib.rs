@@ -31,5 +31,5 @@ pub use project::{
     Underlay, Wire, WireSpec,
 };
 pub use review::{Comment, Reply};
-pub use symbol::{Pin, Symbol};
+pub use symbol::{BoxPin, BoxSide, Pin, Symbol, black_box};
 pub use tag::DeviceTag;
