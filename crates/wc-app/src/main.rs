@@ -3124,7 +3124,16 @@ impl App {
         self.ed.page = i;
         self.ed.tool = Tool::Select;
         self.ed.view.fit = true;
-        self.ed.selection = select.into_iter().collect();
+        // A hit on a hidden or locked layer would be dropped from the selection on the next
+        // frame without a word: say why instead.
+        let note = select.as_ref().and_then(|s| self.prefs.layers.unselectable_note(s));
+        self.ed.selection = self.prefs.layers.keep(select.into_iter().collect());
+        if let Some(note) = note {
+            if let Some(find) = self.find.as_mut() {
+                find.message = note.clone();
+            }
+            self.ed.message = note;
+        }
     }
 
     /// Replace in the ticked find hits, as one undo step.
