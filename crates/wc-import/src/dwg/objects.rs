@@ -16,7 +16,8 @@
 //! the block whose BLOCK_HEADER owns it, or to model space; vertices belong to their polyline
 //! and attributes to their INSERT. The entities become the same entities the DXF reader works
 //! with, so a DWG drawing is drawn exactly like a DXF one: y flipped, block references expanded.
-//! Other entity types, and objects that cannot be decoded, are counted and skipped.
+//! Other entity types (custom ones, numbered 500 and up, under the DXF name their class in
+//! `AcDb:Classes` gives), and objects that cannot be decoded, are counted and skipped.
 //!
 //! Written from the published Open Design Specification for .dwg files only, and checked with
 //! objects the tests write themselves. Input is treated as hostile: every read is checked, and a
@@ -27,6 +28,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use wc_core::geom::{Point, Shape};
 
 use super::bits::{Bits, modular_char, modular_short};
+use super::classes::{Class, read_classes};
 use super::codepage::Decoding;
 use super::{Sections, Version, bad, read_sections};
 use crate::Result;
@@ -37,6 +39,10 @@ pub const MAX_OBJECTS: usize = 4_000_000;
 
 /// The key under which objects that could not be decoded are counted in [`Drawing::skipped`].
 pub const DAMAGED: &str = "damaged objects";
+
+/// The skipped-count key for a class section that could not be read: custom entities (types 500
+/// and up) are then not named or counted.
+pub const CLASSES_DAMAGED: &str = "class section damaged (custom entities not counted)";
 
 /// The skipped-count key for blocks whose base point could not be read: they are kept, placed
 /// as if their base point were (0, 0).
@@ -58,9 +64,10 @@ pub struct Drawing {
     pub model_points: Vec<Point>,
     /// How many of each kind of entity or object were not read, by type name.
     pub skipped: BTreeMap<String, usize>,
-    /// Why objects counted under [`DAMAGED`] could not be decoded (handle, offset and reason),
-    /// then why base points counted under [`BASE_UNREAD`] could not be read, for the first
-    /// [`MAX_REASONS`] of them.
+    /// Why the class section could not be read when it is counted under [`CLASSES_DAMAGED`]
+    /// (always first), then why objects counted under [`DAMAGED`] could not be decoded (handle,
+    /// offset and reason), then why base points counted under [`BASE_UNREAD`] could not be
+    /// read, for the first [`MAX_REASONS`] of them.
     pub damaged: Vec<String>,
     /// Notes about the file as a whole, such as a code page its texts cannot be decoded in.
     pub warnings: Vec<String>,
@@ -116,6 +123,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
 pub(crate) struct Read {
     pub(crate) drawing: dxf::Drawing,
     pub(crate) skipped: BTreeMap<String, usize>,
+    /// As [`Drawing::damaged`]: the class section's reason first when it is damaged.
     pub(crate) damaged: Vec<String>,
     /// Notes about the file as a whole (an unknown code page).
     pub(crate) warnings: Vec<String>,
@@ -134,6 +142,16 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     let mut skipped = BTreeMap::new();
     let mut decoded = Decoded::default();
     let mut damaged = Vec::new();
+    // The classes name the custom types (500 and up); without them those are not counted.
+    let classes = match sections.get("AcDb:Classes") {
+        None => HashMap::new(),
+        Some(data) => read_classes(data, sections.version, sections.maint).unwrap_or_else(|e| {
+            // A section, not an object: counted under its own key, its reason with the others.
+            *skipped.entry(CLASSES_DAMAGED.to_owned()).or_default() += 1;
+            damaged.push(e.to_string());
+            HashMap::new()
+        }),
+    };
     // 2004 texts are in the drawing's code page; one this reader does not know is read as
     // before (UTF-8 or Windows-1252) and said.
     let (decoding, known) = Decoding::of(sections.codepage);
@@ -151,6 +169,7 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
             at,
             handle,
             sections.version,
+            &classes,
             decoding,
             &mut decoded,
             &mut skipped,
@@ -329,7 +348,7 @@ fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Re
 /// The string stream of a 2007 or 2010 object whose data ends at bit `end`: a flag in the last
 /// bit, a size before it (in one or two 16-bit parts), and the texts before that. Also returns
 /// where the other fields end: where the texts start, or at the flag when there are none.
-fn string_stream(bytes: &[u8], end: usize) -> Result<(usize, Option<Bits<'_>>)> {
+pub(crate) fn string_stream(bytes: &[u8], end: usize) -> Result<(usize, Option<Bits<'_>>)> {
     let all = Bits::new(bytes, 0, end);
     let Some(flag_at) = end.checked_sub(1) else {
         return Ok((0, None));
@@ -747,11 +766,13 @@ fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
 }
 
 /// Decode the object at `at` into `out`.
+#[allow(clippy::too_many_arguments)]
 fn decode(
     objects: &[u8],
     at: usize,
     handle: u64,
     version: Version,
+    classes: &HashMap<u16, Class>,
     decoding: Decoding,
     out: &mut Decoded,
     skipped: &mut BTreeMap<String, usize>,
@@ -780,6 +801,28 @@ fn decode(
                     .push(format!("base point of block {name} (object {handle:X}): {e}")),
             }
             out.blocks.insert(handle, name);
+        }
+        return Ok(());
+    }
+    // A custom type: an entity of its class is counted under the class's DXF name; a custom
+    // object (dictionary entries, layouts and the like) draws nothing and is not counted.
+    if o.kind >= 500 {
+        if let Some(class) = classes.get(&o.kind)
+            && class.entity
+        {
+            // A DXF name is upper-case letters, digits and _ or $; anything else (which could
+            // look like one of the reader's own counters) is named by its type number.
+            let plain = !class.dxf_name.is_empty()
+                && class
+                    .dxf_name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '$');
+            let name = if plain {
+                class.dxf_name.clone()
+            } else {
+                format!("custom entity type {}", o.kind)
+            };
+            *skipped.entry(name).or_default() += 1;
         }
         return Ok(());
     }

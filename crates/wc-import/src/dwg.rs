@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use crate::{Error, Result};
 
 mod bits;
+mod classes;
 pub(crate) mod codepage;
 pub mod objects;
 pub mod r2007;
@@ -95,6 +96,9 @@ pub struct Sections {
     pub sections: Vec<Section>,
     /// Names of sections not read because they are stored encrypted.
     pub skipped: Vec<String>,
+    /// The maintenance release of the file (byte 0x0B of the file header), which moves a few
+    /// fields of 2010 drawings.
+    pub maint: u8,
     /// The code page number of the file header (byte 0x13), which AutoCAD 2004 texts are
     /// stored in (`codepage::Decoding::of`); 2007 and 2010 texts are UTF-16 whatever it says.
     pub codepage: u16,
@@ -163,6 +167,7 @@ pub fn read_sections_with(bytes: &[u8], max_total: usize) -> Result<Sections> {
         &format!("section map (page {section_map_id})"),
     )?;
     let mut read = read_section_map(bytes, &section_map, &pages, version, max_total)?;
+    read.maint = bytes.get(0x0B).copied().unwrap_or(0);
     read.codepage = Reader(bytes).bytes::<2>(0x13).map_or(0, u16::from_le_bytes);
     Ok(read)
 }
@@ -387,6 +392,7 @@ fn read_section_map(
         version,
         sections,
         skipped,
+        maint: 0,
         codepage: 0,
     })
 }
