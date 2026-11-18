@@ -1616,3 +1616,33 @@ fn a_terminal_whose_symbol_is_missing_is_counted_the_same_everywhere() {
         out.warnings
     );
 }
+
+#[test]
+fn check_warns_about_a_cloud_of_an_unlisted_revision() {
+    let (mut p, s, parts) = fixture();
+    p.add_revision("A", "", "", "").unwrap();
+    p.add_cloud("p2", Point::new(10.0, 10.0), Point::new(30.0, 30.0), None)
+        .unwrap();
+    let found = |p: &Project| -> Vec<Finding> {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("does not list"))
+            .collect()
+    };
+    assert!(found(&p).is_empty());
+    p.meta.revisions.clear();
+    let f = found(&p);
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!(f[0].severity, Severity::Warning);
+    assert_eq!(f[0].page_id.as_deref(), Some("p2"));
+    assert_eq!(f[0].item.as_deref(), Some("cloud 0"));
+    assert_eq!(
+        f[0].message,
+        "a cloud carries revision A, which the project does not list"
+    );
+}

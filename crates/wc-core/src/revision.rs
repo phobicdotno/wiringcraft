@@ -54,7 +54,16 @@ pub const TABLE_ROW: f64 = 5.0;
 
 /// A one-line field as kept: trimmed, without control characters, not overlong.
 fn field(s: &str, max: usize) -> String {
-    s.trim().chars().filter(|c| !c.is_control()).take(max).collect()
+    let kept: String = s.chars().filter(|c| !c.is_control()).collect();
+    kept.trim().chars().take(max).collect()
+}
+
+/// The text height at which `s` fits `width` millimetres: `max` when it fits, smaller when it
+/// does not. Revision letters are shrunk rather than cut, so two letters always read apart.
+fn fit_height(s: &str, width: f64, max: f64) -> f64 {
+    let n = s.chars().count().max(1) as f64;
+    // Characters of the PDF font are about 0.6 of the text height wide on average.
+    max.min(width / (0.6 * n))
 }
 
 /// A cut text that fits `width` millimetres at the table's text height, ending in `...` when cut.
@@ -102,8 +111,8 @@ impl RevisionCloud {
             Point::new(a.x, b.y),
         ];
         let mut out = Vec::new();
-        for i in 0..4 {
-            let (p, q) = (corners[i], corners[(i + 1) % 4]);
+        let next = corners.iter().cycle().skip(1);
+        for (&p, &q) in corners.iter().zip(next) {
             let len = p.distance(q);
             // At most 500 scallops a side, so a huge cloud stays cheap to draw.
             let n = ((len / SCALLOP).round() as usize).clamp(1, 500);
@@ -148,8 +157,8 @@ impl RevisionCloud {
             },
             Shape::Text {
                 at: Point::new(mid, base - 0.6),
-                text: fit(&self.revision, TAG_SIZE + 2.0),
-                height: 2.0,
+                text: self.revision.clone(),
+                height: fit_height(&self.revision, TAG_SIZE * 0.6, 2.0),
                 align: Align::Center,
                 angle: 0.0,
             },
@@ -223,12 +232,18 @@ pub fn table_shapes(revisions: &[Revision], at: Point) -> Vec<Shape> {
     for (r, texts) in row_texts.enumerate() {
         let baseline = at.y + TABLE_ROW * (r as f64 + 1.0) - (TABLE_ROW - TEXT) / 2.0 - 0.3;
         let mut x = at.x;
-        for (t, (_, w)) in texts.iter().zip(TABLE_COLUMNS) {
+        for (c, (t, (_, w))) in texts.iter().zip(TABLE_COLUMNS).enumerate() {
             if !t.is_empty() {
+                // The revision letter is shrunk to fit, never cut; other columns are cut.
+                let (text, height) = if c == 0 && r > 0 {
+                    (t.clone(), fit_height(t, w - 2.0, TEXT))
+                } else {
+                    (fit(t, w), TEXT)
+                };
                 out.push(Shape::Text {
                     at: Point::new(x + 1.0, baseline),
-                    text: fit(t, w),
-                    height: TEXT,
+                    text,
+                    height,
                     align: Align::Left,
                     angle: 0.0,
                 });
@@ -500,6 +515,40 @@ mod tests {
         assert!(c.hit(Point::new(25.0, 20.0), 0.5), "on the top side");
         assert!(!c.hit(Point::new(25.0, 26.0), 0.5), "inside the area");
         assert!(!c.hit(Point::new(80.0, 26.0), 0.5), "far off");
+    }
+
+    #[test]
+    fn control_characters_around_a_letter_do_not_hide_it() {
+        let mut p = project();
+        p.add_revision("\u{1} A \u{1}", "", "", "").unwrap();
+        assert_eq!(p.meta.revisions[0].letter, "A");
+        assert!(p.add_revision("A", "", "", "").is_err(), "the same letter again");
+        assert!(p.edit_revision("A", "x", "", "").unwrap());
+        p.remove_revision("A").unwrap();
+    }
+
+    #[test]
+    fn long_letters_are_shrunk_not_cut() {
+        let mut p = project();
+        p.add_revision("ABCDEFGH", "", "", "").unwrap();
+        p.add_revision("ABCDEFGI", "", "", "").unwrap();
+        let texts = |shapes: Vec<Shape>| -> Vec<(String, f64)> {
+            shapes
+                .into_iter()
+                .filter_map(|s| match s {
+                    Shape::Text { text, height, .. } => Some((text, height)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let table = texts(table_shapes(&p.meta.revisions, Point::new(0.0, 0.0)));
+        assert!(table.iter().any(|(t, h)| t == "ABCDEFGH" && *h < TEXT));
+        assert!(table.iter().any(|(t, _)| t == "ABCDEFGI"));
+        for l in ["ABCDEFGH", "ABCDEFGI"] {
+            let tag = texts(RevisionCloud::new(Point::new(0.0, 0.0), Point::new(9.0, 9.0), l).tag());
+            assert_eq!(tag[0].0, l);
+            assert!(tag[0].1 * 0.6 * 8.0 <= TAG_SIZE * 0.6 + 1e-9, "fits the triangle");
+        }
     }
 
     #[test]

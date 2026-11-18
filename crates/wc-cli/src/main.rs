@@ -1368,17 +1368,28 @@ fn run(cli: Cli) -> Res<()> {
             match rc {
                 RevisionCmd::List => {
                     for r in &p.meta.revisions {
-                        println!("{}\t{}\t{}\t{}", r.letter, r.date, r.author, r.text);
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            escape_field(&r.letter),
+                            escape_field(&r.date),
+                            escape_field(&r.author),
+                            escape_field(&r.text)
+                        );
                     }
                     for pg in &p.pages {
                         for (i, c) in pg.clouds.iter().enumerate() {
                             println!(
                                 "page {} cloud {i}: revision {} at {:.1},{:.1} to {:.1},{:.1}",
-                                pg.id, c.revision, c.min.x, c.min.y, c.max.x, c.max.y
+                                escape_field(&pg.id),
+                                escape_field(&c.revision),
+                                c.min.x,
+                                c.min.y,
+                                c.max.x,
+                                c.max.y
                             );
                         }
                         if let Some(at) = pg.revision_table {
-                            println!("page {} table at {:.1},{:.1}", pg.id, at.x, at.y);
+                            println!("page {} table at {:.1},{:.1}", escape_field(&pg.id), at.x, at.y);
                         }
                     }
                 }

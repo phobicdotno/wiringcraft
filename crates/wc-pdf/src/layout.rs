@@ -798,10 +798,11 @@ pub fn draw_page(
         }
         pen.end_layer();
     }
-    for (number, letter) in project.clouds_without_revision() {
-        if number == page.number {
+    for c in &page.clouds {
+        if project.revision(&c.revision).is_none() {
             warnings.push(format!(
-                "page {number}: a cloud carries revision {letter}, which the project does not list"
+                "page {}: a cloud carries revision {}, which the project does not list",
+                page.number, c.revision
             ));
         }
     }
