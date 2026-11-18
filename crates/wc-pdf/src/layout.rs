@@ -408,12 +408,28 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
     for (b, (l, t, r, bottom)) in &boxes {
         let top = ty + t;
         let bottom = ty + bottom;
+        // A box shorter than its layout (a low band) has the whole layout squeezed into it:
+        // every baseline and text height scaled alike, so texts keep apart as they are at full
+        // height instead of piling up on the box's foot.
+        let deepest = b
+            .texts
+            .iter()
+            .map(|bt| bt.y)
+            .chain(b.logo.then_some(LOGO_BASELINE))
+            .fold(LABEL_BASELINE, f64::max);
+        let squeeze = ((bottom - top - BELOW_BASELINE) / deepest).clamp(0.0, 1.0);
         // Labels and values never reach past their box: they shrink to fit, and a box too narrow
         // for any text shows none.
         let label_room = r - l - 2.0 * PAD;
-        if label_room > 0.0 {
-            let h = fit_height(&b.label, 1.8, label_room);
-            text((l + PAD, top + 3.0), h, Align::Left, &b.label, Ink::Label, &mut out);
+        if label_room > 0.0
+            && let Some((y, h)) = fit_in_box(
+                top,
+                bottom,
+                top + LABEL_BASELINE * squeeze,
+                fit_height(&b.label, 1.8, label_room) * squeeze,
+            )
+        {
+            text((l + PAD, y), h, Align::Left, &b.label, Ink::Label, &mut out);
         }
         // Each value is shrunk to the width of its box (less padding), so a long one never runs
         // into the next box or over the frame.
@@ -428,7 +444,12 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
             if room <= 0.0 {
                 continue;
             }
-            let Some((y, h)) = fit_in_box(top, bottom, top + bt.y, fit_height(&shown, bt.size, room)) else {
+            let Some((y, h)) = fit_in_box(
+                top,
+                bottom,
+                top + bt.y * squeeze,
+                fit_height(&shown, bt.size, room) * squeeze,
+            ) else {
                 continue;
             };
             text((x, y), h, bt.align, &shown, Ink::Thin, &mut out);
@@ -439,8 +460,8 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
             && let Some((y, h)) = fit_in_box(
                 top,
                 bottom,
-                top + 9.5,
-                fit_height("WiringCraft", 2.0, r - l - 2.0 * PAD),
+                top + LOGO_BASELINE * squeeze,
+                fit_height("WiringCraft", 2.0, r - l - 2.0 * PAD) * squeeze,
             )
         {
             text(((l + r) / 2.0, y), h, Align::Center, "WiringCraft", Ink::Thin, &mut out);
@@ -454,6 +475,10 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
 
 /// Room kept between a title-block text's baseline and the bottom of its box, for descenders.
 const BELOW_BASELINE: f64 = 0.8;
+/// A title-block box's label baseline, below the box's top.
+const LABEL_BASELINE: f64 = 3.0;
+/// The baseline of "WiringCraft" in a logo box of a project without a logo, below its top.
+const LOGO_BASELINE: f64 = 9.5;
 
 /// Where text of height `h` with its baseline at `y` goes in a title-block box from `top` to
 /// `bottom`: moved up to stay inside it, and shrunk when the box is too short for it.
@@ -1491,6 +1516,56 @@ mod template_tests {
             }
         }
         assert!(seen > 0, "the title block shows its texts");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_lowest_title_block_squeezes_its_texts_without_overprinting() {
+        let (mut p, page) = demo(PageSize::A3, true);
+        p.meta.name = "Pump station".into();
+        let (_, h) = page.size.mm();
+        let y1 = h - MARGIN;
+        let band = wc_core::template::MIN_TITLE_HEIGHT;
+        p.meta.template = PageTemplate {
+            height: band,
+            ..Default::default()
+        };
+        let ty = y1 - band;
+        let marks = frame_marks(&p, &page, 0, 1, "");
+        // Every title-block text as the rectangle it covers.
+        let rects: Vec<(String, f64, f64, f64, f64)> = marks
+            .iter()
+            .filter_map(|m| match &m.shape {
+                Shape::Text {
+                    at,
+                    text,
+                    height,
+                    align,
+                    ..
+                } if at.y > ty => {
+                    let w = crate::text_width_mm(text, *height);
+                    let left = match align {
+                        Align::Left => at.x,
+                        Align::Center => at.x - w / 2.0,
+                        Align::Right => at.x - w,
+                    };
+                    Some((text.clone(), left, left + w, at.y - height, at.y))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(rects.iter().any(|r| r.0 == "Pump station"), "{rects:?}");
+        assert!(rects.iter().any(|r| r.0 == page.title), "{rects:?}");
+        for (i, a) in rects.iter().enumerate() {
+            assert!(
+                a.3 >= ty - 1e-9 && a.4 <= y1 - BELOW_BASELINE + 1e-9,
+                "{a:?} leaves the band"
+            );
+            for b in &rects[i + 1..] {
+                let apart = a.2 <= b.1 + 1e-9 || b.2 <= a.1 + 1e-9 || a.4 <= b.3 + 1e-9 || b.4 <= a.3 + 1e-9;
+                assert!(apart, "{a:?} overprints {b:?}");
+            }
+        }
     }
 
     fn texts(marks: &[FrameMark]) -> Vec<(String, f64)> {
