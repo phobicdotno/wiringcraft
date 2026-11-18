@@ -843,12 +843,13 @@ struct HeldGuard {
 
 impl AppTools<'_> {
     /// In a shared session, what a tool's change is checked against: the pages someone else
-    /// holds, and the state to go back to. `None` when nobody holds a page, and for `undo`,
-    /// which the session's host carries out and checks itself.
+    /// holds, and the state to go back to. `None` when nobody holds a page, for `undo`, which
+    /// the session's host carries out and checks itself, and for `open_project`, which
+    /// replaces the project instead of changing it.
     fn held_guard(&self, name: &str) -> Option<HeldGuard> {
         let open = self.0.open.as_ref()?;
         let held = open.held_pages();
-        (!held.is_empty() && name != "undo").then(|| HeldGuard {
+        (!held.is_empty() && !matches!(name, "undo" | "open_project")).then(|| HeldGuard {
             dir: open.dir.clone(),
             held,
             mark: open.mark(),
@@ -4189,5 +4190,30 @@ mod tests {
         a.open.as_mut().unwrap().held_by_others.clear();
         call(&mut a, "delete_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
         assert!(page2(&a).graphics.is_empty());
+
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        // Opening another project (with the same page ids) is not taken for a change to this
+        // one: the new project stays as it was opened.
+        let other = _tmp.path().join("other");
+        let r = call(
+            &mut a,
+            "open_project",
+            json!({"path": other.to_string_lossy(), "create": true, "name": "Other"}),
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(
+            (open.dir.as_path(), open.project.meta.name.as_str()),
+            (other.as_path(), "Other")
+        );
+        assert_eq!(
+            open.project,
+            wc_core::store::load(&other).unwrap(),
+            "nothing of the old project in it"
+        );
     }
 }
