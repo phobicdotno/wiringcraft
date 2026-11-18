@@ -84,6 +84,9 @@ enum Dialog {
         title: String,
         size: PageSize,
         overview: bool,
+        /// The page's own title-block fields, key and value, as the form shows them; a blank
+        /// value shows the project's as a hint and is not stored.
+        fields: Vec<(String, String)>,
         error: Option<String>,
     },
     DeletePage(usize),
@@ -664,6 +667,14 @@ impl App {
                         title: p.title.clone(),
                         size: p.size,
                         overview: p.overview,
+                        fields: p
+                            .title_field_keys()
+                            .into_iter()
+                            .map(|k| {
+                                let v = p.title_block.get(&k).cloned().unwrap_or_default();
+                                (k, v)
+                            })
+                            .collect(),
                         error: None,
                     });
                 }
@@ -1417,8 +1428,14 @@ impl App {
                     title,
                     size,
                     overview,
+                    fields,
                     error,
                 } => {
+                    let project_fields = self
+                        .open
+                        .as_ref()
+                        .map(|o| o.project.meta.title_block.clone())
+                        .unwrap_or_default();
                     egui::Grid::new("pageprops")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
@@ -1444,6 +1461,25 @@ impl App {
                             );
                             ui.end_row();
                         });
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Title block on this page").strong()).on_hover_text(
+                        "Values here win over the project's on this page only. Leave a field empty to show the project's value (shown greyed).",
+                    );
+                    egui::Grid::new("pagefields")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            for (key, value) in fields.iter_mut() {
+                                ui.label(wc_core::project::title_field_label(key));
+                                let hint = project_fields.get(key.as_str()).map_or("", String::as_str);
+                                ui.add(
+                                    egui::TextEdit::singleline(value)
+                                        .hint_text(hint)
+                                        .desired_width(200.0),
+                                );
+                                ui.end_row();
+                            }
+                        });
                     if let Some(e) = error {
                         ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
                     }
@@ -1451,7 +1487,8 @@ impl App {
                         if ui.button("OK").clicked()
                             && let Some(o) = self.open.as_mut()
                         {
-                            match confirm_page_props(o, &self.ed, id, number, title, *size, *overview)
+                            let own: std::collections::BTreeMap<String, String> = fields.iter().cloned().collect();
+                            match confirm_page_props(o, &self.ed, id, number, title, *size, *overview, &own)
                             {
                                 Ok(i) => {
                                     self.ed.page = i;
@@ -2909,6 +2946,7 @@ impl App {
 
 /// The page properties dialog's OK: refused when the page was removed, or when someone else
 /// opened it while the dialog was open.
+#[allow(clippy::too_many_arguments)]
 fn confirm_page_props(
     o: &mut Open,
     ed: &Editor,
@@ -2917,6 +2955,7 @@ fn confirm_page_props(
     title: &str,
     size: wc_core::PageSize,
     overview: bool,
+    fields: &std::collections::BTreeMap<String, String>,
 ) -> Result<usize, String> {
     let i = o
         .project
@@ -2929,7 +2968,7 @@ fn confirm_page_props(
             "{name} has this page open; it is read-only here until they leave it."
         ));
     }
-    o.set_page_props(i, number, title, size, overview)
+    o.set_page_props(i, number, title, size, overview, Some(fields))
 }
 
 /// Who holds the page action `a` would change, in a shared session: then it is refused. Page

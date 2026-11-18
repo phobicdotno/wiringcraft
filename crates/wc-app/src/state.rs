@@ -1126,7 +1126,9 @@ impl Open {
         self.project.pages.iter().position(|p| p.id == id).unwrap_or(0)
     }
 
-    /// Change a page's number, title and size. A number another page already uses is refused.
+    /// Change a page's number, title and size, and with `fields` its own title-block fields
+    /// (key to value; a blank value clears the field so the project's shows again, a key left
+    /// out is kept). A number another page already uses is refused. All of it is one undo step.
     pub fn set_page_props(
         &mut self,
         page: usize,
@@ -1134,6 +1136,7 @@ impl Open {
         title: &str,
         size: PageSize,
         overview: bool,
+        fields: Option<&BTreeMap<String, String>>,
     ) -> Result<usize, String> {
         let number = number.trim();
         if number.is_empty() {
@@ -1146,7 +1149,16 @@ impl Open {
         if self.project.pages.iter().any(|p| p.number == number && p.id != id) {
             return Err(format!("Page {number} already exists."));
         }
-        if current.number == number && current.title == title && current.size == size && current.overview == overview {
+        let mut own = current.clone();
+        for (k, v) in fields.into_iter().flatten() {
+            own.set_title_field(k, v);
+        }
+        if current.number == number
+            && current.title == title
+            && current.size == size
+            && current.overview == overview
+            && current.title_block == own.title_block
+        {
             return Ok(page);
         }
         self.checkpoint();
@@ -1155,6 +1167,7 @@ impl Open {
             p.title = title.trim().to_owned();
             p.size = size;
             p.overview = overview;
+            p.title_block = own.title_block;
         }
         self.project.sort_pages();
         Ok(self.index_of(&id))
@@ -2859,12 +2872,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_pages_own_title_fields_are_one_undo_step_and_saved() {
+        let (_tmp, mut o) = project();
+        o.project.meta.title_block.insert("revision".into(), "A".into());
+        let p = o.project.pages[1].clone();
+        let mut fields = BTreeMap::new();
+        fields.insert("revision".to_owned(), " B ".to_owned());
+        fields.insert("checked_by".to_owned(), "OH".to_owned());
+        let i = o
+            .set_page_props(1, &p.number, "Renamed", p.size, p.overview, Some(&fields))
+            .unwrap();
+        let page = &o.project.pages[i];
+        assert_eq!(page.title_field(&o.project.meta, "revision"), "B");
+        assert_eq!(page.title_block["checked_by"], "OH");
+        o.save().unwrap();
+        let disk = store::load(&o.dir).unwrap();
+        assert_eq!(
+            disk.pages[i].title_block, o.project.pages[i].title_block,
+            "saved in the page file"
+        );
+
+        // Clearing a field falls back to the project's; a key left out is kept.
+        let mut clear = BTreeMap::new();
+        clear.insert("revision".to_owned(), String::new());
+        o.set_page_props(i, &p.number, "Renamed", p.size, p.overview, Some(&clear))
+            .unwrap();
+        let page = &o.project.pages[i];
+        assert_eq!(page.title_field(&o.project.meta, "revision"), "A");
+        assert_eq!(page.title_block.get("checked_by").map(String::as_str), Some("OH"));
+        // The same values again change nothing and record nothing.
+        let mark = o.undo_mark();
+        o.set_page_props(i, &p.number, "Renamed", p.size, p.overview, Some(&clear))
+            .unwrap();
+        assert_eq!(o.undo_mark(), mark);
+
+        // Each change was one undo step: title and fields go back together.
+        assert!(o.undo());
+        assert_eq!(
+            o.project.pages[i].title_block.get("revision").map(String::as_str),
+            Some("B")
+        );
+        assert!(o.undo());
+        assert_eq!(o.project.pages[i].title, p.title);
+        assert!(o.project.pages[i].title_block.is_empty());
+    }
+
+    #[test]
     fn pages_can_be_renamed_moved_duplicated_and_deleted() {
         let (_tmp, mut o) = project();
         assert_eq!(o.project.pages.len(), 2);
         // Renumbering resorts; a taken number is refused.
-        assert!(o.set_page_props(0, "2", "Cover", PageSize::A3, false).is_err());
-        let i = o.set_page_props(0, "10", "Cover sheet", PageSize::A4, true).unwrap();
+        assert!(o.set_page_props(0, "2", "Cover", PageSize::A3, false, None).is_err());
+        let i = o
+            .set_page_props(0, "10", "Cover sheet", PageSize::A4, true, None)
+            .unwrap();
         assert!(o.project.pages[i].overview);
         assert_eq!(i, 1);
         assert_eq!(o.project.pages[1].title, "Cover sheet");

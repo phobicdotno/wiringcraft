@@ -337,8 +337,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_page",
-            "Change a page's number, title or sheet size, mark it as an overview (a line diagram: its devices do not count as drawings in the project check), or make it the project's cover page (it shows the project's name and fields; any other cover page loses the mark).",
-            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}, "overview": {"type": "boolean"}, "cover": {"type": "boolean"}}),
+            "Change a page's number, title or sheet size, mark it as an overview (a line diagram: its devices do not count as drawings in the project check), make it the project's cover page (it shows the project's name and fields; any other cover page loses the mark), or set the page's own title-block fields (get_page lists them).",
+            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "enum": ["A4", "A3", "A2"]}, "overview": {"type": "boolean"}, "cover": {"type": "boolean"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "The page's own title-block fields to change, such as revision, date, drawn_by, checked_by. They win over the project's on this page. An empty text or null clears a field so the project's shows again; fields left out are kept."}}),
             &[],
         ),
         tool(
@@ -1081,7 +1081,7 @@ impl App {
                 let cur = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 let number = s(v, "number").unwrap_or(&cur.number).to_owned();
                 let title = s(v, "title").unwrap_or(&cur.title).to_owned();
-                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size), cur.overview)?;
+                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size), cur.overview, None)?;
                 let p = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 self.go_to(i);
                 Ok(format!("Added page {} ({}), id {}.", p.number, p.title, p.id))
@@ -1091,12 +1091,26 @@ impl App {
                 let size = page_size(v)?;
                 let open = need_open(self.open.as_mut())?;
                 let cur = open.project.pages.get(page).cloned().ok_or("No such page.")?;
+                let fields = match v.get("title_block") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Object(map)) => Some(
+                        map.iter()
+                            .map(|(k, val)| match val {
+                                Value::String(t) => Ok((k.clone(), t.clone())),
+                                Value::Null => Ok((k.clone(), String::new())),
+                                _ => Err(format!("title_block.{k} must be a text, or empty or null to clear it")),
+                            })
+                            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?,
+                    ),
+                    Some(_) => return Err("title_block must be an object of field names and texts.".into()),
+                };
                 let i = open.set_page_props(
                     page,
                     s(v, "number").unwrap_or(&cur.number),
                     s(v, "title").unwrap_or(&cur.title),
                     size.unwrap_or(cur.size),
                     v.get("overview").and_then(Value::as_bool).unwrap_or(cur.overview),
+                    fields.as_ref(),
                 )?;
                 if let Some(cover) = v.get("cover").and_then(Value::as_bool) {
                     open.set_page_cover(i, cover)?;
@@ -2444,7 +2458,16 @@ mod tests {
         // A page properties dialog opened before the page became held cannot change it.
         let id = schematic.id.clone();
         let o = a.open.as_mut().unwrap();
-        let refused = crate::confirm_page_props(o, &a.ed, &id, "99", "Renamed", schematic.size, false);
+        let refused = crate::confirm_page_props(
+            o,
+            &a.ed,
+            &id,
+            "99",
+            "Renamed",
+            schematic.size,
+            false,
+            &Default::default(),
+        );
         assert!(refused.is_err_and(|e| e.contains("Ola")));
         assert_eq!(o.project.pages[0], schematic);
         assert!(status(&a, Action::ArrangePanel), "the panel's own actions work");
@@ -3070,6 +3093,41 @@ mod tests {
         content["title_block"] = json!({});
         call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
         assert!(page2(&a).title_block.is_empty());
+    }
+
+    #[test]
+    fn the_assistant_sets_and_clears_a_pages_own_title_fields() {
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "update_page",
+            json!({"page": "p0002", "title_block": {"revision": "C", "checked_by": "OH"}}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).title_block["revision"], "C");
+        let content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        assert_eq!(content["title_block"]["checked_by"], json!("OH"), "get_page lists them");
+        // Null or an empty text clears a field; one left out is kept.
+        call(
+            &mut a,
+            "update_page",
+            json!({"page": "p0002", "title_block": {"revision": null}}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).title_block.get("revision"), None);
+        assert_eq!(page2(&a).title_block["checked_by"], "OH");
+        let refused = call(
+            &mut a,
+            "update_page",
+            json!({"page": "p0002", "title_block": {"date": 5}}),
+        );
+        assert!(refused.is_err_and(|e| e.contains("title_block.date")));
+        assert_eq!(
+            page2(&a).title_block["checked_by"],
+            "OH",
+            "a refused change changes nothing"
+        );
     }
 
     #[test]
