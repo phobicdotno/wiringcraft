@@ -236,9 +236,10 @@ fn shapes(
         Point::new(x * scale, -y * scale)
     };
     let r_scale = xf.sx.abs() * scale;
-    for e in ents {
+    for (i, e) in ents.iter().enumerate() {
         if *budget == 0 {
-            *skipped.entry(OVER_LIMIT.to_owned()).or_default() += 1;
+            // This entity and every one after it at this level are left out.
+            *skipped.entry(OVER_LIMIT.to_owned()).or_default() += ents.len() - i;
             return;
         }
         *budget -= 1;
@@ -1388,6 +1389,19 @@ mod tests {
         );
         let (g, _) = drawn("0\nINSERT\n2\nB\n10\n0\n20\n0\n", blocks)?;
         assert!(matches!(&g[..], [Shape::Text { angle, .. }] if *angle == 0.0), "{g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn every_entity_past_the_budget_is_counted() -> Result<()> {
+        let line = "0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
+        let d = parse(&dxf(&line.repeat(5), ""))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = 2;
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut budget);
+        assert_eq!(shapes.len(), 2);
+        assert_eq!(skipped.get(OVER_LIMIT), Some(&3), "{skipped:?}");
+        assert_eq!(budget, 0);
         Ok(())
     }
 
