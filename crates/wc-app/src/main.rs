@@ -125,7 +125,15 @@ enum Dialog {
     },
     /// Macros to insert.
     Macros(Vec<state::MacroEntry>),
-    /// Library, Import symbols: the library folders to import into and the one chosen.
+    /// File > Import without a file picker: the file (and, for parts with no folder chosen,
+    /// the library folder) typed, and why the picker could not be used.
+    ImportPath {
+        kind: imports::Kind,
+        target: Option<import_symbols::ImportTarget>,
+        file: prefs::FolderField,
+        lib: prefs::FolderField,
+        error: Option<String>,
+    },
     /// Parts import: the library folder to write into, then the file.
     ImportParts {
         kind: imports::Kind,
@@ -133,6 +141,7 @@ enum Dialog {
         /// An index into `targets`; one past the end is another folder, picked after the file.
         chosen: usize,
     },
+    /// Library, Import symbols: the library folders to import into and the one chosen.
     ImportSymbols {
         targets: Vec<import_symbols::ImportTarget>,
         chosen: usize,
@@ -630,11 +639,19 @@ impl App {
             ));
             return;
         }
-        let Some(open) = self.open.as_mut() else { return };
+        let Some(open) = self.open.as_ref() else { return };
+        let typed = |file: String, why: String| Dialog::ImportPath {
+            kind,
+            target: target.clone(),
+            file: prefs::FolderField::typed(file),
+            lib: prefs::FolderField::default(),
+            error: Some(why),
+        };
         let file = match pick_open(kind.title(), &open.dir, kind.filter()) {
             Picked::Path(f) => f,
+            // Without a picker the path can still be typed.
             Picked::Failed(e) => {
-                self.dialog = Some(Dialog::Message(format!("{e}\n\nNothing was imported.")));
+                self.dialog = Some(typed(String::new(), e));
                 return;
             }
             Picked::Cancelled => return,
@@ -646,7 +663,7 @@ impl App {
             match pick_folder("Library folder for the imported parts", &start) {
                 Picked::Path(d) => Some(d),
                 Picked::Failed(e) => {
-                    self.dialog = Some(Dialog::Message(format!("{e}\n\nNothing was imported.")));
+                    self.dialog = Some(typed(file.display().to_string(), e));
                     return;
                 }
                 Picked::Cancelled => return,
@@ -654,7 +671,20 @@ impl App {
         } else {
             None
         };
-        let (done, msg) = imports::import(open, kind, &file, lib.as_deref(), self.ed.page);
+        self.import_from(kind, &file, lib.as_deref(), target);
+    }
+
+    /// Run the import of `file` (parts into `lib`) and show what it said; `target` is the
+    /// library folder chosen in the parts dialog, declared in the project when it is new.
+    fn import_from(
+        &mut self,
+        kind: imports::Kind,
+        file: &Path,
+        lib: Option<&Path>,
+        target: Option<import_symbols::ImportTarget>,
+    ) {
+        let Some(open) = self.open.as_mut() else { return };
+        let (done, msg) = imports::import(open, kind, file, lib, self.ed.page);
         // The project's own folder is listed first once parts are in it, as for symbols.
         if done && let Some(source) = target.and_then(|t| t.declare) {
             open.checkpoint();
@@ -1257,6 +1287,7 @@ impl App {
             Dialog::Macros(_) => "Insert macro",
             Dialog::ImportSymbols { .. } => "Import symbols",
             Dialog::ImportParts { .. } => "Import parts",
+            Dialog::ImportPath { .. } => "Import",
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
@@ -2227,6 +2258,47 @@ impl App {
                         }
                     });
                 }
+                Dialog::ImportPath {
+                    kind,
+                    target,
+                    file,
+                    lib,
+                    error,
+                } => {
+                    ui.label(kind.title());
+                    let (label, extensions) = kind.filter();
+                    ui.label(format!("File ({label}: .{}), full path:", extensions.join(", .")));
+                    let r = ui.add(egui::TextEdit::singleline(&mut file.text).desired_width(380.0));
+                    let ask_lib = kind.needs_library() && target.is_none();
+                    if ask_lib {
+                        ui.label("Library folder for the parts:");
+                        ui.add(egui::TextEdit::singleline(&mut lib.text).desired_width(380.0));
+                    }
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        let go = ui.button("Import").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
+                        if go {
+                            let folder = if ask_lib { lib.path().map(Some) } else { Ok(None) };
+                            match file.path().and_then(|f| folder.map(|l| (f, l))) {
+                                Ok((f, _)) if !f.is_file() => *error = Some(format!("{} is not a file.", f.display())),
+                                Ok((f, l)) => {
+                                    let (kind, target) = (*kind, target.clone());
+                                    let l = l.or_else(|| target.as_ref().map(|t| t.root.clone()));
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        app.import_from(kind, &f, l.as_deref(), target);
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::ImportParts { kind, targets, chosen } => {
                     ui.label(kind.title());
                     ui.horizontal(|ui| {
@@ -2630,10 +2702,6 @@ fn main_viewport() -> egui::ViewportBuilder {
         .with_icon(window_icon())
 }
 
-/// The project's library folders that symbols can be written into, in the project's order (the
-/// first is its own). Only folders: a git source is a cache that the next sync overwrites. Each
-/// source is paired with its declaration by position (`Library::open` keeps the order), so a git
-/// source sharing a folder's name is never offered.
 /// Where imported symbols or parts can go: the project's own library folder first, then its
 /// other library folders ([`import_symbols::targets`]).
 fn library_targets(lib: &wc_library::Library, open: &Open) -> Vec<import_symbols::ImportTarget> {
@@ -2641,6 +2709,10 @@ fn library_targets(lib: &wc_library::Library, open: &Open) -> Vec<import_symbols
     import_symbols::targets(&open.dir, folder_targets(lib, open), &taken)
 }
 
+/// The project's library folders that symbols can be written into, in the project's order (the
+/// first is its own). Only folders: a git source is a cache that the next sync overwrites. Each
+/// source is paired with its declaration by position (`Library::open` keeps the order), so a git
+/// source sharing a folder's name is never offered.
 fn folder_targets(lib: &wc_library::Library, open: &Open) -> Vec<symbol_editor::Target> {
     lib.sources
         .iter()

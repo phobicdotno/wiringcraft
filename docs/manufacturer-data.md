@@ -30,17 +30,21 @@ From `crates/wc-import`:
 
 In the app, **File → Import** (and the ribbon's Import tab) runs the same project and parts
 imports as `wiringcraft import`, through the same code: EPLAN project (`.elk` or a zip of it),
-SolidWorks Electrical project (`.tewzip`) and libraries, AutomationML, a DWG drawing onto the
-current page, PDF pages, a project archive, and parts from EDZ, BMEcat and CSV. Each opens the
-system file picker filtered to the format's extensions. Parts imports first ask for the library
-folder, like Import symbols: the project's own `library/` (added to the project's libraries
-once parts are in it), one of its other library folders, or another folder picked with the
-folder picker. Messages that name a command line option are worded for the app. Changes not saved yet are saved first, the imported pages and devices come
-in as one undo step, and the import's report and warnings are shown when it is done. New pages
-are numbered from the CLI's default first page, or after the project's highest page number when
-that is higher. The app imports the first project of a SolidWorks archive with its own page
-numbers and no symbol map, and an archive's KiCad libraries and parts lists are listed, not
-imported; use the CLI for `--pick`, `--symbol-map`, `--first-page` and `--lib` there.
+SolidWorks Electrical project (`.tewzip`) and libraries, AutomationML, a DWG or DXF drawing onto
+the current page, PLC addresses from a CSV list, PDF pages, a project archive (zip), and parts
+from EDZ, BMEcat and CSV. Each opens the system file picker filtered to the format's extensions.
+Parts imports first ask for the library folder, like Import symbols: the project's own
+`library/` (added to the project's libraries once parts are in it), one of its other library
+folders, or another folder picked with the folder picker. Where the picker cannot open (Linux
+without a desktop portal), the file and folder are typed into a dialog instead. Messages that
+name a command line option are worded for the app.
+
+Changes not saved yet are saved first, the imported pages and devices come in as one undo step,
+and the import's report and warnings are shown when it is done. New pages are numbered from the
+CLI's default first page, or after the project's highest page number when that is higher. The
+app imports the first project of a SolidWorks archive with its own page numbers and no symbol
+map, and an archive's KiCad libraries and parts lists are listed, not imported; use the CLI for
+`--pick`, `--symbol-map`, `--first-page` and `--lib` there.
 
 In the app, **Library → Import symbols…** takes DXF, SVG, `.kicad_sym` and `.elmt` files together,
 each read by its extension, and writes them into one of the project's library folders. The

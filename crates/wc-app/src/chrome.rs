@@ -45,6 +45,8 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::ImportSweLibrary),
             Some(Action::ImportAml),
             Some(Action::ImportPageDwg),
+            Some(Action::ImportPageDxf),
+            Some(Action::ImportPlcCsv),
             Some(Action::ImportPdf),
             Some(Action::ImportArchive),
             Some(Action::ImportPartsEdz),

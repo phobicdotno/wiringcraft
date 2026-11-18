@@ -17,6 +17,8 @@ pub enum Kind {
     SweLibrary,
     Aml,
     PageDwg,
+    PageDxf,
+    PlcCsv,
     Pdf,
     Archive,
     PartsEdz,
@@ -33,6 +35,8 @@ impl Kind {
             Action::ImportSweLibrary => Kind::SweLibrary,
             Action::ImportAml => Kind::Aml,
             Action::ImportPageDwg => Kind::PageDwg,
+            Action::ImportPageDxf => Kind::PageDxf,
+            Action::ImportPlcCsv => Kind::PlcCsv,
             Action::ImportPdf => Kind::Pdf,
             Action::ImportArchive => Kind::Archive,
             Action::ImportPartsEdz => Kind::PartsEdz,
@@ -50,6 +54,8 @@ impl Kind {
             Kind::SweLibrary => "Import the libraries of a SolidWorks Electrical archive",
             Kind::Aml => "Import AutomationML",
             Kind::PageDwg => "Import a DWG drawing onto the current page",
+            Kind::PageDxf => "Import a DXF drawing onto the current page",
+            Kind::PlcCsv => "Import PLC addresses from a CSV list",
             Kind::Pdf => "Import PDF pages",
             Kind::Archive => "Import another tool's project archive",
             Kind::PartsEdz => "Import parts from an EDZ file",
@@ -66,8 +72,10 @@ impl Kind {
             Kind::SweLibrary => ("SolidWorks Electrical archive", &["tewzip"]),
             Kind::Aml => ("AutomationML", &["aml", "xml"]),
             Kind::PageDwg => ("DWG drawing", &["dwg"]),
+            Kind::PageDxf => ("DXF drawing", &["dxf"]),
+            Kind::PlcCsv => ("CSV list", &["csv", "txt"]),
             Kind::Pdf => ("PDF", &["pdf"]),
-            Kind::Archive => ("Project archive", &["zip", "7z"]),
+            Kind::Archive => ("Project archive", &["zip"]),
             Kind::PartsEdz => ("EPLAN Data Exchange", &["edz"]),
             Kind::PartsBmecat => ("BMEcat catalogue", &["xml"]),
             Kind::PartsCsv => ("CSV list", &["csv", "txt"]),
@@ -145,7 +153,9 @@ pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page
                     Kind::Aml => run::aml(&dir, file, first, &mut log),
                     Kind::Pdf => run::pdf(&dir, file, first, &mut log),
                     Kind::Archive => run::archive(&dir, file, first, None, &mut log),
+                    Kind::PlcCsv => run::plc_csv(&dir, file, &mut log),
                     _ => match open.project.pages.get(page) {
+                        Some(pg) if kind == Kind::PageDxf => run::page_dxf(&dir, file, &pg.id.clone(), 1.0, &mut log),
                         Some(pg) => {
                             let id = pg.id.clone();
                             let converter = std::env::var("WIRINGCRAFT_DWG2DXF").ok();
@@ -184,12 +194,16 @@ pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page
 fn app_wording(text: &str) -> String {
     const SAID: &[(&str, &str)] = &[
         (
+            "remove it or import with --first-page to number the pages from a free number",
+            "remove or renumber that page, then import again",
+        ),
+        (
             "import with --first-page to number the pages from a free number",
-            "renumber or remove the project's pages in the way, then import again",
+            "renumber the page that has it, then import again",
         ),
         (
             "pick another --first-page",
-            "renumber or remove that page, then import again",
+            "remove or renumber that page, then import again",
         ),
         (" (use --pick)", ""),
         (
@@ -212,7 +226,7 @@ mod tests {
     #[test]
     fn every_import_action_has_a_kind_and_a_filter() {
         let kinds: Vec<Kind> = Action::ALL.iter().filter_map(|a| Kind::of(*a)).collect();
-        assert_eq!(kinds.len(), 10);
+        assert_eq!(kinds.len(), 12);
         for k in kinds {
             let (label, extensions) = k.filter();
             assert!(!label.is_empty() && !extensions.is_empty(), "{k:?}");
@@ -291,15 +305,30 @@ mod tests {
     }
 
     #[test]
+    fn a_dxf_drawing_goes_onto_the_current_page() {
+        let (tmp, mut open) = project();
+        let page = open.add_page();
+        let dxf = tmp.path().join("plan.dxf");
+        let text = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n0\n0\nENDSEC\n0\nEOF\n";
+        assert!(std::fs::write(&dxf, text).is_ok());
+        let (done, msg) = import(&mut open, Kind::PageDxf, &dxf, None, page);
+        assert!(done, "{msg}");
+        let shapes = open.project.pages.get(page).map_or(0, |pg| pg.graphics.len());
+        assert_eq!(shapes, 1, "{msg}");
+    }
+
+    #[test]
     fn advice_names_no_command_line_option() {
         for said in [
             "page number 5 is taken; import with --first-page to number the pages from a free number",
+            "page dxf-300 exists; remove it or import with --first-page to number the pages from a free number",
             "page pdf-200 exists; pick another --first-page",
             "no project 2 in the archive (use --pick)",
             "warning: a.kicad_sym: KiCad symbols, not imported: pass --lib <folder>",
             "no importable PDF, DXF, AutomationML, KiCad symbols or CSV lists inside; run `wiringcraft inspect` to see what is there",
         ] {
             let app = app_wording(said);
+            assert!(!app.contains("remove it or"), "{app}");
             assert!(!app.contains("--") && !app.contains("wiringcraft"), "{app}");
         }
     }
