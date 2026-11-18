@@ -126,10 +126,17 @@ fn noise(n: usize, mut seed: u32) -> Vec<u8> {
 
 // ---- A DWG writer for the tests ----
 
+#[derive(Default)]
 struct TestSection {
     name: &'static str,
     data: Vec<u8>,
     encrypted: bool,
+    /// Pages stored without compression.
+    stored: bool,
+    /// How many more times the section map lists each page (a hostile file).
+    listed_again: usize,
+    /// Added to each page's decompressed size in its header (a damaged file).
+    claimed_extra: u32,
 }
 
 const MAX_PAGE_DATA: usize = 0x7400;
@@ -170,10 +177,10 @@ fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> {
     for (index, section) in sections.iter().enumerate() {
         let chunks: Vec<&[u8]> = section.data.chunks(MAX_PAGE_DATA).collect();
         map.extend((section.data.len() as u64).to_le_bytes());
-        map.extend((chunks.len() as u32).to_le_bytes());
+        map.extend(((chunks.len() * (1 + section.listed_again)) as u32).to_le_bytes());
         map.extend((MAX_PAGE_DATA as u32).to_le_bytes());
         map.extend(1u32.to_le_bytes());
-        map.extend(2u32.to_le_bytes());
+        map.extend(if section.stored { 1u32 } else { 2 }.to_le_bytes());
         map.extend((index as u32 + 1).to_le_bytes());
         map.extend(u32::from(section.encrypted).to_le_bytes());
         let mut name = [0u8; 64];
@@ -184,13 +191,17 @@ fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> {
             let number = next_page;
             next_page += 1;
             let address = file.len() as u64;
-            let packed = compress(chunk);
+            let packed = if section.stored {
+                chunk.to_vec()
+            } else {
+                compress(chunk)
+            };
             let mut head = Vec::new();
             for word in [
                 DATA_PAGE,
                 index as u32 + 1,
                 packed.len() as u32,
-                chunk.len() as u32,
+                chunk.len() as u32 + section.claimed_extra,
                 start as u32,
                 0,
                 0,
@@ -201,9 +212,11 @@ fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> {
             let mut page = unscramble_page_header(&head, address);
             page.extend(&packed);
             pad32(&mut page);
-            map.extend(number.to_le_bytes());
-            map.extend((packed.len() as u32).to_le_bytes());
-            map.extend(start.to_le_bytes());
+            for _ in 0..=section.listed_again {
+                map.extend(number.to_le_bytes());
+                map.extend((packed.len() as u32).to_le_bytes());
+                map.extend(start.to_le_bytes());
+            }
             page_sizes.push((number as i32, page.len() as i32));
             file.extend(page);
             start += chunk.len() as u64;
@@ -255,26 +268,31 @@ fn sample_sections() -> Vec<TestSection> {
             name: "AcDb:Header",
             data: b"header variables: $INSUNITS=4 $LTSCALE=1.0".repeat(3),
             encrypted: false,
+            ..TestSection::default()
         },
         TestSection {
             name: "AcDb:Classes",
             data: noise(300, 3),
             encrypted: false,
+            ..TestSection::default()
         },
         TestSection {
             name: "AcDb:SummaryInfo",
             data: b"secret summary".to_vec(),
             encrypted: true,
+            ..TestSection::default()
         },
         TestSection {
             name: "AcDb:Handles",
             data: Vec::new(),
             encrypted: false,
+            ..TestSection::default()
         },
         TestSection {
             name: "AcDb:AcDbObjects",
             data: objects,
             encrypted: false,
+            ..TestSection::default()
         },
     ]
 }
@@ -426,4 +444,48 @@ fn cut_or_flipped_files_give_errors_not_panics() {
         damaged[at] = 0xFF;
         let _ = read_sections(&damaged);
     }
+}
+
+#[test]
+fn stored_pages_are_read_and_a_short_one_is_refused() -> TestResult {
+    let section = |claimed_extra| TestSection {
+        name: "AcDb:Classes",
+        data: noise(300, 3),
+        stored: true,
+        claimed_extra,
+        ..TestSection::default()
+    };
+    let read = read_sections(&write_dwg(b"AC1024", &[section(0)]))?;
+    assert_eq!(read.get("AcDb:Classes"), Some(noise(300, 3).as_slice()));
+    // The header says the page holds 8 bytes more than are stored.
+    let message = read_sections(&write_dwg(b"AC1024", &[section(8)])).map_err(|e| e.to_string());
+    assert!(
+        message.as_ref().is_err_and(|m| m.contains("fewer bytes")),
+        "{message:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_page_listed_many_times_cannot_make_endless_work() -> TestResult {
+    let section = |listed_again| TestSection {
+        name: "AcDb:AcDbObjects",
+        data: b"WiringCraft ".repeat(MAX_PAGE_DATA / 12),
+        listed_again,
+        ..TestSection::default()
+    };
+    let budget = 4 * MAX_PAGE_DATA;
+    // Listed four times, the page fits the budget (each copy lands at the same place).
+    let read = read_sections_with(&write_dwg(b"AC1024", &[section(3)]), budget)?;
+    assert_eq!(
+        read.get("AcDb:AcDbObjects").map(<[u8]>::len),
+        Some(section(0).data.len())
+    );
+    // Listed five times, the fifth decompression is refused before it starts.
+    let message = read_sections_with(&write_dwg(b"AC1024", &[section(4)]), budget).map_err(|e| e.to_string());
+    assert!(
+        message.as_ref().is_err_and(|m| m.contains("decompress to too much")),
+        "{message:?}"
+    );
+    Ok(())
 }

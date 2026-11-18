@@ -24,7 +24,8 @@ use crate::{Error, Result};
 /// The most a single page may decompress to, in bytes.
 pub const MAX_PAGE: usize = 64 * 1024 * 1024;
 /// The most all sections of a file may hold in all, in bytes, so a small hostile file cannot
-/// fill the memory.
+/// fill the memory. It also bounds the work: all the pages a file's sections list may
+/// decompress to this much in all, so a page listed many times cannot keep the reader busy.
 pub const MAX_TOTAL: usize = 512 * 1024 * 1024;
 /// The most pages a file may have.
 pub const MAX_PAGES: usize = 1_000_000;
@@ -110,6 +111,12 @@ pub fn version(bytes: &[u8]) -> Result<Version> {
 
 /// Read the named sections of a DWG file of a supported version.
 pub fn read_sections(bytes: &[u8]) -> Result<Sections> {
+    read_sections_with(bytes, MAX_TOTAL)
+}
+
+/// [`read_sections`] with another bound than [`MAX_TOTAL`] on what the sections may hold and
+/// their pages may decompress to, in bytes.
+pub fn read_sections_with(bytes: &[u8], max_total: usize) -> Result<Sections> {
     let version = version(bytes)?;
     let header = second_header(bytes)?;
     let page_map_at = header
@@ -127,7 +134,7 @@ pub fn read_sections(bytes: &[u8]) -> Result<Sections> {
         ))
     })?;
     let section_map = system_page(bytes, section_map_at, SECTION_MAP, "section map")?;
-    read_section_map(bytes, &section_map, &pages, version)
+    read_section_map(bytes, &section_map, &pages, version, max_total)
 }
 
 /// Unscramble the second header and check it is one.
@@ -213,13 +220,21 @@ fn parse_page_map(map: &[u8], file_len: usize) -> Result<BTreeMap<u32, u64>> {
 }
 
 /// Read every section the decompressed section map describes.
-fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u32, u64>, version: Version) -> Result<Sections> {
+fn read_section_map(
+    bytes: &[u8],
+    map: &[u8],
+    pages: &BTreeMap<u32, u64>,
+    version: Version,
+    max_total: usize,
+) -> Result<Sections> {
     let r = Reader(map);
     let count = r.u32(0)? as usize;
     let mut pos = 0x14;
     let mut sections = Vec::new();
     let mut skipped = Vec::new();
     let mut total = 0usize;
+    // What the pages may still decompress to.
+    let mut budget = max_total;
     for _ in 0..count {
         let size = r.u64(pos)?;
         let page_count = r.u32(pos + 0x08)? as usize;
@@ -230,7 +245,7 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u32, u64>, versio
         pos += SECTION_DESCRIPTION;
         let size = usize::try_from(size)
             .ok()
-            .filter(|s| total.checked_add(*s).is_some_and(|t| t <= MAX_TOTAL))
+            .filter(|s| total.checked_add(*s).is_some_and(|t| t <= max_total))
             .ok_or_else(|| bad(format!("section {name} is too large")))?;
         let list_len = page_count
             .checked_mul(16)
@@ -252,12 +267,12 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u32, u64>, versio
                     "section {name} uses page {number}, which is not in the page map"
                 ))
             })?;
-            let page = data_page(bytes, address, compressed)
-                .map_err(|e| bad(format!("section {name}, page {number}: {e}")))?;
             let start = usize::try_from(start)
                 .ok()
                 .filter(|s| *s <= size)
                 .ok_or_else(|| bad(format!("section {name}, page {number} starts past its end")))?;
+            let page = data_page(bytes, address, compressed, &mut budget)
+                .map_err(|e| bad(format!("section {name}, page {number}: {e}")))?;
             let end = start.saturating_add(page.len()).min(size);
             if data.len() < end {
                 data.resize(end, 0);
@@ -278,7 +293,8 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u32, u64>, versio
 }
 
 /// Read one data page at `address`: unscramble its header, check it, and decompress it.
-fn data_page(bytes: &[u8], address: u64, compressed: u32) -> Result<Vec<u8>> {
+/// Each page's decompressed size is taken from `budget` before it is decompressed.
+fn data_page(bytes: &[u8], address: u64, compressed: u32, budget: &mut usize) -> Result<Vec<u8>> {
     let start = offset(address, bytes.len(), "data page")?;
     let raw = bytes
         .get(start..start.saturating_add(DATA_PAGE_HEADER))
@@ -289,13 +305,19 @@ fn data_page(bytes: &[u8], address: u64, compressed: u32) -> Result<Vec<u8>> {
     }
     let data_size = head.u32(0x08)? as usize;
     let page_size = to_usize(head.u32(0x0C)?, MAX_PAGE, "page")?;
+    *budget = budget
+        .checked_sub(page_size)
+        .ok_or_else(|| bad("the file's pages decompress to too much"))?;
     let data_at = start + DATA_PAGE_HEADER;
     let data = bytes
         .get(data_at..data_at.saturating_add(data_size))
         .ok_or_else(|| bad("the page's data is cut off"))?;
     match compressed {
         2 => decompress(data, page_size),
-        1 => Ok(data.iter().take(page_size).copied().collect()),
+        1 => data
+            .get(..page_size)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| bad("the page holds fewer bytes than its header says")),
         c => Err(bad(format!("unknown compression {c}"))),
     }
 }
