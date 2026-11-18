@@ -149,9 +149,11 @@ enum Cmd {
         #[arg(long, default_value = "")]
         date: String,
     },
-    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, locations) as a table, CSV or Markdown.
+    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, locations) as a table, CSV or Markdown,
+    /// or save it as an Excel workbook (`--format xlsx --out <file>`, one sheet per report).
     Report {
         kind: String,
+        /// `text`, `csv`, `md` or `xlsx`.
         #[arg(long, default_value = "text")]
         format: String,
         /// Write to a file instead of standard output.
@@ -519,8 +521,9 @@ enum ImportCmd {
         #[arg(long, default_value = "")]
         letter_code: String,
     },
-    /// PLC addresses from a CSV list (device and address columns, description optional), as a
-    /// PLC tool or spreadsheet writes it. `report plc --format csv` writes one that reads back.
+    /// PLC addresses from a CSV list or an Excel workbook (device and address columns,
+    /// description optional), as a PLC tool or spreadsheet writes it. `report plc --format csv`
+    /// (or `xlsx`) writes one that reads back.
     PlcCsv { file: PathBuf },
     /// The WAGO configurator list back: a list written by `export wago-configurator`, with the
     /// articles and accessories chosen in the configurator. Each row is matched by its Index to
@@ -584,7 +587,8 @@ enum ImportCmd {
         #[arg(long, default_value = "")]
         letter_code: String,
     },
-    /// Parts from a CSV or semicolon-separated export (Excel "Save as CSV").
+    /// Parts from a CSV or semicolon-separated export, or straight from an Excel workbook
+    /// (`.xlsx`, its first visible sheet), with the same column names either way.
     PartsCsv {
         file: PathBuf,
         #[arg(long)]
@@ -1523,14 +1527,25 @@ fn run(cli: Cli) -> Res<()> {
                 symbols: &symbols,
                 parts: &parts,
             };
+            let kinds = report_kinds(std::slice::from_ref(&kind))?;
+            if format == "xlsx" {
+                let Some(path) = out else {
+                    return Err("an Excel workbook is not text: pass --out <file>.xlsx".into());
+                };
+                let tables: Vec<wc_report::Table> = kinds.iter().map(|k| wc_report::build(*k, &inputs)).collect();
+                let refs: Vec<&wc_report::Table> = tables.iter().collect();
+                let bytes = wc_report::xlsx::workbook(&refs).map_err(e)?;
+                std::fs::write(&path, bytes).map_err(e)?;
+                return Ok(());
+            }
             let mut text = String::new();
-            for k in report_kinds(std::slice::from_ref(&kind))? {
+            for k in kinds {
                 let t = wc_report::build(k, &inputs);
                 text.push_str(&match format.as_str() {
                     "csv" => t.to_csv(),
                     "md" | "markdown" => t.to_markdown(),
                     "text" => plain_table(&t),
-                    other => return Err(format!("unknown format {other:?} (text, csv, md)")),
+                    other => return Err(format!("unknown format {other:?} (text, csv, md, xlsx)")),
                 });
                 text.push('\n');
             }
@@ -1828,7 +1843,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         ImportCmd::PlcCsv { file } => {
             let mut p = load(dir)?;
             let bytes = std::fs::read(&file).map_err(e)?;
-            let (rows, warnings) = wc_import::csv::plc_addresses(&wc_import::csv::decode(&bytes)).map_err(e)?;
+            let (rows, warnings) = wc_import::csv::file_rows(&bytes)
+                .and_then(|rows| wc_import::csv::plc_addresses_from_rows(&rows))
+                .map_err(e)?;
             for w in warnings {
                 eprintln!("warning: {w}");
             }
@@ -1865,7 +1882,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
         ImportCmd::PartsCsv { file, lib } => {
             let bytes = std::fs::read(&file).map_err(e)?;
-            let (parts, warnings) = wc_import::csv::parts(&wc_import::csv::decode(&bytes)).map_err(e)?;
+            let (parts, warnings) = wc_import::csv::file_rows(&bytes)
+                .and_then(|rows| wc_import::csv::parts_from_rows(&rows))
+                .map_err(e)?;
             for p in &parts {
                 wc_library::write_part(&lib, p).map_err(e)?;
             }
@@ -2075,12 +2094,19 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let bytes = std::fs::read(&file).map_err(e)?;
             let entries = wc_import::archive::open_entries(
                 &bytes,
-                &[Kind::Pdf, Kind::Dxf, Kind::AutomationMl, Kind::KicadSymbols, Kind::Csv],
+                &[
+                    Kind::Pdf,
+                    Kind::Dxf,
+                    Kind::AutomationMl,
+                    Kind::KicadSymbols,
+                    Kind::Csv,
+                    Kind::Spreadsheet,
+                ],
             )
             .map_err(e)?;
             if entries.is_empty() {
                 return Err(
-                    "no importable PDF, DXF, AutomationML, KiCad symbols or CSV lists inside; run `wiringcraft inspect` to see what is there"
+                    "no importable PDF, DXF, AutomationML, KiCad symbols, CSV lists or Excel lists inside; run `wiringcraft inspect` to see what is there"
                         .into(),
                 );
             }
@@ -2094,8 +2120,11 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 .into_iter()
                 .map(|(raw, kind, data)| ((escape_field(&raw), raw), kind, data))
                 .collect();
-            // CSV lists come last, so PLC addresses reach devices that pages in the same archive add.
-            let (csvs, entries): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, kind, _)| *kind == Kind::Csv);
+            // CSV and Excel lists come last, so PLC addresses reach devices that pages in the same
+            // archive add.
+            let (csvs, entries): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|(_, kind, _)| matches!(kind, Kind::Csv | Kind::Spreadsheet));
             // Two entries with the same file name would write the same ids over each other.
             let mut prefixes = std::collections::BTreeSet::new();
             for (raw, _, data) in symbols {
@@ -2216,8 +2245,16 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             for (i, ((name, _), _, data)) in csvs.into_iter().enumerate() {
                 println!("{name}:");
                 // Told apart by header, the same column names `plc-csv` and `parts-csv` read.
-                let path = tmp.join(format!("list-{i}.csv"));
-                let cmd = match wc_import::csv::kind(&wc_import::csv::decode(&data)) {
+                let rows = match wc_import::csv::file_rows(&data) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        eprintln!("warning: {name}: {err}");
+                        continue;
+                    }
+                };
+                let ext = if wc_import::xlsx::is_xlsx(&data) { "xlsx" } else { "csv" };
+                let path = tmp.join(format!("list-{i}.{ext}"));
+                let cmd = match wc_import::csv::kind_of_rows(&rows) {
                     Some(wc_import::csv::CsvKind::PlcAddresses) => ImportCmd::PlcCsv { file: path.clone() },
                     Some(wc_import::csv::CsvKind::Parts) => match &lib {
                         Some(lib) => ImportCmd::PartsCsv {
@@ -5767,6 +5804,75 @@ mod tests {
             z.finish().unwrap();
         }
         cli(&dir, &["import", "archive", only.to_str().unwrap()]).unwrap();
+    }
+
+    #[test]
+    fn excel_workbooks_import_parts_and_reports_save_as_xlsx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // A workbook is binary: it needs a file.
+        assert!(cli(&dir, &["report", "all", "--format", "xlsx"]).is_err());
+        let out = tmp.path().join("reports.xlsx");
+        cli(
+            &dir,
+            &["report", "all", "--format", "xlsx", "--out", out.to_str().unwrap()],
+        )
+        .unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(wc_import::xlsx::is_xlsx(&bytes));
+        // One sheet per report, the first one with its header row.
+        assert!(!wc_import::xlsx::rows(&bytes).unwrap().is_empty());
+        let z = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+        let sheets = z.file_names().filter(|n| n.starts_with("xl/worksheets/")).count();
+        assert_eq!(sheets, wc_report::Kind::ALL.len());
+
+        let list = wc_report::Table {
+            title: "Parts".into(),
+            columns: vec!["Manufacturer".into(), "Order number".into(), "Description".into()],
+            rows: vec![vec!["Acme".into(), "R-24".into(), "Relay".into()]],
+            ..wc_report::Table::default()
+        };
+        let xlsx = list.to_xlsx().unwrap();
+        let file = tmp.path().join("parts.xlsx");
+        std::fs::write(&file, &xlsx).unwrap();
+        let lib = tmp.path().join("lib");
+        cli(
+            &dir,
+            &[
+                "import",
+                "parts-csv",
+                file.to_str().unwrap(),
+                "--lib",
+                lib.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_dir(lib.join("parts")).unwrap().count(), 1);
+
+        // Inside an archive, an Excel list is told apart by its header like a CSV list.
+        use std::io::Write;
+        let zipped = tmp.path().join("vendor.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&zipped).unwrap());
+            z.start_file("lists/parts.xlsx", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(&xlsx).unwrap();
+            z.finish().unwrap();
+        }
+        let lib2 = tmp.path().join("lib2");
+        cli(
+            &dir,
+            &[
+                "import",
+                "archive",
+                zipped.to_str().unwrap(),
+                "--lib",
+                lib2.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_dir(lib2.join("parts")).unwrap().count(), 1);
     }
 
     #[test]

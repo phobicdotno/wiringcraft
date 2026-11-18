@@ -3839,6 +3839,7 @@ name = "wc-report"
 version = "0.1.0"
 dependencies = [
  "wc-core",
+ "zip",
 ]
 
 [[package]]

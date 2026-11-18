@@ -1,5 +1,5 @@
 //! Parts lists and PLC address lists from CSV, as written by spreadsheet programs and most
-//! CAD/ERP/PLC exports.
+//! CAD/ERP/PLC exports, or from Excel workbooks through [`file_rows`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -116,7 +116,12 @@ pub fn kind(text: &str) -> Option<CsvKind> {
     // The same header the readers take: the first record that is not blank, quoted line
     // breaks and all.
     let first_line = text.lines().next().unwrap_or("");
-    let header = records(text, guess_delimiter(first_line)).into_iter().next()?;
+    kind_of_rows(&records(text, guess_delimiter(first_line)))
+}
+
+/// [`kind`] for rows already split into cells, such as an Excel worksheet's.
+pub fn kind_of_rows(rows: &[Vec<String>]) -> Option<CsvKind> {
+    let header = rows.first()?;
     let plc: Vec<PlcCol> = header.iter().map(|h| classify_plc(h)).collect();
     if plc.contains(&PlcCol::Tag) && plc.contains(&PlcCol::Address) {
         return Some(CsvKind::PlcAddresses);
@@ -127,11 +132,31 @@ pub fn kind(text: &str) -> Option<CsvKind> {
         .then_some(CsvKind::Parts)
 }
 
+/// The rows of a list file: an Excel workbook (`.xlsx`, its first visible sheet) or CSV text in
+/// any of the encodings [`decode`] reads. An old binary `.xls` workbook is refused with a hint.
+pub fn file_rows(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
+    if crate::xlsx::is_xlsx(bytes) {
+        return crate::xlsx::rows(bytes);
+    }
+    if crate::xlsx::is_legacy_xls(bytes) {
+        return Err(Error::Format(
+            "this is an old Excel .xls workbook; save it as .xlsx or CSV and import that".into(),
+        ));
+    }
+    let text = decode(bytes);
+    let first_line = text.lines().next().unwrap_or("");
+    Ok(records(&text, guess_delimiter(first_line)))
+}
+
 /// Parse a parts list. The first row is the header; columns are matched by name (several
 /// languages), anything unrecognised becomes a part property. Returns parts and warnings.
 pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
     let first_line = text.lines().next().unwrap_or("");
-    let rows = records(text, guess_delimiter(first_line));
+    parts_from_rows(&records(text, guess_delimiter(first_line)))
+}
+
+/// [`parts`] for rows already split into cells: an Excel worksheet's, or [`file_rows`]'.
+pub fn parts_from_rows(rows: &[Vec<String>]) -> Result<(Vec<Part>, Vec<String>)> {
     let Some((header, body)) = rows.split_first() else {
         return Err(Error::Format("the file is empty".into()));
     };
@@ -214,7 +239,11 @@ fn classify_plc(h: &str) -> PlcCol {
 /// reads back unchanged. Returns the rows and warnings for rows that were skipped.
 pub fn plc_addresses(text: &str) -> Result<(Vec<PlcAddress>, Vec<String>)> {
     let first_line = text.lines().next().unwrap_or("");
-    let rows = records(text, guess_delimiter(first_line));
+    plc_addresses_from_rows(&records(text, guess_delimiter(first_line)))
+}
+
+/// [`plc_addresses`] for rows already split into cells: an Excel worksheet's, or [`file_rows`]'.
+pub fn plc_addresses_from_rows(rows: &[Vec<String>]) -> Result<(Vec<PlcAddress>, Vec<String>)> {
     let Some((header, body)) = rows.split_first() else {
         return Err(Error::Format("the file is empty".into()));
     };
