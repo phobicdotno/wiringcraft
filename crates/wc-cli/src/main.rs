@@ -1745,56 +1745,11 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             println!("imported {} part(s) into {}", parts.len(), lib.display());
         }
         ImportCmd::Pdf { file, first_page } => {
-            let mut p = load(dir)?;
-            let bytes = std::fs::read(&file).map_err(e)?;
-            let traced = wc_import::pdf::pages(&bytes).map_err(e)?;
-            let stem = file
-                .file_stem()
-                .map(|n| n.to_string_lossy().into_owned())
+            let source = file
+                .file_name()
+                .map(|n| escape_field(&n.to_string_lossy()))
                 .unwrap_or_default();
-            for (i, t) in traced.into_iter().enumerate() {
-                let id = format!("pdf-{}", first_page + i);
-                if p.page(&id).is_some() {
-                    return Err(format!("page {id} exists; pick another --first-page"));
-                }
-                if t.graphics.is_empty() && t.scan.is_none() {
-                    let why = t.scan_problem.as_deref().unwrap_or("no picture covers the page");
-                    eprintln!(
-                        "warning: page {} of {stem} has no vector content and no usable scan ({why})",
-                        i + 1,
-                    );
-                }
-                let underlay = match &t.scan {
-                    Some(scan) => {
-                        let file = format!("{}/{id}.{}", wc_core::Underlay::DIR, scan.raster.format.extension());
-                        std::fs::create_dir_all(dir.join(wc_core::Underlay::DIR)).map_err(e)?;
-                        std::fs::write(dir.join(&file), &scan.raster.bytes).map_err(e)?;
-                        println!(
-                            "page {}: scanned sheet saved as {file}, shown under the page",
-                            first_page + i
-                        );
-                        Some(wc_core::Underlay {
-                            file,
-                            min: scan.min,
-                            max: scan.max,
-                        })
-                    }
-                    None => None,
-                };
-                let mut page = Page::new(id, (first_page + i).to_string(), format!("{stem} p.{}", i + 1));
-                page.underlay = underlay;
-                let (size, why) = sheet_for(t.size_mm);
-                if let Some(why) = why {
-                    // Named by the page it became: in an archive, `stem` is a staging name.
-                    eprintln!("warning: page {} (PDF page {}): {why}", first_page + i, i + 1);
-                }
-                page.size = size;
-                println!("page {}: {} shapes", page.number, t.graphics.len());
-                page.graphics = t.graphics;
-                p.pages.push(page);
-            }
-            p.sort_pages();
-            save(dir, &p)?;
+            import_pdf(dir, &file, first_page, &source)?;
         }
         ImportCmd::Eplan { path, first_page } => {
             let mut p = load(dir)?;
@@ -1991,6 +1946,11 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 &[Kind::Pdf, Kind::Dxf, Kind::AutomationMl, Kind::KicadSymbols, Kind::Csv],
             )
             .map_err(e)?;
+            // Entry names are printed: written so a name cannot send the terminal control sequences.
+            let entries: Vec<_> = entries
+                .into_iter()
+                .map(|(name, kind, data)| (escape_field(&name), kind, data))
+                .collect();
             if entries.is_empty() {
                 return Err(
                     "no importable PDF, DXF, AutomationML, KiCad symbols or CSV lists inside; run `wiringcraft inspect` to see what is there"
@@ -2049,13 +2009,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 let r = match kind {
                     Kind::Pdf => {
                         let n = wc_import::pdf::pages(&data).map(|p| p.len()).unwrap_or(0);
-                        let r = import_cmd(
-                            dir,
-                            ImportCmd::Pdf {
-                                file: path.clone(),
-                                first_page: next,
-                            },
-                        );
+                        let r = import_pdf(dir, &path, next, &name);
                         next += n.max(1);
                         r
                     }
@@ -2238,6 +2192,63 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             println!("imported {n_g} shapes and {n_s} symbols onto page {page}");
         }
     }
+    Ok(())
+}
+
+/// `import pdf`: the pages of `file` as trace pages numbered from `first_page`. `source` names
+/// the PDF in warnings (the file name, or the entry name inside an archive, where `file` is a
+/// staging file), already escaped with [`escape_field`] by the caller.
+fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str) -> Result<(), String> {
+    let mut p = load(dir)?;
+    let bytes = std::fs::read(file).map_err(e)?;
+    let traced = wc_import::pdf::pages(&bytes).map_err(e)?;
+    let stem = file
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for (i, t) in traced.into_iter().enumerate() {
+        let id = format!("pdf-{}", first_page + i);
+        if p.page(&id).is_some() {
+            return Err(format!("page {id} exists; pick another --first-page"));
+        }
+        if t.graphics.is_empty() && t.scan.is_none() {
+            let why = t.scan_problem.as_deref().unwrap_or("no picture covers the page");
+            eprintln!(
+                "warning: {} page {}: no vector content and no usable scan ({why})",
+                source,
+                i + 1,
+            );
+        }
+        let underlay = match &t.scan {
+            Some(scan) => {
+                let file = format!("{}/{id}.{}", wc_core::Underlay::DIR, scan.raster.format.extension());
+                std::fs::create_dir_all(dir.join(wc_core::Underlay::DIR)).map_err(e)?;
+                std::fs::write(dir.join(&file), &scan.raster.bytes).map_err(e)?;
+                println!(
+                    "page {}: scanned sheet saved as {file}, shown under the page",
+                    first_page + i
+                );
+                Some(wc_core::Underlay {
+                    file,
+                    min: scan.min,
+                    max: scan.max,
+                })
+            }
+            None => None,
+        };
+        let mut page = Page::new(id, (first_page + i).to_string(), format!("{stem} p.{}", i + 1));
+        page.underlay = underlay;
+        let (size, why) = sheet_for(t.size_mm);
+        if let Some(why) = why {
+            eprintln!("warning: page {} ({} page {}): {why}", first_page + i, source, i + 1);
+        }
+        page.size = size;
+        println!("page {}: {} shapes", page.number, t.graphics.len());
+        page.graphics = t.graphics;
+        p.pages.push(page);
+    }
+    p.sort_pages();
+    save(dir, &p)?;
     Ok(())
 }
 
