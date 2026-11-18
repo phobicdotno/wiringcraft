@@ -11,10 +11,18 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// A journal the test can look at.
 #[derive(Clone, Default)]
-struct Log(Rc<RefCell<Vec<Change>>>, Rc<std::cell::Cell<bool>>);
+struct Log(
+    Rc<RefCell<Vec<Change>>>,
+    Rc<std::cell::Cell<bool>>,
+    Rc<std::cell::Cell<bool>>,
+);
 
 impl Journal for Log {
+    /// Fails for a guest's change while [`Log::fail_guests`] is set.
     fn record(&mut self, _project: &Project, change: &Change) -> wc_share::Result<()> {
+        if self.2.get() && change.by != wc_share::HOST {
+            return Err(std::io::Error::other("the history is read-only").into());
+        }
         self.0.borrow_mut().push(change.clone());
         Ok(())
     }
@@ -31,6 +39,10 @@ impl Journal for Log {
 impl Log {
     fn fail_vendor(&self, fail: bool) {
         self.1.set(fail);
+    }
+
+    fn fail_guests(&self, fail: bool) {
+        self.2.set(fail);
     }
 
     fn messages(&self) -> Vec<String> {
@@ -2899,6 +2911,117 @@ fn a_picture_picked_here_under_a_session_name_is_kept_and_shared_under_a_name_of
 }
 
 #[test]
+fn a_picked_picture_whose_change_the_session_refused_is_neither_renamed_nor_shared() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // The session has a picture brand.png that its drawings do not use.
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_sharing(
+        tmp.path(),
+        |_| Ok(()),
+        [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
+    )?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The guest picks its own picture of that name as the logo, and sends that; the session
+    // will refuse it.
+    log.fail_guests(true);
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // Meanwhile the host makes the session's picture of that name its logo: once the guest's
+    // change is refused, the logo here is the session's.
+    let theirs = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    host_open.project.meta.logo = theirs.clone();
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(host_open.project.meta.logo, theirs, "{:?}", g.notes);
+    assert_eq!(guest_open.project.meta.logo, theirs, "not renamed: {:?}", g.notes);
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, mine, "kept");
+    assert_eq!(
+        h.role.as_ref().map(|r| r.pictures().len()),
+        Some(1),
+        "nothing of this copy's was shared"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_picture_renamed_for_some_references_leaves_the_others() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(tmp.path())?;
+    std::fs::create_dir_all(open.dir.join("pictures"))?;
+    std::fs::write(open.dir.join("pictures/brand.png"), PNG)?;
+    let file = "pictures/brand.png".to_owned();
+    open.project.meta.logo = Some(wc_core::Logo {
+        file: file.clone(),
+        cover: None,
+    });
+    let id = open.project.pages[1].id.clone();
+    open.project.pages[1].underlay = Some(wc_core::Underlay {
+        file: file.clone(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(10.0, 10.0),
+    });
+    let new = rename_picture(&mut open, &file, Some(&[PicRef::Logo].into()))?;
+    assert_eq!(
+        open.project.meta.logo.as_ref().map(|l| l.file.as_str()),
+        Some(new.as_str())
+    );
+    assert_eq!(
+        open.project
+            .page(&id)
+            .and_then(|p| p.underlay.as_ref())
+            .map(|u| u.file.as_str()),
+        Some(file.as_str()),
+        "the reference not picked keeps its file"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_pick_refused_or_pointed_elsewhere_is_withdrawn_with_its_waiting_rename() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(tmp.path())?;
+    let id = open.project.pages[1].id.clone();
+    let (a, b) = ("pictures/a.png".to_owned(), "pictures/b.png".to_owned());
+    open.project.meta.logo = Some(wc_core::Logo {
+        file: a.clone(),
+        cover: None,
+    });
+    open.project.pages[1].underlay = Some(wc_core::Underlay {
+        file: a.clone(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(10.0, 10.0),
+    });
+    let mut picks: BTreeMap<String, BTreeSet<PicRef>> = [
+        (a.clone(), [PicRef::Logo, PicRef::Underlay(id.clone())].into()),
+        (b.clone(), [PicRef::Logo].into()),
+    ]
+    .into();
+    let now = std::time::Instant::now();
+    let mut due: BTreeMap<String, std::time::Instant> = [(a.clone(), now), (b.clone(), now)].into();
+    let mut clashes = vec![a.clone(), b.clone()];
+    // The logo's change was refused: a.png keeps its underlay pick; b.png's logo names a.png.
+    let gone = withdraw_picks(&mut picks, &mut due, &mut clashes, &open, (BTreeSet::new(), true));
+    assert_eq!(gone, [b.clone()].into());
+    assert_eq!(picks, [(a.clone(), [PicRef::Underlay(id.clone())].into())].into());
+    assert_eq!(clashes, std::slice::from_ref(&a));
+    assert!(due.contains_key(&a) && !due.contains_key(&b));
+    // Then the underlay's page: nothing is left to rename.
+    let gone = withdraw_picks(&mut picks, &mut due, &mut clashes, &open, ([id].into(), false));
+    assert_eq!(gone, [a].into());
+    assert!(picks.is_empty() && clashes.is_empty() && due.is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_file_here_under_the_name_of_a_picture_the_session_uses_is_kept_and_not_shared() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(
@@ -3006,6 +3129,63 @@ fn a_picture_that_could_not_be_written_is_tried_again_only_after_a_while() -> Te
         .collect();
     assert_eq!(notes.len(), 1, "named once: {notes:?}");
     assert!(notes[0].contains("could not be written"), "{}", notes[0]);
+    Ok(())
+}
+
+#[test]
+fn a_picture_picked_while_the_sessions_of_that_name_waits_to_be_written_gets_a_name_of_its_own() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        std::fs::create_dir_all(o.dir.join("pictures"))?;
+        std::fs::write(o.dir.join("pictures/brand.png"), PNG)?;
+        o.project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/brand.png".into(),
+            cover: None,
+        });
+        Ok(())
+    })?;
+    // A folder stands where the session's picture goes, so writing it fails.
+    let target = guest_open.dir.join("pictures/brand.png");
+    std::fs::create_dir_all(&target)?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // While it waits to be tried again, the guest puts a picture of its own there and picks it
+    // under its own page: that change reaches the session.
+    std::fs::remove_dir(&target)?;
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::write(&target, &mine)?;
+    guest_open.project.page_mut("p0003").ok_or("no page")?.underlay = Some(wc_core::Underlay {
+        file: "pictures/brand.png".into(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(100.0, 100.0),
+    });
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // Once the session's picture is compared again, the pick gets a name of its own.
+    std::thread::sleep(ITEM_RETRY_LATER + std::time::Duration::from_millis(50));
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let file = guest_open
+        .project
+        .page("p0003")
+        .and_then(|p| p.underlay.as_ref())
+        .map(|u| u.file.clone())
+        .ok_or("no underlay")?;
+    assert_ne!(file, "pictures/brand.png", "{:?}", g.notes);
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, mine);
+    assert_eq!(
+        host_open
+            .project
+            .page("p0003")
+            .and_then(|p| p.underlay.as_ref())
+            .map(|u| u.file.clone()),
+        Some(file.clone())
+    );
+    assert_eq!(file_bytes(&host_open.dir, &file)?, mine);
+    assert_eq!(
+        guest_open.project.meta.logo.as_ref().map(|l| l.file.as_str()),
+        Some("pictures/brand.png"),
+        "the session's logo keeps its name"
+    );
     Ok(())
 }
 
@@ -4077,7 +4257,7 @@ fn a_picture_renamed_for_the_session_keeps_its_name_within_255_bytes() -> TestRe
         file: file.clone(),
         cover: None,
     });
-    let new = rename_picture(&mut open, &file)?;
+    let new = rename_picture(&mut open, &file, None)?;
     let name = new.rsplit('/').next().ok_or("no name")?;
     assert!(name.len() <= 255 && name.ends_with(".png"), "{name}");
     assert_eq!(std::fs::read(open.dir.join(&new))?, PNG);

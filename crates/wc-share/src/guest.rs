@@ -90,6 +90,12 @@ pub struct Guest {
     /// set there meanwhile is kept and goes out), and drops a page the session no longer has.
     /// A page the change set without renumbering it (a device rename, say) keeps its number.
     pub retaken_numbers: BTreeMap<String, String>,
+    /// Pages a refused change of this guest's touched, and whether it touched the project's
+    /// settings (`meta`): the host's version came back for them. The window drops a picture
+    /// pick it made there (a logo or an underlay), as the reference is the host's again. Taken
+    /// by whoever shows the project.
+    pub refused_pages: std::collections::BTreeSet<String>,
+    pub refused_meta: bool,
 }
 
 impl Default for Guest {
@@ -124,6 +130,8 @@ impl Guest {
             retaken: Vec::new(),
             retaken_records: crate::Parts::default(),
             retaken_numbers: BTreeMap::new(),
+            refused_pages: std::collections::BTreeSet::new(),
+            refused_meta: false,
         }
     }
 
@@ -425,6 +433,11 @@ impl Guest {
                     self.answered(page);
                 }
                 whole.extend(own.iter().cloned());
+                self.refused_pages.extend(whole.iter().cloned());
+                if let Some(parts) = &put_back {
+                    self.refused_pages.extend(parts.pages.keys().cloned());
+                    self.refused_meta |= parts.meta.is_some();
+                }
                 if let Some(parts) = put_back {
                     if !own.is_empty() {
                         // The own pages are put back by id (`retaken`), and only the numbers

@@ -1289,6 +1289,69 @@ pub fn used_pictures(project: &Project) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// A reference to a picture in a project: the logo, or a page's underlay (by page id).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PicRef {
+    Logo,
+    Underlay(String),
+}
+
+/// The picture `r` names in `project`, if any.
+fn pic_ref_file<'a>(project: &'a Project, r: &PicRef) -> Option<&'a str> {
+    match r {
+        PicRef::Logo => project.meta.logo.as_ref().map(|l| l.file.as_str()),
+        PicRef::Underlay(id) => project.page(id)?.underlay.as_ref().map(|u| u.file.as_str()),
+    }
+}
+
+/// Every picture reference in `project`, with the file it names.
+fn pic_refs(project: &Project) -> Vec<(PicRef, String)> {
+    project
+        .meta
+        .logo
+        .iter()
+        .map(|l| (PicRef::Logo, l.file.clone()))
+        .chain(project.pages.iter().filter_map(|p| {
+            p.underlay
+                .as_ref()
+                .map(|u| (PicRef::Underlay(p.id.clone()), u.file.clone()))
+        }))
+        .collect()
+}
+
+/// Drop the picks (of [`Share::picks`]) the session refused (`refused`: the pages and whether
+/// the project settings a refused change touched) and those that name another file now. A
+/// picture left with no pick gets no name of its own: it is taken out of what waits to be
+/// renamed (`renames_due`, `clashes`), and returned.
+fn withdraw_picks(
+    picks: &mut BTreeMap<String, BTreeSet<PicRef>>,
+    renames_due: &mut BTreeMap<String, std::time::Instant>,
+    clashes: &mut Vec<String>,
+    open: &Open,
+    refused: (BTreeSet<String>, bool),
+) -> BTreeSet<String> {
+    let (pages, meta) = refused;
+    let mut withdrawn = BTreeSet::new();
+    for (file, refs) in picks.iter_mut() {
+        refs.retain(|r| {
+            let refused = match r {
+                PicRef::Logo => meta,
+                PicRef::Underlay(id) => pages.contains(id),
+            };
+            !refused && pic_ref_file(&open.project, r) == Some(file.as_str())
+        });
+        if refs.is_empty() {
+            withdrawn.insert(file.clone());
+        }
+    }
+    for file in &withdrawn {
+        picks.remove(file);
+        renames_due.remove(file);
+    }
+    clashes.retain(|f| !withdrawn.contains(f));
+    withdrawn
+}
+
 /// What [`new_pictures`] found.
 #[derive(Debug, Default)]
 pub struct NewPictures {
@@ -1405,9 +1468,10 @@ pub fn new_pictures(
 }
 
 /// Copy the picture `file` of `open` under a new name in the same folder, one the session is not
-/// likely to have (the name with a mark of the moment), and make the project name it instead.
+/// likely to have (the name with a mark of the moment), and make the project name it instead:
+/// only the references in `only` when given (the ones this copy picked it in), else every one.
 /// The old file stays. Returns the new name.
-fn rename_picture(open: &mut Open, file: &str) -> Result<String, String> {
+fn rename_picture(open: &mut Open, file: &str, only: Option<&BTreeSet<PicRef>>) -> Result<String, String> {
     // Read as an export reads it: never through a link out of the project folder.
     let data = match wc_pdf::read_picture(&open.dir, file) {
         Ok(Some(data)) => data,
@@ -1454,14 +1518,17 @@ fn rename_picture(open: &mut Open, file: &str) -> Result<String, String> {
         data,
     };
     wc_share::write_picture(&open.dir, &picture).map_err(|e| e.to_string())?;
+    let renames = |r: &PicRef| only.is_none_or(|only| only.contains(r));
     if let Some(logo) = open.project.meta.logo.as_mut()
         && logo.file == file
+        && renames(&PicRef::Logo)
     {
         logo.file = new.clone();
     }
     for page in &mut open.project.pages {
         if let Some(u) = page.underlay.as_mut()
             && u.file == file
+            && renames(&PicRef::Underlay(page.id.clone()))
         {
             u.file = new.clone();
         }
@@ -1476,6 +1543,7 @@ struct Pictures<'a> {
     pictures_out: &'a mut BTreeMap<String, std::time::Instant>,
     pictures_taken: &'a mut BTreeMap<String, PictureVersion>,
     replaced: &'a mut std::collections::BTreeSet<String>,
+    picks: &'a mut BTreeMap<String, BTreeSet<PicRef>>,
 }
 
 /// Give the pictures in `taken`, whose names the session has for other files, a name of
@@ -1485,7 +1553,8 @@ struct Pictures<'a> {
 /// picture stays in `pictures_out` (of [`Share`]), so it is not sent again under the taken name.
 /// A picture whose file here is the session's again (put back since it was sent) is not
 /// renamed: it is taken as the session's (into `pictures_taken`, no longer `replaced`), and
-/// nothing is sent.
+/// nothing is sent. A picture this copy picked (in `picks`) is renamed only in the references
+/// it was picked in.
 fn rename_pictures(
     open: &mut Open,
     taken: Vec<String>,
@@ -1498,6 +1567,7 @@ fn rename_pictures(
         pictures_out,
         pictures_taken,
         replaced,
+        picks,
     } = pictures;
     let used = used_pictures(&open.project);
     renames_due.retain(|file, _| used.contains(file));
@@ -1521,6 +1591,7 @@ fn rename_pictures(
                 renames_due.remove(&file);
                 pictures_out.remove(&file);
                 replaced.remove(&file);
+                picks.remove(&file);
                 // What the window showed while the file was another or gone is forgotten.
                 open.underlays.remove(&file);
                 open.picture_problems.remove(&file);
@@ -1530,10 +1601,11 @@ fn rename_pictures(
                 continue;
             }
         }
-        match rename_picture(open, &file) {
+        match rename_picture(open, &file, picks.get(&file)) {
             Ok(new) => {
                 pictures_out.remove(&file);
                 renames_due.remove(&file);
+                picks.remove(&file);
                 notes.push(format!(
                     "The session already has another file named {file}; your picture is renamed {new} here and sent again under that name."
                 ));
@@ -1735,6 +1807,18 @@ impl Role {
 
     /// Pictures this person sent whose name the session has for another file
     /// ([`wc_share::Refusal::PictureNameTaken`]), since the last call.
+    /// The pages and whether the project settings a refused change of this person's touched,
+    /// since the last call ([`wc_share::Guest::refused_pages`]). The host's own are never refused.
+    fn refused_targets(&mut self) -> (BTreeSet<String>, bool) {
+        match self {
+            Role::Host(_) => Default::default(),
+            Role::Guest(j) => (
+                std::mem::take(&mut j.guest.refused_pages),
+                std::mem::take(&mut j.guest.refused_meta),
+            ),
+        }
+    }
+
     fn picture_names_taken(&mut self) -> Vec<String> {
         match self {
             Role::Host(h) => std::mem::take(&mut h.names_taken),
@@ -2138,6 +2222,11 @@ pub struct Share {
     /// the session's pictures: they get a name of their own at the next sync, before what goes
     /// out is worked out.
     clashes: Vec<String>,
+    /// The references this copy pointed at a picture itself (by project path), kept until the
+    /// session's file of that name is compared with it: a clash renames only these, and none
+    /// once the session refused the change that made them (the reference is the session's
+    /// again) or they name another file.
+    picks: BTreeMap<String, BTreeSet<PicRef>>,
     /// Files the session lacks ([`repairs_due`]) whose copy here was looked for and could not
     /// be sent (missing, unreadable, or another version), with when and [`repair_stamp`] then:
     /// each is read again only after [`ITEM_WAIT`], or at once once this copy pins or loads
@@ -2784,6 +2873,7 @@ impl Share {
         self.drop_held = false;
         self.renames_due.clear();
         self.clashes.clear();
+        self.picks.clear();
         self.repair_reads.clear();
     }
 
@@ -3076,10 +3166,19 @@ impl Share {
         // new name here; the picture and the changes naming it go out again under that name.
         // Only a refusal of a picture this copy sent counts: a refusal naming any other path
         // must not make this copy share a file of its own.
+        // A pick whose change the session refused, or that names another file now, is withdrawn:
+        // a rename of the picture would retag a reference that is not this copy's.
+        let withdrawn = withdraw_picks(
+            &mut self.picks,
+            &mut self.renames_due,
+            &mut self.clashes,
+            open,
+            role.refused_targets(),
+        );
         let mut taken: Vec<String> = role
             .picture_names_taken()
             .into_iter()
-            .filter(|f| self.pictures_sent.contains(f))
+            .filter(|f| self.pictures_sent.contains(f) && !withdrawn.contains(f))
             .collect();
         taken.append(&mut self.clashes);
         rename_pictures(
@@ -3091,6 +3190,7 @@ impl Share {
                 pictures_out: &mut self.pictures_out,
                 pictures_taken: &mut self.pictures_taken,
                 replaced: &mut self.pictures_replaced,
+                picks: &mut self.picks,
             },
             &mut self.notes,
         );
@@ -3225,12 +3325,13 @@ impl Share {
             base,
             auth,
         );
-        // Pictures this copy's own changes name: a clash among them is a file picked here.
-        let base_uses = used_pictures(base);
-        let named_here: std::collections::BTreeSet<String> = used_pictures(&open.project)
-            .into_iter()
-            .filter(|f| !base_uses.contains(f))
-            .collect();
+        // References this copy's own changes pointed at a picture: a clash with one is a file
+        // picked here. Kept until compared, also while the comparison waits.
+        for (r, file) in pic_refs(&open.project) {
+            if pic_ref_file(base, &r) != Some(file.as_str()) {
+                self.picks.entry(file).or_default().insert(r);
+            }
+        }
         let before = (!held.is_empty()).then(|| open.project.clone());
         let mut changed = incoming(&mut open.project, auth);
         // What this copy has synced to, with the session's lock; the waiting changes go on top
@@ -3294,7 +3395,21 @@ impl Share {
         // A picture picked here under a name the session has for another file gets a name of
         // its own at the next sync, as when the session refuses it. One only the session's
         // drawings name is theirs: the file here is kept, but neither renamed nor shared.
-        let (mine, theirs): (Vec<_>, Vec<_>) = clashes.into_iter().partition(|f| named_here.contains(f));
+        let (mine, theirs): (Vec<_>, Vec<_>) = clashes.into_iter().partition(|f| self.picks.contains_key(f));
+        // A pick compared without a clash is the session's file or this copy's own: done with.
+        let compared = |f: &String| {
+            self.pictures_taken.contains_key(f)
+                || (role.pictures().contains_key(f) && !skip.contains(f) && !failed.iter().any(|(x, _)| x == f))
+        };
+        let done: Vec<String> = self
+            .picks
+            .keys()
+            .filter(|f| !mine.contains(f) && compared(f))
+            .cloned()
+            .collect();
+        for f in done {
+            self.picks.remove(&f);
+        }
         self.clashes = mine;
         let now = std::time::Instant::now();
         for file in theirs {
