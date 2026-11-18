@@ -154,7 +154,8 @@ fn system_page_bytes(kind: u32, data: &[u8]) -> Vec<u8> {
     page.extend((data.len() as u32).to_le_bytes());
     page.extend((packed.len() as u32).to_le_bytes());
     page.extend(2u32.to_le_bytes());
-    page.extend(0u32.to_le_bytes()); // checksum, not checked
+    let sum = page_checksum(page_checksum(0, &[page.as_slice(), &[0u8; 4]].concat()), &packed);
+    page.extend(sum.to_le_bytes());
     page.extend(packed);
     pad32(&mut page);
     page
@@ -196,8 +197,8 @@ pub(super) fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> 
             } else {
                 compress(chunk)
             };
-            let mut head = Vec::new();
-            for word in [
+            let data_sum = page_checksum(0, &packed);
+            let mut words = [
                 DATA_PAGE,
                 index as u32 + 1,
                 packed.len() as u32,
@@ -205,10 +206,11 @@ pub(super) fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> 
                 start as u32,
                 0,
                 0,
-                0,
-            ] {
-                head.extend(word.to_le_bytes());
-            }
+                data_sum,
+            ];
+            let bytes = |w: &[u32; 8]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            words[6] = page_checksum(data_sum, &bytes(&words));
+            let head = bytes(&words);
             let mut page = unscramble_page_header(&head, address);
             page.extend(&packed);
             pad32(&mut page);
@@ -251,6 +253,8 @@ pub(super) fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> 
     header[0x50..0x54].copy_from_slice(&page_map_id.to_le_bytes());
     header[0x54..0x5C].copy_from_slice(&(page_map_at - PAGES_START).to_le_bytes());
     header[0x5C..0x60].copy_from_slice(&section_map_id.to_le_bytes());
+    let crc = crc32(&header);
+    header[HEADER_CRC_AT..HEADER_CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
     file[ENCRYPTED_HEADER_AT..ENCRYPTED_HEADER_AT + ENCRYPTED_HEADER_LEN].copy_from_slice(&unscramble_header(&header));
     file
 }
@@ -487,5 +491,77 @@ fn a_page_listed_many_times_cannot_make_endless_work() -> TestResult {
         message.as_ref().is_err_and(|m| m.contains("decompress to too much")),
         "{message:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn the_checksums_match_known_values() {
+    // zlib's CRC-32 of "123456789", and Adler-32 (seed 1) of "Wikipedia".
+    assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    assert_eq!(page_checksum(1, b"Wikipedia"), 0x11E6_0398);
+    // Long enough to wrap the sums several times.
+    let long = vec![0xFFu8; 100_000];
+    assert_eq!(page_checksum(1, &long), adler(&long));
+}
+
+/// Adler-32 the plain way, to check the chunked one.
+fn adler(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in data {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn error_of(file: &[u8]) -> String {
+    match read_sections(file) {
+        Ok(_) => "read without an error".to_owned(),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn a_changed_byte_that_still_decompresses_is_caught_by_its_checksum() -> TestResult {
+    // A stored page: any byte of it still "decompresses".
+    let section = TestSection {
+        name: "AcDb:Classes",
+        data: noise(300, 3),
+        stored: true,
+        ..TestSection::default()
+    };
+    let file = write_dwg(b"AC1024", &[section]);
+    assert!(read_sections(&file).is_ok());
+    // The first page is at 0x100, its data after a 0x20-byte header.
+    let mut data = file.clone();
+    data[0x120 + 5] ^= 0x01;
+    let m = error_of(&data);
+    assert!(
+        m.contains("AcDb:Classes") && m.contains("page 1") && m.contains("checksum"),
+        "{m}"
+    );
+    // Its header: the start offset (not read otherwise) changed.
+    let mut head = file.clone();
+    head[0x100 + 0x10] ^= 0x01;
+    let m = error_of(&head);
+    assert!(
+        m.contains("page 1") && m.contains("page header") && m.contains("checksum"),
+        "{m}"
+    );
+    // The second header, a byte past the fields the reader uses.
+    let mut header = file.clone();
+    header[ENCRYPTED_HEADER_AT + 0x64] ^= 0x01;
+    let m = error_of(&header);
+    assert!(m.contains("header is damaged") && m.contains("checksum"), "{m}");
+    // The section map's compressed data: its last byte, the end of a literal run.
+    let section_map = file
+        .windows(4)
+        .rposition(|w| w == SECTION_MAP.to_le_bytes())
+        .ok_or("no section map")?;
+    let packed = u32::from_le_bytes(file[section_map + 8..section_map + 12].try_into()?) as usize;
+    let mut map = file.clone();
+    map[section_map + SYSTEM_PAGE_HEADER + packed - 3] ^= 0x01;
+    let m = error_of(&map);
+    assert!(m.contains("section map") && m.contains("checksum"), "{m}");
     Ok(())
 }
