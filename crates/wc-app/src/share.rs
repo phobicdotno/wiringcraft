@@ -941,26 +941,6 @@ fn updated_here(local: &Project, base: &Project, auth: &Project, kind: ItemKind,
 }
 
 /// An item as messages name it: `symbol wc.coil`, `part acme.relay`.
-/// The items `auth` locks that are not among the session's `files` in that version.
-fn missing_files(
-    auth: &Project,
-    (symbols, parts): (&BTreeMap<String, Symbol>, &BTreeMap<String, wc_core::Part>),
-) -> std::collections::BTreeSet<String> {
-    let symbols = auth
-        .lock
-        .symbols
-        .iter()
-        .filter(|(id, e)| symbols.get(*id).is_none_or(|s| s.hash() != e.hash))
-        .map(|(id, _)| item_name(ItemKind::Symbol, id));
-    let parts = auth
-        .lock
-        .parts
-        .iter()
-        .filter(|(id, e)| parts.get(*id).is_none_or(|p| p.hash() != e.hash))
-        .map(|(id, _)| item_name(ItemKind::Part, id));
-    symbols.chain(parts).collect()
-}
-
 fn item_name(kind: ItemKind, id: &str) -> String {
     match kind {
         ItemKind::Symbol => format!("symbol {id}"),
@@ -1024,6 +1004,23 @@ pub struct NewItems {
     /// Items this copy updated whose earlier version the session took back since the last sync
     /// (`base` has them, the session no longer does): not sent, as an add would undo that.
     pub stale: Vec<String>,
+    /// Files the session lacks whose copy here is back but cannot be sent (another version than
+    /// the pin, or unreadable), with the reason. Nothing waits for them.
+    pub unsent_repairs: Vec<(String, String)>,
+}
+
+/// The items the host's session locks but has no file of ([`wc_share::Host::files_missing`]),
+/// as [`item_name`] names them; none for a guest.
+fn repairs_due(role: &Role) -> std::collections::BTreeSet<String> {
+    match role {
+        Role::Host(h) => h
+            .host
+            .files_missing()
+            .into_iter()
+            .map(|(kind, id)| item_name(kind, &id))
+            .collect(),
+        Role::Guest(_) => Default::default(),
+    }
 }
 
 /// The symbols and parts locked in `local` and not in the session's project `auth`, with their
@@ -1059,8 +1056,9 @@ pub fn new_items(
                 Some(a) if updated_here(local, base, auth, kind, id) => {
                     Some((id.clone(), e.source.clone(), e.hash.clone(), Some(a.hash.clone())))
                 }
+                // The session's entry as it is (its source too): only the file is missing.
                 Some(a) if a.hash == e.hash && repair.contains(&item_name(kind, id)) => {
-                    Some((id.clone(), e.source.clone(), e.hash.clone(), None))
+                    Some((id.clone(), a.source.clone(), e.hash.clone(), None))
                 }
                 Some(_) => None,
             })
@@ -1090,7 +1088,12 @@ pub fn new_items(
                 }
             }
             // A repair whose file is not back here yet waits quietly: the session works as is.
-            Err(_) if before.is_none() && auth.lock.symbols.contains_key(&id) => {}
+            // One that is back but cannot be sent says why.
+            Err(e) if before.is_none() && auth.lock.symbols.contains_key(&id) => {
+                if store::vendor_path(dir, ItemKind::Symbol, &id).is_ok_and(|p| p.exists()) {
+                    out.unsent_repairs.push((item_name(ItemKind::Symbol, &id), e));
+                }
+            }
             Err(e) => out.unreadable.push((item_name(ItemKind::Symbol, &id), e)),
         }
     }
@@ -1104,7 +1107,11 @@ pub fn new_items(
                     Some(before) => new_parts.push((p, source, before)),
                 }
             }
-            Err(_) if before.is_none() && auth.lock.parts.contains_key(&id) => {}
+            Err(e) if before.is_none() && auth.lock.parts.contains_key(&id) => {
+                if store::vendor_path(dir, ItemKind::Part, &id).is_ok_and(|p| p.exists()) {
+                    out.unsent_repairs.push((item_name(ItemKind::Part, &id), e));
+                }
+            }
             Err(e) => out.unreadable.push((item_name(ItemKind::Part, &id), e)),
         }
     }
@@ -2749,14 +2756,20 @@ impl Share {
         );
         // An item the session took is done; one this copy no longer locks (an undo, or an
         // assistant command that rewrote the project) is not sent again, so nothing waits for it.
-        self.items_out
-            .retain(|name, _| !session_took(auth, &open.project, base, name) && session_has(&open.project, name));
+        // A file the session still lacks is not taken, though its pin is there.
+        let repair = repairs_due(role);
+        self.items_out.retain(|name, _| {
+            (!session_took(auth, &open.project, base, name) || repair.contains(name))
+                && session_has(&open.project, name)
+        });
         for (name, out) in self.items_out.iter_mut() {
             if !out.gave_up && out.tries >= ITEM_TRIES && out.at.elapsed() >= ITEM_WAIT {
                 out.gave_up = true;
                 // An update is not kept apart from the project: the copy takes the session's
                 // version again below, as everyone else works on that one.
-                self.notes.push(if session_has(auth, name) {
+                self.notes.push(if repair.contains(name) {
+                    format!("The session could not store the file of {name}; others without the library cannot draw it until it can.")
+                } else if session_has(auth, name) {
                     format!(
                         "The session did not take your update of {name}; your copy takes the session's version again."
                     )
@@ -2779,11 +2792,14 @@ impl Share {
         // not keep out the others it was sent with.
         let apart = self.items_out.keys().cloned().collect();
         // The host's session files: one it locks but has no file of goes out again from here.
-        let repair = match &*role {
-            Role::Host(h) => missing_files(auth, h.host.files()),
-            Role::Guest(_) => Default::default(),
-        };
         let items = new_items(&open.dir, &open.project, base, auth, &skip, &apart, &repair);
+        for (name, why) in &items.unsent_repairs {
+            if self.unreadable.insert(format!("repair {name}")) {
+                self.notes.push(format!(
+                    "The file of {name} is back but cannot be shared ({why}); others without the library cannot draw it."
+                ));
+            }
+        }
         let now = std::time::Instant::now();
         for (name, why) in &items.unreadable {
             // A file that cannot be read counts as a try: the changes that may draw the item
@@ -2824,9 +2840,10 @@ impl Share {
             }
             role.pump(&mut self.notes);
             take_updates(role, base, &mut self.items_out);
+            let repair = repairs_due(role);
             let auth = role.project()?;
             self.items_out
-                .retain(|name, _| !session_took(auth, &open.project, base, name));
+                .retain(|name, _| !session_took(auth, &open.project, base, name) || repair.contains(name));
             // What the session took in is the baseline now, so a take-back before the last
             // look of this frame is still seen.
             follow_take_backs(

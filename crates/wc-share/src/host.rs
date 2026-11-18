@@ -57,6 +57,9 @@ pub struct Host {
     /// user shared ([`Host::share_files`]) and what participants added since.
     symbols: BTreeMap<String, wc_core::Symbol>,
     parts: BTreeMap<String, wc_core::Part>,
+    /// The hash of each file in `symbols` and `parts`, kept as they change so a look at which
+    /// files the session lacks does not hash them again.
+    file_hashes: BTreeMap<(wc_core::lock::ItemKind, String), String>,
     /// Versions an update ([`ProjectEdit::UpdateItems`]) replaced, by id and hash, so an undo
     /// can lock and store them again.
     old_symbols: BTreeMap<(String, String), wc_core::Symbol>,
@@ -117,6 +120,7 @@ impl Host {
             take_backs_held: None,
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
+            file_hashes: BTreeMap::new(),
             old_symbols: BTreeMap::new(),
             old_parts: BTreeMap::new(),
             pictures: BTreeMap::new(),
@@ -127,8 +131,31 @@ impl Host {
     /// The project's vendored symbol and part files, sent to every guest that joins so they can
     /// draw the project without the host's libraries.
     pub fn share_files(&mut self, symbols: BTreeMap<String, wc_core::Symbol>, parts: BTreeMap<String, wc_core::Part>) {
+        use wc_core::lock::ItemKind;
+        self.file_hashes = symbols
+            .values()
+            .map(|s| ((ItemKind::Symbol, s.id.clone()), s.hash()))
+            .chain(parts.values().map(|p| ((ItemKind::Part, p.id.clone()), p.hash())))
+            .collect();
         self.symbols = symbols;
         self.parts = parts;
+    }
+
+    /// The items the session locks that it has no file of in that version (a host that shared
+    /// the project with a copy missing): kind and id.
+    pub fn files_missing(&self) -> Vec<(wc_core::lock::ItemKind, String)> {
+        use wc_core::lock::ItemKind;
+        [ItemKind::Symbol, ItemKind::Part]
+            .into_iter()
+            .flat_map(|kind| {
+                self.project
+                    .lock
+                    .map(kind)
+                    .iter()
+                    .filter(move |(id, e)| self.file_hashes.get(&(kind, (*id).clone())) != Some(&e.hash))
+                    .map(move |(id, _)| (kind, id.clone()))
+            })
+            .collect()
     }
 
     /// The project's picture files (the logo, page underlays) by project path, sent to every
@@ -634,7 +661,10 @@ impl Host {
                 },
             ));
         }
-        self.remember(by, page, message, ChangeKind::Edit, None, was, now);
+        // A file put back alone (the project as it was) is no step to undo.
+        if self.project != before {
+            self.remember(by, page, message, ChangeKind::Edit, None, was, now);
+        }
         Ok(true)
     }
 
@@ -959,6 +989,8 @@ impl Host {
     /// an undo ([`Self::symbol_version`]).
     fn take_versions(&mut self, symbols: Vec<wc_core::Symbol>, parts: Vec<wc_core::Part>, keep: bool) {
         for s in symbols {
+            self.file_hashes
+                .insert((wc_core::lock::ItemKind::Symbol, s.id.clone()), s.hash());
             if let Some(old) = self.symbols.insert(s.id.clone(), s)
                 && keep
                 && self.symbols.get(&old.id).is_some_and(|now| now.hash() != old.hash())
@@ -967,6 +999,8 @@ impl Host {
             }
         }
         for p in parts {
+            self.file_hashes
+                .insert((wc_core::lock::ItemKind::Part, p.id.clone()), p.hash());
             if let Some(old) = self.parts.insert(p.id.clone(), p)
                 && keep
                 && self.parts.get(&old.id).is_some_and(|now| now.hash() != old.hash())

@@ -1164,15 +1164,21 @@ impl Open {
                 return Ok(());
             };
             // The pinned copy may have been put back since: the file is read again.
-            let fixed = store::read_vendored_symbol(&self.dir, id)
-                .ok()
-                .filter(|s| version_fits(&s.id, &s.hash(), id, &pin.hash).is_ok());
-            let Some(fixed) = fixed else {
-                return Err(format!(
-                    "symbol {id}: its copy in the project is not the version the project pins; put the pinned copy back or update the symbol from the library"
-                ));
+            let refused = |why: String| {
+                format!(
+                    "symbol {id}: its copy in the project is not the version the project pins ({why}); put the pinned copy back or update the symbol from the library"
+                )
             };
+            let fixed = store::read_vendored_symbol(&self.dir, id).map_err(|e| refused(e.to_string()))?;
+            version_fits(&fixed.id, &fixed.hash(), id, &pin.hash).map_err(refused)?;
+            // Terminals were numbered with the copy loaded so far: the change in progress is
+            // settled with it, and tracking starts again from the pinned copy, so putting it
+            // back does not read as terminals moved.
+            self.follow_terminals();
             self.symbols.insert(id.to_owned(), fixed);
+            if self.terminals_before.is_some() {
+                self.terminals_before = Some(self.terminal_numbers());
+            }
             return Ok(());
         }
         let lib = || wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string());
@@ -2405,6 +2411,62 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn putting_back_a_pinned_terminal_copy_keeps_jumpers_on_their_terminals() {
+        let (_tmp, mut o) = project();
+        let terminal = |id: &str, role| Symbol {
+            id: id.into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let pinned = terminal("test.term", wc_core::symbol::SymbolRole::Terminal);
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        let other = terminal("test.term2", wc_core::symbol::SymbolRole::Terminal);
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.project.lock.symbols.insert(
+            "test.term".into(),
+            wc_core::lock::LockEntry {
+                source: "starter".into(),
+                hash: pinned.hash(),
+            },
+        );
+        // A (the pinned symbol), B and C on strip -X1, numbered 1, 2, 3; A and B jumpered.
+        for (id, x, symbol) in [
+            ("a", 10.0, "test.term"),
+            ("b", 20.0, "test.term2"),
+            ("c", 30.0, "test.term2"),
+        ] {
+            o.project.pages[1].symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: symbol.into(),
+                at: Point::new(x, 10.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse("-X1").unwrap()),
+            });
+        }
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        o.save().unwrap();
+        // Opened with another copy, in which A's symbol is no terminal (B and C are 1 and 2
+        // then); an edit meanwhile.
+        store::write_vendored_symbol(&o.dir, &terminal("test.term", wc_core::symbol::SymbolRole::Main)).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        o.checkpoint();
+        o.project.pages[1].title = "Terminals".into();
+        // The pinned copy put back, then the symbol placed: nothing moved, so the jumper stays.
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        o.place(1, "test.term", Point::new(80.0, 10.0)).unwrap();
+        o.checkpoint();
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
     fn a_pinned_symbol_is_put_back_from_the_second_of_two_libraries_with_one_name() {
         let (tmp, mut o) = project();
         o.ensure_symbol("wc.coil").unwrap();
@@ -2521,11 +2583,12 @@ pub(crate) mod tests {
         let (tmp, mut o) = project();
         let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
         let mut clip = o.copy(1, &[Selection::Symbol(id)]);
-        // A lamp ahead of the coil, which the library has and the project doesn't yet.
-        let mut lamp = clip.symbols[0].clone();
-        lamp.symbol = "wc.lamp".into();
-        lamp.tag = None;
-        clip.symbols.insert(0, lamp);
+        // A breaker, which the library has and the project doesn't yet: loaded before the coil
+        // (ids are loaded in order), and taken back with it.
+        let mut breaker = clip.symbols[0].clone();
+        breaker.symbol = "wc.breaker.1p".into();
+        breaker.tag = None;
+        clip.symbols.insert(0, breaker);
         let old = o.symbols["wc.coil"].clone();
         o.save().unwrap();
         std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
@@ -2535,14 +2598,14 @@ pub(crate) mod tests {
         library_first(&mut o, tmp.path(), &new);
         o.project.lock.symbols.get_mut("wc.coil").unwrap().source = "mine".into();
         o.project.meta.libraries.retain(|l| l.name == "mine");
-        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.lamp.json");
-        std::fs::copy(starter, tmp.path().join("mine/symbols/wc.lamp.json")).unwrap();
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.breaker.1p.json");
+        std::fs::copy(starter, tmp.path().join("mine/symbols/wc.breaker.1p.json")).unwrap();
         let before = o.project.clone();
         let undo = o.can_undo();
         let err = o.paste(1, &clip, Point::new(80.0, 80.0)).unwrap_err();
         assert!(err.contains("wc.coil"), "the symbol is named: {err}");
-        assert_eq!(o.project, before, "nothing is added, not even the lamp's pin");
-        assert!(!o.symbols.contains_key("wc.lamp"));
+        assert_eq!(o.project, before, "nothing is added, not even the breaker's pin");
+        assert!(!o.symbols.contains_key("wc.breaker.1p"));
         assert_eq!(o.can_undo(), undo, "no undo step");
         let path = o.save_macro(&clip, "Coil", "").unwrap();
         let err = o.insert_macro(1, &path).unwrap_err();

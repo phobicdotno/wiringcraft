@@ -1589,24 +1589,61 @@ fn a_pinned_copy_the_host_puts_back_during_a_session_reaches_the_guests() -> Tes
     guest_open.symbols.remove("wc.coil");
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert!(store::read_vendored_symbol(&guest_open.dir, "wc.coil").is_err());
-    // Placed again: the host puts the pinned version back from the library, and the guests
-    // get its file though the pin did not change.
-    host_open.place(1, "wc.coil", wc_core::Point::new(60.0, 120.0))?;
+    let source = host_open.project.lock.symbols.get("wc.coil").map(|e| e.source.clone());
+    let steps = match h.role.as_ref() {
+        Some(Role::Host(hosting)) => hosting.host.history().len(),
+        _ => return Err("still hosting".into()),
+    };
+    // Placed again while the host cannot store files: the host puts the pinned version back
+    // from the library, the session refuses the file, and the placement waits for it.
+    log.fail_vendor(true);
+    let item = host_open.place(1, "wc.coil", wc_core::Point::new(60.0, 120.0))?;
+    // The copy here names another library for the pin: the session's entry stays as it is.
+    host_open
+        .project
+        .lock
+        .symbols
+        .get_mut("wc.coil")
+        .ok_or("pinned")?
+        .source = "elsewhere".into();
     let coil = host_open.symbols.get("wc.coil").cloned();
     assert!(coil.is_some());
+    // The host's page as the session (and so the guest) has it.
+    let drawn = |o: &Open| {
+        o.project
+            .page("p0002")
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-    // The file goes in before the page that draws it.
-    assert_eq!(
-        log.messages().first().map(String::as_str),
-        Some("Add wc.coil to the project")
-    );
+    assert!(store::read_vendored_symbol(&guest_open.dir, "wc.coil").is_err());
+    assert!(!drawn(&guest_open), "the page waits for the file");
+    // The host can store it again: the next try gets it in, and the page follows.
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_WAIT);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert_eq!(store::read_vendored_symbol(&guest_open.dir, "wc.coil").ok(), coil);
     assert_eq!(guest_open.symbols.get("wc.coil").cloned(), coil);
-    // Sent once.
+    assert!(drawn(&guest_open), "the placement reaches the guest");
+    let messages = log.messages();
+    let add = messages.iter().position(|m| m == "Add wc.coil to the project");
+    let edit = messages.iter().position(|m| m.contains("Edit page 2"));
+    assert!(add.is_some() && add < edit, "the file goes in first: {messages:?}");
+    // The pin is the session's as it was, and the file alone is no step to undo.
+    assert_eq!(
+        guest_open.project.lock.symbols.get("wc.coil").map(|e| e.source.clone()),
+        source
+    );
     match h.role.as_ref() {
-        Some(Role::Host(hosting)) => assert_eq!(hosting.host.files().0.get("wc.coil").cloned(), coil),
+        Some(Role::Host(hosting)) => {
+            assert_eq!(hosting.host.files().0.get("wc.coil").cloned(), coil);
+            assert_eq!(hosting.host.history().len(), steps + 1, "only the page edit");
+        }
         _ => return Err("still hosting".into()),
     }
+    // Sent once.
+    let n = log.messages().len();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(log.messages().len(), n);
     Ok(())
 }
 
