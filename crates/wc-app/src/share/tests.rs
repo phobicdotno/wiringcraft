@@ -3600,6 +3600,45 @@ fn undo_of_a_second_waiting_placement_takes_back_only_that_one() -> TestResult {
 }
 
 #[test]
+fn undo_of_a_rename_of_a_waiting_placements_new_device_brings_the_device_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let tag = guest_open
+        .project
+        .page("p0003")
+        .and_then(|p| p.symbols.iter().find(|s| s.id == first))
+        .and_then(|s| s.tag.clone())
+        .ok_or("no tag")?;
+    let device = guest_open.project.devices.get(&tag).cloned().ok_or("no device")?;
+    let renamed = DeviceTag::parse("-K77")?;
+    // The new device the waiting placement made is renamed before the session has it.
+    guest_open.checkpoint();
+    guest_open.project.rename_device(&tag, &renamed);
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!guest_open.project.devices.contains_key(&tag));
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let on_page = guest_open
+        .project
+        .page("p0003")
+        .and_then(|p| p.symbols.iter().find(|s| s.id == first))
+        .and_then(|s| s.tag.clone());
+    assert_eq!(on_page.as_ref(), Some(&tag), "{:?}", g.notes);
+    assert_eq!(
+        guest_open.project.devices.get(&tag),
+        Some(&device),
+        "the device comes back with it"
+    );
+    assert!(!guest_open.project.devices.contains_key(&renamed));
+    assert!(!host_open.project.devices.contains_key(&tag) && !host_open.project.devices.contains_key(&renamed));
+    Ok(())
+}
+
+#[test]
 fn undo_of_a_waiting_placement_keeps_the_sessions_page_number() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;

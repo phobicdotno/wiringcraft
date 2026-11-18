@@ -2517,10 +2517,25 @@ impl Held {
 /// waiting changes are put back; a number this copy changed is taken back like the rest.
 fn latest_waiting_step(open: &Open, held: &Held, renumbered: &BTreeMap<String, String>) -> Option<wc_share::Parts> {
     let prev = open.before_last_change()?;
-    let mut step = wc_share::Parts::read(prev, &held.now);
-    if step == wc_share::Parts::read(&open.project, &held.now) {
-        return None;
-    }
+    // A device a waiting page named before the action comes back with it, even when it was new
+    // here and the action renamed it away, so no page names it now.
+    let mut keys = held.now.clone();
+    let named_before: Vec<_> = prev
+        .devices
+        .iter()
+        .filter(|(tag, _)| !keys.devices.contains_key(*tag))
+        .filter(|(tag, _)| {
+            keys.pages
+                .keys()
+                .filter_map(|id| prev.page(id))
+                .any(|p| page_mentions(p, &|t| t == *tag))
+        })
+        .map(|(tag, d)| (tag.clone(), Some(d.clone())))
+        .collect();
+    keys.devices.extend(named_before);
+    let mut step = wc_share::Parts::read(prev, &keys);
+    // A page number the session changed since is kept, before comparing, so a stale number
+    // alone is no step to take back.
     for (id, page) in step.pages.iter_mut() {
         if let (Some(page), Some(now), Some(old)) = (page.as_mut(), open.project.page(id), renumbered.get(id))
             && page.number == *old
@@ -2528,7 +2543,7 @@ fn latest_waiting_step(open: &Open, held: &Held, renumbered: &BTreeMap<String, S
             page.number = now.number.clone();
         }
     }
-    Some(step)
+    (step != wc_share::Parts::read(&open.project, &keys)).then_some(step)
 }
 
 /// Whether a symbol or cable on `page` names a device `tag` picks.
