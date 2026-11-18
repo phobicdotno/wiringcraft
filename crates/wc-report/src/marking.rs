@@ -310,17 +310,8 @@ fn blocks(
 fn terminal_markers_on_rail(i: &Inputs<'_>, separator: &str) -> Vec<(String, String)> {
     let mut markers = blocks(terminal_rows_on_rail(i), separator);
     // Stable, and only within a strip: strips keep their order, unarranged strips too.
-    let mut start = 0;
-    while start < markers.len() {
-        let strip = markers[start].0.clone();
-        let end = markers[start..]
-            .iter()
-            .position(|m| m.0 != strip)
-            .map_or(markers.len(), |k| start + k);
-        if let Some(run) = markers.get_mut(start..end) {
-            run.sort_by_key(|m| m.2.unwrap_or(usize::MAX));
-        }
-        start = end;
+    for run in markers.chunk_by_mut(|a, b| a.0 == b.0) {
+        run.sort_by_key(|m| m.2.unwrap_or(usize::MAX));
     }
     markers.into_iter().map(|(s, m, _)| (s, m)).collect()
 }
