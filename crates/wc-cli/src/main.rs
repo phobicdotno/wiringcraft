@@ -3196,7 +3196,7 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
                 None if entry.hash == hash => {}
                 None => {
                     return Err(format!(
-                        "{name}: the project pins another version and has no copy of it ({}); put the copy back or run `lib lock`",
+                        "{name}: the project pins another version and has no copy of it ({}); restore the pinned copy from the project's history, or import the pinned version itself",
                         path.display()
                     ));
                 }
@@ -3225,22 +3225,28 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
         ));
     }
     // A write that fails puts back the files written before it (and removes the ones it made),
-    // so each copy still matches its pin.
+    // so each copy still matches its pin. Only files this import changed are put back: one it
+    // left as it was keeps whatever it holds now.
     let writes = built
         .symbols
         .iter()
         .map(|s| store::write_vendored_symbol(dir, s))
         .chain(built.parts.iter().map(|x| store::write_vendored_part(dir, x)));
-    for (n, written) in writes.enumerate() {
-        if let Err(err) = written {
-            let failed = put_files_back(&files[..n]);
-            if failed.is_empty() {
-                return Err(err.to_string());
+    let mut changed: Written = Vec::new();
+    for (file, written) in files.into_iter().zip(writes) {
+        match written {
+            Ok(true) => changed.push(file),
+            Ok(false) => {}
+            Err(err) => {
+                let failed = put_files_back(&changed);
+                if failed.is_empty() {
+                    return Err(err.to_string());
+                }
+                return Err(format!(
+                    "{err}; putting back the files written before it failed too: {}",
+                    failed.join("; ")
+                ));
             }
-            return Err(format!(
-                "{err}; putting back the files written before it failed too: {}",
-                failed.join("; ")
-            ));
         }
     }
     fill_cover(p, cover_fields);
@@ -3282,7 +3288,7 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
     p.meta.fill_title_block(built.title_block);
-    Ok(files)
+    Ok(changed)
 }
 
 /// The path and bytes of a vendored copy, kept before an import replaces it.
@@ -3309,15 +3315,34 @@ fn put_file_back(path: &Path, before: Option<&[u8]>) -> Result<(), String> {
     if std::fs::read(path).is_ok_and(|now| now == bytes) {
         return Ok(());
     }
-    let mut part = path.as_os_str().to_owned();
-    part.push(".restore");
-    let part = PathBuf::from(part);
-    std::fs::write(&part, bytes)
-        .and_then(|()| std::fs::rename(&part, path))
-        .map_err(|x| {
-            let _ = std::fs::remove_file(&part);
-            fail(x)
-        })
+    // The staging file is made new (never one already there, which could be a link to a file
+    // elsewhere), and only that file is removed when something fails.
+    let mut made = None;
+    for n in 0..100u32 {
+        let mut part = path.as_os_str().to_owned();
+        part.push(format!(".restore-{}-{n}", std::process::id()));
+        let part = PathBuf::from(part);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+            Ok(file) => {
+                made = Some((part, file));
+                break;
+            }
+            Err(x) if x.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(x) => return Err(fail(x)),
+        }
+    }
+    let Some((part, mut file)) = made else {
+        return Err(format!("{}: no free name for the staging file", path.display()));
+    };
+    use std::io::Write as _;
+    let done = file.write_all(bytes).and_then(|()| file.sync_all()).and_then(|()| {
+        drop(file);
+        std::fs::rename(&part, path)
+    });
+    done.map_err(|x| {
+        let _ = std::fs::remove_file(&part);
+        fail(x)
+    })
 }
 
 /// The current time in UTC as `YYYY-MM-DDThh:mm:ssZ`.
@@ -4171,6 +4196,24 @@ mod tests {
         );
         std::fs::remove_dir(&blocker).unwrap();
         assert_eq!(std::fs::read(&coil_file).unwrap(), coil_bytes, "put back");
+        assert_eq!(load(&dir).unwrap().lock, lock);
+
+        // A symbol the import brings new is removed again when a later write fails.
+        let lamp = wc_core::Symbol {
+            id: "swe.lib.lamp".into(),
+            ..coil("Lamp")
+        };
+        let lamp_file = store::vendor_path(&dir, ItemKind::Symbol, "swe.lib.lamp").unwrap();
+        std::fs::create_dir(&blocker).unwrap();
+        let mut p = load(&dir).unwrap();
+        let fresh = wc_import::aml::Built {
+            symbols: vec![lamp],
+            parts: vec![relay("Relay 24 V, v2")],
+            ..Default::default()
+        };
+        assert!(add_built(&dir, &mut p, fresh, "import:a.tewzip").is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert!(!lamp_file.exists(), "the new copy is removed");
         assert_eq!(load(&dir).unwrap().lock, lock);
 
         // A save that fails after the files were written puts them back as well.
