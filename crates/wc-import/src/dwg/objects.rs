@@ -888,4 +888,4 @@ fn with_layer(e: &Entity, layer: u64, layers: &HashMap<u64, String>) -> Entity {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

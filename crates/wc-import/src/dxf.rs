@@ -15,7 +15,7 @@ use wc_core::{DeviceTag, PlacedSymbol};
 use crate::{Error, Result, make_symbol};
 
 /// One entity as group-code/value pairs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Entity {
     pub(crate) kind: String,
     pub(crate) codes: Vec<(i32, String)>,
@@ -49,7 +49,7 @@ impl Entity {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Drawing {
     pub(crate) entities: Vec<Entity>,
     pub(crate) blocks: BTreeMap<String, Vec<Entity>>,
@@ -69,12 +69,25 @@ pub(crate) type Drawn = (Vec<(String, Shape)>, Vec<(String, Point)>);
 /// expanded, and the POINT positions. Entities not drawn are counted in `skipped`. Each entity
 /// visited takes one from `budget`; when it runs out the rest is left out (and counted).
 pub(crate) fn draw(d: &Drawing, ents: &[Entity], skipped: &mut BTreeMap<String, usize>, budget: &mut usize) -> Drawn {
+    draw_mapped(d, ents, Xf::ID.m, 0.0, skipped, budget)
+}
+
+/// [`draw`], with `ents` first mapped by the linear map `m` (row by row: x' = m[0] x + m[1] y,
+/// y' = m[2] x + m[3] y). Texts turn by `rot` degrees.
+pub(crate) fn draw_mapped(
+    d: &Drawing,
+    ents: &[Entity],
+    m: [f64; 4],
+    rot: f64,
+    skipped: &mut BTreeMap<String, usize>,
+    budget: &mut usize,
+) -> Drawn {
     let mut out = Vec::new();
     let mut points = Vec::new();
     shapes(
         d,
         ents,
-        Xf::ID,
+        Xf { m, at: (0.0, 0.0), rot },
         1.0,
         0,
         &|_| false,
@@ -181,36 +194,64 @@ fn parse(text: &str) -> Result<Drawing> {
     Ok(d)
 }
 
-/// Placement of a block reference.
+/// Placement of a block reference: a 2D affine map, so placements nested in mirrored or
+/// unevenly scaled ones compose exactly, plus the sum of the turns for text directions.
 #[derive(Debug, Clone, Copy)]
 struct Xf {
+    /// Linear part, row by row: x' = m[0] x + m[1] y, y' = m[2] x + m[3] y.
+    m: [f64; 4],
     at: (f64, f64),
-    sx: f64,
-    sy: f64,
+    /// The turns of the placements, added up: texts keep their reading direction by it.
     rot: f64,
 }
 
 impl Xf {
     const ID: Xf = Xf {
+        m: [1.0, 0.0, 0.0, 1.0],
         at: (0.0, 0.0),
-        sx: 1.0,
-        sy: 1.0,
         rot: 0.0,
     };
+    /// Scale by `sx`, `sy` (a negative scale mirrors), turn by `rot` degrees counter-clockwise,
+    /// then move to `at`: how a block reference places its block.
+    fn insert(at: (f64, f64), sx: f64, sy: f64, rot: f64) -> Xf {
+        let (s, c) = rot.to_radians().sin_cos();
+        Xf {
+            m: [c * sx, -s * sy, s * sx, c * sy],
+            at,
+            rot,
+        }
+    }
     /// DXF coordinates (y up) to DXF coordinates.
     fn apply(&self, x: f64, y: f64) -> (f64, f64) {
-        let (x, y) = (x * self.sx, y * self.sy);
-        let (s, c) = self.rot.to_radians().sin_cos();
-        (self.at.0 + x * c - y * s, self.at.1 + x * s + y * c)
+        let m = &self.m;
+        (self.at.0 + m[0] * x + m[1] * y, self.at.1 + m[2] * x + m[3] * y)
     }
+    /// This placement inside `outer`: `outer` applied after this one.
     fn then(&self, outer: &Xf) -> Xf {
-        let at = outer.apply(self.at.0, self.at.1);
+        let (a, b) = (&outer.m, &self.m);
         Xf {
-            at,
-            sx: self.sx * outer.sx,
-            sy: self.sy * outer.sy,
+            m: [
+                a[0] * b[0] + a[1] * b[2],
+                a[0] * b[1] + a[1] * b[3],
+                a[2] * b[0] + a[3] * b[2],
+                a[2] * b[1] + a[3] * b[3],
+            ],
+            at: outer.apply(self.at.0, self.at.1),
             rot: self.rot + outer.rot,
         }
+    }
+    fn det(&self) -> f64 {
+        self.m[0] * self.m[3] - self.m[1] * self.m[2]
+    }
+    /// How lengths grow (the mean of the two axes' scales): radii and text heights.
+    fn len_scale(&self) -> f64 {
+        self.det().abs().sqrt()
+    }
+    /// Where the direction at angle 0 points once placed, in degrees, written as close to the
+    /// sum of the turns as possible so plain turns keep their angles as written.
+    fn x_angle(&self) -> f64 {
+        let a = self.m[2].atan2(self.m[0]).to_degrees();
+        self.rot + normal_angle(a - self.rot)
     }
 }
 
@@ -235,7 +276,7 @@ fn shapes(
         let (x, y) = xf.apply(x, y);
         Point::new(x * scale, -y * scale)
     };
-    let r_scale = xf.sx.abs() * scale;
+    let r_scale = xf.len_scale() * scale;
     for (i, e) in ents.iter().enumerate() {
         if *budget == 0 {
             // This entity and every one after it at this level are left out.
@@ -268,7 +309,14 @@ fn shapes(
                 } else {
                     (e.f(50), e.f(51))
                 };
-                let (s, en) = (s + xf.rot, en + xf.rot);
+                // A mirroring placement turns the angle a into x_angle - a, so the arc runs the
+                // other way round; any other placement turns it by x_angle.
+                let turn = xf.x_angle();
+                let (s, en) = if xf.det() < 0.0 {
+                    (turn - en, turn - s)
+                } else {
+                    (s + turn, en + turn)
+                };
                 Some(Shape::Arc {
                     center: q(e.f(10), e.f(20)),
                     radius: e.f(40) * r_scale,
@@ -370,13 +418,7 @@ fn shapes(
             }
             "INSERT" => {
                 if let Some(inner) = e.get(2).and_then(|n| d.blocks.get(n)) {
-                    let ixf = Xf {
-                        at: (e.f(10), e.f(20)),
-                        sx: e.f_or(41, 1.0),
-                        sy: e.f_or(42, 1.0),
-                        rot: e.f(50),
-                    }
-                    .then(&xf);
+                    let ixf = Xf::insert((e.f(10), e.f(20)), e.f_or(41, 1.0), e.f_or(42, 1.0), e.f(50)).then(&xf);
                     shapes(
                         d,
                         inner,
@@ -1198,6 +1240,33 @@ mod tests {
         assert!(r.is_ok());
         // Truncated pair list and garbage numbers.
         let _ = symbol("0\nSECTION\n2\nENTITIES\n0\nLINE\n10\nNaN\n20", "x", "x");
+    }
+
+    #[test]
+    fn a_turned_block_inside_a_mirrored_one_is_placed_by_both() -> Result<()> {
+        // INNER: a line and a quarter arc, inserted turned by 90 degrees; the whole drawn
+        // mirrored in x (#231).
+        let blocks = "0\nBLOCK\n2\nINNER\n0\nLINE\n10\n0\n20\n0\n11\n10\n21\n0\n\
+                      0\nARC\n10\n0\n20\n0\n40\n2\n50\n0\n51\n90\n0\nENDBLK\n";
+        let d = parse(&dxf("0\nINSERT\n2\nINNER\n10\n0\n20\n0\n50\n90\n", blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [-1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        let near = |a: Point, b: Point| a.distance(b) < 1e-9;
+        // (10, 0) turns to (0, 10), stays there when mirrored in x, and is (0, -10) on the page.
+        assert!(
+            shapes
+                .iter()
+                .any(|(_, s)| matches!(s, Shape::Line { a, b } if near(*a, Point::new(0.0, 0.0)) && near(*b, Point::new(0.0, -10.0)))),
+            "{shapes:?}"
+        );
+        // The arc 0..90 turns to 90..180, mirrored in x to 0..90: -90..0 on the y-down page.
+        assert!(
+            shapes.iter().any(|(_, s)| matches!(s, Shape::Arc { start, end, .. }
+                if (*start + 90.0).abs() < 1e-9 && end.abs() < 1e-9)),
+            "{shapes:?}"
+        );
+        Ok(())
     }
 
     #[test]

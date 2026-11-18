@@ -558,10 +558,11 @@ enum ImportCmd {
         first_page: usize,
     },
     /// A SolidWorks Electrical project archive (.tewzip) or project database
-    /// (tew_project_data.sqlite): its schematic and line-diagram pages, symbols as boxes with
-    /// their connection points at the original positions, wires joined to them, and devices with
-    /// part data, linked to the archive catalog's part when it has it. Symbol graphics (DWG) are
-    /// not read.
+    /// (tew_project_data.sqlite): its schematic and line-diagram pages, symbols drawn from their
+    /// DWG blocks (boxes when the block has no readable drawing, and always for a bare database)
+    /// with their connection points at the original positions, the pages' own texts and frames,
+    /// wires joined to the symbols, and devices with part data, linked to the archive catalog's
+    /// part when it has it.
     Swe {
         path: PathBuf,
         /// Which project of the archive, counted from 1 (archives can hold several).
@@ -1770,7 +1771,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 if bytes.len() as u64 > limit {
                     return Err(format!("{} is larger than {} MB", path.display(), limit >> 20));
                 }
-                (bytes, None)
+                (bytes, None, None)
             } else {
                 let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
                 let got =
@@ -1785,9 +1786,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 for w in got.info_warning.iter().chain(info_warnings) {
                     eprintln!("warning: {w}");
                 }
-                (got.bytes, got.info)
+                (got.bytes, got.info, Some(got.folder))
             };
-            let (db, info) = db;
+            let (db, info, folder) = db;
             let conn = wc_import::swe::open(&db).map_err(e)?;
             let mut sw = wc_import::swe::read(&conn).map_err(e)?;
             sw.info = info;
@@ -1810,6 +1811,23 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                         sw.catalog = lib.parts;
                     }
                     Err(x) => eprintln!("warning: devices keep their part numbers as text: {x}"),
+                }
+            }
+            // The symbol and page drawings (DWG): symbols without one stay boxes.
+            if let Some(folder) = &folder {
+                let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
+                match wc_import::swe::drawings_from_archive(file, folder) {
+                    Ok(drawings) => {
+                        for w in &drawings.warnings {
+                            eprintln!("warning: drawings: {w}");
+                        }
+                        if !drawings.skipped.is_empty() {
+                            let kinds: Vec<String> = drawings.skipped.iter().map(|(k, n)| format!("{n} {k}")).collect();
+                            eprintln!("warning: drawings: not drawn: {}", kinds.join(", "));
+                        }
+                        sw.drawings = drawings;
+                    }
+                    Err(x) => eprintln!("warning: symbols are drawn as boxes: {x}"),
                 }
             }
             let (built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);

@@ -530,4 +530,4 @@ impl<T: AsRef<[u8]>> Reader<T> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

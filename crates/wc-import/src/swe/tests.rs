@@ -1697,7 +1697,10 @@ fn a_mapped_block_is_drawn_as_the_library_symbol_and_keeps_its_wire() {
     assert!(ends_on_a1);
     let c = count(&report, "library symbols");
     assert_eq!((c.source, c.imported), (2, 1));
-    assert_eq!(c.note, "1 drawn as boxes: no library symbol fits");
+    assert_eq!(
+        c.note,
+        "1 drawn from their DWG block or as boxes: no library symbol fits"
+    );
 }
 
 #[test]
@@ -2065,4 +2068,402 @@ fn a_mirrored_block_fits_the_library_symbol_mirrored() {
     let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
     assert_eq!(k1.symbol, "my.coil");
     assert_eq!((k1.rotation, k1.mirror), (Rotation::R0, true));
+}
+
+// ---- Symbol and page graphics from the DWG files (#163) ----
+
+use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+
+/// The library symbol drawn for placed symbol `item` (`s1`, ...) on page `n`.
+fn symbol_of<'a>(built: &'a Built, n: &str, item: &str) -> &'a Symbol {
+    let placed = page(built, n).symbols.iter().find(|s| s.id == item).unwrap();
+    built.symbols.iter().find(|s| s.id == placed.symbol).unwrap()
+}
+
+fn has_line(shapes: &[Shape], a: Point, b: Point) -> bool {
+    shapes
+        .iter()
+        .any(|s| matches!(s, Shape::Line { a: p, b: q } if p.distance(a) < 1e-6 && q.distance(b) < 1e-6))
+}
+
+#[test]
+fn symbols_are_drawn_from_their_dwg_block_and_pages_keep_their_texts() {
+    let mut sw = read(&sample()).unwrap();
+    // The block name differs in case from the database's `Coil`.
+    let coil = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0), E::Line((0.0, 5.0), (0.0, 4.0))]);
+    sw.drawings.add_block("COIL", &coil).unwrap();
+    // The page: a note, a frame line, one of the wire lines drawn again (reversed) and a block
+    // reference (the title block), which WiringCraft draws itself.
+    let page_dwg = model_space_dwg(&[
+        E::Text((20.0, 30.0), "Check rotation"),
+        E::Line((10.0, 10.0), (50.0, 10.0)),
+        E::Line((100.0, 224.0), (60.0, 224.0)),
+        E::Insert((0.0, 0.0)),
+    ]);
+    sw.drawings.add_page(10, &page_dwg).unwrap();
+    let (built, _, report) = build(&sw, None);
+
+    let k1 = symbol_of(&built, "01", "s1");
+    assert!(
+        k1.graphics.iter().any(
+            |s| matches!(s, Shape::Circle { center, radius, .. } if *center == Point::new(0.0, 0.0) && *radius == 4.0)
+        ),
+        "{:?}",
+        k1.graphics
+    );
+    assert!(
+        has_line(&k1.graphics, Point::new(0.0, -5.0), Point::new(0.0, -4.0)),
+        "y flipped: {:?}",
+        k1.graphics
+    );
+    assert!(!k1.graphics.iter().any(|s| matches!(s, Shape::Rect { .. })), "no box");
+    // The pins stay where the database puts them.
+    let pins: Vec<(&str, Point)> = k1.pins.iter().map(|q| (q.name.as_str(), q.at)).collect();
+    assert_eq!(pins, [("A1", Point::new(0.0, -5.0)), ("A2", Point::new(0.0, 5.0))]);
+    // The fuse has no drawing: a box.
+    let fuse = symbol_of(&built, "01", "s2");
+    assert!(matches!(fuse.graphics[..], [Shape::Rect { .. }]), "{:?}", fuse.graphics);
+
+    let pg = page(&built, "01");
+    let h = pg.size.mm().1;
+    assert!(
+        pg.graphics
+            .iter()
+            .any(|s| matches!(s, Shape::Text { at, text, .. } if text == "Check rotation" && *at == Point::new(20.0, h - 30.0))),
+        "{:?}",
+        pg.graphics
+    );
+    assert!(has_line(
+        &pg.graphics,
+        Point::new(10.0, h - 10.0),
+        Point::new(50.0, h - 10.0)
+    ));
+    assert_eq!(pg.graphics.len(), 2, "no wire line, no title block: {:?}", pg.graphics);
+
+    let c = count(&report, "DWG symbol graphics");
+    assert_eq!((c.source, c.imported), (2, 1));
+    assert_eq!(
+        c.note,
+        "1 drawn as boxes: 1 block(s) without a readable drawing in the archive"
+    );
+    let c = count(&report, "page drawings");
+    assert_eq!((c.source, c.imported), (1, 1));
+}
+
+#[test]
+fn a_turned_and_mirrored_symbol_turns_its_drawing_like_its_points() {
+    let mut sw = read(&sample()).unwrap();
+    let block = model_space_dwg(&[E::Line((0.0, 0.0), (10.0, 5.0)), E::Arc((0.0, 0.0), 2.0, 0.0, 90.0)]);
+    sw.drawings.add_block("Coil", &block).unwrap();
+    let k1 = sw.symbols.iter_mut().find(|s| s.id == 1).unwrap();
+    (k1.angle, k1.scale) = (90.0, (-1.0, 1.0));
+    // The points placed the same way, so the drawing can be checked against `place`.
+    let end = place(Point::new(0.0, 0.0), 90.0, (-1.0, 1.0), Point::new(10.0, 5.0));
+    assert!(end.distance(Point::new(5.0, 10.0)) < 1e-9, "{end:?}");
+    let (built, _, _) = build(&sw, None);
+    let g = &symbol_of(&built, "01", "s1").graphics;
+    assert!(has_line(g, Point::new(0.0, 0.0), Point::new(5.0, -10.0)), "{g:?}");
+
+    // Mirrored only: the quarter arc from 0 to 90 degrees (y up) runs from 90 to 180, which
+    // on the y-down page is -180 to -90.
+    let k1 = sw.symbols.iter_mut().find(|s| s.id == 1).unwrap();
+    k1.angle = 0.0;
+    let (built, _, _) = build(&sw, None);
+    let g = &symbol_of(&built, "01", "s1").graphics;
+    assert!(
+        g.iter().any(|s| matches!(s, Shape::Arc { start, end, radius, .. }
+            if (*start + 180.0).abs() < 1e-6 && (*end + 90.0).abs() < 1e-6 && *radius == 2.0)),
+        "{g:?}"
+    );
+}
+
+#[test]
+fn an_empty_or_missing_drawing_keeps_the_box() {
+    let mut sw = read(&sample()).unwrap();
+    sw.drawings.add_block("Coil", &model_space_dwg(&[])).unwrap();
+    let (built, _, report) = build(&sw, None);
+    assert!(matches!(
+        symbol_of(&built, "01", "s1").graphics[..],
+        [Shape::Rect { .. }]
+    ));
+    let c = count(&report, "DWG symbol graphics");
+    assert_eq!((c.source, c.imported), (2, 0));
+    assert_eq!(
+        c.note,
+        "2 drawn as boxes: 2 block(s) without a readable drawing in the archive"
+    );
+    assert!(page(&built, "01").graphics.is_empty());
+    assert!(sw.drawings.add_block("Bad", b"AC1024 but nothing else").is_err());
+}
+
+#[test]
+fn drawings_are_read_from_the_archive_and_the_project_copy_wins() {
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    let library = model_space_dwg(&[E::Circle((0.0, 0.0), 3.0)]);
+    let own = model_space_dwg(&[E::Line((0.0, 0.0), (0.0, 6.0))]);
+    let page_dwg = model_space_dwg(&[E::Text((5.0, 5.0), "Note")]);
+    let other_page = model_space_dwg(&[E::Text((5.0, 5.0), "Other project")]);
+    let buf = archive(&[
+        ("Projects/3/Database/tew_project_data.sqlite", &db),
+        ("Projects/3/Block/coil.dwg", &own),
+        ("Block/Coil.dwg", &library),
+        ("Block/Broken.dwg", b"AC1024 cut short"),
+        ("Projects/3/Drawings/10.ewg", &page_dwg),
+        ("Projects/4/Drawings/10.ewg", &other_page),
+    ]);
+    let got = database_from_archive(buf.clone(), 1).unwrap();
+    let drawings = drawings_from_archive(buf, &got.folder).unwrap();
+    assert_eq!((drawings.block_count(), drawings.page_count()), (1, 1));
+    assert_eq!(drawings.warnings.len(), 1, "{:?}", drawings.warnings);
+    assert!(
+        drawings.warnings[0].contains("Block/Broken.dwg"),
+        "{:?}",
+        drawings.warnings
+    );
+
+    let mut sw = read(&open(&got.bytes).unwrap()).unwrap();
+    sw.drawings = drawings;
+    let (built, _, _) = build(&sw, None);
+    let g = &symbol_of(&built, "01", "s1").graphics;
+    assert!(
+        has_line(g, Point::new(0.0, 0.0), Point::new(0.0, -6.0)),
+        "the project's copy: {g:?}"
+    );
+    let texts: Vec<&str> = page(&built, "01")
+        .graphics
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["Note"]);
+    assert!(drawings_from_archive(std::io::Cursor::new(b"not a zip".to_vec()), "Projects/3").is_err());
+}
+
+#[test]
+fn a_page_drawing_that_needs_a_bigger_sheet_gets_one() {
+    let mut sw = read(&sample()).unwrap();
+    // Page 01 has no frame name; its symbols and lines fit A4/A3, but the note at (500, 350)
+    // only fits A2 (594 x 420).
+    sw.drawings
+        .add_page(10, &model_space_dwg(&[E::Text((500.0, 350.0), "Far note")]))
+        .unwrap();
+    let (built, _, _) = build(&sw, None);
+    let pg = page(&built, "01");
+    let (w, h) = pg.size.mm();
+    assert!(w >= 500.0 && h >= 350.0, "{:?}", pg.size);
+    assert!(
+        pg.graphics
+            .iter()
+            .any(|s| matches!(s, Shape::Text { at, .. } if *at == Point::new(500.0, h - 350.0) && at.y >= 0.0)),
+        "{:?}",
+        pg.graphics
+    );
+}
+
+#[test]
+fn another_projects_block_never_replaces_the_library_one() {
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    let library = model_space_dwg(&[E::Circle((0.0, 0.0), 3.0)]);
+    let other = model_space_dwg(&[E::Line((0.0, 0.0), (0.0, 6.0))]);
+    let buf = archive(&[
+        ("Projects/3/Database/tew_project_data.sqlite", &db),
+        ("Block/Coil.dwg", &library),
+        ("Projects/5/Block/Coil.dwg", &other),
+    ]);
+    let drawings = drawings_from_archive(buf, "Projects/3").unwrap();
+    assert_eq!(drawings.block_count(), 1);
+    let mut sw = read(&sample()).unwrap();
+    sw.drawings = drawings;
+    let (built, _, _) = build(&sw, None);
+    let g = &symbol_of(&built, "01", "s1").graphics;
+    assert!(matches!(g[..], [Shape::Circle { .. }]), "the library's: {g:?}");
+}
+
+#[test]
+fn a_symbol_scaled_unevenly_and_turned_is_drawn_like_its_points() {
+    let mut sw = read(&sample()).unwrap();
+    sw.drawings
+        .add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (10.0, 0.0))]))
+        .unwrap();
+    let k1 = sw.symbols.iter_mut().find(|s| s.id == 1).unwrap();
+    (k1.angle, k1.scale) = (90.0, (2.0, 1.0));
+    let end = place(Point::new(0.0, 0.0), 90.0, (2.0, 1.0), Point::new(10.0, 0.0));
+    let (built, _, _) = build(&sw, None);
+    let g = &symbol_of(&built, "01", "s1").graphics;
+    // y flipped on the page.
+    assert!(
+        has_line(g, Point::new(0.0, 0.0), Point::new(round(end.x), -round(end.y))),
+        "{end:?} {g:?}"
+    );
+}
+
+#[test]
+fn the_drawing_limit_is_reported_apart_from_missing_drawings() {
+    // Two symbols drawn from blocks, with no budget left once the first page drawing is in:
+    // checked through the parts the build uses.
+    let mut d = SweDrawings::default();
+    d.add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]))
+        .unwrap();
+    let sw = read(&sample()).unwrap();
+    let coil = sw.symbols.iter().find(|s| s.id == 1).unwrap();
+    let mut skipped = BTreeMap::new();
+    let mut budget = 0;
+    assert_eq!(d.symbol_graphics(coil, &mut budget, &mut skipped), None);
+    assert!(skipped.contains_key(crate::dxf::OVER_LIMIT), "{skipped:?}");
+    assert!(d.has_block("COIL"));
+}
+
+#[test]
+fn a_symbol_drawing_that_needs_a_bigger_sheet_gets_one() {
+    let mut sw = read(&sample()).unwrap();
+    // The coil's block reaches 250 mm right of and 150 mm above the symbol: past A3 (420 x 297)
+    // although its points fit on it.
+    sw.drawings
+        .add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (250.0, 150.0))]))
+        .unwrap();
+    let coil = sw.symbols.iter().find(|s| s.id == 1).unwrap();
+    let reach = Point::new(coil.at.x + 250.0, coil.at.y + 150.0);
+    assert!(reach.y > 297.0, "{reach:?}");
+    let (built, _, _) = build(&sw, None);
+    let (w, h) = page(&built, "01").size.mm();
+    assert!(w >= reach.x && h >= reach.y, "{w} x {h} for {reach:?}");
+}
+
+#[test]
+fn reaching_the_drawing_limit_is_reported_by_the_import() {
+    let mut sw = read(&sample()).unwrap();
+    sw.drawings
+        .add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]))
+        .unwrap();
+    sw.drawings.set_draw_limit(0);
+    let (built, warnings, report) = build(&sw, None);
+    // The coil is boxed, and counted apart from blocks without a drawing.
+    let k1 = symbol_of(&built, "01", "s1");
+    assert!(matches!(k1.graphics[..], [Shape::Rect { .. }]), "{:?}", k1.graphics);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("the symbol and page drawings reached the limit of 0 entities")),
+        "{warnings:?}"
+    );
+    let c = count(&report, "DWG symbol graphics");
+    assert_eq!((c.source, c.imported), (2, 0));
+    assert_eq!(
+        c.note,
+        "1 drawn as boxes: 1 block(s) without a readable drawing in the archive; 1 drawn as boxes: the drawings' entity limit was reached"
+    );
+}
+
+#[test]
+fn refused_drawing_files_count_against_the_archive_total() {
+    let small = model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]);
+    let file = small.len() as u64;
+    let big = vec![0u8; 3 * small.len()];
+    // Two files too big to keep, then one that fits: the bytes read of the two refused ones
+    // (one past the file limit each) use up the total, so the third is not read.
+    let buf = archive(&[("Block/A.dwg", &big), ("Block/B.dwg", &big), ("Block/D.dwg", &small)]);
+    let lim = drawings::Limits {
+        file,
+        total: 2 * (file + 1),
+    };
+    let drawings = drawings::drawings_within(buf, "Projects/3", lim).unwrap();
+    assert!(!drawings.has_block("D"), "{:?}", drawings.warnings);
+    assert!(
+        drawings
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("2 drawing file(s) could not be read")),
+        "{:?}",
+        drawings.warnings
+    );
+    assert!(
+        drawings
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("1 drawing file(s) were not read")),
+        "{:?}",
+        drawings.warnings
+    );
+}
+
+#[test]
+fn local_pins_round_each_point_before_taking_off_the_origin() {
+    let mut sw = read(&sample()).unwrap();
+    let k1 = sw.symbols.iter_mut().find(|s| s.id == 1).unwrap();
+    // Rounding the difference would give 0.500, right on JOIN; rounding each point gives 0.501.
+    k1.at = Point::new(100.0004, 50.0);
+    k1.pins.truncate(1);
+    k1.pins[0].at = Point::new(100.5008, 40.0);
+    let local = local_pins(k1);
+    assert!((local[0].1.x - 0.501).abs() < 1e-9, "{local:?}");
+    assert!((local[0].1.y - 10.0).abs() < 1e-9, "y down: {local:?}");
+}
+
+#[test]
+fn an_empty_block_drawn_before_the_limit_is_not_counted_as_over_it() {
+    let mut sw = read(&sample()).unwrap();
+    // The coil's block has nothing to draw; the fuse's reaches the limit after it.
+    sw.drawings.add_block("Coil", &model_space_dwg(&[])).unwrap();
+    sw.drawings
+        .add_block("Fuse", &model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]))
+        .unwrap();
+    sw.drawings.set_draw_limit(0);
+    let (_, _, report) = build(&sw, None);
+    let c = count(&report, "DWG symbol graphics");
+    assert_eq!((c.source, c.imported), (2, 0));
+    assert_eq!(
+        c.note,
+        "1 drawn as boxes: 1 block(s) without a readable drawing in the archive; 1 drawn as boxes: the drawings' entity limit was reached"
+    );
+}
+
+#[test]
+fn a_drawing_read_in_part_keeps_its_graphics_and_says_why() {
+    let mut d = SweDrawings::default();
+    d.add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (0.0, 6.0)), E::Damaged]))
+        .unwrap();
+    assert_eq!(d.warnings.len(), 1, "{:?}", d.warnings);
+    let w = &d.warnings[0];
+    assert!(
+        w.starts_with(
+            "block Coil: 1 object(s) could not be read and are not drawn, the first because of: object 101 at"
+        ),
+        "{w}"
+    );
+    assert!(w.contains("past the end"), "{w}");
+    // What could be read is drawn.
+    let sw = read(&sample()).unwrap();
+    let coil = sw.symbols.iter().find(|s| s.id == 1).unwrap();
+    let g = d
+        .symbol_graphics(coil, &mut { crate::dxf::MAX_DRAWN }, &mut BTreeMap::new())
+        .unwrap();
+    assert!(has_line(&g, Point::new(0.0, 0.0), Point::new(0.0, -6.0)), "{g:?}");
+}
+
+#[test]
+fn a_symbol_at_the_join_boundary_is_drawn_and_sized_alike_by_both_checks() {
+    let mut sw = read(&sample()).unwrap();
+    // A2 sits 5.5002 below the origin: 5.500 when the difference is rounded (a library fit,
+    // exactly JOIN from the library pin), 5.501 when each point is rounded (no fit).
+    let k1 = sw.symbols.iter_mut().find(|s| s.id == 1).unwrap();
+    k1.at = Point::new(100.0, 200.0006);
+    k1.pins[0].at = Point::new(100.0, 205.0006);
+    k1.pins[1].at = Point::new(100.0, 194.5004);
+    // Its block reaches past A3 (420 x 297).
+    sw.drawings
+        .add_block("Coil", &model_space_dwg(&[E::Line((0.0, 0.0), (250.0, 150.0))]))
+        .unwrap();
+    let (built, _, _) = build_with(&sw, None, &choice(&[lib_coil("wc.coil", 5.0)], &[]));
+    let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();
+    assert_ne!(k1.symbol, "wc.coil", "no library fit at 5.501");
+    let drawn = built.symbols.iter().find(|s| s.id == k1.symbol).unwrap();
+    assert!(
+        !drawn.graphics.iter().any(|s| matches!(s, Shape::Rect { .. })),
+        "drawn from its block: {:?}",
+        drawn.graphics
+    );
+    let (w, h) = page(&built, "01").size.mm();
+    assert!(w >= 350.0 && h >= 350.0, "the sheet has room for the block: {w} x {h}");
 }

@@ -10,8 +10,9 @@
 //! a component of type 3; its terminals are components of type 4 whose `com_com_id` is the strip,
 //! numbered by `com_tag` in `com_tagorderno` order. Each wire record names the component terminal
 //! at both of its ends (`wir_cel_idfrom` + `wir_cte_nofrom`, and the same for `to`). Page drawings and
-//! symbol graphics are DWG files and are not read: each placed symbol becomes a box with its
-//! connection points where the database puts them.
+//! symbol graphics are DWG files in the archive, read by [`drawings`] when the caller gives them
+//! ([`SweProject::drawings`]): a placed symbol is drawn from its block's drawing, or as a box
+//! when there is none, with its connection points where the database puts them.
 //!
 //! Tag paths come in two forms. Most databases write them with aspect signs (`=F1+L1+L11-CR1`,
 //! location `+L1+L11`). Some write the levels separated by spaces with no signs at all
@@ -42,7 +43,10 @@ use wc_core::{CableCore, Device, DeviceTag, Endpoint, Page, PageSize, PlacedSymb
 use crate::aml::Built;
 use crate::{Error, Result};
 
+pub mod drawings;
 pub mod library;
+
+pub use drawings::{SweDrawings, drawings_from_archive};
 
 /// `tew_file.fil_filetype` values (the product's `EwFileType`). Drawn as schematics: schematic
 /// sheet, line diagram, mixed schematic, P&ID, fluid. The others are folders, reports (bill of
@@ -114,6 +118,10 @@ pub struct SweSymbol {
     /// The opposite corner of a box symbol (black box), y up.
     pub corner: Option<Point>,
     pub pins: Vec<SwePin>,
+    /// How the block is placed, like its connection points ([`place`]): turned by this many
+    /// degrees, then scaled along the page axes (a negative scale mirrors).
+    pub angle: f64,
+    pub scale: (f64, f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,6 +205,9 @@ pub struct SweProject {
     /// The archive's catalog parts ([`library::from_archive`]), set by the caller. Devices and
     /// cables that name one of them are linked to it, and their layout footprints take its size.
     pub catalog: Vec<wc_core::Part>,
+    /// The archive's symbol and page drawings ([`drawings::drawings_from_archive`]), set by the
+    /// caller. Without them every symbol that no library symbol fits is drawn as a box.
+    pub drawings: SweDrawings,
     pub warnings: Vec<String>,
 }
 
@@ -1069,6 +1080,8 @@ pub fn read(conn: &Connection) -> Result<SweProject> {
             at,
             corner,
             pins: out_pins,
+            angle,
+            scale,
         });
     }
     if unplaced > 0 {
@@ -1444,6 +1457,43 @@ struct LibraryFit<'a> {
 /// terminal, an interruption for an arrow), as many pins, each pin named like a point and within
 /// [`JOIN`] of it once the symbol is turned by a quarter step and maybe mirrored (blocks drawn
 /// turned, as in horizontal circuits). `pins` are the points relative to the symbol's origin.
+/// A symbol's points around its origin, y down: each coordinate rounded, then the origin
+/// taken off, so the sheet's height (a whole number of mm) never changes the result. Both
+/// library-symbol checks of a page use it, so they always agree.
+fn local_pins(s: &SweSymbol) -> Vec<(String, Point)> {
+    s.pins
+        .iter()
+        .map(|q| {
+            (
+                q.name.clone(),
+                Point::new(round(q.at.x) - round(s.at.x), round(s.at.y) - round(q.at.y)),
+            )
+        })
+        .collect()
+}
+
+/// Draw symbol `s` from its block, and tell whether the entity limit cut its drawing short.
+fn draw_symbol(
+    p: &SweProject,
+    s: &SweSymbol,
+    budget: &mut usize,
+    skipped: &mut BTreeMap<String, usize>,
+) -> (Option<Vec<Shape>>, bool) {
+    let over_before = skipped.get(crate::dxf::OVER_LIMIT).copied().unwrap_or(0);
+    let drawn = p.drawings.symbol_graphics(s, budget, skipped);
+    let over = skipped.get(crate::dxf::OVER_LIMIT).copied().unwrap_or(0) > over_before;
+    (drawn, over)
+}
+
+/// The role a symbol's component gives it.
+fn symbol_role(p: &SweProject, s: &SweSymbol) -> SymbolRole {
+    match s.component.and_then(|c| p.components.get(&c)).map(|c| c.kind) {
+        Some(COMPONENT_ARROW) => SymbolRole::Interruption,
+        Some(COMPONENT_TERMINAL) => SymbolRole::Terminal,
+        _ => SymbolRole::Standalone,
+    }
+}
+
 fn library_fit<'a>(
     choice: &'a SymbolChoice,
     block: &str,
@@ -1788,8 +1838,18 @@ pub fn build_with(
     let mut used_components: BTreeSet<i64> = BTreeSet::new();
     let mut symbols_in = 0;
     let mut symbols_out = 0;
-    // Of those, drawn as a library symbol and as a box.
+    // Of those, drawn as a library symbol and not; of the others, drawn from their DWG block and
+    // as a box, with the blocks that fell back to boxes.
     let (mut library_symbols, mut boxed_symbols) = (0usize, 0usize);
+    let mut dwg_symbols = 0usize;
+    let mut fallback_blocks: BTreeSet<String> = BTreeSet::new();
+    let mut pages_with_drawing = 0usize;
+    // One budget for every drawing of the import, like the DWG reader's own.
+    let mut draw_budget = p.drawings.draw_limit();
+    // Entities of the drawings left out while drawing, and symbols that fell back to boxes
+    // only because that budget ran out.
+    let mut draw_skipped: BTreeMap<String, usize> = BTreeMap::new();
+    let mut over_budget_symbols = 0usize;
     let mut lines_in = 0;
     let mut lines_out = 0usize;
     let mut zero_length = 0;
@@ -1827,16 +1887,41 @@ pub fn build_with(
             extent.x = extent.x.max(q.x);
             extent.y = extent.y.max(q.y);
         };
+        // A symbol no library symbol fits is drawn from its block, which may reach past its
+        // points: drawn here, so the sheet is chosen with room for it.
+        let mut block_drawn: BTreeMap<i64, (Option<Vec<Shape>>, bool)> = BTreeMap::new();
         for s in &syms {
             grow(s.at);
             s.pins.iter().for_each(|q| grow(q.at));
             if let Some(c) = s.corner {
                 grow(c);
             }
+            if s.pins.is_empty() && s.corner.is_none() {
+                continue;
+            }
+            // The points around the symbol's origin, y down, as the build below takes them.
+            let local = local_pins(s);
+            if library_fit(choice, &s.block, symbol_role(p, s), &local).is_some() {
+                continue;
+            }
+            let (drawn, over) = draw_symbol(p, s, &mut draw_budget, &mut draw_skipped);
+            for sh in drawn.iter().flatten() {
+                let (min, max) = sh.bounds();
+                grow(Point::new(s.at.x + max.x, s.at.y - min.y));
+            }
+            block_drawn.insert(s.id, (drawn, over));
         }
         for l in &lines {
             grow(l.a);
             grow(l.b);
+        }
+        // The page drawing's own texts, frames and notes, y flipped: they need room too.
+        let page_drawing = p
+            .drawings
+            .page_graphics(pg.id, &lines, &mut draw_budget, &mut draw_skipped);
+        for sh in &page_drawing {
+            let (min, max) = sh.bounds();
+            grow(Point::new(max.x, -min.y));
         }
         // The sheet the title block names, unless the content does not fit on it.
         let (fitted, fits) = page_size(extent);
@@ -1864,6 +1949,10 @@ pub fn build_with(
         // A line diagram repeats devices the schematics draw in detail.
         page.overview = pg.kind == KIND_LINE_DIAGRAM;
         page.title_block = pg.title_block.clone();
+        page.graphics = drawings::on_sheet(page_drawing, height);
+        if !page.graphics.is_empty() {
+            pages_with_drawing += 1;
+        }
 
         // Pin positions on this page (y down) for joining wire ends.
         let mut pin_at: Vec<(Point, String, String)> = Vec::new();
@@ -1879,20 +1968,33 @@ pub fn build_with(
             if s.component.is_some() && component.is_none() {
                 unknown_component += 1;
             }
-            let role = match component.map(|c| c.kind) {
-                Some(COMPONENT_ARROW) => SymbolRole::Interruption,
-                Some(COMPONENT_TERMINAL) => SymbolRole::Terminal,
-                _ => SymbolRole::Standalone,
-            };
-            let local: Vec<(String, Point)> = pins
-                .iter()
-                .map(|(n, at)| (n.clone(), Point::new(at.x - origin.x, at.y - origin.y)))
-                .collect();
+            let role = symbol_role(p, s);
+            let local = local_pins(s);
             let matched = library_fit(choice, &s.block, role, &local);
             let from_library = matched.is_some();
             let (graphics, out_pins) = match &matched {
                 Some(fit) => (Vec::new(), fit.pins.clone()),
-                None => box_symbol(&s.block, origin, s.corner.map(flip), &pins),
+                None => {
+                    let (boxed, pins) = box_symbol(&s.block, origin, s.corner.map(flip), &pins);
+                    let (drawn, over) = match block_drawn.remove(&s.id) {
+                        Some(got) => got,
+                        None => draw_symbol(p, s, &mut draw_budget, &mut draw_skipped),
+                    };
+                    match drawn {
+                        Some(drawn) => {
+                            dwg_symbols += 1;
+                            (drawn, pins)
+                        }
+                        None if over => {
+                            over_budget_symbols += 1;
+                            (boxed, pins)
+                        }
+                        None => {
+                            fallback_blocks.insert(s.block.to_lowercase());
+                            (boxed, pins)
+                        }
+                    }
+                }
             };
             let key = format!("{}|{:?}|{:?}|{:?}", s.block, role, graphics, out_pins);
             let (rotation, mirror) = matched
@@ -2333,6 +2435,12 @@ pub fn build_with(
     let layouts = cabinet::layouts(p, &tags, &built.devices, &built.parts);
     built.panels.clone_from(&layouts.panels);
 
+    if let Some(n) = draw_skipped.get(crate::dxf::OVER_LIMIT) {
+        warnings.push(format!(
+            "the symbol and page drawings reached the limit of {} entities; {n} more were left out",
+            p.drawings.draw_limit()
+        ));
+    }
     if unknown_component > 0 {
         warnings.push(format!(
             "{unknown_component} symbol(s) refer to a component the database does not have; they are drawn without a tag"
@@ -2406,7 +2514,41 @@ pub fn build_with(
             what: "library symbols",
             source: symbols_out,
             imported: library_symbols,
-            note: note(vec![(boxed_symbols, "drawn as boxes: no library symbol fits")]),
+            note: note(vec![(
+                boxed_symbols,
+                "drawn from their DWG block or as boxes: no library symbol fits",
+            )]),
+        },
+        Count {
+            what: "DWG symbol graphics",
+            source: boxed_symbols,
+            imported: dwg_symbols,
+            note: note(vec![
+                (
+                    boxed_symbols - dwg_symbols - over_budget_symbols,
+                    &format!(
+                        "drawn as boxes: {} block(s) without a readable drawing in the archive",
+                        fallback_blocks.len()
+                    ),
+                ),
+                (
+                    over_budget_symbols,
+                    "drawn as boxes: the drawings' entity limit was reached",
+                ),
+            ]),
+        },
+        Count {
+            what: "page drawings",
+            source: drawn.iter().filter(|pg| pg.kind != KIND_COVER).count(),
+            imported: pages_with_drawing,
+            note: note(vec![(
+                drawn
+                    .iter()
+                    .filter(|pg| pg.kind != KIND_COVER)
+                    .count()
+                    .saturating_sub(pages_with_drawing),
+                "without a drawing in the archive, or with nothing in it besides symbols and wires",
+            )]),
         },
         Count {
             what: "wire lines",
