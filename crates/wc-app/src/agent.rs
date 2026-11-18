@@ -895,17 +895,22 @@ impl AppTools<'_> {
             open.keep(g.mark);
             return r;
         };
-        open.back_to(g.mark);
+        let files = open.back_to(g.mark).err();
         (self.0.ed.page, self.0.ed.selection, self.0.ed.panel) = (g.page, g.selection, g.panel);
         // A form the refused change opened (the cover page made from a held page) edits what
         // was taken back: it closes, and the panel shown before stays shown.
         if !g.had_form && matches!(self.0.dialog, Some(Dialog::Cover { .. } | Dialog::Template { .. })) {
             self.0.dialog = None;
         }
-        Err(match r {
+        let mut msg = match r {
             Ok(_) => format!("Not done: {why}"),
             Err(e) => format!("Not done: {why} The tool also said: {e}"),
-        })
+        };
+        if let Some(f) = files {
+            msg.push(' ');
+            msg.push_str(&f);
+        }
+        Err(msg)
     }
 }
 
@@ -1105,6 +1110,16 @@ impl App {
         if edits_page(name, v)
             && let (Ok(page), Some(open)) = (self.page_of(v, "page"), self.open.as_ref())
             && let Some(why) = open.held_reason(page)
+        {
+            return Err(why);
+        }
+        // Cover Page marks an unmarked first page as the cover: refused before it runs when
+        // someone else holds that page, so the form open now (and its Cancel) stays as it is.
+        if name == "run_action"
+            && s(v, "action").is_some_and(|a| Action::CoverPage.name().eq_ignore_ascii_case(a))
+            && let Some(open) = self.open.as_ref()
+            && open.cover_marks_first()
+            && let Some(why) = open.held_reason(0)
         {
             return Err(why);
         }
@@ -4138,6 +4153,15 @@ mod tests {
         assert!(r.as_ref().is_err_and(|e| e.contains("Ola")), "{r:?}");
         assert!(a.dialog.is_none(), "no cover form for a refused change");
         assert_eq!(a.ed.panel, Some(0), "the panel stays shown");
+        assert_eq!(a.open.as_ref().unwrap().project, project);
+        // An open template form stays open, not replaced by the cover form.
+        call(&mut a, "run_action", json!({"action": Action::PageTemplate.name()})).unwrap();
+        let r = call(&mut a, "run_action", json!({"action": Action::CoverPage.name()}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola")), "{r:?}");
+        assert!(
+            matches!(a.dialog, Some(Dialog::Template { .. })),
+            "the template form stays"
+        );
         assert_eq!(a.open.as_ref().unwrap().project, project);
     }
 

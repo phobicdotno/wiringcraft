@@ -138,6 +138,34 @@ pub(crate) struct Mark {
     form_step: Option<u64>,
     dirty: bool,
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+    /// The vendored symbol and part files with their contents, to put back.
+    files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+/// A vendored item folder of the project, when it lies inside the project folder (a link out
+/// of it is not followed).
+fn vendor_folder(dir: &Path, kind: ItemKind) -> Option<PathBuf> {
+    let folder = dir.join(store::VENDOR_DIR).join(kind.dir());
+    let root = dir.canonicalize().ok()?;
+    folder.canonicalize().ok().filter(|f| f.starts_with(&root))
+}
+
+/// The vendored symbol and part files (plain files only, not links) with their contents.
+fn vendor_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        let Some(entries) = vendor_folder(dir, kind).and_then(|f| std::fs::read_dir(f).ok()) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_file())
+                && let Ok(bytes) = std::fs::read(e.path())
+            {
+                out.insert(e.path(), bytes);
+            }
+        }
+    }
+    out
 }
 
 pub struct Open {
@@ -1238,6 +1266,7 @@ impl Open {
             form_step: self.form_step,
             dirty: self.dirty,
             terminals_before: self.terminals_before.clone(),
+            files: vendor_files(&self.dir),
         }
     }
 
@@ -1259,24 +1288,39 @@ impl Open {
 
     /// Take back everything changed since `mark`: the project, the symbols and parts it
     /// loaded, its undo steps, and the change marks; the undo and redo history are as before.
-    pub(crate) fn back_to(&mut self, mark: Mark) {
+    /// Symbol and part files are as they were too: one the change wrote is removed, one it
+    /// replaced is written back, and one it only read is left alone. Files that could not be
+    /// put back are reported (the rest is taken back all the same).
+    pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
         self.project = mark.project;
         self.symbols.retain(|id, _| mark.symbols.contains(id));
-        // A part file the change took from the library goes too: left behind without its lock
-        // entry, a later use would load it unpinned and the session would never send it.
-        for id in self.parts.keys().filter(|id| !mark.parts.contains(*id)) {
-            if !self.project.lock.parts.contains_key(id)
-                && let Ok(path) = store::vendor_path(&self.dir, ItemKind::Part, id)
-            {
-                let _ = std::fs::remove_file(path);
-            }
-        }
         self.parts.retain(|id, _| mark.parts.contains(id));
         self.undo = mark.undo;
         self.redo = mark.redo;
         self.undo_dropped = mark.undo_dropped;
         (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
         self.terminals_before = mark.terminals_before;
+        // A file left behind without its lock entry would later load unpinned, and the session
+        // would never send it.
+        let now = vendor_files(&self.dir);
+        let mut failed = Vec::new();
+        for path in now.keys().filter(|p| !mark.files.contains_key(*p)) {
+            if let Err(e) = std::fs::remove_file(path) {
+                failed.push(format!("{}: {e}", path.display()));
+            }
+        }
+        for (path, bytes) in &mark.files {
+            if now.get(path) != Some(bytes)
+                && let Err(e) = std::fs::write(path, bytes)
+            {
+                failed.push(format!("{}: {e}", path.display()));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("Library files could not be put back: {}", failed.join("; ")))
+        }
     }
 
     /// Delete a page. The last page of a project cannot be deleted. Returns the page to show next.
@@ -1545,6 +1589,19 @@ impl Open {
         Ok(())
     }
 
+    /// Whether [`Open::cover_page`] would mark the first page as the cover: no page is marked
+    /// yet, and the first one is an empty page titled Cover.
+    pub fn cover_marks_first(&self) -> bool {
+        self.project.cover_page().is_none()
+            && self.project.pages.first().is_some_and(|first| {
+                first.title.trim().eq_ignore_ascii_case("cover")
+                    && first.symbols.is_empty()
+                    && first.wires.is_empty()
+                    && first.graphics.is_empty()
+                    && first.underlay.is_none()
+            })
+    }
+
     /// The cover page's index. A project without one gets one: an empty first page titled
     /// "Cover" (as new projects started) is marked as the cover, otherwise a new cover page
     /// numbered `0` goes in front of the others. Creating or marking it is one undo step. Fails,
@@ -1553,13 +1610,7 @@ impl Open {
         if let Some(i) = self.project.cover_page() {
             return Ok(i);
         }
-        if let Some(first) = self.project.pages.first()
-            && first.title.trim().eq_ignore_ascii_case("cover")
-            && first.symbols.is_empty()
-            && first.wires.is_empty()
-            && first.graphics.is_empty()
-            && first.underlay.is_none()
-        {
+        if self.cover_marks_first() {
             self.checkpoint();
             if let Some(first) = self.project.pages.first_mut() {
                 first.cover = true;
@@ -2194,13 +2245,23 @@ pub(crate) mod tests {
         o.ensure_part(pid).unwrap();
         o.checkpoint();
         assert!(part_file.exists());
-        o.back_to(mark);
+        o.back_to(mark).unwrap();
         assert!(!part_file.exists(), "no unpinned part file is left");
         assert!(!o.project.lock.parts.contains_key(pid));
         assert_eq!((o.undo_mark(), o.can_undo()), (undo_mark, can_undo));
         // Taken again later, it is pinned (and so sent to the session).
         o.ensure_part(pid).unwrap();
         assert!(o.project.lock.parts.contains_key(pid));
+        // A file the change only read stays; one it replaced is written back.
+        let symbol_file = store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap();
+        let symbol_before = std::fs::read(&symbol_file).unwrap();
+        o.parts.remove(pid);
+        let mark = o.mark();
+        o.ensure_part(pid).unwrap();
+        std::fs::write(&symbol_file, b"{}").unwrap();
+        o.back_to(mark).unwrap();
+        assert!(part_file.exists(), "a file that was there before stays");
+        assert_eq!(std::fs::read(&symbol_file).unwrap(), symbol_before);
         // A mark taken inside a kept change (a form it opened) means the same step afterwards.
         let mark = o.mark();
         let inside = o.start_live_form();
