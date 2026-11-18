@@ -1860,9 +1860,9 @@ fn a_pinned_copy_the_host_puts_back_during_a_session_reaches_the_guests() -> Tes
     match h.role.as_ref() {
         Some(Role::Host(hosting)) => {
             assert_eq!(hosting.host.files().0.get("wc.coil").cloned(), coil);
-            // The device the placement made (it does not wait for the file) and the page
-            // edit; the file alone is no step to undo.
-            assert_eq!(hosting.host.history().len(), steps + 2, "{:?}", log.messages());
+            // The page edit, with the device the placement made (it waited with the page); the
+            // file alone is no step to undo.
+            assert_eq!(hosting.host.history().len(), steps + 1, "{:?}", log.messages());
             assert!(
                 hosting
                     .host
@@ -3546,6 +3546,450 @@ fn undo_of_a_waiting_change_takes_it_back_here_and_not_an_older_one_there() -> T
 }
 
 #[test]
+fn undo_of_a_second_waiting_placement_takes_back_only_that_one() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let tag_of = |o: &Open, item: &str| -> Option<wc_core::DeviceTag> {
+        o.project
+            .page("p0003")?
+            .symbols
+            .iter()
+            .find(|s| s.id == item)?
+            .tag
+            .clone()
+    };
+    // The same waiting symbol placed again: its new device record waits with the page.
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    let second_tag = tag_of(&guest_open, &second).ok_or("no tag")?;
+    let first_tag = tag_of(&guest_open, &first).ok_or("no tag")?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(has_placement(&guest_open, "p0003", &second));
+    assert!(!has_placement(&host_open, "p0003", &second));
+    assert!(!host_open.project.devices.contains_key(&second_tag), "{:?}", g.notes);
+
+    let history = h.role.as_ref().map(|r| r.history().len());
+    // One Undo takes back the second placement and its device, here only; the first placement
+    // still waits.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    assert!(!guest_open.project.devices.contains_key(&second_tag));
+    assert!(!host_open.project.devices.contains_key(&second_tag));
+    assert_eq!(
+        h.role.as_ref().map(|r| r.history().len()),
+        history,
+        "nothing in the session"
+    );
+    assert!(g.can_undo(), "the first placement still waits");
+
+    // Once the symbol gets in, the first placement goes out, and only that one.
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(has_placement(&host_open, "p0003", &first), "{:?}", g.notes);
+    assert!(host_open.project.devices.contains_key(&first_tag));
+    assert!(!has_placement(&host_open, "p0003", &second));
+    assert!(!host_open.project.devices.contains_key(&second_tag));
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_rename_of_a_waiting_placements_new_device_brings_the_device_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let tag = guest_open
+        .project
+        .page("p0003")
+        .and_then(|p| p.symbols.iter().find(|s| s.id == first))
+        .and_then(|s| s.tag.clone())
+        .ok_or("no tag")?;
+    let device = guest_open.project.devices.get(&tag).cloned().ok_or("no device")?;
+    let renamed = DeviceTag::parse("-K77")?;
+    // The new device the waiting placement made is renamed before the session has it.
+    guest_open.checkpoint();
+    guest_open.project.rename_device(&tag, &renamed);
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!guest_open.project.devices.contains_key(&tag));
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let on_page = guest_open
+        .project
+        .page("p0003")
+        .and_then(|p| p.symbols.iter().find(|s| s.id == first))
+        .and_then(|s| s.tag.clone());
+    assert_eq!(on_page.as_ref(), Some(&tag), "{:?}", g.notes);
+    assert_eq!(
+        guest_open.project.devices.get(&tag),
+        Some(&device),
+        "the device comes back with it"
+    );
+    assert!(!guest_open.project.devices.contains_key(&renamed));
+    assert!(!host_open.project.devices.contains_key(&tag) && !host_open.project.devices.contains_key(&renamed));
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_waiting_placement_keeps_a_session_change_to_a_synced_device_on_its_page() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let k9 = DeviceTag::parse("-K9")?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        let coil = o.place(2, "wc.coil", wc_core::Point::new(40.0, 160.0))?;
+        if let Some(s) = o.project.pages[2].symbols.iter_mut().find(|s| s.id == coil) {
+            s.tag = Some(k9.clone());
+        }
+        o.project.devices.insert(k9.clone(), Device::default());
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    log.fail_vendor(true);
+    let first = guest_open.place(2, "wc.contact.no", wc_core::Point::new(40.0, 100.0))?;
+    for _ in 0..=ITEM_TRIES {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        std::thread::sleep(ITEM_WAIT);
+    }
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // After the second placement, the host changes -K9, which the waiting page names.
+    host_open.project.devices.insert(
+        k9.clone(),
+        Device {
+            description: "From the host".into(),
+            ..Default::default()
+        },
+    );
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let description = |o: &Open| o.project.devices.get(&k9).map(|d| d.description.clone());
+    assert_eq!(
+        description(&guest_open).as_deref(),
+        Some("From the host"),
+        "{:?}",
+        g.notes
+    );
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    assert_eq!(
+        description(&guest_open).as_deref(),
+        Some("From the host"),
+        "the session's -K9 stays"
+    );
+    assert_eq!(description(&host_open).as_deref(), Some("From the host"));
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_waiting_placement_keeps_the_sessions_page_number() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The host renumbers the waiting page meanwhile, and the guest takes that in.
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    assert_eq!(number(&guest_open).as_deref(), Some("30"));
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    assert_eq!(number(&host_open).as_deref(), Some("30"), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_renumbering_here_of_a_waiting_page_puts_its_number_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    let original = number(&guest_open).ok_or("no page")?;
+    // The guest renumbers the waiting page, then numbers it back: two actions here.
+    for to in ["30", original.as_str()] {
+        guest_open.checkpoint();
+        guest_open.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        guest_open.project.sort_pages();
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open), Some(original.clone()));
+    // Undo takes back the latest of them: the page is numbered 30 again, and still waits.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_renumbering_here_after_the_sessions_takes_back_only_that_one() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    let original = number(&guest_open).ok_or("no page")?;
+    // The session renumbers the waiting page to 30, and the guest takes that in.
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open).as_deref(), Some("30"));
+    // The guest numbers it back to the number it had, then to 40: two actions here.
+    for to in [original.as_str(), "40"] {
+        guest_open.checkpoint();
+        guest_open.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        guest_open.project.sort_pages();
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // Undo takes back the 40 only: the page has the guest's number again, and still waits.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open), Some(original), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_waiting_placement_keeps_the_sessions_second_renumbering() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    let renumber = |o: &mut Open, to: &str| -> TestResult {
+        o.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        o.project.sort_pages();
+        Ok(())
+    };
+    // The session renumbers the waiting page to 30; the guest places a second waiting symbol;
+    // then the session renumbers the page again, to 50.
+    renumber(&mut host_open, "30")?;
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    renumber(&mut host_open, "50")?;
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open).as_deref(), Some("50"));
+    // Undo takes back the second placement only; the page keeps the session's 50.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    assert_eq!(number(&guest_open).as_deref(), Some("50"), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_renumbering_here_before_the_sessions_gives_the_page_the_sessions_number() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    // The guest renumbers the waiting page to 10 ...
+    guest_open.checkpoint();
+    guest_open.project.page_mut("p0003").ok_or("no page")?.number = "10".into();
+    guest_open.project.sort_pages();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // ... and the session renumbers it to 30 meanwhile; the guest's 10 still waits.
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open).as_deref(), Some("10"), "{:?}", g.notes);
+    // Undo takes back the guest's 10: the page has the session's 30, and still waits.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
+fn a_renumbering_here_the_session_repeats_leaves_no_empty_undo_step() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    let original = number(&guest_open).ok_or("no page")?;
+    let host_renumber = |o: &mut Open, to: &str| -> TestResult {
+        o.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        o.project.sort_pages();
+        Ok(())
+    };
+    // The session renumbers the waiting page to 30.
+    host_renumber(&mut host_open, "30")?;
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The guest places a second waiting symbol, then numbers the page back, then to 40.
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for to in [original.as_str(), "40"] {
+        guest_open.checkpoint();
+        guest_open.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        guest_open.project.sort_pages();
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The session numbers it back too.
+    host_renumber(&mut host_open, &original)?;
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // Undo takes back the 40; the next Undo has nothing of the guest's renumbering left to
+    // take back, and takes back the second placement only.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open), Some(original.clone()), "{:?}", g.notes);
+    assert!(has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(
+        has_placement(&guest_open, "p0003", &first),
+        "the first still waits: {:?}",
+        g.notes
+    );
+    assert_eq!(number(&guest_open), Some(original), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
+fn a_renumbering_here_and_back_the_session_then_makes_leaves_no_empty_undo_step() -> TestResult {
+    renumbering_back_then_session_renumbers(false)
+}
+
+#[test]
+fn a_renumbering_the_session_makes_with_another_change_leaves_no_empty_undo_step() -> TestResult {
+    renumbering_back_then_session_renumbers(true)
+}
+
+/// The guest numbers a page with two waiting placements 30 and back, then the session numbers
+/// it 30, and (`rename`) also renames the project in the same sync.
+fn renumbering_back_then_session_renumbers(rename: bool) -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
+    let original = number(&guest_open).ok_or("no page")?;
+    // A second waiting placement, then the guest numbers the page 30 and back.
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    for to in ["30", original.as_str()] {
+        guest_open.checkpoint();
+        guest_open.project.page_mut("p0003").ok_or("no page")?.number = to.into();
+        guest_open.project.sort_pages();
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // Then the session numbers the page 30: the step before the guest's renumbering back is
+    // what the guest has now, and is no step to undo.
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    if rename {
+        host_open.project.meta.name = "Renamed in the session".into();
+    }
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    if rename {
+        assert_eq!(guest_open.project.meta.name, "Renamed in the session");
+    }
+    // One Undo takes back the second placement only.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(
+        has_placement(&guest_open, "p0003", &first),
+        "the first still waits: {:?}",
+        g.notes
+    );
+    assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    if rename {
+        assert_eq!(guest_open.project.meta.name, "Renamed in the session");
+    }
+    Ok(())
+}
+
+#[test]
+fn undo_of_an_action_here_on_nothing_that_waits_still_drops_what_waits_after_a_renumbering() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The latest action here renames the project: nothing that waits.
+    guest_open.checkpoint();
+    guest_open.project.meta.name = "Renamed here".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The session renumbers the waiting page: the step before the rename has its waiting
+    // targets as they are now, and still is the rename's.
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(guest_open.project.meta.name, "Renamed here", "{:?}", g.notes);
+    // Undo drops what waits, as for any action that changed nothing that waits.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(!has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
+fn a_page_renumbered_in_the_undo_history_keeps_the_pages_in_order() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(tmp.path())?;
+    let last = open.project.pages.last().ok_or("no page")?.clone();
+    let order = |p: &Project| p.pages.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+    open.checkpoint();
+    open.project.meta.name = "Renamed".into();
+    // The session numbers the last page before all others: so does the step Undo brings back.
+    open.renumber_in_history(&last.id, &last.number, "0");
+    open.project.page_mut(&last.id).ok_or("no page")?.number = "0".into();
+    open.project.sort_pages();
+    open.undo();
+    assert_eq!(open.project.pages.first().map(|p| p.id.clone()), Some(last.id.clone()));
+    let mut sorted = open.project.clone();
+    sorted.sort_pages();
+    assert_eq!(order(&open.project), order(&sorted));
+    Ok(())
+}
+
+#[test]
 fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
@@ -3573,6 +4017,37 @@ fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
 
 fn waiting(names: &[String]) -> std::collections::BTreeSet<String> {
     names.iter().cloned().collect()
+}
+
+#[test]
+fn a_rename_to_a_tag_only_a_waiting_page_names_waits_as_a_pair() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    let mut contact = symbol("s1", 10.0);
+    contact.symbol = "contact".into();
+    contact.tag = Some(k1.clone());
+    page.symbols.push(contact);
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), Default::default());
+    // On the same page: -K1 renamed to -K2, and a symbol the session does not have placed.
+    let mut local = base.clone();
+    let p1 = local.page_mut("p1").ok_or("no page")?;
+    p1.symbols[0].tag = Some(k2.clone());
+    p1.symbols.push(symbol("s9", 40.0));
+    local.devices.remove(&k1);
+    local.devices.insert(k2.clone(), Default::default());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert!(held.now.devices.contains_key(&k2), "the new tag waits with its page");
+    assert_eq!(
+        held.now.devices.get(&k1),
+        Some(&None),
+        "and the old one's removal with it"
+    );
+    assert_eq!(held.renames.len(), 1);
+    assert_eq!(held.renames[0].devices, [k1, k2].into_iter().collect());
+    Ok(())
 }
 
 #[test]

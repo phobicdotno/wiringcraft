@@ -2209,6 +2209,18 @@ impl Held {
             items.extend(jumper_parts.iter().map(|id| item_name(ItemKind::Part, id)));
             held.now.meta = Some(Box::new(local.meta.clone()));
         }
+        // A device new since `base` that a waiting page names waits with it: placing the symbol
+        // made its record, and Undo of the placement takes both back here alone.
+        let pages: Vec<&Page> = held.now.pages.values().flatten().collect();
+        let new_devices: Vec<(wc_core::DeviceTag, Option<wc_core::Device>)> = local
+            .devices
+            .iter()
+            .filter(|(tag, _)| !base.devices.contains_key(*tag) && !held.now.devices.contains_key(*tag))
+            .filter(|(tag, _)| pages.iter().any(|p| page_mentions(p, &|t| t == *tag)))
+            .map(|(tag, d)| (tag.clone(), Some(d.clone())))
+            .collect();
+        held.now.devices.extend(new_devices);
+        // After those, so a rename to a tag only a waiting page names is held as a pair.
         held.hold_renames(local, base);
         // A new page's comments wait with it, however it came to wait: the session has no page
         // to put them on.
@@ -2493,6 +2505,34 @@ impl Held {
     fn drop_from(&self, project: &mut Project) {
         self.was.apply(project);
     }
+}
+
+/// What takes back the latest action here, when it changed what waits (`held`): those
+/// targets as they were before that action, from the copy's own undo history. `None` when the
+/// latest action changed nothing that waits. A page the session renumbered since that action
+/// keeps the session's number: the undo history has it already
+/// ([`Open::renumber_in_history`]); a number this copy changed is taken back like the rest.
+fn latest_waiting_step(open: &Open, base: &Project, held: &Held) -> Option<wc_share::Parts> {
+    let prev = open.before_last_change()?;
+    // A new device a waiting page named before the action comes back with it, even when the
+    // action renamed it away, so no page names it now. Only one the session never had
+    // (`base`): a synced device is the session's, and may have changed there since.
+    let mut keys = held.now.clone();
+    let named_before: Vec<_> = prev
+        .devices
+        .iter()
+        .filter(|(tag, _)| !keys.devices.contains_key(*tag) && !base.devices.contains_key(*tag))
+        .filter(|(tag, _)| {
+            keys.pages
+                .keys()
+                .filter_map(|id| prev.page(id))
+                .any(|p| page_mentions(p, &|t| t == *tag))
+        })
+        .map(|(tag, d)| (tag.clone(), Some(d.clone())))
+        .collect();
+    keys.devices.extend(named_before);
+    let step = wc_share::Parts::read(prev, &keys);
+    (step != wc_share::Parts::read(&open.project, &keys)).then_some(step)
 }
 
 /// Whether a symbol or cable on `page` names a device `tag` picks.
@@ -3152,9 +3192,16 @@ impl Share {
         }
         let held = Held::find(&open.project, self.base.as_ref()?, &waiting);
         if undo && !held.is_empty() {
-            // Undo of a change that never reached the session: taken back here only.
+            // Undo of a change that never reached the session: taken back here only, and only
+            // the latest action. What waited before it waits still.
             let before = open.project.clone();
-            held.drop_from(&mut open.project);
+            match latest_waiting_step(open, self.base.as_ref()?, &held) {
+                Some(step) => {
+                    step.apply(&mut open.project);
+                    open.forget_last_change();
+                }
+                None => held.drop_from(&mut open.project),
+            }
             if open.project != before {
                 // Also after a save: the copy on disk still has the change.
                 open.dirty = true;
@@ -3210,6 +3257,18 @@ impl Share {
         drain_retaken(role, open, Some(base), &mut self.notes);
         take_updates(role, base, &mut self.items_out);
         let auth = role.project()?;
+        // A waiting page the session renumbers keeps that number through an Undo here: every
+        // step of the undo history that has the number the session replaced gets the new one.
+        // A number this copy set (not synced yet) stays, so an Undo still takes it back.
+        let mut renumbered = false;
+        for id in held.now.pages.keys() {
+            if let (Some(was), Some(now)) = (base.page(id), auth.page(id))
+                && was.number != now.number
+            {
+                open.renumber_in_history(id, &was.number, &now.number);
+                renumbered = true;
+            }
+        }
         let conflicting = conflicts(&open.project, base, auth);
         if !conflicting.is_empty() {
             self.notes.push(format!(
@@ -3249,6 +3308,23 @@ impl Share {
                 ));
             }
             changed = open.project != *before;
+        }
+        // Compared with the project once it has the session's numbers too. A step is the same
+        // when its waiting targets are as they are now and the rest is as it was before this
+        // sync: what else differs came in from the session, and an Undo here leaves that be.
+        // A step of an action here that changed nothing that waits differs in that rest, so
+        // it stays, and its Undo still drops what waits.
+        if renumbered && let Some(pre) = &before {
+            let keys = &held.now;
+            let waiting_before = wc_share::Parts::read(pre, keys);
+            open.forget_steps_like_now(|step, now| {
+                if wc_share::Parts::read(step, keys) != wc_share::Parts::read(now, keys) {
+                    return false;
+                }
+                let mut rest = step.clone();
+                waiting_before.apply(&mut rest);
+                rest == *pre
+            });
         }
         // The session's versions are what this copy has synced to: an item updated here later
         // differs from them ([`updated_here`]).
