@@ -734,6 +734,19 @@ impl Open {
         }
     }
 
+    /// Give page `id` the number `to` in every undo and redo step where it has `from`: the
+    /// session renumbered it from `from`, and an Undo here must not bring that number back.
+    /// A step with another number for it (one this copy set) keeps that.
+    pub fn renumber_in_history(&mut self, id: &str, from: &str, to: &str) {
+        for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if let Some(page) = step.page_mut(id)
+                && page.number == from
+            {
+                page.number = to.to_owned();
+            }
+        }
+    }
+
     /// A mark in the undo history, for [`Open::squash_undo`].
     pub fn undo_mark(&self) -> usize {
         self.undo_dropped + self.undo.len()
