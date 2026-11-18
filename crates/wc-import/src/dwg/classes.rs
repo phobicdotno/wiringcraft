@@ -59,16 +59,23 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
             head.rl().map_err(|e| damaged(&e.to_string()))?;
         }
         let bits = head.rl().map_err(|e| damaged(&e.to_string()))? as usize;
-        // The declared class data must fit in the section.
-        if (head.pos() / 8).checked_add(size).is_none_or(|e| e > data.len()) {
-            return Err(damaged("its size is past its end"));
-        }
+        // The class data area starts after the size fields before the bit size (the first, and
+        // the second from release 4) and holds the bit size, the data and the texts; it must fit
+        // in the section.
+        let area_end = (SENTINEL.len() + if second { 8 } else { 4 })
+            .checked_add(size)
+            .filter(|e| *e <= data.len())
+            .ok_or_else(|| damaged("its size is past its end"))?;
         // The flag bit of the string stream lies `bits` after bit 191 (159 without the second
         // size).
         let flag_at = bits
             .checked_add(if second { 191 } else { 159 })
             .filter(|f| *f < data.len() * 8)
             .ok_or_else(|| damaged("its texts lie past its end"))?;
+        // The streams lie in that area.
+        if flag_at / 8 >= area_end {
+            return Err(damaged("its texts lie past its class data"));
+        }
         let s = string_stream(data, flag_at + 1).map_err(|e| damaged(&e.to_string()))?;
         data_end = s.as_ref().map_or(flag_at, Bits::pos);
         strings = s;
@@ -78,6 +85,11 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
             .checked_add(size)
             .filter(|e| e.saturating_add(2 + SENTINEL.len()) <= data.len())
             .ok_or_else(|| damaged("its size is past its end, or its closing sentinel is missing"))?;
+        // The closing sentinel is the opening one with every bit flipped.
+        let closing = data.get(end + 2..end + 2 + SENTINEL.len());
+        if !closing.is_some_and(|c| c.iter().zip(SENTINEL).all(|(a, b)| *a == !b)) {
+            return Err(damaged("its closing sentinel is wrong"));
+        }
         data_end = end * 8;
     }
     let mut d = Bits::new(data, head.pos(), data_end);
@@ -117,6 +129,9 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
                 dxf_name,
                 entity: id == ENTITY,
             };
+            if number < 500 || number > max {
+                return Err(bad(format!("class {number} is outside 500 to {max}")));
+            }
             if classes.insert(number, class).is_some() {
                 return Err(bad(format!("class {number} is listed twice")));
             }

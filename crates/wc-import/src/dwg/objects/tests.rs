@@ -1255,9 +1255,6 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
 /// An `AcDb:Classes` section listing `classes` (number, DXF name, entity?) as AutoCAD 2004 or
 /// 2010 (maintenance release 6) writes it.
 fn classes_section(v: Version, classes: &[(u16, &str, bool)]) -> Vec<u8> {
-    const SENTINEL: [u8; 16] = [
-        0x8D, 0xA1, 0xC4, 0xB8, 0xC4, 0xA9, 0xF8, 0xC5, 0xC0, 0xDC, 0xF4, 0x5F, 0xE7, 0xCF, 0xB6, 0x8A,
-    ];
     // One class per entry, so an entry listed twice is read twice.
     let max = classes
         .iter()
@@ -1265,6 +1262,14 @@ fn classes_section(v: Version, classes: &[(u16, &str, bool)]) -> Vec<u8> {
         .max()
         .unwrap_or(499)
         .max(499 + classes.len() as u16);
+    classes_section_max(v, max, classes)
+}
+
+/// [`classes_section`] declaring `max` as the highest class number.
+fn classes_section_max(v: Version, max: u16, classes: &[(u16, &str, bool)]) -> Vec<u8> {
+    const SENTINEL: [u8; 16] = [
+        0x8D, 0xA1, 0xC4, 0xB8, 0xC4, 0xA9, 0xF8, 0xC5, 0xC0, 0xDC, 0xF4, 0x5F, 0xE7, 0xCF, 0xB6, 0x8A,
+    ];
     let mut data = W::default();
     let mut strings = W::default();
     data.bs(max).rc(0).rc(0).b(true);
@@ -1300,7 +1305,8 @@ fn classes_section(v: Version, classes: &[(u16, &str, bool)]) -> Vec<u8> {
             body.append(&data).append(&strings);
             body.rs(strings.0.len() as u16).b(true);
             let flag_at = 28 * 8 + body.0.len() - 1;
-            out.rl(data.bytes().len() as u32)
+            // As real files: the size covers the bit size field, the data and the texts.
+            out.rl(body.bytes().len() as u32 + 4)
                 .rl(0)
                 .rl((flag_at - 191) as u32)
                 .append(&body);
@@ -1427,5 +1433,43 @@ fn the_maintenance_release_comes_from_the_file_header() -> TestResult {
     assert_eq!(read.maint, 6);
     let d = drawing(&read)?;
     assert_eq!(d.skipped.get("WIPEOUT"), Some(&1), "{:?} {:?}", d.skipped, d.damaged);
+    Ok(())
+}
+
+#[test]
+fn a_2004_class_section_cut_inside_a_record_or_with_a_wrong_end_is_damaged() -> TestResult {
+    let v = Version::R2004;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        line(v, 0x300, head(None), (0.0, 0.0), (1.0, 0.0)),
+    ];
+    let whole = classes_section(v, &[(500, "WIPEOUT", true), (501, "IMAGE", true)]);
+    // The data area follows the 16-byte sentinel and the 4-byte size; then a CRC and the
+    // closing sentinel.
+    let size = u32::from_le_bytes(whole[16..20].try_into()?) as usize;
+    let trailer = whole[20 + size..].to_vec();
+    // The declared body ends 4 bytes early (inside the second record), the trailer is whole.
+    let mut cut = whole[..16].to_vec();
+    cut.extend(((size - 4) as u32).to_le_bytes());
+    cut.extend(&whole[20..20 + size - 4]);
+    cut.extend(&trailer);
+    // The same length, a closing sentinel with one byte wrong.
+    let mut wrong = whole.clone();
+    let last = wrong.len() - 1;
+    wrong[last] ^= 0xFF;
+    // A class numbered past the declared highest one.
+    let over = classes_section_max(v, 500, &[(501, "WIPEOUT", true)]);
+    for bad in [cut, wrong, over] {
+        let d = drawing(&sections_with_classes(v, &objs, bad))?;
+        assert_eq!(d.model.len(), 1, "the drawing is still read");
+        assert_eq!(
+            d.skipped.get(CLASSES_DAMAGED),
+            Some(&1),
+            "{:?} {:?}",
+            d.skipped,
+            d.damaged
+        );
+    }
     Ok(())
 }
