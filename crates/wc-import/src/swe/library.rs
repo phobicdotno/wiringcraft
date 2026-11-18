@@ -283,6 +283,7 @@ pub fn read_catalog(conn: &Connection, report: &mut LibraryReport, warnings: &mu
                 description,
                 symbol: None,
                 properties,
+                contacts: None,
             },
         );
     }
@@ -544,6 +545,7 @@ pub fn read_cable_types(
                 },
                 symbol: None,
                 properties,
+                contacts: None,
             },
         );
     }
