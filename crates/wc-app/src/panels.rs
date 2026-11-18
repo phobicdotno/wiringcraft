@@ -1390,6 +1390,64 @@ mod tests {
     }
 
     #[test]
+    fn a_field_being_typed_in_changes_nothing_when_the_page_becomes_held() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        o.project.pages[0].symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "iec.coil".into(),
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(DeviceTag::parse("-K1")?),
+        });
+        let mut ed = Editor::default();
+        ed.selection = vec![Selection::Symbol("s1".into())];
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, ps: &mut PanelState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        frame(&mut o, &mut ed, &mut ps, Vec::new());
+        // Tab to the tag field and type in it.
+        let mut typing = false;
+        for _ in 0..12 {
+            frame(&mut o, &mut ed, &mut ps, vec![key(egui::Key::Tab)]);
+            frame(&mut o, &mut ed, &mut ps, vec![egui::Event::Text("9".into())]);
+            if ps.tag.ends_with('9') {
+                typing = true;
+                break;
+            }
+        }
+        assert!(typing, "the tag field never took the typing");
+        let (before, mark, dirty) = (o.project.clone(), o.undo_mark(), o.dirty);
+
+        // Ola opens the page: the field is disabled and loses focus.
+        let page = o.project.pages[0].id.clone();
+        ed.held_by.insert(page, "Ola".into());
+        frame(&mut o, &mut ed, &mut ps, Vec::new());
+        frame(&mut o, &mut ed, &mut ps, vec![key(egui::Key::Enter)]);
+        assert_eq!(o.project, before, "nothing was changed");
+        assert_eq!(o.undo_mark(), mark, "no undo step");
+        assert_eq!(o.dirty, dirty);
+        assert_eq!(ps.tag, "-K1");
+        Ok(())
+    }
+
+    #[test]
     fn a_wire_colour_draft_is_dropped_when_the_page_becomes_held() {
         use wc_core::geom::Point;
         let (_tmp, mut o) = crate::state::tests::project();

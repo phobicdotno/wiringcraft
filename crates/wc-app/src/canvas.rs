@@ -939,11 +939,7 @@ fn select_tool(
     {
         ed.drag = Some(drag_start(open, ed, page, at, tol, snap_step, shift, held));
     }
-    // The page became held during a move: the move stops where it is, and its release does
-    // nothing more (no wiring of pins that now line up).
-    if held && matches!(ed.drag, Some(Drag::Move { .. } | Drag::Logo { .. })) {
-        ed.drag = None;
-    }
+    stop_if_held(ed, held);
     match ed.drag {
         Some(Drag::Logo {
             from,
@@ -1136,6 +1132,14 @@ fn paint_logo(
 
 /// The end of a select-tool drag: a finished move wires the moved symbols' pins that now line
 /// up (see [`auto_wire`]).
+/// The page became held during a move: the move stops where it is, and its release does
+/// nothing more (no wiring of pins that now line up). A selection box goes on.
+fn stop_if_held(ed: &mut Editor, held: bool) {
+    if held && matches!(ed.drag, Some(Drag::Move { .. } | Drag::Logo { .. })) {
+        ed.drag = None;
+    }
+}
+
 fn drag_released(open: &mut Open, ed: &mut Editor, alt: bool) {
     if let Some(Drag::Move { checkpoint: true, .. }) = ed.drag {
         let moved = ed
@@ -1728,6 +1732,35 @@ mod tests {
         assert!(ed.drag.is_none());
         assert!(o.undo());
         assert_eq!(o.project.pages, before, "one undo takes back the move and its wire");
+    }
+
+    #[test]
+    fn a_move_stops_when_its_page_becomes_held_and_wires_nothing() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        // Not held: the move goes on.
+        stop_if_held(&mut ed, false);
+        assert!(matches!(ed.drag, Some(Drag::Move { .. })));
+        // Ola takes the page mid-move: the move stops, and its release wires nothing.
+        stop_if_held(&mut ed, true);
+        assert!(ed.drag.is_none());
+        drag_released(&mut o, &mut ed, false);
+        assert!(o.project.pages[ed.page].wires.is_empty());
+
+        // A logo drag stops the same way; a selection box goes on.
+        ed.drag = Some(Drag::Logo {
+            from: Point::new(0.0, 0.0),
+            start: (Point::new(0.0, 0.0), Point::new(10.0, 10.0)),
+            size: false,
+            checkpoint: true,
+        });
+        stop_if_held(&mut ed, true);
+        assert!(ed.drag.is_none());
+        ed.drag = Some(Drag::Box {
+            from: Point::new(0.0, 0.0),
+        });
+        stop_if_held(&mut ed, true);
+        assert!(matches!(ed.drag, Some(Drag::Box { .. })));
     }
 
     #[test]
