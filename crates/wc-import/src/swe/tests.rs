@@ -2534,13 +2534,14 @@ fn a_jumper_to_a_terminal_whose_tag_was_taken_names_both_tags() {
     assert!(
         warnings
             .iter()
-            .any(|w| w.contains("the tag -X1.2 was taken by another device")),
+            .any(|w| w.contains("the tag -X1.2 was taken by another device")
+                && w.contains("so the terminal became -X1.2_2")),
         "{warnings:?}"
     );
 }
 
 #[test]
-fn a_jumper_between_terminals_not_drawn_is_still_a_jumper() {
+fn a_jumper_to_a_terminal_not_drawn_is_refused_with_its_reason() {
     let c = sample_with_strip();
     // Terminal 3 on the strip has no symbol: its circuit is in no drawing.
     c.execute_batch(
@@ -2551,11 +2552,15 @@ fn a_jumper_between_terminals_not_drawn_is_still_a_jumper() {
            VALUES (90, NULL, -1, '', 61, 0, 62, 1);",
     )
     .unwrap();
-    let (built, _, _) = build(&read(&c).unwrap(), None);
-    assert_eq!(built.jumpers.len(), 1, "{:?}", built.jumpers);
-    let mut terminals = built.jumpers[0].terminals.clone();
-    terminals.sort();
-    assert_eq!(terminals, ["2", "3"]);
+    let (built, warnings, _) = build(&read(&c).unwrap(), None);
+    // Its number would join whichever terminal later gets it, and no plan would show it.
+    assert!(built.jumpers.is_empty(), "{:?}", built.jumpers);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("1 jumper record(s)") && w.contains("a terminal is not drawn on any schematic page")),
+        "{warnings:?}"
+    );
 }
 
 #[test]

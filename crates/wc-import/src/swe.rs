@@ -2358,9 +2358,9 @@ pub fn build_with(
         };
         wire_ends += 1;
         // Not on any drawn line: a jumper made in the terminal strip editor, or a connection the
-        // source keeps only in its wire list. A jumper is told by its terminals alone (a strip
-        // circuit need not be drawn), and counts even where the drawing already joins its ends,
-        // so the terminal plan shows it.
+        // source keeps only in its wire list. A jumper is told by its terminals alone (the
+        // circuit between them need not be drawn, only the terminals), and counts even where the
+        // drawing already joins its ends, so the terminal plan shows it.
         let on_line = carried.contains(&w.id);
         let same_strip = match (strip_of_element(a.0), strip_of_element(b.0)) {
             (Some(x), Some(y)) if x == y && !on_line => Some(x),
@@ -2381,6 +2381,12 @@ pub fn build_with(
                 }
                 if !numbered_terminals.contains(c) {
                     return Err(no_number());
+                }
+                // The project has terminals only where they are drawn: a jumper on a number no
+                // drawn terminal has would show nowhere, and would join whichever terminal later
+                // gets that number.
+                if !element_component.contains_key(&el) {
+                    return Err("a terminal is not drawn on any schematic page".to_string());
                 }
                 let t = tags.get(c).ok_or_else(no_number)?;
                 let strip = tags.get(&x).ok_or_else(no_number)?;

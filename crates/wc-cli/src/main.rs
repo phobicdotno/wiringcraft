@@ -3396,16 +3396,44 @@ fn add_built_joining(
     let before = if p.meta.jumpers.is_empty() {
         None
     } else {
-        // Read with the definitions the import brings for symbols the project has no readable
-        // copy of, as the numbering after it will be: otherwise a terminal that only gets its
-        // role back from the import would look renumbered.
-        let (mut symbols, _) = store::vendored_symbols(dir, p);
+        // A symbol the project has no readable copy of, which the import brings, changes which
+        // placed items are terminals. Whether the jumpers' numbers were given with it or without
+        // it cannot be told, so jumpers on a strip it renumbers are not guessed at.
+        let (own, _) = store::vendored_symbols(dir, p);
+        let mut symbols = own.clone();
         for s in &built.symbols {
             symbols.entry(s.id.clone()).or_insert_with(|| s.clone());
         }
-        Some(wc_core::project::terminal_numbers(p, |id| {
-            symbols.get(id).map(|s| s.role)
-        }))
+        let with = wc_core::project::terminal_numbers(p, |id| symbols.get(id).map(|s| s.role));
+        let without = wc_core::project::terminal_numbers(p, |id| own.get(id).map(|s| s.role));
+        let strips: std::collections::BTreeSet<&DeviceTag> = with
+            .iter()
+            .filter(|(k, v)| without.get(*k) != Some(*v))
+            .map(|(_, (strip, _))| strip)
+            .chain(
+                without
+                    .iter()
+                    .filter(|(k, v)| with.get(*k) != Some(*v))
+                    .map(|(_, (strip, _))| strip),
+            )
+            .collect();
+        if let Some(strip) = strips
+            .into_iter()
+            .find(|s| p.meta.jumpers.iter().any(|j| &j.strip == *s))
+        {
+            let missing: Vec<&str> = built
+                .symbols
+                .iter()
+                .filter(|s| !own.contains_key(&s.id))
+                .map(|s| s.id.as_str())
+                .filter(|id| p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == *id)))
+                .collect();
+            return Err(format!(
+                "the jumpers of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
+                missing.join(", ")
+            ));
+        }
+        Some(with)
     };
     // A write that fails puts back the files written before it (and removes the ones it made),
     // so each copy still matches its pin. Only files this import changed are put back: one it
@@ -4806,7 +4834,7 @@ mod tests {
     }
 
     #[test]
-    fn an_import_that_brings_back_a_missing_terminal_symbol_leaves_jumpers_where_they_are() {
+    fn an_import_that_brings_a_missing_terminal_symbol_does_not_guess_where_jumpers_go() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
@@ -4830,8 +4858,9 @@ mod tests {
             tag: DeviceTag::parse("-X1").ok(),
         };
         let mut p = load(&dir).unwrap();
-        // Three terminals tagged with only the strip, numbered 1, 2, 3; the first one's symbol
-        // has no copy in the project, and the import brings it.
+        // Three terminals tagged with only the strip; the first one's symbol has no copy in the
+        // project, and the import brings it. Jumper 1-2 is b-c if it was numbered without that
+        // symbol, a-b if with it.
         store::write_vendored_symbol(&dir, &term("test.term")).unwrap();
         p.pages[0].symbols.extend([
             placed("a", "test.missing", 10.0),
@@ -4842,13 +4871,21 @@ mod tests {
         p.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
         store::save(&dir, &p).unwrap();
         let mut p = load(&dir).unwrap();
-        let built = wc_import::aml::Built {
+        let built = || wc_import::aml::Built {
             symbols: vec![term("test.missing")],
             ..Default::default()
         };
-        add_built(&dir, &mut p, built, "import:a.tewzip", Replace::No).unwrap();
-        save_imported(&dir, &p).unwrap();
-        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["1", "2"]);
+        let err = add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap_err();
+        assert!(err.contains("no readable copy of test.missing"), "{err}");
+        assert!(
+            store::read_vendored_symbol(&dir, "test.missing").is_err(),
+            "nothing written"
+        );
+        // With the file back the numbering is known, and the import goes ahead.
+        store::write_vendored_symbol(&dir, &term("test.missing")).unwrap();
+        let mut p = load(&dir).unwrap();
+        add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap();
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
     }
 
     #[test]
