@@ -95,7 +95,7 @@ For the other areas, the chapter to read in each help is:
 | Dimensions in the editor | yes | yes | partly: kept from imports (drawn by their block), not drawn by hand | later |
 | Find and replace texts, tags and wire numbers across the project | yes | yes | yes: Edit → Find (Ctrl+F), `wiringcraft find` | done (#109) |
 | Macros / window macros (save and insert groups) | yes | yes | yes | done |
-| Macro placeholders and value sets (one macro, several variants) | yes | partly | no | later |
+| Macro placeholders and value sets (one macro, several variants) | yes | partly | partly: `{{name}}` placeholders in a macro's device descriptions, parts, accessories and properties, wire cross-section, colour and type, and drawn texts, filled from a named value set chosen at insert (Insert > Macro, the assistant, `wiringcraft macro place --set`); placeholders and value sets are written in the macro file, not yet edited in the app | done (#272) |
 | Auto-connect pins that line up | yes | yes | yes | done (#51) |
 | Scanned drawing as underlay to trace over | partly | partly | yes | done |
 | Layers / show-hide groups | yes | yes (DWG layers) | yes: PDF layers, editor layers (View → Layers) | done: show, hide and lock on the canvas, kept per user |

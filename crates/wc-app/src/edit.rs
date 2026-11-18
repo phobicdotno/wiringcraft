@@ -18,6 +18,9 @@ pub struct Clipboard {
     pub graphics: Vec<Shape>,
     /// Top-left corner of what was copied; a paste puts this corner at the pointer.
     pub anchor: Point,
+    /// The device data above wins over the project's for the same tag: set for a macro, whose
+    /// values were chosen when it was inserted. A copy within a project keeps the project's.
+    pub own_devices: bool,
 }
 
 impl From<wc_core::macros::Macro> for Clipboard {
@@ -28,6 +31,7 @@ impl From<wc_core::macros::Macro> for Clipboard {
             devices: m.devices,
             graphics: m.graphics,
             anchor: m.anchor,
+            own_devices: true,
         }
     }
 }
@@ -52,6 +56,8 @@ impl Clipboard {
             graphics: self.graphics.clone(),
             devices: self.devices.clone(),
             anchor: self.anchor,
+            placeholders: Vec::new(),
+            value_sets: Vec::new(),
         }
     }
 
@@ -590,6 +596,7 @@ impl Open {
             devices,
             graphics,
             anchor,
+            own_devices: false,
         }
     }
 
@@ -616,13 +623,14 @@ impl Open {
                     return Some(t.clone());
                 }
                 let t = self.free_tag_like(&old)?;
-                let device = self
-                    .project
-                    .devices
-                    .get(&old)
-                    .or_else(|| clip.devices.get(&old))
-                    .cloned()
-                    .unwrap_or_default();
+                let (project, copied) = (self.project.devices.get(&old), clip.devices.get(&old));
+                let device = if clip.own_devices {
+                    copied.or(project)
+                } else {
+                    project.or(copied)
+                }
+                .cloned()
+                .unwrap_or_default();
                 self.project.devices.insert(t.clone(), device);
                 renamed.insert(old, t.clone());
                 Some(t)
@@ -832,7 +840,7 @@ mod tests {
             ("project", "Two coils", "Coils sharing A2")
         );
         // Inserting lands where the group was drawn, with new tags, and the wire loses its number.
-        let inserted = o.insert_macro(page, &path).unwrap();
+        let inserted = o.insert_macro(page, &path, None).unwrap();
         assert_eq!(inserted.len(), 3);
         let p = &o.project.pages[page];
         let tags: BTreeSet<_> = p.symbols.iter().map(|s| s.tag.clone().unwrap()).collect();
@@ -844,6 +852,66 @@ mod tests {
         let found = o.macros();
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|m| m.error.is_some()));
+    }
+
+    #[test]
+    fn a_macro_with_value_sets_inserts_the_chosen_variant() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        let path = o.save_macro(&clip, "Starter", "").unwrap();
+        // Give the first symbol's device placeholders and two value sets, as a user would in
+        // the file.
+        let mut m = wc_core::macros::read_macro(&path).unwrap();
+        let tag = m.symbols[0].tag.clone().unwrap();
+        let d = m.devices.entry(tag.clone()).or_default();
+        d.description = "Starter {{kW}} kW".into();
+        d.part = Some("{{part}}".into());
+        m.placeholders = ["kW", "part"]
+            .into_iter()
+            .map(|n| wc_core::macros::Placeholder {
+                name: n.into(),
+                ..Default::default()
+            })
+            .collect();
+        m.value_sets = [("0.75 kW", "0.75", "P-075"), ("3 kW", "3", "P-3")]
+            .into_iter()
+            .map(|(name, kw, part)| wc_core::macros::ValueSet {
+                name: name.into(),
+                values: [("kW".to_owned(), kw.to_owned()), ("part".to_owned(), part.to_owned())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        wc_core::macros::write_macro(&o.dir, "starter", &m).unwrap();
+        let found = o.macros();
+        assert_eq!(found[0].value_sets, ["0.75 kW", "3 kW"]);
+        assert_eq!(found[0].error, None);
+
+        let before = o.project.clone();
+        let err = o.insert_macro(page, &path, None).unwrap_err();
+        assert!(err.contains("choose a value set"), "{err}");
+        assert_eq!(o.project, before, "nothing is inserted without a variant");
+
+        for (set, description, part) in [("3 kW", "Starter 3 kW", "P-3"), ("0.75 kW", "Starter 0.75 kW", "P-075")] {
+            let items = o.insert_macro(page, &path, Some(set)).unwrap();
+            let id = match items.first() {
+                Some(Selection::Symbol(id)) => id,
+                other => unreachable!("a symbol first, not {other:?}"),
+            };
+            let new = o.project.pages[page].symbol(id).unwrap().tag.clone().unwrap();
+            assert_ne!(new, tag);
+            let device = &o.project.devices[&new];
+            assert_eq!(device.description, description);
+            assert_eq!(device.part.as_deref(), Some(part));
+        }
+        // The project's own device keeps its data.
+        assert_eq!(o.project.devices.get(&tag), before.devices.get(&tag));
+        // A file whose value set fills an undeclared placeholder is listed with its error.
+        m.value_sets[0].values.insert("voltage".into(), "400".into());
+        wc_core::macros::write_macro(&o.dir, "starter", &m).unwrap();
+        assert!(o.macros()[0].error.as_deref().is_some_and(|e| e.contains("voltage")));
     }
 
     #[test]

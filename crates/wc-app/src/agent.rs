@@ -445,10 +445,11 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "macros",
-            "Macros (saved groups of symbols, wires and drawings): list them, insert one on a page (its top-left corner at x, y), or save items from a page as a new project macro.",
+            "Macros (saved groups of symbols, wires and drawings): list them, insert one on a page (its top-left corner at x, y), or save items from a page as a new project macro. A macro with value sets (variants, such as sizes of a motor starter) needs value_set when inserted; list shows them.",
             json!({
                 "action": {"type": "string", "enum": ["list", "insert", "save"]},
                 "name": {"type": "string"}, "description": {"type": "string"},
+                "value_set": {"type": "string", "description": "insert: which of the macro's value sets fills its placeholders."},
                 "ids": ids_arg(), "page": page_arg(),
                 "x": {"type": "number"}, "y": {"type": "number"}
             }),
@@ -2271,7 +2272,7 @@ impl App {
                     .macros()
                     .into_iter()
                     .map(
-                        |m| json!({"name": m.name, "description": m.description, "source": m.source, "error": m.error}),
+                        |m| json!({"name": m.name, "description": m.description, "value_sets": m.value_sets, "source": m.source, "error": m.error}),
                     )
                     .collect();
                 Ok(pretty(&json!(list)))
@@ -2286,7 +2287,7 @@ impl App {
                 let anchor = wc_core::macros::read_macro(&entry.path)
                     .map_err(|e| e.to_string())?
                     .anchor;
-                let items = open.insert_macro(page, &entry.path)?;
+                let items = open.insert_macro(page, &entry.path, s(v, "value_set"))?;
                 if let (Some(x), Some(y)) = (num(v, "x"), num(v, "y")) {
                     open.move_by(page, &items, Point::new(x - anchor.x, y - anchor.y));
                 }

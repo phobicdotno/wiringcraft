@@ -133,6 +133,11 @@ enum Cmd {
     /// The project logo, shown on the cover page and in every title block.
     #[command(subcommand)]
     Logo(LogoCmd),
+    /// Macros: saved groups of symbols, wires and drawings in the project's `macros` folder or a
+    /// library source's. A macro can hold placeholders (`{{name}}` in its device texts, wire
+    /// values and drawn texts) and named value sets that fill them, one per variant.
+    #[command(subcommand)]
+    Macro(MacroCmd),
     /// The project's revisions, the clouds that mark their changes on pages, and the table
     /// that lists them.
     #[command(subcommand)]
@@ -356,6 +361,29 @@ enum LocationCmd {
     },
     /// Remove a location from the list (devices keep their tags).
     Remove { path: String },
+}
+
+#[derive(Subcommand)]
+enum MacroCmd {
+    /// List the macros, project first, with their value sets.
+    List,
+    /// Place a macro on a page with its top-left corner at `--at`. Its symbols get the next
+    /// free tags and its devices the macro's data, placeholders filled from `--set`. Prints
+    /// the new symbol and wire ids.
+    Place {
+        page: String,
+        /// The macro's name or file name.
+        name: String,
+        /// Position in mm, `x,y`.
+        #[arg(long, value_parser = parse_point)]
+        at: Point,
+        /// The value set (variant) to use; needed when the macro has value sets.
+        #[arg(long)]
+        set: Option<String>,
+        /// A placeholder value, `name=value`, over the value set's. Repeatable.
+        #[arg(long = "value", value_name = "NAME=VALUE")]
+        values: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1350,6 +1378,82 @@ fn run(cli: Cli) -> Res<()> {
                 LocationCmd::Remove { path } => {
                     p.meta.remove_location(&path)?;
                     save(dir, &p)?;
+                }
+            }
+        }
+        Cmd::Macro(mc) => {
+            let mut p = load(dir)?;
+            let mut found: Vec<(String, String, PathBuf)> = wc_core::macros::list_macros(dir)
+                .into_iter()
+                .map(|(id, path)| ("project".to_owned(), id, path))
+                .collect();
+            if let Ok(lib) = wc_library::Library::open(dir, &p) {
+                found.extend(lib.macros());
+            }
+            match mc {
+                MacroCmd::List => {
+                    for (source, id, path) in &found {
+                        match wc_core::macros::read_macro(path) {
+                            Ok(m) => {
+                                let sets: Vec<&str> = m.value_sets.iter().map(|v| v.name.as_str()).collect();
+                                let sets = if sets.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("  [{}]", sets.join(", "))
+                                };
+                                let problem = m.check().err().map(|e| format!("  ({e})")).unwrap_or_default();
+                                println!("{source}\t{id}\t{}{sets}{problem}", m.name);
+                            }
+                            Err(err) => println!("{source}\t{id}\t({err})"),
+                        }
+                    }
+                }
+                MacroCmd::Place {
+                    page,
+                    name,
+                    at,
+                    set,
+                    values,
+                } => {
+                    let mut wanted = None;
+                    for (_, id, path) in &found {
+                        if id.eq_ignore_ascii_case(&name) {
+                            wanted = Some(path.clone());
+                            break;
+                        }
+                        if wanted.is_none()
+                            && wc_core::macros::read_macro(path).is_ok_and(|m| m.name.eq_ignore_ascii_case(name.trim()))
+                        {
+                            wanted = Some(path.clone());
+                        }
+                    }
+                    let path = wanted.ok_or_else(|| format!("no macro {name:?}"))?;
+                    let mut typed = std::collections::BTreeMap::new();
+                    for v in &values {
+                        let (k, val) = v
+                            .split_once('=')
+                            .ok_or_else(|| format!("--value {v:?}: write it as name=value"))?;
+                        typed.insert(k.trim().to_owned(), val.to_owned());
+                    }
+                    let m = wc_core::macros::read_macro(&path)
+                        .and_then(|m| m.apply(set.as_deref(), &typed))
+                        .map_err(e)?;
+                    let symbols: std::collections::BTreeSet<&str> =
+                        m.symbols.iter().map(|s| s.symbol.as_str()).collect();
+                    let missing: Vec<&str> = symbols
+                        .into_iter()
+                        .filter(|id| store::read_vendored_symbol(dir, id).is_err())
+                        .collect();
+                    if !missing.is_empty() {
+                        let lib = wc_library::Library::open(dir, &p).map_err(e)?;
+                        for id in missing {
+                            wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(e)?;
+                        }
+                    }
+                    let page_id = page_mut(&mut p, &page)?.id.clone();
+                    let ids = wc_core::macros::place(&mut p, &page_id, &m, at).map_err(e)?;
+                    save(dir, &p)?;
+                    println!("{}", ids.join(" "));
                 }
             }
         }

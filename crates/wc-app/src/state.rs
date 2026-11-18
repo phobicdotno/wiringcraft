@@ -100,6 +100,8 @@ pub struct MacroEntry {
     pub path: PathBuf,
     pub name: String,
     pub description: String,
+    /// Its value sets, by name: inserting it asks which one to use.
+    pub value_sets: Vec<String>,
     /// Why the file could not be read, if it could not.
     pub error: Option<String>,
 }
@@ -1623,15 +1625,20 @@ impl Open {
         found
             .into_iter()
             .map(|(source, id, path)| {
-                let (name, description, error) = match wc_core::macros::read_macro(&path) {
-                    Ok(m) => (m.name, m.description, None),
-                    Err(e) => (id.clone(), String::new(), Some(e.to_string())),
+                let (name, description, value_sets, error) = match wc_core::macros::read_macro(&path) {
+                    Ok(m) => {
+                        let error = m.check().err().map(|e| e.to_string());
+                        let sets = m.value_sets.into_iter().map(|v| v.name).collect();
+                        (m.name, m.description, sets, error)
+                    }
+                    Err(e) => (id.clone(), String::new(), Vec::new(), Some(e.to_string())),
                 };
                 MacroEntry {
                     source,
                     path,
                     name,
                     description,
+                    value_sets,
                     error,
                 }
             })
@@ -1647,13 +1654,22 @@ impl Open {
         wc_core::macros::write_macro(&self.dir, &id, &clip.to_macro(name, description)).map_err(|e| e.to_string())
     }
 
-    /// Insert a macro on a page where it was drawn (its anchor), like a paste. Returns the
-    /// inserted items, selected so they can be moved into place.
-    pub fn insert_macro(&mut self, page: usize, path: &Path) -> Result<Vec<Selection>, String> {
+    /// Insert a macro on a page where it was drawn (its anchor), like a paste, with its
+    /// placeholders filled from the value set named `value_set` (a macro with value sets needs
+    /// one). Its devices get the macro's data, values filled in. Returns the inserted items,
+    /// selected so they can be moved into place.
+    pub fn insert_macro(
+        &mut self,
+        page: usize,
+        path: &Path,
+        value_set: Option<&str>,
+    ) -> Result<Vec<Selection>, String> {
         if let Some(why) = self.held_reason(page) {
             return Err(why);
         }
-        let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
+        let m = wc_core::macros::read_macro(path)
+            .and_then(|m| m.apply(value_set, &Default::default()))
+            .map_err(|e| e.to_string())?;
         let clip = crate::edit::Clipboard::from(m);
         let at = clip.anchor;
         self.paste(page, &clip, at)
@@ -2796,7 +2812,7 @@ pub(crate) mod tests {
         assert!(!o.symbols.contains_key("wc.breaker.1p"));
         assert_eq!(o.can_undo(), undo, "no undo step");
         let path = o.save_macro(&clip, "Coil", "").unwrap();
-        let err = o.insert_macro(1, &path).unwrap_err();
+        let err = o.insert_macro(1, &path, None).unwrap_err();
         assert!(err.contains("another version"), "{err}");
         assert_eq!(o.project.pages, before.pages, "the macro adds nothing either");
     }
@@ -3941,7 +3957,7 @@ pub(crate) mod tests {
         // Nor renumbered by moving its neighbour past it, nor given a macro or a paste.
         assert_eq!(o.move_page(0, false), None);
         let path = o.dir.join("missing.wcmacro");
-        assert!(o.insert_macro(1, &path).is_err_and(|e| e.contains("Ola")));
+        assert!(o.insert_macro(1, &path, None).is_err_and(|e| e.contains("Ola")));
         let clip = crate::edit::Clipboard {
             graphics: vec![text.clone()],
             ..Default::default()
