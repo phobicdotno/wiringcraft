@@ -1214,6 +1214,9 @@ impl Share {
         let form = self.form.get_or_insert_with(Form::default);
         form.error = None;
         if self.view == View::Join && form.browser.is_none() {
+            // Sessions heard by an earlier browser may be gone; listing them would also hide
+            // why browsing cannot start again.
+            form.sessions.clear();
             match Browser::open() {
                 Ok(b) => {
                     form.browser = Some(b);
@@ -1417,11 +1420,14 @@ impl Share {
     pub fn frame(&mut self, open: Option<&mut Open>, page: Option<String>, busy: bool) -> Option<Open> {
         let role = self.role.as_mut()?;
         if !role.pump(&mut self.notes) {
-            // A join that was turned away goes back to the Join dialog, which says why.
+            // A join that was turned away goes back to the Join dialog, which says why: always
+            // for another version (the person has to update one side), for a plain decline only
+            // while the status window is still open (the note says it otherwise).
+            let shown = self.view == View::Status;
             let refused = match role {
                 Role::Guest(j) => match &j.guest.status {
                     GuestStatus::WrongVersion(v) => Some(format!("You cannot join this session: {v}.")),
-                    GuestStatus::Declined => Some("The host declined your request to join.".to_owned()),
+                    GuestStatus::Declined if shown => Some("The host declined your request to join.".to_owned()),
                     _ => None,
                 },
                 Role::Host(_) => None,
