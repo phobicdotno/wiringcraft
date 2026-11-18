@@ -4,8 +4,10 @@
 //! `AcDb:Handles` is the object map: each object's handle and where it starts in
 //! `AcDb:AcDbObjects`. Each object there is a size, then bit-packed data:
 //! its type, its own handle and fields, and at the end a stream of references to other objects
-//! by handle (its owner, its layer, the block an INSERT shows). In AutoCAD 2010 drawings the
-//! texts of an object are in a third stream at the end of its data.
+//! by handle (its owner, its layer, the block an INSERT shows). In AutoCAD 2007 and 2010
+//! drawings the texts of an object are in a third stream at the end of its data. 2007 objects
+//! are otherwise written like 2004 ones (type as a bit short, data size in bits), with the
+//! entity fields added in 2007 (material, shadow, attribute lock, MTEXT rectangle height).
 //!
 //! The entities read are LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE (2D and 3D) with their
 //! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), SOLID,
@@ -288,8 +290,8 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     })
 }
 
-/// The string stream of a 2007 or 2010 object whose data ends at bit `end`: a flag in the last bit, a
-/// size before it (in one or two 16-bit parts), and the texts before that.
+/// The string stream of a 2007 or 2010 object whose data ends at bit `end`: a flag in the last
+/// bit, a size before it (in one or two 16-bit parts), and the texts before that.
 fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>> {
     let all = Bits::new(bytes, 0, end);
     let Some(flag_at) = end.checked_sub(1) else {
@@ -406,7 +408,8 @@ fn read_entity(kind: u16) -> Option<&'static str> {
 /// The base point of a BLOCK_HEADER whose name has been read.
 fn block_base(o: &mut Object) -> Result<(f64, f64)> {
     // The xref flags of a table entry: 64-flag, xref index and xref dependent up to 2004, only
-    // the xref index from 2007 on.
+    // the xref index from 2007 on (the specification lists all three for every version; a
+    // real 2007 file has only the index, as 2010 files do).
     if o.version == Version::R2004 {
         o.data.b()?;
         o.data.bs()?;
@@ -614,6 +617,8 @@ struct Common {
 /// Read the data every entity has, from both the data and the handle streams.
 fn entity_common(o: &mut Object) -> Result<Common> {
     let r2010 = o.version == Version::R2010;
+    // Material and shadow flags are there from 2007 on, visual styles from 2010 on.
+    let r2007 = o.version != Version::R2004;
     o.skip_eed()?;
     if o.data.b()? {
         // A preview picture of the entity.
@@ -635,9 +640,11 @@ fn entity_common(o: &mut Object) -> Result<Common> {
     let plotstyle = o.data.bb()?;
     let mut material = 0;
     let mut styles = [false; 3];
-    if r2010 {
+    if r2007 {
         material = o.data.bb()?;
         o.data.rc()?;
+    }
+    if r2010 {
         for s in &mut styles {
             *s = o.data.b()?;
         }
@@ -722,14 +729,15 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
         e.s(1, value);
         return Ok(());
     }
-    // ATTRIB and ATTDEF: the tag and flags, and for ATTDEF the prompt.
+    // ATTRIB and ATTDEF: the tag and flags, and for ATTDEF the prompt. A version byte from
+    // 2010 on, a lock position flag from 2007 on.
     if o.version == Version::R2010 {
         o.data.rc()?;
     }
     let tag = o.text()?;
     o.data.bs()?;
     let attr_flags = o.data.rc()?;
-    if o.version == Version::R2010 {
+    if o.version != Version::R2004 {
         o.data.b()?;
     }
     e.s(1, value).s(2, tag).i(70, i64::from(attr_flags));
@@ -782,7 +790,8 @@ fn mtext(o: &mut Object, e: &mut Codes) -> Result<()> {
     let (_, _, z) = d.bd3()?;
     let (dx, dy, _) = d.bd3()?;
     d.bd()?;
-    if o.version == Version::R2010 {
+    // The reference rectangle's height, from 2007 on.
+    if o.version != Version::R2004 {
         d.bd()?;
     }
     let height = d.bd()?;

@@ -291,7 +291,7 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
         let list_len = usize::try_from(page_count)
             .ok()
             .and_then(|c| c.checked_mul(PAGE_DESCRIPTION))
-            .filter(|l| pos + l <= map.len())
+            .filter(|l| pos.checked_add(*l).is_some_and(|end| end <= map.len()))
             .ok_or_else(|| bad(format!("the page list of section {name} is cut off")))?;
         let list = pos;
         pos += list_len;

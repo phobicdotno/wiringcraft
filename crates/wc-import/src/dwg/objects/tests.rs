@@ -1,7 +1,7 @@
 use wc_core::geom::{Align, Point};
 
 use super::super::Section;
-use super::super::tests::{TestSection, write_dwg};
+use super::super::tests::{TestSection, write_dwg, write_dwg_2007};
 use super::*;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -361,7 +361,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
         .bb(if h.extras { 3 } else { 0 });
     // Material and shadow flags from 2007 on, visual styles from 2010 on.
     if v != Version::R2004 {
-        d.bb(0).rc(0);
+        d.bb(if h.extras { 3 } else { 0 }).rc(0);
     }
     if v == Version::R2010 {
         d.b(false).b(h.extras).b(false);
@@ -379,7 +379,12 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
         }
         // The layer as an offset back from the entity's own handle.
         hs.h(0xC, handle - h.layer);
-        hs.h(5, 0x14).h(5, 0x15);
+        // Linetype, material (from 2007 on) and plot style, then a visual style (2010).
+        hs.h(5, 0x14);
+        if v != Version::R2004 {
+            hs.h(5, 0x17);
+        }
+        hs.h(5, 0x15);
         if v == Version::R2010 {
             hs.h(5, 0x16);
         }
@@ -494,10 +499,13 @@ fn sample(v: Version) -> Vec<Obj> {
         .bd(0.0)
         .bd(std::f64::consts::FRAC_PI_2);
     objs.push(a);
+    // Closed, with vertex ids: their count is there from 2010 on only.
     let mut p = entity(v, 77, 0x42, relay);
+    p.data.bs(512 | 1024).bl(3);
+    if v == Version::R2010 {
+        p.data.bl(3);
+    }
     p.data
-        .bs(512)
-        .bl(3)
         .rd(0.0)
         .rd(0.0)
         .dd(4.0, 0.0)
@@ -794,6 +802,13 @@ fn a_2010_drawing_gives_its_blocks_and_model_space() -> TestResult {
 }
 
 #[test]
+fn a_2007_drawing_gives_its_blocks_and_model_space() -> TestResult {
+    let v = Version::R2007;
+    check_sample(&drawing(&sections(v, &sample(v), &[]))?);
+    Ok(())
+}
+
+#[test]
 fn a_2004_drawing_gives_its_blocks_and_model_space() -> TestResult {
     let v = Version::R2004;
     check_sample(&drawing(&sections(v, &sample(v), &[]))?);
@@ -821,6 +836,21 @@ fn a_whole_file_is_read() -> TestResult {
         );
         check_sample(&read_drawing(&file)?);
     }
+    // And a 2007 file, in its own container.
+    let (map, objects) = sections_bytes(&sample(Version::R2007), &[]);
+    let file = write_dwg_2007(&[
+        TestSection {
+            name: "AcDb:AcDbObjects",
+            data: objects,
+            ..Default::default()
+        },
+        TestSection {
+            name: "AcDb:Handles",
+            data: map,
+            ..Default::default()
+        },
+    ]);
+    check_sample(&read_drawing(&file)?);
     Ok(())
 }
 
@@ -972,7 +1002,7 @@ fn a_block_inserting_itself_ends() -> TestResult {
 
 #[test]
 fn flipped_and_cut_objects_give_no_panic() {
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2007, Version::R2010] {
         let s = sections(v, &sample(v), &[]);
         let objects = s.sections[1].data.clone();
         let map = s.sections[0].data.clone();
@@ -1169,7 +1199,7 @@ fn block_header(v: Version, handle: u64, name: &str, base: (f64, f64), xref: boo
 
 #[test]
 fn a_block_is_placed_by_its_base_point() -> TestResult {
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2007, Version::R2010] {
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -1238,7 +1268,7 @@ fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
 
 #[test]
 fn a_dimension_is_drawn_by_its_block() -> TestResult {
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2007, Version::R2010] {
         let d1 = head(Some(0x100));
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),

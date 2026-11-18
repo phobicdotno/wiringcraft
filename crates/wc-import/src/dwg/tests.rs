@@ -951,6 +951,19 @@ fn system_page_2007(data: &[u8], repeat: usize) -> (Vec<u8>, u64, u64) {
 /// Write an AutoCAD 2007 file holding `sections`, each split into pages of at most 0x7400
 /// bytes, followed by the section map and the page map.
 pub(super) fn write_dwg_2007(sections: &[TestSection]) -> Vec<u8> {
+    write_dwg_2007_with(sections, &|_| {}, &|_| {})
+}
+
+/// A page map entry: page number and size.
+type PageEntry2007 = (i64, i64);
+
+/// [`write_dwg_2007`] with the section map's bytes and the page map's entries (number, size)
+/// changed before they are written (a hostile file whose maps are still good code words).
+fn write_dwg_2007_with(
+    sections: &[TestSection],
+    edit_section_map: &dyn Fn(&mut Vec<u8>),
+    edit_page_map: &dyn Fn(&mut Vec<PageEntry2007>),
+) -> Vec<u8> {
     let mut file = vec![0u8; 0x480];
     file[..6].copy_from_slice(b"AC1021");
     let mut pages: Vec<(i64, i64)> = Vec::new();
@@ -1027,6 +1040,7 @@ pub(super) fn write_dwg_2007(sections: &[TestSection]) -> Vec<u8> {
     // The map ends with an unnamed entry, as AutoCAD writes it.
     put(&mut map, &[0, 0xF800, 0, 0, 0, 0, 4, 0]);
     let section_map_id = next;
+    edit_section_map(&mut map);
     let (section_map, sm_stored, sm_size) = system_page_2007(&map, 2);
     pages.push((section_map_id as i64, section_map.len() as i64));
     file.extend(section_map);
@@ -1036,8 +1050,11 @@ pub(super) fn write_dwg_2007(sections: &[TestSection]) -> Vec<u8> {
     let page_map_at = file.len() as u64;
     let mut size = 0x400;
     let (page_map, pm_stored, pm_size) = loop {
+        let mut listed = pages.clone();
+        listed.push((page_map_id as i64, size));
+        edit_page_map(&mut listed);
         let mut entries = Vec::new();
-        for (number, len) in pages.iter().chain([&(page_map_id as i64, size)]) {
+        for (number, len) in &listed {
             entries.extend(len.to_le_bytes());
             entries.extend(number.to_le_bytes());
         }
@@ -1374,4 +1391,48 @@ fn cut_or_flipped_2007_files_give_errors_not_panics() -> TestResult {
         let _ = read_sections(&damaged);
     }
     Ok(())
+}
+
+#[test]
+fn hostile_2007_maps_that_are_good_code_words_give_errors() {
+    let sections = || sample_sections().into_iter().take(2).collect::<Vec<_>>();
+    let message = |section_map: &dyn Fn(&mut Vec<u8>), page_map: &dyn Fn(&mut Vec<PageEntry2007>)| {
+        error_of(&write_dwg_2007_with(&sections(), section_map, page_map))
+    };
+    let no_map = |_: &mut Vec<(i64, i64)>| {};
+    let no_sections = |_: &mut Vec<u8>| {};
+    // The first section's fields: page count at 0x38, encoding at 0x30, name length at 0x20;
+    // its name (AcDb:Header) takes 24 bytes, then the first page's number at 0x10.
+    let set = |at: usize, value: u64| move |m: &mut Vec<u8>| m[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    for (what, at, value, want) in [
+        ("a page count near the largest number", 0x38, u64::MAX / 0x38, "cut off"),
+        ("a page count past the map", 0x38, 1000, "cut off"),
+        ("an unknown encoding", 0x30, 3, "unknown encoding 3"),
+        (
+            "a name length past the map",
+            0x20,
+            0x1000,
+            "name in the section map is cut off",
+        ),
+        (
+            "a page not in the page map",
+            0x40 + 24 + 0x10,
+            999,
+            "page 999, which is not in the page map",
+        ),
+    ] {
+        let m = message(&set(at, value), &no_map);
+        assert!(m.contains(want), "{what}: {m}");
+    }
+    // The page map: a page of size 0 or less, a page listed twice, and a section map page too
+    // small for it.
+    let m = message(&no_sections, &|p: &mut Vec<(i64, i64)>| p[0].1 = -0x20);
+    assert!(m.contains("has size -32"), "{m}");
+    let m = message(&no_sections, &|p: &mut Vec<(i64, i64)>| p[1].0 = p[0].0);
+    assert!(m.contains("listed twice"), "{m}");
+    let m = message(&no_sections, &|p: &mut Vec<(i64, i64)>| {
+        let n = p.len();
+        p[n - 2].1 = 0x20;
+    });
+    assert!(m.contains("section map") && m.contains("reaches past its page"), "{m}");
 }
