@@ -555,6 +555,21 @@ impl Host {
         if self.project == before {
             return Ok(false);
         }
+        // Pages set whole, as a page edit: a wire may not newly end on a pin the locked version of
+        // its symbol lacks (an update may have dropped the pin after the author drew the wire).
+        if edit.set_pages().next().is_some() {
+            let was = self.dangling_in(&before);
+            let dangling: Vec<String> = self.dangling_in(&self.project).difference(&was).cloned().collect();
+            if !dangling.is_empty() {
+                self.project = before;
+                return Err(Refusal::Invalid {
+                    reason: format!(
+                        "wires end on pins the project's version of their symbol does not have ({}); the symbol was updated meanwhile",
+                        dangling.join(", ")
+                    ),
+                });
+            }
+        }
         let message = edit.describe();
         let page = edit.page().map(str::to_owned);
         let added = match &edit {

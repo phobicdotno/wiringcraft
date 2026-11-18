@@ -888,6 +888,27 @@ fn a_refused_rename_on_your_own_page_takes_back_the_page_and_a_move_made_meanwhi
 }
 
 #[test]
+fn a_refused_rename_on_your_own_page_is_taken_back_also_when_the_session_ends_with_it() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    let start = coil_on(&guest_open, &coil)?;
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    guest_open.project.rename_device(&k1, &k2);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // The host refuses, then ends the session before the guest's next frame.
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    h.stop();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(!g.active());
+    assert_eq!(coil_on(&guest_open, &coil)?, start);
+    assert!(g.take_notes().iter().any(|n| n.contains("nor what you did on it")));
+    Ok(())
+}
+
+#[test]
 fn a_change_to_a_free_page_made_before_someone_elses_change_arrived_is_not_kept() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
@@ -3359,4 +3380,34 @@ fn a_picture_whose_rename_failed_gets_its_own_name_later_although_the_session_ha
         "the guest's file stays"
     );
     Ok(())
+}
+
+#[test]
+fn a_page_too_large_to_go_twice_in_one_message_is_not_folded_into_the_batch() {
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    let device = ProjectEdit::SetDevice {
+        tag: wc_core::DeviceTag::parse("-K1").unwrap_or_else(|_| unreachable!()),
+        device: Some(Device::default()),
+        before: None,
+    };
+    let fold = |base: &Project, title: String| {
+        let mut page = base.pages[0].clone();
+        page.title = title;
+        let mut out = Outgoing {
+            page: Some(page),
+            edits: vec![device.clone()],
+            dropped: Vec::new(),
+        };
+        fold_own_page(&mut out, base);
+        out
+    };
+    // A small page joins the batch.
+    let out = fold(&base, "Two".into());
+    assert!(out.page.is_none() && out.edits.len() == 2);
+    // One that would not fit a session message as it is and as it was stays a page edit of its
+    // own, though either version alone fits.
+    base.pages[0].title = "x".repeat(FOLD_LIMIT / 2);
+    let out = fold(&base, "y".repeat(FOLD_LIMIT / 2));
+    assert!(out.page.is_some() && out.edits.len() == 1);
 }
