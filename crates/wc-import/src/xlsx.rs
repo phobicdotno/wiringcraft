@@ -382,8 +382,12 @@ fn builtin_format(id: u32) -> Shown {
 /// Longest zero-only format padded: Excel's own limit on a format code's length.
 const MAX_PADDING: usize = 255;
 
-/// The sections of a format code split at `;`, leaving `;` inside quotes or after a backslash alone.
-fn format_sections(code: &str) -> Vec<&str> {
+/// Most sections a format code has: positive, negative, zero and text.
+const MAX_SECTIONS: usize = 4;
+
+/// The sections of a format code split at `;`, leaving `;` inside quotes or after a backslash
+/// alone. `None` when the code has more sections than a format can have.
+fn format_sections(code: &str) -> Option<Vec<&str>> {
     let mut out = Vec::new();
     let (mut start, mut quoted, mut escaped) = (0, false, false);
     for (i, c) in code.char_indices() {
@@ -392,6 +396,9 @@ fn format_sections(code: &str) -> Vec<&str> {
             '\\' if !quoted => escaped = true,
             '"' => quoted = !quoted,
             ';' if !quoted => {
+                if out.len() + 1 >= MAX_SECTIONS {
+                    return None;
+                }
                 out.push(&code[start..i]);
                 start = i + 1;
             }
@@ -399,7 +406,7 @@ fn format_sections(code: &str) -> Vec<&str> {
         }
     }
     out.push(&code[start..]);
-    out
+    Some(out)
 }
 
 /// What a custom format code shows. Only a code with one section for numbers is applied
@@ -410,7 +417,13 @@ fn format_sections(code: &str) -> Vec<&str> {
 /// locales are passed over. `m` is a month unless the section also shows hours or seconds, as
 /// Excel reads it.
 fn custom_format(code: &str) -> Shown {
-    let mut sections = format_sections(code);
+    // Excel's own codes are at most 255 characters; a longer one is no format it wrote.
+    if code.len() > 4 * MAX_PADDING {
+        return Shown::Plain;
+    }
+    let Some(mut sections) = format_sections(code) else {
+        return Shown::Plain;
+    };
     if sections.len() > 1 && sections.last().is_some_and(|t| t.trim() == "@") {
         sections.pop();
     }
@@ -458,6 +471,10 @@ fn custom_format(code: &str) -> Shown {
     let time = bare.contains(['h', 's']);
     let date = bare.contains(['y', 'd']) || (!time && bare.contains('m'));
     let seconds = bare.contains('s');
+    // Fractions of a second (`ss.000`) are not shown here: such a time stays a number.
+    if seconds && bare.contains("s.0") {
+        return Shown::Plain;
+    }
     match (date, time) {
         (true, true) => Shown::DateTime { seconds },
         (true, false) => Shown::Date,
@@ -1386,7 +1403,14 @@ mod tests {
         assert_eq!(custom_format("yyyy-mm-dd;[=0]0.00"), Shown::Plain);
         assert_eq!(custom_format("yyyy-mm-dd;@"), Shown::Date);
         assert_eq!(custom_format("\"a;b\" yyyy"), Shown::Date);
-        assert_eq!(format_sections(r#"0\;0;"x;y"0"#), vec![r"0\;0", r#""x;y"0"#]);
+        assert_eq!(format_sections(r#"0\;0;"x;y"0"#), Some(vec![r"0\;0", r#""x;y"0"#]));
+        assert_eq!(format_sections("0;0;0;@").map(|s| s.len()), Some(4));
+        assert_eq!(format_sections("0;0;0;0;0"), None);
+        assert_eq!(custom_format(&";".repeat(1_000_000)), Shown::Plain);
+        assert_eq!(custom_format("yyyy-mm-dd"), Shown::Date);
+        assert_eq!(custom_format("h:mm:ss"), Shown::Time { seconds: true });
+        assert_eq!(custom_format("h:mm:ss.000"), Shown::Plain);
+        assert_eq!(custom_format("[$-409]mm:ss.0;@"), Shown::Plain);
         assert_eq!(custom_format(&"0".repeat(MAX_PADDING)), Shown::Padded(MAX_PADDING));
         assert_eq!(custom_format(&"0".repeat(MAX_PADDING + 1)), Shown::Plain);
         assert_eq!(custom_format("0.00E+00"), Shown::Plain);
