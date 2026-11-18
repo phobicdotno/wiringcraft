@@ -1061,6 +1061,9 @@ impl App {
                     page
                 };
                 let open = need_open(self.open.as_mut())?;
+                if let Some(why) = open.held_reason(to) {
+                    return Err(why);
+                }
                 let sel = open.selections(page, &strings(v, "ids"))?;
                 let clip = open.copy(page, &sel);
                 let at = match (num(v, "x"), num(v, "y")) {
@@ -1123,6 +1126,13 @@ impl App {
                 let page = self.page_of(v, "page")?;
                 let up = need_s(v, "direction")? == "up";
                 let open = need_open(self.open.as_mut())?;
+                let other = if up { page.checked_sub(1) } else { Some(page + 1) };
+                if let Some(why) = open
+                    .held_reason(page)
+                    .or_else(|| other.and_then(|o| open.held_reason(o)))
+                {
+                    return Err(why);
+                }
                 let i = open.move_page(page, up).ok_or("The page is already at that end.")?;
                 self.ed.page = i;
                 Ok("Page moved.".into())
@@ -2466,6 +2476,18 @@ mod tests {
             None,
             "refused below the menu too"
         );
+        assert_eq!(numbers(&a), before_numbers);
+        // The assistant's tools say who holds the page instead of claiming the page is at the end
+        // or that nothing was pasted.
+        let first = before_numbers[0].clone();
+        let moved = call(&mut a, "move_page", json!({"page": first, "direction": "down"}));
+        assert!(moved.is_err_and(|e| e.contains("Ola")));
+        let copied = call(
+            &mut a,
+            "copy_items",
+            json!({"page": first, "to_page": before_numbers[1], "ids": []}),
+        );
+        assert!(copied.is_err_and(|e| e.contains("Ola")));
         assert_eq!(numbers(&a), before_numbers);
     }
 
