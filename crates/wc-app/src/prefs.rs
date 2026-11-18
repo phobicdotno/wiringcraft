@@ -29,6 +29,8 @@ pub struct Prefs {
     pub show_assistant: bool,
     /// The assistant's model, effort and (when not in the environment) API key.
     pub assistant: wc_agent::Settings,
+    /// Editor layers this user hid or locked on the canvas.
+    pub layers: crate::layers::Layers,
 }
 
 impl Default for Prefs {
@@ -42,6 +44,7 @@ impl Default for Prefs {
             recent: Vec::new(),
             show_assistant: false,
             assistant: wc_agent::Settings::default(),
+            layers: crate::layers::Layers::default(),
         }
     }
 }

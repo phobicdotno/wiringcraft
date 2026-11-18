@@ -8,6 +8,7 @@ use wc_core::geom::{Align, Point};
 use wc_core::route::Route;
 use wc_core::{Endpoint, Page, Shape};
 
+use crate::layers::Layer;
 use crate::state::{Open, Selection, Tool};
 use crate::theme;
 
@@ -78,6 +79,8 @@ pub struct Editor {
     /// The terminal strip a navigator menu asked to export markers of; the WAGO marking dialog
     /// opens with only that strip when it is set.
     pub marking_strip: Option<String>,
+    /// Layers hidden or locked on the canvas (the app sets it from the preferences).
+    pub layers: crate::layers::Layers,
 }
 
 impl Default for Editor {
@@ -105,6 +108,7 @@ impl Default for Editor {
             panel_drag: None,
             auto_wire: false,
             held_by: Default::default(),
+            layers: Default::default(),
         }
     }
 }
@@ -529,6 +533,9 @@ pub(crate) fn value_placeholder(
 /// changed.
 pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool, snap_step: f64) {
     drop_draft_of_other_page(open, ed);
+    // An item on a layer that was just hidden or locked does not stay selected.
+    let layers = ed.layers.clone();
+    ed.selection.retain(|s| layers.may_select(s));
     let finish = std::mem::take(&mut ed.finish_shape);
     if let Some(panel) = ed.panel {
         crate::panel_view::show(ui, open, ed, panel, snap_step);
@@ -664,7 +671,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     }
 
     // A scanned sheet under the page, toned down so what is drawn over it stands out.
-    if let Some(u) = &page.underlay {
+    if let Some(u) = page.underlay.as_ref().filter(|_| ed.layers.shown(Layer::Underlay)) {
         let area = Rect::from_two_pos(xf.s(u.min), xf.s(u.max));
         match open.underlay_texture(ui.ctx(), u) {
             Some(tex) => {
@@ -695,7 +702,12 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         matches!(ed.tool, Tool::Select),
     );
 
-    for (i, g) in page.graphics.iter().enumerate() {
+    for (i, g) in page
+        .graphics
+        .iter()
+        .enumerate()
+        .filter(|_| ed.layers.shown(Layer::Drawings))
+    {
         let selected = ed.is_selected(&Selection::Graphic(i));
         let c = if selected { t.selection } else { t.ink };
         paint_shape(&painter, &xf, g, Stroke::new(xf.len(0.25).max(0.8), c));
@@ -738,7 +750,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
             .into_iter()
             .flatten()
             .collect();
-        if !label.is_empty() && pts.len() >= 2 {
+        if !label.is_empty() && pts.len() >= 2 && ed.layers.shown(Layer::WireNumbers) {
             let (a, b) = (pts[0], pts[1]);
             let mid = Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
             if (a.x - b.x).abs() < (a.y - b.y).abs() {
@@ -854,12 +866,16 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     // opens the page it points at.
     let xref = wc_pdf::CrossRefs::build(&open.project, &open.symbols);
     let mut xref_warnings = Vec::new();
-    let marks = wc_pdf::xref_marks(&page, &open.symbols, &xref, &mut xref_warnings);
+    let marks = if ed.layers.shown(Layer::CrossReferences) {
+        wc_pdf::xref_marks(&page, &open.symbols, &xref, &mut xref_warnings)
+    } else {
+        Vec::new()
+    };
     let mut jump = None;
     for m in &marks {
         let (a, b) = crate::edit::text_box(m.at, wc_pdf::XREF_HEIGHT, m.align, &m.text);
         let r = Rect::from_two_pos(xf.s(a), xf.s(b));
-        let hovered = resp.hover_pos().is_some_and(|h| r.contains(h));
+        let hovered = ed.layers.pickable(Layer::CrossReferences) && resp.hover_pos().is_some_and(|h| r.contains(h));
         let c = if hovered { t.selection } else { t.wire_label };
         let al = match m.align {
             Align::Left => Align2::LEFT_BOTTOM,
@@ -888,12 +904,17 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     // greyed once resolved. Hovering shows the start of the text; clicking opens it in the
     // properties panel.
     let mut clicked_comment = None;
-    for c in open.project.page_comments(&page.id) {
+    for c in open
+        .project
+        .page_comments(&page.id)
+        .filter(|_| ed.layers.shown(Layer::Comments))
+    {
         let Some(at) = c.at else { continue };
         let spot = xf.s(at);
         let r = 9.0_f32;
         let center = spot + Vec2::new(r + 2.0, -r - 2.0);
-        let hovered = resp.hover_pos().is_some_and(|h| h.distance(center) <= r + 2.0);
+        let hovered =
+            ed.layers.pickable(Layer::Comments) && resp.hover_pos().is_some_and(|h| h.distance(center) <= r + 2.0);
         let chosen = ed.comment.as_deref() == Some(c.id.as_str());
         let fill = if c.resolved { t.faint } else { t.accent };
         painter.add(EShape::convex_polygon(
@@ -949,6 +970,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         ed.wire = None;
         ed.shape_points.clear();
     }
+    leave_unpickable_layer(ed);
 
     // Pointer position in page mm, snapped.
     let hover = resp.hover_pos().map(|hp| xf.mm(hp));
@@ -981,6 +1003,29 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     }
 }
 
+/// What is under `at` that can be picked: a free drawing only while its layer is shown and
+/// unlocked.
+fn pick(open: &Open, ed: &Editor, page: &Page, at: Point, tol: f64) -> Option<Selection> {
+    open.hit(page, at, tol).filter(|s| ed.layers.may_select(s))
+}
+
+/// A tool that adds to a hidden or locked layer (free drawings and texts, or review comments)
+/// falls back to Select, so nothing is drawn that cannot be seen or picked afterwards.
+fn leave_unpickable_layer(ed: &mut Editor) {
+    let layer = match ed.tool {
+        Tool::Text | Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline => Layer::Drawings,
+        Tool::Comment => Layer::Comments,
+        Tool::Select | Tool::Place | Tool::Wire => return,
+    };
+    let Some(why) = ed.layers.refusal(layer) else {
+        return;
+    };
+    ed.tool = Tool::Select;
+    ed.shape_points.clear();
+    ed.shape_page = None;
+    ed.message = why;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_tool(
     painter: &egui::Painter,
@@ -998,7 +1043,7 @@ fn select_tool(
     if resp.clicked_by(egui::PointerButton::Primary)
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
-        match (open.hit(page, at, tol), shift) {
+        match (pick(open, ed, page, at, tol), shift) {
             (Some(h), true) => {
                 if let Some(i) = ed.selection.iter().position(|s| *s == h) {
                     ed.selection.remove(i);
@@ -1016,7 +1061,8 @@ fn select_tool(
     if resp.secondary_clicked()
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
-        right_clicked(ed, open.hit(page, at, tol));
+        let hit = pick(open, ed, page, at, tol);
+        right_clicked(ed, hit);
     }
     if !held && !selected_wires(ed).is_empty() {
         resp.context_menu(|ui| route_menu(ui, open, ed));
@@ -1077,7 +1123,7 @@ fn select_tool(
                 painter.rect_filled(r, 0.0, t.selection.gamma_multiply(0.08));
                 painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, t.selection), egui::StrokeKind::Middle);
                 if resp.drag_stopped() {
-                    let found = open.select_in(ed.page, from, cur);
+                    let found = ed.layers.keep(open.select_in(ed.page, from, cur));
                     if shift {
                         for f in found {
                             if !ed.is_selected(&f) {
@@ -1117,7 +1163,7 @@ fn drag_start(
         return Drag::Box { from: at };
     }
     let logo = wc_pdf::cover_logo_box(&open.project, page);
-    let hit = open.hit(page, at, tol);
+    let hit = pick(open, ed, page, at, tol);
     match (logo, hit) {
         // The sizing corner wins over whatever lies under it; elsewhere the page's items do.
         (Some((a, b)), _) if logo_corner(b, at, tol) => Drag::Logo {
@@ -2458,6 +2504,236 @@ mod tests {
         // The panel view is not the page: it is not held.
         ed.panel = Some(0);
         assert_eq!(ed.held_page(&o.project), None);
+    }
+
+    #[test]
+    fn a_drawing_on_a_hidden_or_locked_layer_cannot_be_picked() {
+        let (_tmp, mut o) = project();
+        o.project.pages[0].graphics.push(Shape::Line {
+            a: Point::new(50.0, 50.0),
+            b: Point::new(80.0, 50.0),
+        });
+        let page = o.project.pages[0].clone();
+        let at = Point::new(60.0, 50.0);
+        let mut ed = Editor::default();
+        assert_eq!(pick(&o, &ed, &page, at, 1.0), Some(Selection::Graphic(0)));
+
+        for hide in [true, false] {
+            let mut ed = Editor::default();
+            if hide {
+                ed.layers.set_shown(Layer::Drawings, false);
+            } else {
+                ed.layers.set_locked(Layer::Drawings, true);
+            }
+            // A click finds nothing, and a drag there draws a selection box instead of
+            // picking the line up.
+            assert_eq!(pick(&o, &ed, &page, at, 1.0), None);
+            let d = drag_start(&o, &mut ed, &page, at, 1.0, 2.5, false, false);
+            assert!(matches!(d, Drag::Box { .. }));
+            assert!(ed.selection.is_empty());
+            // A selection box or Select all leaves it out.
+            let boxed = o.select_in(0, Point::new(0.0, 0.0), Point::new(200.0, 200.0));
+            assert!(boxed.contains(&Selection::Graphic(0)));
+            assert!(!ed.layers.keep(boxed).contains(&Selection::Graphic(0)));
+            assert!(!ed.layers.keep(o.select_all(0)).contains(&Selection::Graphic(0)));
+        }
+
+        // Hiding the layer while the line is selected drops it from the selection on the next
+        // frame, and a drawing tool falls back to Select so nothing invisible is drawn.
+        ed.selection = vec![Selection::Graphic(0)];
+        ed.tool = Tool::Line;
+        ed.layers.set_shown(Layer::Drawings, false);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut o, &mut ed, false, 1.0));
+        });
+        assert!(ed.selection.is_empty());
+        assert_eq!(ed.tool, Tool::Select);
+        assert!(ed.message.contains("Drawings and notes"), "{}", ed.message);
+        assert_eq!(o.project.pages[0], page, "the page is unchanged");
+    }
+
+    /// Draw one frame of the canvas with `events`; returns every text painted and where.
+    fn painted(
+        ctx: &egui::Context,
+        o: &mut Open,
+        ed: &mut Editor,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, Rect)> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, false, 1.0));
+        });
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                EShape::Text(t) => Some((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Click at `pos`: move there, press, release.
+    fn click_at(ctx: &egui::Context, o: &mut Open, ed: &mut Editor, pos: egui::Pos2, t: f64) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        painted(ctx, o, ed, t, vec![egui::Event::PointerMoved(pos)]);
+        painted(ctx, o, ed, t + 0.01, vec![button(true)]);
+        painted(ctx, o, ed, t + 0.02, vec![button(false)]);
+    }
+
+    /// Page 2 with a free text, a numbered wire, a coil -K1 whose contact is on page 3 (so a
+    /// cross-reference shows under the coil), a review comment and a scanned sheet whose
+    /// picture is missing (so its placeholder text shows).
+    fn annotated() -> (tempfile::TempDir, Open, Editor) {
+        let (tmp, mut o) = project();
+        o.project.pages.push(Page::new("p0003", "3", "Contacts"));
+        let coil = o.place(1, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let contact = o.place(2, "wc.contact.no", Point::new(100.0, 60.0)).unwrap();
+        for (page, id) in [(1, &coil), (2, &contact)] {
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| &s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+        }
+        let page = &mut o.project.pages[1];
+        page.underlay = Some(wc_core::Underlay {
+            file: "scans/missing-scan.png".into(),
+            min: Point::new(20.0, 100.0),
+            max: Point::new(120.0, 180.0),
+        });
+        page.graphics.push(
+            serde_json::from_value(serde_json::json!({
+                "kind": "text", "at": {"x": 40.0, "y": 150.0}, "text": "Hello note", "height": 5.0
+            }))
+            .unwrap(),
+        );
+        page.wires.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "w1",
+                "from": {"at": {"x": 200.0, "y": 40.0}},
+                "to": {"at": {"x": 300.0, "y": 40.0}},
+                "number": "W101"
+            }))
+            .unwrap(),
+        );
+        o.project.comments.push(wc_core::Comment {
+            id: "c742".into(),
+            page: "p0002".into(),
+            at: Some(Point::new(250.0, 150.0)),
+            author: "Kari".into(),
+            time: 0,
+            text: "Check this".into(),
+            resolved: false,
+            replies: Vec::new(),
+        });
+        let ed = Editor {
+            page: 1,
+            ..Editor::default()
+        };
+        (tmp, o, ed)
+    }
+
+    #[test]
+    fn a_hidden_layer_is_not_painted_and_a_shown_one_is() {
+        let (_tmp, mut o, mut ed) = annotated();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let has = |texts: &[(String, Rect)], want: &str| texts.iter().any(|(t, _)| t.contains(want));
+        // A first frame fits the page; the second is drawn as it stays.
+        painted(&ctx, &mut o, &mut ed, 0.0, vec![]);
+        let all = painted(&ctx, &mut o, &mut ed, 0.1, vec![]);
+        let xref = all
+            .iter()
+            .find(|(t, _)| t.contains("3."))
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        assert!(!xref.is_empty(), "a cross-reference to page 3 is drawn: {all:?}");
+        for want in ["Hello note", "W101", "742", "missing-scan", xref.as_str()] {
+            assert!(has(&all, want), "{want} is drawn: {all:?}");
+        }
+        for (layer, gone) in [
+            (Layer::Drawings, "Hello note"),
+            (Layer::WireNumbers, "W101"),
+            (Layer::CrossReferences, xref.as_str()),
+            (Layer::Comments, "742"),
+            (Layer::Underlay, "missing-scan"),
+        ] {
+            ed.layers = Default::default();
+            ed.layers.set_shown(layer, false);
+            let texts = painted(&ctx, &mut o, &mut ed, 0.2, vec![]);
+            assert!(!has(&texts, gone), "{layer:?} hidden: {gone} is not drawn");
+            for other in ["Hello note", "W101", "742", "missing-scan", xref.as_str()]
+                .into_iter()
+                .filter(|w| *w != gone)
+            {
+                assert!(has(&texts, other), "{layer:?} hidden: {other} is still drawn");
+            }
+            // Locked is still drawn.
+            ed.layers = Default::default();
+            ed.layers.set_locked(layer, true);
+            let texts = painted(&ctx, &mut o, &mut ed, 0.3, vec![]);
+            assert!(has(&texts, gone), "{layer:?} locked: {gone} is still drawn");
+        }
+    }
+
+    #[test]
+    fn a_locked_comment_or_cross_reference_does_not_open_on_a_click() {
+        let (_tmp, mut o, mut ed) = annotated();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.0, vec![]);
+        let texts = painted(&ctx, &mut o, &mut ed, 0.1, vec![]);
+        let at = |want: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t == want || (want == "xref" && t.contains("3.")))
+                .map(|(_, r)| r.center())
+                .unwrap()
+        };
+        let (bubble, xref) = (at("742"), at("xref"));
+
+        // Locked: a click on the bubble opens nothing, a click on the cross-reference stays.
+        ed.layers.set_locked(Layer::Comments, true);
+        ed.layers.set_locked(Layer::CrossReferences, true);
+        click_at(&ctx, &mut o, &mut ed, bubble, 1.0);
+        assert_eq!(ed.comment, None);
+        click_at(&ctx, &mut o, &mut ed, xref, 2.0);
+        assert_eq!(ed.page, 1, "still on page 2");
+
+        // Unlocked: the bubble opens its comment, the cross-reference goes to page 3.
+        ed.layers = Default::default();
+        click_at(&ctx, &mut o, &mut ed, bubble, 3.0);
+        assert_eq!(ed.comment.as_deref(), Some("c742"));
+        click_at(&ctx, &mut o, &mut ed, xref, 4.0);
+        assert_eq!(ed.page, 2, "on page 3");
+    }
+
+    #[test]
+    fn the_comment_tool_leaves_a_hidden_comment_layer() {
+        let mut ed = Editor {
+            tool: Tool::Comment,
+            ..Editor::default()
+        };
+        leave_unpickable_layer(&mut ed);
+        assert_eq!(ed.tool, Tool::Comment, "shown and unlocked: the tool stays");
+        ed.layers.set_locked(Layer::Comments, true);
+        leave_unpickable_layer(&mut ed);
+        assert_eq!(ed.tool, Tool::Select);
+        // Hiding wire numbers keeps the wire tool: wires are on no layer.
+        ed.tool = Tool::Wire;
+        ed.layers.set_shown(Layer::WireNumbers, false);
+        leave_unpickable_layer(&mut ed);
+        assert_eq!(ed.tool, Tool::Wire);
     }
 
     fn drag(o: &mut Open, ed: &mut Editor, d: Point) {

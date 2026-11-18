@@ -98,7 +98,7 @@ For the other areas, the chapter to read in each help is:
 | Macro placeholders and value sets (one macro, several variants) | yes | partly | no | later |
 | Auto-connect pins that line up | yes | yes | yes | done (#51) |
 | Scanned drawing as underlay to trace over | partly | partly | yes | done |
-| Layers / show-hide groups | yes | yes (DWG layers) | partly: PDF layers | done for export; editor layers later |
+| Layers / show-hide groups | yes | yes (DWG layers) | yes: PDF layers, editor layers (View → Layers) | done: show, hide and lock on the canvas, kept per user |
 
 ## 3. Symbols and library
 

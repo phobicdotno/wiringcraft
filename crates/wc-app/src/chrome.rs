@@ -99,6 +99,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::ZoomFit),
             None,
             Some(Action::ToggleGrid),
+            Some(Action::Layers),
             Some(Action::ToggleChrome),
             Some(Action::ToggleTheme),
             None,

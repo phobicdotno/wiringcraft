@@ -2614,6 +2614,7 @@ mod tests {
             symbol_editor: None,
             find: None,
             strip_editor: None,
+            show_layers: false,
         };
         (tmp, app)
     }
@@ -2954,6 +2955,7 @@ mod tests {
                 sharing: true,
                 share_undo: false,
                 share_redo: false,
+                show_layers: false,
             }
             .enabled(act)
         };
@@ -4373,6 +4375,66 @@ mod tests {
         let r = call(&mut a, "run_action", json!({"action": Action::Delete.name()}));
         assert!(r.as_ref().is_err_and(|e| e.contains("Ola has this page open")), "{r:?}");
         assert_eq!(page2(&a).graphics.len(), 1, "nothing deleted");
+    }
+
+    #[test]
+    fn a_drawing_hidden_or_locked_in_the_layer_list_is_not_deleted_before_the_canvas_redraws() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        for hide in [true, false] {
+            call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            // The layer list changed; Delete runs before the canvas is drawn again.
+            a.apply_layers();
+            assert!(a.ed.selection.is_empty());
+            a.run(Action::Delete);
+            assert_eq!(page2(&a).graphics.len(), 1, "the drawing stays");
+            a.prefs.layers = Default::default();
+            a.apply_layers();
+        }
+        // Shown and unlocked, the same Delete removes it.
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.run(Action::Delete);
+        assert!(page2(&a).graphics.is_empty());
+    }
+
+    #[test]
+    fn the_text_and_comment_dialogs_add_nothing_to_a_layer_hidden_while_they_were_open() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.page = 1;
+        let at = wc_core::geom::Point::new(40.0, 40.0);
+        for hide in [true, false] {
+            for l in [Layer::Drawings, Layer::Comments] {
+                if hide {
+                    a.prefs.layers.set_shown(l, false);
+                } else {
+                    a.prefs.layers.set_locked(l, true);
+                }
+            }
+            a.add_text(at, "Note");
+            assert!(page2(&a).graphics.is_empty());
+            assert!(a.ed.message.contains("Drawings and notes"), "{}", a.ed.message);
+            a.add_comment_at(at, "Check");
+            assert!(a.open.as_ref().unwrap().project.comments.is_empty());
+            assert!(a.ed.message.contains("Review comments"), "{}", a.ed.message);
+            a.prefs.layers = Default::default();
+        }
+        // Shown and unlocked, both are added.
+        a.add_text(at, "Note");
+        assert_eq!(page2(&a).graphics.len(), 1);
+        a.add_comment_at(at, "Check");
+        assert_eq!(a.open.as_ref().unwrap().project.comments.len(), 1);
     }
 
     #[test]

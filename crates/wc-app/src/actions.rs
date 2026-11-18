@@ -45,6 +45,7 @@ pub enum Action {
     ZoomOut,
     ZoomFit,
     ToggleGrid,
+    Layers,
     ToggleAutoWire,
     LibraryStatus,
     LibraryUpdate,
@@ -157,6 +158,7 @@ impl Action {
         Action::ZoomOut,
         Action::ZoomFit,
         Action::ToggleGrid,
+        Action::Layers,
         Action::ToggleAutoWire,
         Action::LibraryStatus,
         Action::LibraryUpdate,
@@ -376,6 +378,12 @@ impl Action {
             Action::ZoomOut => i("Zoom out", "Zoom out", Icon::ZoomOut, "-"),
             Action::ZoomFit => i("Fit page", "Show the whole page", Icon::ZoomFit, "F"),
             Action::ToggleGrid => i("Grid", "Show or hide the grid", Icon::Grid, "G"),
+            Action::Layers => i(
+                "Layers",
+                "Show, hide and lock drawings, wire numbers, cross-references, comments and scanned sheets on the canvas",
+                Icon::Layers,
+                "",
+            ),
             Action::ToggleAutoWire => i(
                 "Auto-wire",
                 "Draw wires between pins that line up when a symbol is placed or moved (hold Alt to skip once)",
@@ -528,7 +536,13 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::PageProps,
         Action::DeletePage,
     ],
-    &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
+    &[
+        Action::ZoomIn,
+        Action::ZoomOut,
+        Action::ZoomFit,
+        Action::ToggleGrid,
+        Action::Layers,
+    ],
     &[
         Action::LibraryStatus,
         Action::LibraryUpdate,
@@ -621,7 +635,13 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
             ("Terminals", &[Action::TerminalStrips]),
             (
                 "View",
-                &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
+                &[
+                    Action::ZoomIn,
+                    Action::ZoomOut,
+                    Action::ZoomFit,
+                    Action::ToggleGrid,
+                    Action::Layers,
+                ],
             ),
         ],
     ),
