@@ -1639,3 +1639,121 @@ fn an_in_process_link_reports_an_orderly_end() {
     assert!(guest_end.try_recv().is_err());
     assert_eq!(guest_end.close_reason(), Some(transport::CloseReason::Ended));
 }
+
+fn symbol(id: &str, name: &str) -> wc_core::Symbol {
+    wc_core::Symbol {
+        id: id.into(),
+        name: name.into(),
+        category: String::new(),
+        letter_code: String::new(),
+        role: Default::default(),
+        graphics: vec![],
+        pins: vec![],
+        tag_at: Point::default(),
+        description: String::new(),
+    }
+}
+
+#[test]
+fn guests_get_the_symbol_files_and_symbols_added_during_the_session() -> TestResult {
+    let mut s = Session::new();
+    let coil = symbol("coil", "Coil");
+    s.host
+        .share_files([(coil.id.clone(), coil.clone())].into(), Default::default());
+    // A guest that joins gets the host's files with the project.
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    assert_eq!(a.symbols.get("coil"), Some(&coil));
+    let (_b, link_b, mut b) = s.join("Kari")?;
+
+    // Ola uses a symbol and a part the project did not have: everyone gets the files and the
+    // lock entries, and the host records it as one change.
+    let lamp = symbol("lamp", "Lamp");
+    let part = wc_core::Part {
+        id: "acme.lamp".into(),
+        manufacturer: "Acme".into(),
+        ..Default::default()
+    };
+    link_a.send(a.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(lamp.clone(), "starter".into())],
+        parts: vec![(part.clone(), "acme".into())],
+    }))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let entry = s.host.project().lock.symbols.get("lamp").cloned();
+    assert_eq!(
+        entry,
+        Some(wc_core::lock::LockEntry {
+            source: "starter".into(),
+            hash: lamp.hash()
+        })
+    );
+    assert_eq!(
+        s.host.project().lock.parts.get("acme.lamp").map(|e| e.hash.clone()),
+        Some(part.hash())
+    );
+    assert_eq!(s.host.files().0.get("lamp"), Some(&lamp));
+    assert_eq!(
+        s.log.0.borrow().last().map(|c| c.message.clone()),
+        Some("Add lamp, acme.lamp to the project".into())
+    );
+    for g in [&a, &b] {
+        assert_eq!(g.symbols.get("lamp"), Some(&lamp));
+        assert_eq!(g.parts.get("acme.lamp"), Some(&part));
+        assert_eq!(g.project.as_ref().map(|p| &p.lock), Some(&s.host.project().lock));
+    }
+    // Someone who joins later gets them in the welcome.
+    let (_c, _link_c, c) = s.join("Per")?;
+    assert_eq!(c.symbols.len(), 2);
+    assert_eq!(c.parts.get("acme.lamp"), Some(&part));
+
+    // Another version of a symbol the project has is refused, and so is an empty list.
+    let changes = s.log.0.borrow().len();
+    for edit in [
+        ProjectEdit::AddItems {
+            symbols: vec![(symbol("lamp", "Other lamp"), "starter".into())],
+            parts: vec![],
+        },
+        ProjectEdit::AddItems {
+            symbols: vec![],
+            parts: vec![],
+        },
+    ] {
+        link_b.send(b.edit_project(edit))?;
+    }
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert_eq!(b.refusals.len(), 2, "{:?}", b.refusals);
+    assert!(
+        b.refusals[0].to_string().contains("another version"),
+        "{}",
+        b.refusals[0]
+    );
+    assert_eq!(s.log.0.borrow().len(), changes);
+    assert_eq!(b.symbols.get("lamp"), Some(&lamp));
+    Ok(())
+}
+
+#[test]
+fn added_symbols_are_committed_with_their_files() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let journal = GitJournal::open(dir)?;
+    let git = journal.git().clone();
+    git.commit("Start")?;
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(journal));
+    let lamp = symbol("lamp", "Lamp");
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(lamp.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    assert_eq!(store::read_vendored_symbol(dir, "lamp")?, lamp);
+    let on_disk = store::load(dir)?;
+    assert_eq!(
+        on_disk.lock.symbols.get("lamp").map(|e| e.hash.clone()),
+        Some(lamp.hash())
+    );
+    let path = store::vendor_path(dir, wc_core::lock::ItemKind::Symbol, "lamp")?;
+    let rel = path.strip_prefix(dir)?.to_string_lossy().replace('\\', "/");
+    assert!(git.show("HEAD", &rel).is_some(), "the file is in the change's commit");
+    assert_eq!(git.author_and_subject("HEAD")?.1, "Add lamp to the project");
+    Ok(())
+}
