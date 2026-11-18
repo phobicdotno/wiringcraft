@@ -948,6 +948,68 @@ fn a_two_level_terminal_shows_its_levels_and_shares_one_marker() {
 }
 
 #[test]
+fn terminal_markers_of_an_arranged_strip_come_in_its_rail_order() {
+    let (mut p, s, parts) = fixture();
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    // -X1.1 and -X1.2 are one two-level terminal.
+    p.devices
+        .entry(DeviceTag::parse("-X1.2").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "2".into());
+    let markers = |p: &wc_core::Project| -> Vec<String> {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        let o = MarkingOptions {
+            kinds: vec![MarkerKind::Terminals],
+            level_separator: LEVEL_SEPARATOR.into(),
+            ..MarkingOptions::default()
+        };
+        marking_list_with(&i, &o)
+            .rows
+            .iter()
+            .map(|r| format!("{} {}", r[1], r[2]))
+            .collect()
+    };
+    // Nobody arranged a strip: today's order.
+    assert_eq!(markers(&p), ["-X1 1 / 2", "-X2 1"]);
+    // A spare S1 goes on the rail before the two-level terminal, and 2 is moved before 1.
+    p.meta
+        .add_spare(&x1, "S1", None, &[("1".to_owned(), false), ("2".to_owned(), false)])
+        .unwrap();
+    let current = vec![
+        ("1".to_owned(), false),
+        ("2".to_owned(), false),
+        ("S1".to_owned(), true),
+    ];
+    p.meta.move_terminal(&x1, "S1", 0, &current).unwrap();
+    let current = vec![
+        ("S1".to_owned(), true),
+        ("1".to_owned(), false),
+        ("2".to_owned(), false),
+    ];
+    p.meta.move_terminal(&x1, "2", 1, &current).unwrap();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let rail: Vec<String> = terminal_plan(&i)
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| r[1].clone())
+        .collect();
+    assert_eq!(rail, ["S1", "2", "1"]);
+    // The spare's marker goes first, as on the rail; the block keeps one marker, numbered
+    // upwards; the strip that nobody arranged is as before, and strips stay in tag order.
+    assert_eq!(markers(&p), ["-X1 S1", "-X1 1 / 2", "-X2 1"]);
+}
+
+#[test]
 fn levels_join_only_upwards_within_one_strip() {
     let rows = |v: &[(&str, &str, Option<u32>)]| -> Vec<(String, String, Option<u32>)> {
         v.iter().map(|(a, b, l)| ((*a).into(), (*b).into(), *l)).collect()
@@ -1542,8 +1604,8 @@ fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_t
     for page in p.pages.iter_mut() {
         page.number = SPARE_PAGE.into();
     }
-    // A drawn terminal 0 without a level, on that page, is not taken for a spare either: its
-    // marker comes first, by number, not after the block.
+    // A drawn terminal 0 without a level, on that page, is not taken for a spare either. -X1 is
+    // arranged, so its marker goes where the rail has it: a newly drawn terminal at the end.
     let mut zero = p
         .pages
         .iter()
@@ -1572,7 +1634,14 @@ fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_t
     let spare = plan.rows.iter().find(|r| r[0] == "-X2" && r[1] == "S1").unwrap();
     assert_eq!(spare[4], "0V");
     let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
-    assert_eq!(marked, ["0", "1 / 2", "1a"]);
+    let rail: Vec<&str> = plan
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| r[1].as_str())
+        .collect();
+    assert_eq!(rail, ["2", "1", "1a", "0"]);
+    assert_eq!(marked, ["1 / 2", "1a", "0"]);
     // The spare -X1.1a has a device entry, but it is marked once, as a terminal.
     let all = marking_list_with(&i, &MarkingOptions::default());
     let named: Vec<&Vec<String>> = all.rows.iter().filter(|r| r.iter().any(|c| c.contains("1a"))).collect();
