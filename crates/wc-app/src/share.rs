@@ -297,16 +297,24 @@ fn merge_unordered<T: PartialEq + Clone>(
         }
         None => true,
     });
+    let mut removed_there = minus(base, auth);
     let mut out = auth.to_vec();
     for r in &removed_here {
-        match out.iter().position(|x| x == r) {
+        match removed_there.iter().position(|x| x == r) {
+            // Gone from the session too (that copy, not another one it still has): a clash if
+            // it may have been changed here, or if the session may have changed it (deleted
+            // here, moved there).
             Some(i) => {
-                out.remove(i);
+                removed_there.swap_remove(i);
+                if added_here.iter().chain(&added_there).any(|a| same_kind(a, r)) {
+                    return None;
+                }
             }
-            // Gone from the session too: a clash if it may have been changed here, or if the
-            // session may have changed it (deleted here, moved there).
-            None if added_here.iter().chain(&added_there).any(|a| same_kind(a, r)) => return None,
-            None => {}
+            None => {
+                if let Some(i) = out.iter().position(|x| x == r) {
+                    out.remove(i);
+                }
+            }
         }
     }
     out.extend(added_here);
