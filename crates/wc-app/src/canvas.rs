@@ -81,6 +81,9 @@ pub struct Editor {
     pub marking_strip: Option<String>,
     /// Layers hidden or locked on the canvas (the app sets it from the preferences).
     pub layers: crate::layers::Layers,
+    /// Findings of the check that runs while drawing, marked on their items; empty when it is
+    /// off.
+    pub live: Vec<wc_report::Finding>,
 }
 
 impl Default for Editor {
@@ -109,6 +112,7 @@ impl Default for Editor {
             auto_wire: false,
             held_by: Default::default(),
             layers: Default::default(),
+            live: Vec::new(),
         }
     }
 }
@@ -900,6 +904,8 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         return;
     }
 
+    paint_live_findings(&painter, &xf, open, &page, ed, resp.hover_pos(), &t);
+
     // Review comments pinned on the page: a numbered bubble whose tail points at the spot,
     // greyed once resolved. Hovering shows the start of the text; clicking opens it in the
     // properties panel.
@@ -1005,6 +1011,85 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
 
 /// What is under `at` that can be picked: a free drawing only while its layer is shown and
 /// unlocked.
+/// Where a finding of the check while drawing is marked: around a placed symbol, or at the
+/// middle of a wire. `None` for anything else, or an item no longer on the page.
+fn live_spot(open: &Open, page: &Page, item: &str) -> Option<(Point, Point)> {
+    if let Some(b) = open.symbol_bounds(page, item) {
+        return Some(b);
+    }
+    let w = page.wires.iter().find(|w| w.id == item)?;
+    let pts = open.wire_points(page, w)?;
+    let mid = match pts.len() {
+        0 => return None,
+        1 => pts[0],
+        n => {
+            // The middle of the middle segment.
+            let (a, b) = (pts[(n - 1) / 2], pts[(n - 1) / 2 + 1]);
+            Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+        }
+    };
+    Some((mid, mid))
+}
+
+/// The findings of the check while drawing on this page: a ring in the colour of the worst
+/// finding around each item, with a badge that lists the findings when hovered.
+fn paint_live_findings(
+    painter: &egui::Painter,
+    xf: &Xf,
+    open: &Open,
+    page: &Page,
+    ed: &Editor,
+    hover: Option<Pos2>,
+    t: &crate::theme::Theme,
+) {
+    use wc_report::Severity;
+    let mut by_item: std::collections::BTreeMap<&str, Vec<&wc_report::Finding>> = Default::default();
+    for f in &ed.live {
+        if f.page_id.as_deref() == Some(page.id.as_str())
+            && f.severity != Severity::Note
+            && let Some(item) = f.item.as_deref()
+        {
+            by_item.entry(item).or_default().push(f);
+        }
+    }
+    let mut tip = None;
+    for (item, found) in by_item {
+        let Some((a, b)) = live_spot(open, page, item) else {
+            continue;
+        };
+        let worst = found.iter().map(|f| f.severity).min().unwrap_or(Severity::Warning);
+        let c = if worst == Severity::Error { t.error } else { t.warning };
+        let ring = Rect::from_two_pos(xf.s(a), xf.s(b)).expand(6.0);
+        painter.rect_stroke(ring, 4.0, Stroke::new(1.5_f32, c), egui::StrokeKind::Outside);
+        let badge = ring.right_top();
+        let r = 6.5_f32;
+        painter.circle_filled(badge, r, c);
+        painter.text(
+            badge,
+            Align2::CENTER_CENTER,
+            "!",
+            crate::theme::strong(10.0),
+            Color32::WHITE,
+        );
+        if hover.is_some_and(|h| h.distance(badge) <= r + 2.0 || ring.contains(h)) {
+            tip = Some((badge, found));
+        }
+    }
+    if let Some((badge, found)) = tip {
+        let text = found
+            .iter()
+            .map(|f| format!("{}: {}", f.severity.label(), f.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), t.ink);
+        let size = galley.size() + Vec2::splat(10.0);
+        let rect = Rect::from_min_size(badge + Vec2::new(10.0, -size.y / 2.0), size);
+        painter.rect_filled(rect, 4.0, t.paper);
+        painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, t.faint), egui::StrokeKind::Inside);
+        painter.galley(rect.min + Vec2::splat(5.0), galley, t.ink);
+    }
+}
+
 fn pick(open: &Open, ed: &Editor, page: &Page, at: Point, tol: f64) -> Option<Selection> {
     open.hit(page, at, tol).filter(|s| ed.layers.may_select(s))
 }

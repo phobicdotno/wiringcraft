@@ -205,7 +205,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Project check with errors and warnings | yes | yes | yes, in the app and the CLI | done |
-| Online check while drawing | yes | partly | no: run on demand | later |
+| Online check while drawing | yes | partly | yes: the check runs again shortly after each edit, off the window thread; problems are ringed on the canvas and counted in the status bar (File → Check while drawing turns it off) | done (#269) |
 | User-defined check rules | yes | no | no | later |
 
 ## 13. Data exchange

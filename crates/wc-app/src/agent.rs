@@ -2615,6 +2615,7 @@ mod tests {
             find: None,
             strip_editor: None,
             show_layers: false,
+            live: Default::default(),
         };
         (tmp, app)
     }

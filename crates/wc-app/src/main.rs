@@ -14,6 +14,7 @@ mod find_window;
 mod icons;
 mod import_symbols;
 mod layers;
+mod live_check;
 mod panel_view;
 mod panels;
 mod prefs;
@@ -179,6 +180,8 @@ struct App {
     strip_editor: Option<strip_editor::StripEditor>,
     /// The layer list window is open.
     show_layers: bool,
+    /// The project check that runs after each edit (Check while drawing).
+    live: live_check::LiveCheck,
 }
 
 struct StatusView<'a> {
@@ -210,6 +213,7 @@ impl chrome::Status for StatusView<'_> {
             Action::ToggleGrid => self.prefs.show_grid,
             Action::Layers => self.show_layers,
             Action::ToggleAutoWire => self.prefs.auto_wire,
+            Action::LiveCheck => self.prefs.live_check,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
             Action::ToggleTheme => self.prefs.theme == theme::Mode::Dark,
             Action::Assistant => self.prefs.show_assistant,
@@ -230,6 +234,7 @@ impl chrome::Status for StatusView<'_> {
             | Action::ToggleGrid
             | Action::Layers
             | Action::ToggleAutoWire
+            | Action::LiveCheck
             | Action::Assistant
             | Action::ReportProblem
             | Action::RequestFunction
@@ -375,6 +380,7 @@ impl App {
             find: None,
             show_layers: false,
             strip_editor: None,
+            live: Default::default(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -509,6 +515,15 @@ impl App {
                     "Auto-wiring is on: pins that line up get a wire (hold Alt to skip once).".into()
                 } else {
                     "Auto-wiring is off.".into()
+                };
+            }
+            Action::LiveCheck => {
+                self.prefs.live_check = !self.prefs.live_check;
+                self.prefs.save();
+                self.ed.message = if self.prefs.live_check {
+                    "Checking while drawing: problems are marked on the canvas shortly after each edit.".into()
+                } else {
+                    "Checking while drawing is off; Check (Ctrl+E) still checks the whole project.".into()
                 };
             }
             Action::Assistant => {
@@ -2748,6 +2763,7 @@ impl eframe::App for App {
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
         }
+        self.live_check(ctx);
         self.log_messages();
         self.assistant_poll(ctx);
         if self.applied_theme != self.prefs.theme {
@@ -2768,7 +2784,12 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
             .frame(side(t.toolbar_bg).inner_margin(egui::Margin::symmetric(10, 4)))
             .show_separator_line(false)
-            .show(ctx, |ui| panels::status_bar(ui, self.open.as_ref(), &self.ed));
+            .show(ctx, |ui| {
+                let live = self.prefs.live_check.then_some(self.live.busy());
+                if panels::status_bar(ui, self.open.as_ref(), &self.ed, live) {
+                    self.dialog = Some(Dialog::Check(self.ed.live.clone()));
+                }
+            });
         self.assistant_panel(ctx);
 
         let mut page_actions = Vec::new();
@@ -2854,6 +2875,25 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Check while drawing: start a check once the last edit has settled, and show the
+    /// findings of one that finished.
+    fn live_check(&mut self, ctx: &egui::Context) {
+        let Some(o) = self.open.as_ref().filter(|_| self.prefs.live_check) else {
+            self.live.clear();
+            self.ed.live.clear();
+            return;
+        };
+        let poll = self
+            .live
+            .poll(&o.project, &o.symbols, &o.parts, std::time::Instant::now());
+        if poll.changed {
+            self.ed.live = self.live.findings.clone();
+        }
+        if let Some(after) = poll.again {
+            ctx.request_repaint_after(after);
+        }
+    }
+
     /// The symbol editor, while open. A saved symbol shows up in the place list at once; when
     /// the project already uses it, its copy in the project is updated too (one undo step).
     /// While the symbol editor is open, Undo and Delete work on the symbol being drawn, and
