@@ -91,6 +91,100 @@ impl Session {
 }
 
 #[test]
+fn a_guest_on_another_protocol_version_is_turned_away_with_both_versions() -> TestResult {
+    let mut s = Session::new();
+    let before = s.host.project().clone();
+    let (id, link, mut guest) = s.connect();
+    let other = crate::PROTOCOL_VERSION + 1;
+    guest.status = GuestStatus::Waiting;
+    link.send(GuestMsg::Join {
+        name: "Ola".into(),
+        email: "ola@example.com".into(),
+        protocol: other,
+    })?;
+    s.pump(&mut [(&link, &mut guest)]);
+    let want = crate::VersionMismatch {
+        host: crate::PROTOCOL_VERSION,
+        guest: other,
+    };
+    assert_eq!(guest.status, GuestStatus::WrongVersion(want));
+    let said = want.to_string();
+    assert!(
+        said.contains(&format!("version {}", crate::PROTOCOL_VERSION)) && said.contains(&format!("version {other}")),
+        "{said}"
+    );
+    assert!(s.hub.is_empty(), "the connection is dropped");
+    assert!(s.host.pending().is_empty(), "nobody is asked to approve it");
+    assert!(!s.host.approve(id));
+    assert_eq!(s.host.project(), &before);
+    assert!(s.log.0.borrow().is_empty());
+    assert!(s.host.peers().iter().all(|p| p.id != id));
+
+    // The same build still joins.
+    s.join("Kari")?;
+    Ok(())
+}
+
+#[test]
+fn a_join_from_a_build_without_versions_is_declined_and_reads_as_declined_there() -> TestResult {
+    // A build before versions sends no protocol: it counts as 0.
+    let old = r#"{"type":"join","name":"Ola","email":"o@x"}"#;
+    assert!(matches!(decode::<GuestMsg>(old)?, GuestMsg::Join { protocol: 0, .. }));
+    let mut s = Session::new();
+    let (_, link, mut guest) = s.connect();
+    link.send(decode::<GuestMsg>(old)?)?;
+    s.pump(&mut [(&link, &mut guest)]);
+    assert_eq!(
+        guest.status,
+        GuestStatus::WrongVersion(crate::VersionMismatch {
+            host: crate::PROTOCOL_VERSION,
+            guest: 0
+        })
+    );
+    // That build's own Declined has no fields: it still reads the refusal as a decline.
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OldHostMsg {
+        Declined,
+    }
+    let line = encode(&HostMsg::Declined {
+        version: Some(crate::VersionMismatch { host: 1, guest: 0 }),
+    })?;
+    assert!(matches!(
+        serde_json::from_str::<OldHostMsg>(&line)?,
+        OldHostMsg::Declined
+    ));
+    // A plain decline is written as before.
+    assert_eq!(
+        encode(&HostMsg::Declined { version: None })?.trim(),
+        r#"{"type":"declined"}"#
+    );
+    Ok(())
+}
+
+#[test]
+fn a_guest_stops_at_the_welcome_of_a_host_on_another_version() {
+    let mut guest = Guest::new();
+    let _ = guest.join("Ola", "o@x");
+    guest.handle(HostMsg::Welcome {
+        you: 1,
+        project: Box::new(Snapshot::from(&demo())),
+        locks: std::collections::BTreeMap::new(),
+        peers: Vec::new(),
+        history: Vec::new(),
+        protocol: 0,
+    });
+    assert_eq!(
+        guest.status,
+        GuestStatus::WrongVersion(crate::VersionMismatch {
+            host: 0,
+            guest: crate::PROTOCOL_VERSION
+        })
+    );
+    assert!(guest.project.is_none(), "nothing of that session is taken");
+}
+
+#[test]
 fn nobody_joins_without_approval() -> TestResult {
     let mut s = Session::new();
     let (id, link, mut guest) = s.connect();
@@ -363,6 +457,7 @@ fn messages_survive_a_json_line() -> TestResult {
         GuestMsg::Join {
             name: "Ola".into(),
             email: "o@x".into(),
+            protocol: crate::PROTOCOL_VERSION,
         },
         GuestMsg::Open { page: None },
         GuestMsg::EditPage { page },
@@ -398,6 +493,7 @@ fn messages_survive_a_json_line() -> TestResult {
             reverts: None,
             undone_by: None,
         }],
+        protocol: crate::PROTOCOL_VERSION,
     };
     assert_eq!(decode::<HostMsg>(&encode(&welcome)?)?, welcome);
     // A welcome from a host without undo still reads.
@@ -1384,6 +1480,7 @@ mod discovery {
             project: project.into(),
             host: host.into(),
             port,
+            protocol: crate::PROTOCOL_VERSION,
         }
     }
 
@@ -1453,7 +1550,49 @@ mod discovery {
         Announcer::start_to(at_limit, to, EVERY)?.stop();
         let over = beacon(&"P".repeat(MAX_BEACON - fixed + 1), "Ola", 7001);
         let err = Announcer::start_to(over, to, EVERY).err().ok_or("accepted")?;
-        assert!(err.to_string().contains("2048"), "{err}");
+        assert!(err.to_string().contains(&MAX_BEACON.to_string()), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn names_that_fit_before_the_version_was_announced_still_fit() -> TestResult {
+        // The beacon as it was written before the version field: 2048 bytes at most.
+        #[derive(serde::Serialize)]
+        struct Old<'a> {
+            magic: &'a str,
+            project: &'a str,
+            host: &'a str,
+            port: u16,
+        }
+        let old_len = |project: &str| -> std::result::Result<usize, serde_json::Error> {
+            Ok(serde_json::to_vec(&Old {
+                magic: "wiringcraft-session",
+                project,
+                host: "Ola",
+                port: 65535,
+            })?
+            .len())
+        };
+        let room = 2048 - old_len("")?;
+        let project = "P".repeat(room);
+        assert_eq!(old_len(&project)?, 2048);
+        let b = Beacon {
+            port: 65535,
+            protocol: u32::MAX,
+            ..beacon(&project, "Ola", 1)
+        };
+        assert!(b.encode().len() <= MAX_BEACON, "{}", b.encode().len());
+        // It is sent, and a browser reads it whole.
+        let mut browser = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let to = browser.local_addr()?;
+        let announcer = Announcer::start_to(b, to, EVERY)?;
+        let list = poll_until(&mut browser, |l| !l.is_empty())?;
+        announcer.stop();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].project, project);
+        assert_eq!(list[0].host, "Ola");
+        assert_eq!(list[0].addr.port(), 65535);
+        assert_eq!(list[0].protocol, u32::MAX);
         Ok(())
     }
 
@@ -1498,6 +1637,27 @@ mod discovery {
         let list = b.poll()?;
         assert_eq!(list.len(), 1, "{list:?}");
         assert_eq!(list[0].addr, SocketAddr::new(from.ip(), 7003));
+        assert_eq!(list[0].protocol, crate::PROTOCOL_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn a_beacon_from_an_older_build_reads_as_version_0() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let from: SocketAddr = "192.168.1.30:5000".parse()?;
+        let wire = br#"{"magic":"wiringcraft-session","project":"Old","host":"Kari","port":7004}"#.to_vec();
+        let mut sent = false;
+        b.receive(|buf| {
+            if sent {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            sent = true;
+            buf[..wire.len()].copy_from_slice(&wire);
+            Ok((wire.len(), from))
+        })?;
+        let list = b.poll()?;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].protocol, 0);
         Ok(())
     }
 

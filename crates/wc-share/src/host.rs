@@ -230,6 +230,7 @@ impl Host {
             locks: self.locks.clone(),
             peers: self.peers(),
             history: self.history(),
+            protocol: crate::PROTOCOL_VERSION,
         };
         self.outbox.push((id, welcome));
         for (file, data) in &self.pictures {
@@ -248,7 +249,7 @@ impl Host {
         match self.peers.get(&id) {
             Some(p) if p.status == Status::Pending => {
                 self.peers.remove(&id);
-                self.outbox.push((id, HostMsg::Declined));
+                self.outbox.push((id, HostMsg::Declined { version: None }));
                 true
             }
             _ => false,
@@ -332,7 +333,17 @@ impl Host {
             (_, msg) => msg,
         };
         let result = match (status, msg) {
-            (Status::Connected, GuestMsg::Join { name, email }) => {
+            (Status::Connected, GuestMsg::Join { protocol, .. }) if protocol != crate::PROTOCOL_VERSION => {
+                // Turned away before anyone sees the request: nothing of the session changes.
+                self.peers.remove(&from);
+                let version = crate::VersionMismatch {
+                    host: crate::PROTOCOL_VERSION,
+                    guest: protocol,
+                };
+                self.outbox.push((from, HostMsg::Declined { version: Some(version) }));
+                Ok(())
+            }
+            (Status::Connected, GuestMsg::Join { name, email, .. }) => {
                 if let Some(p) = self.peers.get_mut(&from) {
                     p.name = clean(&name, "Guest", 100);
                     p.email = clean(&email, "guest@localhost", 200);

@@ -1989,10 +1989,16 @@ impl App {
                                         wc_library::State::Changed => (t.selection, "newer in library"),
                                         wc_library::State::NotLocked => (t.wire, "not pinned"),
                                         wc_library::State::GoneFromLibrary => (t.error, "gone from library"),
+                                        wc_library::State::WrongId => (t.error, "library file has another id"),
                                     };
                                     chrome::dot(ui, c);
                                     ui.label(RichText::new(&it.id).monospace());
-                                    ui.label(s);
+                                    if it.state == wc_library::State::WrongId {
+                                        // Names the source and the id its file declares.
+                                        ui.label(format!("{s}: {}", it.changes.join("; ")));
+                                    } else {
+                                        ui.label(s);
+                                    }
                                     ui.end_row();
                                 }
                             });

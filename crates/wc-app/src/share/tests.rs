@@ -187,6 +187,75 @@ fn a_joined_guest_gets_its_own_copy_on_disk() -> TestResult {
 }
 
 #[test]
+fn a_guest_on_another_version_is_told_both_versions_instead_of_a_dropped_connection() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    let (mut h, log) = host(&host_open);
+    let (guest_end, host_end) = pair();
+    if let Some(Role::Host(hosting)) = h.role.as_mut() {
+        hosting.hub.add(&mut hosting.host, host_end);
+    }
+    let other = wc_share::PROTOCOL_VERSION + 1;
+    // The status window is open after "Ask to join", with what the person typed.
+    let typed = Form {
+        name: "Kari".into(),
+        email: "kari@example.com".into(),
+        addr: "192.168.1.20:47810".into(),
+        folder: tmp.path().join("guest").display().to_string(),
+        ..Form::default()
+    };
+    let mut g = Share {
+        role: Some(Role::Guest(Box::new(Joining {
+            guest: Guest::new(),
+            link: guest_end,
+            addr: "in-process".into(),
+            folder: tmp.path().join("guest"),
+            dir: None,
+        }))),
+        view: View::Status,
+        form: Some(typed),
+        ..Default::default()
+    };
+    if let Some(Role::Guest(j)) = g.role.as_mut() {
+        let _ = j.guest.join("Kari", "kari@example.com");
+        let join = wc_share::GuestMsg::Join {
+            name: "Kari".into(),
+            email: "kari@example.com".into(),
+            protocol: other,
+        };
+        assert!(j.link.send(join).is_ok());
+    }
+    let before = host_open.project.clone();
+    h.frame(Some(&mut host_open), None, false);
+    assert!(pending(&h).is_empty(), "the host is not asked");
+    assert!(g.frame(None, None, false).is_none());
+    assert!(!g.active());
+    let notes = g.take_notes();
+    let told = notes.iter().find(|n| n.contains("cannot join")).ok_or("no note")?;
+    // Each whole version number next to its side, so swapping them (or a longer number that
+    // starts with the same digits) fails.
+    let host_says = format!(
+        "host's WiringCraft uses session protocol version {} and",
+        wc_share::PROTOCOL_VERSION
+    );
+    let guest_says = format!("guest's uses version {other};");
+    assert!(told.contains(&host_says) && told.contains(&guest_says), "{told}");
+    // The Join dialog is shown again with the same reason, the typed values kept.
+    assert!(g.view == View::Join);
+    let form = g.form.as_ref().ok_or("no form")?;
+    assert_eq!(form.error.as_deref(), Some(told.as_str()));
+    assert_eq!(
+        (form.name.as_str(), form.email.as_str(), form.addr.as_str()),
+        ("Kari", "kari@example.com", "192.168.1.20:47810")
+    );
+    assert_eq!(form.folder, tmp.path().join("guest").display().to_string());
+    assert!(!notes.iter().any(|n| n.contains("connection")), "{notes:?}");
+    assert_eq!(host_open.project, before);
+    assert!(log.messages().is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_declined_guest_is_told_and_the_session_ends_for_them() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut host_open = project(&tmp.path().join("host"))?;
@@ -1635,5 +1704,232 @@ fn a_picture_that_could_not_be_written_is_tried_again_only_after_a_while() -> Te
         .collect();
     assert_eq!(notes.len(), 1, "named once: {notes:?}");
     assert!(notes[0].contains("could not be written"), "{}", notes[0]);
+    Ok(())
+}
+
+/// A guest on its own end of a link, as after "Ask to join" with the status window open.
+fn asking(tmp: &Path) -> (Share, wc_share::transport::HostLink) {
+    let (guest_end, host_end) = pair();
+    let mut guest = Guest::new();
+    let _ = guest.join("Kari", "kari@example.com");
+    let g = Share {
+        role: Some(Role::Guest(Box::new(Joining {
+            guest,
+            link: guest_end,
+            addr: "in-process".into(),
+            folder: tmp.join("guest"),
+            dir: None,
+        }))),
+        view: View::Status,
+        form: Some(Form::default()),
+        ..Default::default()
+    };
+    (g, host_end)
+}
+
+#[test]
+fn a_close_right_behind_a_welcome_from_another_version_does_not_hide_the_version() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let open = project(&tmp.path().join("host"))?;
+    let (mut g, host_end) = asking(tmp.path());
+    let old = wc_share::PROTOCOL_VERSION + 1;
+    // Both arrive before the guest's next frame.
+    host_end.send(wc_share::HostMsg::Welcome {
+        you: 1,
+        project: Box::new(wc_share::Snapshot::from(&open.project)),
+        locks: Default::default(),
+        peers: Vec::new(),
+        history: Vec::new(),
+        protocol: old,
+    })?;
+    host_end.send(wc_share::HostMsg::Closed)?;
+    assert!(g.frame(None, None, false).is_none());
+    let notes = g.take_notes();
+    assert!(notes.iter().any(|n| n.contains("cannot join")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("has ended")), "{notes:?}");
+    assert!(g.view == View::Join);
+    let error = g.form.as_ref().and_then(|f| f.error.clone()).ok_or("no form error")?;
+    assert!(error.contains(&format!("version {old} and")), "{error}");
+    Ok(())
+}
+
+#[test]
+fn a_plain_decline_does_not_reopen_a_status_window_that_was_closed() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut g, host_end) = asking(tmp.path());
+    g.view = View::Closed;
+    host_end.send(wc_share::HostMsg::Declined { version: None })?;
+    assert!(g.frame(None, None, false).is_none());
+    assert!(g.view == View::Closed, "left closed");
+    assert!(g.take_notes().iter().any(|n| n.contains("declined")));
+
+    // With the status window open it goes back to the Join dialog, which says so.
+    let (mut g, host_end) = asking(tmp.path());
+    host_end.send(wc_share::HostMsg::Declined { version: None })?;
+    assert!(g.frame(None, None, false).is_none());
+    assert!(g.view == View::Join);
+    assert_eq!(
+        g.form.as_ref().and_then(|f| f.error.as_deref()),
+        Some("The host declined your request to join.")
+    );
+    Ok(())
+}
+
+#[test]
+fn the_join_dialog_forgets_sessions_heard_by_an_earlier_browser() -> TestResult {
+    let mut s = Share {
+        form: Some(Form {
+            sessions: vec![wc_share::discovery::Session {
+                project: "Gone".into(),
+                host: "Ola".into(),
+                addr: ([127, 0, 0, 1], 9).into(),
+                protocol: wc_share::PROTOCOL_VERSION,
+            }],
+            ..Form::default()
+        }),
+        ..Default::default()
+    };
+    s.show_join();
+    let form = s.form.as_ref().ok_or("no form")?;
+    assert!(form.sessions.is_empty(), "{:?}", form.sessions);
+    Ok(())
+}
+
+#[test]
+fn another_version_goes_back_to_the_join_dialog_even_when_the_status_window_was_closed() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let open = project(&tmp.path().join("host"))?;
+    let (mut g, host_end) = asking(tmp.path());
+    g.view = View::Closed;
+    let old = wc_share::PROTOCOL_VERSION + 1;
+    host_end.send(wc_share::HostMsg::Welcome {
+        you: 1,
+        project: Box::new(wc_share::Snapshot::from(&open.project)),
+        locks: Default::default(),
+        peers: Vec::new(),
+        history: Vec::new(),
+        protocol: old,
+    })?;
+    assert!(g.frame(None, None, false).is_none());
+    assert!(g.view == View::Join, "reopened: the person has to update one side");
+    let error = g.form.as_ref().and_then(|f| f.error.clone()).ok_or("no form error")?;
+    assert!(error.contains(&format!("version {old} and")), "{error}");
+    assert!(
+        error.contains(&format!("guest's uses version {};", wc_share::PROTOCOL_VERSION)),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_session_on_another_version_is_listed_as_such_and_cannot_be_picked() {
+    let row = |protocol| wc_share::discovery::Session {
+        project: "Pump station".into(),
+        host: "Ola".into(),
+        addr: ([192, 168, 1, 20], 47812).into(),
+        protocol,
+    };
+    let (label, joinable) = session_row(&row(wc_share::PROTOCOL_VERSION));
+    assert!(joinable);
+    assert_eq!(label, "Pump station  ·  Ola  (192.168.1.20:47812)");
+    let (label, joinable) = session_row(&row(0));
+    assert!(!joinable);
+    assert!(
+        label.contains(&format!("version 0, this one uses {};", wc_share::PROTOCOL_VERSION)),
+        "{label}"
+    );
+    assert!(label.contains("cannot be joined"), "{label}");
+}
+
+#[test]
+fn a_session_on_another_version_cannot_be_picked_in_the_join_dialog() {
+    let row = |protocol, last| wc_share::discovery::Session {
+        project: "Pump station".into(),
+        host: "Ola".into(),
+        addr: ([192, 168, 1, last], 47812).into(),
+        protocol,
+    };
+    let mut s = Share {
+        form: Some(Form {
+            addr: String::new(),
+            sessions: vec![row(0, 20), row(wc_share::PROTOCOL_VERSION, 21)],
+            ..Form::default()
+        }),
+        view: View::Join,
+        ..Default::default()
+    };
+    let ctx = egui::Context::default();
+    let frame = |s: &mut Share, events: Vec<egui::Event>| {
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| s.join_window(ctx));
+    };
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    };
+    let addr = |s: &Share| s.form.as_ref().map(|f| f.addr.clone()).unwrap_or_default();
+    frame(&mut s, Vec::new());
+    // Step through the dialog with the keyboard and pick the first row that takes it: the
+    // older session's row comes first but cannot be focused or picked.
+    for _ in 0..8 {
+        frame(&mut s, vec![key(egui::Key::Tab)]);
+        frame(&mut s, vec![key(egui::Key::Space)]);
+        if !addr(&s).is_empty() {
+            break;
+        }
+    }
+    assert_eq!(addr(&s), "192.168.1.21:47812");
+}
+
+#[test]
+fn a_refusal_is_forgotten_once_another_address_is_chosen() {
+    let mut form = Form {
+        addr: "192.168.1.20:47812".into(),
+        error: Some("The host declined your request to join.".into()),
+        ..Form::default()
+    };
+    let folder = form.folder.clone();
+    form.forget_error_unless("192.168.1.20:47812", &folder);
+    assert!(form.error.is_some(), "same address: still shown");
+    // Another folder does not make the host take the request.
+    form.forget_error_unless("192.168.1.20:47812", "/somewhere/else");
+    assert!(form.error.is_some(), "only the folder changed: still shown");
+    form.addr = "192.168.1.21:47812".into();
+    form.forget_error_unless("192.168.1.20:47812", &folder);
+    assert!(form.error.is_none());
+}
+
+#[test]
+fn a_folder_error_stays_until_the_folder_changes() -> TestResult {
+    let mut s = Share {
+        form: Some(Form {
+            addr: "192.168.1.20:47812".into(),
+            folder: "C:shared".into(),
+            ..Form::default()
+        }),
+        view: View::Join,
+        ..Default::default()
+    };
+    // The folder is refused (as `C:shared` is on Windows) before the host is tried.
+    s.ask_to_join(|typed| Err(format!("{typed} is relative to the current folder")));
+    assert!(s.role.is_none(), "not joined");
+    let form = s.form.as_mut().ok_or("no form")?;
+    assert_eq!(
+        form.error.as_deref(),
+        Some("C:shared is relative to the current folder")
+    );
+    // Another address does not make the folder usable.
+    form.addr = "192.168.1.21:47812".into();
+    form.forget_error_unless("192.168.1.20:47812", "C:shared");
+    assert!(form.error.is_some(), "the folder is still the same");
+    form.folder = "C:\\shared".into();
+    form.forget_error_unless("192.168.1.21:47812", "C:shared");
+    assert!(form.error.is_none());
     Ok(())
 }

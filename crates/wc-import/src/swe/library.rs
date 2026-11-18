@@ -16,7 +16,9 @@
 //!
 //! Parts become WiringCraft parts (`<manufacturer>.<reference>` ids, as [`Part::make_id`]
 //! builds them), with their terminals as properties; cable types become parts with their cores;
-//! blocks become box symbols (`swe.lib.<block>`) with their connection points as pins. The
+//! blocks become symbols (`swe.lib.<block>`) with their connection points as pins, drawn from the
+//! block's DWG file in the archive (`Block/<name>.dwg`, read like the project import does, #230),
+//! or as a box around the points when the archive has no readable drawing for the block. The
 //! archive is treated as hostile like the project database: sizes are capped and unreadable rows
 //! are counted, never a panic.
 
@@ -27,7 +29,7 @@ use rusqlite::Connection;
 use wc_core::geom::Point;
 use wc_core::{Device, DevicePart, Part, Symbol};
 
-use super::{MAX_DATABASE_BYTES, box_symbol, open, readable, slug, sql};
+use super::{MAX_DATABASE_BYTES, SweDrawings, box_symbol, open, readable, slug, sql};
 use crate::aml::Built;
 use crate::{Error, Result};
 
@@ -87,6 +89,8 @@ pub struct LibraryReport {
     pub cables_out: usize,
     pub blocks_in: usize,
     pub blocks_out: usize,
+    /// Of the blocks imported, how many are drawn from their DWG file; the rest are boxes.
+    pub blocks_drawn: usize,
 }
 
 impl LibraryReport {
@@ -102,8 +106,11 @@ impl LibraryReport {
                 self.cables_in, self.cables_out
             ),
             format!(
-                "symbol blocks: {} in the source, {} imported as box symbols with their connection points",
-                self.blocks_in, self.blocks_out
+                "symbol blocks: {} in the source, {} imported with their connection points: {} drawn from their DWG file, {} as boxes",
+                self.blocks_in,
+                self.blocks_out,
+                self.blocks_drawn,
+                self.blocks_out.saturating_sub(self.blocks_drawn)
             ),
         ]
     }
@@ -549,9 +556,17 @@ pub fn read_cable_types(
     Ok(by_id.into_values().collect())
 }
 
-/// Symbol blocks with their connection points, as box symbols. Missing tables or fields are
-/// warnings.
-pub fn read_blocks(conn: &Connection, report: &mut LibraryReport, warnings: &mut Vec<String>) -> Result<Vec<Symbol>> {
+/// Symbol blocks with their connection points. A block `drawings` has a drawing for is drawn from
+/// it (y down, the insertion point at the origin); the others are boxes around their points.
+/// Missing tables or fields are warnings.
+pub fn read_blocks(
+    conn: &Connection,
+    drawings: Option<&SweDrawings>,
+    report: &mut LibraryReport,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Symbol>> {
+    // The counts are for this call's result, also when the report was used before.
+    (report.blocks_in, report.blocks_out, report.blocks_drawn) = (0, 0, 0);
     let Some(blocks) = Table::open(conn, "tew_block")? else {
         warnings.push("no tew_block table; no symbol blocks were read".into());
         return Ok(Vec::new());
@@ -649,6 +664,12 @@ pub fn read_blocks(conn: &Connection, report: &mut LibraryReport, warnings: &mut
 
     let mut by_id: BTreeMap<String, Symbol> = BTreeMap::new();
     let mut skipped = 0usize;
+    // One entity budget for every block drawing, like the project import's.
+    let mut budget = drawings.map_or(0, SweDrawings::draw_limit);
+    let mut not_drawn: BTreeMap<String, usize> = BTreeMap::new();
+    // Blocks boxed, and blocks drawn only in part, because that budget ran out.
+    let (mut over_budget, mut cut_short) = (0usize, 0usize);
+    let mut drawn_blocks = 0usize;
     for (row, name, description) in rows {
         let Some(points) = pts.remove(&row).filter(|p| !p.is_empty()) else {
             skipped += 1;
@@ -662,7 +683,22 @@ pub fn read_blocks(conn: &Connection, report: &mut LibraryReport, warnings: &mut
             k += 1;
             sid = format!("{stem}.{k}");
         }
-        let (graphics, pins) = box_symbol(&name, Point::new(0.0, 0.0), None, &points);
+        let (boxed, pins) = box_symbol(&name, Point::new(0.0, 0.0), None, &points);
+        let over = |n: &BTreeMap<String, usize>| n.get(crate::dxf::OVER_LIMIT).copied().unwrap_or(0);
+        let over_before = over(&not_drawn);
+        let drawn = drawings.and_then(|d| d.block_graphics(&name, &mut budget, &mut not_drawn));
+        let hit_limit = over(&not_drawn) > over_before;
+        let graphics = match drawn {
+            Some(drawn) => {
+                drawn_blocks += 1;
+                cut_short += usize::from(hit_limit);
+                drawn
+            }
+            None => {
+                over_budget += usize::from(hit_limit);
+                boxed
+            }
+        };
         by_id.insert(
             sid.clone(),
             Symbol {
@@ -687,12 +723,38 @@ pub fn read_blocks(conn: &Connection, report: &mut LibraryReport, warnings: &mut
             "{skipped} symbol block(s) without connection points were left out (frames, texts, graphics)"
         ));
     }
+    if over_budget > 0 {
+        warnings.push(format!(
+            "{over_budget} symbol block(s) are boxes because the drawings' entity limit was reached"
+        ));
+    }
+    if cut_short > 0 {
+        warnings.push(format!(
+            "{cut_short} symbol block(s) are drawn only in part because the drawings' entity limit was reached"
+        ));
+    }
+    not_drawn.remove(crate::dxf::OVER_LIMIT);
+    if !not_drawn.is_empty() {
+        let kinds: Vec<String> = not_drawn.iter().map(|(k, n)| format!("{k}: {n}")).collect();
+        warnings.push(format!("block drawings: entities not drawn ({})", kinds.join(", ")));
+    }
     report.blocks_out = by_id.len();
+    report.blocks_drawn = drawn_blocks;
     Ok(by_id.into_values().collect())
 }
 
 /// Read every library a catalog and an application data database hold. Either may be missing.
+/// Symbol blocks are boxes; [`read_with`] draws them from their DWG files.
 pub fn read(catalog: Option<&Connection>, app_data: Option<&Connection>) -> Result<SweLibrary> {
+    read_with(catalog, app_data, None)
+}
+
+/// [`read`], drawing each symbol block `drawings` has a drawing for from it.
+pub fn read_with(
+    catalog: Option<&Connection>,
+    app_data: Option<&Connection>,
+    drawings: Option<&SweDrawings>,
+) -> Result<SweLibrary> {
     let mut lib = SweLibrary::default();
     if let Some(c) = catalog {
         lib.parts = read_catalog(c, &mut lib.report, &mut lib.warnings)?;
@@ -713,7 +775,7 @@ pub fn read(catalog: Option<&Connection>, app_data: Option<&Connection>) -> Resu
             ));
         }
         lib.parts.sort_by(|a, b| a.id.cmp(&b.id));
-        lib.symbols = read_blocks(a, &mut lib.report, &mut lib.warnings)?;
+        lib.symbols = read_blocks(a, drawings, &mut lib.report, &mut lib.warnings)?;
     } else {
         lib.warnings
             .push(format!("no {APP_DATA_DB}; no cable types or symbol blocks were read"));
@@ -747,9 +809,44 @@ fn read_entry<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str)
     Ok(bytes)
 }
 
-/// Read the libraries out of a project archive (`.tewzip`). An archive with neither library
-/// database is an error; one with only one of them gives what that one holds.
+/// Read the libraries out of a project archive (`.tewzip`), drawing symbol blocks from the
+/// archive's block files (`Block/<name>.dwg` outside `Projects/`). An archive with neither library
+/// database is an error; one with only one of them gives what that one holds. A drawing that
+/// cannot be read leaves its block a box and is a warning.
 pub fn from_archive<R: Read + std::io::Seek>(reader: R) -> Result<SweLibrary> {
+    from_archive_with(reader, true)
+}
+
+/// [`from_archive`] without reading any drawing: for callers that need only the parts.
+pub fn catalog_from_archive<R: Read + std::io::Seek>(reader: R) -> Result<SweLibrary> {
+    from_archive_with(reader, false)
+}
+
+/// What reading the block drawings left out: files that could not be read, and entities the DWG
+/// reader does not read, by type (damaged objects are already in the files' warnings).
+fn read_warnings(d: &SweDrawings) -> Vec<String> {
+    // The warnings name archive entries, whose names the archive's author chose.
+    let mut out: Vec<String> = d
+        .warnings
+        .iter()
+        .map(|w| crate::printable(&format!("block drawings: {w}")))
+        .collect();
+    let kinds: Vec<String> = d
+        .skipped
+        .iter()
+        .filter(|(k, _)| k.as_str() != crate::dwg::objects::DAMAGED)
+        .map(|(k, n)| format!("{k}: {n}"))
+        .collect();
+    if !kinds.is_empty() {
+        out.push(crate::printable(&format!(
+            "block drawings: entities not read ({})",
+            kinds.join(", ")
+        )));
+    }
+    out
+}
+
+fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<SweLibrary> {
     let mut zip =
         zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
     let catalog = find_entry(&zip, CATALOG_DB);
@@ -767,7 +864,34 @@ pub fn from_archive<R: Read + std::io::Seek>(reader: R) -> Result<SweLibrary> {
         Some(n) => Some(open(&read_entry(&mut zip, &n)?)?),
         None => None,
     };
-    read(catalog.as_ref(), app_data.as_ref())
+    // Block drawings only matter when there are blocks to draw.
+    let mut drawing_warnings = Vec::new();
+    let drawings = if draw && app_data.is_some() {
+        let mut reader = zip.into_inner();
+        // No project folder: only the shared library's block files are read. A rewind that
+        // fails leaves the blocks boxes, like a drawing read that fails.
+        let read = reader
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| Error::Format(format!("archive: {e}")))
+            .and_then(|_| super::drawings_from_archive(reader, ""));
+        match read {
+            Ok(d) => {
+                drawing_warnings = read_warnings(&d);
+                Some(d)
+            }
+            Err(e) => {
+                drawing_warnings.push(crate::printable(&format!(
+                    "block drawings were not read, blocks are boxes: {e}"
+                )));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut lib = read_with(catalog.as_ref(), app_data.as_ref(), drawings.as_ref())?;
+    lib.warnings.extend(drawing_warnings);
+    Ok(lib)
 }
 
 /// Give each imported device and cable the library part its `Manufacturer` and `PartNumber`
