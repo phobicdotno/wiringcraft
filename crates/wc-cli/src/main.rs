@@ -2081,7 +2081,15 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                                     save(dir, &p)
                                 };
                                 if let Err(why) = remove() {
-                                    eprintln!("warning: {name}: the empty page {id} could not be removed: {why}");
+                                    // The save may fail after the page file is gone already.
+                                    let left = load(dir).map_or(true, |p| p.pages.iter().any(|pg| pg.id == id));
+                                    if left {
+                                        eprintln!("warning: {name}: the empty page {id} could not be removed: {why}");
+                                    } else {
+                                        eprintln!(
+                                            "warning: {name}: the empty page {id} was removed, but the project could not be saved in full: {why}"
+                                        );
+                                    }
                                 }
                             }
                             r
@@ -4250,9 +4258,42 @@ mod tests {
         p.pages.push(upper.clone());
         save(&dir, &p).unwrap();
         cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
-        let p = load(&dir).unwrap();
+        let mut p = load(&dir).unwrap();
         assert_eq!(p.page("DXF-300"), Some(&upper));
         assert!(p.page("dxf-300").is_none());
+        p.pages.retain(|pg| pg.id != "DXF-300");
+        save(&dir, &p).unwrap();
+
+        // Every save fails after the page files are written (a panel file that has to be
+        // rewritten cannot be): each drawing's page is still removed again, and every entry
+        // is tried.
+        p.panels
+            .push(wc_core::panel::Panel::new("cab", "Cabinet", 600.0, 800.0));
+        save(&dir, &p).unwrap();
+        let panel = dir.join("panels").join("cab.panel.json");
+        let text = std::fs::read_to_string(&panel).unwrap();
+        std::fs::write(&panel, format!("{text}\n\n")).unwrap();
+        std::fs::create_dir(dir.join("panels").join("cab.panel.json.tmp")).unwrap();
+        let two = tmp.path().join("two.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&two).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            for name in ["a.dxf", "b.dxf"] {
+                z.start_file(name, opt).unwrap();
+                z.write_all(b"this is not a drawing").unwrap();
+            }
+            z.finish().unwrap();
+        }
+        cli(&dir, &["import", "archive", two.to_str().unwrap()]).unwrap();
+        let p = load(&dir).unwrap();
+        assert!(p.pages.iter().all(|p| !p.id.starts_with("dxf-")));
+        let left: Vec<_> = std::fs::read_dir(dir.join("pages"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("dxf-"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
