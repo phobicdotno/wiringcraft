@@ -382,30 +382,47 @@ fn builtin_format(id: u32) -> Shown {
 /// Longest zero-only format padded: Excel's own limit on a format code's length.
 const MAX_PADDING: usize = 255;
 
-/// What a custom format code shows, from its first section (the one for positive numbers).
+/// The sections of a format code split at `;`, leaving `;` inside quotes or after a backslash alone.
+fn format_sections(code: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in code.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if !quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                out.push(&code[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&code[start..]);
+    out
+}
+
+/// What a custom format code shows. Only a code with one section for numbers is applied
+/// (a last text section `@`, as in `yyyy-mm-dd;@`, is passed over): a code with sections for
+/// negative numbers or zero, or with a condition (`[>=1000]…`), picks its section by the value,
+/// which is not followed here, so such a cell stays a number, like an elapsed time `[h]:mm`.
 /// Quoted text, escaped characters, spacing and fill characters and bracketed colours and
-/// locales are passed over. A format with a condition (`[>=1000]…`) picks its section by the
-/// value, which is not followed here: it stays a number, like an elapsed time such as `[h]:mm`.
-/// `m` is a month unless the section also shows hours or seconds, as Excel reads it.
+/// locales are passed over. `m` is a month unless the section also shows hours or seconds, as
+/// Excel reads it.
 fn custom_format(code: &str) -> Shown {
+    let mut sections = format_sections(code);
+    if sections.len() > 1 && sections.last().is_some_and(|t| t.trim() == "@") {
+        sections.pop();
+    }
+    let [only] = sections[..] else {
+        return Shown::Plain;
+    };
     let mut section = String::new();
     // The section's own characters, lower case, without quoted or escaped text.
     let mut bare = String::new();
-    let mut sections = 1;
-    let mut chars = code.chars();
+    let mut chars = only.chars();
     while let Some(c) = chars.next() {
         match c {
-            ';' => {
-                sections += 1;
-                // Later sections only matter for a condition or a zero-only format, both
-                // decided below from the count and the first section.
-                for c in chars.by_ref() {
-                    if c == ';' {
-                        sections += 1;
-                    }
-                }
-                break;
-            }
             '"' => {
                 section.push(c);
                 for q in chars.by_ref() {
@@ -445,7 +462,7 @@ fn custom_format(code: &str) -> Shown {
         (true, true) => Shown::DateTime { seconds },
         (true, false) => Shown::Date,
         (false, true) => Shown::Time { seconds },
-        _ if sections == 1 && (1..=MAX_PADDING).contains(&section.len()) && section.chars().all(|c| c == '0') => {
+        _ if (1..=MAX_PADDING).contains(&section.len()) && section.chars().all(|c| c == '0') => {
             Shown::Padded(section.len())
         }
         _ => Shown::Plain,
@@ -1364,6 +1381,12 @@ mod tests {
         assert_eq!(custom_format("h:mm AM/PM"), Shown::Time { seconds: false });
         assert_eq!(custom_format("[>=1000]yyyy-mm-dd;0.00"), Shown::Plain);
         assert_eq!(custom_format("00000;-00000"), Shown::Plain);
+        // Sections for negatives or zero, or a condition in any section: a number.
+        assert_eq!(custom_format("yyyy-mm-dd;0;0"), Shown::Plain);
+        assert_eq!(custom_format("yyyy-mm-dd;[=0]0.00"), Shown::Plain);
+        assert_eq!(custom_format("yyyy-mm-dd;@"), Shown::Date);
+        assert_eq!(custom_format("\"a;b\" yyyy"), Shown::Date);
+        assert_eq!(format_sections(r#"0\;0;"x;y"0"#), vec![r"0\;0", r#""x;y"0"#]);
         assert_eq!(custom_format(&"0".repeat(MAX_PADDING)), Shown::Padded(MAX_PADDING));
         assert_eq!(custom_format(&"0".repeat(MAX_PADDING + 1)), Shown::Plain);
         assert_eq!(custom_format("0.00E+00"), Shown::Plain);
