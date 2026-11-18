@@ -2687,6 +2687,11 @@ impl eframe::App for App {
         for a in actions {
             self.run(a);
         }
+        // So did any the actions made (a move by arrow key, say): the panels show jumpers that
+        // match the terminals.
+        if let Some(o) = self.open.as_mut() {
+            o.follow_terminals();
+        }
         self.log_messages();
         self.assistant_poll(ctx);
         if self.applied_theme != self.prefs.theme {

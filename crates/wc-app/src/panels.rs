@@ -208,47 +208,21 @@ fn jumper_with<'a>(open: &'a Open, strip: &DeviceTag, number: &str) -> Option<&'
 /// and the libraries' parts, or none.
 fn jumper_part(ui: &mut egui::Ui, open: &mut Open, strip: &DeviceTag, number: &str) {
     let current = jumper_with(open, strip, number).and_then(|j| j.part.clone());
-    let label = current.as_ref().map_or_else(
-        || "none".to_owned(),
-        |id| {
-            open.part_library
-                .iter()
-                .find(|(p, _)| p == id)
-                .map_or(id.clone(), |(_, l)| l.clone())
-        },
-    );
     let search_id = ui.id().with("jumper part search");
     let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
-    let mut pick: Option<Option<String>> = None;
-    ui.horizontal(|ui| {
-        ui.label("Jumper part");
-        egui::ComboBox::from_id_salt("jumper part")
-            .width(ui.available_width().min(200.0))
-            .selected_text(label)
-            .height(320.0)
-            .show_ui(ui, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut search).hint_text("Search parts"));
-                if ui
-                    .selectable_label(current.is_none(), RichText::new("none").italics())
-                    .clicked()
-                {
-                    pick = Some(None);
-                }
-                let q = search.to_lowercase();
-                for (id, l) in &open.part_library {
-                    if !q.is_empty() && !id.to_lowercase().contains(&q) && !l.to_lowercase().contains(&q) {
-                        continue;
-                    }
-                    if ui
-                        .selectable_label(current.as_deref() == Some(id.as_str()), l)
-                        .on_hover_text(id)
-                        .clicked()
-                    {
-                        pick = Some(Some(id.clone()));
-                    }
-                }
-            });
-    });
+    let pick = ui
+        .horizontal(|ui| {
+            ui.label("Jumper part");
+            part_picker(
+                ui,
+                "jumper part",
+                200.0,
+                &open.part_library,
+                current.as_deref(),
+                &mut search,
+            )
+        })
+        .inner;
     ui.data_mut(|d| d.insert_temp(search_id, search));
     let error_id = ui.id().with("jumper part error");
     if let Some(choice) = pick {
@@ -1066,44 +1040,51 @@ fn accessories_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, 
     }
 }
 
-/// Part and own properties of the selected symbol's device.
-fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: &DeviceTag, t: &Theme) {
-    subsection(ui, "Part");
-    let current = open.project.devices.get(tag).and_then(|d| d.part.clone());
-    let label = current
-        .as_ref()
-        .map(|id| {
-            open.part_library
+/// A drop-down to pick a part from `library` (id, label), or none, with a search field
+/// (`search`) at its top. Shows `current` by its label. Returns the pick, if one was made:
+/// `Some(None)` for none.
+fn part_picker(
+    ui: &mut egui::Ui,
+    salt: &str,
+    max_width: f32,
+    library: &[(String, String)],
+    current: Option<&str>,
+    search: &mut String,
+) -> Option<Option<String>> {
+    let label = current.map_or_else(
+        || "none".to_owned(),
+        |id| {
+            library
                 .iter()
                 .find(|(p, _)| p == id)
-                .map_or(id.clone(), |(_, l)| l.clone())
-        })
-        .unwrap_or_else(|| "none".into());
-    let mut pick: Option<Option<String>> = None;
+                .map_or(id.to_owned(), |(_, l)| l.clone())
+        },
+    );
     let short: String = if label.chars().count() > 34 {
         format!("{}\u{2026}", label.chars().take(33).collect::<String>())
     } else {
-        label.clone()
+        label
     };
-    egui::ComboBox::from_id_salt("part")
-        .width(ui.available_width().min(240.0))
+    let mut pick = None;
+    egui::ComboBox::from_id_salt(salt)
+        .width(ui.available_width().min(max_width))
         .selected_text(short)
         .height(320.0)
         .show_ui(ui, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut ps.part_search).hint_text("Search parts"));
+            ui.add(egui::TextEdit::singleline(search).hint_text("Search parts"));
             if ui
                 .selectable_label(current.is_none(), RichText::new("none").italics())
                 .clicked()
             {
                 pick = Some(None);
             }
-            let q = ps.part_search.to_lowercase();
-            for (id, l) in &open.part_library {
+            let q = search.to_lowercase();
+            for (id, l) in library {
                 if !q.is_empty() && !id.to_lowercase().contains(&q) && !l.to_lowercase().contains(&q) {
                     continue;
                 }
                 if ui
-                    .selectable_label(current.as_deref() == Some(id.as_str()), l)
+                    .selectable_label(current == Some(id.as_str()), l)
                     .on_hover_text(id)
                     .clicked()
                 {
@@ -1111,6 +1092,21 @@ fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: 
                 }
             }
         });
+    pick
+}
+
+/// Part and own properties of the selected symbol's device.
+fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: &DeviceTag, t: &Theme) {
+    subsection(ui, "Part");
+    let current = open.project.devices.get(tag).and_then(|d| d.part.clone());
+    let pick = part_picker(
+        ui,
+        "part",
+        240.0,
+        &open.part_library,
+        current.as_deref(),
+        &mut ps.part_search,
+    );
     if let Some(choice) = pick {
         ps.part_error = open.set_device_part(tag, choice.as_deref()).err();
     }
