@@ -1515,3 +1515,32 @@ fn revision_clouds_and_the_revision_table_are_drawn() -> Result<(), String> {
     );
     Ok(())
 }
+
+#[test]
+fn an_unlisted_revision_is_reported_only_for_the_page_that_has_the_cloud() -> Result<(), String> {
+    let mut project = Project::new("Revisions");
+    // Two pages that share a display number: only the page id tells them apart.
+    project.pages = vec![Page::new("p1", "1", "Clean"), Page::new("p2", "1", "Orphan")];
+    project.add_revision("A", "", "", "").map_err(|e| e.to_string())?;
+    project
+        .add_cloud("p2", Point::new(50.0, 50.0), Point::new(80.0, 80.0), None)
+        .map_err(|e| e.to_string())?;
+    project.meta.revisions.clear();
+    let only = |id: &str| Options {
+        pages: vec![id.into()],
+        ..Default::default()
+    };
+    let (_, clean) = export(&project, &BTreeMap::new(), &only("p1"));
+    assert!(
+        !clean.warnings.iter().any(|w| w.contains("revision A")),
+        "{:?}",
+        clean.warnings
+    );
+    let (_, orphan) = export(&project, &BTreeMap::new(), &only("p2"));
+    assert!(
+        orphan.warnings.iter().any(|w| w.contains("revision A")),
+        "{:?}",
+        orphan.warnings
+    );
+    Ok(())
+}
