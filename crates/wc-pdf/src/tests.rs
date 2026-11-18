@@ -1474,3 +1474,97 @@ fn a_report_after_a_short_first_page_prints_on_the_larger_sheet() {
     let strip = media(project.pages[0].size.mm());
     assert_eq!(boxes, [strip.as_str(), strip.as_str(), media(want.mm()).as_str()]);
 }
+
+#[test]
+fn revision_clouds_and_the_revision_table_are_drawn() -> Result<(), String> {
+    let mut project = Project::new("Revisions");
+    project.pages = vec![Page::new("p1", "1", "Power")];
+    project
+        .add_revision("A", "2026-11-01", "First issue", "OP")
+        .map_err(|e| e.to_string())?;
+    project
+        .add_revision("B", "2026-11-18", "Motor added", "OP")
+        .map_err(|e| e.to_string())?;
+    let plain = String::from_utf8_lossy(&export(&project, &BTreeMap::new(), &Options::default()).0).into_owned();
+    project
+        .add_cloud("p1", Point::new(50.0, 50.0), Point::new(110.0, 80.0), None)
+        .map_err(|e| e.to_string())?;
+    // Without the table, only the cloud's tag can print its revision letter.
+    let tag = format!("{} Tj", writer::pdf_text("B"));
+    let cloud_only = String::from_utf8_lossy(&export(&project, &BTreeMap::new(), &Options::default()).0).into_owned();
+    assert_eq!(
+        cloud_only.matches(&tag).count(),
+        plain.matches(&tag).count() + 1,
+        "the cloud's tag prints B"
+    );
+    project
+        .set_revision_table("p1", Some(Point::new(200.0, 30.0)))
+        .map_err(|e| e.to_string())?;
+    let (bytes, report) = export(&project, &BTreeMap::new(), &Options::default());
+    let pdf = String::from_utf8_lossy(&bytes);
+    for text in ["Rev", "Description", "First issue", "Motor added", "2026-11-18"] {
+        assert!(
+            pdf.contains(&format!("{} Tj", writer::pdf_text(text))),
+            "{text} is printed"
+        );
+    }
+    // The cloud's scallops add curves.
+    assert!(pdf.matches(" c\n").count() > plain.matches(" c\n").count() + 20);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    // A letter saved by hand that the PDF cannot print is reported for the cloud and the table.
+    project.meta.revisions[1].letter = "Ж".into();
+    project.pages[0].clouds[0].revision = "Ж".into();
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("cannot print revision Ж"))
+            .count(),
+        2,
+        "{:?}",
+        report.warnings
+    );
+    project.meta.revisions[1].letter = "B".into();
+    project.pages[0].clouds[0].revision = "B".into();
+
+    // A cloud of a revision the project no longer lists is reported.
+    project.meta.revisions.pop();
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(
+        report.warnings.iter().any(|w| w.contains("revision B")),
+        "{:?}",
+        report.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unlisted_revision_is_reported_only_for_the_page_that_has_the_cloud() -> Result<(), String> {
+    let mut project = Project::new("Revisions");
+    // Two pages that share a display number: only the page id tells them apart.
+    project.pages = vec![Page::new("p1", "1", "Clean"), Page::new("p2", "1", "Orphan")];
+    project.add_revision("A", "", "", "").map_err(|e| e.to_string())?;
+    project
+        .add_cloud("p2", Point::new(50.0, 50.0), Point::new(80.0, 80.0), None)
+        .map_err(|e| e.to_string())?;
+    project.meta.revisions.clear();
+    let only = |id: &str| Options {
+        pages: vec![id.into()],
+        ..Default::default()
+    };
+    let (_, clean) = export(&project, &BTreeMap::new(), &only("p1"));
+    assert!(
+        !clean.warnings.iter().any(|w| w.contains("revision A")),
+        "{:?}",
+        clean.warnings
+    );
+    let (_, orphan) = export(&project, &BTreeMap::new(), &only("p2"));
+    assert!(
+        orphan.warnings.iter().any(|w| w.contains("revision A")),
+        "{:?}",
+        orphan.warnings
+    );
+    Ok(())
+}

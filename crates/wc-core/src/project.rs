@@ -56,6 +56,10 @@ pub struct ProjectMeta {
     /// written once it differs from the built-in layout.
     #[serde(default, skip_serializing_if = "crate::template::PageTemplate::is_default")]
     pub template: crate::template::PageTemplate,
+    /// The project's issued revisions, oldest first: what a page's clouds and revision table
+    /// refer to.
+    #[serde(default, rename = "revision", skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<crate::revision::Revision>,
 }
 
 /// The project's logo: a JPEG or PNG file in the project folder. The title block shows it in
@@ -728,6 +732,7 @@ impl ProjectMeta {
             strips: Vec::new(),
             logo: None,
             template: crate::template::PageTemplate::default(),
+            revisions: Vec::new(),
         }
     }
 
@@ -1532,6 +1537,12 @@ pub struct Page {
     /// ([`ProjectMeta::title_block`]); fields the page does not set come from the project.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub title_block: BTreeMap<String, String>,
+    /// Clouds drawn around what a revision changed on this page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clouds: Vec<crate::revision::RevisionCloud>,
+    /// Where this page shows the project's revision table (its top-left corner), if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_table: Option<Point>,
 }
 
 /// A raster picture under a page: a JPEG or PNG file in the project folder, stretched over a
@@ -1570,6 +1581,8 @@ impl Page {
             overview: false,
             cover: false,
             title_block: BTreeMap::new(),
+            clouds: Vec::new(),
+            revision_table: None,
         }
     }
 

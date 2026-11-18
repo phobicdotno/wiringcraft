@@ -706,6 +706,19 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         }
     }
 
+    // Revision clouds and the revision table, drawn from the same shapes as the PDF.
+    let revision_ink = Stroke::new(xf.len(0.25).max(0.8), t.ink);
+    for c in &page.clouds {
+        for s in c.shapes() {
+            paint_shape(&painter, &xf, &s, revision_ink);
+        }
+    }
+    if let Some(at) = page.revision_table {
+        for s in wc_core::revision::table_shapes(&open.project.meta.revisions, at) {
+            paint_shape(&painter, &xf, &s, revision_ink);
+        }
+    }
+
     for w in &page.wires {
         let Some(pts) = open.wire_points(&page, w) else {
             continue;

@@ -1618,6 +1618,59 @@ fn a_terminal_whose_symbol_is_missing_is_counted_the_same_everywhere() {
 }
 
 #[test]
+fn check_warns_about_a_cloud_of_an_unlisted_revision() {
+    let (mut p, s, parts) = fixture();
+    p.add_revision("A", "", "", "").unwrap();
+    p.add_cloud("p2", Point::new(10.0, 10.0), Point::new(30.0, 30.0), None)
+        .unwrap();
+    let found = |p: &Project| -> Vec<Finding> {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("does not list"))
+            .collect()
+    };
+    assert!(found(&p).is_empty());
+    p.meta.revisions.clear();
+    let f = found(&p);
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!(f[0].severity, Severity::Warning);
+    assert_eq!(f[0].page_id.as_deref(), Some("p2"));
+    assert_eq!(f[0].item.as_deref(), Some("cloud 0"));
+    assert_eq!(
+        f[0].message,
+        "a cloud carries revision A, which the project does not list"
+    );
+}
+
+#[test]
+fn check_warns_about_a_revision_letter_the_pdf_cannot_print() {
+    let (mut p, s, parts) = fixture();
+    p.add_revision("A", "", "", "").unwrap();
+    let found = |p: &Project| -> Vec<Finding> {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cannot print apart"))
+            .collect()
+    };
+    assert!(found(&p).is_empty());
+    p.meta.revisions[0].letter = "Ж".into();
+    let f = found(&p);
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!(f[0].severity, Severity::Warning);
+    assert!(f[0].message.starts_with("revision Ж "), "{f:?}");
+}
+
+#[test]
 fn check_finds_a_device_that_draws_more_contacts_than_its_parts_have() {
     let (mut p, mut s, mut parts) = fixture();
     s.insert("nc".into(), sym("nc", SymbolRole::Auxiliary, &["21", "22"]));

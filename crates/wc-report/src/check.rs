@@ -55,6 +55,35 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
     let mut out = Vec::new();
     let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
 
+    // Revision clouds whose revision the project does not list.
+    for page in &p.pages {
+        for (n, c) in page.clouds.iter().enumerate() {
+            if p.cloud_revision(&c.revision).is_none() {
+                out.push(at(
+                    page,
+                    &format!("cloud {n}"),
+                    Severity::Warning,
+                    format!(
+                        "a cloud carries revision {}, which the project does not list",
+                        c.revision
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Revision letters the PDF cannot print: they come out as `?` and read alike.
+    for letter in p.unprintable_revisions() {
+        out.push(Finding {
+            severity: Severity::Warning,
+            page_id: None,
+            item: None,
+            message: format!(
+                "revision {letter} has characters the PDF cannot print apart from others; give it plain Latin-1 letters"
+            ),
+        });
+    }
+
     // Symbols missing from the project's library copy, and wires on missing symbols or pins.
     for page in &p.pages {
         for s in &page.symbols {

@@ -780,6 +780,46 @@ pub fn draw_page(
         pen.end_layer();
     }
 
+    // Revision clouds and the revision table.
+    if !page.clouds.is_empty() || page.revision_table.is_some() {
+        pen.begin_layer(Layer::Drawings);
+        for c in &page.clouds {
+            if !c.is_valid() {
+                warnings.push(format!("page {}: a revision cloud has no area", page.number));
+            }
+            for s in c.shapes() {
+                draw_shape(&mut pen, &s);
+            }
+        }
+        if let Some(at) = page.revision_table {
+            for s in wc_core::revision::table_shapes(&project.meta.revisions, at) {
+                draw_shape(&mut pen, &s);
+            }
+        }
+        pen.end_layer();
+    }
+    for c in &page.clouds {
+        if project.cloud_revision(&c.revision).is_none() {
+            warnings.push(format!(
+                "page {}: a cloud carries revision {}, which the project does not list",
+                page.number, c.revision
+            ));
+        } else if !wc_core::revision::letter_prints(&c.revision) {
+            warnings.push(format!(
+                "page {}: the PDF cannot print revision {} on a cloud; it can read like another letter",
+                page.number, c.revision
+            ));
+        }
+    }
+    if page.revision_table.is_some() {
+        for letter in project.unprintable_revisions() {
+            warnings.push(format!(
+                "page {}: the PDF cannot print revision {letter} in the revision table; it can read like another letter",
+                page.number
+            ));
+        }
+    }
+
     // Wires under symbols.
     pen.colour(0.0, 0.0, 0.0);
     pen.width(0.35);
