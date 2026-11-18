@@ -1140,6 +1140,12 @@ fn run(cli: Cli) -> Res<()> {
                         continue;
                     }
                     let symbol_id = format!("box.{}.{id}", pg.id);
+                    if symbol_id.len() > 128 {
+                        return Err(format!(
+                            "page id {:?} is too long to name a box symbol (box.<page>.<id> must stay within 128 characters)",
+                            pg.id
+                        ));
+                    }
                     let path = store::vendor_path(dir, ItemKind::Symbol, &symbol_id).map_err(e)?;
                     if !lock.contains_key(&symbol_id) && !path.exists() {
                         break (id, symbol_id, path);
@@ -5983,6 +5989,78 @@ mod tests {
             "{:?}",
             found.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_box_whose_save_fails_puts_the_project_back_and_goes_through_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        let args = [
+            "box",
+            "p1",
+            "--at",
+            "10,10",
+            "--size",
+            "20,10",
+            "--tag=-A1",
+            "--pin",
+            "1:left:5",
+        ];
+        let files = || {
+            let mut out: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+            for folder in [dir.clone(), dir.join(store::PAGES_DIR)] {
+                for entry in std::fs::read_dir(folder).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_file() {
+                        out.push((path.clone(), std::fs::read(&path).unwrap()));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+        let before = files();
+        // The page file cannot be written: the lock and devices are written before it.
+        let mut blocker = dir
+            .join(store::PAGES_DIR)
+            .join(format!("p1{}", store::PAGE_SUFFIX))
+            .into_os_string();
+        blocker.push(".tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        assert!(cli(&dir, &args).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(files(), before, "project files put back");
+        assert!(
+            store::read_vendored_symbol(&dir, "box.p1.s1").is_err(),
+            "symbol file removed"
+        );
+        cli(&dir, &args).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.page("p1").unwrap().symbols[0].symbol, "box.p1.s1");
+        assert!(p.lock.symbols.contains_key("box.p1.s1"));
+        assert!(store::read_vendored_symbol(&dir, "box.p1.s1").is_ok());
+    }
+
+    #[test]
+    fn a_page_id_too_long_for_a_box_symbol_is_refused_before_anything_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // `box.` + page + `.s1`: 121 characters fit in 128, 122 do not.
+        for (len, fits) in [(121, true), (122, false)] {
+            let page = "p".repeat(len);
+            cli(&dir, &["page", "add", &page, "--number", &len.to_string()]).unwrap();
+            let lock = std::fs::read(dir.join(store::LOCK_FILE)).ok();
+            let r = cli(&dir, &["box", &page, "--at", "0,0", "--size", "10,10"]);
+            assert_eq!(r.is_ok(), fits, "{len}: {r:?}");
+            if !fits {
+                assert!(r.unwrap_err().contains("too long"));
+                assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).ok(), lock);
+                assert!(load(&dir).unwrap().page(&page).unwrap().symbols.is_empty());
+            }
+        }
     }
 
     #[test]
