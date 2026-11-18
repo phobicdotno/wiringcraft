@@ -58,24 +58,31 @@ fn field(s: &str, max: usize) -> String {
     kept.trim().chars().take(max).collect()
 }
 
-/// The text height at which `s` fits `width` millimetres: `max` when it fits, smaller when it
-/// does not. Revision letters are shrunk rather than cut, so two letters always read apart.
+/// The text height at which `s` fits `width` millimetres in the PDF's font: `max` when it
+/// fits, smaller when it does not. Revision letters are shrunk rather than cut, so two letters
+/// always read apart.
 fn fit_height(s: &str, width: f64, max: f64) -> f64 {
-    let n = s.chars().count().max(1) as f64;
-    // Characters of the PDF font are about 0.6 of the text height wide on average.
-    max.min(width / (0.6 * n))
+    let at_max = crate::font::text_width_mm(s, max);
+    if at_max <= width || at_max <= 0.0 {
+        max
+    } else {
+        // Width grows in proportion to the height.
+        max * width / at_max
+    }
 }
 
-/// A cut text that fits `width` millimetres at the table's text height, ending in `...` when cut.
+/// A cut text that fits `width` millimetres (less a millimetre of padding each side) at the
+/// table's text height in the PDF's font, ending in `...` when cut.
 fn fit(s: &str, width: f64) -> String {
-    // Characters of the PDF font are about 0.6 of the text height wide on average.
-    let room = ((width - 2.0) / (TEXT * 0.6)).floor().max(1.0) as usize;
-    if s.chars().count() <= room {
+    let room = width - 2.0;
+    if crate::font::text_width_mm(s, TEXT) <= room {
         return s.to_owned();
     }
-    let mut out: String = s.chars().take(room.saturating_sub(3)).collect();
-    out.push_str("...");
-    out
+    let mut out: String = s.to_owned();
+    while !out.is_empty() && crate::font::text_width_mm(&format!("{out}..."), TEXT) > room {
+        out.pop();
+    }
+    format!("{out}...")
 }
 
 impl RevisionCloud {
@@ -547,8 +554,17 @@ mod tests {
         for l in ["ABCDEFGH", "ABCDEFGI"] {
             let tag = texts(RevisionCloud::new(Point::new(0.0, 0.0), Point::new(9.0, 9.0), l).tag());
             assert_eq!(tag[0].0, l);
-            assert!(tag[0].1 * 0.6 * 8.0 <= TAG_SIZE * 0.6 + 1e-9, "fits the triangle");
+            assert!(
+                crate::font::text_width_mm(&tag[0].0, tag[0].1) <= TAG_SIZE * 0.6 + 1e-9,
+                "fits the triangle"
+            );
         }
+        // Wide letters fit the table's Rev column as printed, not by an average width.
+        let mut p = project();
+        p.add_revision("WWWWWWWW", "", "", "").unwrap();
+        let table = texts(table_shapes(&p.meta.revisions, Point::new(0.0, 0.0)));
+        let (t, h) = table.iter().find(|(t, _)| t == "WWWWWWWW").unwrap();
+        assert!(crate::font::text_width_mm(t, *h) <= TABLE_COLUMNS[0].1 - 2.0 + 1e-9);
     }
 
     #[test]

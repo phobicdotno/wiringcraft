@@ -7,6 +7,7 @@ pub mod autowire;
 pub mod connectivity;
 pub mod error;
 pub mod find;
+pub mod font;
 pub mod geom;
 pub mod hash;
 pub mod lock;

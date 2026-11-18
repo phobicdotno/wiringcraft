@@ -83,3 +83,28 @@ fn revisions_clouds_and_the_table_are_kept_in_the_project() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn revision_list_escapes_control_characters_from_the_project_file() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    // A hand-edited file can hold what the CLI would never write.
+    let file = dir.join("project.toml");
+    let mut text = std::fs::read_to_string(&file)?;
+    text.push_str("\n[[revision]]\nletter = \"X\\u001b[2J\"\ntext = \"two\\nlines\\tand a tab\"\nauthor = \"OP\"\n");
+    std::fs::write(&file, text)?;
+
+    let list = wiringcraft(&dir, &["revision", "list"])?;
+    assert!(!list.contains('\u{1b}'), "no raw ESC: {list:?}");
+    let line = list.lines().next().ok_or("no revision line")?;
+    assert_eq!(line.split('\t').count(), 4, "{line:?}");
+    assert!(line.starts_with("X\\u{1b}[2J\t"), "{line:?}");
+    assert!(line.ends_with("two\\nlines\\tand a tab"), "{line:?}");
+    Ok(())
+}
