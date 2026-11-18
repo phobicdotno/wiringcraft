@@ -822,10 +822,29 @@ pub fn catalog_from_archive<R: Read + std::io::Seek>(reader: R) -> Result<SweLib
     from_archive_with(reader, false)
 }
 
+/// `text` with control characters (line breaks, terminal escapes) written as escapes, so a name
+/// from the archive cannot start a new line or steer the terminal when the warning is printed.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// What reading the block drawings left out: files that could not be read, and entities the DWG
 /// reader does not read, by type (damaged objects are already in the files' warnings).
 fn read_warnings(d: &SweDrawings) -> Vec<String> {
-    let mut out: Vec<String> = d.warnings.iter().map(|w| format!("block drawings: {w}")).collect();
+    // The warnings name archive entries, whose names the archive's author chose.
+    let mut out: Vec<String> = d
+        .warnings
+        .iter()
+        .map(|w| printable(&format!("block drawings: {w}")))
+        .collect();
     let kinds: Vec<String> = d
         .skipped
         .iter()
@@ -833,7 +852,10 @@ fn read_warnings(d: &SweDrawings) -> Vec<String> {
         .map(|(k, n)| format!("{k}: {n}"))
         .collect();
     if !kinds.is_empty() {
-        out.push(format!("block drawings: entities not read ({})", kinds.join(", ")));
+        out.push(printable(&format!(
+            "block drawings: entities not read ({})",
+            kinds.join(", ")
+        )));
     }
     out
 }
@@ -860,17 +882,21 @@ fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<S
     let mut drawing_warnings = Vec::new();
     let drawings = if draw && app_data.is_some() {
         let mut reader = zip.into_inner();
-        reader
+        // No project folder: only the shared library's block files are read. A rewind that
+        // fails leaves the blocks boxes, like a drawing read that fails.
+        let read = reader
             .seek(std::io::SeekFrom::Start(0))
-            .map_err(|e| Error::Format(format!("archive: {e}")))?;
-        // No project folder: only the shared library's block files are read.
-        match super::drawings_from_archive(reader, "") {
+            .map_err(|e| Error::Format(format!("archive: {e}")))
+            .and_then(|_| super::drawings_from_archive(reader, ""));
+        match read {
             Ok(d) => {
                 drawing_warnings = read_warnings(&d);
                 Some(d)
             }
             Err(e) => {
-                drawing_warnings.push(format!("block drawings were not read, blocks are boxes: {e}"));
+                drawing_warnings.push(printable(&format!(
+                    "block drawings were not read, blocks are boxes: {e}"
+                )));
                 None
             }
         }

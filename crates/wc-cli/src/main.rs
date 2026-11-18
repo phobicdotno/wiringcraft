@@ -601,7 +601,9 @@ enum ImportCmd {
     },
     /// The libraries of a SolidWorks Electrical archive (.tewzip): catalog parts with their
     /// terminals, cable types with their cores, and symbol blocks with their connection points,
-    /// drawn from the archive's block DWG files (boxes where a block has none). Into a library folder with --lib, else vendored into the project.
+    /// drawn from the archive's block DWG files (boxes where a block has none). A symbol or part
+    /// the project already vendors with other content (an earlier import's box) is refused, not
+    /// replaced (import into a fresh project, or into a library folder with --lib). Into a library folder with --lib, else vendored into the project.
     SweLibrary {
         path: PathBuf,
         /// A library folder to write into instead of the project.

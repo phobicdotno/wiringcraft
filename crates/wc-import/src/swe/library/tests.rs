@@ -418,6 +418,8 @@ INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (1, 2, 'A2', 0, -5), (2, 1, '
         ),
     ]))
     .unwrap();
+    let ids: Vec<&str> = lib.symbols.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["swe.lib.bad", "swe.lib.coil", "swe.lib.lamp"]);
     assert_eq!(lib.report.blocks_drawn, 0);
     assert!(
         lib.symbols
@@ -493,4 +495,11 @@ CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_
         "{w:?}"
     );
     assert!(!w.iter().any(|w| w.contains("damaged")), "{w:?}");
+
+    // A file name with a line break or a terminal escape is printed escaped.
+    d.warnings.push("Block/a\nwarning: fake\u{1b}[2J.dwg: bad".into());
+    let w = read_warnings(&d);
+    let named = w.iter().find(|w| w.contains("fake")).unwrap();
+    assert!(!named.chars().any(char::is_control), "{named:?}");
+    assert!(named.contains("a\\nwarning: fake\\u{1b}[2J.dwg"), "{named:?}");
 }
