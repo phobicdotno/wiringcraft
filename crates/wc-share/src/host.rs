@@ -460,6 +460,22 @@ impl Host {
             }
             return Ok(());
         }
+        // A page may not start using a symbol the project does not lock: the app sends the item
+        // first (`AddItems`), so only a broken or older guest gets here. Uses the project
+        // already had stay editable.
+        let unlocked = Parts {
+            pages: [(page.id.clone(), Some(page.clone()))].into(),
+            ..Parts::default()
+        }
+        .unlocked_uses(&self.project);
+        if !unlocked.is_empty() {
+            return Err(Refusal::Invalid {
+                reason: format!(
+                    "the page uses {} that the project's library does not have; add it to the session first",
+                    unlocked.join(", ")
+                ),
+            });
+        }
         // A wire may not end on a pin the locked version of its symbol lacks: an update may have
         // dropped the pin after the author drew the wire. Wires already like that may stay.
         let on_page = |p: &Page| {

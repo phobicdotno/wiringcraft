@@ -1636,6 +1636,47 @@ pub struct Share {
     pictures_failed: BTreeMap<String, std::time::Instant>,
 }
 
+/// Changes of this copy kept back while the items they use are not in the session yet.
+struct Held {
+    /// The held page's edit.
+    page: Option<Page>,
+    /// The project-level edits.
+    edits: Vec<ProjectEdit>,
+    /// What the copy had synced to when they were made.
+    base: Project,
+    /// The copy with them, to tell whether anything else changed.
+    local: Project,
+}
+
+impl Held {
+    /// Put the held changes back into `project`, which now holds the session's project. A
+    /// change whose target the session changed meanwhile is not put back; those are returned.
+    fn put_back(&self, project: &mut Project) -> Vec<String> {
+        let mut lost = Vec::new();
+        if let Some(page) = &self.page {
+            if self.base.page(&page.id) == project.page(&page.id)
+                && let Some(slot) = project.page_mut(&page.id)
+            {
+                let number = std::mem::take(&mut slot.number);
+                *slot = page.clone();
+                slot.number = number;
+            } else {
+                lost.push(format!("page {}", page.number));
+            }
+        }
+        for edit in &self.edits {
+            let keys = edit.touches(project);
+            if wc_share::Parts::read(&self.base, &keys) == wc_share::Parts::read(project, &keys) {
+                wc_share::apply_edit(project, edit);
+            } else {
+                lost.push(edit.describe());
+            }
+        }
+        // The items they use stay locked here: `incoming` keeps entries the session lacks.
+        lost
+    }
+}
+
 /// One symbol or part sent to the session and not taken yet.
 #[derive(Debug, Clone, Copy)]
 struct ItemOut {
@@ -1990,7 +2031,7 @@ impl Share {
         take_updates(role, base, &mut self.items_out);
         // Symbols and parts used for the first time go out first. Until the session has them,
         // the changes that may draw them wait in the window: a page must not reach the session
-        // without its symbols, and an item the session refused is sent again a few times.
+        // without its symbols, and an item the session refused is sent again until it is in.
         let auth = role.project()?;
         // Items the session took back are dropped here first, or they would look new below.
         follow_take_backs(
@@ -2015,7 +2056,9 @@ impl Share {
                         "The session did not take your update of {name}; your copy takes the session's version again."
                     )
                 } else {
-                    format!("The session did not take {name}; your changes that use it are sent without it.")
+                    format!(
+                        "The session did not take {name}; your changes that use it wait until it does, and it is sent again now and then."
+                    )
                 });
             }
         }
@@ -2102,9 +2145,24 @@ impl Share {
         for edit in pictures.edits {
             role.edit_project(edit, &mut self.notes);
         }
+        // While an item is on its way (a few tries, seconds at most) everything waits: what
+        // comes in would put the session's lock entry back over an update sent from here.
         if self.items_out.values().any(|o| !o.gave_up) {
             return None;
         }
+        // After that, only a change that uses an item the session has not taken waits, however
+        // long: the session refuses a page that draws a symbol it does not have. Others' changes
+        // come in meanwhile; the session never had the item, so nothing replaces its entry here.
+        let hold = {
+            let base = self.base.as_ref()?;
+            let (symbols, parts) = fresh_uses(&open.project, base);
+            symbols
+                .iter()
+                .map(|id| item_name(ItemKind::Symbol, id))
+                .chain(parts.iter().map(|id| item_name(ItemKind::Part, id)))
+                .any(|name| self.items_out.contains_key(&name))
+        };
+        let base = self.base.get_or_insert_with(|| open.project.clone());
         let mut out = outgoing(&open.project, base, mine, &role.locks(), me);
         if !out.dropped.is_empty() {
             // One action is kept whole or not at all: a device renamed on two pages must not
@@ -2116,6 +2174,13 @@ impl Share {
             out.page = None;
             out.edits.clear();
         }
+        // Held changes stay in this copy, on top of what comes in from the session.
+        let held = (hold && (out.page.is_some() || !out.edits.is_empty())).then(|| Held {
+            page: out.page.take(),
+            edits: std::mem::take(&mut out.edits),
+            base: base.clone(),
+            local: open.project.clone(),
+        });
         let sent = out.page.is_some() || !out.edits.is_empty();
         // One action, one change: the edits that can go together are checked and recorded by
         // the host as one batch, all or nothing.
@@ -2147,7 +2212,19 @@ impl Share {
             base,
             auth,
         );
-        let changed = incoming(&mut open.project, auth);
+        let mut changed = incoming(&mut open.project, auth);
+        // What this copy has synced to; held changes go on top and are found again next time.
+        let synced = held.as_ref().map(|_| open.project.clone());
+        if let Some(held) = &held {
+            let lost = held.put_back(&mut open.project);
+            if !lost.is_empty() && self.unreadable.insert(format!("held {}", lost.join(", "))) {
+                self.notes.push(format!(
+                    "Your waiting change to {} was not kept: the session changed it meanwhile.",
+                    lost.join(", ")
+                ));
+            }
+            changed = open.project != held.local;
+        }
         // The session's versions are what this copy has synced to: an item updated here later
         // differs from them ([`updated_here`]).
         if let Some(base) = self.base.as_mut() {
@@ -2197,7 +2274,9 @@ impl Share {
             // Others' changes are in the window, not yet in this copy's files.
             open.dirty = true;
         }
-        if changed || sent || !out.dropped.is_empty() {
+        if let Some(synced) = synced {
+            self.base = Some(synced);
+        } else if changed || sent || !out.dropped.is_empty() {
             open.forget_terminal_change();
             self.base = Some(open.project.clone());
         }

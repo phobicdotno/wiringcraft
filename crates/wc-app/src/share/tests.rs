@@ -1537,7 +1537,7 @@ fn a_page_waits_until_the_session_has_the_symbols_it_draws() -> TestResult {
 }
 
 #[test]
-fn a_page_goes_without_a_symbol_the_session_keeps_refusing() -> TestResult {
+fn a_page_waits_for_its_symbol_while_others_changes_come_in() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
@@ -1547,18 +1547,40 @@ fn a_page_goes_without_a_symbol_the_session_keeps_refusing() -> TestResult {
         frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
         std::thread::sleep(ITEM_WAIT);
     }
+    // The host changes its own page while the guest's page waits.
+    host_open.project.page_mut("p0002").ok_or("no page")?.title = "Motor, renamed".into();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-    assert!(
-        host_open
-            .project
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let has_item = |o: &Open| {
+        o.project
             .page("p0003")
-            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item)),
-        "the change is not held forever"
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
+    assert!(!has_item(&host_open), "the page does not go without its symbol");
+    assert!(has_item(&guest_open), "the guest keeps its waiting change");
+    assert_eq!(
+        guest_open.project.page("p0002").map(|p| p.title.as_str()),
+        Some("Motor, renamed"),
+        "others' changes come in meanwhile"
     );
     let notes = g.take_notes();
     assert!(
-        notes.iter().any(|n| n.contains("did not take symbol wc.contact.no")),
+        notes
+            .iter()
+            .any(|n| n.contains("did not take symbol wc.contact.no") && n.contains("wait until it does")),
         "{notes:?}"
+    );
+
+    // Once the host can store it, the symbol gets in and the page follows.
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(host_open.project.lock.symbols.contains_key("wc.contact.no"));
+    assert!(has_item(&host_open), "{:?} {:?}", g.notes, h.notes);
+    assert_eq!(
+        host_open.project.page("p0002").map(|p| p.title.as_str()),
+        Some("Motor, renamed")
     );
     Ok(())
 }
@@ -1704,7 +1726,7 @@ fn leaving_a_session_forgets_the_items_sent_to_it() -> TestResult {
 }
 
 #[test]
-fn a_symbol_whose_file_becomes_unreadable_stops_holding_the_session() -> TestResult {
+fn a_symbol_whose_file_becomes_unreadable_holds_only_the_change_that_uses_it() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
@@ -1725,13 +1747,12 @@ fn a_symbol_whose_file_becomes_unreadable_stops_holding_the_session() -> TestRes
         Some("Motor, renamed"),
         "the session's changes come in again"
     );
-    assert!(
-        host_open
-            .project
+    let has_item = |o: &Open| {
+        o.project
             .page("p0003")
-            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item)),
-        "the held change went out"
-    );
+            .is_some_and(|p| p.symbols.iter().any(|s| s.id == item))
+    };
+    assert!(!has_item(&host_open), "the change that uses it still waits");
     let notes = g.take_notes();
     assert!(notes.iter().any(|n| n.contains("could not be read")), "{notes:?}");
     assert!(
@@ -1747,6 +1768,8 @@ fn a_symbol_whose_file_becomes_unreadable_stops_holding_the_session() -> TestRes
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert_eq!(host_open.symbols.get("wc.contact.no"), Some(&sym), "sent again later");
     assert!(g.items_out.is_empty());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(has_item(&host_open), "the waiting change follows it");
     Ok(())
 }
 
@@ -1761,6 +1784,9 @@ fn an_item_this_copy_no_longer_locks_stops_holding_changes() -> TestResult {
     assert!(!g.items_out.is_empty(), "the refused symbol is still on its way");
     // This copy stops using it, as when an assistant command rewrote the project.
     guest_open.project.lock.symbols.remove("wc.contact.no");
+    for page in &mut guest_open.project.pages {
+        page.symbols.retain(|s| s.symbol != "wc.contact.no");
+    }
     guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Valves, renamed".into();
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     assert!(g.items_out.is_empty());
