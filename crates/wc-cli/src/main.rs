@@ -99,6 +99,9 @@ enum Cmd {
     /// Jumpers (bridges) between terminals of one strip: jumpered terminals are one potential.
     #[command(subcommand)]
     Jumper(JumperCmd),
+    /// The project logo, shown on the cover page and in every title block.
+    #[command(subcommand)]
+    Logo(LogoCmd),
     /// Set a device's part and description.
     Device {
         tag: String,
@@ -313,6 +316,17 @@ enum LocationCmd {
     },
     /// Remove a location from the list (devices keep their tags).
     Remove { path: String },
+}
+
+#[derive(Subcommand)]
+enum LogoCmd {
+    /// Show the logo's file, if the project has one.
+    Show,
+    /// Make a PNG or JPEG picture the logo: it is copied into the project's `pictures` folder
+    /// (a picture already there is used as it is). Its place on the cover page is kept.
+    Set { file: PathBuf },
+    /// Take the logo off the cover page and the title blocks; its file stays in the project.
+    Remove,
 }
 
 #[derive(Subcommand)]
@@ -1048,6 +1062,30 @@ fn run(cli: Cli) -> Res<()> {
                 LocationCmd::Remove { path } => {
                     p.meta.remove_location(&path)?;
                     save(dir, &p)?;
+                }
+            }
+        }
+        Cmd::Logo(lc) => {
+            let mut p = load(dir)?;
+            match lc {
+                LogoCmd::Show => match &p.meta.logo {
+                    Some(l) => println!("{}", l.file),
+                    None => println!("no logo"),
+                },
+                LogoCmd::Set { file } => {
+                    let file = wc_core::Logo::copy_into(dir, &file)?;
+                    let cover = p.meta.logo.as_ref().and_then(|l| l.cover);
+                    p.meta.logo = Some(wc_core::Logo {
+                        file: file.clone(),
+                        cover,
+                    });
+                    save(dir, &p)?;
+                    println!("{file}");
+                }
+                LogoCmd::Remove => {
+                    if p.meta.logo.take().is_some() {
+                        save(dir, &p)?;
+                    }
                 }
             }
         }
@@ -3433,6 +3471,47 @@ mod tests {
         p.pages[0].symbols[0].tag = DeviceTag::parse("-X1.7").ok();
         save(&dir, &p).unwrap();
         assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["4", "7"]);
+    }
+
+    #[test]
+    fn the_logo_is_set_and_removed_from_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 2, image::Rgb([10, 20, 30])))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let src = tmp.path().join("Our logo.png");
+        std::fs::write(&src, &png).unwrap();
+        let text = tmp.path().join("notes.png");
+        std::fs::write(&text, b"not a picture").unwrap();
+        let pdf_has_picture = |dir: &Path| {
+            let out = dir.join("out.pdf");
+            cli(dir, &["pdf", out.to_str().unwrap()]).unwrap();
+            String::from_utf8_lossy(&std::fs::read(&out).unwrap()).contains("/Subtype /Image")
+        };
+        assert!(!pdf_has_picture(&dir));
+
+        let err = cli(&dir, &["logo", "set", text.to_str().unwrap()]).unwrap_err();
+        assert!(err.contains("PNG or JPEG"), "{err}");
+        assert_eq!(load(&dir).unwrap().meta.logo, None);
+
+        cli(&dir, &["logo", "set", src.to_str().unwrap()]).unwrap();
+        let logo = load(&dir).unwrap().meta.logo.unwrap();
+        assert_eq!(logo.file, "pictures/Our_logo.png");
+        assert_eq!(std::fs::read(dir.join(&logo.file)).unwrap(), png);
+        assert!(pdf_has_picture(&dir));
+        // The copy in the project, set again, is used as it is.
+        let inside = dir.join(&logo.file);
+        cli(&dir, &["logo", "set", inside.to_str().unwrap()]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.logo.unwrap().file, "pictures/Our_logo.png");
+        cli(&dir, &["logo", "show"]).unwrap();
+
+        cli(&dir, &["logo", "remove"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.logo, None);
+        assert!(dir.join("pictures/Our_logo.png").exists(), "the file stays");
+        assert!(!pdf_has_picture(&dir));
     }
 
     #[test]

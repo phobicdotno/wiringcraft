@@ -385,8 +385,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "set_project",
-            "Rename the project and set title-block fields (customer, project_number, plant, drawn_by, checked_by, revision, date, or any other; empty value removes one).",
-            json!({"name": {"type": "string"}, "title_block": {"type": "object", "additionalProperties": {"type": "string"}}}),
+            "Rename the project, set title-block fields (customer, project_number, plant, drawn_by, checked_by, revision, date, or any other; empty value removes one) and set or remove the logo.",
+            json!({"name": {"type": "string"}, "title_block": {"type": "object", "additionalProperties": {"type": "string"}}, "logo": {"type": "string", "description": "A PNG or JPEG file in the project folder (path relative to it) to make the logo; it is copied into pictures/ when it is elsewhere. An empty text removes the logo (its file stays)."}}),
             &[],
         ),
         tool(
@@ -1226,9 +1226,48 @@ impl App {
                         fields.insert(k.clone(), val);
                     }
                 }
+                // The logo first: a file that cannot be used changes nothing.
+                let logo = match s(v, "logo").map(str::trim) {
+                    None => None,
+                    Some("") => Some(None),
+                    Some(path) => {
+                        if !wc_core::project::relative_file_is_safe(path) {
+                            return Err(format!(
+                                "{path}: give a file in the project folder, as a path relative to it"
+                            ));
+                        }
+                        let src = open.dir.join(path);
+                        let real = src.canonicalize().map_err(|e| format!("{path}: {e}"))?;
+                        let dir = open.dir.canonicalize().map_err(|e| e.to_string())?;
+                        if !real.starts_with(&dir) {
+                            return Err(format!("{path} leads out of the project folder"));
+                        }
+                        let bytes = std::fs::read(&real).map_err(|e| format!("{path}: {e}"))?;
+                        if wc_core::Logo::picture_kind(&bytes).is_none() {
+                            return Err(format!("{path}: the logo must be a PNG or JPEG picture"));
+                        }
+                        Some(Some(src))
+                    }
+                };
+                // The only way the properties can be refused; checked before the logo is copied,
+                // and the logo copied before the properties change, so a failure changes nothing.
+                if name.trim().is_empty() {
+                    return Err("The project name cannot be empty.".into());
+                }
+                let said = match logo {
+                    Some(Some(src)) => {
+                        let file = open.set_logo_from(&src)?;
+                        format!("Project properties set; the logo is {file}.")
+                    }
+                    Some(None) => {
+                        open.remove_logo();
+                        "Project properties set; the logo is removed.".to_owned()
+                    }
+                    None => "Project properties set.".to_owned(),
+                };
                 let fields: Vec<(String, String)> = fields.into_iter().collect();
                 open.set_project_props(&name, &fields, None)?;
-                Ok("Project properties set.".into())
+                Ok(said)
             }
             "comments" => self.tool_comments(v),
             "macros" => self.tool_macros(v),
@@ -1450,6 +1489,7 @@ impl App {
             "branch": open.branch,
             "unsaved_changes": open.dirty,
             "title_block": open.project.meta.title_block,
+            "logo": open.project.meta.logo.as_ref().map(|l| l.file.clone()),
             "libraries": open.project.meta.libraries.iter().map(|l| format!("{} ({}: {})", l.name, l.kind, l.location)).collect::<Vec<_>>(),
             "pages": pages,
             "panels": panels,
@@ -2298,6 +2338,66 @@ mod tests {
 
     fn page2(app: &App) -> &Page {
         app.open.as_ref().unwrap().project.page("p0002").unwrap()
+    }
+
+    #[test]
+    fn the_assistant_reads_sets_and_removes_the_logo() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3])))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/brand.png"), &png).unwrap();
+        std::fs::write(dir.join("docs/readme.png"), b"text").unwrap();
+        let logo_of = |a: &mut App| {
+            let state: Value = serde_json::from_str(&call(a, "get_state", json!({})).unwrap()).unwrap();
+            state["logo"].clone()
+        };
+        assert_eq!(logo_of(&mut a), Value::Null);
+
+        // Files outside the project, missing ones and other kinds are refused, changing nothing.
+        for bad in ["../brand.png", "/etc/passwd", "docs/none.png", "docs/readme.png"] {
+            assert!(
+                call(&mut a, "set_project", json!({"logo": bad, "name": "Renamed"})).is_err(),
+                "{bad}"
+            );
+        }
+        assert_ne!(a.open.as_ref().unwrap().project.meta.name, "Renamed");
+        assert_eq!(logo_of(&mut a), Value::Null);
+
+        let r = call(
+            &mut a,
+            "set_project",
+            json!({"logo": "docs/brand.png", "title_block": {"customer": "ACME"}}),
+        )
+        .unwrap();
+        assert!(r.contains("pictures/brand.png"), "{r}");
+        assert_eq!(logo_of(&mut a), json!("pictures/brand.png"));
+        assert_eq!(std::fs::read(dir.join("pictures/brand.png")).unwrap(), png);
+        assert_eq!(a.open.as_ref().unwrap().project.meta.title_block["customer"], "ACME");
+
+        call(&mut a, "set_project", json!({"logo": ""})).unwrap();
+        assert_eq!(logo_of(&mut a), Value::Null);
+        assert!(dir.join("pictures/brand.png").exists(), "the file stays");
+
+        // A copy that fails (pictures/ is a file) leaves the name, fields and undo as they were.
+        std::fs::remove_dir_all(dir.join("pictures")).unwrap();
+        std::fs::write(dir.join("pictures"), b"in the way").unwrap();
+        let before = a.open.as_ref().unwrap().project.meta.clone();
+        let could_undo = a.open.as_ref().unwrap().can_undo();
+        assert!(
+            call(
+                &mut a,
+                "set_project",
+                json!({"logo": "docs/brand.png", "name": "Renamed", "title_block": {"customer": "Other"}})
+            )
+            .is_err()
+        );
+        assert_eq!(a.open.as_ref().unwrap().project.meta, before);
+        assert_eq!(a.open.as_ref().unwrap().can_undo(), could_undo);
+        assert!(call(&mut a, "set_project", json!({"name": "  "})).is_err());
     }
 
     #[test]
