@@ -45,7 +45,8 @@ configurator with articles chosen can be matched to the project's devices row by
 - Rails in WiringCraft's panel layouts are horizontal, so the rotation is always `0`.
 - Jumpers have no part of their own yet: their Article is empty.
 - Strip tags such as `-X1` start with `-`; a spreadsheet that opens the file may take them for
-  formulas. The WAGO tools read them as text, as in the marker export, so the tag columns are
-  written as they are. Free texts (article, manufacturer, description, wire specs, plate name)
+  formulas. The WAGO tools read them as text, as in the marker export, so such tags are written
+  as they are. A tag with a function or location aspect (`=A-X1`, `+C1-X1`) gets a leading `'`
+  in the Index and Strip columns, with a warning. Free texts (article, manufacturer, description, wire specs, plate name)
   that start with `=`, `+`, `-` or `@` are written with a leading `'` so a spreadsheet shows them
   as text, and the export warns about each one.

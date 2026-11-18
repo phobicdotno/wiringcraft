@@ -253,39 +253,41 @@ impl Row {
     }
 
     /// The cells in column order. Free texts (part data, wire specs, plate names) that a
-    /// spreadsheet would take for a formula get a leading `'`, with a warning; the tag-derived
-    /// columns (index, strip, terminal numbers) start with `-` by design and stay as they are.
+    /// spreadsheet would take for a formula get a leading `'`, with a warning. The tag-derived
+    /// columns (index, strip) do the same, except for a leading `-`: a product aspect starts a
+    /// plain tag (`-X1`), while a function or location aspect (`=A-X1`, `+C1-X1`) is guarded.
     fn into_cells(self, warnings: &mut Vec<String>) -> Vec<String> {
         let index = self.index.clone();
-        let mut safe = |column: &str, text: String| -> String {
-            match text.chars().next() {
-                Some(c @ ('=' | '+' | '-' | '@' | '\t' | '\r')) => {
-                    warnings.push(format!(
-                        "{index}: {column} {text:?} starts with {c:?}, which a spreadsheet may run as a formula; \
-                         it is written with a leading '"
-                    ));
-                    format!("'{text}")
-                }
-                _ => text,
-            }
+        // `tag`: a leading `-` is a product aspect and stays as it is.
+        let mut guard = |column: &str, text: String, tag: bool| -> String {
+            let c = match text.chars().next() {
+                Some(c @ ('=' | '+' | '@' | '\t' | '\r')) => c,
+                Some('-') if !tag => '-',
+                _ => return text,
+            };
+            warnings.push(format!(
+                "{index}: {column} {text:?} starts with {c:?}, which a spreadsheet may run as a formula; \
+                 it is written with a leading '"
+            ));
+            format!("'{text}")
         };
         vec![
-            self.index.clone(),
+            guard("Index", self.index, true),
             self.kind.to_owned(),
-            self.strip,
+            guard("Strip", self.strip, true),
             self.position,
             self.terminal,
             self.level,
-            safe("Article", self.article),
-            safe("Manufacturer", self.manufacturer),
-            safe("Description", self.description),
+            guard("Article", self.article, false),
+            guard("Manufacturer", self.manufacturer, false),
+            guard("Description", self.description, false),
             self.quantity,
-            safe("Upper section", self.upper_section),
-            safe("Upper colour", self.upper_colour),
-            safe("Lower section", self.lower_section),
-            safe("Lower colour", self.lower_colour),
+            guard("Upper section", self.upper_section, false),
+            guard("Upper colour", self.upper_colour, false),
+            guard("Lower section", self.lower_section, false),
+            guard("Lower colour", self.lower_colour, false),
             self.connects,
-            safe("Plate", self.plate),
+            guard("Plate", self.plate, false),
             self.rail,
             self.rail_length,
             self.rail_rotation,

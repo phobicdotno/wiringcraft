@@ -1256,6 +1256,28 @@ fn a_terminal_tagged_with_only_its_strip_takes_the_strip_devices_part() {
 }
 
 #[test]
+fn configurator_tags_with_a_function_or_location_aspect_are_written_as_text() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s9", "term", 140.0, Some("=A+C1-X9.1")));
+    let out = configurator_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let row = out.table.rows.iter().find(|r| r[2].contains("X9")).unwrap();
+    assert_eq!(row[0], "'=A+C1-X9/T1");
+    assert_eq!(row[2], "'=A+C1-X9");
+    assert!(
+        out.warnings.iter().any(|w| w.contains("Strip \"=A+C1-X9\"")),
+        "{:?}",
+        out.warnings
+    );
+    assert!(out.warnings.iter().any(|w| w.contains("Index \"=A+C1-X9/T1\"")));
+    let plain = out.table.rows.iter().find(|r| r[0] == "-X1/T1").unwrap();
+    assert_eq!(plain[2], "-X1", "a plain tag stays as it is");
+}
+
+#[test]
 fn configurator_free_texts_that_look_like_formulas_are_written_as_text() {
     let (mut p, s, mut parts) = fixture();
     let odd = Part {

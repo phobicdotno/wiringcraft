@@ -2291,19 +2291,26 @@ fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
             format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals are not in the list")
         })
         .collect();
-    let parts = vendored_parts(dir, &p);
-    // A part that is used but could not be read is written by its id; say why.
+    let mut parts = vendored_parts(dir, &p);
+    // Accessories are read here too; a part that is used but could not be read is written by
+    // its id, and the warning says why.
     let used: std::collections::BTreeSet<&str> = p
         .devices
         .values()
         .flat_map(|d| d.all_parts())
         .map(|(id, _)| id)
         .collect();
-    for id in used.into_iter().filter(|id| !parts.contains_key(*id)) {
-        if let Err(err) = store::read_vendored_part(dir, id) {
-            warnings.push(format!(
+    for id in used {
+        if parts.contains_key(id) {
+            continue;
+        }
+        match store::read_vendored_part(dir, id) {
+            Ok(part) => {
+                parts.insert(id.to_owned(), part);
+            }
+            Err(err) => warnings.push(format!(
                 "part {id} could not be read ({err}); its article number is written as the part id"
-            ));
+            )),
         }
     }
     let inputs = wc_report::Inputs {
@@ -3792,6 +3799,30 @@ mod tests {
             "{:?}",
             done.warnings
         );
+
+        // An accessory with a readable vendored part gives its article, not the part id.
+        let stop = wc_core::Part {
+            id: "wago.2002-1291".into(),
+            manufacturer: "WAGO".into(),
+            order_number: "2002-1291".into(),
+            description: "End plate".into(),
+            ..Default::default()
+        };
+        store::write_vendored_part(&dir, &stop).unwrap();
+        p.devices.insert(
+            x1.clone(),
+            wc_core::Device {
+                accessories: vec![wc_core::DevicePart {
+                    part: stop.id.clone(),
+                    qty: 1,
+                }],
+                ..Default::default()
+            },
+        );
+        store::save(&dir, &p).unwrap();
+        export_wago_configurator(&dir, &out).unwrap();
+        let csv = std::fs::read_to_string(&out).unwrap();
+        assert!(csv.contains(";2002-1291;WAGO;End plate;"), "{csv}");
     }
 
     #[test]
