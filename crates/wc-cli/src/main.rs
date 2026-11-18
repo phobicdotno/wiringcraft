@@ -2829,7 +2829,8 @@ struct Exported {
 
 /// Write the WAGO smartScript marker list of the project in `dir` to `out`. Unknown kinds, lines,
 /// languages and strips are refused before anything is written. Symbols without a vendored copy
-/// are warned about: their terminals cannot be recognised and are left out.
+/// are warned about: their terminals are recognised by their tag (`-X1.3`) but their wiring is
+/// not known.
 fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Exported> {
     let kinds = wc_report::parse_kinds(&args.kinds)?;
     let lines = wc_report::parse_lines(&args.lines)?;
@@ -2840,7 +2841,7 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
     let mut warnings: Vec<String> = missing
         .iter()
         .map(|m| {
-            format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals are not in the list")
+            format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals are listed by their tags, without their wiring")
         })
         .collect();
     let parts = vendored_parts(dir, &p);
@@ -2881,15 +2882,15 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
 }
 
 /// Write the project's terminal strips in `dir` for the WAGO configurator to `out`. Symbols
-/// without a vendored copy are warned about: their terminals cannot be recognised and are left
-/// out. `markers` in the result counts the rows.
+/// without a vendored copy are warned about: their terminals are recognised by their tag
+/// (`-X1.3`) but their wiring is not known. `markers` in the result counts the rows.
 fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
     let p = load(dir)?;
     let (symbols, missing) = store::vendored_symbols(dir, &p);
     let mut warnings: Vec<String> = missing
         .iter()
         .map(|m| {
-            format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals are not in the list")
+            format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`); its terminals are listed by their tags, without their wiring")
         })
         .collect();
     let mut parts = vendored_parts(dir, &p);
@@ -6612,13 +6613,27 @@ mod tests {
         store::save(&dir, &p).unwrap();
         let out = tmp.path().join("c.csv");
         let done = export_wago_configurator(&dir, &out).unwrap();
-        // -X1.3 has no vendored symbol: it is not known as a terminal and is left out.
-        assert_eq!(done.markers, 3, "{:?}", std::fs::read_to_string(&out));
+        // -X1.3 has no vendored symbol: its terminal level makes it a terminal, as in the strip
+        // editor and jumpers, so it is on the rail (with a warning that its wiring is not known).
+        assert_eq!(done.markers, 4, "{:?}", std::fs::read_to_string(&out));
+        assert!(
+            std::fs::read_to_string(&out)
+                .unwrap()
+                .contains("\r\n-X1/T3;Terminal;-X1;3;3;"),
+            "{:?}",
+            std::fs::read_to_string(&out)
+        );
         let csv = std::fs::read_to_string(&out).unwrap();
         assert!(csv.starts_with("\u{feff}Index;Type;Strip;Position;Terminal;"), "{csv}");
         assert!(csv.contains("\r\n-X1/T2;Terminal;-X1;2;2;"), "{csv}");
         assert!(csv.contains("\r\n-X1/J1;Jumper;-X1;"), "{csv}");
         assert!(done.warnings.iter().any(|w| w.contains("no.such.symbol")));
+        // Its terminal is listed now, so no warning may say it is left out.
+        assert!(
+            !done.warnings.iter().any(|w| w.contains("not in the list")),
+            "{:?}",
+            done.warnings
+        );
 
         // A part that is used but cannot be read is named, with the reason.
         p.devices.insert(
@@ -6703,10 +6718,12 @@ mod tests {
 
         let out = tmp.path().join("m.csv");
         let done = export_wago_marking(&dir, &out, &kinds(&["cables", "devices"])).unwrap();
-        assert_eq!(done.markers, 2);
+        // -X1.1 has no vendored symbol, but its terminal level makes it a terminal (as in the
+        // terminal plan), so it gets a terminal marker and no device marker.
+        assert_eq!(done.markers, 1);
         assert_eq!(
             std::fs::read_to_string(&out).unwrap(),
-            "\u{feff}Type;Group;Marker;Count\r\nDevice;;-X1.1;1\r\nCable;;-W1;2\r\n"
+            "\u{feff}Type;Group;Marker;Count\r\nCable;;-W1;2\r\n"
         );
         assert!(
             done.warnings.iter().any(|w| w.contains("no.such.symbol")),

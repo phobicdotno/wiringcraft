@@ -1555,3 +1555,64 @@ fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_t
     let terminal = MarkerKind::Terminals.label(MarkingOptions::default().language);
     assert_eq!(named[0][..3], [terminal.to_owned(), "-X1".to_owned(), "W1".to_owned()]);
 }
+
+#[test]
+fn a_terminal_whose_symbol_is_missing_is_counted_the_same_everywhere() {
+    let (mut p, s, parts) = fixture();
+    // -X1.3 drawn with a symbol the project has no copy of; -K9 likewise, but no terminal.
+    p.pages[0].symbols.push(place("s8", "gone.term", 150.0, Some("-X1.3")));
+    p.pages[0].symbols.push(place("s9", "gone.relay", 160.0, Some("-K9")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // The strip editor and jumpers count it ...
+    let numbers = wc_core::project::terminal_numbers(&p, |id| s.get(id).map(|s| s.role));
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    assert_eq!(
+        numbers.get(&(p.pages[0].id.clone(), "s8".to_owned())),
+        Some(&(x1, "3".to_owned()))
+    );
+    assert!(!numbers.contains_key(&(p.pages[0].id.clone(), "s9".to_owned())));
+    // ... and so do the terminal plan (marked), the markers and the configurator (warned).
+    let plan = terminal_plan(&i);
+    let row = plan.rows.iter().find(|r| r[0] == "-X1" && r[1] == "3").unwrap();
+    assert_eq!(row[2], "(symbol gone.term missing)");
+    assert!(!plan.rows.iter().any(|r| r.iter().any(|c| c.contains("gone.relay"))));
+    let markers = marking_list(&i, &[MarkerKind::Terminals]);
+    assert!(
+        markers.rows.iter().any(|r| r[1] == "-X1" && r[2] == "3"),
+        "{:?}",
+        markers.rows
+    );
+    // With devices asked for too, -X1.3 has its terminal marker only, not a device marker.
+    let both = marking_list(&i, &[MarkerKind::Devices, MarkerKind::Terminals]);
+    let device = MarkerKind::Devices.label(MarkingOptions::default().language);
+    assert!(
+        !both
+            .rows
+            .iter()
+            .any(|r| r[0] == device && r.iter().any(|c| c.contains("X1.3"))),
+        "{:?}",
+        both.rows
+    );
+    assert!(
+        both.rows.iter().any(|r| r[1] == "-X1" && r[2] == "3"),
+        "{:?}",
+        both.rows
+    );
+    let out = configurator_list(&i);
+    assert!(
+        out.table.rows.iter().any(|r| r.iter().any(|c| c == "-X1/T3")),
+        "{:?}",
+        out.table.rows
+    );
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("-X1.3") && w.contains("gone.term")),
+        "{:?}",
+        out.warnings
+    );
+}
