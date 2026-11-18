@@ -362,13 +362,39 @@ pub fn follow_terminals_in(
     }
     let was = project.meta.clone();
     let mut after = numbers_after(project, before, &role);
+    // A spare can only go with its strip to a tag no other device is drawn with there: it would
+    // take over that device (its part, its panel place), as Project::add_spare refuses.
+    let drawn: std::collections::BTreeSet<DeviceTag> = project
+        .pages
+        .iter()
+        .flat_map(|p| p.symbols.iter().filter_map(|s| s.tag.clone()))
+        .collect();
     // A strip's layout taken along to its new name brings its spares, which can change the
     // numbers of terminals tagged with only the strip there: followed again from the start
     // with the numbers those spares give.
     let mut moves = Vec::new();
     for pass in 0..2 {
-        project.meta.follow_terminals(before, &after);
-        moves = project.meta.follow_layouts_moving(before, &after);
+        let refuse = |to: &DeviceTag, layout: &StripLayout| {
+            layout.spares.iter().any(|n| {
+                let mut tag = to.clone();
+                tag.product.push(n.clone());
+                drawn.contains(&tag) && !after.values().any(|(s, m)| s == to && m == n)
+            })
+        };
+        // Layouts first: a jumper on a spare that went with its strip goes along too.
+        moves = project.meta.follow_layouts_refusing(before, &after, refuse);
+        let (mut jb, mut ja) = (before.clone(), after.clone());
+        for (from, to) in &moves {
+            for n in was.strip_layout(from).map(|l| l.spares.clone()).unwrap_or_default() {
+                if before.values().any(|(s, m)| s == from && *m == n) {
+                    continue;
+                }
+                let key = (String::new(), format!("spare {from} {n}"));
+                jb.insert(key.clone(), (from.clone(), n.clone()));
+                ja.insert(key, (to.clone(), n));
+            }
+        }
+        project.meta.follow_terminals(&jb, &ja);
         let again = numbers_after(project, before, &role);
         if again == after || pass == 1 {
             break;
@@ -376,18 +402,16 @@ pub fn follow_terminals_in(
         project.meta = was.clone();
         after = again;
     }
-    // The device data of a spare (its part, its level) goes with it to the strip's new name,
-    // unless that name has data of its own already.
+    // The device data of a spare (its part, its level, its panel place) goes with it to the
+    // strip's new name, unless that name has data of its own already.
     for (from, to) in &moves {
         let spares = was.strip_layout(from).map(|l| l.spares.clone()).unwrap_or_default();
         for n in spares {
             let (mut old, mut new) = (from.clone(), to.clone());
             old.product.push(n.clone());
             new.product.push(n);
-            if !project.devices.contains_key(&new)
-                && let Some(device) = project.devices.remove(&old)
-            {
-                project.devices.insert(new, device);
+            if !project.devices.contains_key(&new) {
+                project.rename_device(&old, &new);
             }
         }
     }
@@ -894,6 +918,17 @@ impl ProjectMeta {
         before: &TerminalNumbers,
         after: &TerminalNumbers,
     ) -> Vec<(DeviceTag, DeviceTag)> {
+        self.follow_layouts_refusing(before, after, |_, _| false)
+    }
+
+    /// [`ProjectMeta::follow_layouts_moving`], where a layout `refuse(new strip, layout)` says
+    /// may not go to the new strip stays under its old one.
+    pub fn follow_layouts_refusing(
+        &mut self,
+        before: &TerminalNumbers,
+        after: &TerminalNumbers,
+        refuse: impl Fn(&DeviceTag, &StripLayout) -> bool,
+    ) -> Vec<(DeviceTag, DeviceTag)> {
         let old = self.strips.clone();
         let mut moves: Vec<(DeviceTag, DeviceTag)> = Vec::new();
         for layout in std::mem::take(&mut self.strips) {
@@ -929,7 +964,8 @@ impl ProjectMeta {
                 (true, [only])
                     if *only != strip
                         && !old.iter().any(|l| &l.strip == *only)
-                        && !moves.iter().any(|(_, to)| to == *only) =>
+                        && !moves.iter().any(|(_, to)| to == *only)
+                        && !refuse(only, &layout) =>
                 {
                     Some((*only).clone())
                 }
@@ -2687,6 +2723,86 @@ mod tests {
         assert!(terminal_numbers(&p, role).values().any(|(_, n)| n == "3"));
         assert_eq!(p.devices.get(&DeviceTag::parse("-X2.2")?), Some(&spare));
         assert!(!p.devices.contains_key(&DeviceTag::parse("-X1.2")?));
+        Ok(())
+    }
+
+    #[test]
+    fn a_jumper_on_a_spare_goes_with_its_strip_when_the_strip_is_renamed() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = strips_project(
+            &[("a", "-X1.1"), ("b", "-X1.2")],
+            &[("-X1", &["1", "2", "S1"], &["S1"])],
+        )?;
+        let x1 = DeviceTag::parse("-X1")?;
+        p.meta.add_jumper(&x1, &["1".to_owned(), "S1".to_owned()])?;
+        let role = |_: &str| None;
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        retag(&mut p, "b", "-X2.2")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        let x2 = DeviceTag::parse("-X2")?;
+        assert_eq!(p.meta.jumpers.len(), 1);
+        assert_eq!(p.meta.jumpers[0].strip, x2);
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "S1"]);
+        assert_eq!(
+            p.meta.strip_layout(&x2).map(|l| l.spares.clone()),
+            Some(vec!["S1".to_owned()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_renamed_onto_a_drawn_device_named_like_its_spare_keeps_its_layout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // -X2.S1 is drawn as something that is no terminal, and has no device entry.
+        let mut p = strips_project(&[("a", "-X1.1"), ("k", "-X2.S1")], &[("-X1", &["S1", "1"], &["S1"])])?;
+        let spare = Device {
+            part: Some("WAGO 2002-1201".into()),
+            ..Device::default()
+        };
+        p.devices.insert(DeviceTag::parse("-X1.S1")?, spare.clone());
+        let role = |id: &str| {
+            Some(if id == "term" {
+                crate::symbol::SymbolRole::Terminal
+            } else {
+                crate::symbol::SymbolRole::Main
+            })
+        };
+        p.pages[0].symbols[1].symbol = "coil".into();
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        follow_terminals_in(&mut p, &before, role);
+        let x1 = p.meta.strip_layout(&DeviceTag::parse("-X1")?).ok_or("x1 kept")?;
+        assert_eq!(x1.spares, ["S1"]);
+        assert!(p.meta.strip_layout(&DeviceTag::parse("-X2")?).is_none());
+        assert_eq!(p.devices.get(&DeviceTag::parse("-X1.S1")?), Some(&spare));
+        assert!(!p.devices.contains_key(&DeviceTag::parse("-X2.S1")?));
+        Ok(())
+    }
+
+    #[test]
+    fn a_spare_moved_with_its_strip_keeps_its_panel_place() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = strips_project(&[("a", "-X1.1")], &[("-X1", &["1", "S1"], &["S1"])])?;
+        let mut panel = crate::panel::Panel::new("p", "P", 600.0, 400.0);
+        panel.items.push(crate::panel::PanelItem::Device {
+            tag: DeviceTag::parse("-X1.S1")?,
+            at: Point::default(),
+            width: 6.0,
+            height: 50.0,
+        });
+        p.panels.push(panel);
+        let role = |_: &str| None;
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        let tags: Vec<String> = p.panels[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                crate::panel::PanelItem::Device { tag, .. } => Some(tag.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tags, ["-X2.S1"]);
         Ok(())
     }
 
