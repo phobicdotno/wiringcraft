@@ -48,8 +48,9 @@ pub struct Guest {
     pub parts: BTreeMap<String, wc_core::Part>,
     /// The number of the last project edit sent.
     last_edit: u64,
-    /// Project edits sent and not answered yet, by number.
-    unanswered: std::collections::BTreeSet<u64>,
+    /// Project edits sent and not answered yet, by number, each with the page it adds or
+    /// removes, if any.
+    unanswered: BTreeMap<u64, Option<String>>,
 }
 
 impl Default for Guest {
@@ -74,7 +75,7 @@ impl Guest {
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
             last_edit: 0,
-            unanswered: std::collections::BTreeSet::new(),
+            unanswered: BTreeMap::new(),
         }
     }
 
@@ -143,7 +144,12 @@ impl Guest {
             apply_edit(p, &edit);
         }
         self.last_edit += 1;
-        self.unanswered.insert(self.last_edit);
+        let structural = match &edit {
+            ProjectEdit::AddPage { page } => Some(page.id.clone()),
+            ProjectEdit::RemovePage { id } => Some(id.clone()),
+            _ => None,
+        };
+        self.unanswered.insert(self.last_edit, structural);
         GuestMsg::EditProject {
             edit,
             seq: self.last_edit,
@@ -263,11 +269,9 @@ impl Guest {
                 edit,
                 put_back,
             } => {
-                if let Some(seq) = edit {
-                    self.unanswered.remove(&seq);
-                }
+                let structural = edit.and_then(|seq| self.unanswered.remove(&seq)).flatten();
                 if let Some(parts) = put_back {
-                    self.put_back(*parts);
+                    self.put_back(*parts, structural.as_deref());
                 }
                 // Only the refusal of an undo, redo or revert answers one: a refusal of an
                 // earlier edit, arriving first, must not end the wait for the restoration.
@@ -290,14 +294,15 @@ impl Guest {
 
     /// Take the host's version of what a refused project edit touched. A page this guest has
     /// open keeps its content (page edits of it may still be on their way), and takes only the
-    /// host's display number.
-    fn put_back(&mut self, mut parts: crate::Parts) {
+    /// host's display number, unless the refused edit added or removed that page: then the
+    /// content here is not the host's page at all, and the host's page comes back whole.
+    fn put_back(&mut self, mut parts: crate::Parts, structural: Option<&str>) {
         let me = self.me;
         let Some(project) = self.project.as_mut() else {
             return;
         };
         for (id, host) in parts.pages.iter_mut() {
-            let held = me.is_some() && self.locks.get(id) == me.as_ref();
+            let held = me.is_some() && self.locks.get(id) == me.as_ref() && structural != Some(id.as_str());
             if held && let (Some(host), Some(mine)) = (host.as_mut(), project.page(id)) {
                 let number = std::mem::take(&mut host.number);
                 *host = mine.clone();

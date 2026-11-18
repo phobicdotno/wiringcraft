@@ -678,6 +678,61 @@ fn a_refused_edit_does_not_take_back_work_on_the_page_the_guest_has_open() -> Te
 }
 
 #[test]
+fn a_refused_removal_and_new_page_bring_back_the_hosts_page_the_guest_had_open() -> TestResult {
+    let log = Shared::default();
+    let mut s = Session {
+        host: Host::new(
+            demo(),
+            "Hanna Host",
+            "h@x.no",
+            Box::new(Flaky {
+                fail: 1,
+                log: log.clone(),
+            }),
+        ),
+        hub: Hub::new(),
+        log,
+    };
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    let old = s.host.project().page("p0002").cloned().ok_or("page")?;
+    // The removal is not recorded, so the host keeps the old page and refuses the new one.
+    a_link.send(a.edit_project(ProjectEdit::RemovePage { id: "p0002".into() }))?;
+    a_link.send(a.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0002", "2", "New"),
+    }))?;
+    assert!(
+        a.project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .is_some_and(|p| p.title == "New")
+    );
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert_eq!(a.refusals.len(), 2);
+    assert_eq!(s.host.project().page("p0002"), Some(&old));
+    assert_eq!(a.project.as_ref(), Some(s.host.project()), "the old page is back");
+    assert_eq!(a.unanswered_edits(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_project_edit_before_approval_is_answered() -> TestResult {
+    let mut s = Session::new();
+    let (id, link, mut guest) = s.connect();
+    link.send(guest.join("Ola", "ola@example.com"))?;
+    s.pump(&mut [(&link, &mut guest)]);
+    link.send(guest.edit_project(ProjectEdit::RemovePage { id: "p0002".into() }))?;
+    s.pump(&mut [(&link, &mut guest)]);
+    assert_eq!(guest.refusals, vec![Refusal::NotApproved]);
+    assert_eq!(guest.unanswered_edits(), 0);
+    assert!(s.host.approve(id));
+    s.pump(&mut [(&link, &mut guest)]);
+    assert_eq!(guest.unanswered_edits(), 0);
+    Ok(())
+}
+
+#[test]
 fn every_project_edit_of_a_guest_gets_exactly_one_answer() -> TestResult {
     let mut s = Session::new();
     let (_, a_link, mut a) = s.join("Ola")?;

@@ -290,6 +290,11 @@ impl Host {
             return Err(Refusal::NotApproved);
         };
         let take_back = matches!(msg, GuestMsg::Undo | GuestMsg::Redo | GuestMsg::Revert { .. });
+        // A project edit refused before the guest joined still answers that edit.
+        let edit_seq = match &msg {
+            GuestMsg::EditProject { seq, .. } => Some(*seq),
+            _ => None,
+        };
         // A project edit gets exactly one answer of its own.
         let msg = match (&status, msg) {
             (Status::Joined, GuestMsg::EditProject { edit, seq }) => return self.guest_edit_project(from, edit, seq),
@@ -348,7 +353,7 @@ impl Host {
                 HostMsg::Refused {
                     refusal: refusal.clone(),
                     take_back,
-                    edit: None,
+                    edit: edit_seq,
                     put_back: None,
                 },
             ));
