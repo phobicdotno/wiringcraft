@@ -717,6 +717,48 @@ fn a_refused_removal_and_new_page_bring_back_the_hosts_page_the_guest_had_open()
 }
 
 #[test]
+fn adding_a_page_that_is_there_already_does_not_take_back_work_on_it() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    a_link.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    // The page is there already: nothing changes here, and the host refuses it.
+    a_link.send(a.edit_project(ProjectEdit::AddPage {
+        page: Page::new("p0002", "2", "Again"),
+    }))?;
+    let draw = |a: &mut Guest, id: &str, x: f64| -> std::result::Result<GuestMsg, Box<dyn std::error::Error>> {
+        let mut page = a
+            .project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .cloned()
+            .ok_or("page")?;
+        place(&mut page, id, x);
+        Ok(a.edit_page(page).ok_or("lock")?)
+    };
+    a_link.send(draw(&mut a, "s1", 10.0)?)?;
+    s.hub.pump(&mut s.host);
+    let mut refused = false;
+    for msg in a_link.drain() {
+        let refusal = matches!(msg, HostMsg::Refused { edit: Some(1), .. });
+        a.handle(msg);
+        if refusal {
+            refused = true;
+            let mine = a.project.as_ref().and_then(|p| p.page("p0002")).ok_or("page")?;
+            assert_eq!(mine.symbols.len(), 1, "the drawing is kept");
+            // Drawn again before the first drawing's answer arrives.
+            a_link.send(draw(&mut a, "s2", 20.0)?)?;
+        }
+    }
+    assert!(refused);
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert!(s.host.project().page("p0002").is_some_and(|p| p.symbols.len() == 2));
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert_eq!(a.unanswered_edits(), 0);
+    Ok(())
+}
+
+#[test]
 fn work_on_the_page_put_back_by_one_refusal_survives_the_next() -> TestResult {
     let log = Shared::default();
     let mut s = Session {

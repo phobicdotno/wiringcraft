@@ -142,17 +142,22 @@ impl Guest {
     /// do symbols and parts (it refuses one the session has in another version, or cannot
     /// store, and this copy must not count it as taken). See [`ProjectEdit::applied_at_once`].
     pub fn edit_project(&mut self, edit: ProjectEdit) -> GuestMsg {
+        let target = match &edit {
+            ProjectEdit::AddPage { page } => Some(page.id.clone()),
+            ProjectEdit::RemovePage { id } => Some(id.clone()),
+            _ => None,
+        };
+        let has = |p: &Option<wc_core::Project>, id: &str| p.as_ref().is_some_and(|p| p.page(id).is_some());
+        let before = target.as_deref().map(|id| has(&self.project, id));
         if edit.applied_at_once()
             && let Some(p) = self.project.as_mut()
         {
             apply_edit(p, &edit);
         }
         self.last_edit += 1;
-        let structural = match &edit {
-            ProjectEdit::AddPage { page } => Some(page.id.clone()),
-            ProjectEdit::RemovePage { id } => Some(id.clone()),
-            _ => None,
-        };
+        // Only an edit that really added or removed the page here leaves content that is not
+        // the host's page (adding a page that is there already changes nothing).
+        let structural = target.filter(|id| before != Some(has(&self.project, id)));
         if let Some(page) = &structural {
             self.replaced.insert(page.clone(), self.last_edit);
         }
