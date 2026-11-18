@@ -752,6 +752,18 @@ fn a_new_wire_to_a_symbol_the_session_removed_is_a_clash() -> TestResult {
 }
 
 #[test]
+fn a_session_wire_to_a_symbol_removed_here_is_a_clash() -> TestResult {
+    let (mut base, mut auth, mut local) = three_copies()?;
+    // This window removed s2 and its wire; the session drew a new wire to s2.
+    local.pages[0].symbols.retain(|s| s.id != "s2");
+    local.pages[0].wires.clear();
+    auth.pages[0].wires.push(wire("w2", "s1", "s2")?);
+    assert_eq!(yield_to_session(&mut local, &mut base, &auth), ["page 1"]);
+    assert_eq!(local.pages[0], auth.pages[0], "no wire left hanging");
+    Ok(())
+}
+
+#[test]
 fn a_kept_edit_keeps_a_number_only_this_window_changed() -> TestResult {
     let (mut base, mut auth, mut local) = three_copies()?;
     auth.pages[0].title = "Restored".into();

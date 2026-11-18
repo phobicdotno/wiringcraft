@@ -200,7 +200,7 @@ pub fn outgoing(
 /// page with the local changes on top, or `None` when the two touched the same thing. Symbols
 /// and wires are matched by id, title-block fields by name; the title, size, underlay, the
 /// overview and cover marks, and the free graphics (which carry no id) each count as one thing.
-/// A local wire that ends at a symbol the session took away is a clash too. The page number is
+/// A wire that ends at a symbol the other side took away is a clash too. The page number is
 /// left as the session's.
 fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
     let mut page = auth.clone();
@@ -226,7 +226,6 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
     let dangling = page
         .wires
         .iter()
-        .filter(|w| !auth.wires.contains(w))
         .flat_map(|w| [&w.from, &w.to])
         .any(|end| matches!(end, wc_core::Endpoint::Pin { item, .. } if !symbols.contains(item.as_str())));
     (!dangling).then_some(page)
