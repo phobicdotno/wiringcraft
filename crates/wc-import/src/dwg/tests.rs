@@ -137,6 +137,8 @@ pub(super) struct TestSection {
     pub(super) listed_again: usize,
     /// Added to each page's stored data size in its header (a damaged file).
     pub(super) claimed_extra: u32,
+    /// Added to the page size the section map gives (a damaged file).
+    pub(super) page_size_extra: u32,
 }
 
 const MAX_PAGE_DATA: usize = 0x7400;
@@ -178,7 +180,7 @@ pub(super) fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> 
         let chunks: Vec<&[u8]> = section.data.chunks(MAX_PAGE_DATA).collect();
         map.extend((section.data.len() as u64).to_le_bytes());
         map.extend(((chunks.len() * (1 + section.listed_again)) as u32).to_le_bytes());
-        map.extend((MAX_PAGE_DATA as u32).to_le_bytes());
+        map.extend((MAX_PAGE_DATA as u32 + section.page_size_extra).to_le_bytes());
         map.extend(1u32.to_le_bytes());
         map.extend(if section.stored { 1u32 } else { 2 }.to_le_bytes());
         map.extend((index as u32 + 1).to_le_bytes());
@@ -585,5 +587,38 @@ fn a_compressed_page_costs_what_it_gives_not_the_page_size() -> TestResult {
     };
     let read = read_sections_with(&write_dwg(b"AC1024", &[section]), 1000)?;
     assert_eq!(read.get("AcDb:Classes").map(<[u8]>::len), Some(300));
+    Ok(())
+}
+
+#[test]
+fn a_page_short_of_what_its_section_needs_is_refused() -> TestResult {
+    // Two pages of 0x7400, but the section map says pages hold 0x100 more: the first page
+    // would leave a hole of zeros.
+    let section = TestSection {
+        name: "AcDb:AcDbObjects",
+        data: noise(MAX_PAGE_DATA + 100, 9),
+        page_size_extra: 0x100,
+        ..TestSection::default()
+    };
+    let m = read_sections(&write_dwg(b"AC1024", &[section])).map_err(|e| e.to_string());
+    assert!(m.as_ref().is_err_and(|m| m.contains("page 1 gives")), "{m:?}");
+    Ok(())
+}
+
+#[test]
+fn a_section_map_reaching_past_its_page_is_refused() -> TestResult {
+    let mut file = write_dwg(b"AC1024", &sample_sections()[..1]);
+    let at = file
+        .windows(4)
+        .rposition(|w| w == SECTION_MAP.to_le_bytes())
+        .ok_or("no section map")?;
+    let packed = u32::from_le_bytes(file[at + 8..at + 12].try_into()?);
+    file[at + 8..at + 12].copy_from_slice(&(packed + 0x1000).to_le_bytes());
+    let m = read_sections(&file).map_err(|e| e.to_string());
+    assert!(
+        m.as_ref()
+            .is_err_and(|m| m.contains("section map reaches past its page")),
+        "{m:?}"
+    );
     Ok(())
 }

@@ -134,15 +134,21 @@ pub fn read_sections_with(bytes: &[u8], max_total: usize) -> Result<Sections> {
         .ok_or_else(|| bad("the page map address is out of range"))?;
     let section_map_id = header.u32(0x5C)?;
 
-    let page_map = system_page(bytes, page_map_at, PAGE_MAP, "page map")?;
+    let page_map = system_page(bytes, page_map_at, None, PAGE_MAP, "page map")?;
     let pages = parse_page_map(&page_map, bytes.len())?;
 
-    let (section_map_at, _) = *pages.get(&section_map_id).ok_or_else(|| {
+    let (section_map_at, section_map_extent) = *pages.get(&section_map_id).ok_or_else(|| {
         bad(format!(
             "the section map (page {section_map_id}) is not in the page map"
         ))
     })?;
-    let section_map = system_page(bytes, section_map_at, SECTION_MAP, "section map")?;
+    let section_map = system_page(
+        bytes,
+        section_map_at,
+        Some(section_map_extent),
+        SECTION_MAP,
+        "section map",
+    )?;
     read_section_map(bytes, &section_map, &pages, version, max_total)
 }
 
@@ -171,7 +177,9 @@ pub(crate) fn unscramble_header(data: &[u8]) -> Vec<u8> {
 }
 
 /// Read a page map or section map page at `at`: check its type and decompress it.
-fn system_page(bytes: &[u8], at: u64, kind: u32, what: &str) -> Result<Vec<u8>> {
+/// `extent` is the page's size from the page map, which its header and data stay in (the page
+/// map itself is read before there is one).
+fn system_page(bytes: &[u8], at: u64, extent: Option<u64>, kind: u32, what: &str) -> Result<Vec<u8>> {
     let start = offset(at, bytes.len(), what)?;
     let head = Reader(
         bytes
@@ -183,6 +191,9 @@ fn system_page(bytes: &[u8], at: u64, kind: u32, what: &str) -> Result<Vec<u8>> 
     }
     let size = to_usize(head.u32(4)?, MAX_PAGE, what)?;
     let compressed_size = head.u32(8)? as usize;
+    if extent.is_some_and(|e| (SYSTEM_PAGE_HEADER + compressed_size) as u64 > e) {
+        return Err(bad(format!("the {what} reaches past its page")));
+    }
     let compression = head.u32(0x0C)?;
     let data_at = start + SYSTEM_PAGE_HEADER;
     let data = bytes
@@ -285,6 +296,14 @@ fn read_section_map(
                 .ok_or_else(|| bad(format!("section {name}, page {number} starts past its end")))?;
             let page = data_page(bytes, address, extent, compressed, max_page, &mut budget)
                 .map_err(|e| bad(format!("section {name}, page {number}: {e}")))?;
+            // A page short of what the section still needs from it would leave a hole of zeros.
+            let needs = (size - start).min(max_page as usize);
+            if page.len() < needs {
+                return Err(bad(format!(
+                    "section {name}, page {number} gives {} bytes, the section needs {needs} from it",
+                    page.len()
+                )));
+            }
             let end = start.saturating_add(page.len()).min(size);
             if data.len() < end {
                 data.resize(end, 0);
@@ -337,7 +356,8 @@ fn data_page(
         .get(data_at..data_at.saturating_add(data_size))
         .ok_or_else(|| bad("the page's data is cut off"))?;
     let too_much = || bad("the file's pages decompress to too much");
-    if data_size > *budget {
+    // Every page costs at least a byte, also an empty one listed many times.
+    if data_size.max(1) > *budget {
         return Err(too_much());
     }
     let page = match compressed {
@@ -347,7 +367,9 @@ fn data_page(
     };
     // What the page gave, or its stored bytes when more (reading them costs too, also for a
     // page listed many times).
-    *budget = budget.checked_sub(page.len().max(data_size)).ok_or_else(too_much)?;
+    *budget = budget
+        .checked_sub(page.len().max(data_size).max(1))
+        .ok_or_else(too_much)?;
     Ok(page)
 }
 
