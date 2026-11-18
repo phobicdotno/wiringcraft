@@ -90,6 +90,31 @@ impl Library {
         Ok((p, loc.source))
     }
 
+    /// Part `id` as source `source` has it (not necessarily the source that wins for it).
+    pub fn part_in(&self, source: &str, id: &str) -> Result<Part> {
+        store::check_id(id)?;
+        let not_found = || Error::NotFound {
+            kind: ItemKind::Part,
+            id: id.into(),
+        };
+        let s = self.sources.iter().find(|s| s.name == source).ok_or_else(not_found)?;
+        let path = s.root.join(ItemKind::Part.dir()).join(format!("{id}.json"));
+        // An entry that is there but cannot be followed (a link to nothing) says so.
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
+            Err(e) => return Err(wc_core::Error::io(&path, e).into()),
+            Ok(_) => {}
+        }
+        match std::fs::metadata(&path) {
+            Err(e) => return Err(wc_core::Error::io(&path, e).into()),
+            Ok(m) if !m.is_file() => {
+                return Err(wc_core::Error::io(&path, std::io::Error::other("it is not a file")).into());
+            }
+            Ok(_) => {}
+        }
+        Ok(store::read_json(&path)?)
+    }
+
     /// Every item id per kind, with the source that wins for it.
     pub fn index(&self, kind: ItemKind) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
