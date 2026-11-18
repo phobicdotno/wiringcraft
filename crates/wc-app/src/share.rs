@@ -1517,16 +1517,21 @@ fn rename_pictures(
         .chain(due)
         .collect();
     for file in files {
-        if let Some(theirs) = session.get(&file)
-            && matches!(wc_pdf::read_picture(&open.dir, &file), Ok(Some(data)) if data == *theirs)
-        {
-            renames_due.remove(&file);
-            pictures_out.remove(&file);
-            replaced.remove(&file);
-            if let Some(version) = picture_version(&open.dir, &file) {
-                pictures_taken.insert(file, version);
+        if let Some(theirs) = session.get(&file) {
+            // The version first: a write after it makes the next look read the file again.
+            let before = picture_version(&open.dir, &file);
+            if matches!(wc_pdf::read_picture(&open.dir, &file), Ok(Some(data)) if data == *theirs) {
+                renames_due.remove(&file);
+                pictures_out.remove(&file);
+                replaced.remove(&file);
+                // What the window showed while the file was another or gone is forgotten.
+                open.underlays.remove(&file);
+                open.picture_problems.remove(&file);
+                if let Some(version) = before {
+                    pictures_taken.insert(file, version);
+                }
+                continue;
             }
-            continue;
         }
         match rename_picture(open, &file) {
             Ok(new) => {

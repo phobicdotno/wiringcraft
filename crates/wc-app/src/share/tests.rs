@@ -2563,6 +2563,9 @@ fn a_picture_a_guest_put_back_before_the_session_refused_its_replacement_is_not_
     std::fs::write(guest_open.dir.join(&file), b"\x89PNG\r\n\x1a\nanother logo")?;
     g.frame(Some(&mut guest_open), Some("p0003".into()), false);
     assert!(g.pictures_replaced.contains(&file), "sent as a replacement");
+    // The window found nothing to show meanwhile (the file was gone for a moment).
+    guest_open.underlays.insert(file.clone(), None);
+    guest_open.picture_problems.insert(file.clone(), "missing".into());
     // Put back before the refusal comes in.
     std::fs::write(guest_open.dir.join(&file), PNG)?;
     for _ in 0..5 {
@@ -2579,6 +2582,9 @@ fn a_picture_a_guest_put_back_before_the_session_refused_its_replacement_is_not_
     assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
     assert_eq!(log.messages().len(), n, "{:?}", log.messages());
     assert!(!g.take_notes().iter().any(|n| n.contains("renamed")));
+    // Shown again: what the window found before is forgotten.
+    assert!(!guest_open.underlays.contains_key(&file));
+    assert!(!guest_open.picture_problems.contains_key(&file));
     // Taken as the session's again: more frames send nothing.
     assert!(g.pictures_replaced.is_empty());
     for _ in 0..3 {
