@@ -1130,11 +1130,28 @@ impl App {
                                     }
                                 });
                                 ui.label(m.source.as_str());
-                                if ui.add_enabled(m.error.is_none(), egui::Button::new("Insert")).clicked() {
-                                    let path = m.path.clone();
-                                    let name = m.name.clone();
-                                    then = Some(Box::new(move |app: &mut App| app.insert_macro(&path, &name)));
-                                    keep = false;
+                                if m.value_sets.is_empty() || m.error.is_some() {
+                                    if ui.add_enabled(m.error.is_none(), egui::Button::new("Insert")).clicked() {
+                                        let path = m.path.clone();
+                                        let name = m.name.clone();
+                                        then = Some(Box::new(move |app: &mut App| app.insert_macro(&path, &name, None)));
+                                        keep = false;
+                                    }
+                                } else {
+                                    // A macro with variants asks which one to insert.
+                                    ui.menu_button("Insert…", |ui| {
+                                        ui.label("Which variant?");
+                                        for set in &m.value_sets {
+                                            if ui.button(set.as_str()).clicked() {
+                                                let (path, name, set) = (m.path.clone(), m.name.clone(), set.clone());
+                                                then = Some(Box::new(move |app: &mut App| {
+                                                    app.insert_macro(&path, &name, Some(&set))
+                                                }));
+                                                keep = false;
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
                                 }
                                 ui.end_row();
                             }
@@ -2176,12 +2193,16 @@ impl App {
     }
 
     /// Insert a macro on the current page, selected so it can be dragged into place.
-    fn insert_macro(&mut self, path: &std::path::Path, name: &str) {
+    fn insert_macro(&mut self, path: &std::path::Path, name: &str, value_set: Option<&str>) {
         let page = self.ed.page;
         let Some(open) = self.open.as_mut() else { return };
-        match open.insert_macro(page, path) {
+        match open.insert_macro(page, path, value_set) {
             Ok(items) if !items.is_empty() => {
                 self.ed.tool = Tool::Select;
+                let name = match value_set {
+                    Some(set) => format!("{name} ({set})"),
+                    None => name.to_owned(),
+                };
                 self.ed.message = format!("Inserted macro {name}: drag it into place.");
                 self.ed.selection = items;
             }
