@@ -2470,3 +2470,80 @@ fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestRes
     assert_eq!(out.unreadable[0].0, "symbol lamp");
     Ok(())
 }
+
+#[test]
+fn a_guest_logo_named_like_an_unused_file_of_the_host_gets_a_name_of_its_own() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    host_open.save()?;
+    // An old logo the project no longer uses lies in the host's folder.
+    let old_logo = b"\x89PNG\r\n\x1a\nthe old logo";
+    std::fs::create_dir_all(host_open.dir.join(wc_core::Logo::DIR))?;
+    std::fs::write(host_open.dir.join("pictures/logo.png"), old_logo)?;
+    // The host records into git, as a real session does.
+    let journal = GitJournal::open(&host_open.dir)?;
+    let mut host = Host::new(
+        host_open.project.clone(),
+        "Hanna",
+        "hanna@example.com",
+        Box::new(journal),
+    );
+    let files = vendored_files(&host_open.dir, &host_open.project);
+    host.share_files(files.symbols, files.parts);
+    let mut h = Share {
+        role: Some(Role::Host(Box::new(Hosting {
+            host,
+            hub: Hub::new(),
+            listener: None,
+            announcer: None,
+            port: 0,
+            dir: host_open.dir.clone(),
+            took_updates: Vec::new(),
+        }))),
+        base: Some(host_open.project.clone()),
+        ..Default::default()
+    };
+    let mut join = |name: &str| -> std::result::Result<(Share, Open), Box<dyn std::error::Error>> {
+        let mut g = guest(&mut h, name, &tmp.path().join(name));
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        let ids = pending(&h);
+        approve(&mut h, ids[0], true);
+        let open = g.frame(None, None, false).ok_or("no project")?;
+        Ok((g, open))
+    };
+    let (mut g, mut guest_open) = join("Ola")?;
+    let (mut k, mut kari_open) = join("Kari")?;
+
+    // Ola picks a logo whose file name in Ola's own folder is free.
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    assert_eq!(guest_open.set_logo_from(&src)?, "pictures/logo.png");
+    for _ in 0..4 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        k.frame(Some(&mut kari_open), Some("p0001".into()), false);
+    }
+    let file = host_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(file, "pictures/logo.png", "a name of its own");
+    assert_eq!(guest_open.project.meta.logo, host_open.project.meta.logo);
+    assert_eq!(kari_open.project.meta.logo, host_open.project.meta.logo);
+    for dir in [&host_open.dir, &guest_open.dir, &kari_open.dir] {
+        assert_eq!(file_bytes(dir, &file)?, PNG, "{}", dir.display());
+    }
+    assert_eq!(
+        file_bytes(&host_open.dir, "pictures/logo.png")?,
+        old_logo,
+        "the old file is untouched"
+    );
+    let notes = g.take_notes();
+    assert!(
+        notes.iter().any(|n| n.contains(&format!("shared as {file}"))),
+        "{notes:?}"
+    );
+    Ok(())
+}

@@ -1125,6 +1125,59 @@ pub fn new_pictures(
     out
 }
 
+/// Copy the picture `file` of `open` under a new name in the same folder, one the session is not
+/// likely to have (the name with a mark of the moment), and make the project name it instead.
+/// The old file stays. Returns the new name.
+fn rename_picture(open: &mut Open, file: &str) -> Result<String, String> {
+    let data = std::fs::read(open.dir.join(file)).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let (folder, name) = file.rsplit_once('/').unwrap_or(("", file));
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    let mark = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+        % 0xff_ffff_ffff;
+    let mut new = String::new();
+    for n in 0..16u32 {
+        let base = if n == 0 {
+            format!("{stem}-{mark:x}")
+        } else {
+            format!("{stem}-{mark:x}-{n}")
+        };
+        let candidate = match (folder.is_empty(), ext.is_empty()) {
+            (true, true) => base,
+            (true, false) => format!("{base}.{ext}"),
+            (false, true) => format!("{folder}/{base}"),
+            (false, false) => format!("{folder}/{base}.{ext}"),
+        };
+        if std::fs::symlink_metadata(open.dir.join(&candidate)).is_err() {
+            new = candidate;
+            break;
+        }
+    }
+    if new.is_empty() {
+        return Err("no free name".into());
+    }
+    let picture = Picture {
+        file: new.clone(),
+        data,
+    };
+    wc_share::write_picture(&open.dir, &picture).map_err(|e| e.to_string())?;
+    if let Some(logo) = open.project.meta.logo.as_mut()
+        && logo.file == file
+    {
+        logo.file = new.clone();
+    }
+    for page in &mut open.project.pages {
+        if let Some(u) = page.underlay.as_mut()
+            && u.file == file
+        {
+            u.file = new.clone();
+        }
+    }
+    open.dirty = true;
+    Ok(new)
+}
+
 /// Write the session's pictures that `open` uses and has not taken yet (`taken`, by project
 /// path) into its folder, and forget what the window showed for them. A file of the same name
 /// with other content is never written over: a guest's copy starts in an empty folder, so such
@@ -1272,6 +1325,21 @@ impl Role {
         }
     }
 
+    /// Pictures this guest sent whose name the session has for another file
+    /// ([`wc_share::Refusal::PictureNameTaken`]), since the last call.
+    fn picture_names_taken(&mut self) -> Vec<String> {
+        match self {
+            Role::Host(_) => Vec::new(),
+            Role::Guest(j) => std::mem::take(&mut j.guest.refusals)
+                .into_iter()
+                .filter_map(|r| match r {
+                    wc_share::Refusal::PictureNameTaken { file } => Some(file),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
     /// The symbol and part files the session has, by id.
     fn files(&self) -> (&BTreeMap<String, Symbol>, &BTreeMap<String, Part>) {
         match self {
@@ -1410,7 +1478,13 @@ impl Role {
                         }
                     }
                 }
-                for r in std::mem::take(&mut j.guest.refusals) {
+                // A picture name the session has for another file is handled by renaming the
+                // picture ([`Role::picture_names_taken`]), not reported.
+                let (taken, other): (Vec<_>, Vec<_>) = std::mem::take(&mut j.guest.refusals)
+                    .into_iter()
+                    .partition(|r| matches!(r, wc_share::Refusal::PictureNameTaken { .. }));
+                j.guest.refusals = taken;
+                for r in other {
                     notes.push(format!("The host did not take a change: {r}"));
                 }
                 match j.guest.status {
@@ -2081,6 +2155,22 @@ impl Share {
                 base,
                 auth,
             );
+        }
+        // A picture whose name the session (or the host's folder) has for another file gets a
+        // new name here; the picture and the changes naming it go out again under that name.
+        for file in role.picture_names_taken() {
+            if !used_pictures(&open.project).contains(&file) {
+                continue;
+            }
+            self.pictures_out.remove(&file);
+            match rename_picture(open, &file) {
+                Ok(new) => self.notes.push(format!(
+                    "The session already has another file named {file}; your picture is shared as {new}."
+                )),
+                Err(why) => self.notes.push(format!(
+                    "The session already has another file named {file}, and your picture could not be given a new name: {why}"
+                )),
+            }
         }
         // Pictures used for the first time go out before the change that names them. Changes do
         // not wait for them: without its picture a page still works, it just shows a gap.

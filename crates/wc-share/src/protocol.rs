@@ -17,7 +17,7 @@ pub type PeerId = u32;
 /// before versions were sent counts as 0), since a message one side does not know cannot be
 /// read by the other. Raise it whenever a message, edit or field is added or changed in a way
 /// an older build cannot read.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The session protocol versions of a host and a guest that cannot work together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,6 +509,11 @@ pub enum Refusal {
     /// The change could not be written to the project's history, so it was undone.
     #[error("the change could not be recorded: {reason}")]
     NotRecorded { reason: String },
+    /// A picture ([`ProjectEdit::AddPicture`]) has a name the session or the host's folder
+    /// already uses for another file. The sender gives its picture a new name and sends it
+    /// again, with the changes that name it.
+    #[error("the session already has another file named {file}")]
+    PictureNameTaken { file: String },
 }
 
 /// The whole project as sent to a guest when they join.
