@@ -2,7 +2,7 @@
 //! sections [`super::read_sections`] returns.
 //!
 //! `AcDb:Handles` is the object map: each object's handle and where it starts in
-//! `AcDb:AcDbObjects`. Each object there is a size, then bit-packed data (see [`super::bits`]):
+//! `AcDb:AcDbObjects`. Each object there is a size, then bit-packed data:
 //! its type, its own handle and fields, and at the end a stream of references to other objects
 //! by handle (its owner, its layer, the block an INSERT shows). In AutoCAD 2010 drawings the
 //! texts of an object are in a third stream at the end of its data.
