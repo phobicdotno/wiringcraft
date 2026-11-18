@@ -1265,6 +1265,10 @@ fn free_graphics_merge_item_by_item() {
     assert_eq!(m(&[&a, &b], &[&b], &[&b, &text]), Some(vec![b.clone(), text.clone()]));
     // The same, but the session put a new line in its place (a moved to d): a clash.
     assert_eq!(m(&[&a, &b], &[&b, &d], &[&b, &text]), None);
+    // The same move made on both sides (a to c) and a text added here: agreed, text kept.
+    assert_eq!(m(&[&a], &[&c], &[&c, &text]), Some(vec![c.clone(), text.clone()]));
+    // Moved to different places on the two sides, with a text added here: still a clash.
+    assert_eq!(m(&[&a], &[&c], &[&d, &text]), None);
 }
 
 #[test]

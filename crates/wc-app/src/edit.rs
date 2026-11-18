@@ -92,8 +92,10 @@ fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
 
 /// Point the graphics in `sel` at the same items after the page's graphics changed from `old`
 /// to `new` (a shared session merged others' changes in, which can move an item to another
-/// place in the list). An item is found by its content, repeats by their order; a selected item
-/// that is gone is no longer selected. Symbols and wires are left as they are.
+/// place in the list). An item still in its place stays selected there; otherwise it is found
+/// by its content, repeats by their order when the list has as many copies as before. A selected
+/// item that is gone, or whose copies changed so it cannot be told apart, is no longer selected.
+/// Symbols and wires are left as they are.
 pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
     if old == new {
         return;
@@ -105,8 +107,15 @@ pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
         let Some(item) = old.get(*i) else {
             return false;
         };
+        if new.get(*i) == Some(item) {
+            return true;
+        }
+        let copies = |list: &[Shape]| list.iter().filter(|x| *x == item).count();
+        if copies(old) != copies(new) {
+            return false;
+        }
         // The how-many-th copy of this item it is, found again in the new list.
-        let nth = old[..*i].iter().filter(|x| *x == item).count();
+        let nth = copies(&old[..*i]);
         match new.iter().enumerate().filter(|(_, x)| *x == item).nth(nth) {
             Some((j, _)) => {
                 *i = j;
@@ -566,7 +575,8 @@ mod tests {
             Selection::Graphic(2),
             Selection::Graphic(3),
         ];
-        // Item 0 moved to the end, item 1 dropped, a second copy of item 2 came in front of it.
+        // Item 0 moved to the end, item 1 dropped, a second copy of item 2 came in: which of
+        // the two is the selected one cannot be told, so neither is selected.
         let old = [l(1.0), l(2.0), l(3.0), l(4.0)];
         let new = [l(3.0), l(3.0), l(4.0), l(1.0)];
         remap_graphics(&mut sel, &old, &new);
@@ -575,7 +585,6 @@ mod tests {
             vec![
                 Selection::Graphic(3),
                 Selection::Symbol("s1".into()),
-                Selection::Graphic(0),
                 Selection::Graphic(2)
             ]
         );
@@ -583,6 +592,21 @@ mod tests {
         let mut sel = vec![Selection::Graphic(1)];
         remap_graphics(&mut sel, &old, &new);
         assert!(sel.is_empty());
+        // Of two copies one changed: the one still in its place stays selected, the changed
+        // one is not handed to the other copy.
+        let (a, b, c) = (l(1.0), l(2.0), l(3.0));
+        let (old, new) = ([a.clone(), b.clone(), a.clone()], [c.clone(), b.clone(), a.clone()]);
+        let mut sel = vec![Selection::Graphic(2)];
+        remap_graphics(&mut sel, &old, &new);
+        assert_eq!(sel, vec![Selection::Graphic(2)]);
+        let mut sel = vec![Selection::Graphic(0)];
+        remap_graphics(&mut sel, &old, &new);
+        assert!(sel.is_empty());
+        // Repeats that all moved keep their order.
+        let new = [b.clone(), a.clone(), a.clone()];
+        let mut sel = vec![Selection::Graphic(0), Selection::Graphic(2)];
+        remap_graphics(&mut sel, &old, &new);
+        assert_eq!(sel, vec![Selection::Graphic(1), Selection::Graphic(2)]);
     }
     use crate::state::tests::project;
 

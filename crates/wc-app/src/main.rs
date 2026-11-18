@@ -317,11 +317,12 @@ impl App {
         {
             self.ed.page = o.project.pages.len().saturating_sub(1);
         }
-        if let (Some((id, old)), Some(o)) = (&graphics_before, &self.open)
-            && let Some(p) = o.project.pages.get(self.ed.page)
-            && &p.id == id
-        {
-            edit::remap_graphics(&mut self.ed.selection, old, &p.graphics);
+        if let Some((id, old)) = &graphics_before {
+            match self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page)) {
+                Some(p) if &p.id == id => edit::remap_graphics(&mut self.ed.selection, old, &p.graphics),
+                // The page was removed: what was selected on it is not on the page shown now.
+                _ => self.ed.selection.clear(),
+            }
         }
         self.ed.held_by = self.share.held_by_others();
         if let Some(o) = self.open.as_mut() {

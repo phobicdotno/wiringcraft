@@ -288,6 +288,15 @@ fn merge_unordered<T: PartialEq + Clone>(
     let removed_here = minus(base, local);
     let mut added_here = minus(local, base);
     let mut added_there = minus(auth, base);
+    // Additions made on both sides (the same move made here and there) are one change, agreed:
+    // already in the session's list, and no sign of a clash.
+    added_here.retain(|x| match added_there.iter().position(|y| y == x) {
+        Some(i) => {
+            added_there.swap_remove(i);
+            false
+        }
+        None => true,
+    });
     let mut out = auth.to_vec();
     for r in &removed_here {
         match out.iter().position(|x| x == r) {
@@ -300,13 +309,6 @@ fn merge_unordered<T: PartialEq + Clone>(
             None => {}
         }
     }
-    added_here.retain(|x| match added_there.iter().position(|y| y == x) {
-        Some(i) => {
-            added_there.swap_remove(i);
-            false
-        }
-        None => true,
-    });
     out.extend(added_here);
     Some(out)
 }
