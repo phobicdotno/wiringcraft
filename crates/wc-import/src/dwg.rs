@@ -191,7 +191,7 @@ fn system_page(bytes: &[u8], at: u64, extent: Option<u64>, kind: u32, what: &str
     }
     let size = to_usize(head.u32(4)?, MAX_PAGE, what)?;
     let compressed_size = head.u32(8)? as usize;
-    if extent.is_some_and(|e| (SYSTEM_PAGE_HEADER + compressed_size) as u64 > e) {
+    if extent.is_some_and(|e| SYSTEM_PAGE_HEADER as u64 + compressed_size as u64 > e) {
         return Err(bad(format!("the {what} reaches past its page")));
     }
     let compression = head.u32(0x0C)?;
@@ -297,6 +297,10 @@ fn read_section_map(
             let page = data_page(bytes, address, extent, compressed, max_page, &mut budget)
                 .map_err(|e| bad(format!("section {name}, page {number}: {e}")))?;
             // A page short of what the section still needs from it would leave a hole of zeros.
+            // A section with bytes to give needs pages that can hold some.
+            if max_page == 0 && start < size {
+                return Err(bad(format!("section {name} has pages of size 0")));
+            }
             let needs = (size - start).min(max_page as usize);
             if page.len() < needs {
                 return Err(bad(format!(
@@ -348,7 +352,7 @@ fn data_page(
     let data_size = to_usize(head.u32(0x08)?, MAX_PAGE, "page")?;
     // The data stays in the page the page map gives it (only the last page's padding may be
     // missing from the file, which the read below checks).
-    if (DATA_PAGE_HEADER + data_size) as u64 > extent {
+    if DATA_PAGE_HEADER as u64 + data_size as u64 > extent {
         return Err(bad("the page's data reaches past its page"));
     }
     let data_at = start + DATA_PAGE_HEADER;

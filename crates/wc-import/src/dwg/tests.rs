@@ -137,8 +137,8 @@ pub(super) struct TestSection {
     pub(super) listed_again: usize,
     /// Added to each page's stored data size in its header (a damaged file).
     pub(super) claimed_extra: u32,
-    /// Added to the page size the section map gives (a damaged file).
-    pub(super) page_size_extra: u32,
+    /// The page size the section map gives instead of the real one (a damaged file).
+    pub(super) page_size: Option<u32>,
 }
 
 const MAX_PAGE_DATA: usize = 0x7400;
@@ -180,7 +180,7 @@ pub(super) fn write_dwg(version: &[u8; 6], sections: &[TestSection]) -> Vec<u8> 
         let chunks: Vec<&[u8]> = section.data.chunks(MAX_PAGE_DATA).collect();
         map.extend((section.data.len() as u64).to_le_bytes());
         map.extend(((chunks.len() * (1 + section.listed_again)) as u32).to_le_bytes());
-        map.extend((MAX_PAGE_DATA as u32 + section.page_size_extra).to_le_bytes());
+        map.extend(section.page_size.unwrap_or(MAX_PAGE_DATA as u32).to_le_bytes());
         map.extend(1u32.to_le_bytes());
         map.extend(if section.stored { 1u32 } else { 2 }.to_le_bytes());
         map.extend((index as u32 + 1).to_le_bytes());
@@ -597,7 +597,7 @@ fn a_page_short_of_what_its_section_needs_is_refused() -> TestResult {
     let section = TestSection {
         name: "AcDb:AcDbObjects",
         data: noise(MAX_PAGE_DATA + 100, 9),
-        page_size_extra: 0x100,
+        page_size: Some(MAX_PAGE_DATA as u32 + 0x100),
         ..TestSection::default()
     };
     let m = read_sections(&write_dwg(b"AC1024", &[section])).map_err(|e| e.to_string());
@@ -620,5 +620,19 @@ fn a_section_map_reaching_past_its_page_is_refused() -> TestResult {
             .is_err_and(|m| m.contains("section map reaches past its page")),
         "{m:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn a_section_with_pages_of_size_0_is_refused() -> TestResult {
+    let section = TestSection {
+        name: "AcDb:Classes",
+        data: noise(300, 10),
+        stored: true,
+        page_size: Some(0),
+        ..TestSection::default()
+    };
+    let m = read_sections(&write_dwg(b"AC1024", &[section])).map_err(|e| e.to_string());
+    assert!(m.as_ref().is_err_and(|m| m.contains("pages of size 0")), "{m:?}");
     Ok(())
 }
