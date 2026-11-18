@@ -1823,20 +1823,40 @@ impl Held {
                     }
                 }
             }
-            for b in base.panels.iter().filter(|b| panel_mentions(b, &was)) {
-                if let Some(l) = local.panels.iter().find(|l| l.id == b.id) {
-                    to.extend(new_tags.iter().filter(|t| panel_mentions(l, &|x| x == *t)).cloned());
+            // Panel footprints and jumpers carry no id: the same entry at the same place, with
+            // only its tag changed, is the renamed one.
+            use wc_core::panel::PanelItem;
+            for b in &base.panels {
+                let Some(l) = local.panels.iter().find(|l| l.id == b.id) else {
+                    continue;
+                };
+                for (bi, li) in b.items.iter().zip(&l.items) {
+                    if let (
+                        PanelItem::Device {
+                            tag: bt,
+                            at: ba,
+                            width: bw,
+                            height: bh,
+                        },
+                        PanelItem::Device {
+                            tag: lt,
+                            at: la,
+                            width: lw,
+                            height: lh,
+                        },
+                    ) = (bi, li)
+                        && was(bt)
+                        && named(lt)
+                        && (ba, bw, bh) == (la, lw, lh)
+                    {
+                        to.insert(lt.clone());
+                    }
                 }
             }
-            if base.meta.jumpers.iter().any(|j| was(&j.strip)) {
-                to.extend(
-                    local
-                        .meta
-                        .jumpers
-                        .iter()
-                        .filter(|j| named(&j.strip))
-                        .map(|j| j.strip.clone()),
-                );
+            for (bj, lj) in base.meta.jumpers.iter().zip(&local.meta.jumpers) {
+                if was(&bj.strip) && named(&lj.strip) && (&bj.terminals, &bj.part) == (&lj.terminals, &lj.part) {
+                    to.insert(lj.strip.clone());
+                }
             }
             to
         };

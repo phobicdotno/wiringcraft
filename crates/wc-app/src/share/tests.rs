@@ -2712,6 +2712,62 @@ fn a_device_removed_beside_a_waiting_rename_goes_out_at_once() -> TestResult {
 }
 
 #[test]
+fn a_device_removed_beside_a_waiting_rename_on_a_panel_goes_out_at_once() -> TestResult {
+    use wc_core::panel::{Panel, PanelItem};
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let k9 = wc_core::DeviceTag::parse("-K9")?;
+    let mut base = Project::new("Test");
+    let mut panel = Panel::new("pn1", "Plate", 400.0, 300.0);
+    for (tag, x) in [(&k1, 10.0), (&k9, 60.0)] {
+        panel.items.push(PanelItem::Device {
+            tag: tag.clone(),
+            at: wc_core::geom::Point::new(x, 10.0),
+            width: 20.0,
+            height: 40.0,
+        });
+    }
+    base.panels.push(panel);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k9.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    // -K9 leaves the device list but keeps its footprint on the plate.
+    local.devices.remove(&k9);
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.relay")]));
+    assert!(held.now.devices.contains_key(&k1));
+    assert!(held.now.devices.contains_key(&k2));
+    assert!(!held.now.devices.contains_key(&k9));
+    Ok(())
+}
+
+#[test]
+fn a_device_removed_beside_a_waiting_rename_with_jumpers_goes_out_at_once() -> TestResult {
+    let x1 = wc_core::DeviceTag::parse("-X1")?;
+    let x2 = wc_core::DeviceTag::parse("-X2")?;
+    let x9 = wc_core::DeviceTag::parse("-X9")?;
+    let mut base = Project::new("Test");
+    for strip in [&x1, &x9] {
+        base.meta.jumpers.push(wc_core::project::Jumper {
+            strip: strip.clone(),
+            terminals: vec!["1".into(), "2".into()],
+            part: None,
+        });
+        base.devices.insert(strip.clone(), wc_core::Device::default());
+    }
+    let mut local = base.clone();
+    local.rename_device(&x1, &x2);
+    local.devices.get_mut(&x2).ok_or("no -X2")?.part = Some("acme.strip".into());
+    local.devices.remove(&x9);
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.strip")]));
+    assert!(held.now.devices.contains_key(&x1));
+    assert!(held.now.devices.contains_key(&x2));
+    assert!(!held.now.devices.contains_key(&x9));
+    Ok(())
+}
+
+#[test]
 fn a_waiting_rename_is_dropped_whole_when_the_session_changed_one_of_its_pages() -> TestResult {
     let k1 = wc_core::DeviceTag::parse("-K1")?;
     let k2 = wc_core::DeviceTag::parse("-K2")?;
