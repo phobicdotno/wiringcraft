@@ -602,10 +602,11 @@ enum ImportCmd {
     /// The libraries of a SolidWorks Electrical archive (.tewzip): catalog parts with their
     /// terminals, cable types with their cores, and symbol blocks with their connection points,
     /// drawn from the archive's block DWG files (boxes where a block has none). A symbol or part
-    /// the project already vendors with other content (an earlier import's box) is refused, not
-    /// replaced. To take the drawn version into such a project, import with --lib into a library
-    /// folder, add that folder as a source (`lib add`) and run `lib update <id>`. Into a library
-    /// folder with --lib, else vendored into the project.
+    /// the project already vendors is replaced by the new version (an earlier import's box by
+    /// the drawn block) when its copy is still the one the project pins; a copy changed in the
+    /// project is refused, not replaced. To take the new version into such a project, import
+    /// with --lib into a library folder, add that folder as a source (`lib add`) and run
+    /// `lib update <id>`. Into a library folder with --lib, else vendored into the project.
     SweLibrary {
         path: PathBuf,
         /// A library folder to write into instead of the project.
@@ -1807,8 +1808,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             let (n_dev, n_pages) = (built.devices.len(), built.pages.len());
             let n_drawn = built.pages.iter().filter(|pg| pg.id.starts_with("eplan-page-")).count();
-            add_built(dir, &mut p, built, &source)?;
-            save(dir, &p)?;
+            add_and_save(dir, &mut p, built, &source)?;
             println!(
                 "imported {} Eplan pages as {n_pages} page(s), {n_drawn} of them as drawn: {n_dev} devices, {} \
                  connections",
@@ -1965,8 +1965,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             );
             // Through the shared preflight: conflicts are refused before anything is written.
             let (n_pages, n_dev) = (built.pages.len(), built.devices.len());
-            add_built(dir, &mut p, built, &source)?;
-            save(dir, &p)?;
+            add_and_save(dir, &mut p, built, &source)?;
             println!(
                 "imported {n_dev} devices, {} connections on {n_pages} page(s)",
                 imp.links.len()
@@ -2745,8 +2744,7 @@ fn import_swe_library(
                 parts: got.parts,
                 ..Default::default()
             };
-            add_built(dir, &mut p, built, source)?;
-            save(dir, &p)?;
+            add_and_save(dir, &mut p, built, source)?;
         }
     }
     Ok((got.report, got.warnings))
@@ -3114,7 +3112,38 @@ fn fill_cover(p: &mut Project, fields: std::collections::BTreeMap<String, String
     }
 }
 
-fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, source: &str) -> Result<(), String> {
+/// What [`add_built`] wrote: each vendored file with what it held before (none when it had no
+/// such file), for [`put_files_back`] when the save after it fails.
+type Written = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+/// [`add_built`], then save: when the save fails, the vendored files go back as they were, so
+/// each still matches the pin the project's files keep.
+fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str) -> Res<()> {
+    let written = add_built(dir, p, built, source)?;
+    if let Err(err) = save(dir, p) {
+        let failed = put_files_back(&written);
+        if failed.is_empty() {
+            return Err(err);
+        }
+        return Err(format!(
+            "{err}; putting back the vendored files failed too: {}",
+            failed.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+/// Put each file back as it was ([`put_file_back`]), the last written first. Returns why each
+/// one that could not be put back failed.
+fn put_files_back(files: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
+    files
+        .iter()
+        .rev()
+        .filter_map(|(path, before)| put_file_back(path, before.as_deref()).err())
+        .collect()
+}
+
+fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, source: &str) -> Result<Written, String> {
     let cover_fields = keep_one_cover(p, &mut built.pages);
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of
     // an earlier one and then fail half way.
@@ -3204,11 +3233,7 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
         .chain(built.parts.iter().map(|x| store::write_vendored_part(dir, x)));
     for (n, written) in writes.enumerate() {
         if let Err(err) = written {
-            let failed: Vec<String> = files[..n]
-                .iter()
-                .rev()
-                .filter_map(|(path, before)| put_file_back(path, before.as_deref()).err())
-                .collect();
+            let failed = put_files_back(&files[..n]);
             if failed.is_empty() {
                 return Err(err.to_string());
             }
@@ -3257,7 +3282,7 @@ fn add_built(dir: &Path, p: &mut Project, mut built: wc_import::aml::Built, sour
     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
     // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
     p.meta.fill_title_block(built.title_block);
-    Ok(())
+    Ok(files)
 }
 
 /// The path and bytes of a vendored copy, kept before an import replaces it.
@@ -4146,6 +4171,27 @@ mod tests {
         );
         std::fs::remove_dir(&blocker).unwrap();
         assert_eq!(std::fs::read(&coil_file).unwrap(), coil_bytes, "put back");
+        assert_eq!(load(&dir).unwrap().lock, lock);
+
+        // A save that fails after the files were written puts them back as well.
+        let lock_blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&lock_blocker).unwrap();
+        let mut p = load(&dir).unwrap();
+        assert!(
+            add_and_save(
+                &dir,
+                &mut p,
+                built("Coil, drawn again", "Relay 24 V, v2"),
+                "import:a.tewzip"
+            )
+            .is_err()
+        );
+        std::fs::remove_dir(&lock_blocker).unwrap();
+        assert_eq!(
+            std::fs::read(&coil_file).unwrap(),
+            coil_bytes,
+            "put back after the failed save"
+        );
         assert_eq!(load(&dir).unwrap().lock, lock);
 
         // Changed in the project since: still refused, and nothing is written.
