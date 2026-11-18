@@ -23,6 +23,8 @@ const MAX_ROWS: usize = 1_048_576;
 /// Most cells read in all, the empty ones a row skips included: a row with one cell in column
 /// `XFD` holds 16,384, so this bounds memory, not only the row count.
 const MAX_CELLS: usize = 20_000_000;
+/// Most text kept in all: one long shared string referenced from every row is copied each time.
+const MAX_TEXT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Whether `bytes` look like an Office Open XML package (a zip file).
 pub fn is_xlsx(bytes: &[u8]) -> bool {
@@ -265,7 +267,9 @@ impl Cell {
                 .and_then(|i| strings.get(i).cloned())
                 .unwrap_or_default(),
             "inlineStr" => unescape_xstring(&self.inline),
-            "str" | "e" => self.value,
+            // A formula's cached text is escaped like any other string.
+            "str" => unescape_xstring(&self.value),
+            "e" => self.value,
             "b" => match self.value.trim() {
                 "1" => "TRUE".into(),
                 "0" => "FALSE".into(),
@@ -277,6 +281,12 @@ impl Cell {
 }
 
 fn sheet_rows(xml: &str, strings: &[String]) -> Result<Vec<Vec<String>>> {
+    sheet_rows_within(xml, strings, MAX_TEXT_BYTES)
+}
+
+/// [`sheet_rows`] keeping at most `max_text` bytes of cell text.
+fn sheet_rows_within(xml: &str, strings: &[String], max_text: usize) -> Result<Vec<Vec<String>>> {
+    let mut text_bytes = 0usize;
     let mut r = Reader::from_str(xml);
     let mut out: Vec<Vec<String>> = Vec::new();
     let mut row: BTreeMap<usize, String> = BTreeMap::new();
@@ -328,6 +338,13 @@ fn sheet_rows(xml: &str, strings: &[String]) -> Result<Vec<Vec<String>>> {
                     if let Some(c) = cell.take() {
                         let column = c.column;
                         let text = c.text(strings);
+                        text_bytes = text_bytes.saturating_add(text.len());
+                        if text_bytes > max_text {
+                            return Err(Error::Format(format!(
+                                "xlsx: more than {} MB of cell text",
+                                max_text / 1024 / 1024
+                            )));
+                        }
                         if !text.is_empty() {
                             row.insert(column, text);
                         }
@@ -597,5 +614,32 @@ mod tests {
         let err = rows(&bytes).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(!err.contains('\u{1b}') && !err.contains('\u{7}'), "{err:?}");
         assert!(err.contains("\\u{1b}"), "{err:?}");
+    }
+
+    #[test]
+    fn a_shared_string_repeated_on_every_row_stops_at_the_text_budget() {
+        let long = "x".repeat(1024 * 1024);
+        let mut xml = String::from("<worksheet><sheetData>");
+        for _ in 0..3 {
+            xml.push_str(r#"<row><c t="s"><v>0</v></c></row>"#);
+        }
+        xml.push_str("</sheetData></worksheet>");
+        let strings = [long];
+        assert!(sheet_rows_within(&xml, &strings, 3 * 1024 * 1024).is_ok());
+        let err = sheet_rows_within(&xml, &strings, 2 * 1024 * 1024 + 1)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("cell text"), "{err}");
+    }
+
+    #[test]
+    fn a_cached_formula_string_is_unescaped() -> Result<()> {
+        let xml = r#"<worksheet><sheetData><row><c t="str"><f>A1</f><v>part_x005F_x0041_</v></c><c t="str"><v>plain</v></c></row></sheetData></worksheet>"#;
+        assert_eq!(
+            sheet_rows(xml, &[])?,
+            vec![vec!["part_x0041_".to_owned(), "plain".into()]]
+        );
+        Ok(())
     }
 }
