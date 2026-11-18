@@ -127,6 +127,10 @@ enum Cmd {
     /// The project logo, shown on the cover page and in every title block.
     #[command(subcommand)]
     Logo(LogoCmd),
+    /// The project's revisions, the clouds that mark their changes on pages, and the table
+    /// that lists them.
+    #[command(subcommand)]
+    Revision(RevisionCmd),
     /// The page template: the frame's reference columns and the title block's boxes.
     #[command(subcommand)]
     Template(TemplateCmd),
@@ -357,6 +361,64 @@ enum LogoCmd {
     Set { file: PathBuf },
     /// Take the logo off the cover page and the title blocks; its file stays in the project.
     Remove,
+}
+
+#[derive(Subcommand)]
+enum RevisionCmd {
+    /// List the revisions, oldest first, and the clouds on each page.
+    List,
+    /// Add a revision after the others.
+    Add {
+        letter: String,
+        /// What changed.
+        #[arg(long, default_value = "")]
+        text: String,
+        #[arg(long, default_value = "")]
+        date: String,
+        /// Who made it.
+        #[arg(long, default_value = "")]
+        by: String,
+    },
+    /// Change a revision's description, date and author.
+    Edit {
+        letter: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        date: Option<String>,
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Remove a revision; refused while a cloud carries it.
+    Remove { letter: String },
+    /// Draw a cloud on a page around the rectangle from (x1, y1) to (x2, y2), in mm.
+    Cloud {
+        page: String,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        /// The revision in its tag; the latest when left out.
+        #[arg(long)]
+        rev: Option<String>,
+    },
+    /// Remove a page's clouds: the one at an index `revision list` shows, or with `--rev` every
+    /// cloud of that revision.
+    Uncloud {
+        page: String,
+        index: Option<usize>,
+        #[arg(long)]
+        rev: Option<String>,
+    },
+    /// Show the revision table on a page with its top-left corner at (x, y) in mm, or take it
+    /// off with `--off`.
+    Table {
+        page: String,
+        x: Option<f64>,
+        y: Option<f64>,
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1296,6 +1358,91 @@ fn run(cli: Cli) -> Res<()> {
                 }
                 LogoCmd::Remove => {
                     if p.meta.logo.take().is_some() {
+                        save(dir, &p)?;
+                    }
+                }
+            }
+        }
+        Cmd::Revision(rc) => {
+            let mut p = load(dir)?;
+            match rc {
+                RevisionCmd::List => {
+                    for r in &p.meta.revisions {
+                        println!("{}\t{}\t{}\t{}", r.letter, r.date, r.author, r.text);
+                    }
+                    for pg in &p.pages {
+                        for (i, c) in pg.clouds.iter().enumerate() {
+                            println!(
+                                "page {} cloud {i}: revision {} at {:.1},{:.1} to {:.1},{:.1}",
+                                pg.id, c.revision, c.min.x, c.min.y, c.max.x, c.max.y
+                            );
+                        }
+                        if let Some(at) = pg.revision_table {
+                            println!("page {} table at {:.1},{:.1}", pg.id, at.x, at.y);
+                        }
+                    }
+                }
+                RevisionCmd::Add { letter, text, date, by } => {
+                    p.add_revision(&letter, &date, &text, &by).map_err(e)?;
+                    save(dir, &p)?;
+                }
+                RevisionCmd::Edit { letter, text, date, by } => {
+                    let r = p
+                        .revision(&letter)
+                        .cloned()
+                        .ok_or_else(|| format!("no revision {}", letter.trim()))?;
+                    let changed = p
+                        .edit_revision(
+                            &letter,
+                            date.as_deref().unwrap_or(&r.date),
+                            text.as_deref().unwrap_or(&r.text),
+                            by.as_deref().unwrap_or(&r.author),
+                        )
+                        .map_err(e)?;
+                    if changed {
+                        save(dir, &p)?;
+                    }
+                }
+                RevisionCmd::Remove { letter } => {
+                    p.remove_revision(&letter).map_err(e)?;
+                    save(dir, &p)?;
+                }
+                RevisionCmd::Cloud {
+                    page,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    rev,
+                } => {
+                    let i = p
+                        .add_cloud(&page, Point::new(x1, y1), Point::new(x2, y2), rev.as_deref())
+                        .map_err(e)?;
+                    save(dir, &p)?;
+                    println!("{i}");
+                }
+                RevisionCmd::Uncloud { page, index, rev } => {
+                    let pg = p.page_mut(&page).ok_or_else(|| format!("no page {page:?}"))?;
+                    let before = pg.clouds.len();
+                    match (index, rev) {
+                        (Some(i), None) if i < before => {
+                            pg.clouds.remove(i);
+                        }
+                        (Some(i), None) => return Err(format!("page {page:?} has no cloud {i}")),
+                        (None, Some(r)) => pg.clouds.retain(|c| c.revision != r.trim()),
+                        _ => return Err("give a cloud's index or --rev, not both".into()),
+                    }
+                    if pg.clouds.len() != before {
+                        save(dir, &p)?;
+                    }
+                }
+                RevisionCmd::Table { page, x, y, off } => {
+                    let at = match (x, y, off) {
+                        (Some(x), Some(y), false) => Some(Point::new(x, y)),
+                        (None, None, true) => None,
+                        _ => return Err("give x and y, or --off".into()),
+                    };
+                    if p.set_revision_table(&page, at).map_err(e)? {
                         save(dir, &p)?;
                     }
                 }

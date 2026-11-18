@@ -16,6 +16,7 @@ pub mod panel;
 pub mod part;
 pub mod project;
 pub mod review;
+pub mod revision;
 pub mod route;
 pub mod store;
 pub mod symbol;
@@ -31,5 +32,6 @@ pub use project::{
     Underlay, Wire, WireSpec,
 };
 pub use review::{Comment, Reply};
+pub use revision::{Revision, RevisionCloud};
 pub use symbol::{BoxPin, BoxSide, Pin, Symbol, black_box};
 pub use tag::DeviceTag;

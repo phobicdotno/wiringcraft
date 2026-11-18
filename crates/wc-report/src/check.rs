@@ -55,6 +55,23 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
     let mut out = Vec::new();
     let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
 
+    // Revision clouds whose revision the project does not list.
+    for page in &p.pages {
+        for (n, c) in page.clouds.iter().enumerate() {
+            if p.revision(&c.revision).is_none() {
+                out.push(at(
+                    page,
+                    &format!("cloud {n}"),
+                    Severity::Warning,
+                    format!(
+                        "a cloud carries revision {}, which the project does not list",
+                        c.revision
+                    ),
+                ));
+            }
+        }
+    }
+
     // Symbols missing from the project's library copy, and wires on missing symbols or pins.
     for page in &p.pages {
         for s in &page.symbols {

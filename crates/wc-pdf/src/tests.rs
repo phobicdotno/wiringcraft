@@ -1474,3 +1474,44 @@ fn a_report_after_a_short_first_page_prints_on_the_larger_sheet() {
     let strip = media(project.pages[0].size.mm());
     assert_eq!(boxes, [strip.as_str(), strip.as_str(), media(want.mm()).as_str()]);
 }
+
+#[test]
+fn revision_clouds_and_the_revision_table_are_drawn() -> Result<(), String> {
+    let mut project = Project::new("Revisions");
+    project.pages = vec![Page::new("p1", "1", "Power")];
+    project
+        .add_revision("A", "2026-11-01", "First issue", "OP")
+        .map_err(|e| e.to_string())?;
+    project
+        .add_revision("B", "2026-11-18", "Motor added", "OP")
+        .map_err(|e| e.to_string())?;
+    let plain = String::from_utf8_lossy(&export(&project, &BTreeMap::new(), &Options::default()).0).into_owned();
+    project
+        .add_cloud("p1", Point::new(50.0, 50.0), Point::new(110.0, 80.0), None)
+        .map_err(|e| e.to_string())?;
+    project
+        .set_revision_table("p1", Some(Point::new(200.0, 30.0)))
+        .map_err(|e| e.to_string())?;
+    let (bytes, report) = export(&project, &BTreeMap::new(), &Options::default());
+    let pdf = String::from_utf8_lossy(&bytes);
+    for text in ["Rev", "Description", "First issue", "Motor added", "2026-11-18"] {
+        assert!(
+            pdf.contains(&format!("{} Tj", writer::pdf_text(text))),
+            "{text} is printed"
+        );
+    }
+    // The cloud's tag carries its revision letter, and its scallops add curves.
+    assert!(pdf.contains(&format!("{} Tj", writer::pdf_text("B"))));
+    assert!(pdf.matches(" c\n").count() > plain.matches(" c\n").count() + 20);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    // A cloud of a revision the project no longer lists is reported.
+    project.meta.revisions.pop();
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(
+        report.warnings.iter().any(|w| w.contains("revision B")),
+        "{:?}",
+        report.warnings
+    );
+    Ok(())
+}

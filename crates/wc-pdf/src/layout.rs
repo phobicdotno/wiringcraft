@@ -780,6 +780,32 @@ pub fn draw_page(
         pen.end_layer();
     }
 
+    // Revision clouds and the revision table.
+    if !page.clouds.is_empty() || page.revision_table.is_some() {
+        pen.begin_layer(Layer::Drawings);
+        for c in &page.clouds {
+            if !c.is_valid() {
+                warnings.push(format!("page {}: a revision cloud has no area", page.number));
+            }
+            for s in c.shapes() {
+                draw_shape(&mut pen, &s);
+            }
+        }
+        if let Some(at) = page.revision_table {
+            for s in wc_core::revision::table_shapes(&project.meta.revisions, at) {
+                draw_shape(&mut pen, &s);
+            }
+        }
+        pen.end_layer();
+    }
+    for (number, letter) in project.clouds_without_revision() {
+        if number == page.number {
+            warnings.push(format!(
+                "page {number}: a cloud carries revision {letter}, which the project does not list"
+            ));
+        }
+    }
+
     // Wires under symbols.
     pen.colour(0.0, 0.0, 0.0);
     pen.width(0.35);
