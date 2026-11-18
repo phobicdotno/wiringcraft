@@ -520,7 +520,7 @@ pub fn cover_logo_default(project: &Project, page: &Page) -> (Point, Point) {
     let band = project.meta.template.band_height();
     let (x0, y0, x1, ty) = (MARGIN, MARGIN + HEADER, w - MARGIN, h - MARGIN - band);
     let cx = (x0 + x1) / 2.0;
-    let name_y = cover_name_y(cover_rows(project, "").len(), project.meta.logo.is_some(), y0, ty);
+    let name_y = cover_name_y(cover_rows(project, "").len(), default_cover_logo(project), y0, ty);
     let top = y0 + COVER_LOGO_TOP;
     let bottom = (name_y - COVER_LOGO_TO_NAME).max(top + COVER_LOGO_MIN);
     let half = 45.0_f64.min((x1 - x0) / 2.0 - 5.0);
@@ -597,6 +597,12 @@ fn cover_name_y(rows: usize, logo: bool, y0: f64, y1: f64) -> f64 {
     ideal.min(y1 - needed).max(highest)
 }
 
+/// Whether the cover shows the project's logo in its default place, above the name: only then
+/// does the name leave room for it.
+fn default_cover_logo(project: &Project) -> bool {
+    project.meta.logo.as_ref().is_some_and(|l| l.cover.is_none())
+}
+
 /// How many rows of the cover's field table fit on a cover whose drawing area runs from `y0`
 /// to `y1` and lists `rows` fields, at no less than [`COVER_MIN_ROW`] each.
 fn cover_fits(rows: usize, logo: bool, y0: f64, y1: f64) -> usize {
@@ -649,7 +655,7 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     };
     let fit = |t: &str, height: f64| fit_height(t, height, x1 - x0 - 10.0);
     let mut rows = cover_rows(project, date);
-    let logo = project.meta.logo.is_some();
+    let logo = default_cover_logo(project);
     let name_y = cover_name_y(rows.len(), logo, y0, y1);
     let name = &project.meta.name;
     push_text((cx, name_y), fit(name, 9.0), Align::Center, name, Ink::Thin, out);
@@ -747,7 +753,7 @@ pub fn draw_page(
         if rows.iter().any(|(_, v)| !v.trim().is_empty())
             && cover_fits(
                 rows.len(),
-                project.meta.logo.is_some(),
+                default_cover_logo(project),
                 MARGIN + HEADER,
                 h - MARGIN - band,
             ) == 0

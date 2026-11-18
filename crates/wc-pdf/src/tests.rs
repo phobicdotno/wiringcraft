@@ -951,6 +951,38 @@ fn a_cover_too_short_for_any_field_is_a_warning() -> Result<(), String> {
 }
 
 #[test]
+fn only_a_logo_in_its_default_place_takes_room_from_the_cover_table() -> Result<(), String> {
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p1", "1", "Cover");
+    cover.cover = true;
+    cover.size = PageSize::custom(297, 100)?;
+    project.meta.template.height = 30.0;
+    project.meta.title_block.insert("customer".into(), "Acme".into());
+    project.pages = vec![cover];
+    let mut logo = wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    };
+    project.meta.logo = Some(logo.clone());
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(
+        report.warnings.iter().any(|w| w.contains("too short")),
+        "{:?}",
+        report.warnings
+    );
+    // Moved off to the side, the logo leaves the name where it is without one.
+    logo.cover = Some((wc_core::Point::new(200.0, 20.0), wc_core::Point::new(280.0, 40.0)));
+    project.meta.logo = Some(logo);
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("too short")),
+        "{:?}",
+        report.warnings
+    );
+    Ok(())
+}
+
+#[test]
 fn text_widths_are_helvetica_advance_widths() {
     // Adobe Helvetica AFM: W 944, O 778, H 722, e 556, l 222, o 556, i 222, space 278.
     let em_mm = |units: f64| units / 1000.0 * (10.0 / 0.72);
