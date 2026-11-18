@@ -256,8 +256,9 @@ fn pick<T: PartialEq + Clone>(base: &T, auth: &T, local: &T) -> Option<T> {
 /// added twice). A change to an item is its removal and the new version's addition, so `None` (a
 /// clash) when an item removed here is gone from the session too and this window added an item
 /// that may be its new version (`same_kind`, such as another line for a line): it was most
-/// likely changed here and removed or changed by the session. Removed on both sides with nothing
-/// of its kind added here is no clash.
+/// likely changed here and removed or changed by the session. Likewise when the session added
+/// such an item: it most likely changed the item this window deleted. Removed on both sides
+/// with nothing of its kind added on either side is no clash.
 fn merge_unordered<T: PartialEq + Clone>(
     base: &[T],
     auth: &[T],
@@ -293,8 +294,9 @@ fn merge_unordered<T: PartialEq + Clone>(
             Some(i) => {
                 out.remove(i);
             }
-            // Gone from the session too: a clash if it may have been changed here.
-            None if added_here.iter().any(|a| same_kind(a, r)) => return None,
+            // Gone from the session too: a clash if it may have been changed here, or if the
+            // session may have changed it (deleted here, moved there).
+            None if added_here.iter().chain(&added_there).any(|a| same_kind(a, r)) => return None,
             None => {}
         }
     }

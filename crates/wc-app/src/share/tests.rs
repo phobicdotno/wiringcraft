@@ -1256,12 +1256,15 @@ fn free_graphics_merge_item_by_item() {
     assert_eq!(m(&[&a, &b], &[&a, &b], &[&c, &b]), Some(vec![c.clone(), b.clone()]));
     // Changed here (a to c) while the session changed it too (a to b): a clash.
     assert_eq!(m(&[&a], &[&b], &[&c]), None);
+    // Deleted here while the session moved it (a to c): a clash, not a silent comeback.
+    assert_eq!(m(&[&a, &b], &[&c, &b], &[&b]), None);
+    // Deleted here while the session added only a text: no clash.
+    assert_eq!(m(&[&a, &b], &[&b, &text], &[&b]), Some(vec![b.clone(), text.clone()]));
     // Deleted on both sides while a text was added here: the text cannot be the line's new
     // version, so it is kept.
-    assert_eq!(
-        m(&[&a, &b], &[&b, &d], &[&b, &text]),
-        Some(vec![b.clone(), d.clone(), text.clone()])
-    );
+    assert_eq!(m(&[&a, &b], &[&b], &[&b, &text]), Some(vec![b.clone(), text.clone()]));
+    // The same, but the session put a new line in its place (a moved to d): a clash.
+    assert_eq!(m(&[&a, &b], &[&b, &d], &[&b, &text]), None);
 }
 
 #[test]
