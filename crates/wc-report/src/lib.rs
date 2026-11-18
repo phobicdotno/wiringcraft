@@ -22,7 +22,7 @@ mod tests;
 pub use aml::{AmlCounts, automationml};
 pub use check::{Finding, Severity, check, check_table};
 pub use marking::{
-    Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,
+    LEVEL_SEPARATOR, Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,
     marking_list_with, parse_kinds, parse_lines, terminal_strips, to_smartscript_csv,
 };
 pub use plc::{PlcVariables, plc_variables};
@@ -477,7 +477,60 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
     t
 }
 
+/// The device property that makes a terminal one level of a multi-level (double- or triple-deck)
+/// terminal: `1` is the bottom level, `2` the next one up. A terminal with level 2 or more sits on
+/// the same terminal block as the terminal before it in the strip, so `-X1.1` (level 1) and
+/// `-X1.2` (level 2) are one two-level terminal.
+pub const LEVEL_PROPERTY: &str = "Level";
+
+/// A [`LEVEL_PROPERTY`] value as a level, or why it is not one.
+fn parse_level(value: &str) -> Result<u32, String> {
+    match value.trim().parse::<u32>() {
+        Ok(0) => Err("levels start at 1".into()),
+        Ok(l) => Ok(l),
+        Err(e) => Err(format!("not a whole number ({e})")),
+    }
+}
+
+/// A terminal's [`LEVEL_PROPERTY`] value, `None` when it has none.
+fn level_value<'p>(project: &'p wc_core::Project, strip: &str, number: &str) -> Option<&'p str> {
+    let tag = DeviceTag::parse(&format!("{strip}.{number}")).ok()?;
+    project
+        .devices
+        .get(&tag)?
+        .properties
+        .get(LEVEL_PROPERTY)
+        .map(String::as_str)
+}
+
+/// A terminal's level from its [`LEVEL_PROPERTY`]; `None` when it has none or the value is not a
+/// level ([`level_warnings`] says which and why).
+fn terminal_level(project: &wc_core::Project, strip: &str, number: &str) -> Option<u32> {
+    parse_level(level_value(project, strip, number)?).ok()
+}
+
+/// One warning for each device whose [`LEVEL_PROPERTY`] is set but is not a level, naming the
+/// device, the value and the reason. Such a terminal counts as single-level in the terminal plan
+/// and the marking export.
+pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
+    project
+        .devices
+        .iter()
+        .filter_map(|(tag, dev)| {
+            let value = dev.properties.get(LEVEL_PROPERTY)?;
+            let reason = parse_level(value).err()?;
+            Some(format!(
+                "{tag}: {LEVEL_PROPERTY} {value:?} is ignored: {reason}; the terminal counts as single-level"
+            ))
+        })
+        .collect()
+}
+
 /// Terminal plan: for every terminal strip, each terminal with what connects to its two sides.
+///
+/// The last column is the terminal's level on a multi-level terminal (see [`LEVEL_PROPERTY`]):
+/// empty for a single-level terminal, and `1` for the bottom level of a block even when only the
+/// levels above it say so.
 ///
 /// A terminal is a symbol with the terminal role. Its strip and number come from the tag:
 /// `-X1.3` is terminal 3 of strip `-X1`. Terminals tagged with just the strip (`-X1`) are
@@ -493,6 +546,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             "Potential",
             "Page",
             "Jumpered with",
+            "Level",
         ],
     );
     // The potential column sees jumpers; the Upper and Lower columns show what is wired to that
@@ -592,7 +646,8 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             let ka = a.number.as_deref().map(natural_key);
             let kb = b.number.as_deref().map(natural_key);
             match (ka, kb) {
-                (Some(x), Some(y)) => x.cmp(&y),
+                // `1` and `01` have equal keys: order them exactly too, as the marking export does.
+                (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.number.cmp(&b.number)),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => page_order(&a.page_id)
@@ -605,12 +660,42 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
             .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
             .max()
             .unwrap_or(0);
-        for term in list {
-            let number = term
-                .number
-                .clone()
-                .or_else(|| wc_core::project::next_number(&mut next))
-                .unwrap_or_default();
+        let numbered: Vec<(Term, String)> = list
+            .into_iter()
+            .map(|term| {
+                let number = term
+                    .number
+                    .clone()
+                    .or_else(|| wc_core::project::next_number(&mut next))
+                    .unwrap_or_default();
+                (term, number)
+            })
+            .collect();
+        // Levels are inferred over distinct terminals: a terminal drawn twice has one level.
+        let mut distinct: Vec<&str> = numbered.iter().map(|(_, n)| n.as_str()).collect();
+        distinct.dedup();
+        let mut by_number: BTreeMap<&str, u32> = BTreeMap::new();
+        for (k, n) in distinct.iter().enumerate() {
+            let own = terminal_level(i.project, &strip, n);
+            // The bottom level of a block needs no property of its own: the level above says so.
+            // A bad value is not missing: that terminal stays single-level, as its warning says.
+            let missing = level_value(i.project, &strip, n).is_none();
+            let below = || {
+                distinct
+                    .get(k + 1)
+                    .and_then(|up| terminal_level(i.project, &strip, up))
+                    .filter(|l| missing && *l >= 2)
+                    .map(|_| 1)
+            };
+            if let Some(l) = own.or_else(below) {
+                by_number.insert(n, l);
+            }
+        }
+        let levels: Vec<Option<u32>> = numbered
+            .iter()
+            .map(|(_, n)| by_number.get(n.as_str()).copied())
+            .collect();
+        for ((term, number), level) in numbered.into_iter().zip(levels) {
             let side = |n: usize| -> (String, Option<String>) {
                 let Some(pin) = term.pins.get(n) else {
                     return (String::new(), None);
@@ -628,6 +713,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 pa.or(pb).unwrap_or_default(),
                 term.page.clone(),
                 term.jumpered.clone(),
+                level.map(|l| l.to_string()).unwrap_or_default(),
             ]);
         }
     }

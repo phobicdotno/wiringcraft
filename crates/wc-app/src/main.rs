@@ -132,6 +132,8 @@ enum Dialog {
         strip: Option<String>,
         /// The project's terminal strips, for the strip menu.
         strips: Vec<String>,
+        /// Between the numbers of a multi-level terminal's levels on its marker.
+        level_separator: String,
     },
 }
 
@@ -1660,6 +1662,7 @@ impl App {
                     language,
                     strip,
                     strips,
+                    level_separator,
                 } => {
                     use wc_report::{Language, LineField, MarkerKind};
                     let field_label = |f: LineField| match f {
@@ -1720,6 +1723,13 @@ impl App {
                                     }
                                 });
                             ui.end_row();
+                            ui.label("Level separator");
+                            ui.add(egui::TextEdit::singleline(level_separator).desired_width(60.0))
+                                .on_hover_text(
+                                    "Between the numbers of a multi-level terminal's levels on its one marker \
+                                     (a terminal's level is its Level property)",
+                                );
+                            ui.end_row();
                         });
                     ui.weak(
                         "The marker text is a device's Marker property when it has one, otherwise its tag. \
@@ -1741,6 +1751,7 @@ impl App {
                                 lines: chosen_lines(lines),
                                 language: *language,
                                 strip: strip.clone(),
+                                level_separator: level_separator.clone(),
                             };
                             then = Some(Box::new(move |app: &mut App| {
                                 if let Some(o) = app.open.as_ref() {
@@ -2404,6 +2415,7 @@ fn wago_marking_dialog(open: &Open, strip: Option<String>) -> Dialog {
         language: wc_report::Language::En,
         strip,
         strips: wc_report::terminal_strips(&inputs),
+        level_separator: wc_report::LEVEL_SEPARATOR.to_owned(),
     }
 }
 
@@ -2445,7 +2457,10 @@ fn export_wago_marking(open: &Open, options: &wc_report::MarkingOptions) -> Stri
                 t.rows.len(),
                 path.display()
             );
-            for w in wc_report::formula_warnings(&t) {
+            for w in wc_report::formula_warnings(&t)
+                .into_iter()
+                .chain(wc_report::level_warnings(inputs.project))
+            {
                 msg.push_str("\n\nWarning: ");
                 msg.push_str(&w);
             }
@@ -3295,6 +3310,7 @@ mod marking_tests {
             lines: vec![wc_report::LineField::Marker, wc_report::LineField::Description],
             language: wc_report::Language::De,
             strip,
+            level_separator: wc_report::LEVEL_SEPARATOR.to_owned(),
         };
         let msg = export_wago_marking(&o, &options);
         assert!(
