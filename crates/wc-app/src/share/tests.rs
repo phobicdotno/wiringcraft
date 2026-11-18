@@ -888,6 +888,31 @@ fn a_refused_rename_on_your_own_page_takes_back_the_page_and_a_move_made_meanwhi
 }
 
 #[test]
+fn a_refused_rename_on_your_own_page_puts_the_page_back_after_it_was_deleted_meanwhile() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), coil) =
+        session_with_a_coil_on_the_guests_page(tmp.path())?;
+    let (k1, k2) = (DeviceTag::parse("-K1")?, DeviceTag::parse("-K2")?);
+    let start = coil_on(&guest_open, &coil)?;
+    host_open.project.devices.get_mut(&k1).ok_or("no -K1")?.description = "Pump contactor".into();
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    guest_open.project.rename_device(&k1, &k2);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // The guest deletes its page before the answer comes.
+    guest_open.project.pages.retain(|p| p.id != "p0003");
+    g.frame(Some(&mut guest_open), Some("p0002".into()), false);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0002"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0002"));
+
+    // The refused action is not kept: the page is back, and the session never lost it.
+    assert_eq!(coil_on(&host_open, &coil)?, start);
+    assert_eq!(coil_on(&guest_open, &coil)?, start);
+    assert_eq!(host_open.project.pages, guest_open.project.pages);
+    assert_eq!(host_open.project.devices, guest_open.project.devices);
+    Ok(())
+}
+
+#[test]
 fn a_refused_rename_on_your_own_page_is_taken_back_also_when_the_session_ends_with_it() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, _log, mut host_open, mut g, mut guest_open), coil) =
@@ -904,6 +929,9 @@ fn a_refused_rename_on_your_own_page_is_taken_back_also_when_the_session_ends_wi
     g.frame(Some(&mut guest_open), Some("p0003".into()), false);
     assert!(!g.active());
     assert_eq!(coil_on(&guest_open, &coil)?, start);
+    // The device records come back with the page: -K1 as the session has it, no -K2.
+    assert_eq!(guest_open.project.devices.get(&k1), host_open.project.devices.get(&k1));
+    assert!(!guest_open.project.devices.contains_key(&k2));
     assert!(g.take_notes().iter().any(|n| n.contains("nor what you did on it")));
     Ok(())
 }
@@ -3410,4 +3438,8 @@ fn a_page_too_large_to_go_twice_in_one_message_is_not_folded_into_the_batch() {
     base.pages[0].title = "x".repeat(FOLD_LIMIT / 2);
     let out = fold(&base, "y".repeat(FOLD_LIMIT / 2));
     assert!(out.page.is_some() && out.edits.len() == 1);
+    // One that fits, though it is more than half of what a message may carry, is folded.
+    base.pages[0].title = "x".repeat(net::MAX_LINE * 3 / 8);
+    let out = fold(&base, "y".repeat(net::MAX_LINE * 3 / 8));
+    assert!(out.page.is_none() && out.edits.len() == 2);
 }

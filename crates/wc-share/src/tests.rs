@@ -3596,3 +3596,46 @@ fn pages_written_by_project_edits_may_not_start_using_a_symbol_the_session_lacks
     assert_eq!(host.project().page("p0003").ok_or("page")?.symbols.len(), 1);
     Ok(())
 }
+
+#[test]
+fn a_page_set_is_judged_by_which_wire_ends_dangle_not_by_their_labels() -> TestResult {
+    // A wire already on a pin the locked version lacks (drawn before the update).
+    let mut project = demo();
+    wired(&mut project.pages[1], "A2");
+    let mut host = Host::new(
+        project,
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(coil_with(&["A1"]), "starter".into())],
+        parts: vec![],
+    })?;
+    let was = host.project().page("p0002").ok_or("page")?.clone();
+
+    // A tag given to the coil relabels the end already dangling: no new end, accepted.
+    let mut page = was.clone();
+    page.symbols.iter_mut().find(|s| s.id == "k1").ok_or("k1")?.tag = Some(wc_core::DeviceTag::parse("-K5")?);
+    host.edit_project(ProjectEdit::SetPages {
+        pages: vec![page.clone()],
+        before: vec![was],
+    })?;
+
+    // A second wire on the same missing pin has the same label, but is a new end: refused.
+    let before = host.project().clone();
+    let mut more = page.clone();
+    let mut second = more.wires[0].clone();
+    second.id = "w2".into();
+    more.wires.push(second);
+    let err = host
+        .edit_project(ProjectEdit::SetPages {
+            pages: vec![more],
+            before: vec![page],
+        })
+        .err()
+        .ok_or("refused")?;
+    assert!(err.to_string().contains("-K5:A2"), "{err}");
+    assert_eq!(host.project(), &before);
+    Ok(())
+}
