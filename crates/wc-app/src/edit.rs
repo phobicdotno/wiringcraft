@@ -167,6 +167,13 @@ pub fn graphic_bounds(g: &Shape) -> (Point, Point) {
             });
             wc_core::geom::bounds_of(&corners)
         }
+        // The drawn part of an arc, so a selection box around a quarter arc takes it.
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => wc_core::geom::bounds_of(&crate::canvas::arc_points(*center, *radius, *start, *end)),
         _ => g.bounds(),
     }
 }

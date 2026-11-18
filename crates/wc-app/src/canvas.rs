@@ -1796,6 +1796,18 @@ mod tests {
             end: 450.0,
         };
         assert!(graphic_hit(&more_than_full, Point::new(-10.0, 0.0), 0.5));
+        // A box around the drawn quarter arc holds it (not the whole circle).
+        let quarter = Shape::Arc {
+            center: Point::new(100.0, 100.0),
+            radius: 10.0,
+            start: 0.0,
+            end: 90.0,
+        };
+        let (a, b) = crate::edit::graphic_bounds(&quarter);
+        assert!(
+            a.x >= 99.0 && a.y >= 99.0 && b.x <= 111.0 && b.y <= 111.0,
+            "{a:?} {b:?}"
+        );
         assert!(graphic_hit(&g[2], Point::new(160.0, 60.0), 0.5), "the closing side");
 
         // Undo takes the last one back off; moving and deleting work like other drawings.
