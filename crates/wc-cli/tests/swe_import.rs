@@ -148,6 +148,14 @@ fn an_imported_jumper_stays_on_the_sources_terminals_when_the_import_renumbers_t
     // The drawn connection is imported as a wire; the jumper's record is not.
     let wires: usize = p.pages.iter().map(|pg| pg.wires.len()).sum();
     assert_eq!(wires, 1, "{:?}", p.pages.iter().map(|pg| &pg.wires).collect::<Vec<_>>());
+    let wire = p.pages.iter().flat_map(|pg| &pg.wires).next().ok_or("no wire")?;
+    // Wire 91: terminal 2's second connection point to terminal 9's first (wire 90 is the
+    // other way round).
+    let pin = |item: &str, pin: &str| wc_core::Endpoint::Pin {
+        item: item.into(),
+        pin: pin.into(),
+    };
+    assert_eq!((&wire.from, &wire.to), (&pin("s20", "2"), &pin("s21", "1")), "{wire:?}");
 
     // And the WAGO configurator list built from the saved project says the same.
     let csv = tmp.path().join("wago.csv");
