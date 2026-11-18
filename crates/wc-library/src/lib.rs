@@ -297,18 +297,55 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
 /// Copy the library's current version of an item into the project and pin it.
 /// Returns the new lock entry.
 pub fn take(project_dir: &Path, project: &mut Project, lib: &Library, kind: ItemKind, id: &str) -> Result<LockEntry> {
-    let entry = match kind {
+    let item = fetch(lib, kind, id, None)?;
+    store_item(project_dir, project, id, item)
+}
+
+/// An item read from the library to be written into a project, with its lock entry.
+enum Fetched {
+    Symbol(Symbol, LockEntry),
+    Part(Part, LockEntry),
+}
+
+/// Read item `id` from the library and check that its file holds that id and, when `hash` is
+/// given, that it is that version.
+fn fetch(lib: &Library, kind: ItemKind, id: &str, hash: Option<&str>) -> Result<Fetched> {
+    let moved = |source: &str, what: &str| Error::Source {
+        name: source.to_owned(),
+        message: format!("the {what} {id} changed in the library while it was being updated; update again"),
+    };
+    Ok(match kind {
         ItemKind::Symbol => {
             let (s, source) = lib.symbol(id)?;
             same_id(&source, "symbol", id, &s.id)?;
-            store::write_vendored_symbol(project_dir, &s)?;
-            LockEntry { source, hash: s.hash() }
+            let h = s.hash();
+            if hash.is_some_and(|want| want != h) {
+                return Err(moved(&source, "symbol"));
+            }
+            Fetched::Symbol(s, LockEntry { source, hash: h })
         }
         ItemKind::Part => {
             let (p, source) = lib.part(id)?;
             same_id(&source, "part", id, &p.id)?;
+            let h = p.hash();
+            if hash.is_some_and(|want| want != h) {
+                return Err(moved(&source, "part"));
+            }
+            Fetched::Part(p, LockEntry { source, hash: h })
+        }
+    })
+}
+
+/// Write a fetched item into the project folder and pin it.
+fn store_item(project_dir: &Path, project: &mut Project, id: &str, item: Fetched) -> Result<LockEntry> {
+    let (kind, entry) = match item {
+        Fetched::Symbol(s, entry) => {
+            store::write_vendored_symbol(project_dir, &s)?;
+            (ItemKind::Symbol, entry)
+        }
+        Fetched::Part(p, entry) => {
             store::write_vendored_part(project_dir, &p)?;
-            LockEntry { source, hash: p.hash() }
+            (ItemKind::Part, entry)
         }
     };
     project.lock.map_mut(kind).insert(id.to_owned(), entry.clone());
@@ -427,57 +464,48 @@ pub fn changed(all: &[ItemStatus], only: Option<&[String]>) -> Vec<(ItemKind, St
 
 /// Take exactly these library versions, in order: each item `(kind, id, hash)` only in the
 /// version with that hash, read once and written as read. What a caller that looked at
-/// [`status`] first and kept copies of what it is about to replace uses, so nothing is written
-/// that it has not seen. An item whose library version is another one by now is an error. Stops
-/// at the first item that cannot be taken (items before it are taken already). Returns the
-/// items.
+/// [`status`] first uses, so nothing is written that it has not seen. Every item is read and
+/// checked before any is written: an item whose library version is another one by now is an
+/// error and nothing is taken. When a write fails, the files already written are put back as
+/// they were and the lock is left as it was. Returns the items.
 pub fn update_items(
     project_dir: &Path,
     project: &mut Project,
     lib: &Library,
     items: &[(ItemKind, String, String)],
 ) -> Result<Vec<(ItemKind, String)>> {
-    for (kind, id, hash) in items {
-        take_version(project_dir, project, lib, *kind, id, hash)?;
+    let fetched = items
+        .iter()
+        .map(|(kind, id, hash)| fetch(lib, *kind, id, Some(hash)))
+        .collect::<Result<Vec<_>>>()?;
+    let lock = project.lock.clone();
+    let mut written: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for ((kind, id, _), item) in items.iter().zip(fetched) {
+        let path = store::vendor_path(project_dir, *kind, id)?;
+        let was = std::fs::read_to_string(&path).ok();
+        if let Err(e) = store_item(project_dir, project, id, item) {
+            written.push((path, was));
+            for (path, was) in written.into_iter().rev() {
+                // Best effort: the update's own error is what the caller sees.
+                let _ = match was {
+                    Some(text) => store::write_if_changed(&path, &text).map(|_| ()),
+                    None => std::fs::remove_file(&path)
+                        .or_else(|e| {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                Ok(())
+                            } else {
+                                Err(e)
+                            }
+                        })
+                        .map_err(|e| wc_core::Error::io(&path, e)),
+                };
+            }
+            project.lock = lock;
+            return Err(e);
+        }
+        written.push((path, was));
     }
     Ok(items.iter().map(|(k, id, _)| (*k, id.clone())).collect())
-}
-
-/// [`take`], only when the library's version has `hash`.
-fn take_version(
-    project_dir: &Path,
-    project: &mut Project,
-    lib: &Library,
-    kind: ItemKind,
-    id: &str,
-    hash: &str,
-) -> Result<LockEntry> {
-    let moved = |source: &str, what: &str| Error::Source {
-        name: source.to_owned(),
-        message: format!("the {what} {id} changed in the library while it was being updated; update again"),
-    };
-    let entry = match kind {
-        ItemKind::Symbol => {
-            let (s, source) = lib.symbol(id)?;
-            same_id(&source, "symbol", id, &s.id)?;
-            if s.hash() != hash {
-                return Err(moved(&source, "symbol"));
-            }
-            store::write_vendored_symbol(project_dir, &s)?;
-            LockEntry { source, hash: s.hash() }
-        }
-        ItemKind::Part => {
-            let (p, source) = lib.part(id)?;
-            same_id(&source, "part", id, &p.id)?;
-            if p.hash() != hash {
-                return Err(moved(&source, "part"));
-            }
-            store::write_vendored_part(project_dir, &p)?;
-            LockEntry { source, hash: p.hash() }
-        }
-    };
-    project.lock.map_mut(kind).insert(id.to_owned(), entry.clone());
-    Ok(entry)
 }
 
 /// Propose a project's vendored version of an item back to a library source. The file goes to

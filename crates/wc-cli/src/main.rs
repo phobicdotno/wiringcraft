@@ -2048,7 +2048,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                         let mut p = load(dir)?;
                         let id = format!("dxf-{next}");
                         next += 1;
-                        if p.page(&id).is_some() {
+                        // Page files are named by id, and some folders do not tell `DXF-300`
+                        // from `dxf-300`.
+                        if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
                             // Never added over an earlier page: removing it again on failure
                             // would delete that page.
                             Err(format!(
@@ -2058,15 +2060,17 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                             p.pages
                                 .push(Page::new(id.clone(), (next - 1).to_string(), name.clone()));
                             p.sort_pages();
-                            save(dir, &p)?;
-                            let r = import_cmd(
-                                dir,
-                                ImportCmd::PageDxf {
-                                    file: path.clone(),
-                                    page: id.clone(),
-                                    scale: 1.0,
-                                },
-                            );
+                            // A save that fails part way is cleaned up like a failed import.
+                            let r = save(dir, &p).and_then(|()| {
+                                import_cmd(
+                                    dir,
+                                    ImportCmd::PageDxf {
+                                        file: path.clone(),
+                                        page: id.clone(),
+                                        scale: 1.0,
+                                    },
+                                )
+                            });
                             // A drawing that could not be imported leaves no blank page behind.
                             // When that fails too, the entry's own error still counts and the
                             // other entries still come in.
@@ -2158,12 +2162,12 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             // What is in the vendor folder now, so a write that fails part way leaves no copy
             // without its pin (a retry would skip a readable one).
-            let before: Vec<(PathBuf, Option<Vec<u8>>)> = needed
+            let before: Vec<(PathBuf, Option<String>)> = needed
                 .iter()
                 .map(|id| {
                     let path = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
-                    let was = match std::fs::read(&path) {
-                        Ok(bytes) => Some(bytes),
+                    let was = match std::fs::read_to_string(&path) {
+                        Ok(text) => Some(text),
                         Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
                         Err(x) => return Err(format!("{}: {x}", path.display())),
                     };
@@ -2174,17 +2178,20 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 let failed: Vec<String> = before
                     .iter()
                     .filter_map(|(path, was)| {
+                        // Written only when it differs, and whole or not at all.
                         let r = match was {
-                            Some(bytes) => std::fs::write(path, bytes),
+                            Some(text) => store::write_if_changed(path, text)
+                                .map(|_| ())
+                                .map_err(|x| x.to_string()),
                             None => std::fs::remove_file(path).or_else(|x| {
                                 if x.kind() == std::io::ErrorKind::NotFound {
                                     Ok(())
                                 } else {
-                                    Err(x)
+                                    Err(format!("{}: {x}", path.display()))
                                 }
                             }),
                         };
-                        r.err().map(|x| format!("{}: {x}", path.display()))
+                        r.err()
                     })
                     .collect();
                 if failed.is_empty() {
@@ -3587,6 +3594,20 @@ mod tests {
         assert!(err.contains("no-such-page"), "{err}");
         assert!(store::read_vendored_symbol(&dir, "aa.good").is_err());
 
+        // A copy that cannot be written after `aa.good` was copied takes that copy away again.
+        let blocked = store::vendor_path(&dir, ItemKind::Symbol, "zz.bad").unwrap();
+        let mut tmp_path = blocked.as_os_str().to_owned();
+        tmp_path.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_path);
+        std::fs::create_dir_all(&tmp_path).unwrap();
+        cli(&dir, &args).unwrap_err();
+        assert!(
+            store::read_vendored_symbol(&dir, "aa.good").is_err(),
+            "the copy written first is gone again"
+        );
+        assert!(!load(&dir).unwrap().lock.symbols.contains_key("aa.good"));
+        std::fs::remove_dir(&tmp_path).unwrap();
+
         // And the retry pins both.
         cli(&dir, &args).unwrap();
         let p = load(&dir).unwrap();
@@ -4217,6 +4238,18 @@ mod tests {
         let p = load(&dir).unwrap();
         assert_eq!(p.page("dxf-300"), Some(&earlier));
         assert_eq!(p.pages.len(), pages + 1);
+
+        // Nor one whose id differs only in case: its file may be the same file.
+        let mut p = load(&dir).unwrap();
+        p.pages.retain(|pg| pg.id != "dxf-300");
+        let mut upper = Page::new("DXF-300", "299", "Earlier drawing");
+        upper.title_block.insert("revision".into(), "C".into());
+        p.pages.push(upper.clone());
+        save(&dir, &p).unwrap();
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.page("DXF-300"), Some(&upper));
+        assert!(p.page("dxf-300").is_none());
     }
 
     #[test]

@@ -381,3 +381,62 @@ fn lock_missing_reports_a_file_that_turns_wrong_after_the_scan_and_pins_the_rest
     assert!(!f.project.lock.symbols.contains_key("bb"));
     Ok(())
 }
+
+#[test]
+fn an_update_checks_every_item_before_it_writes_any() -> Result<()> {
+    let mut f = fixture()?;
+    // Both placed, so both are pinned.
+    f.project.pages[0].symbols.push(PlacedSymbol {
+        id: "s2".into(),
+        symbol: "other".into(),
+        at: Point::new(30.0, 10.0),
+        rotation: Default::default(),
+        mirror: false,
+        tag: None,
+    });
+    let lib = Library::open(&f.proj, &f.project)?;
+    assert!(lock_missing(&f.proj, &mut f.project, &lib)?.is_empty());
+    let lock = f.project.lock.clone();
+    write_symbol(&f.company, &sym("coil", 12.5))?;
+    write_symbol(&f.company, &sym("other", 6.0))?;
+    let all = status(&f.proj, &f.project, &lib);
+    let todo = changed(&all, None);
+    assert_eq!(todo.len(), 2);
+    // The second one changes again after it was looked at: nothing is taken, not even the
+    // first, so the files and the lock still agree.
+    write_symbol(&f.company, &sym("other", 7.0))?;
+    let r = update_items(&f.proj, &mut f.project, &lib, &todo);
+    assert!(r.is_err_and(|e| {
+        e.to_string()
+            .contains("changed in the library while it was being updated")
+    }));
+    assert_eq!(f.project.lock, lock);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "other")?.pins[1].at.y,
+        5.0
+    );
+
+    // A write that fails puts back what was written before it and leaves the lock as it was.
+    let todo = changed(&status(&f.proj, &f.project, &lib), None);
+    let other = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "other")?;
+    let mut tmp = other.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::create_dir_all(PathBuf::from(&tmp)).map_err(|e| wc_core::Error::io("tmp", e))?;
+    assert!(update_items(&f.proj, &mut f.project, &lib, &todo).is_err());
+    assert_eq!(f.project.lock, lock);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    std::fs::remove_dir(PathBuf::from(&tmp)).map_err(|e| wc_core::Error::io("tmp", e))?;
+    assert_eq!(update_items(&f.proj, &mut f.project, &lib, &todo)?.len(), 2);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "other")?.pins[1].at.y,
+        7.0
+    );
+    Ok(())
+}
