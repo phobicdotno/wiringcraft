@@ -553,6 +553,13 @@ pub const SPARE_PAGE: &str = "spare";
 /// terminal strip editor put the strip in another order ([`wc_core::project::StripLayout`]);
 /// its spare terminals are listed with [`SPARE_PAGE`] in the Page column.
 pub fn terminal_plan(i: &Inputs<'_>) -> Table {
+    terminal_plan_with_spares(i).0
+}
+
+/// [`terminal_plan`], with which of its rows are spare terminals (by row index): a spare is
+/// known by where it comes from, not by what its Page cell says.
+pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usize>) {
+    let mut spare_rows: BTreeSet<usize> = BTreeSet::new();
     let mut t = Table::new(
         "Terminal plan",
         &[
@@ -701,7 +708,8 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
         let mut usual: Vec<String> = numbered.iter().map(|(_, n)| n.clone()).collect();
         usual.dedup();
         for spare in layout.iter().flat_map(|l| &l.spares) {
-            if usual.contains(spare) || level_value(i.project, &strip, spare).is_none() {
+            // Only a valid level of its own counts; a bad value is reported by level_warnings.
+            if usual.contains(spare) || terminal_level(i.project, &strip, spare).is_none() {
                 continue;
             }
             let key = (natural_key(spare), spare.clone());
@@ -776,6 +784,7 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                             .join(", ")
                     })
                     .unwrap_or_default();
+                spare_rows.insert(t.rows.len());
                 t.rows.push(vec![
                     strip.clone(),
                     number,
@@ -811,9 +820,9 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
     }
     // A spare has no wiring of its own, but a jumper to a drawn terminal puts it on that
     // terminal's potential.
-    for k in 0..t.rows.len() {
+    for &k in &spare_rows {
         let Some(row) = t.rows.get(k) else { continue };
-        if row[5] != SPARE_PAGE || !row[4].is_empty() {
+        if !row[4].is_empty() {
             continue;
         }
         let (strip, number) = (row[0].clone(), row[1].clone());
@@ -829,13 +838,16 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
         let potential = t
             .rows
             .iter()
-            .find(|r| r[0] == strip && r[5] != SPARE_PAGE && jumper.terminals.contains(&r[1]) && !r[4].is_empty())
-            .map(|r| r[4].clone());
+            .enumerate()
+            .find(|(n, r)| {
+                !spare_rows.contains(n) && r[0] == strip && jumper.terminals.contains(&r[1]) && !r[4].is_empty()
+            })
+            .map(|(_, r)| r[4].clone());
         if let (Some(p), Some(row)) = (potential, t.rows.get_mut(k)) {
             row[4] = p;
         }
     }
-    t
+    (t, spare_rows)
 }
 
 /// Table of contents: every schematic page with its title and what is drawn on it.

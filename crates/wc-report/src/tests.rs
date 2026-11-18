@@ -1495,4 +1495,32 @@ fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_t
     assert_eq!(marked, ["1 / 2", "1a"]);
     let spare = plan.rows.iter().find(|r| r[0] == "-X2" && r[1] == "S1").unwrap();
     assert_eq!((spare[2].as_str(), spare[4].as_str()), ("", "0V"));
+
+    // A page numbered "spare" is not taken for a spare: the potential still comes through, and
+    // the drawn terminals keep their marker order.
+    for page in p.pages.iter_mut() {
+        page.number = SPARE_PAGE.into();
+    }
+    // A spare with a bad level does not join the inference: 1 keeps level 1.
+    p.devices
+        .entry(DeviceTag::parse("-X1.1a").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "x".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let plan = terminal_plan(&i);
+    let level_of = |n: &str| plan.rows.iter().find(|r| r[0] == "-X1" && r[1] == n).unwrap()[7].clone();
+    assert_eq!((level_of("1"), level_of("1a")), ("1".to_owned(), String::new()));
+    let spare = plan.rows.iter().find(|r| r[0] == "-X2" && r[1] == "S1").unwrap();
+    assert_eq!(spare[4], "0V");
+    let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
+    assert_eq!(marked, ["1 / 2", "1a"]);
+    // The spare -X1.1a has a device entry, but it is marked once, as a terminal.
+    let all = marking_list_with(&i, &MarkingOptions::default());
+    let named: Vec<&Vec<String>> = all.rows.iter().filter(|r| r.iter().any(|c| c.contains("1a"))).collect();
+    assert_eq!(named.len(), 1, "{named:?}");
 }

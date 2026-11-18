@@ -42,7 +42,12 @@ pub struct ProjectMeta {
     pub jumpers: Vec<Jumper>,
     /// Terminal strips arranged in the terminal strip editor: their terminal order and spare
     /// terminals. A strip that is not listed keeps the usual order (by terminal number).
-    #[serde(default, rename = "strip", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "strip",
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "unique_layouts"
+    )]
     pub strips: Vec<StripLayout>,
     /// The project's logo, shown on the cover page and in every title block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +206,22 @@ pub struct StripLayout {
     pub spares: Vec<String>,
 }
 
+/// Read the `[[strip]]` layouts, refusing two for the same strip: which one counts would
+/// depend on their order in the file.
+fn unique_layouts<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<StripLayout>, D::Error> {
+    let list = Vec::<StripLayout>::deserialize(d)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for l in &list {
+        if !seen.insert(&l.strip) {
+            return Err(serde::de::Error::custom(format!(
+                "terminal strip {} is arranged twice in [[strip]]",
+                l.strip
+            )));
+        }
+    }
+    Ok(list)
+}
+
 /// A [`StripLayout`] as read from `project.toml`, before its terminal numbers are checked.
 #[derive(Deserialize)]
 struct StoredStripLayout {
@@ -337,7 +358,13 @@ pub fn follow_terminals_in(
             .is_some_and(|pg| pg.overview && pg.symbols.iter().any(|s| s.id == key.1));
         // Its old number now belongs to another terminal (strip-only terminals renumbered
         // without the overview page): it is no longer that terminal, and leaves its jumper.
-        if on_overview && !after.contains_key(key) && !taken.contains(was) {
+        // A registered spare whose drawing went is still on the rail as a spare: it keeps its
+        // place in the jumper, like a terminal that is not drawn.
+        let spare = project
+            .meta
+            .strip_layout(&was.0)
+            .is_some_and(|l| l.spares.contains(&was.1));
+        if (on_overview || spare) && !after.contains_key(key) && !taken.contains(was) {
             after.insert(key.clone(), was.clone());
         }
     }
@@ -2260,6 +2287,43 @@ mod tests {
         let bad = "name = \"t\"\n[[strip]]\nstrip = \"-X1\"\nspares = [\"=HYPERLINK(1)\"]\n";
         let err = toml::from_str::<ProjectMeta>(bad).err().ok_or("loaded")?.to_string();
         assert!(err.contains("cannot be a terminal of -X1"), "{err}");
+        let twice = "name = \"t\"\n[[strip]]\nstrip = \"-X1\"\norder = [\"1\", \"2\"]\n[[strip]]\nstrip = \"-X1\"\norder = [\"2\", \"1\"]\n";
+        let err = toml::from_str::<ProjectMeta>(twice).err().ok_or("loaded")?.to_string();
+        assert!(err.contains("-X1 is arranged twice"), "{err}");
+        assert!(toml::from_str::<ProjectMeta>("name = \"t\"\n")?.strips.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_jumpered_spare_keeps_its_jumper_when_its_drawing_is_deleted() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        for (id, tag) in [("t1", "-X1.1"), ("t2", "-X1.2"), ("ts", "-X1.S1")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "term".into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        p.pages.push(page);
+        p.meta.add_spare(&x1, "S1", None, &[])?;
+        p.meta.add_jumper(&x1, &["1".to_owned(), "S1".to_owned()])?;
+        p.meta.add_jumper(&x1, &["2".to_owned(), "1".to_owned()])?;
+        let role = |_: &str| None;
+        // The registered spare's drawing goes: it is a spare again, still jumpered.
+        let before = terminal_numbers(&p, role);
+        p.pages[0].symbols.retain(|s| s.id != "ts");
+        follow_terminals_in(&mut p, &before, role);
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "2", "S1"]);
+        // A drawn terminal that is no spare still leaves its jumper when deleted.
+        let before = terminal_numbers(&p, role);
+        p.pages[0].symbols.retain(|s| s.id != "t2");
+        follow_terminals_in(&mut p, &before, role);
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "S1"]);
         Ok(())
     }
 

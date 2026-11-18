@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use wc_core::DeviceTag;
 use wc_core::symbol::SymbolRole;
 
-use crate::{Inputs, Table, natural_key, terminal_plan};
+use crate::{Inputs, Table, natural_key};
 
 /// What kind of marker a row is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -222,13 +222,15 @@ fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
     // The terminal plan already numbers terminals and sorts strips and numbers. A spare
     // without a level of its own (terminal strip editor) is in no multi-level block, so it
     // goes after its strip's other terminals and never splits a block's marker.
-    let mut rows: Vec<(String, bool, String, Option<u32>)> = terminal_plan(i)
+    let (plan, spares) = crate::terminal_plan_with_spares(i);
+    let mut rows: Vec<(String, bool, String, Option<u32>)> = plan
         .rows
         .into_iter()
-        .filter_map(|r| match (r.first(), r.get(1)) {
+        .enumerate()
+        .filter_map(|(k, r)| match (r.first(), r.get(1)) {
             (Some(strip), Some(number)) if strip != "(untagged)" => {
                 let level = r.get(7).and_then(|l| l.parse().ok());
-                let loose = level.is_none() && r.get(5).is_some_and(|p| p == crate::SPARE_PAGE);
+                let loose = level.is_none() && spares.contains(&k);
                 Some((strip.clone(), loose, number.clone(), level))
             }
             _ => None,
@@ -369,6 +371,13 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
         // Devices are marked by their tag; terminals and cables have markers of their own,
         // and interruption points (links between pages) are not devices.
         let mut skip: BTreeSet<DeviceTag> = cables.clone();
+        // Spare terminals (terminal strip editor) have terminal markers too.
+        let (plan, spares) = crate::terminal_plan_with_spares(i);
+        for r in spares.iter().filter_map(|k| plan.rows.get(*k)) {
+            if let Ok(tag) = DeviceTag::parse(&format!("{}.{}", r[0], r[1])) {
+                skip.insert(tag);
+            }
+        }
         for page in &i.project.pages {
             for s in &page.symbols {
                 let role = i.symbols.get(&s.symbol).map(|y| y.role);

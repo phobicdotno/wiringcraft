@@ -155,10 +155,9 @@ impl StripEditor {
                             // Only a terminal of this rail moves; a payload from before the rail
                             // changed is dropped.
                             if let Some(from) = r.dnd_release_payload::<Dragged>()
-                                && from.0 == strip
-                                && rail.iter().any(|(t, _)| *t == from.1)
+                                && let Some(change) = drop_on(&strip, &rail, &from, k)
                             {
-                                action = Some(Change::Move(from.1.clone(), k));
+                                action = Some(change);
                             }
                         }
                         if let Some(level) = level_picker(ui, open, &strip, number) {
@@ -281,19 +280,25 @@ impl StripEditor {
                 .clicked();
         });
         if add {
-            match DeviceTag::parse(self.new_strip.trim()) {
-                Ok(strip) => {
-                    let spare = self.spare.trim().to_owned();
-                    self.apply(open, &strip, Change::AddSpare(spare, None));
-                    if self.message.is_empty() {
-                        self.new_strip.clear();
-                        self.strip = Some(strip);
-                    }
-                }
-                Err(e) => self.message = e.to_string(),
-            }
+            self.add_first_spare(open);
         }
         self.show_message(ui);
+    }
+
+    /// What Add spare does with no strip in the project: start the typed strip with the typed
+    /// spare, and show that strip from the next frame on.
+    fn add_first_spare(&mut self, open: &mut Open) {
+        match DeviceTag::parse(self.new_strip.trim()) {
+            Ok(strip) => {
+                let spare = self.spare.trim().to_owned();
+                self.apply(open, &strip, Change::AddSpare(spare, None));
+                if self.message.is_empty() {
+                    self.new_strip.clear();
+                    self.strip = Some(strip);
+                }
+            }
+            Err(e) => self.message = e.to_string(),
+        }
     }
 
     fn show_message(&self, ui: &mut egui::Ui) {
@@ -351,6 +356,13 @@ enum Change {
     Unjumper(String),
 }
 
+/// What a drag released on place `to` of the rail of `strip` does: move the dragged terminal
+/// there, unless it is not on this rail any more (another strip's, or gone after an undo or
+/// another participant's edit), when nothing happens.
+fn drop_on(strip: &DeviceTag, rail: &[(String, bool)], from: &Dragged, to: usize) -> Option<Change> {
+    (from.0 == *strip && rail.iter().any(|(t, _)| *t == from.1)).then(|| Change::Move(from.1.clone(), to))
+}
+
 /// The device tag of terminal `number` of `strip` (`-X1.3`).
 fn terminal_tag(strip: &DeviceTag, number: &str) -> Result<DeviceTag, String> {
     DeviceTag::parse(&format!("{strip}.{number}")).map_err(|e| e.to_string())
@@ -389,7 +401,7 @@ fn level_picker(ui: &mut egui::Ui, open: &Open, strip: &DeviceTag, number: &str)
         })
         .response
         .on_hover_text(
-            "The terminal's own level on a multi-level terminal (1 is the bottom). – sets none: a terminal right below one of level 2 or more is still level 1 in the terminal plan.",
+            "The terminal's own level on a multi-level terminal (1 is the bottom). – sets none of its own. Levels are inferred in number order, not rail order: a terminal whose next number up has level 2 or more is still level 1 in the terminal plan.",
         );
     (picked != current).then_some(picked)
 }
@@ -529,18 +541,68 @@ mod tests {
         crate::theme::install_fonts(&ctx);
         ed.new_strip = "-X5".into();
         ed.spare = "1".into();
-        // What the Add spare button does.
-        let strip = DeviceTag::parse(ed.new_strip.trim())?;
-        let spare = ed.spare.clone();
-        ed.apply(&mut o, &strip, Change::AddSpare(spare, None));
+        let texts = |ed: &mut StripEditor, o: &mut Open| -> Vec<String> {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                ed.show(ctx, o);
+            })
+            .shapes
+            .into_iter()
+            .filter_map(|s| match s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+        };
+        // The empty view offers the strip and spare fields and the button;
+        // a window paints its contents from its second frame on.
+        texts(&mut ed, &mut o);
+        let first = texts(&mut ed, &mut o);
+        assert!(first.iter().any(|t| t == "Add spare"), "{first:?}");
+        assert!(
+            first.iter().any(|t| t.starts_with("No terminal strips yet")),
+            "{first:?}"
+        );
+        // What its Add spare button does; a bad tag is refused and shown.
+        ed.new_strip = "X5".into();
+        ed.add_first_spare(&mut o);
+        assert!(!ed.message.is_empty());
+        ed.new_strip = "-X5".into();
+        ed.add_first_spare(&mut o);
         assert!(ed.message.is_empty(), "{}", ed.message);
+        let strip = DeviceTag::parse("-X5")?;
         assert_eq!(
             o.strip_terminals().get(&strip).cloned().unwrap_or_default(),
             [("1".to_owned(), true)]
         );
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            ed.show(ctx, &mut o);
-        });
+        // The next frame shows the new rail.
+        let next = texts(&mut ed, &mut o);
+        assert!(next.iter().any(|t| t == "1 (spare)"), "{next:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_drop_moves_only_a_terminal_still_on_the_rail() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let x1 = DeviceTag::parse("-X1")?;
+        o.add_spare(&x1, "1", None)?;
+        o.add_spare(&x1, "2", None)?;
+        o.add_spare(&x1, "3", None)?;
+        let rail = |o: &Open| o.strip_terminals().remove(&x1).unwrap_or_default();
+        // A valid drop on the same strip moves the terminal.
+        let mut ed = StripEditor::for_project(&o);
+        let change = drop_on(&x1, &rail(&o), &Dragged(x1.clone(), "3".into()), 0).ok_or("no move")?;
+        ed.apply(&mut o, &x1, change);
+        assert_eq!(rail(&o).first().map(|(t, _)| t.as_str()), Some("3"));
+        // Dragging spare 3, then an undo takes it off again: the drop on a remaining row does
+        // nothing, so neither the rail nor the undo history changes.
+        o.undo();
+        o.undo();
+        let before = (rail(&o), o.undo_mark());
+        assert!(drop_on(&x1, &before.0, &Dragged(x1.clone(), "3".into()), 0).is_none());
+        // Another strip's terminal is not moved here either.
+        let x2 = DeviceTag::parse("-X2")?;
+        assert!(drop_on(&x1, &before.0, &Dragged(x2, "1".into()), 0).is_none());
+        assert_eq!((rail(&o), o.undo_mark()), before);
         Ok(())
     }
 }

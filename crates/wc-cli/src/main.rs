@@ -394,7 +394,8 @@ enum StripCmd {
     Unspare { strip: String, terminal: String },
     /// Set a terminal's level on a multi-level terminal (1 is the bottom), e.g.
     /// `strip level -- -X1 4 2`; leave the level out to clear the terminal's own `Level`
-    /// property (a terminal right below one with level 2 or more is still level 1).
+    /// property. Levels are inferred in number order, not rail order: a terminal whose next
+    /// number up has level 2 or more is still level 1.
     Level {
         strip: String,
         terminal: String,
