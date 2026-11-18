@@ -8,7 +8,8 @@
 //!
 //! The file is semicolon-separated UTF-8 with a byte-order mark and CRLF line ends, which is
 //! how Excel and smartScript read CSV files in European locales without garbling `æøå` or
-//! splitting decimal commas. Rows are sorted in natural tag order (`-X2` before `-X10`).
+//! splitting decimal commas. Rows are sorted in natural tag order (`-X2` before `-X10`); the
+//! terminal markers of a strip arranged in the terminal strip editor come in its rail order.
 //!
 //! WAGO's add-in for EPLAN also offers template files for smartScript's MultiImport; those are
 //! not written here (their layout is not publicly documented).
@@ -218,11 +219,23 @@ pub fn terminal_strips(i: &Inputs<'_>) -> Vec<String> {
 /// (strip, number, level) of every numbered terminal, sorted and without repeats. The level is
 /// the terminal plan's: set on the levels of a multi-level terminal.
 fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
+    terminal_rows_on_rail(i)
+        .into_iter()
+        .map(|(s, n, l, _)| (s, n, l))
+        .collect()
+}
+
+/// [`terminal_rows`], each with its place on the rail when its strip was arranged in the
+/// terminal strip editor (the terminal plan follows that order): `None` on other strips.
+fn terminal_rows_on_rail(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>, Option<usize>)> {
     // The terminal plan already numbers terminals and sorts strips and numbers. A spare
     // without a level of its own (terminal strip editor) is in no multi-level block, so it
     // goes after its strip's other terminals and never splits a block's marker.
     let (plan, spares) = crate::terminal_plan_with_spares(i);
-    let mut rows: Vec<(String, bool, String, Option<u32>)> = plan
+    let arranged: BTreeSet<String> = i.project.meta.strips.iter().map(|l| l.strip.to_string()).collect();
+    // (strip, loose spare, number, level, place on the rail)
+    type Row = (String, bool, String, Option<u32>, Option<usize>);
+    let mut rows: Vec<Row> = plan
         .rows
         .into_iter()
         .enumerate()
@@ -230,11 +243,13 @@ fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
             (Some(strip), Some(number)) if strip != "(untagged)" => {
                 let level = r.get(7).and_then(|l| l.parse().ok());
                 let loose = level.is_none() && spares.contains(&k);
-                Some((strip.clone(), loose, number.clone(), level))
+                let rail = arranged.contains(strip).then_some(k);
+                Some((strip.clone(), loose, number.clone(), level, rail))
             }
             _ => None,
         })
         .collect();
+    // Stable: a terminal drawn twice keeps its first place on the rail through `dedup`.
     rows.sort_by(|a, b| {
         // `-X1` and `-X01` have equal keys: settle the exact strip before the numbers, so one
         // strip's terminals stay together.
@@ -248,31 +263,57 @@ fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
             .then_with(|| a.2.cmp(&b.2))
     });
     rows.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
-    rows.into_iter().map(|(s, _, n, l)| (s, n, l)).collect()
+    rows.into_iter().map(|(s, _, n, l, k)| (s, n, l, k)).collect()
 }
 
 /// The terminal markers of `rows` (from [`terminal_rows`]) as (strip, marker text): one per
 /// terminal block, so the levels of a multi-level terminal share one marker with their numbers
 /// joined by `separator` (`1 / 2`). A level of 2 or more joins the terminal before it in the
 /// same strip when that one is a lower level.
+#[cfg(test)]
 pub(crate) fn terminal_markers(rows: Vec<(String, String, Option<u32>)>, separator: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+    let rows = rows.into_iter().map(|(s, n, l)| (s, n, l, None)).collect();
+    blocks(rows, separator).into_iter().map(|(s, m, _)| (s, m)).collect()
+}
+
+/// [`terminal_markers`], each block with the first rail place of its terminals.
+fn blocks(
+    rows: Vec<(String, String, Option<u32>, Option<usize>)>,
+    separator: &str,
+) -> Vec<(String, String, Option<usize>)> {
+    let mut out: Vec<(String, String, Option<usize>)> = Vec::new();
     let mut last: Option<(String, u32)> = None;
-    for (strip, number, level) in rows {
+    for (strip, number, level, rail) in rows {
         let joins = match (&last, level) {
             (Some((s, below)), Some(l)) => *s == strip && l >= 2 && l > *below,
             _ => false,
         };
         match out.last_mut() {
-            Some((_, marker)) if joins => {
+            Some((_, marker, first)) if joins => {
                 marker.push_str(separator);
                 marker.push_str(&number);
+                *first = match (*first, rail) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
             }
-            _ => out.push((strip.clone(), number)),
+            _ => out.push((strip.clone(), number, rail)),
         }
         last = level.map(|l| (strip, l));
     }
     out
+}
+
+/// The terminal markers (see [`terminal_markers`]) in the order they go on: strips in natural
+/// tag order; on a strip arranged in the terminal strip editor, its blocks in rail order, a
+/// block where its first terminal is; on others, by number.
+fn terminal_markers_on_rail(i: &Inputs<'_>, separator: &str) -> Vec<(String, String)> {
+    let mut markers = blocks(terminal_rows_on_rail(i), separator);
+    // Stable, and only within a strip: strips keep their order, unarranged strips too.
+    for run in markers.chunk_by_mut(|a, b| a.0 == b.0) {
+        run.sort_by_key(|m| m.2.unwrap_or(usize::MAX));
+    }
+    markers.into_iter().map(|(s, m, _)| (s, m)).collect()
 }
 
 /// The marker list as `o` asks for it: columns type, group, one per line, count.
@@ -331,7 +372,7 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
     };
 
     if wanted(MarkerKind::Terminals) {
-        for (strip, number) in terminal_markers(terminal_rows(i), &o.level_separator) {
+        for (strip, number) in terminal_markers_on_rail(i, &o.level_separator) {
             if o.strip.as_ref().is_some_and(|s| s.trim() != strip) {
                 continue;
             }

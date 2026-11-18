@@ -5,7 +5,9 @@ app has it under Export, WAGO marking; the command line has `wiringcraft export 
 
 The file is semicolon-separated UTF-8 with a byte-order mark and CRLF line ends, so Excel and
 smartScript read it in European locales without garbling `æøå`. There is one row per marker,
-sorted in natural tag order (`-X2` before `-X10`).
+sorted in natural tag order (`-X2` before `-X10`). On a terminal strip arranged in the
+terminal strip editor, its markers come in rail order, spares included, so they print in the
+order they go on the rail.
 
 ## Columns
 
