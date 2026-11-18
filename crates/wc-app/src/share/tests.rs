@@ -3884,6 +3884,26 @@ fn a_renumbering_here_the_session_repeats_leaves_no_empty_undo_step() -> TestRes
 }
 
 #[test]
+fn a_page_renumbered_in_the_undo_history_keeps_the_pages_in_order() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(tmp.path())?;
+    let last = open.project.pages.last().ok_or("no page")?.clone();
+    let order = |p: &Project| p.pages.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+    open.checkpoint();
+    open.project.meta.name = "Renamed".into();
+    // The session numbers the last page before all others: so does the step Undo brings back.
+    open.renumber_in_history(&last.id, &last.number, "0");
+    open.project.page_mut(&last.id).ok_or("no page")?.number = "0".into();
+    open.project.sort_pages();
+    open.undo();
+    assert_eq!(open.project.pages.first().map(|p| p.id.clone()), Some(last.id.clone()));
+    let mut sorted = open.project.clone();
+    sorted.sort_pages();
+    assert_eq!(order(&open.project), order(&sorted));
+    Ok(())
+}
+
+#[test]
 fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;

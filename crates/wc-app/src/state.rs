@@ -745,6 +745,7 @@ impl Open {
                 && page.number == from
             {
                 page.number = to.to_owned();
+                step.sort_pages();
             }
         }
         self.undo.dedup();
