@@ -13,6 +13,9 @@
 //! older and newer versions are refused too. Sections stored encrypted (password-protected
 //! drawings) are listed in [`Sections::skipped`] and not returned.
 //!
+//! [`read_drawing`] goes on to decode the objects in those sections into blocks and shapes; see
+//! [`objects`].
+//!
 //! Written from the published Open Design Specification for .dwg files only, and checked with
 //! files the tests write themselves. Input is treated as hostile: every size and offset is
 //! checked, and a damaged file gives an error naming what is wrong, never a panic.
@@ -20,6 +23,11 @@
 use std::collections::BTreeMap;
 
 use crate::{Error, Result};
+
+mod bits;
+pub mod objects;
+
+pub use objects::{Drawing, read_drawing};
 
 /// The most a single page may decompress to, in bytes.
 pub const MAX_PAGE: usize = 64 * 1024 * 1024;

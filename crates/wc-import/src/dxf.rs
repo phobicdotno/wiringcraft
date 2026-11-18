@@ -1,9 +1,10 @@
 //! ASCII DXF reading: symbols and whole drawings.
 //!
-//! Supported entities: LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, LWPOLYLINE, POLYLINE/VERTEX,
-//! TEXT, MTEXT, POINT and INSERT (block references, exploded or turned into library symbols).
-//! Ellipses and splines become polylines through sampled points; a solid hatch becomes a filled
-//! outline, a patterned one its outline. Other entities are counted in one warning per kind.
+//! Supported entities: LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, SOLID/TRACE, LWPOLYLINE,
+//! POLYLINE/VERTEX, TEXT, MTEXT, POINT and INSERT (block references, exploded or turned into
+//! library symbols). Ellipses and splines become polylines through sampled points; a solid hatch
+//! and a SOLID become filled outlines, a patterned hatch its outline. Other entities are counted
+//! in one warning per kind.
 //! DXF has y pointing up; WiringCraft pages have y pointing down, so y is flipped on the way in.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,16 +16,16 @@ use crate::{Error, Result, make_symbol};
 
 /// One entity as group-code/value pairs.
 #[derive(Debug, Clone, Default)]
-struct Entity {
-    kind: String,
-    codes: Vec<(i32, String)>,
+pub(crate) struct Entity {
+    pub(crate) kind: String,
+    pub(crate) codes: Vec<(i32, String)>,
 }
 
 impl Entity {
     fn get(&self, code: i32) -> Option<&str> {
         self.codes.iter().find(|(c, _)| *c == code).map(|(_, v)| v.as_str())
     }
-    fn f(&self, code: i32) -> f64 {
+    pub(crate) fn f(&self, code: i32) -> f64 {
         self.get(code)
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
@@ -49,9 +50,40 @@ impl Entity {
 }
 
 #[derive(Debug, Default)]
-struct Drawing {
-    entities: Vec<Entity>,
-    blocks: BTreeMap<String, Vec<Entity>>,
+pub(crate) struct Drawing {
+    pub(crate) entities: Vec<Entity>,
+    pub(crate) blocks: BTreeMap<String, Vec<Entity>>,
+}
+
+/// The most entities one import draws, block references expanded: a few nested blocks that
+/// each insert the next many times would otherwise fill the memory.
+pub const MAX_DRAWN: usize = 2_000_000;
+
+/// The key under which entities left out over [`MAX_DRAWN`] are counted.
+pub(crate) const OVER_LIMIT: &str = "over the limit";
+
+/// Shapes and POINT positions, each with its layer.
+pub(crate) type Drawn = (Vec<(String, Shape)>, Vec<(String, Point)>);
+
+/// Draw `ents` of `d` as page shapes with their layers (y flipped, unscaled), block references
+/// expanded, and the POINT positions. Entities not drawn are counted in `skipped`. Each entity
+/// visited takes one from `budget`; when it runs out the rest is left out (and counted).
+pub(crate) fn draw(d: &Drawing, ents: &[Entity], skipped: &mut BTreeMap<String, usize>, budget: &mut usize) -> Drawn {
+    let mut out = Vec::new();
+    let mut points = Vec::new();
+    shapes(
+        d,
+        ents,
+        Xf::ID,
+        1.0,
+        0,
+        &|_| false,
+        &mut out,
+        &mut points,
+        skipped,
+        budget,
+    );
+    (out, points)
 }
 
 fn pairs(text: &str) -> Result<Vec<(i32, String)>> {
@@ -194,6 +226,7 @@ fn shapes(
     out: &mut Vec<(String, Shape)>,
     points: &mut Vec<(String, Point)>,
     skipped: &mut BTreeMap<String, usize>,
+    budget: &mut usize,
 ) {
     if depth > 8 {
         return; // block nesting this deep is either a cycle or not worth drawing
@@ -203,7 +236,13 @@ fn shapes(
         Point::new(x * scale, -y * scale)
     };
     let r_scale = xf.sx.abs() * scale;
-    for e in ents {
+    for (i, e) in ents.iter().enumerate() {
+        if *budget == 0 {
+            // This entity and every one after it at this level are left out.
+            *skipped.entry(OVER_LIMIT.to_owned()).or_default() += ents.len() - i;
+            return;
+        }
+        *budget -= 1;
         let layer = e.layer();
         if skip_layer(&layer) {
             continue;
@@ -312,9 +351,18 @@ fn shapes(
                     text,
                     height: (e.f_or(40, 2.5) * r_scale).max(0.5),
                     align,
-                    // Code 50: rotation in degrees, counter-clockwise.
-                    angle: normal_angle(e.f(50)),
+                    // Code 50: rotation in degrees, counter-clockwise; a turned block turns it too.
+                    angle: normal_angle(e.f(50) + xf.rot),
                 })
+            }
+            "SOLID" | "TRACE" => {
+                // Corners in the order 1, 2, 4, 3: the third and fourth make a "Z".
+                let mut pts = vec![q(e.f(10), e.f(20)), q(e.f(11), e.f(21)), q(e.f(13), e.f(23))];
+                let third = q(e.f(12), e.f(22));
+                if pts.last().is_none_or(|l| l.distance(third) > 1e-9) {
+                    pts.push(third);
+                }
+                polyline(pts, true, true)
             }
             "POINT" => {
                 points.push((layer.clone(), p(e.f(10), e.f(20))));
@@ -329,7 +377,18 @@ fn shapes(
                         rot: e.f(50),
                     }
                     .then(&xf);
-                    shapes(d, inner, ixf, scale, depth + 1, skip_layer, out, points, skipped);
+                    shapes(
+                        d,
+                        inner,
+                        ixf,
+                        scale,
+                        depth + 1,
+                        skip_layer,
+                        out,
+                        points,
+                        skipped,
+                        budget,
+                    );
                 }
                 None
             }
@@ -873,7 +932,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
     skipped
         .into_iter()
         .map(|(kind, n)| {
-            if kind == HATCH_UNFILLED {
+            if kind == OVER_LIMIT {
+                format!("{n} entities not drawn: the drawing expands to more than {MAX_DRAWN} entities")
+            } else if kind == HATCH_UNFILLED {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
             } else {
@@ -938,6 +999,7 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
         &mut raw,
         &mut points,
         &mut skipped,
+        &mut { MAX_DRAWN },
     );
     let mut pins: Vec<(Option<String>, Point)> = points.into_iter().map(|(_, p)| (None, p)).collect();
     let mut labels = Vec::new();
@@ -1045,6 +1107,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         &mut raw,
         &mut points,
         &mut skipped,
+        &mut { MAX_DRAWN },
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped);
@@ -1178,6 +1241,7 @@ mod tests {
             &mut raw,
             &mut points,
             &mut skipped,
+            &mut { MAX_DRAWN },
         );
         Ok((raw.into_iter().map(|(_, s)| s).collect(), skipped))
     }
@@ -1308,9 +1372,50 @@ mod tests {
 
     #[test]
     fn entities_not_read_are_counted_per_kind() -> Result<()> {
-        let ents = "0\n3DFACE\n8\n0\n0\n3DFACE\n8\n0\n0\nSOLID\n8\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
+        let ents = "0\n3DFACE\n8\n0\n0\n3DFACE\n8\n0\n0\nMLINE\n8\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
         let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
-        assert_eq!(p.warnings, ["2 3DFACE entities not read", "1 SOLID entity not read"]);
+        assert_eq!(p.warnings, ["2 3DFACE entities not read", "1 MLINE entity not read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_in_a_turned_block_turns_with_it() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nB\n0\nTEXT\n10\n0\n20\n0\n40\n2\n1\nK1\n0\nENDBLK\n";
+        let turned = "0\nINSERT\n2\nB\n10\n0\n20\n0\n50\n90\n";
+        let (g, _) = drawn(turned, blocks)?;
+        assert!(
+            matches!(&g[..], [Shape::Text { angle, .. }] if (*angle - 90.0).abs() < 1e-9),
+            "{g:?}"
+        );
+        let (g, _) = drawn("0\nINSERT\n2\nB\n10\n0\n20\n0\n", blocks)?;
+        assert!(matches!(&g[..], [Shape::Text { angle, .. }] if *angle == 0.0), "{g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn every_entity_past_the_budget_is_counted() -> Result<()> {
+        let line = "0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
+        let d = parse(&dxf(&line.repeat(5), ""))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = 2;
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut budget);
+        assert_eq!(shapes.len(), 2);
+        assert_eq!(skipped.get(OVER_LIMIT), Some(&3), "{skipped:?}");
+        assert_eq!(budget, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_solid_is_a_filled_outline() -> Result<()> {
+        // A triangle (third and fourth corner the same) and a square, corners in "Z" order.
+        let ents = "0\nSOLID\n10\n0\n20\n0\n11\n4\n21\n0\n12\n0\n22\n3\n13\n0\n23\n3\n\
+            0\nSOLID\n10\n0\n20\n0\n11\n1\n21\n0\n12\n0\n22\n1\n13\n1\n23\n1\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert!(skipped.is_empty());
+        assert_eq!(poly(&g[0]).0.len(), 3);
+        let (square, closed, filled) = poly(&g[1]);
+        assert!(closed && filled);
+        assert_eq!(square[2], Point::new(1.0, -1.0), "the fourth corner comes third");
         Ok(())
     }
 
