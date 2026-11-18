@@ -237,6 +237,10 @@ pub const TITLE_FIELDS: &[(&str, &str)] = &[
     ("date", "Date"),
 ];
 
+/// The title-block fields that usually differ from page to page, which the page properties
+/// offer first: a page's own value wins over the project's ([`Page::title_field`]).
+pub const PAGE_TITLE_FIELDS: &[&str] = &["revision", "date", "drawn_by", "checked_by"];
+
 /// The label for a title-block field key: its [`TITLE_FIELDS`] label, or the key itself.
 pub fn title_field_label(key: &str) -> &str {
     TITLE_FIELDS
@@ -774,6 +778,32 @@ impl Page {
         }
     }
 
+    /// The keys of this page's own title-block fields as a form lists them: the per-page ones
+    /// ([`PAGE_TITLE_FIELDS`]) first, then any other key the page has.
+    pub fn title_field_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = PAGE_TITLE_FIELDS.iter().map(|k| (*k).to_owned()).collect();
+        for k in self.title_block.keys() {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
+        }
+        keys
+    }
+
+    /// Set this page's own title-block field `key`. A blank value removes it, so the project's
+    /// value shows on this page again. Returns whether the page changed.
+    pub fn set_title_field(&mut self, key: &str, value: &str) -> bool {
+        let value = value.trim();
+        if value.is_empty() {
+            return self.title_block.remove(key).is_some();
+        }
+        if self.title_block.get(key).is_some_and(|v| v == value) {
+            return false;
+        }
+        self.title_block.insert(key.to_owned(), value.to_owned());
+        true
+    }
+
     /// A title-block field as this page shows it: the page's own value when it has one that
     /// is not blank, else the project's. Empty when neither has it.
     pub fn title_field<'a>(&'a self, meta: &'a ProjectMeta, key: &str) -> &'a str {
@@ -1138,6 +1168,26 @@ mod tests {
         assert!(!page.overview);
         assert!(!serde_json::to_string(&page)?.contains("overview"));
         Ok(())
+    }
+
+    #[test]
+    fn a_pages_own_title_field_is_set_cleared_and_falls_back() {
+        let mut meta = ProjectMeta::new("Demo");
+        meta.title_block.insert("revision".into(), "A".into());
+        let mut page = Page::new("p1", "1", "Power");
+        assert_eq!(page.title_field(&meta, "revision"), "A");
+        assert!(page.set_title_field("revision", " B "));
+        assert_eq!(page.title_field(&meta, "revision"), "B");
+        assert!(!page.set_title_field("revision", "B"), "the same value changes nothing");
+        assert!(page.set_title_field("revision", "  "));
+        assert!(page.title_block.is_empty(), "a blank value removes the field");
+        assert_eq!(page.title_field(&meta, "revision"), "A", "the project's shows again");
+        assert!(!page.set_title_field("date", ""));
+        page.set_title_field("sheet_note", "x");
+        assert_eq!(
+            page.title_field_keys(),
+            ["revision", "date", "drawn_by", "checked_by", "sheet_note"]
+        );
     }
 
     #[test]

@@ -366,6 +366,14 @@ enum PageCmd {
         #[arg(long)]
         off: bool,
     },
+    /// Show a page's title-block fields, or set the page's own with `key=value` (revision,
+    /// date, drawn_by, checked_by, ...). The page's own values win over the project's on that
+    /// page; `key=` clears one, so the project's shows again.
+    Fields {
+        id: String,
+        /// `key=value` pairs to set; none lists the fields.
+        set: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -909,6 +917,31 @@ fn run(cli: Cli) -> Res<()> {
                         .position(|pg| pg.id == id)
                         .ok_or_else(|| format!("no page {id:?}"))?;
                     cover_moved(p.set_cover(i, !off).unwrap_or_default());
+                }
+                PageCmd::Fields { id, set } => {
+                    let i = p
+                        .pages
+                        .iter()
+                        .position(|pg| pg.id == id)
+                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    if set.is_empty() {
+                        print!("{}", page_fields(&p, i));
+                        return Ok(());
+                    }
+                    let mut pairs = Vec::new();
+                    for kv in &set {
+                        let (k, v) = kv.split_once('=').ok_or_else(|| format!("{kv:?} is not key=value"))?;
+                        let k = k.trim();
+                        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            return Err(format!("{k:?} is not a field name (letters, digits and _)"));
+                        }
+                        pairs.push((k.to_owned(), v.to_owned()));
+                    }
+                    if let Some(page) = p.pages.get_mut(i) {
+                        for (k, v) in pairs {
+                            page.set_title_field(&k, &v);
+                        }
+                    }
                 }
             }
             save(dir, &p)?;
@@ -2780,6 +2813,37 @@ fn keep_library_sources(p: &mut Project, ids: &[String], sources: &std::collecti
     }
 }
 
+/// A page's title-block fields, one per line: key, the value the page shows, and whether it is
+/// the page's own or the project's.
+fn page_fields(p: &Project, page: usize) -> String {
+    let Some(pg) = p.pages.get(page) else {
+        return String::new();
+    };
+    let mut keys = pg.title_field_keys();
+    for k in p.meta.title_block.keys() {
+        if !keys.contains(k) {
+            keys.push(k.clone());
+        }
+    }
+    let mut out = String::new();
+    for k in keys {
+        let value = pg.title_field(&p.meta, &k);
+        let from = if pg.title_block.get(&k).is_some_and(|v| !v.trim().is_empty()) {
+            "page"
+        } else if value.is_empty() {
+            "-"
+        } else {
+            "project"
+        };
+        out.push_str(&format!(
+            "{:<16} {:<24} ({from})\n",
+            escape_field(&k),
+            escape_field(value)
+        ));
+    }
+    out
+}
+
 /// A project has one cover page. When the project already has one, imported cover pages are
 /// dropped and their title-block values (the first non-blank one of each field) come back, to
 /// fill the fields the existing cover leaves empty with [`fill_cover`]; otherwise only the first
@@ -3485,6 +3549,64 @@ mod tests {
             "no part file written"
         );
         assert_eq!(std::fs::read(dir.join("project.toml")).unwrap(), project_file);
+    }
+
+    #[test]
+    fn a_pages_own_title_fields_are_set_listed_and_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        let d = dir.to_str().unwrap();
+        let cli = |args: &[&str]| {
+            let mut all = vec!["wiringcraft", "--project", d];
+            all.extend(args);
+            run(Cli::try_parse_from(all).unwrap())
+        };
+        run(Cli::try_parse_from(["wiringcraft", "new", d, "--no-git"]).unwrap()).unwrap();
+        cli(&["page", "add", "p9", "--number", "9", "--title", "Motors"]).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.meta.title_block.insert("revision".into(), "A".into());
+        save(&dir, &p).unwrap();
+
+        cli(&["page", "fields", "p9", "revision=B", "checked_by=OH"]).unwrap();
+        let p = load(&dir).unwrap();
+        let i = p.pages.iter().position(|pg| pg.id == "p9").unwrap();
+        let listed = page_fields(&p, i);
+        assert!(
+            listed.contains("revision") && listed.contains("B") && listed.contains("(page)"),
+            "{listed}"
+        );
+        assert!(listed.contains("checked_by") && listed.contains("OH"), "{listed}");
+
+        cli(&["page", "fields", "p9", "revision="]).unwrap();
+        let p = load(&dir).unwrap();
+        let line = page_fields(&p, i)
+            .lines()
+            .find(|l| l.starts_with("revision"))
+            .unwrap()
+            .to_owned();
+        assert!(line.contains('A') && line.contains("(project)"), "falls back: {line}");
+        assert_eq!(p.pages[i].title_block.get("checked_by").map(String::as_str), Some("OH"));
+
+        // A value that would steer the terminal or start a false row is printed escaped.
+        let mut p = load(&dir).unwrap();
+        p.pages[i]
+            .title_block
+            .insert("note\nfake".into(), "A\u{1b}[2JB\nrevision X".into());
+        let listed = page_fields(&p, i);
+        assert!(!listed.contains('\u{1b}'), "{listed}");
+        assert_eq!(
+            listed.lines().filter(|l| l.starts_with("revision")).count(),
+            1,
+            "{listed}"
+        );
+        assert!(
+            listed.contains("note\\nfake") && listed.contains("A\\u{1b}[2JB\\nrevision X"),
+            "{listed}"
+        );
+
+        assert!(cli(&["page", "fields", "p9", "revision"]).is_err());
+        assert!(cli(&["page", "fields", "p9", "bad key=x"]).is_err());
+        assert!(cli(&["page", "fields", "nope", "revision=C"]).is_err());
     }
 
     #[test]
