@@ -1,6 +1,6 @@
 //! The host's side of a session: approval, page locks, applying changes and telling everyone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::{Page, Project};
 
@@ -705,6 +705,22 @@ impl Host {
         check_edit(&self.project, &self.locks, by, &edit)?;
         let before = self.project.clone();
         apply_edit(&mut self.project, &edit);
+        // A symbol locked again in an older version must still have every pin wired since.
+        let dangling: Vec<String> = entry
+            .before
+            .lock_symbols
+            .iter()
+            .filter_map(|(id, e)| Some((id, self.symbol_version(id, &e.as_ref()?.hash)?)))
+            .flat_map(|(id, s)| self.project.dangling_pins(id, &s))
+            .collect();
+        if !dangling.is_empty() {
+            self.project = before;
+            return invalid(format!(
+                "\"{}\" cannot be taken back: wires end on pins the earlier versions do not have ({}); move those wires first",
+                entry.info.message,
+                dangling.join(", ")
+            ));
+        }
         // The message names the edit itself: a redo of "Undo X" is "Redo X".
         let what = match kind {
             ChangeKind::Redo => entry
@@ -776,12 +792,23 @@ impl Host {
         self.take_versions(symbols, parts, true);
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for g in ids {
-            if !resent.0.is_empty() || !resent.1.is_empty() {
+            // One file a message: each came in one message, so each fits the line limit, while
+            // several together may not.
+            for s in &resent.0 {
                 self.outbox.push((
                     g,
                     HostMsg::Items {
-                        symbols: resent.0.clone(),
-                        parts: resent.1.clone(),
+                        symbols: vec![s.clone()],
+                        parts: Vec::new(),
+                    },
+                ));
+            }
+            for p in &resent.1 {
+                self.outbox.push((
+                    g,
+                    HostMsg::Items {
+                        symbols: Vec::new(),
+                        parts: vec![p.clone()],
                     },
                 ));
             }
@@ -835,6 +862,18 @@ impl Host {
             let extra = self.history.len() - crate::MAX_HISTORY;
             self.history.drain(..extra);
         }
+        // Replaced versions only an undo or redo in the kept history can lock again stay.
+        let wanted = |e: &Entry, symbols: bool| -> Vec<(String, String)> {
+            [&e.before, &e.after]
+                .into_iter()
+                .flat_map(|p| if symbols { &p.lock_symbols } else { &p.lock_parts })
+                .filter_map(|(id, l)| Some((id.clone(), l.as_ref()?.hash.clone())))
+                .collect()
+        };
+        let symbols: BTreeSet<(String, String)> = self.history.iter().flat_map(|e| wanted(e, true)).collect();
+        let parts: BTreeSet<(String, String)> = self.history.iter().flat_map(|e| wanted(e, false)).collect();
+        self.old_symbols.retain(|k, _| symbols.contains(k));
+        self.old_parts.retain(|k, _| parts.contains(k));
         let ids: Vec<PeerId> = self.joined_guests().collect();
         for g in ids {
             self.outbox.push((g, HostMsg::Recorded { change: info.clone() }));

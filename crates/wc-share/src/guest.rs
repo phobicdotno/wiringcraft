@@ -48,6 +48,10 @@ pub struct Guest {
     /// [`ProjectEdit::AddItems`] and [`ProjectEdit::UpdateItems`], and as [`HostMsg::Items`]), by id: what this guest's copy needs to draw the project.
     pub symbols: BTreeMap<String, wc_core::Symbol>,
     pub parts: BTreeMap<String, wc_core::Part>,
+    /// Items of this guest's [`ProjectEdit::UpdateItems`] the session took, as (kind, id, hash),
+    /// in the order the host recorded them: the answer to each update, even when a later change
+    /// (someone's undo) put the item back before this guest looked. Taken by whoever sent them.
+    pub took_updates: Vec<(wc_core::lock::ItemKind, String, String)>,
     /// Picture files the session sent ([`HostMsg::Picture`]), by project path: what this
     /// guest's copy needs to show the logo and underlays.
     pub pictures: BTreeMap<String, Vec<u8>>,
@@ -83,6 +87,7 @@ impl Guest {
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
             pictures: BTreeMap::new(),
+            took_updates: Vec::new(),
             last_edit: 0,
             unanswered: BTreeMap::new(),
             replaced: BTreeMap::new(),
@@ -274,6 +279,15 @@ impl Guest {
                         self.parts.extend(parts.iter().map(|(p, _)| (p.id.clone(), p.clone())));
                     }
                     ProjectEdit::UpdateItems { symbols, parts } => {
+                        if Some(by) == self.me {
+                            use wc_core::lock::ItemKind;
+                            self.took_updates.extend(
+                                symbols
+                                    .iter()
+                                    .map(|(s, _, _)| (ItemKind::Symbol, s.id.clone(), s.hash()))
+                                    .chain(parts.iter().map(|(p, _, _)| (ItemKind::Part, p.id.clone(), p.hash()))),
+                            );
+                        }
                         self.symbols
                             .extend(symbols.iter().map(|(s, _, _)| (s.id.clone(), s.clone())));
                         self.parts

@@ -82,6 +82,9 @@ impl Journal for MemoryJournal {
 pub struct GitJournal {
     dir: PathBuf,
     git: Git,
+    /// The vendored files [`Journal::vendor`] wrote since the last recorded change, as they were
+    /// before (`None`: not there), so [`Journal::restore`] can put them back.
+    vendored_before: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl GitJournal {
@@ -90,7 +93,11 @@ impl GitJournal {
         let dir = dir.into();
         let git = Git::new(&dir);
         git.init()?;
-        Ok(Self { dir, git })
+        Ok(Self {
+            dir,
+            git,
+            vendored_before: Vec::new(),
+        })
     }
 
     pub fn dir(&self) -> &std::path::Path {
@@ -106,11 +113,36 @@ impl Journal for GitJournal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()> {
         wc_core::store::save(&self.dir, project)?;
         self.git.commit_as(&change.message, &change.author)?;
+        self.vendored_before.clear();
         Ok(())
     }
 
     /// Write the vendored files into the project folder (`vendor/symbols`, `vendor/parts`).
     fn vendor(&mut self, symbols: &[Symbol], parts: &[Part]) -> Result<()> {
+        use wc_core::{lock::ItemKind, store::vendor_path};
+        let targets = symbols
+            .iter()
+            .map(|s| (ItemKind::Symbol, &s.id))
+            .chain(parts.iter().map(|p| (ItemKind::Part, &p.id)));
+        // Every file as it was first, so a failure below or in `record` puts them all back.
+        for (kind, id) in targets {
+            let path = vendor_path(&self.dir, kind, id)?;
+            if self.vendored_before.iter().any(|(p, _)| *p == path) {
+                continue;
+            }
+            let was = match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => {
+                    return Err(wc_core::Error::Io {
+                        path: path.clone(),
+                        source,
+                    }
+                    .into());
+                }
+            };
+            self.vendored_before.push((path, was));
+        }
         for s in symbols {
             wc_core::store::write_vendored_symbol(&self.dir, s)?;
         }
@@ -129,8 +161,30 @@ impl Journal for GitJournal {
     /// Save the project as it was before the change, so the folder does not keep a change
     /// whose commit failed.
     fn restore(&mut self, project: &Project) -> Result<()> {
+        // The vendored files first: their lock entries go back with the project below.
+        let mut failed = None;
+        for (path, was) in std::mem::take(&mut self.vendored_before) {
+            let put = match &was {
+                Some(bytes) => std::fs::write(&path, bytes),
+                None => match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+            };
+            if let Err(source) = put {
+                failed.get_or_insert(wc_core::Error::Io {
+                    path: path.clone(),
+                    source,
+                });
+                // Kept, so the next restore tries this file again.
+                self.vendored_before.push((path, was));
+            }
+        }
         wc_core::store::save(&self.dir, project)?;
-        Ok(())
+        match failed {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
     }
 }
 

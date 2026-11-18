@@ -1961,26 +1961,10 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Wire ends on pins of symbol `id` that `symbol` does not have: `page 3 -K1:13` each.
+/// Wire ends on pins of symbol `id` that `symbol` does not have: `page 3 -K1:13` each
+/// ([`wc_core::Project::dangling_pins`]).
 pub fn dangling_pins(project: &wc_core::Project, id: &str, symbol: &wc_core::Symbol) -> Vec<String> {
-    let mut out = Vec::new();
-    for page in &project.pages {
-        for w in &page.wires {
-            for end in [&w.from, &w.to] {
-                let wc_core::Endpoint::Pin { item, pin } = end else {
-                    continue;
-                };
-                let Some(placed) = page.symbol(item) else { continue };
-                if placed.symbol == id && symbol.pin(pin).is_none() {
-                    let name = placed.tag.as_ref().map_or_else(|| item.clone(), ToString::to_string);
-                    out.push(format!("page {} {name}:{pin}", page.number));
-                }
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
+    project.dangling_pins(id, symbol)
 }
 
 /// A file's bytes before it is changed, or `None` when there is no such file. Any other

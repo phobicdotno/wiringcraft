@@ -3135,9 +3135,16 @@ fn an_update_is_committed_with_its_file_and_an_undo_writes_the_old_file_back() -
     );
     let path = store::vendor_path(dir, wc_core::lock::ItemKind::Symbol, "lamp")?;
     let rel = path.strip_prefix(dir)?.to_string_lossy().replace('\\', "/");
+    // The file and the lock entry naming its hash, both as the commit has them.
+    let committed =
+        |git: &wc_vcs::Git| -> std::result::Result<(Option<String>, Option<String>), Box<dyn std::error::Error>> {
+            let lock = git.show("HEAD", store::LOCK_FILE).ok_or("no lock in HEAD")?;
+            let lock: wc_core::Lockfile = toml::from_str(&lock)?;
+            Ok((git.show("HEAD", &rel), lock.symbols.get("lamp").map(|e| e.hash.clone())))
+        };
     assert_eq!(
-        git.show("HEAD", &rel),
-        Some(store::to_json(&v2)?),
+        committed(&git)?,
+        (Some(store::to_json(&v2)?), Some(v2.hash())),
         "file and lock in one commit"
     );
     host.undo()?;
@@ -3145,6 +3152,130 @@ fn an_update_is_committed_with_its_file_and_an_undo_writes_the_old_file_back() -
     assert_eq!(
         store::load(dir)?.lock.symbols.get("lamp").map(|e| e.hash.clone()),
         Some(v1.hash())
+    );
+    assert_eq!(
+        committed(&git)?,
+        (Some(store::to_json(&v1)?), Some(v1.hash())),
+        "the undo commits the old file with its lock entry"
+    );
+    Ok(())
+}
+
+/// A coil symbol with these pins.
+fn coil_with(pins: &[&str]) -> wc_core::Symbol {
+    let mut s = symbol("coil", "Coil");
+    s.pins = pins
+        .iter()
+        .map(|n| wc_core::Pin {
+            name: (*n).into(),
+            at: Point::default(),
+            dir: Default::default(),
+        })
+        .collect();
+    s
+}
+
+/// Two coils `k1` and `k2` on `page`, wired from pin `pin` to pin `pin`.
+fn wired(page: &mut Page, pin: &str) {
+    place(page, "k1", 10.0);
+    place(page, "k2", 50.0);
+    let end = |item: &str| wc_core::Endpoint::Pin {
+        item: item.into(),
+        pin: pin.into(),
+    };
+    page.wires.push(wc_core::Wire {
+        id: "w1".into(),
+        from: end("k1"),
+        to: end("k2"),
+        via: Vec::new(),
+        number: None,
+        potential: None,
+        cable: None,
+        route: Default::default(),
+        spec: Default::default(),
+    });
+}
+
+#[test]
+fn an_update_that_drops_a_pin_wired_in_the_session_is_refused() -> TestResult {
+    let mut project = demo();
+    wired(&mut project.pages[1], "A2");
+    let mut host = Host::new(
+        project,
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1", "A2"]), coil_with(&["A1"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    let err = host.edit_project(update_symbol(&v1, &v2)).err().ok_or("refused")?;
+    assert!(err.to_string().contains("page 2 k1:A2"), "{err}");
+    assert_eq!(
+        host.project().lock.symbols.get("coil").map(|e| e.hash.clone()),
+        Some(v1.hash())
+    );
+    Ok(())
+}
+
+#[test]
+fn an_update_is_not_taken_back_while_a_wire_uses_a_pin_only_it_has() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1"]), coil_with(&["A1", "A2"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.edit_project(update_symbol(&v1, &v2))?;
+    let update = host.history().last().ok_or("recorded")?.id;
+    host.open(Some("p0002"))?;
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    wired(&mut page, "A2");
+    host.edit_page(page.clone())?;
+    let err = host.revert(update).err().ok_or("refused")?;
+    assert!(err.to_string().contains("page 2 k1:A2"), "{err}");
+    let hash = |h: &Host| h.project().lock.symbols.get("coil").map(|e| e.hash.clone());
+    assert_eq!(hash(&host), Some(v2.hash()));
+    page.wires.clear();
+    host.edit_page(page)?;
+    host.revert(update)?;
+    assert_eq!(hash(&host), Some(v1.hash()), "taken back once the wire is gone");
+    Ok(())
+}
+
+#[test]
+fn a_git_journal_puts_vendored_files_back_when_a_change_is_not_recorded() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let project = store::create(dir, "Demo")?;
+    let mut journal = GitJournal::open(dir)?;
+    let (v1, v2, lamp) = (
+        symbol("coil", "Coil"),
+        symbol("coil", "Coil v2"),
+        symbol("lamp", "Lamp"),
+    );
+    journal.vendor(std::slice::from_ref(&v1), &[])?;
+    let change = Change {
+        by: HOST,
+        author: "Hanna Host <hanna@example.com>".into(),
+        page: None,
+        message: "Add coil".into(),
+    };
+    journal.record(&project, &change)?;
+    // The update's files are written, then its record fails: the caller puts the project back.
+    journal.vendor(&[v2, lamp], &[])?;
+    journal.restore(&project)?;
+    assert_eq!(store::read_vendored_symbol(dir, "coil")?, v1, "the old version is back");
+    assert!(
+        !store::vendor_path(dir, wc_core::lock::ItemKind::Symbol, "lamp")?.exists(),
+        "a file that was not there is gone again"
     );
     Ok(())
 }

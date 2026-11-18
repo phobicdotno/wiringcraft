@@ -811,6 +811,8 @@ pub fn conflicts(local: &Project, base: &Project, auth: &Project) -> Vec<String>
                 .iter()
                 .filter(move |(id, e)| auth.lock.map(kind).get(*id).is_some_and(|a| a.hash != e.hash))
                 .filter(move |(id, _)| !updated_here(local, base, auth, kind, id))
+                // A copy still on the version the last sync brought did not change it here.
+                .filter(move |(id, e)| base.lock.map(kind).get(*id).is_none_or(|b| b.hash != e.hash))
                 .map(move |(id, _)| item_name(kind, id))
         })
         .collect()
@@ -848,6 +850,30 @@ fn session_has(auth: &Project, name: &str) -> bool {
 fn session_took(auth: &Project, local: &Project, base: &Project, name: &str) -> bool {
     named(name)
         .is_some_and(|(kind, id)| auth.lock.map(kind).contains_key(id) && !updated_here(local, base, auth, kind, id))
+}
+
+/// The items an update edit names, as (kind, id, hash).
+fn updated_items(edit: &ProjectEdit) -> Vec<(ItemKind, String, String)> {
+    match edit {
+        ProjectEdit::UpdateItems { symbols, parts } => symbols
+            .iter()
+            .map(|(s, _, _)| (ItemKind::Symbol, s.id.clone(), s.hash()))
+            .chain(parts.iter().map(|(p, _, _)| (ItemKind::Part, p.id.clone(), p.hash())))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Take in the session's answers to this person's updates: the version it took is what this copy
+/// synced to (`base`), so a later change here goes out as an update from it, and one the session
+/// took is not waited for or sent again, even when a later change (an undo) put it back since.
+fn take_updates(role: &mut Role, base: &mut Project, items_out: &mut BTreeMap<String, ItemOut>) {
+    for (kind, id, hash) in role.took_updates() {
+        if let Some(e) = base.lock.map_mut(kind).get_mut(&id) {
+            e.hash = hash;
+        }
+        items_out.remove(&item_name(kind, &id));
+    }
 }
 
 /// The kind and id of the item [`item_name`] names.
@@ -1175,6 +1201,8 @@ pub struct Hosting {
     announcer: Option<Announcer>,
     pub port: u16,
     dir: PathBuf,
+    /// Items of the host's own updates the session took, as [`Guest::took_updates`].
+    took_updates: Vec<(ItemKind, String, String)>,
 }
 
 /// A guest's side: its view of the session and the connection to the host.
@@ -1295,8 +1323,10 @@ impl Role {
     fn edit_project(&mut self, edit: ProjectEdit, notes: &mut Vec<String>) {
         match self {
             Role::Host(h) => {
-                if let Err(e) = h.host.edit_project(edit) {
-                    notes.push(format!("Your change was not kept: {e}"));
+                let updated = updated_items(&edit);
+                match h.host.edit_project(edit) {
+                    Ok(()) => h.took_updates.extend(updated),
+                    Err(e) => notes.push(format!("Your change was not kept: {e}")),
                 }
             }
             Role::Guest(j) => {
@@ -1305,6 +1335,15 @@ impl Role {
                 let msg = j.guest.edit_project(edit);
                 send(&j.link, msg, notes);
             }
+        }
+    }
+
+    /// The items of this person's updates the session took since the last call, as
+    /// [`Guest::took_updates`].
+    fn took_updates(&mut self) -> Vec<(ItemKind, String, String)> {
+        match self {
+            Role::Host(h) => std::mem::take(&mut h.took_updates),
+            Role::Guest(j) => std::mem::take(&mut j.guest.took_updates),
         }
     }
 
@@ -1782,6 +1821,7 @@ impl Share {
             announcer,
             port,
             dir: open.dir.clone(),
+            took_updates: Vec::new(),
         })));
         self.base = Some(open.project.clone());
         self.forget_items();
@@ -1940,6 +1980,7 @@ impl Share {
         }
         let mine = page.as_deref().filter(|p| role.holds(p));
         let me = role.me().unwrap_or(HOST);
+        take_updates(role, base, &mut self.items_out);
         // Symbols and parts used for the first time go out first. Until the session has them,
         // the changes that may draw them wait in the window: a page must not reach the session
         // without its symbols, and an item the session refused is sent again a few times.
@@ -1960,9 +2001,15 @@ impl Share {
         for (name, out) in self.items_out.iter_mut() {
             if !out.gave_up && out.tries >= ITEM_TRIES && out.at.elapsed() >= ITEM_WAIT {
                 out.gave_up = true;
-                self.notes.push(format!(
-                    "The session did not take {name}; your changes that use it are sent without it."
-                ));
+                // An update is not kept apart from the project: the copy takes the session's
+                // version again below, as everyone else works on that one.
+                self.notes.push(if session_has(auth, name) {
+                    format!(
+                        "The session did not take your update of {name}; your copy takes the session's version again."
+                    )
+                } else {
+                    format!("The session did not take {name}; your changes that use it are sent without it.")
+                });
             }
         }
         let skip = self
@@ -2006,6 +2053,7 @@ impl Share {
                 role.edit_project(edit, &mut self.notes);
             }
             role.pump(&mut self.notes);
+            take_updates(role, base, &mut self.items_out);
             let auth = role.project()?;
             self.items_out
                 .retain(|name, _| !session_took(auth, &open.project, base, name));
@@ -2067,8 +2115,9 @@ impl Share {
             // The host answers what was sent this frame at once; the reply goes out now.
             role.pump(&mut self.notes);
         }
-        let auth = role.project()?;
         let base = self.base.get_or_insert_with(|| open.project.clone());
+        take_updates(role, base, &mut self.items_out);
+        let auth = role.project()?;
         let conflicting = conflicts(&open.project, base, auth);
         if !conflicting.is_empty() {
             self.notes.push(format!(
@@ -2438,10 +2487,18 @@ fn write_copy(
     let leaf = crate::prefs::folder_name(&project.meta.name).unwrap_or_else(|| "shared-project".into());
     let dir = fresh_dir(folder, &leaf)?;
     store::save(&dir, project).map_err(|e| e.to_string())?;
-    for s in symbols.values() {
+    // A file the session sent ahead of the change that locks it (an undo's earlier version)
+    // waits: the copy takes it once that change is here.
+    for (id, s) in symbols {
+        if project.lock.symbols.get(id).is_some_and(|e| e.hash != s.hash()) {
+            continue;
+        }
         store::write_vendored_symbol(&dir, s).map_err(|e| e.to_string())?;
     }
-    for p in parts.values() {
+    for (id, p) in parts {
+        if project.lock.parts.get(id).is_some_and(|e| e.hash != p.hash()) {
+            continue;
+        }
         store::write_vendored_part(&dir, p).map_err(|e| e.to_string())?;
     }
     let mut open = Open::load(&dir)?;

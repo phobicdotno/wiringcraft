@@ -852,6 +852,17 @@ pub(crate) fn check_edit(
                     Some(_) => {}
                 }
             }
+            // Someone may have wired a pin the new version drops since the sender checked.
+            let dangling: Vec<String> = symbols
+                .iter()
+                .flat_map(|(s, _, _)| project.dangling_pins(&s.id, s))
+                .collect();
+            if !dangling.is_empty() {
+                return invalid(format!(
+                    "wires in the session end on pins the new versions no longer have ({}); move those wires first",
+                    dangling.join(", ")
+                ));
+            }
             Ok(())
         }
         ProjectEdit::Batch { edits } => {

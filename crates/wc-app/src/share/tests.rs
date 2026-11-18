@@ -77,6 +77,7 @@ fn host(open: &Open) -> (Share, Log) {
             announcer: None,
             port: 0,
             dir: open.dir.clone(),
+            took_updates: Vec::new(),
         }))),
         base: Some(open.project.clone()),
         ..Default::default()
@@ -2329,5 +2330,49 @@ fn a_symbol_updated_in_a_session_reaches_the_host_and_an_undo_brings_the_old_one
     assert_eq!(hash(&guest_open), Some(v1.hash()), "{:?}", g.notes);
     assert_eq!(guest_open.symbols.get("wc.coil"), Some(&v1));
     assert_eq!(store::read_vendored_symbol(&guest_open.dir, "wc.coil")?, v1);
+    Ok(())
+}
+
+#[test]
+fn an_update_undone_before_its_sender_looked_is_not_sent_again_and_others_see_no_conflict() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    guest_open.place(2, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let v1 = guest_open.symbols.get("wc.coil").cloned().ok_or("coil")?;
+    let mut v2 = v1.clone();
+    v2.name = "Coil, newer".into();
+    store::write_vendored_symbol(&guest_open.dir, &v2)?;
+    guest_open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = v2.hash();
+    guest_open.symbols.insert("wc.coil".into(), v2.clone());
+    // The guest sends the update; the host takes it and takes it back again at once, so the
+    // guest gets both answers in one look.
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    let hash = |o: &Open| o.project.lock.symbols.get("wc.coil").map(|e| e.hash.clone());
+    assert_eq!(hash(&host_open), Some(v2.hash()), "{:?}", h.notes);
+    assert!(
+        !h.notes.iter().any(|n| n.contains("first in another version")),
+        "an update someone else made is no conflict here: {:?}",
+        h.notes
+    );
+    let Some(Role::Host(hosting)) = h.role.as_mut() else {
+        return Err("hosting".into());
+    };
+    let update = hosting.host.history().last().ok_or("recorded")?.id;
+    h.revert(update)?;
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    assert_eq!(hash(&host_open), Some(v1.hash()), "{:?}", h.notes);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    // Past the wait for an answer: an update still counted as unanswered would go again now.
+    std::thread::sleep(ITEM_WAIT * 2);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(hash(&host_open), Some(v1.hash()), "the undo stays: {:?}", g.notes);
+    assert_eq!(hash(&guest_open), Some(v1.hash()), "{:?}", g.notes);
+    assert!(
+        !g.notes.iter().any(|n| n.contains("first in another version")),
+        "{:?}",
+        g.notes
+    );
     Ok(())
 }
