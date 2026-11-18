@@ -3562,17 +3562,26 @@ mod marking_tests {
             let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
             s.tag = Some(wc_core::DeviceTag::parse(tag).unwrap());
         }
+        let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+        o.project
+            .meta
+            .add_jumper(&x1, &["1".to_owned(), "2".to_owned()])
+            .unwrap();
         export_wago_configurator(&o);
         let csv = std::fs::read_to_string(o.dir.join("export").join("wago-configurator.csv"))
             .unwrap()
             .replace("-X1/T1;Terminal;-X1;1;1;;;", "-X1/T1;Terminal;-X1;1;1;;EX-TB-2.5;")
-            .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;NO-SUCH;");
+            .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;NO-SUCH;")
+            .replace("-X1/J1;Jumper;-X1;;;;;", "-X1/J1;Jumper;-X1;;;;EX-TB-2.5;");
         let before = o.undo_mark();
         let msg = o.import_wago_configured(csv.as_bytes()).unwrap();
         assert!(
-            msg.starts_with("WAGO configurator: 1 device(s) changed, 0 row(s) already up to date, 1 not matched."),
+            msg.starts_with(
+                "WAGO configurator: 2 device(s) or jumper(s) changed, 0 row(s) already up to date, 1 not matched."
+            ),
             "{msg}"
         );
+        assert_eq!(o.project.meta.jumpers[0].part.as_deref(), Some("example.ex-tb-2-5"));
         assert!(msg.contains("NO-SUCH"), "{msg}");
         let x11 = wc_core::DeviceTag::parse("-X1.1").unwrap();
         assert_eq!(
@@ -3583,6 +3592,10 @@ mod marking_tests {
         assert_eq!(o.undo_mark(), before + 1);
         assert!(o.undo());
         assert!(o.project.devices.get(&x11).and_then(|d| d.part.as_deref()).is_none());
+        assert!(
+            o.project.meta.jumpers[0].part.is_none(),
+            "the jumper in the same undo step"
+        );
         assert!(o.import_wago_configured(b"Article\n1\n").is_err());
     }
 

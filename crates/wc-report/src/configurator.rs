@@ -177,6 +177,7 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
                 description: format!("{}-way jumper", j.terminals.len()),
                 quantity: "1".into(),
                 connects: j.terminals.join(", "),
+                target: Some(Target::Jumper(strip_tag.clone(), n)),
                 ..row(format!("{strip}/J{}", n + 1), "Jumper")
             };
             if let Some(part) = &j.part {
@@ -259,12 +260,12 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
 pub struct Configurator {
     pub table: Table,
     pub warnings: Vec<String>,
-    /// Which device part each row's article is, by `Index` (as written, before any leading `'`):
-    /// terminal and accessory rows. Plates, rails and jumpers are not device parts and have none.
+    /// Which device part or jumper each row's article is, by `Index` (as written, before any
+    /// leading `'`): terminal, jumper and accessory rows. Plates and rails have none.
     pub targets: BTreeMap<String, Target>,
 }
 
-/// The device part a row of [`configurator_list`] stands for, so a list that comes back from the
+/// The device part (or jumper) a row of [`configurator_list`] stands for, so a list that comes back from the
 /// configurator can be written onto the project (#123).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -272,6 +273,9 @@ pub enum Target {
     Part(DeviceTag),
     /// The device's accessory at this position (from 0) of its accessory list.
     Accessory(DeviceTag, usize),
+    /// The strip's jumper at this position (from 0) among the strip's jumpers, in the
+    /// project's order (`<strip>/J<n + 1>`).
+    Jumper(DeviceTag, usize),
 }
 
 /// One row of the list, by column (see [`CONFIGURATOR_COLUMNS`]).

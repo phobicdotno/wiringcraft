@@ -1,5 +1,6 @@
 //! The WAGO configurator list back: the articles and accessories chosen in the configurator
-//! (smartDESIGNER), written onto the project's terminal and strip devices (#123).
+//! (smartDESIGNER), written onto the project's terminal and strip devices (#123) and its jumpers
+//! (#237).
 //!
 //! `wiringcraft export wago-configurator` writes one row per item with an `Index` that stays the
 //! same as long as the strip does not change (`-X1/T3`, `-X1/A2`). The list comes back with the
@@ -12,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use wc_core::lock::ItemKind;
+use wc_core::project::Jumper;
 use wc_core::{Device, DevicePart, DeviceTag, Part, Project, store};
 use wc_report::{Inputs, Target};
 
@@ -237,6 +239,9 @@ pub enum Slot {
     Accessory(usize),
     /// A new accessory at the end of its list (a row the configurator added, without an index).
     NewAccessory,
+    /// The part of the strip's jumper at this position (from 0) among the strip's jumpers; the
+    /// assignment's tag is the strip.
+    Jumper(usize),
 }
 
 /// One change [`plan`] found.
@@ -372,12 +377,32 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
                 ));
                 continue;
             }
+            // A jumper's index is its position among the strip's jumpers, which moves when a
+            // jumper before it is added or taken apart: it must still join the same terminals.
+            if kind == "Jumper" {
+                match &row.connects {
+                    None => {
+                        miss(
+                            "the file has no Connects column, so the terminals this jumper joins cannot be checked; export the list again"
+                                .into(),
+                        );
+                        continue;
+                    }
+                    Some(file) if !same_terminals(file, connects) => {
+                        miss(format!(
+                            "the jumper joins terminals {file} in the file but {connects} in the project now; export the list again"
+                        ));
+                        continue;
+                    }
+                    Some(_) => {}
+                }
+            }
             match now.targets.get(&row.index) {
                 Some(Target::Part(t)) => (t.clone(), Slot::Part),
                 Some(Target::Accessory(t, k)) => (t.clone(), Slot::Accessory(*k)),
+                Some(Target::Jumper(t, n)) => (t.clone(), Slot::Jumper(*n)),
                 None => {
                     miss(match &**kind {
-                        "Jumper" => "jumpers have no part of their own yet".into(),
                         "Plate" | "Rail" => format!("a {} is not a device of the project", kind.to_lowercase()),
                         _ => "the terminal has no device tag".into(),
                     });
@@ -394,6 +419,7 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
         };
         let device = i.project.devices.get(&tag);
         let (now_part, now_qty) = match &slot {
+            Slot::Jumper(n) => (jumper(i.project, &tag, *n).and_then(|j| j.part.clone()), 1),
             Slot::Part => (device.and_then(|d| d.part.clone()), 1),
             Slot::Accessory(k) => device
                 .and_then(|d| d.accessories.get(*k))
@@ -401,7 +427,7 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
             Slot::NewAccessory => (None, 1),
         };
         let qty = match slot {
-            Slot::Part => 1,
+            Slot::Part | Slot::Jumper(_) => 1,
             _ => row.quantity.unwrap_or(now_qty).max(1),
         };
         if slot == Slot::NewAccessory {
@@ -482,7 +508,7 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
     // A new accessory the device has after the rows above (or an earlier new one) is there
     // already.
     let mut after: BTreeMap<DeviceTag, Device> = BTreeMap::new();
-    for a in &out.assignments {
+    for a in out.assignments.iter().filter(|a| !matches!(a.slot, Slot::Jumper(_))) {
         put(after.entry(a.tag.clone()).or_insert_with(|| device_now(i, &a.tag)), a);
     }
     for a in new_accessories {
@@ -494,6 +520,23 @@ pub fn plan(i: &Inputs<'_>, candidates: &Candidates, rows: &[ConfiguredRow]) -> 
         }
     }
     out
+}
+
+/// The `n`-th jumper (from 0) of `strip`, in the project's order.
+fn jumper<'a>(project: &'a Project, strip: &DeviceTag, n: usize) -> Option<&'a Jumper> {
+    project.meta.jumpers.iter().filter(|j| &j.strip == strip).nth(n)
+}
+
+/// Whether two Connects cells name the same terminals (`1, 2` and `1,2` do).
+fn same_terminals(a: &str, b: &str) -> bool {
+    let list = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    list(a) == list(b)
 }
 
 fn device_now(i: &Inputs<'_>, tag: &DeviceTag) -> Device {
@@ -514,6 +557,8 @@ fn put(d: &mut Device, a: &Assignment) -> bool {
         },
         Slot::NewAccessory if d.uses_part(&a.part) => return false,
         Slot::NewAccessory => d.accessories.push(part),
+        // Jumpers are not devices: see [`apply`].
+        Slot::Jumper(_) => return false,
     }
     true
 }
@@ -595,19 +640,30 @@ fn find_part(candidates: &Candidates, article: &str, manufacturer: &str) -> std:
     }
 }
 
-/// Write `plan` onto the project's devices (a drawn device without an entry gets one). Returns
-/// how many devices changed. `plan` must come from this project as it is: accessory positions
-/// are those it had then.
+/// Write `plan` onto the project's devices (a drawn device without an entry gets one) and
+/// jumpers. Returns how many devices and jumpers changed. `plan` must come from this project as
+/// it is: accessory and jumper positions are those it had then.
 pub fn apply(project: &mut Project, plan: &Plan) -> usize {
     let mut changed: BTreeSet<&DeviceTag> = BTreeSet::new();
+    let mut jumpers = 0;
     // New accessories come last in a plan, so a device keeps one only when a replacement
     // that was planned (and not dropped since) does not keep it already.
     for a in &plan.assignments {
+        if let Slot::Jumper(n) = a.slot {
+            let j = project.meta.jumpers.iter_mut().filter(|j| j.strip == a.tag).nth(n);
+            if let Some(j) = j
+                && j.part.as_deref() != Some(a.part.as_str())
+            {
+                j.part = Some(a.part.clone());
+                jumpers += 1;
+            }
+            continue;
+        }
         if put(project.devices.entry(a.tag.clone()).or_default(), a) {
             changed.insert(&a.tag);
         }
     }
-    changed.len()
+    changed.len() + jumpers
 }
 
 #[cfg(test)]
@@ -799,7 +855,6 @@ mod tests {
         assert_eq!(plan.unchanged, 1, "the marker: {plan:?}");
         assert_eq!(plan.unmatched.len(), 5, "{:#?}", plan.unmatched);
         for (n, why) in [
-            "jumpers have no part",
             "neither is taken",
             "no part of the project or its libraries",
             "the project has no such row",
@@ -831,6 +886,114 @@ mod tests {
         };
         let again = super::plan(&inputs, &library(&parts), &rows);
         assert!(again.assignments.is_empty(), "{again:#?}");
+    }
+
+    #[test]
+    fn a_jumper_row_gives_the_strips_jumper_its_article() {
+        let (mut p, symbols) = project();
+        // A second jumper of -X1 and one of -X2, which must keep their (lack of) part.
+        p.meta.jumpers.push(Jumper {
+            strip: tag("-X1"),
+            terminals: vec!["3".into(), "4".into()],
+            part: None,
+        });
+        p.meta.jumpers.push(Jumper {
+            strip: tag("-X2"),
+            terminals: vec!["1".into(), "2".into()],
+            part: None,
+        });
+        let mut parts = candidates();
+        parts.extend([part("wago.2002-402", "WAGO", "2002-402")]);
+        let lib = library(&parts);
+        let list = |p: &Project| {
+            let inputs = Inputs {
+                project: p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            let mut t = wc_report::configurator_list(&inputs).table;
+            let r = t.rows.iter_mut().find(|r| r[0] == "-X1/J1").unwrap();
+            assert_eq!(r[1], "Jumper");
+            assert_eq!(r[14], "1, 2");
+            r[6] = "2002-402".into();
+            wc_report::to_smartscript_csv(&t)
+        };
+        let bytes = list(&p);
+        let (rows, _) = read_configured(bytes.as_bytes()).unwrap();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let planned = plan(&inputs, &lib, &rows);
+        assert!(planned.unmatched.is_empty(), "{:#?}", planned.unmatched);
+        assert_eq!(planned.assignments.len(), 1, "{planned:#?}");
+        assert_eq!(planned.assignments[0].slot, Slot::Jumper(0));
+        assert_eq!(planned.parts().into_iter().collect::<Vec<_>>(), ["wago.2002-402"]);
+        assert_eq!(apply(&mut p, &planned), 1);
+        assert_eq!(p.meta.jumpers[0].part.as_deref(), Some("wago.2002-402"));
+        assert!(p.meta.jumpers[1..].iter().all(|j| j.part.is_none()), "only the first");
+        assert!(
+            p.devices.get(&tag("-X1")).is_some_and(|d| d.part.is_none()),
+            "not the strip"
+        );
+
+        // The same list again changes nothing.
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let again = plan(&inputs, &lib, &rows);
+        assert!(again.assignments.is_empty(), "{again:#?}");
+        assert_eq!(again.unchanged, planned.unchanged + 1, "the jumper is up to date now");
+        assert_eq!(apply(&mut p, &again), 0);
+    }
+
+    #[test]
+    fn a_jumper_row_whose_terminals_changed_is_not_taken() {
+        let (mut p, symbols) = project();
+        let mut parts = candidates();
+        parts.extend([part("wago.2002-402", "WAGO", "2002-402")]);
+        let text = "Index;Type;Article;Connects\n\
+                    -X1/J1;Jumper;2002-402;1,2\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let ok = plan(&inputs, &library(&parts), &rows);
+        assert_eq!(ok.assignments.len(), 1, "spaces in Connects do not matter: {ok:#?}");
+
+        // The jumper now joins 1 to 3: the row stood for 1 and 2.
+        p.meta
+            .add_jumper(&tag("-X1"), &["2".to_owned(), "3".to_owned()])
+            .unwrap();
+        let inputs = Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let moved = plan(&inputs, &library(&parts), &rows);
+        assert!(moved.assignments.is_empty(), "{moved:#?}");
+        assert_eq!(moved.unmatched.len(), 1);
+        assert!(
+            moved.unmatched[0].contains("joins terminals 1,2 in the file but 1, 2, 3 in the project now"),
+            "{:#?}",
+            moved.unmatched
+        );
+
+        // Without a Connects column the jumper cannot be checked.
+        let text = "Index;Type;Article\n-X1/J1;Jumper;2002-402\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        let blind = plan(&inputs, &library(&parts), &rows);
+        assert!(blind.assignments.is_empty());
+        assert!(
+            blind.unmatched[0].contains("no Connects column"),
+            "{:#?}",
+            blind.unmatched
+        );
     }
 
     #[test]
