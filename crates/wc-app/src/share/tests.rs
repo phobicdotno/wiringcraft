@@ -3885,6 +3885,17 @@ fn a_renumbering_here_the_session_repeats_leaves_no_empty_undo_step() -> TestRes
 
 #[test]
 fn a_renumbering_here_and_back_the_session_then_makes_leaves_no_empty_undo_step() -> TestResult {
+    renumbering_back_then_session_renumbers(false)
+}
+
+#[test]
+fn a_renumbering_the_session_makes_with_another_change_leaves_no_empty_undo_step() -> TestResult {
+    renumbering_back_then_session_renumbers(true)
+}
+
+/// The guest numbers a page with two waiting placements 30 and back, then the session numbers
+/// it 30, and (`rename`) also renames the project in the same sync.
+fn renumbering_back_then_session_renumbers(rename: bool) -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
     let number = |o: &Open| o.project.page("p0003").map(|p| p.number.clone());
@@ -3902,10 +3913,16 @@ fn a_renumbering_here_and_back_the_session_then_makes_leaves_no_empty_undo_step(
     // what the guest has now, and is no step to undo.
     host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
     host_open.project.sort_pages();
+    if rename {
+        host_open.project.meta.name = "Renamed in the session".into();
+    }
     for _ in 0..2 {
         frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     }
     assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    if rename {
+        assert_eq!(guest_open.project.meta.name, "Renamed in the session");
+    }
     // One Undo takes back the second placement only.
     g.undo()?;
     for _ in 0..3 {
@@ -3918,6 +3935,37 @@ fn a_renumbering_here_and_back_the_session_then_makes_leaves_no_empty_undo_step(
         g.notes
     );
     assert_eq!(number(&guest_open).as_deref(), Some("30"), "{:?}", g.notes);
+    if rename {
+        assert_eq!(guest_open.project.meta.name, "Renamed in the session");
+    }
+    Ok(())
+}
+
+#[test]
+fn undo_of_an_action_here_on_nothing_that_waits_still_drops_what_waits_after_a_renumbering() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
+    let second = guest_open.place(2, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The latest action here renames the project: nothing that waits.
+    guest_open.checkpoint();
+    guest_open.project.meta.name = "Renamed here".into();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The session renumbers the waiting page: the step before the rename has its waiting
+    // targets as they are now, and still is the rename's.
+    host_open.project.page_mut("p0003").ok_or("no page")?.number = "30".into();
+    host_open.project.sort_pages();
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(guest_open.project.meta.name, "Renamed here", "{:?}", g.notes);
+    // Undo drops what waits, as for any action that changed nothing that waits.
+    g.undo()?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(!has_placement(&guest_open, "p0003", &second), "{:?}", g.notes);
+    assert!(!has_placement(&guest_open, "p0003", &first), "{:?}", g.notes);
     Ok(())
 }
 

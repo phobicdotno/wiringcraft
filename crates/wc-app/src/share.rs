@@ -3309,9 +3309,22 @@ impl Share {
             }
             changed = open.project != *before;
         }
-        // Compared with the project once it has the session's numbers too.
-        if renumbered {
-            open.forget_steps_like_now();
+        // Compared with the project once it has the session's numbers too. A step is the same
+        // when its waiting targets are as they are now and the rest is as it was before this
+        // sync: what else differs came in from the session, and an Undo here leaves that be.
+        // A step of an action here that changed nothing that waits differs in that rest, so
+        // it stays, and its Undo still drops what waits.
+        if renumbered && let Some(pre) = &before {
+            let keys = &held.now;
+            let waiting_before = wc_share::Parts::read(pre, keys);
+            open.forget_steps_like_now(|step, now| {
+                if wc_share::Parts::read(step, keys) != wc_share::Parts::read(now, keys) {
+                    return false;
+                }
+                let mut rest = step.clone();
+                waiting_before.apply(&mut rest);
+                rest == *pre
+            });
         }
         // The session's versions are what this copy has synced to: an item updated here later
         // differs from them ([`updated_here`]).

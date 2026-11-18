@@ -753,13 +753,13 @@ impl Open {
         self.redo.dedup();
     }
 
-    /// Drop the latest undo and redo steps that are the project as it is now: an Undo or Redo
-    /// of them would change nothing.
-    pub fn forget_steps_like_now(&mut self) {
-        while self.undo.last() == Some(&self.project) {
+    /// Drop the latest undo and redo steps that `like_now` finds the same as the project now
+    /// (an Undo or Redo of them would change nothing), down to the first that is not.
+    pub fn forget_steps_like_now(&mut self, like_now: impl Fn(&Project, &Project) -> bool) {
+        while self.undo.last().is_some_and(|s| like_now(s, &self.project)) {
             self.undo.pop();
         }
-        while self.redo.last() == Some(&self.project) {
+        while self.redo.last().is_some_and(|s| like_now(s, &self.project)) {
             self.redo.pop();
         }
     }
