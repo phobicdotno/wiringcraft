@@ -4181,7 +4181,23 @@ mod tests {
             z.write_all(b"this is not a drawing").unwrap();
             z.finish().unwrap();
         }
-        let _ = cli(&dir, &["import", "archive", file.to_str().unwrap()]);
+        // The drawing itself does not import, so the archive entry reaches that failure; the
+        // archive import still succeeds and only warns about it.
+        let broken = tmp.path().join("broken.dxf");
+        std::fs::write(&broken, b"this is not a drawing").unwrap();
+        let mut q = load(&dir).unwrap();
+        q.pages.push(Page::new("probe", "999", "Probe"));
+        save(&dir, &q).unwrap();
+        assert!(
+            cli(
+                &dir,
+                &["import", "page-dxf", broken.to_str().unwrap(), "--page", "probe"]
+            )
+            .is_err()
+        );
+        q.pages.retain(|pg| pg.id != "probe");
+        save(&dir, &q).unwrap();
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
         let p = load(&dir).unwrap();
         assert_eq!(
             p.pages.len(),
@@ -4197,7 +4213,7 @@ mod tests {
         earlier.title_block.insert("revision".into(), "B".into());
         p.pages.push(earlier.clone());
         save(&dir, &p).unwrap();
-        let _ = cli(&dir, &["import", "archive", file.to_str().unwrap()]);
+        cli(&dir, &["import", "archive", file.to_str().unwrap()]).unwrap();
         let p = load(&dir).unwrap();
         assert_eq!(p.page("dxf-300"), Some(&earlier));
         assert_eq!(p.pages.len(), pages + 1);
