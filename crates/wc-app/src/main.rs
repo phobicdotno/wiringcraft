@@ -2323,7 +2323,10 @@ fn export_wago_marking(open: &Open, options: &wc_report::MarkingOptions) -> Stri
                 t.rows.len(),
                 path.display()
             );
-            for w in wc_report::formula_warnings(&t) {
+            for w in wc_report::formula_warnings(&t)
+                .into_iter()
+                .chain(wc_report::level_warnings(inputs.project))
+            {
                 msg.push_str("\n\nWarning: ");
                 msg.push_str(&w);
             }

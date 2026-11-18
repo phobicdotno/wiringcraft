@@ -2255,6 +2255,7 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
     let t = wc_report::marking_list_with(&inputs, &options);
     std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::formula_warnings(&t));
+    warnings.extend(wc_report::level_warnings(inputs.project));
     Ok(Exported {
         markers: t.rows.len(),
         warnings,

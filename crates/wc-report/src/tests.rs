@@ -958,3 +958,90 @@ fn levels_join_only_upwards_within_one_strip() {
     let got: Vec<String> = got.into_iter().map(|(s, m)| format!("{s} {m}")).collect();
     assert_eq!(got, ["-X1 1/2/3", "-X1 4", "-X2 1", "-X2 2"]);
 }
+
+#[test]
+fn a_bad_level_is_warned_about_with_its_device_value_and_reason() {
+    let (mut p, _, _) = fixture();
+    for (tag, level) in [("-X1.1", "1"), ("-X1.2", "two"), ("-X1.3", "0")] {
+        p.devices
+            .entry(DeviceTag::parse(tag).unwrap())
+            .or_default()
+            .properties
+            .insert(LEVEL_PROPERTY.into(), level.into());
+    }
+    let w = level_warnings(&p);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("-X1.2") && w[0].contains("\"two\"") && w[0].contains("not a whole number"));
+    assert!(w[1].contains("-X1.3") && w[1].contains("\"0\"") && w[1].contains("start at 1"));
+}
+
+#[test]
+fn a_bottom_level_drawn_twice_gets_its_level_on_every_occurrence() {
+    let (mut p, s, parts) = fixture();
+    // -X1.1 is drawn a second time; -X1.2 says it is level 2.
+    p.pages[0].symbols.push(place("t9", "term", 150.0, Some("-X1.1")));
+    p.devices
+        .entry(DeviceTag::parse("-X1.2").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "2".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let levels: Vec<(String, String)> = terminal_plan(&i)
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| (r[1].clone(), r[7].clone()))
+        .collect();
+    assert!(
+        levels.iter().filter(|(n, _)| n == "1").all(|(_, l)| l == "1"),
+        "{levels:?}"
+    );
+    let o = MarkingOptions {
+        strip: Some("-X1".into()),
+        ..MarkingOptions::default()
+    };
+    let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
+    assert_eq!(marked, ["1 / 2"]);
+}
+
+#[test]
+fn strips_with_equal_natural_keys_keep_their_levels_together() {
+    let (mut p, s, parts) = fixture();
+    for (id, tag, x) in [
+        ("a1", "-X01.1", 160.0),
+        ("a2", "-X01.2", 165.0),
+        ("b1", "-X9.1", 170.0),
+        ("b2", "-X9.2", 175.0),
+        ("c1", "-X09.1", 180.0),
+        ("c2", "-X09.2", 185.0),
+    ] {
+        p.pages[0].symbols.push(place(id, "term", x, Some(tag)));
+    }
+    for tag in ["-X01.2", "-X9.2", "-X09.2"] {
+        p.devices
+            .entry(DeviceTag::parse(tag).unwrap())
+            .or_default()
+            .properties
+            .insert(LEVEL_PROPERTY.into(), "2".into());
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let marked: Vec<String> = marking_list_with(&i, &MarkingOptions::default())
+        .rows
+        .iter()
+        .filter(|r| r[2].contains(" / "))
+        .map(|r| r[2].clone())
+        .collect();
+    assert_eq!(
+        marked,
+        ["1 / 2", "1 / 2", "1 / 2"],
+        "-X01, -X09 and -X9 each give one block"
+    );
+}

@@ -483,19 +483,37 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
 /// `-X1.2` (level 2) are one two-level terminal.
 pub const LEVEL_PROPERTY: &str = "Level";
 
-/// A terminal's level from its [`LEVEL_PROPERTY`]; `None` when it has none or it is not a whole
-/// number from 1 up.
+/// A [`LEVEL_PROPERTY`] value as a level, or why it is not one.
+fn parse_level(value: &str) -> Result<u32, String> {
+    match value.trim().parse::<u32>() {
+        Ok(0) => Err("levels start at 1".into()),
+        Ok(l) => Ok(l),
+        Err(e) => Err(format!("not a whole number ({e})")),
+    }
+}
+
+/// A terminal's level from its [`LEVEL_PROPERTY`]; `None` when it has none or the value is not a
+/// level ([`level_warnings`] says which and why).
 fn terminal_level(project: &wc_core::Project, strip: &str, number: &str) -> Option<u32> {
     let tag = DeviceTag::parse(&format!("{strip}.{number}")).ok()?;
+    parse_level(project.devices.get(&tag)?.properties.get(LEVEL_PROPERTY)?).ok()
+}
+
+/// One warning for each device whose [`LEVEL_PROPERTY`] is set but is not a level, naming the
+/// device, the value and the reason. Such a terminal counts as single-level in the terminal plan
+/// and the marking export.
+pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
     project
         .devices
-        .get(&tag)?
-        .properties
-        .get(LEVEL_PROPERTY)?
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|l| *l >= 1)
+        .iter()
+        .filter_map(|(tag, dev)| {
+            let value = dev.properties.get(LEVEL_PROPERTY)?;
+            let reason = parse_level(value).err()?;
+            Some(format!(
+                "{tag}: {LEVEL_PROPERTY} {value:?} is ignored: {reason}; the terminal counts as single-level"
+            ))
+        })
+        .collect()
 }
 
 /// Terminal plan: for every terminal strip, each terminal with what connects to its two sides.
@@ -642,16 +660,28 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 (term, number)
             })
             .collect();
-        let mut levels: Vec<Option<u32>> = numbered
-            .iter()
-            .map(|(_, n)| terminal_level(i.project, &strip, n))
-            .collect();
-        // The bottom level of a block needs no property of its own: the level above says so.
-        for k in 0..levels.len() {
-            if levels[k].is_none() && levels.get(k + 1).copied().flatten().is_some_and(|l| l >= 2) {
-                levels[k] = Some(1);
+        // Levels are inferred over distinct terminals: a terminal drawn twice has one level.
+        let mut distinct: Vec<&str> = numbered.iter().map(|(_, n)| n.as_str()).collect();
+        distinct.dedup();
+        let mut by_number: BTreeMap<&str, u32> = BTreeMap::new();
+        for (k, n) in distinct.iter().enumerate() {
+            let own = terminal_level(i.project, &strip, n);
+            // The bottom level of a block needs no property of its own: the level above says so.
+            let below = || {
+                distinct
+                    .get(k + 1)
+                    .and_then(|up| terminal_level(i.project, &strip, up))
+                    .filter(|l| *l >= 2)
+                    .map(|_| 1)
+            };
+            if let Some(l) = own.or_else(below) {
+                by_number.insert(n, l);
             }
         }
+        let levels: Vec<Option<u32>> = numbered
+            .iter()
+            .map(|(_, n)| by_number.get(n.as_str()).copied())
+            .collect();
         for ((term, number), level) in numbered.into_iter().zip(levels) {
             let side = |n: usize| -> (String, Option<String>) {
                 let Some(pin) = term.pins.get(n) else {

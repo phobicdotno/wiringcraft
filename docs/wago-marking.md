@@ -48,7 +48,8 @@ A double- or triple-deck terminal gets one marker, not one per level. A terminal
 `Level` device property (`1` at the bottom, `2` above it, ...): a terminal with level 2 or more
 sits on the same block as the terminal before it in the strip. So with `-X1.2` at level 2,
 `-X1.1` and `-X1.2` print as one marker `1 / 2`. The bottom level needs no property of its own.
-The terminal plan lists each level in its Level column.
+The terminal plan lists each level in its Level column. A `Level` that is not a whole number
+from 1 up is ignored, and the export warns about it with the device, the value and the reason.
 
 The app writes `export/wago-marking.csv`, or `export/wago-marking-<strip>.csv` for one strip.
 

@@ -231,12 +231,15 @@ fn terminal_rows(i: &Inputs<'_>) -> Vec<(String, String, Option<u32>)> {
         })
         .collect();
     rows.sort_by(|a, b| {
+        // `-X1` and `-X01` have equal keys: settle the exact strip before the numbers, so one
+        // strip's terminals stay together.
         natural_key(&a.0)
             .cmp(&natural_key(&b.0))
+            .then_with(|| a.0.cmp(&b.0))
             .then(natural_key(&a.1).cmp(&natural_key(&b.1)))
             // `1` and `01` have equal keys: order them exactly too, so `dedup` sees
             // repeats side by side.
-            .then_with(|| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
+            .then_with(|| a.1.cmp(&b.1))
     });
     rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     rows
