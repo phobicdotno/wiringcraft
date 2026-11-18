@@ -948,9 +948,13 @@ impl App {
                     out.push(a);
                 }
             }
+            if i.key_pressed(Key::Enter) && i.modifiers.is_none() && self.ed.tool == Tool::Polyline {
+                self.ed.finish_shape = true;
+            }
             if i.key_pressed(Key::Escape) {
                 if !self.ed.shape_points.is_empty() {
                     self.ed.shape_points.clear();
+                    self.ed.message = canvas::shape_hint(self.ed.tool, 0).into();
                 } else if self.ed.wire.is_some() {
                     self.ed.wire = None;
                 } else {

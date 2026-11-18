@@ -237,24 +237,34 @@ fn divider(ui: &mut egui::Ui, t: &Theme, height: f32) {
 
 pub fn classic_toolbar(ui: &mut egui::Ui, status: &dyn Status, out: &mut Vec<Action>) {
     let t = Theme::of(ui.ctx());
+    // The switches sit on the right; the toolbar groups fill the rest and wrap onto a second
+    // row when the window is too narrow for them, so no button is cut off.
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        for (i, group) in TOOLBAR.iter().enumerate() {
-            if i > 0 {
-                divider(ui, &t, 20.0);
-            }
-            for a in *group {
-                if icon_button(ui, *a, 30.0, status, &t) {
-                    out.push(*a);
-                }
-            }
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
             for a in [Action::ToggleChrome, Action::ToggleTheme] {
                 if icon_button(ui, a, 30.0, status, &t) {
                     out.push(a);
                 }
             }
+            ui.with_layout(
+                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                |ui| {
+                    for (i, group) in TOOLBAR.iter().enumerate() {
+                        if i > 0 {
+                            divider(ui, &t, 20.0);
+                        }
+                        // A group stays together on one row.
+                        ui.horizontal(|ui| {
+                            for a in *group {
+                                if icon_button(ui, *a, 30.0, status, &t) {
+                                    out.push(*a);
+                                }
+                            }
+                        });
+                    }
+                },
+            );
         });
     });
 }
@@ -377,4 +387,47 @@ pub fn dot(ui: &mut egui::Ui, c: Color32) {
     let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
     ui.painter()
         .circle_filled(Rect::from_center_size(r.center(), Vec2::splat(8.0)).center(), 4.0, c);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct AllOn;
+    impl Status for AllOn {
+        fn active(&self, _: Action) -> bool {
+            false
+        }
+        fn enabled(&self, _: Action) -> bool {
+            true
+        }
+    }
+
+    /// The width the classic toolbar takes in a window `width` points wide.
+    fn toolbar_width(width: f32) -> f32 {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 600.0))),
+            ..Default::default()
+        };
+        let mut used = 0.0;
+        // The first frame loads the fonts; measure on the second.
+        let _ = ctx.run(input.clone(), |_| {});
+        let _ = ctx.run(input, |ctx| {
+            egui::TopBottomPanel::top("tb").show(ctx, |ui| {
+                let mut out = Vec::new();
+                classic_toolbar(ui, &AllOn, &mut out);
+                used = ui.min_rect().right();
+            });
+        });
+        used
+    }
+
+    #[test]
+    fn the_classic_toolbar_fits_the_smallest_window() {
+        // 900 points is the window's minimum width: every button stays on screen.
+        let used = toolbar_width(900.0);
+        assert!(used <= 900.0, "the toolbar runs to {used}");
+    }
 }

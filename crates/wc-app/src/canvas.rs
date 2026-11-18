@@ -49,6 +49,10 @@ pub struct Editor {
     drag: Option<Drag>,
     /// The clicks so far of a line, rectangle, circle, arc or polyline being drawn.
     pub shape_points: Vec<Point>,
+    /// The id of the page those clicks were made on: on another page they are dropped.
+    pub shape_page: Option<String>,
+    /// Enter was pressed (and no dialog or text field took it): finish the polyline being drawn.
+    pub finish_shape: bool,
     /// The text tool was clicked here; the app asks for the text.
     pub ask_text: Option<Point>,
     /// The comment tool was clicked here; the app asks for the comment.
@@ -85,6 +89,8 @@ impl Default for Editor {
             cursor: None,
             drag: None,
             shape_points: Vec::new(),
+            shape_page: None,
+            finish_shape: false,
             ask_text: None,
             ask_comment: None,
             comment: None,
@@ -171,7 +177,7 @@ fn snap(p: Point, step: f64) -> Point {
     Point::new((p.x / step).round() * step, (p.y / step).round() * step)
 }
 
-fn arc_points(center: Point, r: f64, start: f64, end: f64) -> Vec<Point> {
+pub(crate) fn arc_points(center: Point, r: f64, start: f64, end: f64) -> Vec<Point> {
     let mut sweep = end - start;
     if sweep <= 0.0 {
         sweep += 360.0;
@@ -513,6 +519,8 @@ pub(crate) fn value_placeholder(
 /// Show the canvas for the current page and handle the tools. Returns true when the project
 /// changed.
 pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool, snap_step: f64) {
+    drop_draft_of_other_page(open, ed);
+    let finish = std::mem::take(&mut ed.finish_shape);
     if let Some(panel) = ed.panel {
         crate::panel_view::show(ui, open, ed, panel, snap_step);
         return;
@@ -940,7 +948,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
             }
         }
         Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline => {
-            shape_tool(&painter, &resp, open, ed, &xf, &t)
+            shape_tool(&painter, &resp, open, ed, &xf, &t, finish)
         }
     }
 }
@@ -1303,12 +1311,6 @@ fn route_note(changed: usize, style: Route) -> String {
     }
 }
 
-/// The angle of `p` seen from `c`, in degrees from 0 to 360 as [`Shape::Arc`] counts them.
-fn angle_of(c: Point, p: Point) -> f64 {
-    let a = (p.y - c.y).atan2(p.x - c.x).to_degrees();
-    if a < 0.0 { a + 360.0 } else { a }
-}
-
 /// How many clicks a drawing tool takes (`None`: a polyline takes clicks until it is finished).
 pub(crate) fn clicks_needed(tool: Tool) -> Option<usize> {
     match tool {
@@ -1319,13 +1321,13 @@ pub(crate) fn clicks_needed(tool: Tool) -> Option<usize> {
 }
 
 /// The shape `tool` draws from the clicks `pts`, or `None` while it is too small to draw
-/// (both corners on one point, a circle without a radius, an arc that ends at its centre).
+/// (both clicks on one point, a circle without a radius, an arc that ends at its centre).
 /// A line, rectangle and circle take two clicks (the circle: centre, then a point on it), an arc
 /// three (centre, start, end; it runs clockwise on paper) and a polyline two or more.
 pub(crate) fn drawn_shape(tool: Tool, pts: &[Point]) -> Option<Shape> {
     match (tool, pts) {
         (Tool::Line, &[a, b]) if a != b => Some(Shape::Line { a, b }),
-        (Tool::Rect, &[a, b]) if a.x != b.x && a.y != b.y => Some(Shape::Rect {
+        (Tool::Rect, &[a, b]) if a != b => Some(Shape::Rect {
             min: Point::new(a.x.min(b.x), a.y.min(b.y)),
             max: Point::new(a.x.max(b.x), a.y.max(b.y)),
         }),
@@ -1337,8 +1339,8 @@ pub(crate) fn drawn_shape(tool: Tool, pts: &[Point]) -> Option<Shape> {
         (Tool::Arc, &[c, s, e]) if c != s && c != e => Some(Shape::Arc {
             center: c,
             radius: c.distance(s),
-            start: angle_of(c, s),
-            end: angle_of(c, e),
+            start: crate::symbol_editor::angle(c, s),
+            end: crate::symbol_editor::angle(c, e),
         }),
         (Tool::Polyline, pts) if pts.len() >= 2 => {
             // A polyline that ends where it started is closed.
@@ -1358,7 +1360,7 @@ pub(crate) fn drawn_shape(tool: Tool, pts: &[Point]) -> Option<Shape> {
 }
 
 /// What to click next, for the status line.
-fn shape_hint(tool: Tool, clicks: usize) -> &'static str {
+pub(crate) fn shape_hint(tool: Tool, clicks: usize) -> &'static str {
     match (tool, clicks) {
         (Tool::Circle, 0) => "Click the centre of the circle.",
         (Tool::Circle, _) => "Click a point on the circle (Esc cancels).",
@@ -1395,7 +1397,13 @@ fn shape_tool(
     ed: &mut Editor,
     xf: &Xf,
     t: &theme::Theme,
+    enter: bool,
 ) {
+    // Enter ends a polyline wherever the pointer is.
+    if enter && ed.tool == Tool::Polyline && ed.shape_points.len() >= 2 {
+        finish_shape(open, ed);
+        return;
+    }
     let Some(cur) = ed.cursor else { return };
     let ghost = Stroke::new(1.5_f32, t.ghost);
     if !ed.shape_points.is_empty() {
@@ -1410,16 +1418,33 @@ fn shape_tool(
             None => {}
         }
     }
-    let enter = resp.ctx.memory(|m| m.focused().is_none()) && resp.ctx.input(|i| i.key_pressed(egui::Key::Enter));
-    if ed.tool == Tool::Polyline
-        && (resp.double_clicked_by(egui::PointerButton::Primary) || enter)
-        && ed.shape_points.len() >= 2
-    {
-        finish_shape(open, ed);
-        return;
+    shape_input(
+        open,
+        ed,
+        cur,
+        resp.clicked_by(egui::PointerButton::Primary),
+        resp.double_clicked_by(egui::PointerButton::Primary),
+    );
+}
+
+/// A drawing started on another page does not go on this one: its clicks are dropped when
+/// the page shown changes (by id, so the same page moved in the navigator keeps them).
+pub(crate) fn drop_draft_of_other_page(open: &Open, ed: &mut Editor) {
+    let page_id = open.project.pages.get(ed.page).map(|p| p.id.as_str());
+    if !ed.shape_points.is_empty() && ed.shape_page.as_deref() != page_id {
+        ed.shape_points.clear();
+        ed.message = shape_hint(ed.tool, 0).into();
     }
-    if resp.clicked_by(egui::PointerButton::Primary) {
-        shape_click(open, ed, cur);
+}
+
+/// A primary click (`click`, and `double` when it was the second of a double-click) at `at`
+/// with a drawing tool. A double-click ends a polyline only where its last point is, so a fast
+/// click on another point adds that point instead.
+pub(crate) fn shape_input(open: &mut Open, ed: &mut Editor, at: Point, click: bool, double: bool) {
+    if double && ed.tool == Tool::Polyline && ed.shape_points.len() >= 2 && ed.shape_points.last() == Some(&at) {
+        finish_shape(open, ed);
+    } else if click {
+        shape_click(open, ed, at);
     }
 }
 
@@ -1429,6 +1454,9 @@ pub(crate) fn shape_click(open: &mut Open, ed: &mut Editor, at: Point) {
     // The second click of a double-click lands on the point just added.
     if ed.shape_points.last() == Some(&at) {
         return;
+    }
+    if ed.shape_points.is_empty() {
+        ed.shape_page = open.project.pages.get(ed.page).map(|p| p.id.clone());
     }
     ed.shape_points.push(at);
     let n = ed.shape_points.len();
@@ -1635,6 +1663,52 @@ mod tests {
     }
 
     #[test]
+    fn a_polyline_ends_on_a_double_click_at_its_last_point_only() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Polyline,
+            ..Default::default()
+        };
+        let p = Point::new;
+        shape_input(&mut open, &mut ed, p(10.0, 10.0), true, false);
+        shape_input(&mut open, &mut ed, p(20.0, 10.0), true, false);
+        // A fast click on another point counts as a double-click by time only: it adds the point.
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), true, true);
+        assert_eq!(ed.shape_points.len(), 3);
+        assert!(open.project.pages[0].graphics.is_empty());
+        // The second click of a real double-click, on the last point, ends it with three points.
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), true, true);
+        assert!(ed.shape_points.is_empty());
+        assert!(matches!(
+            &open.project.pages[0].graphics[..],
+            [Shape::Polyline { points, closed: false, .. }] if points.len() == 3
+        ));
+    }
+
+    #[test]
+    fn a_drawing_started_on_one_page_is_dropped_on_another() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Arc,
+            ..Default::default()
+        };
+        shape_click(&mut open, &mut ed, Point::new(10.0, 10.0));
+        shape_click(&mut open, &mut ed, Point::new(20.0, 10.0));
+        // The same page, moved to another place in the list: the clicks stay.
+        open.project.pages.swap(0, 1);
+        ed.page = 1;
+        drop_draft_of_other_page(&open, &mut ed);
+        assert_eq!(ed.shape_points.len(), 2);
+        // Another page: they go, and the next click starts a new arc there.
+        ed.page = 0;
+        drop_draft_of_other_page(&open, &mut ed);
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(ed.message, "Click the centre of the arc.");
+        shape_click(&mut open, &mut ed, Point::new(50.0, 50.0));
+        assert!(open.project.pages.iter().all(|p| p.graphics.is_empty()));
+    }
+
+    #[test]
     fn drawing_tools_make_their_shapes() {
         let p = Point::new;
         assert_eq!(
@@ -1663,7 +1737,7 @@ mod tests {
         assert_eq!(drawn_shape(Tool::Circle, &[p(1.0, 1.0), p(1.0, 1.0)]), None);
         assert_eq!(drawn_shape(Tool::Arc, &[p(1.0, 1.0), p(1.0, 1.0), p(3.0, 1.0)]), None);
         assert_eq!(drawn_shape(Tool::Polyline, &[p(1.0, 1.0)]), None);
-        assert_eq!(drawn_shape(Tool::Rect, &[p(1.0, 1.0), p(1.0, 5.0)]), None);
+        assert_eq!(drawn_shape(Tool::Rect, &[p(1.0, 1.0), p(1.0, 1.0)]), None);
     }
 
     #[test]
@@ -1692,6 +1766,7 @@ mod tests {
         );
         assert!(ed.shape_points.is_empty());
         assert_eq!(ed.selection, vec![Selection::Graphic(2)]);
+        assert_eq!(open.project.pages[0].graphics.len(), 3);
         let g = open.project.pages[0].graphics.clone();
         assert_eq!(g.len(), 3, "{g:?}");
         assert!(matches!(g[2], Shape::Polyline { closed: true, ref points, .. } if points.len() == 3));
@@ -1701,6 +1776,26 @@ mod tests {
         assert!(graphic_hit(&g[0], Point::new(50.0, 55.0), 0.5));
         assert!(graphic_hit(&g[1], Point::new(107.07, 57.07), 0.5), "inside the sweep");
         assert!(!graphic_hit(&g[1], Point::new(90.0, 50.0), 0.5), "the open part");
+        // A large arc is picked on the chords the canvas draws, not only on the true circle.
+        let big = Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 250.0,
+            start: 0.0,
+            end: 90.0,
+        };
+        let chord_mid = {
+            let pts = arc_points(Point::new(0.0, 0.0), 250.0, 0.0, 90.0);
+            Point::new((pts[0].x + pts[1].x) / 2.0, (pts[0].y + pts[1].y) / 2.0)
+        };
+        assert!(graphic_hit(&big, chord_mid, 0.3), "on the drawn stroke");
+        // An arc past a full turn is picked all round, as it is drawn.
+        let more_than_full = Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            start: 0.0,
+            end: 450.0,
+        };
+        assert!(graphic_hit(&more_than_full, Point::new(-10.0, 0.0), 0.5));
         assert!(graphic_hit(&g[2], Point::new(160.0, 60.0), 0.5), "the closing side");
 
         // Undo takes the last one back off; moving and deleting work like other drawings.
