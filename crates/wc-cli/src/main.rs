@@ -1957,10 +1957,10 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 .into_iter()
                 .partition(|(_, kind, _)| *kind == Kind::KicadSymbols);
             // Entry names are printed: written so a name cannot send the terminal control
-            // sequences. A library's prefix is made from its name as it is.
+            // sequences. A library's prefix and a page's title are made from the name as it is.
             let entries: Vec<_> = entries
                 .into_iter()
-                .map(|(name, kind, data)| (escape_field(&name), kind, data))
+                .map(|(raw, kind, data)| ((escape_field(&raw), raw), kind, data))
                 .collect();
             // CSV lists come last, so PLC addresses reach devices that pages in the same archive add.
             let (csvs, entries): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, kind, _)| *kind == Kind::Csv);
@@ -1999,7 +1999,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let staging = staging_dir("wiringcraft-archive-").map_err(e)?;
             let tmp = staging.path();
             let mut next = first_page;
-            for (i, (name, kind, data)) in entries.into_iter().enumerate() {
+            for (i, ((name, raw), kind, data)) in entries.into_iter().enumerate() {
                 let ext = match kind {
                     Kind::Pdf => "pdf",
                     Kind::Dxf => "dxf",
@@ -2028,8 +2028,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                                 "page {id} exists; remove it or import with --first-page to number the pages from a free number"
                             ))
                         } else {
-                            p.pages
-                                .push(Page::new(id.clone(), (next - 1).to_string(), name.clone()));
+                            p.pages.push(Page::new(id.clone(), (next - 1).to_string(), raw.clone()));
                             p.sort_pages();
                             // A save that fails part way is cleaned up like a failed import.
                             let r = save(dir, &p).and_then(|()| {
@@ -2082,7 +2081,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     eprintln!("warning: {name}: {err}");
                 }
             }
-            for (i, (name, _, data)) in csvs.into_iter().enumerate() {
+            for (i, ((name, _), _, data)) in csvs.into_iter().enumerate() {
                 println!("{name}:");
                 // Told apart by header, the same column names `plc-csv` and `parts-csv` read.
                 let path = tmp.join(format!("list-{i}.csv"));
@@ -2260,8 +2259,9 @@ fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str) -> Resul
 /// of its own size, each side at least [`PageSize::MIN_MM`]; one beyond the custom range gets
 /// A0, with the reason as a warning.
 fn sheet_for((w, h): (f64, f64)) -> (PageSize, Option<String>) {
-    // PDF sizes are in points, so an A3 page reads a fraction of a millimetre off.
-    const SLACK: f64 = 1.0;
+    // PDF sizes are in whole points, so an A3 page reads a fraction of a millimetre off; one
+    // point of slack covers that rounding and no more, so no drawing is cut by the sheet.
+    const SLACK: f64 = 25.4 / 72.0;
     let portrait = h > w;
     if let Some(named) = PageSize::NAMED
         .into_iter()
@@ -3723,6 +3723,14 @@ mod tests {
         assert_eq!(sheet_for_size((950.0, 600.0)), PageSize::A0);
         // A point-rounded A3 still reads as A3.
         assert_eq!(sheet_for_size((420.3, 297.2)), PageSize::A3);
+        // A drawing most of a millimetre wider than A0 is not cut to fit it.
+        assert_eq!(
+            sheet_for_size((1189.8, 841.0)),
+            PageSize::Custom {
+                width: 1190,
+                height: 841
+            }
+        );
         assert_eq!(
             sheet_for_size((1300.0, 900.0)),
             PageSize::Custom {
