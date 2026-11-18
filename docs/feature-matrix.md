@@ -92,7 +92,8 @@ For the other areas, the chapter to read in each help is:
 | Select, box select, copy, cut, paste, delete, undo/redo | yes | yes | yes | done |
 | Grid, snap, zoom, pan, fit page | yes | yes | yes | done |
 | Free graphics: lines, rectangles, texts | yes | yes | yes | done |
-| Circles, arcs, polylines and dimensions in the editor | yes | yes | partly: kept from imports, not drawn by hand | later |
+| Circles, arcs and polylines in the editor | yes | yes | yes: drawn by hand (Graphics toolbar), picked, moved, deleted and exported like other drawings | done |
+| Dimensions in the editor | yes | yes | partly: kept from imports (drawn by their block), not drawn by hand | later |
 | Find and replace texts, tags and wire numbers across the project | yes | yes | yes: Edit → Find (Ctrl+F), `wiringcraft find` | done (#109) |
 | Macros / window macros (save and insert groups) | yes | yes | yes | done |
 | Macro placeholders and value sets (one macro, several variants) | yes | partly | no | later |

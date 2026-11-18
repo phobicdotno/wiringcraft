@@ -1307,6 +1307,9 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
             Tool::Comment => "Comment",
             Tool::Line => "Line",
             Tool::Rect => "Rectangle",
+            Tool::Circle => "Circle",
+            Tool::Arc => "Arc",
+            Tool::Polyline => "Polyline",
         };
         // The current tool as an accent pill.
         let g = ui

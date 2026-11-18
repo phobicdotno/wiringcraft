@@ -2625,6 +2625,52 @@ mod tests {
         (tmp, app)
     }
 
+    #[test]
+    fn enter_ends_a_polyline_only_without_a_dialog_or_a_focused_field() {
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.tool = crate::state::Tool::Polyline;
+        let ctx = egui::Context::default();
+        let enter = || egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // A frame (focusing a text field first when asked), then one with Enter pressed.
+        let press = |a: &mut App, field: bool| -> bool {
+            a.ed.finish_shape = false;
+            let id = egui::Id::new("field");
+            for events in [vec![], vec![enter()]] {
+                let enter_frame = !events.is_empty();
+                let raw = egui::RawInput {
+                    events,
+                    ..Default::default()
+                };
+                let _ = ctx.run(raw, |ctx| {
+                    if field {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let mut s = String::new();
+                            ui.add(egui::TextEdit::singleline(&mut s).id(id));
+                        });
+                        ctx.memory_mut(|m| m.request_focus(id));
+                    }
+                    if enter_frame {
+                        let _ = a.shortcuts(ctx);
+                    }
+                });
+            }
+            a.ed.finish_shape
+        };
+        assert!(press(&mut a, false), "Enter ends the polyline");
+        a.dialog = Some(crate::Dialog::Message("Busy".into()));
+        assert!(!press(&mut a, false), "not under a dialog");
+        a.dialog = None;
+        assert!(!press(&mut a, true), "not while a text field has the keys");
+        a.ed.tool = crate::state::Tool::Line;
+        assert!(!press(&mut a, false), "only with the polyline tool");
+    }
+
     fn call(app: &mut App, name: &str, input: Value) -> Result<String, String> {
         wc_agent::Tools::run(&mut AppTools(app), name, &input)
     }
@@ -2927,6 +2973,9 @@ mod tests {
             Action::TextTool,
             Action::LineTool,
             Action::RectTool,
+            Action::CircleTool,
+            Action::ArcTool,
+            Action::PolylineTool,
             Action::PageProps,
         ];
         for act in editing {

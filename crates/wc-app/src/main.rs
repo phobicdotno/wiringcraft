@@ -196,6 +196,9 @@ impl chrome::Status for StatusView<'_> {
             Action::CommentTool => self.ed.tool == Tool::Comment,
             Action::LineTool => self.ed.tool == Tool::Line,
             Action::RectTool => self.ed.tool == Tool::Rect,
+            Action::CircleTool => self.ed.tool == Tool::Circle,
+            Action::ArcTool => self.ed.tool == Tool::Arc,
+            Action::PolylineTool => self.ed.tool == Tool::Polyline,
             Action::ToggleGrid => self.prefs.show_grid,
             Action::ToggleAutoWire => self.prefs.auto_wire,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
@@ -495,24 +498,40 @@ impl App {
             Action::Select => {
                 self.ed.tool = Tool::Select;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
             Action::PlaceSymbol => {
                 self.ed.tool = Tool::Place;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
-            Action::DrawWire => self.ed.tool = Tool::Wire,
-            Action::TextTool | Action::LineTool | Action::RectTool | Action::CommentTool => {
+            Action::DrawWire => {
+                self.ed.tool = Tool::Wire;
+                self.ed.shape_points.clear();
+            }
+            Action::TextTool
+            | Action::LineTool
+            | Action::RectTool
+            | Action::CircleTool
+            | Action::ArcTool
+            | Action::PolylineTool
+            | Action::CommentTool => {
                 self.ed.tool = match a {
                     Action::TextTool => Tool::Text,
                     Action::CommentTool => Tool::Comment,
                     Action::LineTool => Tool::Line,
+                    Action::CircleTool => Tool::Circle,
+                    Action::ArcTool => Tool::Arc,
+                    Action::PolylineTool => Tool::Polyline,
                     _ => Tool::Rect,
                 };
                 self.ed.wire = None;
-                self.ed.shape_start = None;
+                self.ed.shape_points.clear();
                 self.ed.message = match a {
                     Action::TextTool => "Click where the text goes.",
                     Action::CommentTool => "Click where the comment goes.",
+                    Action::CircleTool => "Click the centre of the circle.",
+                    Action::ArcTool => "Click the centre of the arc.",
                     _ => "Click the first point.",
                 }
                 .into();
@@ -934,9 +953,13 @@ impl App {
                     out.push(a);
                 }
             }
+            if i.key_pressed(Key::Enter) && i.modifiers.is_none() && self.ed.tool == Tool::Polyline {
+                self.ed.finish_shape = true;
+            }
             if i.key_pressed(Key::Escape) {
-                if self.ed.shape_start.is_some() {
-                    self.ed.shape_start = None;
+                if !self.ed.shape_points.is_empty() {
+                    self.ed.shape_points.clear();
+                    self.ed.message = canvas::shape_hint(self.ed.tool, 0).into();
                 } else if self.ed.wire.is_some() {
                     self.ed.wire = None;
                 } else {
