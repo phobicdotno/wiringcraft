@@ -128,7 +128,10 @@ fn keep_libraries(project: &mut Project, base: &Path) {
         if lib.kind != "folder" || Path::new(&lib.location).is_absolute() {
             continue;
         }
-        let named = lexical(&base.join(&lib.location));
+        // Where the folder really is, with links followed before `..` as the library loader
+        // does when it opens the path.
+        let full = base.join(&lib.location);
+        let named = resolved(&full).unwrap_or_else(|_| lexical(&full));
         if !named.starts_with(base) {
             lib.location = named.to_string_lossy().into_owned();
         }
@@ -457,6 +460,34 @@ mod tests {
         let new = tmp.path().join("new");
         create_from(&b, &new, "New", "2026-11-18").unwrap();
         assert!(!new.join("pictures/secret.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_library_path_through_a_link_keeps_pointing_where_the_link_leads() {
+        use crate::project::LibrarySource;
+        let tmp = tempfile::tempdir().unwrap();
+        let company = tmp.path().join("company");
+        let b = company.join("base");
+        base(&b);
+        // `company/link` points at `other/deep`, so `../link/../library` is `other/library`.
+        fs::create_dir_all(tmp.path().join("other/deep")).unwrap();
+        fs::create_dir_all(tmp.path().join("other/library")).unwrap();
+        fs::create_dir_all(company.join("library")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("other/deep"), company.join("link")).unwrap();
+        let mut p = store::load(&b).unwrap();
+        p.meta.libraries = vec![LibrarySource {
+            name: "through".into(),
+            kind: "folder".into(),
+            location: "../link/../library".into(),
+            reference: None,
+        }];
+        store::save(&b, &p).unwrap();
+        let made = create_from(&b, &tmp.path().join("new"), "New", "2026-11-18").unwrap();
+        assert_eq!(
+            Path::new(&made.meta.libraries[0].location),
+            fs::canonicalize(tmp.path().join("other/library")).unwrap()
+        );
     }
 
     #[cfg(unix)]
