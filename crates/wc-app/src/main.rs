@@ -1488,12 +1488,24 @@ impl App {
                             ui.end_row();
                             ui.label("Sheet size");
                             egui::ComboBox::from_id_salt("pagesize")
-                                .selected_text(size_label(*size))
+                                .selected_text(size.label())
                                 .show_ui(ui, |ui| {
-                                    for s in [PageSize::A4, PageSize::A3, PageSize::A2] {
-                                        ui.selectable_value(size, s, size_label(s));
+                                    for s in PageSize::NAMED {
+                                        ui.selectable_value(size, s, s.label());
+                                    }
+                                    if !matches!(size, PageSize::Custom { .. }) {
+                                        ui.selectable_value(size, custom_from(*size), "Custom size…");
                                     }
                                 });
+                            if let PageSize::Custom { width, height } = size {
+                                ui.end_row();
+                                ui.label("Custom size (mm)");
+                                ui.horizontal(|ui| {
+                                    let range = PageSize::MIN_MM..=PageSize::MAX_MM;
+                                    ui.add(egui::DragValue::new(width).range(range.clone()).suffix(" wide"));
+                                    ui.add(egui::DragValue::new(height).range(range).suffix(" high"));
+                                });
+                            }
                             ui.end_row();
                             ui.label("Overview");
                             ui.checkbox(overview, "Line diagram").on_hover_text(
@@ -2145,14 +2157,6 @@ impl App {
             }
             Err(e) => self.dialog = Some(Dialog::Message(format!("Could not create the branch:\n{e}"))),
         }
-    }
-}
-
-fn size_label(s: PageSize) -> &'static str {
-    match s {
-        PageSize::A4 => "A4 landscape",
-        PageSize::A3 => "A3 landscape",
-        PageSize::A2 => "A2 landscape",
     }
 }
 
@@ -3242,6 +3246,16 @@ impl App {
     }
 }
 
+/// The custom sheet "Custom size…" starts from: the size shown, as it is drawn (A4 portrait
+/// gives 210 x 297 mm).
+fn custom_from(size: PageSize) -> PageSize {
+    let (w, h) = size.mm();
+    PageSize::Custom {
+        width: w.round() as u32,
+        height: h.round() as u32,
+    }
+}
+
 fn main() -> eframe::Result {
     // Started by Claude Code as the assistant's MCP server: pass messages to the running app.
     let mut args = std::env::args_os();
@@ -3783,5 +3797,28 @@ mod marking_tests {
         let msg = export_wago_marking(&o, &options);
         assert!(msg.starts_with("Nothing exported") && msg.contains("-X1"), "{msg}");
         assert!(!o.dir.join("export").join("wago-marking--X1.csv").exists());
+    }
+}
+
+#[cfg(test)]
+mod page_size_tests {
+    use super::*;
+
+    #[test]
+    fn a_custom_sheet_starts_from_the_size_shown() {
+        assert_eq!(
+            custom_from(PageSize::A4Portrait),
+            PageSize::Custom {
+                width: 210,
+                height: 297
+            }
+        );
+        assert_eq!(
+            custom_from(PageSize::A3),
+            PageSize::Custom {
+                width: 420,
+                height: 297
+            }
+        );
     }
 }

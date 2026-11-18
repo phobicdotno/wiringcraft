@@ -374,6 +374,8 @@ enum PageCmd {
         number: String,
         #[arg(long, default_value = "")]
         title: String,
+        /// A4, A3, A2, A1 or A0, landscape unless followed by `-portrait` (`A4-portrait`), or
+        /// a sheet of its own as WIDTHxHEIGHT in millimetres (`500x700`).
         #[arg(long, default_value = "A3")]
         size: String,
         /// An overview (line diagram): its devices do not count as drawings in `check`.
@@ -393,6 +395,12 @@ enum PageCmd {
         id: String,
         #[arg(long)]
         off: bool,
+    },
+    /// Change a page's sheet size (as `page add --size` takes it). What is drawn stays where it
+    /// is; a smaller sheet can leave some of it outside the frame.
+    Size {
+        id: String,
+        size: String,
     },
     /// Make a page the project's cover page (any other page loses the mark), or with `--off` a
     /// normal page again.
@@ -911,12 +919,7 @@ fn run(cli: Cli) -> Res<()> {
                     }
                     let mut page = Page::new(id, number, title);
                     page.overview = overview;
-                    page.size = match size.to_uppercase().as_str() {
-                        "A4" => PageSize::A4,
-                        "A3" => PageSize::A3,
-                        "A2" => PageSize::A2,
-                        other => return Err(format!("unknown size {other}")),
-                    };
+                    page.size = PageSize::parse(&size)?;
                     p.pages.push(page);
                     if cover {
                         let i = p.pages.len() - 1;
@@ -930,7 +933,7 @@ fn run(cli: Cli) -> Res<()> {
                             "{:<10} {:<6} {} ({} symbols, {} wires){}",
                             pg.id,
                             pg.number,
-                            pg.title,
+                            escape_field(&pg.title),
                             pg.symbols.len(),
                             pg.wires.len(),
                             match (pg.cover, pg.overview) {
@@ -957,6 +960,15 @@ fn run(cli: Cli) -> Res<()> {
                         .find(|pg| pg.id == id)
                         .ok_or_else(|| format!("no page {id:?}"))?;
                     page.overview = !off;
+                }
+                PageCmd::Size { id, size } => {
+                    let size = PageSize::parse(&size)?;
+                    let page = p
+                        .pages
+                        .iter_mut()
+                        .find(|pg| pg.id == id)
+                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    page.size = size;
                 }
                 PageCmd::Cover { id, off } => {
                     let i = p
@@ -1739,57 +1751,11 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             println!("imported {} part(s) into {}", parts.len(), lib.display());
         }
         ImportCmd::Pdf { file, first_page } => {
-            let mut p = load(dir)?;
-            let bytes = std::fs::read(&file).map_err(e)?;
-            let traced = wc_import::pdf::pages(&bytes).map_err(e)?;
-            let stem = file
-                .file_stem()
-                .map(|n| n.to_string_lossy().into_owned())
+            let source = file
+                .file_name()
+                .map(|n| escape_field(&n.to_string_lossy()))
                 .unwrap_or_default();
-            for (i, t) in traced.into_iter().enumerate() {
-                let id = format!("pdf-{}", first_page + i);
-                if p.page(&id).is_some() {
-                    return Err(format!("page {id} exists; pick another --first-page"));
-                }
-                if t.graphics.is_empty() && t.scan.is_none() {
-                    let why = t.scan_problem.as_deref().unwrap_or("no picture covers the page");
-                    eprintln!(
-                        "warning: page {} of {stem} has no vector content and no usable scan ({why})",
-                        i + 1,
-                    );
-                }
-                let underlay = match &t.scan {
-                    Some(scan) => {
-                        let file = format!("{}/{id}.{}", wc_core::Underlay::DIR, scan.raster.format.extension());
-                        std::fs::create_dir_all(dir.join(wc_core::Underlay::DIR)).map_err(e)?;
-                        std::fs::write(dir.join(&file), &scan.raster.bytes).map_err(e)?;
-                        println!(
-                            "page {}: scanned sheet saved as {file}, shown under the page",
-                            first_page + i
-                        );
-                        Some(wc_core::Underlay {
-                            file,
-                            min: scan.min,
-                            max: scan.max,
-                        })
-                    }
-                    None => None,
-                };
-                let mut page = Page::new(id, (first_page + i).to_string(), format!("{stem} p.{}", i + 1));
-                page.underlay = underlay;
-                page.size = if t.size_mm.0 > 500.0 {
-                    PageSize::A2
-                } else if t.size_mm.0 > 350.0 {
-                    PageSize::A3
-                } else {
-                    PageSize::A4
-                };
-                println!("page {}: {} shapes", page.number, t.graphics.len());
-                page.graphics = t.graphics;
-                p.pages.push(page);
-            }
-            p.sort_pages();
-            save(dir, &p)?;
+            import_pdf(dir, &file, first_page, &source)?;
         }
         ImportCmd::Eplan { path, first_page } => {
             let mut p = load(dir)?;
@@ -1998,17 +1964,24 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let (symbols, entries): (Vec<_>, Vec<_>) = entries
                 .into_iter()
                 .partition(|(_, kind, _)| *kind == Kind::KicadSymbols);
+            // Entry names are printed: written so a name cannot send the terminal control
+            // sequences. A library's prefix and a page's title are made from the name as it is.
+            let entries: Vec<_> = entries
+                .into_iter()
+                .map(|(raw, kind, data)| ((escape_field(&raw), raw), kind, data))
+                .collect();
             // CSV lists come last, so PLC addresses reach devices that pages in the same archive add.
             let (csvs, entries): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, kind, _)| *kind == Kind::Csv);
             // Two entries with the same file name would write the same ids over each other.
             let mut prefixes = std::collections::BTreeSet::new();
-            for (name, _, data) in symbols {
+            for (raw, _, data) in symbols {
+                let name = escape_field(&raw);
                 println!("{name}:");
                 let Some(lib) = &lib else {
                     eprintln!("warning: {name}: KiCad symbols, not imported: pass --lib <folder>");
                     continue;
                 };
-                let prefix = kicad_prefix(&name);
+                let prefix = kicad_prefix(&raw);
                 if prefixes.contains(&prefix) {
                     eprintln!("warning: {name}: skipped, an earlier entry already imports as {prefix}");
                     continue;
@@ -2034,7 +2007,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let staging = staging_dir("wiringcraft-archive-").map_err(e)?;
             let tmp = staging.path();
             let mut next = first_page;
-            for (i, (name, kind, data)) in entries.into_iter().enumerate() {
+            for (i, ((name, raw), kind, data)) in entries.into_iter().enumerate() {
                 let ext = match kind {
                     Kind::Pdf => "pdf",
                     Kind::Dxf => "dxf",
@@ -2046,13 +2019,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 let r = match kind {
                     Kind::Pdf => {
                         let n = wc_import::pdf::pages(&data).map(|p| p.len()).unwrap_or(0);
-                        let r = import_cmd(
-                            dir,
-                            ImportCmd::Pdf {
-                                file: path.clone(),
-                                first_page: next,
-                            },
-                        );
+                        let r = import_pdf(dir, &path, next, &name);
                         next += n.max(1);
                         r
                     }
@@ -2069,8 +2036,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                                 "page {id} exists; remove it or import with --first-page to number the pages from a free number"
                             ))
                         } else {
-                            p.pages
-                                .push(Page::new(id.clone(), (next - 1).to_string(), name.clone()));
+                            p.pages.push(Page::new(id.clone(), (next - 1).to_string(), raw.clone()));
                             p.sort_pages();
                             // A save that fails part way is cleaned up like a failed import.
                             let r = save(dir, &p).and_then(|()| {
@@ -2123,7 +2089,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     eprintln!("warning: {name}: {err}");
                 }
             }
-            for (i, (name, _, data)) in csvs.into_iter().enumerate() {
+            for (i, ((name, _), _, data)) in csvs.into_iter().enumerate() {
                 println!("{name}:");
                 // Told apart by header, the same column names `plc-csv` and `parts-csv` read.
                 let path = tmp.join(format!("list-{i}.csv"));
@@ -2236,6 +2202,93 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// `import pdf`: the pages of `file` as trace pages numbered from `first_page`. `source` names
+/// the PDF in warnings (the file name, or the entry name inside an archive, where `file` is a
+/// staging file), already escaped with [`escape_field`] by the caller.
+fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str) -> Result<(), String> {
+    let mut p = load(dir)?;
+    let bytes = std::fs::read(file).map_err(e)?;
+    let traced = wc_import::pdf::pages(&bytes).map_err(e)?;
+    let stem = file
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for (i, t) in traced.into_iter().enumerate() {
+        let id = format!("pdf-{}", first_page + i);
+        if p.page(&id).is_some() {
+            return Err(format!("page {id} exists; pick another --first-page"));
+        }
+        if t.graphics.is_empty() && t.scan.is_none() {
+            // The reason can quote the file: written so it cannot send control sequences.
+            let why = escape_field(t.scan_problem.as_deref().unwrap_or("no picture covers the page"));
+            eprintln!(
+                "warning: {} page {}: no vector content and no usable scan ({why})",
+                source,
+                i + 1,
+            );
+        }
+        let underlay = match &t.scan {
+            Some(scan) => {
+                let file = format!("{}/{id}.{}", wc_core::Underlay::DIR, scan.raster.format.extension());
+                std::fs::create_dir_all(dir.join(wc_core::Underlay::DIR)).map_err(e)?;
+                std::fs::write(dir.join(&file), &scan.raster.bytes).map_err(e)?;
+                println!(
+                    "page {}: scanned sheet saved as {file}, shown under the page",
+                    first_page + i
+                );
+                Some(wc_core::Underlay {
+                    file,
+                    min: scan.min,
+                    max: scan.max,
+                })
+            }
+            None => None,
+        };
+        let mut page = Page::new(id, (first_page + i).to_string(), format!("{stem} p.{}", i + 1));
+        page.underlay = underlay;
+        let (size, why) = sheet_for(t.size_mm);
+        if let Some(why) = why {
+            eprintln!("warning: page {} ({} page {}): {why}", first_page + i, source, i + 1);
+        }
+        page.size = size;
+        println!("page {}: {} shapes", page.number, t.graphics.len());
+        page.graphics = t.graphics;
+        p.pages.push(page);
+    }
+    p.sort_pages();
+    save(dir, &p)?;
+    Ok(())
+}
+
+/// The sheet for a traced drawing of `(width, height)` millimetres: the smallest ISO size
+/// that holds both sides, upright when the drawing is. A drawing larger than A0 gets a sheet
+/// of its own size, each side at least [`PageSize::MIN_MM`]; one beyond the custom range gets
+/// A0, with the reason as a warning.
+fn sheet_for((w, h): (f64, f64)) -> (PageSize, Option<String>) {
+    // PDF sizes are in whole points, so an A3 page reads a fraction of a millimetre off; one
+    // point of slack covers that rounding and no more, so no drawing is cut by the sheet.
+    const SLACK: f64 = 25.4 / 72.0;
+    let portrait = h > w;
+    if let Some(named) = PageSize::NAMED
+        .into_iter()
+        .filter(|s| s.is_portrait() == portrait)
+        .find(|s| {
+            let (sw, sh) = s.mm();
+            w <= sw + SLACK && h <= sh + SLACK
+        })
+    {
+        return (named, None);
+    }
+    let side = |mm: f64| (mm.ceil() as u32).max(PageSize::MIN_MM);
+    match PageSize::custom(side(w), side(h)) {
+        Ok(size) => (size, None),
+        Err(why) => {
+            let a0 = if portrait { PageSize::A0Portrait } else { PageSize::A0 };
+            (a0, Some(format!("{why}, so it is drawn on {}", a0.label())))
+        }
+    }
 }
 
 /// What `lib lock` could not pin, one line each.
@@ -3751,6 +3804,69 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn pages_can_be_upright_large_or_of_their_own_size() {
+        let sheet_for_size = |mm| sheet_for(mm).0;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        for (id, size, want) in [
+            ("up", "A4-portrait", PageSize::A4Portrait),
+            ("big", "A1", PageSize::A1),
+            (
+                "own",
+                "500x700",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+        ] {
+            cli(&dir, &["page", "add", id, "--number", id, "--size", size]).unwrap();
+            assert_eq!(load(&dir).unwrap().page(id).map(|p| p.size), Some(want), "{size}");
+        }
+        cli(&dir, &["page", "size", "big", "A0-portrait"]).unwrap();
+        assert_eq!(
+            load(&dir).unwrap().page("big").map(|p| p.size),
+            Some(PageSize::A0Portrait)
+        );
+        let err = cli(&dir, &["page", "add", "bad", "--number", "bad", "--size", "A5"]).unwrap_err();
+        assert!(err.contains("portrait"), "{err}");
+        assert_eq!(sheet_for_size((210.0, 297.0)), PageSize::A4Portrait);
+        assert_eq!(sheet_for_size((841.0, 594.0)), PageSize::A1);
+        assert_eq!(sheet_for_size((420.0, 297.0)), PageSize::A3);
+        // Both sides count: a 950 x 600 mm page is wider than A1 though its long side is short
+        // of A0's.
+        assert_eq!(sheet_for_size((950.0, 600.0)), PageSize::A0);
+        // A point-rounded A3 still reads as A3.
+        assert_eq!(sheet_for_size((420.3, 297.2)), PageSize::A3);
+        // A drawing most of a millimetre wider than A0 is not cut to fit it.
+        assert_eq!(
+            sheet_for_size((1189.8, 841.0)),
+            PageSize::Custom {
+                width: 1190,
+                height: 841
+            }
+        );
+        assert_eq!(
+            sheet_for_size((1300.0, 900.0)),
+            PageSize::Custom {
+                width: 1300,
+                height: 900
+            }
+        );
+        assert_eq!(sheet_for_size((5000.0, 900.0)), PageSize::A0);
+        assert!(sheet_for((5000.0, 900.0)).1.is_some_and(|w| w.contains("A0 landscape")));
+        // A long, low drawing gets the smallest side a sheet may have.
+        assert_eq!(
+            sheet_for_size((1300.0, 80.0)),
+            PageSize::Custom {
+                width: 1300,
+                height: 100
+            }
+        );
     }
 
     #[test]
