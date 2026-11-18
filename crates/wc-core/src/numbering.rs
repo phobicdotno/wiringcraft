@@ -225,6 +225,18 @@ mod tests {
     }
 
     #[test]
+    fn page_column_numbers_use_the_templates_columns() {
+        let mut p = project();
+        p.meta.template.columns = 20;
+        number_wires(&mut p, Rule::PageColumn, false, |_| None, pos);
+        // A3 with 20 columns of 20 mm from x = 10: not the built-in 3.8, 3.2 and 3.5.
+        assert_eq!(
+            numbers(&p),
+            [Some("3.15"), Some("3.15"), Some("3.3"), None, Some("3.10")]
+        );
+    }
+
+    #[test]
     fn existing_numbers_are_kept_unless_overwritten() {
         let mut p = project();
         p.pages[0].wires[1].number = Some("1".into());

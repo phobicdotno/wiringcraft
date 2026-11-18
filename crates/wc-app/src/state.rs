@@ -1390,15 +1390,7 @@ impl Open {
         if !name_changes && self.project.meta.title_block == block {
             return;
         }
-        // Keep adding to the form's own undo step only while nothing else has touched the
-        // history since; after any other change (a page added, another properties edit, an
-        // undo) the form starts a new step.
-        if self.form_step == Some(self.history) {
-            self.dirty = true;
-        } else {
-            self.checkpoint();
-            self.form_step = Some(self.history);
-        }
+        self.live_form_step();
         if name_changes {
             self.project.meta.name = name.to_owned();
         }
@@ -1412,13 +1404,20 @@ impl Open {
         if self.project.meta.template == *template {
             return;
         }
+        self.live_form_step();
+        self.project.meta.template = template.clone();
+    }
+
+    /// Before a live form's change: keep adding to the form's own undo step only while nothing
+    /// else has touched the history since; after any other change (a page added, another
+    /// properties edit, an undo) the form starts a new step.
+    fn live_form_step(&mut self) {
         if self.form_step == Some(self.history) {
             self.dirty = true;
         } else {
             self.checkpoint();
             self.form_step = Some(self.history);
         }
-        self.project.meta.template = template.clone();
     }
 
     /// Take back what [`Open::set_template_live`] changed since `since` (the form was
@@ -1431,10 +1430,10 @@ impl Open {
                 p.meta.template.clone_from(&self.project.meta.template);
                 p == self.project && prev.meta.template == *before
             });
-        if only_the_form {
-            if self.undo() {
-                self.redo.clear();
-            }
+        // When the undo cannot be done (the symbol files could not follow it), the template
+        // alone is put back below, so Cancel still leaves the template as it was.
+        if only_the_form && self.undo() {
+            self.redo.clear();
             return;
         }
         if self.project.meta.template != *before {

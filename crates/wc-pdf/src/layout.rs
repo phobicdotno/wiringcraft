@@ -405,7 +405,13 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
     };
     for (b, (l, t, r, _)) in &boxes {
         let top = ty + t;
-        text((l + PAD, top + 3.0), 1.8, Align::Left, &b.label, Ink::Label, &mut out);
+        // Labels and values never reach past their box: they shrink to fit, and a box too narrow
+        // for any text shows none.
+        let label_room = r - l - 2.0 * PAD;
+        if label_room > 0.0 {
+            let h = fit_height(&b.label, 1.8, label_room);
+            text((l + PAD, top + 3.0), h, Align::Left, &b.label, Ink::Label, &mut out);
+        }
         // Each value is shrunk to the width of its box (less padding), so a long one never runs
         // into the next box or over the frame.
         for bt in &b.texts {
@@ -416,6 +422,9 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
                 Align::Right => (r - bt.inset, r - l - bt.inset - PAD),
                 Align::Center => ((l + r) / 2.0, r - l - 2.0 * PAD),
             };
+            if room <= 0.0 {
+                continue;
+            }
             let h = fit_height(&shown, bt.size, room);
             text((x, top + bt.y), h, bt.align, &shown, Ink::Thin, &mut out);
         }
@@ -1349,6 +1358,88 @@ mod template_tests {
         let (w, _) = page.size.mm();
         assert_eq!(p.column_of(&page, w - MARGIN - 1.0), 12);
         assert_eq!(p.column_of(&page, MARGIN + (w - 2.0 * MARGIN) / 12.0 + 0.1), 2);
+    }
+
+    fn texts(marks: &[FrameMark]) -> Vec<(String, f64)> {
+        marks
+            .iter()
+            .filter_map(|m| match &m.shape {
+                Shape::Text { text, height, .. } => Some((text.clone(), *height)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn labels_and_values_stay_inside_narrow_boxes() {
+        let (mut p, page) = demo(PageSize::A3, false);
+        let mut t = PageTemplate::default();
+        // 2 mm wide: no room for any text once padded.
+        let mut tiny = TitleBox::new("Tiny", (100.0, Side::Left), (102.0, Side::Left), 0.0, 12.0);
+        tiny.texts.push(BoxText::new(&["customer"], 2.5, 9.5, Align::Left));
+        // 12 mm wide with a long label: the label shrinks.
+        let narrow = TitleBox::new(
+            "A label far too long for its box",
+            (110.0, Side::Left),
+            (122.0, Side::Left),
+            0.0,
+            12.0,
+        );
+        t.boxes.push(tiny);
+        t.boxes.push(narrow);
+        p.meta.template = t;
+        let all = texts(&frame_marks(&p, &page, 0, 1, ""));
+        assert!(!all.iter().any(|(t, _)| t == "Tiny"), "no room for the label");
+        assert_eq!(
+            all.iter().filter(|(t, _)| t == "ACME").count(),
+            1,
+            "only the customer box shows the value, not the 2 mm box"
+        );
+        let (label, h) = all
+            .iter()
+            .find(|(t, _)| t.starts_with("A label"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(h < 1.8, "{label} drawn at {h}");
+        assert!(crate::writer::text_width_mm(&label, h) <= 12.0 - 2.0 * PAD + 1e-6);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn cross_references_use_the_templates_columns() {
+        use wc_core::geom::Point;
+        use wc_core::symbol::{Pin, PinDir, SymbolRole};
+        let coil = Symbol {
+            id: "coil".into(),
+            name: "coil".into(),
+            category: String::new(),
+            letter_code: "K".into(),
+            role: SymbolRole::Main,
+            graphics: Vec::new(),
+            pins: vec![Pin {
+                name: "A1".into(),
+                at: Point::new(0.0, 0.0),
+                dir: PinDir::Up,
+            }],
+            tag_at: Point::new(0.0, 0.0),
+            description: String::new(),
+        };
+        let symbols = BTreeMap::from([("coil".to_owned(), coil)]);
+        let (mut p, mut page) = demo(PageSize::A3, false);
+        // 205 mm across an A3 frame: column 5 of 10, column 10 of 20.
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "coil".into(),
+            at: Point::new(205.0, 100.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(DeviceTag::parse("-K1").unwrap()),
+        });
+        p.pages.push(page);
+        let column = |p: &Project| CrossRefs::build(p, &symbols).mains.values().next().unwrap()[0].column;
+        assert_eq!(column(&p), 5);
+        p.meta.template.columns = 20;
+        assert_eq!(column(&p), 10);
     }
 
     #[test]
