@@ -29,11 +29,16 @@ fn place(page: &mut Page, id: &str, x: f64) {
 
 /// A journal shared with the test so it can look at what was recorded.
 #[derive(Clone, Default)]
-struct Shared(Rc<RefCell<Vec<Change>>>);
+struct Shared(Rc<RefCell<Vec<Change>>>, Rc<RefCell<Vec<String>>>);
 
 impl Journal for Shared {
     fn record(&mut self, _project: &Project, change: &Change) -> Result<()> {
         self.0.borrow_mut().push(change.clone());
+        Ok(())
+    }
+
+    fn picture(&mut self, picture: &Picture) -> Result<()> {
+        self.1.borrow_mut().push(picture.file.clone());
         Ok(())
     }
 }
@@ -2578,6 +2583,31 @@ fn a_session_takes_only_so_many_new_pictures() -> TestResult {
     s.host.edit_project(ProjectEdit::AddPicture {
         picture: picture("pictures/p0.png", b"x"),
     })?;
+    Ok(())
+}
+
+#[test]
+fn a_session_takes_only_so_many_bytes_of_new_pictures() -> TestResult {
+    let mut s = Session::new();
+    let mb = vec![7u8; 1024 * 1024];
+    let fit = MAX_ADDED_PICTURE_BYTES / mb.len();
+    assert!(fit < MAX_ADDED_PICTURES, "the byte limit is reached first");
+    for n in 0..fit {
+        s.host.edit_project(ProjectEdit::AddPicture {
+            picture: picture(&format!("pictures/p{n}.png"), &mb),
+        })?;
+    }
+    let (pictures, recorded) = (s.host.pictures().clone(), s.log.1.borrow().clone());
+    let refused = s.host.edit_project(ProjectEdit::AddPicture {
+        picture: picture("pictures/one-more.png", b"x"),
+    });
+    assert!(
+        matches!(&refused, Err(Refusal::Invalid { reason }) if reason.contains("at most")),
+        "{refused:?}"
+    );
+    assert_eq!(s.host.pictures(), &pictures, "the session's pictures are unchanged");
+    assert_eq!(*s.log.1.borrow(), recorded, "nothing more was written");
+    assert_eq!(recorded.len(), fit);
     Ok(())
 }
 

@@ -236,12 +236,69 @@ fn write_new(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// Put the finished file `part` at `path`, failing with `AlreadyExists` when something is
-/// there. A hard link does that in one step; where a folder cannot hold hard links, the
-/// file is copied into a newly made file instead.
+/// there. A hard link does that in one step.
 fn publish(part: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::hard_link(part, path) {
+    publish_with(part, path, |a, b| std::fs::hard_link(a, b))
+}
+
+/// [`publish`] with the hard link made by `link`. Where a folder cannot hold hard links
+/// (FAT, some network drives), the whole part file is renamed into place once nothing is
+/// there, so no cut-off picture ever shows under the name. That check and the rename are
+/// two steps: a file made in between by someone else would be replaced, which only another
+/// writer of the same picture name at the same moment could cause.
+fn publish_with(
+    part: &std::path::Path,
+    path: &std::path::Path,
+    link: impl Fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    match link(part, path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-        Err(_) => write_new(path, &std::fs::read(part)?),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(e),
+        Err(_) => match std::fs::symlink_metadata(path) {
+            Ok(_) => Err(std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                "the picture is there already",
+            )),
+            Err(e) if e.kind() == ErrorKind::NotFound => std::fs::rename(part, path),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    fn no_links(_: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no hard links here",
+        ))
+    }
+
+    #[test]
+    fn without_hard_links_a_picture_is_renamed_into_place_whole() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let (part, path) = (tmp.path().join(".logo.png.part"), tmp.path().join("logo.png"));
+        std::fs::write(&part, b"whole picture")?;
+        publish_with(&part, &path, no_links)?;
+        assert_eq!(std::fs::read(&path)?, b"whole picture");
+        assert!(!part.exists(), "the part file became the picture");
+        Ok(())
+    }
+
+    #[test]
+    fn without_hard_links_a_file_already_there_is_kept() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let (part, path) = (tmp.path().join(".logo.png.part"), tmp.path().join("logo.png"));
+        std::fs::write(&part, b"new")?;
+        std::fs::write(&path, b"mine")?;
+        let r = publish_with(&part, &path, no_links);
+        assert!(r.is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read(&path)?, b"mine");
+        Ok(())
     }
 }
