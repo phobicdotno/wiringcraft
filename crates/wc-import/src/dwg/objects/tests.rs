@@ -1555,7 +1555,7 @@ fn far_apart_arc_angles_still_make_an_arc_and_a_lost_hole_unfills() -> TestResul
     let far = hatch_obj(v, 0x300, "ANSI31", false, 1, |d| {
         d.bl(1).bl(2);
         d.rc(1).rd(20.0).rd(0.0).rd(30.0).rd(0.0);
-        d.rc(2).rd(25.0).rd(0.0).bd(5.0).bd(-1e306).bd(1e306).b(true);
+        d.rc(2).rd(25.0).rd(0.0).bd(5.0).bd(-2e306).bd(2e306).b(true);
         d.bl(0);
     });
     // A solid square with a hole whose arc overflows: drawn as outlines, not filled over.
@@ -1576,11 +1576,29 @@ fn far_apart_arc_angles_still_make_an_arc_and_a_lost_hole_unfills() -> TestResul
             .b(true)
             .bl(0);
     });
+    // Each end is a number of degrees, their difference is not.
+    let (d0, d1) = ((-2e306f64).to_degrees(), 2e306f64.to_degrees());
+    assert!(d0.is_finite() && d1.is_finite() && !(d1 - d0).is_finite());
+    // A solid triangle whose bulged side overflows: left out and counted, not filled straight.
+    let bulge = hatch_obj(v, 0x302, "SOLID", true, 1, |d| {
+        d.bl(2).b(true).b(true).bl(3);
+        d.rd(-1e308)
+            .rd(0.0)
+            .bd(1.0)
+            .rd(1e308)
+            .rd(0.0)
+            .bd(0.0)
+            .rd(0.0)
+            .rd(1.0)
+            .bd(0.0);
+        d.bl(0);
+    });
     let objs = vec![
         entry(v, LAYER, LAYER_H, "0"),
         entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
         far,
         lost,
+        bulge,
     ];
     let d = drawing(&sections(v, &objs, &[]))?;
     let polys: Vec<(usize, bool)> = d
@@ -1593,5 +1611,15 @@ fn far_apart_arc_angles_still_make_an_arc_and_a_lost_hole_unfills() -> TestResul
         .collect();
     assert!(polys.iter().any(|(n, _)| *n > 5), "the arc is drawn: {polys:?}");
     assert!(polys.contains(&(4, false)), "the square is not filled: {polys:?}");
+    assert!(
+        !polys.contains(&(3, true)),
+        "the bulged triangle is not filled straight: {polys:?}"
+    );
+    assert_eq!(
+        d.skipped.get("HATCH with a boundary that is not numbers"),
+        Some(&2),
+        "{:?}",
+        d.skipped
+    );
     Ok(())
 }

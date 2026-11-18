@@ -725,7 +725,9 @@ impl Cursor<'_> {
 
 /// Points of a polyline vertex list with bulges: an arc between two points where the bulge is
 /// not zero (bulge = tan(sweep / 4), positive counter-clockwise).
-fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Vec<(f64, f64)> {
+/// `None` when a bulged segment cannot be sampled (its numbers overflow), so the caller does not
+/// draw a straight side in place of an arc.
+fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)>> {
     let mut out = Vec::new();
     let n = vertices.len();
     for i in 0..n {
@@ -751,9 +753,12 @@ fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Vec<(f64, f64)> {
         let a0 = (a.1 - c.1).atan2(a.0 - c.0).to_degrees();
         let a1 = (b.1 - c.1).atan2(b.0 - c.0).to_degrees();
         let pts = arc_points(c, r, a0, a1, bulge > 0.0);
+        if pts.len() < 2 || !pts.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
+            return None;
+        }
         out.extend(pts.iter().skip(1).take(pts.len().saturating_sub(2)));
     }
-    out
+    Some(out)
 }
 
 /// The boundary loops of a HATCH, as DXF points. Unreadable loops are left out.
@@ -779,7 +784,9 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                 let bulge = if has_bulge { cur.take(42).unwrap_or(0.0) } else { 0.0 };
                 vs.push((v, bulge));
             }
-            pts = bulged(&vs, true);
+            // A bulge that cannot be sampled marks the loop as not numbers, so the HATCH arm
+            // leaves it out and counts it rather than drawing a straight side.
+            pts = bulged(&vs, true).unwrap_or_else(|| vec![(f64::NAN, f64::NAN); 3]);
         } else {
             let edges = cur.count(93);
             for edge in 0..edges {
@@ -1517,7 +1524,7 @@ mod tests {
     fn a_bulge_in_a_hatch_loop_is_an_arc() {
         // From (0,0) to (10,0) with bulge 1: a half circle turning counter-clockwise around
         // (5,0), so it passes (5,-5).
-        let pts = bulged(&[((0.0, 0.0), 1.0), ((10.0, 0.0), 0.0)], false);
+        let pts = bulged(&[((0.0, 0.0), 1.0), ((10.0, 0.0), 0.0)], false).unwrap_or_default();
         assert!(
             pts.iter().any(|p| (p.0 - 5.0).abs() < 1e-9 && (p.1 + 5.0).abs() < 1e-9),
             "{pts:?}"
