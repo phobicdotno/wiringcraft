@@ -222,7 +222,7 @@ For the other areas, the chapter to read in each help is:
 | AutomationML export | yes | partly | yes | done |
 | List exchange as CSV (import and export) | yes | yes | yes | done |
 | Excel workbook (.xlsx) import and export | yes | yes | no: CSV only | later |
-| WAGO and other maker configurator links | add-on | partly | partly: terminal strips with rails, jumpers and accessories as a CSV for the WAGO configurator ([docs](wago-configurator.md)); import back is #123 | partly (#122) |
+| WAGO and other maker configurator links | add-on | partly | partly: terminal strips with rails, jumpers and accessories as a CSV for the WAGO configurator ([docs](wago-configurator.md)), and the chosen articles back onto the devices (`import wago`, File → WAGO articles back) | partly (#122) |
 
 ## 14. Revisions and collaboration
 

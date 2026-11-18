@@ -58,12 +58,16 @@ pub const CONFIGURATOR_COLUMNS: [&str; 19] = [
 /// - `Accessory` rows: the strip device's own part and accessories (end plates, end stops,
 ///   marker carriers) and each terminal's accessories, with their quantities.
 ///
-/// The `Index` column is `<strip>/T<position>` for a terminal, `/J<n>` for a jumper, `/A<n>` for
-/// an accessory, `/P<n>` for a plate and `/R<n>` for a rail (`-X1/T3`).
+/// The `Index` column is `<strip>/T<position>` for a terminal, `/J<n>` for a jumper, `/P<n>` for
+/// a plate and `/R<n>` for a rail (`-X1/T3`). Accessory rows name the device slot they are:
+/// `<strip>/S` for the strip device's own part, `<strip>/A<n>` for its n-th accessory, and
+/// `<strip>/T<position>/A<n>` for the n-th accessory of the terminal device first at that
+/// position (`-X1/T2/A1`).
 pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
     let mut out = Configurator {
         table: Table::new("WAGO configurator", &CONFIGURATOR_COLUMNS),
         warnings: Vec::new(),
+        targets: BTreeMap::new(),
     };
     let info = terminal_info(i);
     // (number, level) of each terminal in strip order, each terminal once, by strip.
@@ -143,8 +147,14 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
                 quantity: "1".into(),
                 ..row(format!("{strip}/T{}", pos + 1), "Terminal")
             };
-            if let Some(part) = device_of(number).and_then(|(_, d)| d.part.as_deref()) {
-                r.set_part(i, part);
+            if let Some((tag, d)) = device_of(number) {
+                if let Some(part) = d.part.as_deref() {
+                    r.set_part(i, part);
+                }
+                r.target = Some(Target::Part(tag.clone()));
+            } else if let Some(tag) = info.get(&(strip.clone(), number.clone())).and_then(|t| t.tag.as_ref()) {
+                // Drawn but without a device entry yet: the import back makes one.
+                r.target = Some(Target::Part(tag.clone()));
             }
             if let Some([(us, uc), (ls, lc)]) = info.get(&(strip.clone(), number.clone())).map(|t| &t.sides) {
                 r.upper_section = join(us);
@@ -173,34 +183,63 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
 
         // The strip device's own parts first (unless terminals are drawn as the strip device
         // itself: then its part is theirs), then each terminal device's accessories in strip
-        // order, once per device.
-        let mut accessories: Vec<(String, u32, String)> = Vec::new();
+        // order, once per device. Each index names the device's own slot, so adding an
+        // accessory to one device leaves the others' indexes as they are.
+        let mut accessories: Vec<(String, String, u32, String, Target)> = Vec::new();
         let strip_is_a_terminal = terminals
             .iter()
             .any(|(n, _)| device_of(n).is_some_and(|(t, _)| *t == strip_tag));
         if !strip_is_a_terminal && let Some(d) = i.project.devices.get(&strip_tag) {
-            accessories.extend(d.part.iter().map(|p| (p.clone(), 1, String::new())));
-            accessories.extend(d.accessories.iter().map(|a| (a.part.clone(), a.qty, String::new())));
+            accessories.extend(d.part.iter().map(|p| {
+                (
+                    format!("{strip}/S"),
+                    p.clone(),
+                    1,
+                    String::new(),
+                    Target::Part(strip_tag.clone()),
+                )
+            }));
+            accessories.extend(d.accessories.iter().enumerate().map(|(k, a)| {
+                (
+                    format!("{strip}/A{}", k + 1),
+                    a.part.clone(),
+                    a.qty,
+                    String::new(),
+                    Target::Accessory(strip_tag.clone(), k),
+                )
+            }));
         }
         let mut seen: BTreeSet<&DeviceTag> = BTreeSet::new();
-        for (number, _) in terminals {
+        for (pos, (number, _)) in terminals.iter().enumerate() {
             if let Some((tag, d)) = device_of(number)
                 && seen.insert(tag)
             {
-                accessories.extend(d.accessories.iter().map(|a| (a.part.clone(), a.qty, number.clone())));
+                accessories.extend(d.accessories.iter().enumerate().map(|(k, a)| {
+                    (
+                        format!("{strip}/T{}/A{}", pos + 1, k + 1),
+                        a.part.clone(),
+                        a.qty,
+                        number.clone(),
+                        Target::Accessory(tag.clone(), k),
+                    )
+                }));
             }
         }
-        for (n, (part, qty, number)) in accessories.into_iter().enumerate() {
+        for (index, part, qty, number, target) in accessories {
             let mut r = Row {
                 quantity: qty.to_string(),
                 connects: number,
-                ..row(format!("{strip}/A{}", n + 1), "Accessory")
+                target: Some(target),
+                ..row(index, "Accessory")
             };
             r.set_part(i, &part);
             rows.push(r);
         }
     }
-    for r in rows {
+    for mut r in rows {
+        if let Some(t) = r.target.take() {
+            out.targets.insert(r.index.clone(), t);
+        }
         let cells = r.into_cells(&mut out.warnings);
         out.table.rows.push(cells);
     }
@@ -212,6 +251,19 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
 pub struct Configurator {
     pub table: Table,
     pub warnings: Vec<String>,
+    /// Which device part each row's article is, by `Index` (as written, before any leading `'`):
+    /// terminal and accessory rows. Plates, rails and jumpers are not device parts and have none.
+    pub targets: BTreeMap<String, Target>,
+}
+
+/// The device part a row of [`configurator_list`] stands for, so a list that comes back from the
+/// configurator can be written onto the project (#123).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// The device's main part: a terminal's, or the strip device's own part.
+    Part(DeviceTag),
+    /// The device's accessory at this position (from 0) of its accessory list.
+    Accessory(DeviceTag, usize),
 }
 
 /// One row of the list, by column (see [`CONFIGURATOR_COLUMNS`]).
@@ -236,6 +288,8 @@ struct Row {
     rail: String,
     rail_length: String,
     rail_rotation: String,
+    /// Not a cell: the device part the row stands for.
+    target: Option<Target>,
 }
 
 impl Row {

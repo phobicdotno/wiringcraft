@@ -416,6 +416,64 @@ impl Open {
         Ok(())
     }
 
+    /// Write the articles of a list that came back from the WAGO configurator onto the terminal
+    /// and strip devices, as one undo step (see [`wc_import::wago`]). Articles are looked up
+    /// among the project's own parts, then the libraries'; a library part that is used is taken
+    /// into the project. Returns the report: what changed and every row not matched, with why.
+    pub fn import_wago_configured(&mut self, bytes: &[u8]) -> Result<String, String> {
+        let (rows, mut warnings) = wc_import::wago::read_configured(bytes).map_err(|e| e.to_string())?;
+        let (candidates, more) = wc_import::wago::Candidates::load(&self.dir, &self.project);
+        warnings.extend(more);
+        let plan = wc_import::wago::plan(
+            &wc_report::Inputs {
+                project: &self.project,
+                symbols: &self.symbols,
+                parts: &candidates.all(),
+            },
+            &candidates,
+            &rows,
+        );
+        let mut unmatched = plan.unmatched.clone();
+        let mut taken = plan.clone();
+        for id in plan.parts() {
+            let r = candidates
+                .take(&self.dir, &mut self.project, id)
+                .and_then(|()| self.ensure_part(id));
+            if let Err(why) = r {
+                for a in plan.assignments.iter().filter(|a| a.part == id) {
+                    unmatched.push(format!(
+                        "line {}: part {id} cannot be taken into the project: {why}",
+                        a.line
+                    ));
+                }
+                taken.assignments.retain(|a| a.part != id);
+            }
+        }
+        let changed = if taken.assignments.is_empty() {
+            0
+        } else {
+            self.checkpoint();
+            wc_import::wago::apply(&mut self.project, &taken)
+        };
+        let mut msg = format!(
+            "WAGO configurator: {changed} device(s) changed, {} row(s) already up to date, {} not matched.",
+            plan.unchanged,
+            unmatched.len()
+        );
+        if !unmatched.is_empty() {
+            msg.push_str("\n\nNot matched:");
+            for u in &unmatched {
+                msg.push_str("\n- ");
+                msg.push_str(u);
+            }
+        }
+        for w in warnings {
+            msg.push_str("\n\nWarning: ");
+            msg.push_str(&w);
+        }
+        Ok(msg)
+    }
+
     /// Make sure a part is in the project (taken from the library when needed) and loaded.
     fn ensure_part(&mut self, id: &str) -> Result<(), String> {
         if self.parts.contains_key(id) {
