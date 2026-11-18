@@ -385,8 +385,19 @@ fn shapes(
                 polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false)
             }
             "SPLINE" => {
-                let (pts, closed) = spline_points(e);
-                polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false)
+                let (pts, closed, curve) = spline_points(e);
+                let drawn = polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false);
+                // Knots that make no curve (wrong count or degree, an empty interval): the points
+                // are still joined, and said; a spline with too few points to join is said too.
+                let note = match (&drawn, curve) {
+                    (None, _) => Some(SPLINE_TOO_FEW),
+                    (Some(_), false) => Some(SPLINE_NOT_CURVE),
+                    (Some(_), true) => None,
+                };
+                if let Some(note) = note {
+                    *skipped.entry(note.to_owned()).or_default() += 1;
+                }
+                drawn
             }
             "HATCH" => {
                 let mut solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
@@ -586,10 +597,9 @@ fn de_boor(ctrl: &[(f64, f64, f64)], knots: &[f64], p: usize, u: f64) -> Option<
     if n <= p || knots.len() != n + p + 1 {
         return None;
     }
-    let mut k = p;
-    while k + 1 < n && knots.get(k + 1).is_some_and(|&t| t <= u) {
-        k += 1;
-    }
+    // The knot span holding u, by binary search (the knots are sorted): a long spline sampled
+    // many times would cost samples x knots with a scan.
+    let k = p + knots.get(p + 1..n)?.partition_point(|&t| t <= u);
     let mut d: Vec<(f64, f64, f64)> = ctrl.get(k - p..=k)?.to_vec();
     for r in 1..=p {
         for j in (r..=p).rev() {
@@ -627,6 +637,13 @@ const HATCH_BRIDGE_WORK: usize = 20_000_000;
 
 /// The `skipped` key of a solid hatch drawn as its boundaries because its holes could not be cut.
 const HATCH_UNFILLED: &str = "solid HATCH (holes too complex)";
+
+/// The key under which splines whose knots make no curve are counted (drawn through their
+/// points instead).
+const SPLINE_NOT_CURVE: &str = "SPLINE whose knots make no curve";
+
+/// The key under which splines with too few points to draw are counted.
+const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
@@ -683,20 +700,24 @@ fn bspline_points(ctrl: &[(f64, f64)], knots: &[f64], weights: &[f64], degree: u
 
 /// Points of a SPLINE entity: the curve through its control points, else through its fit
 /// points; and whether it is closed.
-fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool) {
+/// The points of a SPLINE, whether it is closed, and whether its knots made a curve (true when
+/// it has none to make one from).
+fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, bool) {
     let closed = (e.f(70) as i64) & 1 == 1;
     // Whole pairs only, both coordinates finite: a NaN would make the project file unreadable.
     let finite = |(x, y): &(f64, f64)| x.is_finite() && y.is_finite();
     let ctrl: Vec<(f64, f64)> = e.all(10).into_iter().zip(e.all(20)).filter(finite).collect();
     let fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).filter(finite).collect();
     let degree = e.f_or(71, 3.0).max(0.0) as usize;
-    if let Some(pts) = bspline_points(&ctrl, &e.all(40), &e.all(41), degree) {
-        return (pts, closed);
+    let knots = e.all(40);
+    if let Some(pts) = bspline_points(&ctrl, &knots, &e.all(41), degree) {
+        return (pts, closed, true);
     }
+    let curve = knots.is_empty() || ctrl.is_empty();
     if fit.len() >= 2 {
-        return (fit, closed);
+        return (fit, closed, curve);
     }
-    (ctrl, closed)
+    (ctrl, closed, curve)
 }
 
 /// Reads the group codes of an entity in order.
@@ -1066,6 +1087,12 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
                 format!(
                     "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
                 )
+            } else if kind == SPLINE_TOO_FEW {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} SPLINE{s} with too few points to draw, left out")
+            } else if kind == SPLINE_NOT_CURVE {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
             } else if kind == HATCH_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
@@ -1996,6 +2023,20 @@ mod tests {
                 a: Point::new(0.0, 0.0),
                 b: Point::new(5.0, 0.0)
             }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_spline_whose_knots_make_no_curve_says_so() -> Result<()> {
+        // A quadratic over three points whose knots leave no interval.
+        let ents = "0\nSPLINE\n71\n2\n40\n0\n40\n0\n40\n0\n40\n0\n40\n1\n40\n1\n\
+                    10\n0\n20\n0\n10\n5\n20\n10\n10\n10\n20\n0\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert_eq!(g.len(), 1, "drawn through its points");
+        assert_eq!(
+            skipped_warnings(skipped),
+            ["1 SPLINE whose knots make no curve, drawn through their points"]
         );
         Ok(())
     }

@@ -818,6 +818,97 @@ impl Open {
 /// The app as the assistant's toolbox.
 pub struct AppTools<'a>(pub &'a mut App);
 
+/// Whether tool `name` with input `v` changes the page its `page` field names (the shown page
+/// without one). Tools that only read, select, show or comment do not.
+fn edits_page(name: &str, v: &Value) -> bool {
+    match name {
+        "place_symbol" | "add_wire" | "update_symbol" | "update_wire" | "add_graphic" | "update_graphic"
+        | "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "delete_page" | "edit_page_json" => true,
+        "macros" => s(v, "action") == Some("insert"),
+        _ => false,
+    }
+}
+
+/// What [`AppTools::held_check`] checks a tool's change against, and what it puts back.
+struct HeldGuard {
+    dir: PathBuf,
+    held: Vec<Page>,
+    mark: crate::state::Mark,
+    page: usize,
+    selection: Vec<Selection>,
+    panel: Option<usize>,
+    /// Whether a cover or template form was open before: one the change opened goes with it.
+    had_form: bool,
+}
+
+impl AppTools<'_> {
+    /// In a shared session, what a tool's change is checked against: the pages someone else
+    /// holds, and the state to go back to. `None` when nobody holds a page; for undo and redo
+    /// (the tool, or the action), which the session's host carries out and checks itself; and
+    /// for `open_project`, which replaces the project instead of changing it.
+    fn held_guard(&mut self, name: &str, input: &Value) -> Option<HeldGuard> {
+        let undoes = match name {
+            "undo" | "open_project" => true,
+            "run_action" => s(input, "action").is_some_and(|a| {
+                [Action::Undo, Action::Redo]
+                    .iter()
+                    .any(|u| u.name().eq_ignore_ascii_case(a))
+            }),
+            _ => false,
+        };
+        let (page, selection, panel) = (self.0.ed.page, self.0.ed.selection.clone(), self.0.ed.panel);
+        let had_form = matches!(self.0.dialog, Some(Dialog::Cover { .. } | Dialog::Template { .. }));
+        let open = self.0.open.as_mut()?;
+        let held = open.held_pages();
+        (!held.is_empty() && !undoes).then(|| HeldGuard {
+            dir: open.dir.clone(),
+            held,
+            mark: open.mark(),
+            page,
+            selection,
+            panel,
+            had_form,
+        })
+    }
+
+    /// A page someone else holds is read-only here, whatever the tool did: a change that
+    /// reached one (a rename that also renames symbols there, a cover flag moved off it) is
+    /// taken back as a whole, with the page shown and the selection, and refused with who
+    /// holds the page, as the host would refuse it. The tool's own error, if any, is kept.
+    fn held_check(&mut self, guard: Option<HeldGuard>, r: Result<String, String>) -> Result<String, String> {
+        let Some(g) = guard else {
+            return r;
+        };
+        let Some(open) = self.0.open.as_mut() else {
+            return r;
+        };
+        // Another project opened in between is not this project's change.
+        if open.dir != g.dir {
+            return r;
+        }
+        let Some(why) = open.held_change(&g.held) else {
+            open.keep(g.mark);
+            return r;
+        };
+        let files = open.back_to(g.mark).err();
+        (self.0.ed.page, self.0.ed.selection, self.0.ed.panel) = (g.page, g.selection, g.panel);
+        // A form the refused change opened (the cover page made from a held page) edits what
+        // was taken back: it closes, and the panel shown before stays shown.
+        if !g.had_form && matches!(self.0.dialog, Some(Dialog::Cover { .. } | Dialog::Template { .. })) {
+            self.0.dialog = None;
+        }
+        let mut msg = match r {
+            Ok(_) => format!("Not done: {why}"),
+            Err(e) => format!("Not done: {why} The tool also said: {e}"),
+        };
+        if let Some(f) = files {
+            msg.push(' ');
+            msg.push_str(&f);
+        }
+        Err(msg)
+    }
+}
+
 impl wc_agent::Tools for AppTools<'_> {
     fn specs(&self) -> Vec<Value> {
         self.0.assistant.specs().to_vec()
@@ -828,7 +919,9 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
+        let guard = self.held_guard(name, input);
         let r = self.0.agent_tool(name, input);
+        let r = self.held_check(guard, r);
         // Items the assistant removed must not stay selected.
         self.0.prune_selection();
         r
@@ -839,11 +932,24 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
-        let r = self.0.agent_start(name, input);
-        if matches!(r, Started::Done(_)) {
-            self.0.prune_selection();
+        let guard = self.held_guard(name, input);
+        match self.0.agent_start(name, input) {
+            Started::Done(r) => {
+                let r = self.held_check(guard, r);
+                self.0.prune_selection();
+                Started::Done(r)
+            }
+            running => {
+                // A tool that runs on in the background is not checked here (its result is
+                // applied later); the undo history set aside for the check goes back now.
+                if let (Some(g), Some(open)) = (guard, self.0.open.as_mut())
+                    && open.dir == g.dir
+                {
+                    open.keep(g.mark);
+                }
+                running
+            }
         }
-        r
     }
 
     fn finish(&mut self, name: &str, input: &Value, result: Result<String, String>) -> Result<String, String> {
@@ -1003,6 +1109,24 @@ impl App {
 
     /// Run one assistant tool.
     pub(crate) fn agent_tool(&mut self, name: &str, v: &Value) -> Result<String, String> {
+        // In a shared session a page someone else has open is read-only here: an editing tool
+        // aimed at it is refused before it runs (an unknown page gets the tool's own error).
+        if edits_page(name, v)
+            && let (Ok(page), Some(open)) = (self.page_of(v, "page"), self.open.as_ref())
+            && let Some(why) = open.held_reason(page)
+        {
+            return Err(why);
+        }
+        // Cover Page marks an unmarked first page as the cover: refused before it runs when
+        // someone else holds that page, so the form open now (and its Cancel) stays as it is.
+        if name == "run_action"
+            && s(v, "action").is_some_and(|a| Action::CoverPage.name().eq_ignore_ascii_case(a))
+            && let Some(open) = self.open.as_ref()
+            && open.cover_marks_first()
+            && let Some(why) = open.held_reason(0)
+        {
+            return Err(why);
+        }
         match name {
             "get_state" => self.tool_state(),
             "get_page" => {
@@ -1484,6 +1608,17 @@ impl App {
                     .ok_or_else(|| format!("No command {want:?}."))?;
                 if a == Action::Assistant {
                     return Err("That would hide this panel.".into());
+                }
+                // The toolbar's own hold check (which page an action edits, with or without a
+                // panel shown): its refusal is an error here, as for the editing tools.
+                if let Some(name) = self
+                    .open
+                    .as_ref()
+                    .and_then(|o| crate::held_for(a, &self.ed, &o.project))
+                {
+                    return Err(format!(
+                        "{name} has this page open; it is read-only here until they leave it."
+                    ));
                 }
                 let before = self.dialog.is_some();
                 self.run(a);
@@ -3262,6 +3397,77 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_follows_its_graphic_through_a_session_sync_and_goes_with_its_page() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        // A third page, so the page under a panel has one after it.
+        open.duplicate_page(0).unwrap();
+        assert_eq!(open.project.pages.len(), 3);
+        open.project.pages[1].graphics = vec![line(1.0), line(2.0)];
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        a.ed.page = 1;
+        // Delete the first line; the second is then graphic 0 and selected.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].graphics.remove(0);
+        a.sync_session_now(false);
+        a.ed.selection = vec![Selection::Graphic(0)];
+        // The session's undo puts the first line back in front: the selection follows its line,
+        // also with a panel open over the page while a page before it goes.
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[1].graphics,
+            vec![line(1.0), line(2.0)]
+        );
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(1)]);
+        // With a panel open over the page, the session takes back a page added before it: the
+        // page under the panel is found again at its new place, and so is the selection.
+        let open = a.open.as_mut().unwrap();
+        let id = open.project.pages[1].id.clone();
+        open.checkpoint();
+        let mut extra = open.project.pages[0].clone();
+        (extra.id, extra.number) = ("p0099".into(), "0".into());
+        open.project.pages.insert(0, extra);
+        a.sync_session_now(false);
+        let pages = &a.open.as_ref().unwrap().project.pages;
+        a.ed.page = pages.iter().position(|p| p.id == id).unwrap();
+        assert_eq!((a.ed.page, pages[0].id.as_str()), (2, "p0099"));
+        a.ed.panel = Some(0);
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), 3);
+        assert_eq!(a.open.as_ref().unwrap().project.pages[a.ed.page].id, id);
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(1)]);
+        a.ed.panel = None;
+        a.ed.page = 0;
+
+        // A page added and shown, something selected on it, and the session takes the page
+        // back: nothing stays selected on the page shown instead, though it has a graphic 0 too.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        for p in &mut open.project.pages {
+            p.graphics.push(line(5.0));
+        }
+        a.sync_session_now(false);
+        let open = a.open.as_mut().unwrap();
+        let i = open.duplicate_page(0).unwrap();
+        a.sync_session_now(false);
+        a.ed.page = i;
+        a.ed.selection = vec![Selection::Graphic(0)];
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        let pages = &a.open.as_ref().unwrap().project.pages;
+        assert_eq!(pages.len(), i);
+        assert!(!pages[a.ed.page].graphics.is_empty(), "graphic 0 is there to select");
+        assert!(a.ed.selection.is_empty(), "{:?}", a.ed.selection);
+    }
+
+    #[test]
     fn undo_in_a_shared_session_goes_through_the_host() {
         let (_tmp, mut a) = app(vec![]);
         let open = a.open.as_mut().unwrap();
@@ -4003,6 +4209,25 @@ mod tests {
     }
 
     #[test]
+    fn a_background_tool_started_while_a_page_is_held_keeps_the_undo_history() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({})).unwrap();
+        call(&mut a, "add_page", json!({})).unwrap();
+        call(&mut a, "undo", json!({})).unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.held_by_others.insert("p0002".into(), "Ola".into());
+        let (mark, can_undo, can_redo) = (open.undo_mark(), open.can_undo(), open.can_redo());
+        let v = json!({"action": "search", "query": "relay"});
+        let started = wc_agent::Tools::start(&mut AppTools(&mut a), "todo", &v);
+        assert!(matches!(started, Started::Running(_)));
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(
+            (open.undo_mark(), open.can_undo(), open.can_redo()),
+            (mark, can_undo, can_redo)
+        );
+    }
+
+    #[test]
     fn todo_searches_run_on_a_worker_thread() {
         let (_tmp, mut a) = app(vec![]);
         let v = json!({"action": "search", "query": "relay"});
@@ -4012,5 +4237,217 @@ mod tests {
             a.agent_start("todo", &json!({"action": "file"})),
             Started::Done(Err(_))
         ));
+    }
+
+    #[test]
+    fn a_refused_cover_page_opens_no_form_and_keeps_the_panel_shown() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let panel = wc_core::panel::Panel::with_rails("panel1", "Panel 1", 600.0, 800.0);
+        open.project.panels.push(panel);
+        for p in &mut open.project.pages {
+            p.cover = false;
+        }
+        let first = &mut open.project.pages[0];
+        (first.title, first.symbols, first.wires, first.graphics) = ("Cover".into(), vec![], vec![], vec![]);
+        let id = first.id.clone();
+        open.held_by_others.insert(id, "Ola".into());
+        let project = open.project.clone();
+        a.ed.panel = Some(0);
+        let r = call(&mut a, "run_action", json!({"action": Action::CoverPage.name()}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola")), "{r:?}");
+        assert!(a.dialog.is_none(), "no cover form for a refused change");
+        assert_eq!(a.ed.panel, Some(0), "the panel stays shown");
+        assert_eq!(a.open.as_ref().unwrap().project, project);
+        // An open template form stays open, not replaced by the cover form.
+        call(&mut a, "run_action", json!({"action": Action::PageTemplate.name()})).unwrap();
+        let r = call(&mut a, "run_action", json!({"action": Action::CoverPage.name()}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola")), "{r:?}");
+        assert!(
+            matches!(a.dialog, Some(Dialog::Template { .. })),
+            "the template form stays"
+        );
+        assert_eq!(a.open.as_ref().unwrap().project, project);
+    }
+
+    #[test]
+    fn a_form_opened_while_a_page_is_held_cancels_only_its_own_step() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({})).unwrap();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        call(&mut a, "run_action", json!({"action": Action::PageTemplate.name()})).unwrap();
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        assert!(
+            matches!(a.dialog, Some(Dialog::Template { since, .. }) if since == mark),
+            "the form's undo mark is the window's"
+        );
+    }
+
+    #[test]
+    fn a_toolbar_edit_on_a_held_page_is_an_error_for_the_assistant() {
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.ed.held_by.insert("p0002".into(), "Ola".into());
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let r = call(&mut a, "run_action", json!({"action": Action::Delete.name()}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola has this page open")), "{r:?}");
+        assert_eq!(page2(&a).graphics.len(), 1, "nothing deleted");
+    }
+
+    #[test]
+    fn the_assistant_cannot_change_a_page_someone_else_holds_but_can_read_and_comment_there() {
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        // A refused change keeps what can be redone and the page shown.
+        call(&mut a, "add_page", json!({})).unwrap();
+        call(&mut a, "undo", json!({})).unwrap();
+        assert!(a.open.as_ref().unwrap().can_redo());
+        let shown = a.ed.page;
+        let before = page2(&a).clone();
+        let r = call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 1, "y": 1}, "text": "x"}}),
+        );
+        assert!(r.is_err(), "{r:?}");
+        assert!(a.open.as_ref().unwrap().can_redo(), "redo survives a refusal");
+        assert_eq!(a.ed.page, shown);
+        let line = json!({"kind": "line", "a": {"x": 0, "y": 0}, "b": {"x": 5, "y": 0}});
+        let edits = [
+            (
+                "place_symbol",
+                json!({"page": "p0002", "symbol": "wc.coil", "x": 50, "y": 50}),
+            ),
+            (
+                "add_wire",
+                json!({"page": "p0002", "points": [{"x": 0, "y": 0}, {"x": 9, "y": 0}]}),
+            ),
+            ("update_symbol", json!({"page": "p0002", "id": "s0", "tag": "-K9"})),
+            ("update_wire", json!({"page": "p0002", "id": "w0", "label": "1"})),
+            ("add_graphic", json!({"page": "p0002", "shape": line})),
+            ("update_graphic", json!({"page": "p0002", "id": "g0", "shape": line})),
+            ("delete_items", json!({"page": "p0002", "ids": ["g0"]})),
+            ("move_items", json!({"page": "p0002", "ids": ["g0"], "dx": 5, "dy": 5})),
+            ("rotate_items", json!({"page": "p0002", "ids": ["g0"]})),
+            ("mirror_items", json!({"page": "p0002", "ids": ["g0"]})),
+            ("delete_page", json!({"page": "p0002"})),
+            ("edit_page_json", json!({"page": "p0002", "json": "{}"})),
+            ("macros", json!({"action": "insert", "page": "p0002", "name": "any"})),
+        ];
+        for (tool, input) in edits {
+            let r = call(&mut a, tool, input);
+            assert!(
+                r.as_ref().is_err_and(|e| e.contains("Ola has this page open")),
+                "{tool}: {r:?}"
+            );
+            assert_eq!(page2(&a), &before, "{tool} changed the held page");
+        }
+
+        // A change that reaches the held page from elsewhere is refused as a whole: moving
+        // the cover flag off it, or renaming a device drawn on it and on a free page.
+        for p in &mut a.open.as_mut().unwrap().project.pages {
+            p.cover = p.id == "p0002";
+        }
+        let project = a.open.as_ref().unwrap().project.clone();
+        let r = call(&mut a, "update_page", json!({"page": "1", "cover": true}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola has open")), "{r:?}");
+        assert_eq!(a.open.as_ref().unwrap().project, project, "nothing of it stays");
+        let tag = wc_core::DeviceTag::parse("-K1").unwrap();
+        let held = std::mem::take(&mut a.open.as_mut().unwrap().held_by_others);
+        for page in ["1", "2"] {
+            call(
+                &mut a,
+                "place_symbol",
+                json!({"symbol": "wc.coil", "x": 60, "y": 120, "page": page, "tag": "-K1"}),
+            )
+            .unwrap();
+        }
+        a.open.as_mut().unwrap().held_by_others = held;
+        let (before, project) = (page2(&a).clone(), a.open.as_ref().unwrap().project.clone());
+        let r = call(&mut a, "set_device", json!({"tag": "-K1", "rename_to": "-K2"}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("Ola has open")), "{r:?}");
+        assert_eq!(page2(&a), &before);
+        assert_eq!(a.open.as_ref().unwrap().project, project, "the free page keeps -K1 too");
+        assert!(a.open.as_ref().unwrap().project.tag_index().contains_key(&tag));
+        // The live path (start) refuses the same way.
+        let started = wc_agent::Tools::start(
+            &mut AppTools(&mut a),
+            "set_device",
+            &json!({"tag": "-K1", "rename_to": "-K2"}),
+        );
+        assert!(
+            matches!(&started, Started::Done(Err(e)) if e.contains("Ola has open")),
+            "set_device runs at once and is refused"
+        );
+        assert_eq!(a.open.as_ref().unwrap().project, project);
+
+        // Reading, selecting and commenting still work there.
+        assert!(
+            call(&mut a, "get_page", json!({"page": "p0002"}))
+                .unwrap()
+                .contains("Hello")
+        );
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        call(
+            &mut a,
+            "comments",
+            json!({"action": "add", "page": "p0002", "text": "Check this", "x": 10, "y": 10}),
+        )
+        .unwrap();
+        assert_eq!(a.open.as_ref().unwrap().project.comments.len(), 1);
+
+        // Once Ola leaves, the same tools work again.
+        a.open.as_mut().unwrap().held_by_others.clear();
+        call(&mut a, "delete_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        assert!(page2(&a).graphics.is_empty());
+
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        // Opening another project (with the same page ids) is not taken for a change to this
+        // one: the new project stays as it was opened.
+        let other = _tmp.path().join("other");
+        let r = call(
+            &mut a,
+            "open_project",
+            json!({"path": other.to_string_lossy(), "create": true, "name": "Other"}),
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(
+            (open.dir.as_path(), open.project.meta.name.as_str()),
+            (other.as_path(), "Other")
+        );
+        assert_eq!(
+            open.project,
+            wc_core::store::load(&other).unwrap(),
+            "nothing of the old project in it"
+        );
     }
 }

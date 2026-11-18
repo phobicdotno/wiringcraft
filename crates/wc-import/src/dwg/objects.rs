@@ -8,7 +8,8 @@
 //! texts of an object are in a third stream at the end of its data.
 //!
 //! The entities read are LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE (2D and 3D) with their
-//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), HATCH, SOLID,
+//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), HATCH,
+//! ELLIPSE, SPLINE, SOLID,
 //! TRACE and POINT. Each entity belongs to
 //! the block whose BLOCK_HEADER owns it, or to model space; vertices belong to their polyline
 //! and attributes to their INSERT. The entities become the same entities the DXF reader works
@@ -24,6 +25,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use wc_core::geom::{Point, Shape};
 
 use super::bits::{Bits, modular_char, modular_short};
+use super::codepage::Decoding;
 use super::{Sections, Version, bad, read_sections};
 use crate::Result;
 use crate::dxf::{self, Entity};
@@ -58,6 +60,8 @@ pub struct Drawing {
     /// then why base points counted under [`BASE_UNREAD`] could not be read, for the first
     /// [`MAX_REASONS`] of them.
     pub damaged: Vec<String>,
+    /// Notes about the file as a whole, such as a code page its texts cannot be decoded in.
+    pub warnings: Vec<String>,
 }
 
 /// The most reasons [`Drawing::damaged`] keeps.
@@ -74,6 +78,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
         drawing: d,
         mut skipped,
         damaged,
+        warnings,
     } = dxf_drawing(sections)?;
     // One budget for model space and every block, so nested blocks cannot multiply the work.
     let mut budget = dxf::MAX_DRAWN;
@@ -101,6 +106,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
         model_points,
         skipped,
         damaged,
+        warnings,
     })
 }
 
@@ -109,6 +115,8 @@ pub(crate) struct Read {
     pub(crate) drawing: dxf::Drawing,
     pub(crate) skipped: BTreeMap<String, usize>,
     pub(crate) damaged: Vec<String>,
+    /// Notes about the file as a whole (an unknown code page).
+    pub(crate) warnings: Vec<String>,
 }
 
 /// The entities of a DWG file as the DXF reader's entities, by block and model space, with a
@@ -124,8 +132,27 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     let mut skipped = BTreeMap::new();
     let mut decoded = Decoded::default();
     let mut damaged = Vec::new();
+    // 2004 texts are in the drawing's code page; one this reader does not know is read as
+    // before (UTF-8 or Windows-1252) and said.
+    let (decoding, known) = Decoding::of(sections.codepage);
+    let mut warnings = Vec::new();
+    if sections.version == Version::R2004 && !known {
+        warnings.push(format!(
+            "its texts are in {}, which is not supported: read with the legacy decoder (UTF-8 \
+             when they are, else byte for byte as Latin-1)",
+            Decoding::name(sections.codepage)
+        ));
+    }
     for (handle, at) in map {
-        if let Err(e) = decode(objects, at, handle, sections.version, &mut decoded, &mut skipped) {
+        if let Err(e) = decode(
+            objects,
+            at,
+            handle,
+            sections.version,
+            decoding,
+            &mut decoded,
+            &mut skipped,
+        ) {
             *skipped.entry(DAMAGED.to_owned()).or_default() += 1;
             if damaged.len() < MAX_REASONS {
                 damaged.push(format!("object {handle:X} at {at}: {e}"));
@@ -142,6 +169,7 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
         drawing: decoded.assemble(&mut skipped),
         skipped,
         damaged,
+        warnings,
     })
 }
 
@@ -196,6 +224,8 @@ pub(crate) fn object_map(data: &[u8]) -> Result<Vec<(u64, usize)>> {
 /// One object's streams, after its type and own handle are read.
 struct Object<'a> {
     version: Version,
+    /// How its 2004 texts are decoded.
+    decoding: Decoding,
     kind: u16,
     handle: u64,
     data: Bits<'a>,
@@ -207,7 +237,7 @@ impl Object<'_> {
     /// TV: a text, from the data stream (2004) or the string stream (2010).
     fn text(&mut self) -> Result<String> {
         match self.version {
-            Version::R2004 => self.data.t8(),
+            Version::R2004 => Ok(self.decoding.decode(&self.data.t8_bytes()?)),
             Version::R2010 => self
                 .strings
                 .as_mut()
@@ -234,7 +264,7 @@ impl Object<'_> {
 }
 
 /// Split the object at `at` of the objects section into its streams.
-fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
+fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Result<Object<'_>> {
     let rest = objects.get(at..).ok_or_else(|| bad("an object is past the end"))?;
     let (size, n) = modular_short(rest)?;
     let mut start = at + n;
@@ -277,6 +307,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     };
     Ok(Object {
         version,
+        decoding,
         kind,
         handle,
         data,
@@ -358,8 +389,6 @@ fn unread_entity(kind: u16) -> Option<&'static str> {
         29 => "POLYLINE_PFACE",
         30 => "POLYLINE_MESH",
         33 => "SHAPE",
-        35 => "ELLIPSE",
-        36 => "SPLINE",
         37 => "REGION",
         38 => "3DSOLID",
         39 => "BODY",
@@ -393,6 +422,8 @@ fn read_entity(kind: u16) -> Option<&'static str> {
         27 => "POINT",
         31 | 32 => "SOLID",
         34 => "VIEWPORT",
+        35 => "ELLIPSE",
+        36 => "SPLINE",
         44 => "MTEXT",
         77 => "LWPOLYLINE",
         78 => "HATCH",
@@ -611,16 +642,109 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
     Ok(())
 }
 
+/// ELLIPSE: centre, major axis end (relative), extrusion, axis ratio and the start and end
+/// parameters (radians, as in DXF).
+fn ellipse(o: &mut Object, e: &mut Codes) -> Result<()> {
+    let d = &mut o.data;
+    let (cx, cy, cz) = d.bd3()?;
+    let (mx, my, mz) = d.bd3()?;
+    let (ex, ey, z) = d.bd3()?;
+    let ratio = d.bd()?;
+    let (start, end) = (d.bd()?, d.bd()?);
+    if ![cx, cy, cz, mx, my, mz, ex, ey, z, ratio, start, end]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return Err(bad("an ellipse has a value that is not a number"));
+    }
+    e.f(10, cx).f(20, cy).f(11, mx).f(21, my).f(230, z);
+    e.f(40, ratio).f(41, start).f(42, end);
+    Ok(())
+}
+
+/// The most knots, control points or fit points a SPLINE may list; more is a damaged object.
+const MAX_SPLINE_POINTS: u32 = 10_000;
+
+fn spline_count(o: &mut Object, what: &str) -> Result<u32> {
+    let n = o.data.bl()?;
+    if n > MAX_SPLINE_POINTS {
+        return Err(bad(format!("a spline lists {n} {what}")));
+    }
+    Ok(n)
+}
+
+/// SPLINE, as DXF codes: 70 (closed), 71 degree, and either knots (40), control points (10/20)
+/// and weights (41), or fit points (11/21). Before 2013 a scenario says which: 1 control
+/// points, 2 fit points.
+fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
+    let scenario = o.data.bl()?;
+    if scenario != 1 && scenario != 2 {
+        return Err(bad(format!("a spline has unknown scenario {scenario}")));
+    }
+    let degree = o.data.bl()?;
+    if scenario == 1 {
+        let d = &mut o.data;
+        let _rational = d.b()?;
+        let closed = d.b()?;
+        let periodic = d.b()?;
+        d.bd()?;
+        d.bd()?;
+        let knots = spline_count(o, "knots")?;
+        let points = spline_count(o, "control points")?;
+        let weighted = o.data.b()?;
+        // A curve of degree d over n control points needs n + d + 1 knots; a periodic one may
+        // list fewer, but never fewer than n + 1.
+        let full = points.saturating_add(degree).saturating_add(1);
+        if knots < points.saturating_add(1) || (!periodic && knots != full) {
+            return Err(bad(format!(
+                "a spline of degree {degree} lists {knots} knots for {points} control points"
+            )));
+        }
+        e.i(70, i64::from(closed)).i(71, i64::from(degree));
+        let mut last = f64::NEG_INFINITY;
+        for _ in 0..knots {
+            let k = o.data.bd()?;
+            // Knots are numbers that never decrease (repeats are fine).
+            if !k.is_finite() || k < last {
+                return Err(bad("a spline's knots are not numbers in order"));
+            }
+            last = k;
+            e.f(40, k);
+        }
+        for _ in 0..points {
+            let (x, y, _) = o.data.bd3()?;
+            e.f(10, x).f(20, y);
+            if weighted {
+                e.f(41, o.data.bd()?);
+            }
+        }
+    } else {
+        // Fit tolerance, the start and end tangents (DXF 12/22 and 13/23), then the fit points.
+        o.data.bd()?;
+        let (sx, sy, _) = o.data.bd3()?;
+        let (ex, ey, _) = o.data.bd3()?;
+        let fit = spline_count(o, "fit points")?;
+        e.i(70, 0).i(71, i64::from(degree));
+        e.f(12, sx).f(22, sy).f(13, ex).f(23, ey);
+        for _ in 0..fit {
+            let (x, y, _) = o.data.bd3()?;
+            e.f(11, x).f(21, y);
+        }
+    }
+    Ok(())
+}
+
 /// Decode the object at `at` into `out`.
 fn decode(
     objects: &[u8],
     at: usize,
     handle: u64,
     version: Version,
+    decoding: Decoding,
     out: &mut Decoded,
     skipped: &mut BTreeMap<String, usize>,
 ) -> Result<()> {
-    let mut o = object(objects, at, version)?;
+    let mut o = object(objects, at, version, decoding)?;
     if o.handle != handle {
         return Err(bad("an object's handle differs from the object map"));
     }
@@ -667,6 +791,8 @@ fn decode(
         1..=3 => text(&mut o, &mut e)?,
         7 => block = Some(insert(&mut o, &mut e)?),
         78 => hatch(&mut o, &mut e)?,
+        35 => ellipse(&mut o, &mut e)?,
+        36 => spline(&mut o, &mut e)?,
         // Drawn by its anonymous block, which comes after the dimension style in the handles.
         20..=26 => {
             o.handle_ref()?;

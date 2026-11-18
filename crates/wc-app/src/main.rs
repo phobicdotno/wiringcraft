@@ -277,7 +277,19 @@ impl App {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
         });
-        let mut shown = page.clone();
+        // The page under the canvas, also under an open panel: it is found again after the
+        // sync, and so is what was selected on it.
+        let mut shown = self
+            .open
+            .as_ref()
+            .and_then(|o| o.project.pages.get(self.ed.page))
+            .map(|p| p.id.clone());
+        // The shown page's graphics, so a selection follows its items when a merge moves them.
+        let graphics_before = self
+            .open
+            .as_ref()
+            .and_then(|o| o.project.pages.get(self.ed.page))
+            .map(|p| (p.id.clone(), p.graphics.clone()));
         if let Some(joined) = self.share.frame(self.open.as_mut(), page, busy) {
             // The joined copy replaces the open project: keep its unsaved work first.
             if let Some(o) = self.open.as_mut()
@@ -310,6 +322,13 @@ impl App {
             && self.ed.page >= o.project.pages.len()
         {
             self.ed.page = o.project.pages.len().saturating_sub(1);
+        }
+        if let Some((id, old)) = &graphics_before {
+            match self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page)) {
+                Some(p) if &p.id == id => edit::remap_graphics(&mut self.ed.selection, old, &p.graphics),
+                // The page was removed: what was selected on it is not on the page shown now.
+                _ => self.ed.selection.clear(),
+            }
         }
         self.ed.held_by = self.share.held_by_others();
         if let Some(o) = self.open.as_mut() {
@@ -3590,7 +3609,11 @@ mod marking_tests {
             .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;NO-SUCH;")
             .replace("-X1/J1;Jumper;-X1;;;;;", "-X1/J1;Jumper;-X1;;;;EX-TB-2.5;");
         let before = o.undo_mark();
+        let pid = "example.ex-tb-2-5";
+        assert!(!o.project.lock.parts.contains_key(pid), "not pinned yet");
+        let lock = o.project.lock.clone();
         let msg = o.import_wago_configured(csv.as_bytes()).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid), "taken and pinned");
         assert!(
             msg.starts_with(
                 "WAGO configurator: 2 device(s) or jumper(s) changed, 0 row(s) already up to date, 1 not matched."
@@ -3612,6 +3635,18 @@ mod marking_tests {
             o.project.meta.jumpers[0].part.is_none(),
             "the jumper in the same undo step"
         );
+        assert_eq!(o.project.lock, lock, "and the pin");
+        o.save().unwrap();
+        assert!(!wc_core::store::load(&o.dir).unwrap().lock.parts.contains_key(pid));
+        assert!(o.redo());
+        assert!(o.project.lock.parts.contains_key(pid), "Redo brings the pin back");
+        assert_eq!(o.project.devices.get(&x11).and_then(|d| d.part.as_deref()), Some(pid));
+        // Undone again, then given by hand: the copy left behind is pinned again.
+        assert!(o.undo());
+        o.set_device_part(&x11, Some(pid)).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid));
+        assert!(o.undo());
+        assert_eq!(o.project.lock, lock, "setting a part is one undo step with its pin");
         assert!(o.import_wago_configured(b"Article\n1\n").is_err());
     }
 

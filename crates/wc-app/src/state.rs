@@ -126,6 +126,54 @@ impl WireNumbering {
     }
 }
 
+/// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
+pub(crate) struct Mark {
+    project: Project,
+    symbols: std::collections::BTreeSet<String>,
+    parts: std::collections::BTreeSet<String>,
+    undo: Vec<Project>,
+    redo: Vec<Project>,
+    undo_dropped: usize,
+    history: u64,
+    form_step: Option<u64>,
+    dirty: bool,
+    terminals_before: Option<wc_core::project::TerminalNumbers>,
+    /// The vendored symbol and part files there were, or why that is not known.
+    files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
+}
+
+/// The vendored symbol and part files by kind and id (plain files only, not links), from folders
+/// inside the project folder. Only names are read. An error (with its reason) when a folder that
+/// may be there cannot be checked or listed, or lies outside the project: then nothing is known
+/// to be new.
+fn vendor_names(dir: &Path) -> Result<std::collections::BTreeSet<(ItemKind, String)>, String> {
+    let root = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut out = std::collections::BTreeSet::new();
+    for kind in [ItemKind::Symbol, ItemKind::Part] {
+        let folder = dir.join(store::VENDOR_DIR).join(kind.dir());
+        let at = |e: std::io::Error| format!("{}: {e}", folder.display());
+        // Only a folder known to be missing is skipped; one that cannot be checked is unknown.
+        if !folder.try_exists().map_err(at)? {
+            continue;
+        }
+        let real = folder.canonicalize().map_err(at)?;
+        if !real.starts_with(&root) {
+            return Err(format!("{} lies outside the project", folder.display()));
+        }
+        for e in std::fs::read_dir(real).map_err(at)? {
+            let e = e.map_err(at)?;
+            let path = e.path();
+            if e.file_type().map_err(at)?.is_file()
+                && path.extension().is_some_and(|x| x == "json")
+                && let Some(id) = path.file_stem().and_then(|s| s.to_str())
+            {
+                out.insert((kind, id.to_owned()));
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
@@ -176,10 +224,26 @@ pub struct Open {
     /// Tests: a file whose backup read fails, though the file is a plain readable one.
     #[cfg(test)]
     unreadable: Option<PathBuf>,
+    /// Tests: a library file rewritten once the update's backups are taken, as if someone
+    /// saved it in between.
+    #[cfg(test)]
+    rewrite_after_snapshot: Option<(PathBuf, String)>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
     /// Parts the last Undo or Redo could not load, with the reason, though the step was done.
     step_warning: Option<String>,
+}
+
+/// The most Undo steps kept; older ones are dropped.
+const UNDO_STEPS: usize = 200;
+
+/// The history as it was before a library update, so a failed one leaves no trace in it.
+struct HistoryState {
+    redo: Vec<Project>,
+    /// The oldest Undo step, when the update's checkpoint pushes it out.
+    evicted: Option<Project>,
+    dirty: bool,
+    history: u64,
 }
 
 impl Open {
@@ -212,6 +276,8 @@ impl Open {
             block_after_snapshot: None,
             #[cfg(test)]
             unreadable: None,
+            #[cfg(test)]
+            rewrite_after_snapshot: None,
             undo_error: None,
             step_warning: None,
         };
@@ -336,10 +402,14 @@ impl Open {
         if current == part {
             return Ok(());
         }
-        if let Some(id) = part {
-            self.ensure_part(id)?;
+        let lock = self.project.lock.clone();
+        if let Some(id) = part
+            && let Err(e) = self.ensure_part(id)
+        {
+            self.project.lock = lock;
+            return Err(e);
         }
-        self.checkpoint();
+        self.checkpoint_with_lock(lock);
         self.project.devices.entry(tag.clone()).or_default().part = part.map(str::to_owned);
         Ok(())
     }
@@ -366,11 +436,22 @@ impl Open {
         );
         let mut unmatched = plan.unmatched.clone();
         let mut taken = plan.clone();
+        // The lock as it was: the undo step goes back to it, and a part that cannot be used
+        // loses the pin it may have got on the way.
+        let lock = self.project.lock.clone();
         for id in plan.parts() {
             let r = candidates
                 .take(&self.dir, &mut self.project, id)
                 .and_then(|()| self.ensure_part(id));
             if let Err(why) = r {
+                match lock.parts.get(id) {
+                    Some(e) => {
+                        self.project.lock.parts.insert(id.to_owned(), e.clone());
+                    }
+                    None => {
+                        self.project.lock.parts.remove(id);
+                    }
+                }
                 for a in plan.assignments.iter().filter(|a| a.part == id) {
                     unmatched.push(format!(
                         "line {}: part {id} cannot be taken into the project: {why}",
@@ -380,12 +461,23 @@ impl Open {
                 taken.assignments.retain(|a| a.part != id);
             }
         }
-        let changed = if taken.assignments.is_empty() {
-            0
+        // Applied to a copy first: an undo step only for a change that is made, and pins only
+        // for the parts the result uses.
+        let mut staged = self.project.clone();
+        let changed = wc_import::wago::apply(&mut staged, &taken);
+        let used = staged.used_parts();
+        for id in plan.parts() {
+            if !used.contains(id) && !lock.parts.contains_key(id) {
+                self.project.lock.parts.remove(id);
+            }
+        }
+        if changed > 0 {
+            self.checkpoint_with_lock(lock);
+            wc_import::wago::apply(&mut self.project, &taken);
         } else {
-            self.checkpoint();
-            wc_import::wago::apply(&mut self.project, &taken)
-        };
+            // Nothing applies: no pin either, so the lock stays as saved and undoable.
+            self.project.lock = lock;
+        }
         let mut msg = format!(
             "WAGO configurator: {changed} device(s) or jumper(s) changed, {} row(s) already up to date, {} not matched.",
             plan.unchanged,
@@ -407,14 +499,83 @@ impl Open {
 
     /// Make sure a part is in the project (taken from the library when needed) and loaded.
     fn ensure_part(&mut self, id: &str) -> Result<(), String> {
-        if self.parts.contains_key(id) {
+        let pin = self.project.lock.parts.get(id).cloned();
+        if pin.is_some() && self.parts.contains_key(id) {
             return Ok(());
         }
-        // Only go to the library when the project has no copy; a broken copy is reported as is.
         let vendored = store::vendor_path(&self.dir, ItemKind::Part, id).map_err(|e| e.to_string())?;
-        if !vendored.exists() {
-            let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
-            wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
+        let lib = || wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string());
+        let exists = vendored
+            .try_exists()
+            .map_err(|e| format!("part {id}: {} cannot be checked: {e}", vendored.display()))?;
+        match (&pin, exists) {
+            // No copy of a pinned part: put back from the library only in the version it pins,
+            // the very part checked, and the pin kept as it is.
+            (Some(pin), false) => {
+                // The source the pin names first: another one may come first with another version.
+                // The one that wins for the id may still have the pinned version when the
+                // named source has moved on.
+                let lib = lib()?;
+                let fits = |p: &Part| p.hash() == pin.hash && p.id == id;
+                let named = lib.part_in(&pin.source, id);
+                let p = match named {
+                    Ok(p) if fits(&p) => p,
+                    named => match lib.part(id) {
+                        Ok((p, _)) if fits(&p) => p,
+                        first => {
+                            let mut why = String::new();
+                            if let Err(e) = named {
+                                why.push_str(&format!(" (source {}: {e})", pin.source));
+                            }
+                            if let Err(e) = first {
+                                why.push_str(&format!(" ({e})"));
+                            }
+                            return Err(format!(
+                                "part {id}: its copy in the project is missing and the library has another version than the project pins{why}; put the copy back or update the part from the library"
+                            ));
+                        }
+                    },
+                };
+                store::write_vendored_part(&self.dir, &p).map_err(|e| e.to_string())?;
+            }
+            // No copy and no pin: a new part, taken from the library and pinned.
+            (None, false) => {
+                let lib = lib()?;
+                wc_library::take(&self.dir, &mut self.project, &lib, ItemKind::Part, id).map_err(|e| e.to_string())?;
+            }
+            // A pinned copy: used only when it is the version the pin names.
+            (Some(pin), true) => {
+                let copy = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
+                if copy.hash() != pin.hash || copy.id != id {
+                    return Err(format!(
+                        "part {id}: its copy in the project is not the version the project pins; put the pinned copy back or update the part from the library"
+                    ));
+                }
+            }
+            // A copy without its pin (an undone change took the pin back): pinned again as it
+            // is, never replaced by a newer library version, to the library that has the part.
+            (None, true) => {
+                let copy = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
+                let (found, source) = lib()?.part(id).map_err(|e| match e {
+                    wc_library::Error::NotFound { .. } => {
+                        format!("part {id} has a copy in the project but no pin, and no library has it to pin it to")
+                    }
+                    e => format!("part {id} has a copy in the project but no pin, and its library file cannot be read to pin it: {e}"),
+                })?;
+                if found.id != id {
+                    return Err(format!(
+                        "part {id} has a copy in the project but no pin, and the library file for it ({source}) declares id {:?}",
+                        found.id
+                    ));
+                }
+                self.project.lock.parts.insert(
+                    id.to_owned(),
+                    wc_core::LockEntry {
+                        source,
+                        hash: copy.hash(),
+                    },
+                );
+            }
         }
         let p = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
         self.parts.insert(id.to_owned(), p);
@@ -431,10 +592,15 @@ impl Open {
         if self.project.devices.get(tag).map_or(&[][..], |d| &d.accessories) == accessories.as_slice() {
             return Ok(());
         }
+        let lock = self.project.lock.clone();
         for a in &accessories {
-            self.ensure_part(&a.part)?;
+            if let Err(e) = self.ensure_part(&a.part) {
+                // Parts taken before this one are not pinned without a change that uses them.
+                self.project.lock = lock;
+                return Err(e);
+            }
         }
-        self.checkpoint();
+        self.checkpoint_with_lock(lock);
         self.project.devices.entry(tag.clone()).or_default().accessories = accessories;
         Ok(())
     }
@@ -477,13 +643,21 @@ impl Open {
     }
 
     /// Take a snapshot before a change, so it can be undone.
+    /// [`Open::checkpoint`] for a change that pinned library items before it: the undo step
+    /// keeps the lock as it was (`lock`), so Undo takes those pins back and Redo brings them.
+    fn checkpoint_with_lock(&mut self, lock: wc_core::Lockfile) {
+        let now = std::mem::replace(&mut self.project.lock, lock);
+        self.checkpoint();
+        self.project.lock = now;
+    }
+
     pub fn checkpoint(&mut self) {
         // The change before this one is done: its jumpers follow their terminals first, so the
         // snapshot and this change start from that.
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
         self.undo.push(self.project.clone());
-        if self.undo.len() > 200 {
+        if self.undo.len() > UNDO_STEPS {
             self.undo.remove(0);
             self.undo_dropped += 1;
         }
@@ -781,20 +955,31 @@ impl Open {
         lib: &wc_library::Library,
         only: Option<&[String]>,
     ) -> Result<Vec<(ItemKind, String)>, String> {
-        let todo: Vec<(ItemKind, String)> = wc_library::status(&self.dir, &self.project, lib)
-            .into_iter()
-            .filter(|s| s.state == wc_library::State::Changed)
-            .filter(|s| only.is_none_or(|ids| ids.contains(&s.id)))
-            .map(|s| (s.kind, s.id))
-            .collect();
+        let all = wc_library::status(&self.dir, &self.project, lib);
+        // An item named on purpose whose library file is wrong stops the update.
+        if let Some(bad) = wc_library::wrong_named(&all, only) {
+            return Err(bad.to_string());
+        }
+        // Exactly these versions are taken, as seen here: an item whose library file changes
+        // after this (from a wrong id to a new version, or to yet another version) is not
+        // written without a backup; it waits for the next update.
+        let todo = wc_library::changed(&all, only);
         // Checked before anything is written: a new version that drops a wired pin stops the
         // whole update.
-        let mut dangling: Vec<String> = todo
-            .iter()
-            .filter(|(kind, _)| *kind == ItemKind::Symbol)
-            .filter_map(|(_, id)| Some(dangling_pins(&self.project, id, &lib.symbol(id).ok()?.0)))
-            .flatten()
-            .collect();
+        // The pins are checked on the very version the update will take: one that changed in the
+        // library since it was looked at is not taken at all.
+        let mut dangling: Vec<String> = Vec::new();
+        for (kind, id, hash) in &todo {
+            let Some((s, _)) = (*kind == ItemKind::Symbol).then(|| lib.symbol(id).ok()).flatten() else {
+                continue;
+            };
+            if s.hash() != *hash {
+                return Err(format!(
+                    "nothing was updated: the symbol {id} changed in the library while it was being updated; update again"
+                ));
+            }
+            dangling.extend(dangling_pins(&self.project, id, &s));
+        }
         if !dangling.is_empty() {
             dangling.sort();
             return Err(format!(
@@ -802,12 +987,11 @@ impl Open {
                 dangling.join(", ")
             ));
         }
-        // Undo puts back the lock and the symbol files; part files are kept here, so a write
-        // that fails halfway leaves none of them changed either.
-        let parts: Vec<(PathBuf, Option<Vec<u8>>)> = todo
+        // Every file the update may write, and the lock, are kept here: a failure puts them
+        // back directly, whatever undo can or cannot restore.
+        let files: Vec<(PathBuf, Option<Vec<u8>>)> = todo
             .iter()
-            .filter(|(kind, _)| *kind == ItemKind::Part)
-            .filter_map(|(kind, id)| store::vendor_path(&self.dir, *kind, id).ok())
+            .filter_map(|(kind, id, _)| store::vendor_path(&self.dir, *kind, id).ok())
             .map(|path| {
                 #[cfg(test)]
                 if self.unreadable.as_ref() == Some(&path) {
@@ -817,31 +1001,31 @@ impl Open {
             })
             .collect::<Result<_, String>>()
             .map_err(|e| format!("nothing was updated: {e}"))?;
+        let lock = self.project.lock.clone();
+        let history = HistoryState {
+            redo: self.redo.clone(),
+            evicted: (self.undo.len() >= UNDO_STEPS)
+                .then(|| self.undo.first().cloned())
+                .flatten(),
+            dirty: self.dirty,
+            history: self.history,
+        };
         #[cfg(test)]
         if let Some(path) = self.block_after_snapshot.take() {
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::create_dir(&path);
         }
+        #[cfg(test)]
+        if let Some((path, text)) = self.rewrite_after_snapshot.take() {
+            std::fs::write(&path, text).map_err(|e| format!("test: {} cannot be rewritten: {e}", path.display()))?;
+        }
         self.archive_symbols();
         self.checkpoint();
-        let done = match wc_library::update(&self.dir, &mut self.project, lib, only) {
+        let done = match wc_library::update_items(&self.dir, &mut self.project, lib, &todo) {
             Ok(done) => done,
             Err(e) => {
-                // Some items may have been taken already: take them back too.
-                let mut unrestored: Vec<String> = parts
-                    .iter()
-                    .filter_map(|(path, was)| {
-                        restore_file(path, was.as_deref())
-                            .err()
-                            .map(|err| format!("{} ({err})", path.display()))
-                    })
-                    .collect();
-                self.reload_symbols();
-                let undone = self.undo();
-                self.redo.clear();
-                if let (false, Some(why)) = (undone, self.take_undo_error()) {
-                    unrestored.push(why);
-                }
+                // `update_items` put back what it wrote; only the undo step goes.
+                let unrestored = self.roll_back_update(&[], lock, history);
                 return Err(if unrestored.is_empty() {
                     e.to_string()
                 } else {
@@ -864,16 +1048,53 @@ impl Open {
         }
         dangling.sort();
         let wires = dangling.join(", ");
-        if !self.undo() {
-            let why = self.take_undo_error().unwrap_or_default();
+        let unrestored = self.roll_back_update(&files, lock, history);
+        if !unrestored.is_empty() {
             return Err(format!(
-                "wires end on pins the new versions no longer have ({wires}), and the update could not be taken back: {why}"
+                "wires end on pins the new versions no longer have ({wires}), and the update could not be taken back: {}",
+                unrestored.join("; ")
             ));
         }
-        self.redo.clear();
         Err(format!(
             "nothing was updated: wires end on pins the new versions no longer have ({wires}). Move those wires first."
         ))
+    }
+
+    /// Take back a library update that failed: the files it wrote and the lock as they were
+    /// (`files`, `lock`), its undo step dropped, and the history as it was before it (`was`: the
+    /// Redo list, the oldest Undo step its checkpoint pushed out, whether there were unsaved
+    /// changes). Returns what could not be put back.
+    fn roll_back_update(
+        &mut self,
+        files: &[(PathBuf, Option<Vec<u8>>)],
+        lock: wc_core::Lockfile,
+        was: HistoryState,
+    ) -> Vec<String> {
+        let mut unrestored: Vec<String> = files
+            .iter()
+            .filter_map(|(path, was)| {
+                restore_file(path, was.as_deref())
+                    .err()
+                    .map(|err| format!("{} ({err})", path.display()))
+            })
+            .collect();
+        self.reload_symbols();
+        if !self.undo()
+            && let Some(why) = self.take_undo_error()
+        {
+            unrestored.push(why);
+        }
+        // Whatever undo managed, the lock is the one the files above match.
+        self.project.lock = lock;
+        self.redo = was.redo;
+        if let Some(oldest) = was.evicted {
+            self.undo.insert(0, oldest);
+            self.undo_dropped = self.undo_dropped.saturating_sub(1);
+        }
+        self.dirty = was.dirty;
+        self.history = was.history;
+        self.reload_symbols();
+        unrestored
     }
 
     /// Why the last Undo or Redo failed, once.
@@ -1107,6 +1328,123 @@ impl Open {
         self.held_by_others
             .get(id)
             .map(|name| format!("{name} has this page open; it is read-only here until they leave it."))
+    }
+
+    /// The pages someone else holds, as they are now: what [`Open::held_change`] compares with.
+    pub fn held_pages(&self) -> Vec<Page> {
+        self.project
+            .pages
+            .iter()
+            .filter(|p| self.held_by_others.contains_key(&p.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Why a change is refused: it changed or removed one of the pages someone else held when
+    /// [`Open::held_pages`] gave `before`.
+    pub fn held_change(&self, before: &[Page]) -> Option<String> {
+        before.iter().find_map(|old| {
+            let who = self.held_by_others.get(&old.id).map_or("Someone", String::as_str);
+            match self.project.pages.iter().position(|p| p.id == old.id) {
+                None => Some(format!(
+                    "it would remove page {}, which {who} has open; it is read-only here until they leave it.",
+                    old.number
+                )),
+                Some(i) if self.project.pages[i] != *old => Some(format!(
+                    "it would change page {}, which {who} has open; it is read-only here until they leave it.",
+                    old.number
+                )),
+                Some(_) => None,
+            }
+        })
+    }
+
+    /// Start a change that may be refused as a whole: the project and the symbols and parts
+    /// loaded now are kept, and the undo history is set aside, so the change's own undo steps
+    /// collect apart from it. [`Open::keep`] or [`Open::back_to`] ends it. Undo and redo
+    /// must not run in between.
+    /// The steps set aside still count in [`Open::undo_mark`], so a mark taken in between
+    /// (a form opened by the change) stays valid after [`Open::keep`].
+    pub(crate) fn mark(&mut self) -> Mark {
+        let undo = std::mem::take(&mut self.undo);
+        let undo_dropped = self.undo_dropped;
+        self.undo_dropped += undo.len();
+        Mark {
+            project: self.project.clone(),
+            symbols: self.symbols.keys().cloned().collect(),
+            parts: self.parts.keys().cloned().collect(),
+            undo,
+            redo: std::mem::take(&mut self.redo),
+            undo_dropped,
+            history: self.history,
+            form_step: self.form_step,
+            dirty: self.dirty,
+            terminals_before: self.terminals_before.clone(),
+            files: vendor_names(&self.dir),
+        }
+    }
+
+    /// The change since `mark` stays: its undo steps go after the earlier ones (the oldest
+    /// dropped beyond the usual limit), and redo is kept only when it made no undo step.
+    pub(crate) fn keep(&mut self, mark: Mark) {
+        let mut undo = mark.undo;
+        // The set-aside steps counted as dropped while the change ran; they are back now.
+        self.undo_dropped -= undo.len();
+        undo.append(&mut self.undo);
+        let over = undo.len().saturating_sub(UNDO_STEPS);
+        undo.drain(..over);
+        self.undo_dropped += over;
+        self.undo = undo;
+        if self.history == mark.history {
+            self.redo = mark.redo;
+        }
+    }
+
+    /// Take back everything changed since `mark`: the project, the symbols and parts it
+    /// loaded, its undo steps, and the change marks; the undo and redo history are as before.
+    /// A symbol or part file the change added (there was none, and the project as it was does
+    /// not pin it) is removed; files that were there are never touched, nor rewritten. One that
+    /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
+    /// when it is next used.
+    pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
+        self.project = mark.project;
+        self.symbols.retain(|id, _| mark.symbols.contains(id));
+        self.parts.retain(|id, _| mark.parts.contains(id));
+        self.undo = mark.undo;
+        self.redo = mark.redo;
+        self.undo_dropped = mark.undo_dropped;
+        (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
+        self.terminals_before = mark.terminals_before;
+        let (before, now) = match (mark.files, vendor_names(&self.dir)) {
+            (Ok(before), Ok(now)) => (before, now),
+            (Err(e), _) | (_, Err(e)) => {
+                return Err(format!("Library files it may have added were not checked: {e}"));
+            }
+        };
+        let lock = &self.project.lock;
+        let mut failed = Vec::new();
+        for (kind, id) in now.difference(&before) {
+            let pinned = match kind {
+                ItemKind::Symbol => lock.symbols.contains_key(id),
+                ItemKind::Part => lock.parts.contains_key(id),
+            };
+            if pinned {
+                continue;
+            }
+            if let Ok(path) = store::vendor_path(&self.dir, *kind, id)
+                && let Err(e) = std::fs::remove_file(&path)
+            {
+                failed.push(format!("{}: {e}", path.display()));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Library files it added could not be removed: {}",
+                failed.join("; ")
+            ))
+        }
     }
 
     /// Delete a page. The last page of a project cannot be deleted. Returns the page to show next.
@@ -1375,6 +1713,19 @@ impl Open {
         Ok(())
     }
 
+    /// Whether [`Open::cover_page`] would mark the first page as the cover: no page is marked
+    /// yet, and the first one is an empty page titled Cover.
+    pub fn cover_marks_first(&self) -> bool {
+        self.project.cover_page().is_none()
+            && self.project.pages.first().is_some_and(|first| {
+                first.title.trim().eq_ignore_ascii_case("cover")
+                    && first.symbols.is_empty()
+                    && first.wires.is_empty()
+                    && first.graphics.is_empty()
+                    && first.underlay.is_none()
+            })
+    }
+
     /// The cover page's index. A project without one gets one: an empty first page titled
     /// "Cover" (as new projects started) is marked as the cover, otherwise a new cover page
     /// numbered `0` goes in front of the others. Creating or marking it is one undo step. Fails,
@@ -1383,13 +1734,7 @@ impl Open {
         if let Some(i) = self.project.cover_page() {
             return Ok(i);
         }
-        if let Some(first) = self.project.pages.first()
-            && first.title.trim().eq_ignore_ascii_case("cover")
-            && first.symbols.is_empty()
-            && first.wires.is_empty()
-            && first.graphics.is_empty()
-            && first.underlay.is_none()
-        {
+        if self.cover_marks_first() {
             self.checkpoint();
             if let Some(first) = self.project.pages.first_mut() {
                 first.cover = true;
@@ -1609,10 +1954,14 @@ impl Open {
         if !meta.set_jumper_part(strip, terminal, part)? {
             return Ok(());
         }
-        if let Some(id) = part {
-            self.ensure_part(id)?;
+        let lock = self.project.lock.clone();
+        if let Some(id) = part
+            && let Err(e) = self.ensure_part(id)
+        {
+            self.project.lock = lock;
+            return Err(e);
         }
-        self.checkpoint();
+        self.checkpoint_with_lock(lock);
         self.project.meta.jumpers = meta.jumpers;
         Ok(())
     }
@@ -1973,6 +2322,110 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_jumper_part_is_one_undo_step_with_its_pin() {
+        let (_tmp, mut o) = project();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        for (x, tag) in [(20.0, "-X1.1"), (40.0, "-X1.2")] {
+            let id = o.place(1, "wc.terminal", Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(DeviceTag::parse(tag).unwrap());
+        }
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        let pid = "example.ex-tb-2-5";
+        let lock = o.project.lock.clone();
+        assert!(!lock.parts.contains_key(pid));
+        o.set_jumper_part(&x1, "2", Some(pid)).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid));
+        assert!(o.undo());
+        assert_eq!(o.project.lock, lock, "Undo takes the pin back with the part");
+        assert!(o.project.meta.jumpers[0].part.is_none());
+        assert!(o.redo());
+        assert!(o.project.lock.parts.contains_key(pid), "Redo brings it back");
+        assert_eq!(o.project.meta.jumpers[0].part.as_deref(), Some(pid));
+    }
+
+    #[test]
+    fn a_part_copy_without_its_pin_is_pinned_as_it_is_not_replaced() {
+        let (tmp, mut o) = project();
+        let pid = "example.ex-ct-9-24dc";
+        let tag = DeviceTag::parse("-K1").unwrap();
+        o.set_device_part(&tag, Some(pid)).unwrap();
+        // The pin is gone (an undone import left the copy), and the library has a newer one.
+        let copy = store::read_vendored_part(&o.dir, pid).unwrap();
+        o.project.lock.parts.remove(pid);
+        o.parts.remove(pid);
+        changed_part_in_mine(&o, tmp.path(), pid);
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let coil = o.symbols["wc.coil"].clone();
+        library_first(&mut o, tmp.path(), &coil);
+        let other = DeviceTag::parse("-K2").unwrap();
+        o.set_device_part(&other, Some(pid)).unwrap();
+        assert_eq!(
+            store::read_vendored_part(&o.dir, pid).unwrap(),
+            copy,
+            "the copy is kept"
+        );
+        assert_eq!(o.project.lock.parts[pid].hash, copy.hash(), "and pinned as it is");
+
+        // A pinned part whose copy is missing is not replaced by another library version.
+        o.parts.remove(pid);
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
+        let third = DeviceTag::parse("-K3").unwrap();
+        let err = o.set_device_part(&third, Some(pid)).unwrap_err();
+        assert!(err.contains("another version than the project pins"), "{err}");
+        assert!(o.project.devices.get(&third).is_none_or(|d| d.part.is_none()));
+        // Pinned to a source that still has the pinned version, though another one comes first
+        // with a newer one: the copy comes from the source the pin names.
+        let pin = o.project.lock.parts[pid].clone();
+        o.project.lock.parts.get_mut(pid).unwrap().source = "starter".into();
+        let sixth = DeviceTag::parse("-K6").unwrap();
+        o.set_device_part(&sixth, Some(pid)).unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), copy);
+        o.parts.remove(pid);
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
+        o.project.lock.parts.insert(pid.into(), pin);
+        // Pinned to a source that has moved on, while the source that comes first still has the
+        // pinned version: the copy comes from that one, and the pin stays as it is.
+        let pin = o.project.lock.parts[pid].clone();
+        assert_eq!(pin.source, "mine");
+        o.project.meta.libraries.rotate_left(1);
+        let seventh = DeviceTag::parse("-K7").unwrap();
+        o.set_device_part(&seventh, Some(pid)).unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), copy);
+        assert_eq!(o.project.lock.parts[pid], pin);
+        o.project.meta.libraries.rotate_right(1);
+        o.parts.remove(pid);
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
+        // With the pinned version back in the library, the copy is put back and the pin kept.
+        let pin = o.project.lock.parts[pid].clone();
+        wc_library::write_part(&tmp.path().join("mine"), &copy).unwrap();
+        o.set_device_part(&third, Some(pid)).unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), copy);
+        assert_eq!(o.project.lock.parts[pid], pin);
+
+        // A copy that is not the pinned version is not used.
+        let mut edited = copy.clone();
+        edited.description = "Edited by hand".into();
+        store::write_vendored_part(&o.dir, &edited).unwrap();
+        o.parts.remove(pid);
+        let fifth = DeviceTag::parse("-K5").unwrap();
+        let err = o.set_device_part(&fifth, Some(pid)).unwrap_err();
+        assert!(err.contains("not the version the project pins"), "{err}");
+        store::write_vendored_part(&o.dir, &copy).unwrap();
+
+        // A copy without its pin whose library file cannot be read says why.
+        o.project.lock.parts.remove(pid);
+        o.parts.remove(pid);
+        std::fs::write(tmp.path().join(format!("mine/parts/{pid}.json")), "{ not json").unwrap();
+        let fourth = DeviceTag::parse("-K4").unwrap();
+        let err = o.set_device_part(&fourth, Some(pid)).unwrap_err();
+        assert!(
+            err.contains("cannot be read") && err.contains("line 1"),
+            "the parse error is kept: {err}"
+        );
+    }
+
+    #[test]
     fn an_update_refused_for_a_dropped_pin_writes_no_part_either() {
         let (tmp, mut o) = project();
         let s1 = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
@@ -2009,6 +2462,165 @@ pub(crate) mod tests {
             "the part file is untouched"
         );
         assert_eq!(o.project.lock, lock);
+    }
+
+    #[test]
+    fn a_change_taken_back_leaves_no_part_file_and_keeps_undo_marks_in_step() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let (undo_mark, can_undo) = (o.undo_mark(), o.can_undo());
+        let pid = "example.ex-ct-9-24dc";
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        // A refused change that took a part from the library: its file goes with it.
+        let mark = o.mark();
+        assert_eq!(o.undo_mark(), undo_mark, "the set-aside steps still count");
+        o.ensure_part(pid).unwrap();
+        o.checkpoint();
+        assert!(part_file.exists());
+        o.back_to(mark).unwrap();
+        assert!(!part_file.exists(), "no unpinned part file is left");
+        assert!(!o.project.lock.parts.contains_key(pid));
+        assert_eq!((o.undo_mark(), o.can_undo()), (undo_mark, can_undo));
+        // Taken again later, it is pinned (and so sent to the session).
+        o.ensure_part(pid).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid));
+        // A file that was there before stays, even when the change only read it.
+        o.parts.remove(pid);
+        let mark = o.mark();
+        o.ensure_part(pid).unwrap();
+        o.back_to(mark).unwrap();
+        assert!(part_file.exists(), "a file that was there before stays");
+        // An unpinned copy left behind (a failed removal) is pinned when it is next used.
+        o.project.lock.parts.remove(pid);
+        o.parts.remove(pid);
+        o.ensure_part(pid).unwrap();
+        assert!(
+            o.project.lock.parts.contains_key(pid),
+            "the leftover copy is pinned again"
+        );
+        // A vendor folder that cannot be checked (here: a link out of the project) is reported,
+        // and nothing in it is removed.
+        #[cfg(unix)]
+        {
+            let parts = o.dir.join(store::VENDOR_DIR).join(ItemKind::Part.dir());
+            let outside = _tmp.path().join("outside-parts");
+            std::fs::rename(&parts, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, &parts).unwrap();
+            let mark = o.mark();
+            let err = o.back_to(mark).unwrap_err();
+            assert!(
+                err.contains("not checked") && err.contains("outside the project"),
+                "{err}"
+            );
+            assert!(part_file.exists(), "nothing removed");
+            std::fs::remove_file(&parts).unwrap();
+            std::fs::rename(&outside, &parts).unwrap();
+        }
+        // A mark taken inside a kept change (a form it opened) means the same step afterwards.
+        let mark = o.mark();
+        let inside = o.start_live_form();
+        o.keep(mark);
+        assert_eq!(inside, o.undo_mark());
+    }
+
+    #[test]
+    fn an_update_takes_only_the_items_it_looked_at() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        // The library's coil file names another id: not an update when the update looks.
+        let mut wrong = old.clone();
+        wrong.id = "wc.other".into();
+        let lib = library_first(&mut o, tmp.path(), &wrong);
+        let file = tmp.path().join("mine/symbols/wc.coil.json");
+        std::fs::write(&file, serde_json::to_string(&wrong).unwrap()).unwrap();
+        // Fixed and changed right after the backups are taken.
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        o.rewrite_after_snapshot = Some((file, serde_json::to_string(&new).unwrap()));
+        let done = o.update_library(&lib, None).unwrap();
+        assert_eq!(done, vec![(ItemKind::Part, pid.to_owned())]);
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "the coil it did not look at is not taken"
+        );
+        assert_eq!(o.project.lock.symbols["wc.coil"].hash, old.hash());
+    }
+
+    #[test]
+    fn an_update_takes_no_newer_version_than_it_looked_at_and_keeps_redo() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        // An edit undone before the update: Redo must still bring it back after a failed one.
+        o.checkpoint();
+        o.project.pages[1].title = "Renamed".into();
+        assert!(o.undo());
+        assert!(o.can_redo());
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let part_before = std::fs::read(&part_file).unwrap();
+        let mut seen = changed_part_in_mine(&o, tmp.path(), pid);
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        // The part changes again right after the backups are taken.
+        seen.description = "Changed again".into();
+        o.rewrite_after_snapshot = Some((
+            tmp.path().join(format!("mine/parts/{pid}.json")),
+            serde_json::to_string(&seen).unwrap(),
+        ));
+        let lock = o.project.lock.clone();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(
+            err.contains("changed in the library while it was being updated"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&part_file).unwrap(),
+            part_before,
+            "the part file is as it was"
+        );
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
+            old,
+            "and the coil"
+        );
+        assert_eq!(o.project.lock, lock);
+        assert!(o.can_redo(), "the earlier Redo is kept");
+        assert!(o.redo());
+        assert_eq!(o.project.pages[1].title, "Renamed");
+    }
+
+    #[test]
+    fn a_failed_update_leaves_a_full_undo_history_and_a_saved_project_as_they_were() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        for n in 0..UNDO_STEPS {
+            o.checkpoint();
+            o.project.pages[1].title = format!("Step {n}");
+        }
+        let mut seen = changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.save().unwrap();
+        let (undo, history, dropped) = (o.undo.clone(), o.history, o.undo_dropped);
+        seen.description = "Changed again".into();
+        o.rewrite_after_snapshot = Some((
+            tmp.path().join(format!("mine/parts/{pid}.json")),
+            serde_json::to_string(&seen).unwrap(),
+        ));
+        assert!(o.update_library(&lib, None).is_err());
+        assert_eq!(o.undo, undo, "the oldest Undo step is still there");
+        assert_eq!((o.history, o.undo_dropped), (history, dropped));
+        assert!(!o.dirty, "nothing to save");
     }
 
     #[test]

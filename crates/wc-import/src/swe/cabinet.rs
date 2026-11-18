@@ -4,10 +4,11 @@
 //! wire ducts and the devices' footprints. The database has no item kind of its own for them, so
 //! an item is sorted by its block name first (`Rail 35`, `Duct 40x60`, `Mounting plate`), then by
 //! whether its component is an imported device, then by its component's description and part
-//! number. A footprint's size is the symbol's box (`sym_posend*`); without one a device takes its
-//! part's width and height (`wc_core::panel::part_size`, the part linked from the archive's
-//! catalog), else the [`DEFAULT_SIZE`] footprint, counted as estimated; either way at its
-//! insertion point as the top-left corner. A rail or
+//! number. A footprint's size is the symbol's box (`sym_posend*`); without one a device takes the
+//! box round its block's drawing (`Block/<name>.dwg`, turned and scaled like the symbol, where
+//! the drawing puts it), else its part's width and height (`wc_core::panel::part_size`, the part
+//! linked from the archive's catalog), else the [`DEFAULT_SIZE`] footprint, counted as
+//! estimated; the last two at its insertion point as the top-left corner. A rail or
 //! duct, which has no length then, is left out. WiringCraft rails run left to right, so an
 //! upright rail is left out too. Everything left out is counted with the reason.
 //!
@@ -47,6 +48,8 @@ pub struct Layouts {
     pub estimated: usize,
     /// Devices whose symbol has no box, sized from their part's width and height.
     pub from_part: usize,
+    /// Devices whose symbol has no box, sized from their block's drawing.
+    pub from_drawing: usize,
     /// Rails and ducts without a box, so without a length.
     pub no_size: usize,
     /// Rails that run up and down.
@@ -140,6 +143,8 @@ pub fn layouts(
         .collect();
     let mut out = Layouts::default();
     let mut ids: BTreeSet<String> = BTreeSet::new();
+    // One drawing budget for every footprint sized from its drawing, on all layout pages.
+    let mut budget = p.drawings.draw_limit();
     for page in p.pages.iter().filter(|pg| pg.kind == KIND_CABINET) {
         let mut plate: Option<(Point, Point)> = None;
         // Items in page coordinates (y up), placed on the plate once its box is known.
@@ -164,7 +169,16 @@ pub fn layouts(
                 (Kind::Rail | Kind::Duct, None) => out.no_size += 1,
                 (Kind::Device, b) => {
                     let Some(tag) = tag else { continue };
-                    let (min, max) = b.unwrap_or_else(|| {
+                    // A box with no width or no height sizes nothing.
+                    let b = b.filter(|(min, max)| max.x > min.x && max.y > min.y);
+                    let drawn = || {
+                        let b = p.drawings.placed_extents(s, &mut budget);
+                        if b.is_some() {
+                            out.from_drawing += 1;
+                        }
+                        b
+                    };
+                    let (min, max) = b.or_else(drawn).unwrap_or_else(|| {
                         let from_part = devices
                             .get(tag)
                             .and_then(|d| d.part.as_deref())
