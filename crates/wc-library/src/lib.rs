@@ -233,7 +233,7 @@ pub fn status(project_dir: &Path, project: &Project, lib: &Library) -> Vec<ItemS
                 .filter(|(_, _, inside)| *inside != id)
                 .map(|(_, src, inside)| {
                     let what = if kind == ItemKind::Symbol { "symbol" } else { "part" };
-                    format!("the {what} file for {id:?} in {src} declares id {inside:?}; fix the library file")
+                    format!("the {what} file for {id:?} in {src:?} declares id {inside:?}; fix the library file")
                 });
             let library_source = lib_v.as_ref().map(|v| v.1.clone());
             let lib_v = lib_v.filter(|_| wrong_id.is_none());
