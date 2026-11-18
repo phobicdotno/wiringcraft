@@ -997,7 +997,6 @@ fn a_cover_too_short_for_its_description_leaves_it_out_of_the_title_block() -> R
     let mut cover = Page::new("p1", "1", "Cover");
     cover.cover = true;
     cover.size = PageSize::custom(297, 100)?;
-    project.meta.template.height = 50.0;
     project
         .meta
         .title_block
@@ -1006,20 +1005,34 @@ fn a_cover_too_short_for_its_description_leaves_it_out_of_the_title_block() -> R
         file: "pictures/logo.png".into(),
         cover: None,
     });
-    let ty = cover.size.mm().1 - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
-    let marks = layout::frame_marks(&project, &cover, 0, 1, "2026-11-17");
     let cx = cover.size.mm().0 / 2.0;
-    let found: Vec<f64> = marks
-        .iter()
-        .filter_map(|m| match &m.shape {
-            Shape::Text { text, at, .. } if text == "Pump station" && (at.x - cx).abs() < 0.01 => Some(at.y),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        found.iter().all(|y| *y <= ty),
-        "description at {found:?}, title block from {ty}"
-    );
+    let descriptions = |project: &Project| -> Vec<f64> {
+        layout::frame_marks(project, &cover, 0, 1, "2026-11-17")
+            .iter()
+            .filter_map(|m| match &m.shape {
+                Shape::Text { text, at, .. } if text == "Pump station" && (at.x - cx).abs() < 0.01 => Some(at.y),
+                _ => None,
+            })
+            .collect()
+    };
+    // Title bands in 0.1 mm steps, so one puts the baseline on the rule and others within the
+    // room the letters reach below it: the description stays clear of the rule, or is left out.
+    let mut left_out = false;
+    for tenths in 300..=600 {
+        project.meta.template.height = f64::from(tenths) / 10.0;
+        let ty = cover.size.mm().1 - wc_core::project::FRAME_MARGIN - project.meta.template.band_height();
+        let found = descriptions(&project);
+        left_out |= found.is_empty();
+        assert!(
+            found.iter().all(|y| *y + 0.8 <= ty + 1e-9),
+            "band {}: description at {found:?}, title block from {ty}",
+            project.meta.template.height
+        );
+    }
+    assert!(left_out, "no band left the description out");
+    // Where it fits, it is there.
+    project.meta.template.height = 30.0;
+    assert_eq!(descriptions(&project).len(), 1);
     Ok(())
 }
 

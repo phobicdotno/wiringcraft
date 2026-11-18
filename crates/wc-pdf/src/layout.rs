@@ -662,7 +662,7 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     // On a sheet too short for it, the description is left out rather than drawn into the
     // title block.
     let desc = tb.get("description").map(String::as_str).unwrap_or("");
-    if name_y + 9.0 <= y1 {
+    if name_y + 9.0 + BELOW_BASELINE <= y1 {
         push_text((cx, name_y + 9.0), fit(desc, 4.0), Align::Center, desc, Ink::Thin, out);
     }
 
