@@ -2236,22 +2236,23 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
     Ok(())
 }
 
-/// The named sheet a traced drawing of `(width, height)` millimetres fits best: the smallest
-/// ISO size whose long side holds the drawing's long side, upright when the drawing is.
+/// The sheet for a traced drawing of `(width, height)` millimetres: the smallest ISO size
+/// that holds both sides, upright when the drawing is. A drawing larger than A0 gets a sheet
+/// of its own size (A0 when that is beyond the custom range).
 fn sheet_for((w, h): (f64, f64)) -> PageSize {
-    let long = w.max(h);
-    let (landscape, portrait) = if long > 1000.0 {
-        (PageSize::A0, PageSize::A0Portrait)
-    } else if long > 700.0 {
-        (PageSize::A1, PageSize::A1Portrait)
-    } else if long > 500.0 {
-        (PageSize::A2, PageSize::A2Portrait)
-    } else if long > 350.0 {
-        (PageSize::A3, PageSize::A3Portrait)
-    } else {
-        (PageSize::A4, PageSize::A4Portrait)
-    };
-    if h > w { portrait } else { landscape }
+    // PDF sizes are in points, so an A3 page reads a fraction of a millimetre off.
+    const SLACK: f64 = 1.0;
+    let portrait = h > w;
+    PageSize::NAMED
+        .into_iter()
+        .filter(|s| s.is_portrait() == portrait)
+        .find(|s| {
+            let (sw, sh) = s.mm();
+            w <= sw + SLACK && h <= sh + SLACK
+        })
+        // Larger than A0: a sheet of the page's own size, or A0 when even that is too large.
+        .or_else(|| PageSize::custom(w.ceil() as u32, h.ceil() as u32).ok())
+        .unwrap_or(if portrait { PageSize::A0Portrait } else { PageSize::A0 })
 }
 
 /// What `lib lock` could not pin, one line each.
@@ -3688,6 +3689,19 @@ mod tests {
         assert_eq!(sheet_for((210.0, 297.0)), PageSize::A4Portrait);
         assert_eq!(sheet_for((841.0, 594.0)), PageSize::A1);
         assert_eq!(sheet_for((420.0, 297.0)), PageSize::A3);
+        // Both sides count: a 950 x 600 mm page is wider than A1 though its long side is short
+        // of A0's.
+        assert_eq!(sheet_for((950.0, 600.0)), PageSize::A0);
+        // A point-rounded A3 still reads as A3.
+        assert_eq!(sheet_for((420.3, 297.2)), PageSize::A3);
+        assert_eq!(
+            sheet_for((1300.0, 900.0)),
+            PageSize::Custom {
+                width: 1300,
+                height: 900
+            }
+        );
+        assert_eq!(sheet_for((5000.0, 900.0)), PageSize::A0);
     }
 
     #[test]

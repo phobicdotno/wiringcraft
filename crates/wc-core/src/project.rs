@@ -662,8 +662,10 @@ impl ProjectMeta {
 }
 
 /// A page's sheet: an ISO A size, landscape or portrait, or a size of its own. Stored by
-/// name (`A3`, `A4Portrait`) or as `{ Custom = { width, height } }`.
+/// name (`A3`, `A4Portrait`) or as `{ Custom = { width, height } }`. A stored custom size
+/// outside [`PageSize::MIN_MM`] to [`PageSize::MAX_MM`] is refused when read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(try_from = "StoredPageSize")]
 pub enum PageSize {
     A4,
     #[default]
@@ -682,6 +684,42 @@ pub enum PageSize {
         width: u32,
         height: u32,
     },
+}
+
+/// [`PageSize`] as stored, before a custom size is checked.
+#[derive(Deserialize)]
+enum StoredPageSize {
+    A4,
+    A3,
+    A2,
+    A1,
+    A0,
+    A4Portrait,
+    A3Portrait,
+    A2Portrait,
+    A1Portrait,
+    A0Portrait,
+    Custom { width: u32, height: u32 },
+}
+
+impl TryFrom<StoredPageSize> for PageSize {
+    type Error = String;
+
+    fn try_from(stored: StoredPageSize) -> Result<Self, String> {
+        Ok(match stored {
+            StoredPageSize::A4 => PageSize::A4,
+            StoredPageSize::A3 => PageSize::A3,
+            StoredPageSize::A2 => PageSize::A2,
+            StoredPageSize::A1 => PageSize::A1,
+            StoredPageSize::A0 => PageSize::A0,
+            StoredPageSize::A4Portrait => PageSize::A4Portrait,
+            StoredPageSize::A3Portrait => PageSize::A3Portrait,
+            StoredPageSize::A2Portrait => PageSize::A2Portrait,
+            StoredPageSize::A1Portrait => PageSize::A1Portrait,
+            StoredPageSize::A0Portrait => PageSize::A0Portrait,
+            StoredPageSize::Custom { width, height } => PageSize::custom(width, height)?,
+        })
+    }
 }
 
 impl PageSize {
@@ -765,11 +803,15 @@ impl PageSize {
     /// landscape`, or a custom `500x700` (millimetres, width first). The error says what is
     /// accepted.
     pub fn parse(text: &str) -> Result<PageSize, String> {
-        let t = text.trim().to_ascii_lowercase().replace(['-', '_'], " ");
+        let lower = text.trim().to_ascii_lowercase();
+        // Hyphens join the words of a name (`A4-portrait`); a custom size keeps its signs.
+        let t = lower.replace(['-', '_'], " ");
         let words: Vec<&str> = t.split_whitespace().collect();
         let (name, portrait) = match words.as_slice() {
-            [one] if one.len() == 3 && one.ends_with('p') && one.starts_with('a') => (&one[..2], true),
-            [one] => (*one, false),
+            [one] => match one.strip_suffix('p') {
+                Some(prefix) if prefix.starts_with('a') => (prefix, true),
+                _ => (*one, false),
+            },
             [one, "portrait"] => (*one, true),
             [one, "landscape"] => (*one, false),
             _ => ("", false),
@@ -795,7 +837,7 @@ impl PageSize {
                 "size {text:?} is not A4, A3, A2, A1 or A0 (add \"portrait\" for an upright sheet) or a custom WIDTHxHEIGHT in millimetres"
             )
         };
-        let compact: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+        let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
         let compact = compact.strip_suffix("mm").unwrap_or(&compact);
         let (w, h) = compact.split_once('x').ok_or_else(bad)?;
         let (width, height) = (
@@ -1409,7 +1451,9 @@ mod tests {
         ] {
             assert_eq!(PageSize::parse(text), Ok(want), "{text}");
         }
-        for bad in ["A5", "B4", "50x700", "500x9000", "500x", "x", ""] {
+        for bad in [
+            "A5", "B4", "50x700", "500x9000", "500x", "x", "", "-500x700", "500x-700", "ap", "a4pp",
+        ] {
             assert!(PageSize::parse(bad).is_err(), "{bad}");
         }
         for size in PageSize::NAMED.into_iter().chain([PageSize::Custom {
@@ -1445,6 +1489,15 @@ mod tests {
             let text = serde_json::to_string(&page(size)).unwrap();
             assert_eq!(serde_json::from_str::<Page>(&text).unwrap().size, size, "{text}");
         }
+        // A custom size outside the allowed range is refused when read, as when typed.
+        let mut text = serde_json::to_value(page(PageSize::Custom {
+            width: 500,
+            height: 700,
+        }))
+        .unwrap();
+        text["size"]["Custom"]["width"] = 0.into();
+        let err = serde_json::from_value::<Page>(text).unwrap_err().to_string();
+        assert!(err.contains("outside 100 to 2000 mm"), "{err}");
     }
 
     #[test]

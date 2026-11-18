@@ -1470,14 +1470,8 @@ impl App {
                                     for s in PageSize::NAMED {
                                         ui.selectable_value(size, s, s.label());
                                     }
-                                    // A sheet of its own: starts from the size shown, as it is drawn.
-                                    let (w, h) = size.mm();
-                                    let own = PageSize::Custom {
-                                        width: w.round() as u32,
-                                        height: h.round() as u32,
-                                    };
                                     if !matches!(size, PageSize::Custom { .. }) {
-                                        ui.selectable_value(size, own, "Custom size…");
+                                        ui.selectable_value(size, custom_from(*size), "Custom size…");
                                     }
                                 });
                             if let PageSize::Custom { width, height } = size {
@@ -3229,6 +3223,16 @@ impl App {
     }
 }
 
+/// The custom sheet "Custom size…" starts from: the size shown, as it is drawn (A4 portrait
+/// gives 210 x 297 mm).
+fn custom_from(size: PageSize) -> PageSize {
+    let (w, h) = size.mm();
+    PageSize::Custom {
+        width: w.round() as u32,
+        height: h.round() as u32,
+    }
+}
+
 fn main() -> eframe::Result {
     // Started by Claude Code as the assistant's MCP server: pass messages to the running app.
     let mut args = std::env::args_os();
@@ -3770,5 +3774,28 @@ mod marking_tests {
         let msg = export_wago_marking(&o, &options);
         assert!(msg.starts_with("Nothing exported") && msg.contains("-X1"), "{msg}");
         assert!(!o.dir.join("export").join("wago-marking--X1.csv").exists());
+    }
+}
+
+#[cfg(test)]
+mod page_size_tests {
+    use super::*;
+
+    #[test]
+    fn a_custom_sheet_starts_from_the_size_shown() {
+        assert_eq!(
+            custom_from(PageSize::A4Portrait),
+            PageSize::Custom {
+                width: 210,
+                height: 297
+            }
+        );
+        assert_eq!(
+            custom_from(PageSize::A3),
+            PageSize::Custom {
+                width: 420,
+                height: 297
+            }
+        );
     }
 }

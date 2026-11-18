@@ -338,7 +338,9 @@ impl PageTemplate {
                     (Side::Left, Side::Right) => v(b.left) + v(b.right) + MIN_MIDDLE_BOX,
                     (Side::Left, Side::Left) => v(b.right),
                     (Side::Right, Side::Right) => v(b.left),
-                    (Side::Right, Side::Left) => v(b.left) + v(b.right),
+                    // Its edges cross over: the box is visible on frames narrower than
+                    // the sum, so it only needs each edge to stay on the frame.
+                    (Side::Right, Side::Left) => v(b.left).max(v(b.right)),
                 }
             })
             .fold(0.0, f64::max)
@@ -532,5 +534,30 @@ mod tests {
         assert!(on.iter().all(|(_, (l, _, r, _))| *l >= 10.0 && *r <= 200.0 && r > l));
         let project = on.iter().find(|(b, _)| b.label == "Project").map(|(_, r)| *r);
         assert!(project.is_some_and(|(l, _, r, _)| r - l > 20.0), "{project:?}");
+    }
+
+    #[test]
+    fn a_box_with_crossed_anchors_that_fits_stays_as_it_is() {
+        // Left edge 40 mm from the right, right edge 380 mm from the left: 20 mm wide on a
+        // 400 mm frame. Nothing has to narrow for it.
+        let t = PageTemplate {
+            boxes: vec![TitleBox::new(
+                "Logo",
+                (40.0, Side::Right),
+                (380.0, Side::Left),
+                0.0,
+                10.0,
+            )],
+            ..PageTemplate::default()
+        };
+        let band = t.band_height();
+        let on: Vec<_> = t.boxes_on(0.0, 400.0, band).into_iter().map(|(_, r)| r).collect();
+        assert_eq!(on, [(360.0, 0.0, 380.0, 10.0)]);
+        // On a frame too narrow for its edges it narrows with the rest and stays visible.
+        let on = t.boxes_on(0.0, 300.0, band);
+        assert!(
+            on.first().is_some_and(|(_, (l, _, r, _))| r > l && *r <= 300.0),
+            "{on:?}"
+        );
     }
 }

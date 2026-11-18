@@ -3820,6 +3820,26 @@ mod tests {
         let p = open.project.pages.iter().find(|p| p.title == "Motors").unwrap();
         assert_eq!(p.size, PageSize::A2);
         assert_eq!(a.ed.page, open.find_page(&p.number).unwrap());
+        // Upright and custom sheets come through the tools too.
+        call(&mut a, "add_page", json!({"title": "Upright", "size": "A4-portrait"})).unwrap();
+        let size_of = |a: &App, title: &str| {
+            let open = a.open.as_ref().unwrap();
+            open.project
+                .pages
+                .iter()
+                .find(|p| p.title == title)
+                .map(|p| (p.size, p.number.clone()))
+        };
+        let (size, number) = size_of(&a, "Upright").unwrap();
+        assert_eq!(size, PageSize::A4Portrait);
+        call(&mut a, "update_page", json!({"page": number, "size": "500x700"})).unwrap();
+        assert_eq!(
+            size_of(&a, "Upright").map(|(s, _)| s),
+            Some(PageSize::Custom {
+                width: 500,
+                height: 700
+            })
+        );
 
         call(
             &mut a,

@@ -492,7 +492,8 @@ impl Doc {
         &Obj::Null
     }
 
-    /// Pages in document order with their inherited resources and media box.
+    /// Pages in document order with their inherited resources and media box. A rotation set
+    /// only on a parent `/Pages` node is put into the page's dictionary.
     fn pages(&self) -> Vec<(BTreeMap<String, Obj>, Obj, [f64; 4])> {
         let root = self.objs.values().find(|o| {
             matches!(
@@ -502,7 +503,7 @@ impl Doc {
         });
         let mut out = Vec::new();
         if let Some(pages) = root.and_then(|r| r.dict()).and_then(|d| d.get("Pages")) {
-            self.walk(self.get(pages), None, None, &mut out, 0);
+            self.walk(self.get(pages), None, None, None, &mut out, 0);
         }
         if out.is_empty() {
             // Damaged tree: fall back to every page object in object order.
@@ -537,6 +538,7 @@ impl Doc {
         node: &Obj,
         res: Option<&Obj>,
         mb: Option<[f64; 4]>,
+        rotate: Option<&Obj>,
         out: &mut Vec<(BTreeMap<String, Obj>, Obj, [f64; 4])>,
         depth: usize,
     ) {
@@ -546,16 +548,23 @@ impl Doc {
         let Some(d) = node.dict() else { return };
         let res = d.get("Resources").map(|r| self.get(r)).or(res);
         let mb = self.media_box(d.get("MediaBox")).or(mb);
+        let rotate = d.get("Rotate").map(|r| self.get(r)).or(rotate);
         match d.get("Type").and_then(Obj::name) {
-            Some("Page") => out.push((
-                d.clone(),
-                res.cloned().unwrap_or(Obj::Null),
-                mb.unwrap_or([0.0, 0.0, 595.0, 842.0]),
-            )),
+            Some("Page") => {
+                let mut page = d.clone();
+                if let Some(r) = rotate {
+                    page.insert("Rotate".into(), r.clone());
+                }
+                out.push((
+                    page,
+                    res.cloned().unwrap_or(Obj::Null),
+                    mb.unwrap_or([0.0, 0.0, 595.0, 842.0]),
+                ));
+            }
             _ => {
                 if let Some(Obj::Array(kids)) = d.get("Kids").map(|k| self.get(k)) {
                     for k in kids {
-                        self.walk(self.get(k), res, mb, out, depth + 1);
+                        self.walk(self.get(k), res, mb, rotate, out, depth + 1);
                     }
                 }
             }
@@ -1583,6 +1592,25 @@ mod tests {
             (a.y - 0.0).abs() < 0.01 && (e.y - 100.0 * 25.4 / 72.0).abs() < 0.01,
             "{a:?} {e:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rotation_set_on_the_page_tree_turns_its_pages() -> Result<()> {
+        let doc = |page_rotate: &str| {
+            let mut b = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 90 >>\nendobj\n".to_vec();
+            b.extend_from_slice(
+                format!("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] {page_rotate} /Contents 4 0 R >>\nendobj\n").as_bytes(),
+            );
+            b.extend_from_slice(b"4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n%%EOF\n");
+            b
+        };
+        // Inherited from the parent: shown landscape.
+        let p = pages(&doc(""))?;
+        assert!((p[0].size_mm.0 - 297.0).abs() < 0.5, "{:?}", p[0].size_mm);
+        // The page's own rotation wins.
+        let p = pages(&doc("/Rotate 0"))?;
+        assert!((p[0].size_mm.0 - 210.0).abs() < 0.5, "{:?}", p[0].size_mm);
         Ok(())
     }
 

@@ -556,6 +556,12 @@ fn a_logo_keeps_its_proportions_in_its_box() {
     let page = Page::new("p", "1", "x");
     let (a, b) = title_logo_box(&Project::new("x"), &page).unwrap();
     assert!(a.x < b.x && a.y < b.y && b.x < 420.0 && b.y < 297.0);
+    // A logo box narrowed below its padding still has room for the logo.
+    let mut project = Project::new("x");
+    let logo = project.meta.template.boxes.iter_mut().find(|b| b.logo).unwrap();
+    logo.left = logo.right + 1.5;
+    let (a, b) = title_logo_box(&project, &page).unwrap();
+    assert!(a.x < b.x && a.y < b.y, "{a:?} {b:?}");
 }
 
 #[test]
@@ -1171,6 +1177,7 @@ fn portrait_large_and_custom_sheets_export_at_their_size() {
         assert!(text.contains(&media), "{size:?}: {media}");
     }
     let (pages, _) = page_drawings(&project, &symbols, &Options::default());
+    assert_eq!(pages.len(), sizes.len(), "every sheet has its drawing");
     for (page, size) in pages.iter().zip(sizes) {
         assert_eq!(page.size_mm, size.mm());
         let (w, h) = size.mm();

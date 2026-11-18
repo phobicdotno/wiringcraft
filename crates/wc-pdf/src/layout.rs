@@ -504,7 +504,11 @@ pub fn title_logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
         .boxes_on(x0, x1, band)
         .into_iter()
         .filter(|(b, _)| b.logo)
-        .map(|(_, (l, t, r, b))| (Point::new(l + 1.0, ty + t + 1.0), Point::new(r - 1.0, ty + b - 1.0)))
+        .map(|(_, (l, t, r, b))| {
+            // 1 mm of padding, less in a box narrowed below 4 mm, so the logo keeps an area.
+            let (ix, iy) = (((r - l) / 4.0).min(1.0), ((b - t) / 4.0).min(1.0));
+            (Point::new(l + ix, ty + t + iy), Point::new(r - ix, ty + b - iy))
+        })
         .filter(|(a, b)| a.x < b.x && a.y < b.y)
         .collect()
 }
