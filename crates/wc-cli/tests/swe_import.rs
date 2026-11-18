@@ -33,8 +33,9 @@ CREATE TABLE tew_wire (wir_id INTEGER, wir_cab_id INTEGER, wir_caw_no INTEGER, w
 CREATE TABLE tew_linewirepair (lwp_lin_id INTEGER, lwp_wir_id INTEGER, lwp_wir_orderno INTEGER);
 ";
 
-/// A project database with one schematic page: strip X1 with terminals 2 and 9, and a jumper
-/// between them recorded in the terminal strip editor (a wire record no line carries).
+/// A project database with one schematic page: strip X1 with terminals 2 and 9, a drawn
+/// connection between them (wire 91 on line 80), and a jumper between them recorded in the
+/// terminal strip editor (wire 90, which no line carries).
 fn database(path: &Path) -> TestResult {
     let c = rusqlite::Connection::open(path)?;
     c.execute_batch(SCHEMA)?;
@@ -51,7 +52,9 @@ INSERT INTO tew_symbolpt VALUES (20, 0, 0, 0, 5), (20, 0, 1, 0, -5), (21, 0, 0, 
 INSERT INTO tew_componentelement VALUES (60, 20, 0, 201, 0), (61, 21, 0, 202, 0);
 INSERT INTO tew_componentterminal VALUES (60, 0, NULL), (60, 1, NULL), (61, 0, NULL), (61, 1, NULL);
 INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
-  VALUES (90, NULL, -1, '', 60, 0, 61, 1);
+  VALUES (90, NULL, -1, '', 60, 0, 61, 1), (91, NULL, -1, '', 60, 1, 61, 0);
+INSERT INTO tew_line VALUES (80, 10, 150, 195, 170, 205, NULL);
+INSERT INTO tew_linewirepair VALUES (80, 91, 0);
 ",
     )?;
     Ok(())
@@ -65,21 +68,21 @@ fn run(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> 
         .args(args)
         .output()?;
     if !out.status.success() {
-        return Err(String::from_utf8(out.stderr)?.into());
+        return Err(format!("{}: {}", out.status, String::from_utf8_lossy(&out.stderr)).into());
     }
     Ok(String::from_utf8(out.stdout)?)
 }
 
-/// The jumpers' terminal sets, each sorted, in order.
-fn jumper_sets(p: &wc_core::Project) -> Vec<Vec<String>> {
-    let mut sets: Vec<Vec<String>> = p
+/// The jumpers' strips and terminal sets, each set sorted, in order.
+fn jumper_sets(p: &wc_core::Project) -> Vec<(String, Vec<String>)> {
+    let mut sets: Vec<(String, Vec<String>)> = p
         .meta
         .jumpers
         .iter()
         .map(|j| {
             let mut t = j.terminals.clone();
             t.sort();
-            t
+            (j.strip.to_string(), t)
         })
         .collect();
     sets.sort();
@@ -140,7 +143,11 @@ fn an_imported_jumper_stays_on_the_sources_terminals_when_the_import_renumbers_t
     // Saved as the command left it: the project's jumper follows its terminals, the imported
     // one stays on the source's.
     let p = store::load(&dir)?;
-    assert_eq!(jumper_sets(&p), [vec!["10", "11"], vec!["2", "9"]]);
+    let set = |terminals: [&str; 2]| ("-X1".to_owned(), terminals.map(str::to_owned).to_vec());
+    assert_eq!(jumper_sets(&p), [set(["10", "11"]), set(["2", "9"])]);
+    // The drawn connection is imported as a wire; the jumper's record is not.
+    let wires: usize = p.pages.iter().map(|pg| pg.wires.len()).sum();
+    assert_eq!(wires, 1, "{:?}", p.pages.iter().map(|pg| &pg.wires).collect::<Vec<_>>());
 
     // And the WAGO configurator list built from the saved project says the same.
     let csv = tmp.path().join("wago.csv");
@@ -150,8 +157,12 @@ fn an_imported_jumper_stays_on_the_sources_terminals_when_the_import_renumbers_t
         .lines()
         .map(|l| l.split(';').collect::<Vec<_>>())
         .filter(|r| r.get(1) == Some(&"Jumper"))
-        .filter_map(|r| r.get(14).map(|s| (*s).to_owned()))
-        .collect();
+        .map(|r| {
+            r.get(14)
+                .map(|s| (*s).to_owned())
+                .ok_or(format!("a jumper row without its connections: {r:?}"))
+        })
+        .collect::<Result<_, _>>()?;
     connects.sort();
     assert_eq!(connects, ["10, 11", "2, 9"], "{csv}");
     Ok(())
