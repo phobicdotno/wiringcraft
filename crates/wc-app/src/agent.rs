@@ -806,13 +806,9 @@ impl Open {
         Ok(self.project.rename_device(from, to))
     }
 
-    /// Make every symbol a page uses available in the project.
+    /// Make every symbol a page uses available in the project, or none of them.
     fn ensure_page_symbols(&mut self, page: &Page) -> Result<(), String> {
-        let ids: Vec<String> = page.symbols.iter().map(|s| s.symbol.clone()).collect();
-        for id in ids {
-            self.ensure_symbol(&id).map_err(|e| format!("symbol {id}: {e}"))?;
-        }
-        Ok(())
+        self.ensure_symbols(page.symbols.iter().map(|s| s.symbol.as_str()))
     }
 }
 
@@ -1245,7 +1241,7 @@ impl App {
                     (Some(x), Some(y)) => Point::new(x, y),
                     _ => clip.anchor + Point::new(10.0, 10.0),
                 };
-                let new = open.paste(to, &clip, at);
+                let new = open.paste(to, &clip, at)?;
                 let ids: Vec<String> = new.iter().map(selection_id).collect();
                 Ok(format!("Pasted as {}.", ids.join(", ")))
             }
