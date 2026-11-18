@@ -27,6 +27,7 @@ use wc_core::geom::{Point, Shape};
 
 use super::bits::{Bits, modular_char, modular_short};
 use super::classes::{Class, read_classes};
+use super::codepage::Decoding;
 use super::{Sections, Version, bad, read_sections};
 use crate::Result;
 use crate::dxf::{self, Entity};
@@ -65,6 +66,8 @@ pub struct Drawing {
     /// then why base points counted under [`BASE_UNREAD`] could not be read, for the first
     /// [`MAX_REASONS`] of them.
     pub damaged: Vec<String>,
+    /// Notes about the file as a whole, such as a code page its texts cannot be decoded in.
+    pub warnings: Vec<String>,
 }
 
 /// The most reasons [`Drawing::damaged`] keeps.
@@ -81,6 +84,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
         drawing: d,
         mut skipped,
         damaged,
+        warnings,
     } = dxf_drawing(sections)?;
     // One budget for model space and every block, so nested blocks cannot multiply the work.
     let mut budget = dxf::MAX_DRAWN;
@@ -108,6 +112,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
         model_points,
         skipped,
         damaged,
+        warnings,
     })
 }
 
@@ -116,6 +121,8 @@ pub(crate) struct Read {
     pub(crate) drawing: dxf::Drawing,
     pub(crate) skipped: BTreeMap<String, usize>,
     pub(crate) damaged: Vec<String>,
+    /// Notes about the file as a whole (an unknown code page).
+    pub(crate) warnings: Vec<String>,
 }
 
 /// The entities of a DWG file as the DXF reader's entities, by block and model space, with a
@@ -141,6 +148,17 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
             HashMap::new()
         }),
     };
+    // 2004 texts are in the drawing's code page; one this reader does not know is read as
+    // before (UTF-8 or Windows-1252) and said.
+    let (decoding, known) = Decoding::of(sections.codepage);
+    let mut warnings = Vec::new();
+    if sections.version == Version::R2004 && !known {
+        warnings.push(format!(
+            "its texts are in {}, which is not supported: read with the legacy decoder (UTF-8 \
+             when they are, else byte for byte as Latin-1)",
+            Decoding::name(sections.codepage)
+        ));
+    }
     for (handle, at) in map {
         if let Err(e) = decode(
             objects,
@@ -148,6 +166,7 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
             handle,
             sections.version,
             &classes,
+            decoding,
             &mut decoded,
             &mut skipped,
         ) {
@@ -167,6 +186,7 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
         drawing: decoded.assemble(&mut skipped),
         skipped,
         damaged,
+        warnings,
     })
 }
 
@@ -221,6 +241,8 @@ pub(crate) fn object_map(data: &[u8]) -> Result<Vec<(u64, usize)>> {
 /// One object's streams, after its type and own handle are read.
 struct Object<'a> {
     version: Version,
+    /// How its 2004 texts are decoded.
+    decoding: Decoding,
     kind: u16,
     handle: u64,
     data: Bits<'a>,
@@ -232,7 +254,7 @@ impl Object<'_> {
     /// TV: a text, from the data stream (2004) or the string stream (2010).
     fn text(&mut self) -> Result<String> {
         match self.version {
-            Version::R2004 => self.data.t8(),
+            Version::R2004 => Ok(self.decoding.decode(&self.data.t8_bytes()?)),
             Version::R2010 => self
                 .strings
                 .as_mut()
@@ -259,7 +281,7 @@ impl Object<'_> {
 }
 
 /// Split the object at `at` of the objects section into its streams.
-fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
+fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Result<Object<'_>> {
     let rest = objects.get(at..).ok_or_else(|| bad("an object is past the end"))?;
     let (size, n) = modular_short(rest)?;
     let mut start = at + n;
@@ -302,6 +324,7 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     };
     Ok(Object {
         version,
+        decoding,
         kind,
         handle,
         data,
@@ -735,10 +758,11 @@ fn decode(
     handle: u64,
     version: Version,
     classes: &HashMap<u16, Class>,
+    decoding: Decoding,
     out: &mut Decoded,
     skipped: &mut BTreeMap<String, usize>,
 ) -> Result<()> {
-    let mut o = object(objects, at, version)?;
+    let mut o = object(objects, at, version, decoding)?;
     if o.handle != handle {
         return Err(bad("an object's handle differs from the object map"));
     }

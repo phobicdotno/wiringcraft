@@ -124,9 +124,9 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
                 }
                 None if r2010 => return Err(bad("its texts are missing")),
                 None => {
-                    d.t8()?;
-                    d.t8()?;
-                    d.t8()?
+                    crate::csv::decode(&d.t8_bytes()?);
+                    crate::csv::decode(&d.t8_bytes()?);
+                    crate::csv::decode(&d.t8_bytes()?)
                 }
             };
             d.b()?;

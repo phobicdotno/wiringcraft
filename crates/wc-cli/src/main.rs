@@ -2632,8 +2632,10 @@ struct WagoImported {
 
 /// Write the articles of a configured WAGO configurator list onto the project in `dir` (see
 /// [`wc_import::wago`]). Articles are looked up among the project's own parts first, then its
-/// libraries; a library part that is used is taken into the project. Nothing is saved when
-/// nothing changes.
+/// libraries; a library part that is used is taken into the project. A part the project uses
+/// without a pin, named by a row or not, is pinned too: the lock is written for that, and a
+/// missing copy is written from the library when one has the part; the assignment files are
+/// left alone. Nothing else is saved when no row changes.
 fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
     let (rows, mut warnings) = wc_import::wago::read_configured(&bytes).map_err(e)?;
@@ -2656,12 +2658,8 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     let mut unmatched = plan.unmatched.clone();
     let mut taken = plan.clone();
     for id in plan.parts() {
-        // A locked part is only ever planned when its copy was read.
-        if candidates.project.contains_key(id) {
-            continue;
-        }
-        // Taken from the library it was read from: another library that cannot be opened
-        // does not stop it.
+        // Pinned as it is when the project has a copy; else taken from the library it was read
+        // from: another library that cannot be opened does not stop it.
         if let Err(why) = candidates.take(dir, &mut p, id) {
             // Its rows are listed, not written with a part the project cannot hold.
             for a in plan.assignments.iter().filter(|a| a.part == id) {
@@ -2674,6 +2672,29 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
         }
     }
     let changed = wc_import::wago::apply(&mut p, &taken);
+    // A part a device or jumper already uses without a pin (left by an import whose lock write
+    // failed before the lock went first) is pinned now: its copy as it is, or the library's
+    // when the project has none. One no library has and the project has no copy of is left to
+    // `lib lock` to report.
+    let mut repaired = 0;
+    for id in p.used_parts() {
+        let known = candidates.project.contains_key(&id)
+            || candidates.unreadable.contains_key(&id)
+            || candidates.library.contains_key(&id);
+        if p.lock.parts.contains_key(&id) || !known {
+            continue;
+        }
+        match candidates.take(dir, &mut p, &id) {
+            Ok(()) => repaired += 1,
+            Err(why) => warnings.push(format!("part {id} is used without a pin and cannot be pinned: {why}")),
+        }
+    }
+    // The pins first: if a later write fails, a repeat import still finds the part unassigned
+    // and saves again, instead of leaving it assigned without a pin. Only pins changed: the
+    // other files are left alone.
+    if changed > 0 || repaired > 0 {
+        store::save_lock(dir, &p).map_err(e)?;
+    }
     if changed > 0 {
         save(dir, &p)?;
     }
@@ -4691,6 +4712,84 @@ mod tests {
     }
 
     #[test]
+    fn a_wago_import_whose_lock_write_fails_pins_the_part_on_the_next_try() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = wago_project(tmp.path(), &[part("wago.2002-1201", "WAGO", "2002-1201")]);
+        fill_wago_list(&out, "2002-1201", "");
+        let names = [store::PROJECT_FILE, store::DEVICES_FILE, store::LOCK_FILE];
+        let files = |d: &Path| names.map(|f| std::fs::read(d.join(f)).ok());
+        let times = |d: &Path| names.map(|f| std::fs::metadata(d.join(f)).and_then(|m| m.modified()).ok());
+        let before = files(&dir);
+        // The lock's write goes through library.lock.tmp: a folder there makes it fail.
+        let blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&blocker).unwrap();
+        let err = import_wago(&dir, &out).err().unwrap_or_default();
+        assert!(err.contains("library.lock"), "{err}");
+        assert_eq!(files(&dir), before, "the assignment is not written before its pin");
+        std::fs::remove_dir(&blocker).unwrap();
+        let done = run_import_wago(&dir, &out);
+        assert_eq!(done.changed, 1, "{:?}", done.unmatched);
+        let p = load(&dir).unwrap();
+        let x11 = wc_core::DeviceTag::parse("-X1.1").unwrap();
+        assert_eq!(
+            p.devices.get(&x11).and_then(|d| d.part.as_deref()),
+            Some("wago.2002-1201")
+        );
+        assert!(p.lock.parts.contains_key("wago.2002-1201"), "pinned");
+        // A repeat import of the pinned part writes nothing.
+        let saved = times(&dir);
+        let again = run_import_wago(&dir, &out);
+        assert_eq!((again.changed, again.unchanged), (0, 1));
+        assert_eq!(times(&dir), saved, "no file written again");
+
+        // A project left by the old order (assigned, pin missing) is repaired by a re-import,
+        // pinning its own copy as it is although the library has another version by now, and
+        // writing nothing but the lock.
+        let mut p = load(&dir).unwrap();
+        p.lock.parts.remove("wago.2002-1201");
+        save(&dir, &p).unwrap();
+        let mut newer = part("wago.2002-1201", "WAGO", "2002-1201");
+        newer.description = "Changed in the library".into();
+        wc_library::write_part(&tmp.path().join("lib"), &newer).unwrap();
+        let copy_file = store::vendor_path(&dir, ItemKind::Part, "wago.2002-1201").unwrap();
+        let copy = std::fs::read(&copy_file).unwrap();
+        // A full save would rewrite devices.json written by hand like this, and its write fails.
+        let devices_file = dir.join(store::DEVICES_FILE);
+        let by_hand = format!("{}\n\n", std::fs::read_to_string(&devices_file).unwrap().trim_end());
+        std::fs::write(&devices_file, &by_hand).unwrap();
+        let devices_tmp = dir.join(format!("{}.tmp", store::DEVICES_FILE));
+        std::fs::create_dir(&devices_tmp).unwrap();
+        let devices = std::fs::metadata(&devices_file).unwrap().modified().unwrap();
+        let again = run_import_wago(&dir, &out);
+        assert_eq!(std::fs::read_to_string(&devices_file).unwrap(), by_hand);
+        std::fs::remove_dir(&devices_tmp).unwrap();
+        assert_eq!(again.changed, 0, "{:?}", again.unmatched);
+        assert_eq!(std::fs::read(&copy_file).unwrap(), copy, "the copy is kept");
+        assert_eq!(
+            load(&dir)
+                .unwrap()
+                .lock
+                .parts
+                .get("wago.2002-1201")
+                .map(|e| e.hash.clone()),
+            Some(store::read_vendored_part(&dir, "wago.2002-1201").unwrap().hash()),
+            "pinned again, to its own copy"
+        );
+        assert_ne!(
+            store::read_vendored_part(&dir, "wago.2002-1201").unwrap().hash(),
+            newer.hash()
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join(store::DEVICES_FILE))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            devices,
+            "only the lock is written"
+        );
+    }
+
+    #[test]
     fn a_wago_article_several_parts_have_stays_unmatched_after_one_of_them_is_taken() {
         let tmp = tempfile::tempdir().unwrap();
         let (dir, out) = wago_project(tmp.path(), &[part("dup.a", "", "DUP-1"), part("dup.b", "", "DUP-1")]);
@@ -4704,6 +4803,63 @@ mod tests {
         let again = run_import_wago(&dir, &out);
         assert_eq!((again.changed, again.unchanged), (0, 1), "{:?}", again.unmatched);
         assert_eq!(again.unmatched, first.unmatched);
+    }
+
+    #[test]
+    fn a_used_part_whose_copy_cannot_be_read_is_not_pinned_or_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = wago_project(tmp.path(), &[part("wago.2002-1201", "WAGO", "2002-1201")]);
+        fill_wago_list(&out, "2002-1201", "");
+        assert_eq!(run_import_wago(&dir, &out).changed, 1);
+        let mut p = load(&dir).unwrap();
+        p.lock.parts.remove("wago.2002-1201");
+        save(&dir, &p).unwrap();
+        let copy_file = store::vendor_path(&dir, ItemKind::Part, "wago.2002-1201").unwrap();
+        std::fs::write(&copy_file, "{ not json").unwrap();
+        let done = run_import_wago(&dir, &out);
+        assert_eq!(
+            std::fs::read_to_string(&copy_file).unwrap(),
+            "{ not json",
+            "the file stays"
+        );
+        assert!(!load(&dir).unwrap().lock.parts.contains_key("wago.2002-1201"), "no pin");
+        assert!(
+            done.warnings
+                .iter()
+                .any(|w| w.contains("wago.2002-1201") && w.contains("cannot be read") && w.contains("line 1")),
+            "{:?}",
+            done.warnings
+        );
+
+        // A link to nothing is there, not absent: the library part does not replace it.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&copy_file).unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("gone.json"), &copy_file).unwrap();
+            let done = run_import_wago(&dir, &out);
+            assert!(std::fs::symlink_metadata(&copy_file).unwrap().file_type().is_symlink());
+            assert!(!load(&dir).unwrap().lock.parts.contains_key("wago.2002-1201"));
+            assert!(
+                done.warnings
+                    .iter()
+                    .any(|w| w.contains("wago.2002-1201") && w.contains("cannot be read")),
+                "{:?}",
+                done.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_no_library_has_and_nothing_uses_does_not_hide_a_library_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = wago_project(tmp.path(), &[part("current.b", "WAGO", "2002-1201")]);
+        store::write_vendored_part(&dir, &part("old.a", "WAGO", "2002-1201")).unwrap();
+        fill_wago_list(&out, "2002-1201", "");
+        let done = run_import_wago(&dir, &out);
+        assert_eq!(done.changed, 1, "{:?}", done.unmatched);
+        let p = load(&dir).unwrap();
+        let x11 = wc_core::DeviceTag::parse("-X1.1").unwrap();
+        assert_eq!(p.devices.get(&x11).and_then(|d| d.part.as_deref()), Some("current.b"));
     }
 
     fn run_import_wago(dir: &Path, file: &Path) -> WagoImported {
