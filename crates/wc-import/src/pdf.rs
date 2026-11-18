@@ -938,17 +938,33 @@ impl Interp<'_> {
                 "pictures with {channels} colour channel(s) at {bits} bit(s) are not supported yet"
             ));
         }
-        // Decode [1 0] swaps black and white; an image mask paints its 0 samples by default. With
-        // several colour channels, every channel must be swapped or none.
+        // Decode [1 0] swaps black and white; an image mask paints its 0 samples by default. Only
+        // one pair per channel is read, each [0 1] or [1 0], and every channel must use the same.
         let decode_inverted = match get("Decode") {
             Some(Obj::Array(a)) => {
-                let starts: Vec<Option<f64>> = a.iter().step_by(2).map(Obj::num).collect();
-                if channels > 1 && starts.windows(2).any(|w| w.first() != w.get(1)) {
-                    return Err(
-                        "pictures that map their colour channels differently (Decode) are not supported yet".into(),
-                    );
+                let kinds: Vec<Option<bool>> = a
+                    .chunks(2)
+                    .map(
+                        |pair| match (pair.first().and_then(Obj::num), pair.get(1).and_then(Obj::num)) {
+                            (Some(0.0), Some(1.0)) => Some(false),
+                            (Some(1.0), Some(0.0)) => Some(true),
+                            _ => None,
+                        },
+                    )
+                    .collect();
+                match kinds.first() {
+                    Some(&Some(inverted))
+                        if kinds.len() == usize::from(channels) && kinds.iter().all(|k| *k == Some(inverted)) =>
+                    {
+                        inverted
+                    }
+                    _ => {
+                        return Err(
+                            "pictures that map their colour channels in other ways (Decode) are not supported yet"
+                                .into(),
+                        );
+                    }
                 }
-                starts.first().copied().flatten() == Some(1.0)
             }
             _ => false,
         };
@@ -1790,6 +1806,27 @@ mod tests {
             full,
         ))?;
         assert!(p[0].scan_problem.as_deref().is_some_and(|m| m.contains("Decode")));
+        // A Decode array that only narrows the range, or has too few pairs, is refused too.
+        for decode in ["[0 0.5 0 1 0 1 0 1]", "[1 0]"] {
+            let p = pages(&picture_pdf(
+                0,
+                &format!("/Width 3 /Height 1 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Decode {decode}"),
+                &cmyk,
+                full,
+            ))?;
+            assert!(
+                p[0].scan_problem.as_deref().is_some_and(|m| m.contains("Decode")),
+                "{decode}"
+            );
+        }
+        // Swapping all four inks is read.
+        let p = pages(&picture_pdf(
+            0,
+            "/Width 3 /Height 1 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Decode [1 0 1 0 1 0 1 0]",
+            &cmyk,
+            full,
+        ))?;
+        assert!(p[0].scan.is_some());
         Ok(())
     }
 
