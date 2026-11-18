@@ -939,25 +939,29 @@ fn an_object_map_needs_its_crc_and_its_end() -> TestResult {
         &[0, 4, 1, 4, 0],
         &[0, 4, 1, 4, 0, 0],
         &[0, 4, 1, 4, 0, 0, 0],
+        &[0, 4, 1, 4, 0, 0, 0, 2],
+        &[0, 4, 1, 4, 0, 0, 0, 2, 0],
+        &[0, 2],
+        &[0, 2, 0],
     ] {
         assert!(object_map(cut).is_err(), "{cut:?}");
     }
     assert!(object_map(&[0, 1]).is_err(), "a part too short to hold its size");
-    assert_eq!(object_map(&[0, 4, 1, 4, 0, 0, 0, 2])?, [(1, 4)]);
-    assert!(object_map(&[0, 2])?.is_empty());
+    assert_eq!(object_map(&[0, 4, 1, 4, 0, 0, 0, 2, 0, 0])?, [(1, 4)]);
+    assert!(object_map(&[0, 2, 0, 0])?.is_empty());
     Ok(())
 }
 
 #[test]
 fn a_handle_listed_twice_is_refused_even_across_parts() {
     // Handle 1 at 4, then in a second part handle 1 again.
-    let map = [0u8, 4, 1, 4, 0, 0, 0, 4, 1, 8, 0, 0, 0, 2];
+    let map = [0u8, 4, 1, 4, 0, 0, 0, 4, 1, 8, 0, 0, 0, 2, 0, 0];
     assert!(object_map(&map).is_err_and(|e| e.to_string().contains("listed twice")));
     // The same within one part: a handle step of zero.
-    let map = [0u8, 6, 1, 4, 0, 4, 0, 0, 0, 2];
+    let map = [0u8, 6, 1, 4, 0, 4, 0, 0, 0, 2, 0, 0];
     assert!(object_map(&map).is_err());
     // Different handles across parts are fine.
-    let map = [0u8, 4, 1, 4, 0, 0, 0, 4, 2, 8, 0, 0, 0, 2];
+    let map = [0u8, 4, 1, 4, 0, 0, 0, 4, 2, 8, 0, 0, 0, 2, 0, 0];
     assert_eq!(object_map(&map).ok(), Some(vec![(1, 4), (2, 8)]));
 }
 

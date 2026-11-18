@@ -140,11 +140,12 @@ pub(crate) fn object_map(data: &[u8]) -> Result<Vec<(u64, usize)>> {
     let mut pos = 0usize;
     let cut = || bad("the object map is cut off");
     // Each part is a big-endian size (counting the size itself), pairs of handle and offset
-    // changes, and a two-byte CRC. A part of size 2 ends the map.
+    // changes, and a two-byte CRC. A part of size 2 (no entries, still with its CRC) ends the map.
     loop {
         let head = data.get(pos..pos + 2).ok_or_else(cut)?;
         let size = usize::from(u16::from_be_bytes([head[0], head[1]]));
         if size == 2 {
+            data.get(pos + 2..pos + 4).ok_or_else(cut)?;
             break;
         }
         if size < 2 {
