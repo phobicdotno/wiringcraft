@@ -1718,6 +1718,40 @@ mod tests {
     }
 
     #[test]
+    fn enter_ends_a_polyline_through_the_canvas_with_the_pointer_away() {
+        let (_tmp, mut open) = project();
+        let page_id = open.project.pages[0].id.clone();
+        let mut ed = Editor {
+            tool: Tool::Polyline,
+            shape_points: vec![Point::new(10.0, 10.0), Point::new(30.0, 10.0)],
+            shape_page: Some(page_id),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut frame = |open: &mut Open, ed: &mut Editor| {
+            // No pointer over the canvas at all.
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, false, 1.0));
+            });
+        };
+        frame(&mut open, &mut ed);
+        assert_eq!(ed.shape_points.len(), 2, "nothing happens without Enter");
+        // The keyboard shortcut sets the flag (not while a dialog or text field has the keys).
+        ed.finish_shape = true;
+        frame(&mut open, &mut ed);
+        assert!(ed.shape_points.is_empty() && !ed.finish_shape);
+        assert!(matches!(
+            &open.project.pages[0].graphics[..],
+            [Shape::Polyline { points, .. }] if points.len() == 2
+        ));
+    }
+
+    #[test]
     fn an_arc_ending_on_its_centre_keeps_its_first_clicks() {
         let (_tmp, mut open) = project();
         let mut ed = Editor {
