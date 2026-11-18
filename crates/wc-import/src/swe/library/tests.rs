@@ -425,3 +425,72 @@ INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (1, 2, 'A2', 0, -5), (2, 1, '
             .all(|s| matches!(s.graphics[..], [Shape::Rect { .. }]))
     );
 }
+
+#[test]
+fn block_drawing_limits_and_unread_entities_are_reported() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    let app = db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Lamp', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (2, 1, 'X1', 0, 5);
+");
+    let mut d = SweDrawings::default();
+    d.add_block(
+        "Coil",
+        &model_space_dwg(&[E::Line((0.0, 0.0), (0.0, 5.0)), E::Line((1.0, 0.0), (1.0, 5.0))]),
+    )
+    .unwrap();
+    d.add_block("Lamp", &model_space_dwg(&[E::Circle((0.0, 0.0), 3.0)]))
+        .unwrap();
+    // One entity left: the coil is drawn in part and the lamp is a box.
+    d.set_draw_limit(1);
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let symbols = read_blocks(&app, Some(&d), &mut report, &mut warnings).unwrap();
+    assert_eq!(symbols[0].graphics.len(), 1, "{:?}", symbols[0].graphics);
+    assert_eq!((report.blocks_out, report.blocks_drawn), (2, 1));
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("1 symbol block(s) are drawn only in part")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.starts_with("1 symbol block(s) are boxes")),
+        "{warnings:?}"
+    );
+
+    // Everything fits: no limit warning.
+    d.set_draw_limit(100);
+    let mut warnings = Vec::new();
+    read_blocks(&app, Some(&d), &mut report, &mut warnings).unwrap();
+    assert_eq!(report.blocks_drawn, 2);
+    assert!(!warnings.iter().any(|w| w.contains("entity limit")), "{warnings:?}");
+
+    // A report used again for blocks that give nothing counts nothing drawn, and never underflows.
+    let empty = db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+");
+    read_blocks(&empty, Some(&d), &mut report, &mut Vec::new()).unwrap();
+    assert_eq!((report.blocks_out, report.blocks_drawn), (0, 0));
+    assert!(report.lines()[2].contains("0 drawn from their DWG file, 0 as boxes"));
+    read_blocks(
+        &db("CREATE TABLE x (a INTEGER);"),
+        Some(&d),
+        &mut report,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(report.blocks_drawn, 0);
+
+    // Entities the DWG reader skipped are named; damaged objects are not repeated.
+    d.skipped.insert("SPLINE".into(), 3);
+    d.skipped.insert(crate::dwg::objects::DAMAGED.into(), 1);
+    let w = read_warnings(&d);
+    assert!(
+        w.iter().any(|w| w == "block drawings: entities not read (SPLINE: 3)"),
+        "{w:?}"
+    );
+    assert!(!w.iter().any(|w| w.contains("damaged")), "{w:?}");
+}

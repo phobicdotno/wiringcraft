@@ -110,7 +110,7 @@ impl LibraryReport {
                 self.blocks_in,
                 self.blocks_out,
                 self.blocks_drawn,
-                self.blocks_out - self.blocks_drawn
+                self.blocks_out.saturating_sub(self.blocks_drawn)
             ),
         ]
     }
@@ -565,6 +565,8 @@ pub fn read_blocks(
     report: &mut LibraryReport,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Symbol>> {
+    // The counts are for this call's result, also when the report was used before.
+    (report.blocks_in, report.blocks_out, report.blocks_drawn) = (0, 0, 0);
     let Some(blocks) = Table::open(conn, "tew_block")? else {
         warnings.push("no tew_block table; no symbol blocks were read".into());
         return Ok(Vec::new());
@@ -665,7 +667,9 @@ pub fn read_blocks(
     // One entity budget for every block drawing, like the project import's.
     let mut budget = drawings.map_or(0, SweDrawings::draw_limit);
     let mut not_drawn: BTreeMap<String, usize> = BTreeMap::new();
-    let mut over_budget = 0usize;
+    // Blocks boxed, and blocks drawn only in part, because that budget ran out.
+    let (mut over_budget, mut cut_short) = (0usize, 0usize);
+    let mut drawn_blocks = 0usize;
     for (row, name, description) in rows {
         let Some(points) = pts.remove(&row).filter(|p| !p.is_empty()) else {
             skipped += 1;
@@ -680,16 +684,18 @@ pub fn read_blocks(
             sid = format!("{stem}.{k}");
         }
         let (boxed, pins) = box_symbol(&name, Point::new(0.0, 0.0), None, &points);
-        let over_before = not_drawn.get(crate::dxf::OVER_LIMIT).copied().unwrap_or(0);
-        let graphics = match drawings.and_then(|d| d.block_graphics(&name, &mut budget, &mut not_drawn)) {
+        let over = |n: &BTreeMap<String, usize>| n.get(crate::dxf::OVER_LIMIT).copied().unwrap_or(0);
+        let over_before = over(&not_drawn);
+        let drawn = drawings.and_then(|d| d.block_graphics(&name, &mut budget, &mut not_drawn));
+        let hit_limit = over(&not_drawn) > over_before;
+        let graphics = match drawn {
             Some(drawn) => {
-                report.blocks_drawn += 1;
+                drawn_blocks += 1;
+                cut_short += usize::from(hit_limit);
                 drawn
             }
             None => {
-                if not_drawn.get(crate::dxf::OVER_LIMIT).copied().unwrap_or(0) > over_before {
-                    over_budget += 1;
-                }
+                over_budget += usize::from(hit_limit);
                 boxed
             }
         };
@@ -722,12 +728,18 @@ pub fn read_blocks(
             "{over_budget} symbol block(s) are boxes because the drawings' entity limit was reached"
         ));
     }
+    if cut_short > 0 {
+        warnings.push(format!(
+            "{cut_short} symbol block(s) are drawn only in part because the drawings' entity limit was reached"
+        ));
+    }
     not_drawn.remove(crate::dxf::OVER_LIMIT);
     if !not_drawn.is_empty() {
         let kinds: Vec<String> = not_drawn.iter().map(|(k, n)| format!("{k}: {n}")).collect();
         warnings.push(format!("block drawings: entities not drawn ({})", kinds.join(", ")));
     }
     report.blocks_out = by_id.len();
+    report.blocks_drawn = drawn_blocks;
     Ok(by_id.into_values().collect())
 }
 
@@ -810,6 +822,22 @@ pub fn catalog_from_archive<R: Read + std::io::Seek>(reader: R) -> Result<SweLib
     from_archive_with(reader, false)
 }
 
+/// What reading the block drawings left out: files that could not be read, and entities the DWG
+/// reader does not read, by type (damaged objects are already in the files' warnings).
+fn read_warnings(d: &SweDrawings) -> Vec<String> {
+    let mut out: Vec<String> = d.warnings.iter().map(|w| format!("block drawings: {w}")).collect();
+    let kinds: Vec<String> = d
+        .skipped
+        .iter()
+        .filter(|(k, _)| k.as_str() != crate::dwg::objects::DAMAGED)
+        .map(|(k, n)| format!("{k}: {n}"))
+        .collect();
+    if !kinds.is_empty() {
+        out.push(format!("block drawings: entities not read ({})", kinds.join(", ")));
+    }
+    out
+}
+
 fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<SweLibrary> {
     let mut zip =
         zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
@@ -838,7 +866,7 @@ fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<S
         // No project folder: only the shared library's block files are read.
         match super::drawings_from_archive(reader, "") {
             Ok(d) => {
-                drawing_warnings.extend(d.warnings.iter().map(|w| format!("block drawings: {w}")));
+                drawing_warnings = read_warnings(&d);
                 Some(d)
             }
             Err(e) => {
