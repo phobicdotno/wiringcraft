@@ -41,6 +41,8 @@ use wc_core::project::TITLE_FIELDS;
 enum Dialog {
     /// The folder field, and why the last Browse could not be used.
     OpenPath(prefs::FolderField, Option<String>),
+    /// Save as without a save dialog: the folder for the copy, and why the last try failed.
+    SaveAsPath(prefs::FolderField, Option<String>),
     NewProject {
         /// The folder the project folder goes in.
         location: prefs::FolderField,
@@ -188,6 +190,8 @@ enum Pending {
     Marking(wc_report::MarkingOptions),
     ReportCsv(wc_report::Kind),
     Import(imports::Kind),
+    /// The WAGO configurator's article list to read back.
+    WagoList,
 }
 
 /// The whole-project exports that ask where to go.
@@ -421,6 +425,22 @@ impl App {
         }
     }
 
+    /// Save the open project as a copy in `d` and work on in the copy; the error says why not.
+    fn save_as_to(&mut self, d: &Path) -> Result<(), String> {
+        let Some(open) = self.open.as_mut() else {
+            return Err("No project is open.".into());
+        };
+        let (d, links) = open.save_as(d).map_err(|e| format!("Save as failed:\n{e}"))?;
+        let mut m = format!("Saved as {}; you are working in the copy now.", d.display());
+        if links > 0 {
+            m.push_str(&format!(" {links} link(s) in the project folder were not copied."));
+        }
+        self.ed.message = m;
+        self.prefs.remember(d);
+        self.prefs.save();
+        Ok(())
+    }
+
     /// Show the picker an action asked for, then carry the action out with what was picked.
     fn ask(&mut self, p: Pending) {
         if let Pending::Open = p {
@@ -476,16 +496,18 @@ impl App {
                     &name,
                     None,
                 ) {
-                    Picked::Path(d) => match open.save_as(&d) {
-                        Ok(d) => {
-                            self.ed.message = format!("Saved as {}; you are working in the copy now.", d.display());
-                            self.prefs.remember(d);
-                            self.prefs.save();
+                    Picked::Path(d) => {
+                        if let Err(e) = self.save_as_to(&d) {
+                            self.dialog = Some(Dialog::Message(e));
                         }
-                        Err(e) => self.dialog = Some(Dialog::Message(format!("Save as failed:\n{e}"))),
-                    },
+                    }
+                    // Without a save dialog the folder can be typed.
                     Picked::Failed(e) => {
-                        self.dialog = Some(Dialog::Message(format!("{e}\n\nThe project was not copied.")));
+                        let field = prefs::FolderField::typed(parent.join(&name).display().to_string());
+                        self.dialog = Some(Dialog::SaveAsPath(
+                            field,
+                            Some(format!("{e} Type the folder for the copy.")),
+                        ));
                     }
                     Picked::Cancelled => {}
                 }
@@ -499,6 +521,19 @@ impl App {
                     Picked::Cancelled => return,
                 };
                 self.dialog = Some(Dialog::Message(note + &export_drawings_to(open, &dir)));
+            }
+            Pending::Export(Export::WagoConfigurator) if nothing_for_configurator(open) => {
+                self.dialog = Some(Dialog::Message(export_wago_configurator_to(
+                    open,
+                    &open.dir.join("export"),
+                )));
+            }
+            Pending::Marking(options) if !marking_strip_listed(open, &options) => {
+                self.dialog = Some(Dialog::Message(export_wago_marking_to(
+                    open,
+                    &options,
+                    &open.dir.join("export"),
+                )));
             }
             Pending::Export(kind) => {
                 let (title, default, filter): (&str, PathBuf, (&str, &[&str])) = match kind {
@@ -530,6 +565,27 @@ impl App {
                     return;
                 };
                 self.dialog = Some(Dialog::Message(note + &export_wago_marking_to(open, &options, &path)));
+            }
+            Pending::WagoList => {
+                let file = match pick_open(
+                    "WAGO configurator list with articles",
+                    &open.dir.join("export"),
+                    ("CSV list", &["csv", "txt"]),
+                ) {
+                    Picked::Path(f) => f,
+                    Picked::Failed(e) => {
+                        self.dialog = Some(Dialog::Message(e));
+                        return;
+                    }
+                    Picked::Cancelled => return,
+                };
+                let msg = match std::fs::read(&file) {
+                    Ok(bytes) => open
+                        .import_wago_configured(&bytes)
+                        .unwrap_or_else(|e| format!("Nothing imported: {e}")),
+                    Err(e) => format!("{}: {e}", file.display()),
+                };
+                self.dialog = Some(Dialog::Message(msg));
             }
             Pending::ReportCsv(kind) => {
                 let default = open.dir.join("export").join(format!("{}.csv", kind.name()));
@@ -566,7 +622,7 @@ impl App {
             return;
         }
         let Some(open) = self.open.as_mut() else { return };
-        let file = match pick_file(kind.title(), &open.dir, kind.filter()) {
+        let file = match pick_open(kind.title(), &open.dir, kind.filter()) {
             Picked::Path(f) => f,
             Picked::Failed(e) => {
                 self.dialog = Some(Dialog::Message(format!("{e}\n\nNothing was imported.")));
@@ -765,6 +821,11 @@ impl App {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
                 Err(e) => self.dialog = Some(Dialog::Message(format!("Saving failed:\n{e}"))),
             },
+            Action::SaveAs if self.share.active() => {
+                self.ed.message = "Save as is not available in a shared session: it would end the session. \
+                                   Stop sharing (or leave) first."
+                    .into();
+            }
             Action::SaveAs if self.assistant.command_running() => {
                 self.ed.message = "Saving waits until the assistant's command has finished.".into();
             }
@@ -984,24 +1045,7 @@ impl App {
                 self.dialog = Some(wago_marking_dialog(open, strip));
             }
             Action::ExportWagoConfigurator => self.pending = Some(Pending::Export(Export::WagoConfigurator)),
-            Action::ImportWagoConfigurator => {
-                let mut picker = rfd::FileDialog::new()
-                    .set_title("WAGO configurator list with articles")
-                    .add_filter("CSV list", &["csv", "txt"]);
-                let export = open.dir.join("export");
-                if export.is_dir() {
-                    picker = picker.set_directory(export);
-                }
-                if let Some(file) = picker.pick_file() {
-                    let msg = match std::fs::read(&file) {
-                        Ok(bytes) => open
-                            .import_wago_configured(&bytes)
-                            .unwrap_or_else(|e| format!("Nothing imported: {e}")),
-                        Err(e) => format!("{}: {e}", file.display()),
-                    };
-                    self.dialog = Some(Dialog::Message(msg));
-                }
-            }
+            Action::ImportWagoConfigurator => self.pending = Some(Pending::WagoList),
             Action::NumberWires => {
                 let done = open.number_wires(wc_core::numbering::Rule::PageColumn);
                 self.dialog = Some(Dialog::Message(done.report()));
@@ -1173,6 +1217,7 @@ impl App {
         let mut then: Option<Then> = None;
         let title = match &dialog {
             Dialog::OpenPath(..) => "Open project",
+            Dialog::SaveAsPath(..) => "Save project as",
             Dialog::NewProject { .. } => "New project",
             Dialog::ProjectProps { .. } => "Project properties",
             Dialog::Cover { .. } => "Cover page",
@@ -1389,6 +1434,32 @@ impl App {
                                         let mut prefs = std::mem::take(&mut app.prefs);
                                         app.open_dir(&p, &mut prefs);
                                         app.prefs = prefs;
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::SaveAsPath(path, error) => {
+                    ui.label("Folder for the copy (new, or empty):");
+                    let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(380.0));
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        let go = ui.button("Save as").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
+                        if go {
+                            match path.path() {
+                                Ok(p) => {
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        if let Err(e) = app.save_as_to(&p) {
+                                            app.dialog = Some(Dialog::Message(e));
+                                        }
                                     }));
                                     keep = false;
                                 }
@@ -2378,8 +2449,8 @@ fn pick_folder(title: &str, start: &str) -> Picked {
 /// only files of one kind shown. Blocks the window while open, like any modal dialog.
 fn pick_save(title: &str, dir: &Path, name: &str, filter: Option<(&str, &[&str])>) -> Picked {
     let mut dialog = rfd::FileDialog::new().set_title(title).set_file_name(name);
-    if dir.is_dir() {
-        dialog = dialog.set_directory(dir);
+    if let Some(d) = dir.ancestors().find(|d| !d.as_os_str().is_empty() && d.is_dir()) {
+        dialog = dialog.set_directory(d);
     }
     if let Some((label, extensions)) = filter {
         dialog = dialog.add_filter(label, extensions);
@@ -2390,12 +2461,12 @@ fn pick_save(title: &str, dir: &Path, name: &str, filter: Option<(&str, &[&str])
     picker_outcome(r, shown.elapsed(), &applog::take_picker_errors())
 }
 
-/// The system's file picker for one file of a kind, starting in `dir`. Blocks the window while
-/// open, like any modal dialog.
-fn pick_file(title: &str, dir: &Path, filter: (&str, &[&str])) -> Picked {
+/// The system's file picker for one file of a kind, in `dir` or its nearest existing folder.
+/// Blocks the window while open, like any modal dialog.
+fn pick_open(title: &str, dir: &Path, filter: (&str, &[&str])) -> Picked {
     let mut dialog = rfd::FileDialog::new().set_title(title).add_filter(filter.0, filter.1);
-    if dir.is_dir() {
-        dialog = dialog.set_directory(dir);
+    if let Some(d) = dir.ancestors().find(|d| !d.as_os_str().is_empty() && d.is_dir()) {
+        dialog = dialog.set_directory(d);
     }
     applog::take_picker_errors();
     let shown = std::time::Instant::now();
@@ -2829,7 +2900,31 @@ fn export_wago_configurator(open: &Open) -> String {
     export_wago_configurator_to(open, &open.dir.join("export").join("wago-configurator.csv"))
 }
 
-/// `export_wago_configurator`, to the file `path`.
+/// Whether the project has no terminal strip for the configurator list (the export then says
+/// so without asking where to save).
+fn nothing_for_configurator(open: &Open) -> bool {
+    let inputs = wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    };
+    wc_report::configurator_list(&inputs).table.rows.is_empty()
+}
+
+/// Whether the strip a marker list is limited to (if any) has terminals to list.
+fn marking_strip_listed(open: &Open, options: &wc_report::MarkingOptions) -> bool {
+    let inputs = wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    };
+    options
+        .strip
+        .as_ref()
+        .is_none_or(|s| wc_report::terminal_strips(&inputs).contains(s))
+}
+
+/// The configurator list (as `export_wago_configurator` writes it) to the file `path`.
 fn export_wago_configurator_to(open: &Open, path: &Path) -> String {
     let inputs = wc_report::Inputs {
         project: &open.project,
@@ -2880,7 +2975,7 @@ fn wago_marking_file(open: &Open, options: &wc_report::MarkingOptions) -> PathBu
     open.dir.join("export").join(name)
 }
 
-/// `export_wago_marking`, to the file `path`.
+/// The marker list (as `export_wago_marking` writes it) to the file `path`.
 fn export_wago_marking_to(open: &Open, options: &wc_report::MarkingOptions, path: &Path) -> String {
     let inputs = wc_report::Inputs {
         project: &open.project,

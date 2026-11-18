@@ -95,6 +95,7 @@ For the other areas, the chapter to read in each help is:
 | Dimensions in the editor | yes | yes | partly: kept from imports (drawn by their block), not drawn by hand | later |
 | Find and replace texts, tags and wire numbers across the project | yes | yes | yes: Edit → Find (Ctrl+F), `wiringcraft find` | done (#109) |
 | Macros / window macros (save and insert groups) | yes | yes | yes | done |
+| Open, Save as and export with the system file dialogs | yes | yes | yes: Open (Ctrl+O) and Save as (Ctrl+Shift+S, a copy in a new folder, history included) use the system pickers, and every export asks where to save, starting in `export/` | done (#338) |
 | Macro placeholders and value sets (one macro, several variants) | yes | partly | no | later |
 | Auto-connect pins that line up | yes | yes | yes | done (#51) |
 | Scanned drawing as underlay to trace over | partly | partly | yes | done |
@@ -122,7 +123,7 @@ For the other areas, the chapter to read in each help is:
 | Part (article) database with manufacturer, order number, data | yes | yes (catalog) | yes | done |
 | Several parts on one device (main part plus accessories) | yes | yes | no: one part per device | todo (#106) |
 | Black box / device box for devices without a symbol | yes | yes | partly: imported, not drawable | later |
-| Part data from the maker's data portal | add-on (Data Portal) | yes (content portal) | EDZ part data (macros listed per part, symbol by `--symbol-map`) and BMEcat | done (#144) |
+| Part data from the maker's data portal | add-on (Data Portal) | yes (content portal) | EDZ part data, and macros as symbols with their connection points (multi-line, variant A; or a symbol by `--symbol-map`), and BMEcat | done (#144, #311) |
 | Manufacturer symbol and macro sources | yes | yes | listed in docs | done (#46) |
 
 ## 5. Wires, potentials and connections
@@ -215,7 +216,7 @@ For the other areas, the chapter to read in each help is:
 | PDF export with links and layers | yes | yes | yes | done |
 | DXF / SVG export | yes (DXF/DWG) | yes (DWG/DXF) | yes | done |
 | DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | yes: sampled curves, solid hatches filled | done |
-| DWG read and write | yes | yes | read: AutoCAD 2004 and 2010 drawings, for SolidWorks Electrical symbols and pages; no write | read done (#161, #162, #163); write not planned, DXF covers it |
+| DWG read and write | yes | yes | read: AutoCAD 2004, 2007 and 2010 drawings, for SolidWorks Electrical symbols and pages; no write | read done (#161, #162, #163, #215); write not planned, DXF covers it |
 | Import EPLAN projects | - | yes (some) | yes | done |
 | Import SolidWorks Electrical projects | no | - | yes | done; library parts, cable types and symbol blocks with `import swe-library` (#62); cabinet layouts as panels (#60); symbol and page graphics from the DWG files (#163); follow-ups #61, #108, #149 |
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |

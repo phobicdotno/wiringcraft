@@ -129,11 +129,11 @@ impl WireNumbering {
     }
 }
 
-/// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
-pub(crate) struct Mark {
+/// The project and its undo history, set aside by [`Open::set_aside`] and put back whole by
+/// [`Open::put_back`]: a field added to the history belongs here, so every path that takes a
+/// change back restores it.
+struct Kept {
     project: Project,
-    symbols: std::collections::BTreeSet<String>,
-    parts: std::collections::BTreeSet<String>,
     undo: Vec<Project>,
     redo: Vec<Project>,
     undo_dropped: usize,
@@ -141,6 +141,13 @@ pub(crate) struct Mark {
     form_step: Option<u64>,
     dirty: bool,
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+}
+
+/// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
+pub(crate) struct Mark {
+    kept: Kept,
+    symbols: std::collections::BTreeSet<String>,
+    parts: std::collections::BTreeSet<String>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
 }
@@ -631,18 +638,47 @@ impl Open {
     /// for showing a form on a page someone else holds, where a field that still commits must
     /// leave no trace (no change, no undo step, redo kept, not marked as changed).
     pub(crate) fn without_changes<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let project = self.project.clone();
-        let undo = std::mem::take(&mut self.undo);
-        let redo = std::mem::take(&mut self.redo);
-        let (undo_dropped, history, form_step, dirty) = (self.undo_dropped, self.history, self.form_step, self.dirty);
-        let terminals_before = self.terminals_before.clone();
+        let kept = self.set_aside();
         let r = f(self);
+        self.put_back(kept);
+        r
+    }
+
+    /// The project as it is and its undo history: the undo and redo steps are moved out (the
+    /// history is empty after), the rest copied.
+    fn set_aside(&mut self) -> Kept {
+        Kept {
+            project: self.project.clone(),
+            undo: std::mem::take(&mut self.undo),
+            redo: std::mem::take(&mut self.redo),
+            undo_dropped: self.undo_dropped,
+            history: self.history,
+            form_step: self.form_step,
+            dirty: self.dirty,
+            terminals_before: self.terminals_before.clone(),
+        }
+    }
+
+    /// Back to the project and undo history set aside in `kept`.
+    fn put_back(&mut self, kept: Kept) {
+        let Kept {
+            project,
+            undo,
+            redo,
+            undo_dropped,
+            history,
+            form_step,
+            dirty,
+            terminals_before,
+        } = kept;
         self.project = project;
         self.undo = undo;
         self.redo = redo;
-        (self.undo_dropped, self.history, self.form_step, self.dirty) = (undo_dropped, history, form_step, dirty);
+        self.undo_dropped = undo_dropped;
+        self.history = history;
+        self.form_step = form_step;
+        self.dirty = dirty;
         self.terminals_before = terminals_before;
-        r
     }
 
     /// Take a snapshot before a change, so it can be undone.
@@ -1172,12 +1208,17 @@ impl Open {
     /// Save the project as a copy in `target`, which must not exist yet or be an empty folder,
     /// and go on working in the copy. Everything in the project folder is copied (its history
     /// included), then the changes not saved yet are saved in the copy only, so the original
-    /// stays as it was last saved. Library folders given relative to the project are pointed
-    /// at the same folders from the new place. Returns the folder the copy is in.
-    pub fn save_as(&mut self, target: &Path) -> Result<PathBuf, String> {
+    /// stays as it was last saved. Library folders given relative to the project and lying
+    /// outside it are pointed at the same folders from the new place; the project's own library
+    /// (inside it) is copied and stays the copy's own. Returns the folder the copy is in and how
+    /// many links in the project folder were left out of the copy. When saving in the copy
+    /// fails, the project goes on being worked on in its old folder.
+    pub fn save_as(&mut self, target: &Path) -> Result<(PathBuf, usize), String> {
         let target = crate::prefs::absolute(target)?;
         let from = self.dir.clone();
-        if target.starts_with(&from) {
+        // Compared as the file system resolves them, so another letter case on Windows, a link
+        // or `..` cannot hide that the target is inside the project.
+        if resolved(&target).starts_with(resolved(&from)) {
             return Err(format!(
                 "{} is inside the project folder; pick a place outside it.",
                 target.display()
@@ -1194,17 +1235,37 @@ impl Open {
                 ));
             }
         }
-        copy_dir(&from, &target).map_err(|e| format!("Copying to {} failed: {e}", target.display()))?;
-        for lib in &mut self.project.meta.libraries {
-            if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
-                let at = from.join(&lib.location);
-                lib.location = relative_to(&at, &target).unwrap_or(at).display().to_string();
-                self.dirty = true;
+        let links = copy_dir(&from, &target).map_err(|e| format!("Copying to {} failed: {e}", target.display()))?;
+        // A relative library folder outside the project is the same folder seen from the copy;
+        // one inside it was copied along.
+        let repoint = |libs: &mut Vec<wc_core::project::LibrarySource>| {
+            for lib in libs {
+                if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
+                    let at = lexical(&from.join(&lib.location));
+                    if !at.starts_with(lexical(&from)) {
+                        lib.location = relative_to(&at, &target).unwrap_or(at).display().to_string();
+                    }
+                }
             }
-        }
+        };
+        let (old_libraries, old_dirty) = (self.project.meta.libraries.clone(), self.dirty);
+        repoint(&mut self.project.meta.libraries);
         self.dir = target.clone();
-        self.save()?;
-        Ok(target)
+        if let Err(e) = self.save() {
+            self.dir = from.clone();
+            self.project.meta.libraries = old_libraries;
+            self.dirty = old_dirty;
+            return Err(format!(
+                "{e}\nThe copy in {} is not complete; you are still working in {}.",
+                target.display(),
+                from.display()
+            ));
+        }
+        // Undo and Redo must not bring the old folders back into the copy.
+        for p in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            repoint(&mut p.meta.libraries);
+        }
+        Ok((target, links))
     }
 
     /// Make sure a library symbol is vendored and pinned before it is placed.
@@ -1444,20 +1505,12 @@ impl Open {
     /// The steps set aside still count in [`Open::undo_mark`], so a mark taken in between
     /// (a form opened by the change) stays valid after [`Open::keep`].
     pub(crate) fn mark(&mut self) -> Mark {
-        let undo = std::mem::take(&mut self.undo);
-        let undo_dropped = self.undo_dropped;
-        self.undo_dropped += undo.len();
+        let kept = self.set_aside();
+        self.undo_dropped += kept.undo.len();
         Mark {
-            project: self.project.clone(),
+            kept,
             symbols: self.symbols.keys().cloned().collect(),
             parts: self.parts.keys().cloned().collect(),
-            undo,
-            redo: std::mem::take(&mut self.redo),
-            undo_dropped,
-            history: self.history,
-            form_step: self.form_step,
-            dirty: self.dirty,
-            terminals_before: self.terminals_before.clone(),
             files: vendor_names(&self.dir),
         }
     }
@@ -1465,7 +1518,7 @@ impl Open {
     /// The change since `mark` stays: its undo steps go after the earlier ones (the oldest
     /// dropped beyond the usual limit), and redo is kept only when it made no undo step.
     pub(crate) fn keep(&mut self, mark: Mark) {
-        let mut undo = mark.undo;
+        let mut undo = mark.kept.undo;
         // The set-aside steps counted as dropped while the change ran; they are back now.
         self.undo_dropped -= undo.len();
         undo.append(&mut self.undo);
@@ -1473,8 +1526,8 @@ impl Open {
         undo.drain(..over);
         self.undo_dropped += over;
         self.undo = undo;
-        if self.history == mark.history {
-            self.redo = mark.redo;
+        if self.history == mark.kept.history {
+            self.redo = mark.kept.redo;
         }
     }
 
@@ -1485,14 +1538,9 @@ impl Open {
     /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
     /// when it is next used.
     pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
-        self.project = mark.project;
+        self.put_back(mark.kept);
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
-        self.undo = mark.undo;
-        self.redo = mark.redo;
-        self.undo_dropped = mark.undo_dropped;
-        (self.history, self.form_step, self.dirty) = (mark.history, mark.form_step, mark.dirty);
-        self.terminals_before = mark.terminals_before;
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
             (Err(e), _) | (_, Err(e)) => {
@@ -2251,40 +2299,65 @@ fn restore_file(path: &Path, was: Option<&[u8]>) -> std::io::Result<()> {
 }
 
 /// Copy a folder and everything in it. Links are not followed: a link is left out, so a copy
-/// never reaches outside the folder.
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+/// never reaches outside the folder. Returns how many links were left out.
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<usize> {
     std::fs::create_dir_all(to)?;
+    let mut links = 0;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         let dest = to.join(entry.file_name());
         if kind.is_dir() {
-            copy_dir(&entry.path(), &dest)?;
+            links += copy_dir(&entry.path(), &dest)?;
         } else if kind.is_file() {
             std::fs::copy(entry.path(), &dest)?;
+        } else {
+            links += 1;
         }
     }
-    Ok(())
+    Ok(links)
+}
+
+/// A path's parts with `.` dropped and `..` taken back where it can be (lexically).
+fn lexical_parts(p: &Path) -> Vec<std::path::Component<'_>> {
+    use std::path::Component;
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.last(), Some(Component::Normal(_))) => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// [`lexical_parts`] as a path: `/w/old/../lib` is `/w/lib`.
+fn lexical(p: &Path) -> PathBuf {
+    lexical_parts(p).iter().map(|c| c.as_os_str()).collect()
+}
+
+/// A path as the file system resolves it: its longest existing part resolved (letter case,
+/// links), the rest added as written.
+fn resolved(p: &Path) -> PathBuf {
+    let p = lexical(p);
+    for at in p.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            return match p.strip_prefix(at) {
+                Ok(rest) if !rest.as_os_str().is_empty() => real.join(rest),
+                _ => real,
+            };
+        }
+    }
+    p
 }
 
 /// `path` as seen from the folder `base`, both full paths: `../library` and the like. `None`
 /// when they share no root (another drive).
 fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-    fn normal(p: &Path) -> Vec<Component<'_>> {
-        let mut out: Vec<Component<'_>> = Vec::new();
-        for c in p.components() {
-            match c {
-                Component::CurDir => {}
-                Component::ParentDir if matches!(out.last(), Some(Component::Normal(_))) => {
-                    out.pop();
-                }
-                c => out.push(c),
-            }
-        }
-        out
-    }
-    let (p, b) = (normal(path), normal(base));
+    let (p, b) = (lexical_parts(path), lexical_parts(base));
     let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
     if common == 0 {
         return None;
@@ -2327,10 +2400,18 @@ pub(crate) mod tests {
             location: "../library".into(),
             reference: None,
         });
+        // The project's own library, inside it, goes along with the copy.
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "own".into(),
+            kind: "folder".into(),
+            location: "library".into(),
+            reference: None,
+        });
+        o.checkpoint();
         o.project.meta.name = "Changed".into();
         o.dirty = true;
         let to = tmp.path().join("copies").join("plant 2");
-        assert_eq!(o.save_as(&to).unwrap(), to);
+        assert_eq!(o.save_as(&to).unwrap(), (to.clone(), 0));
         assert_eq!(o.dir, to);
         assert!(!o.dirty);
         // The original is as it was last saved; the copy has the change and its library is
@@ -2340,7 +2421,13 @@ pub(crate) mod tests {
         assert_eq!(copy.project.meta.name, "Changed");
         let lib = copy.project.meta.libraries.iter().find(|l| l.name == "shared").unwrap();
         assert_eq!(Path::new(&lib.location), Path::new("../../library"));
+        let own = copy.project.meta.libraries.iter().find(|l| l.name == "own").unwrap();
+        assert_eq!(own.location, "library");
         assert_eq!(copy.project.pages.len(), o.project.pages.len());
+        // Undo goes back to the name before, not to the library folders seen from the original.
+        assert!(o.undo());
+        let shared = o.project.meta.libraries.iter().find(|l| l.name == "shared").unwrap();
+        assert_eq!(Path::new(&shared.location), Path::new("../../library"));
         // Not over a folder with something in it, and not inside the project itself.
         assert!(o.save_as(&from).unwrap_err().contains("already exists"));
         assert!(o.save_as(&to.join("inner")).unwrap_err().contains("inside the project"));

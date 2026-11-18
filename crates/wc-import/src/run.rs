@@ -848,9 +848,55 @@ pub fn import_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>) -> Res<(us
         None => None,
     };
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
-    let (mut parts, mut report, warnings) = crate::edz::read(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    let crate::edz::Edz {
+        mut parts,
+        symbols,
+        mut report,
+        mut warnings,
+    } = crate::edz::read_all(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
+    // The parts whose symbol the map chose.
+    let mut mapped: std::collections::BTreeSet<String> = Default::default();
     if let Some(map) = &map {
+        let mut probe: Vec<wc_core::Part> = parts
+            .iter()
+            .map(|p| wc_core::Part {
+                symbol: None,
+                ..p.clone()
+            })
+            .collect();
+        crate::edz::apply_symbol_map(&mut probe, map, &mut report.clone());
+        mapped = probe.into_iter().filter(|p| p.symbol.is_some()).map(|p| p.id).collect();
         crate::edz::apply_symbol_map(&mut parts, map, &mut report);
+    }
+    // Symbols first, so no part is written pointing at a symbol the library lacks. A symbol that
+    // cannot be written is skipped, and its parts are written without it.
+    let mut unwritten: std::collections::BTreeSet<String> = Default::default();
+    for s in &symbols {
+        if let Err(x) = wc_library::write_symbol(lib, s) {
+            warnings.push(format!("symbol {} not written: {x}", s.id));
+            unwritten.insert(s.id.clone());
+        }
+    }
+    if !unwritten.is_empty() {
+        // A link the symbol map chose is kept while the library still holds a readable symbol of
+        // that id; a link to the macro's own symbol, which was not saved, is dropped.
+        let readable = |id: &str| {
+            std::fs::read_to_string(lib.join("symbols").join(format!("{id}.json")))
+                .ok()
+                .and_then(|t| serde_json::from_str::<wc_core::Symbol>(&t).ok())
+                .is_some()
+        };
+        let keep = |part: &str, id: &str| !unwritten.contains(id) || (mapped.contains(part) && readable(id));
+        for p in &mut parts {
+            if p.symbol.as_deref().is_some_and(|s| !keep(&p.id, s)) {
+                p.symbol = None;
+            }
+        }
+        for m in &mut report.part_macros {
+            if m.symbol.as_deref().is_some_and(|s| !keep(&m.part, s)) {
+                m.symbol = None;
+            }
+        }
     }
     for p in &parts {
         wc_library::write_part(lib, p).map_err(e)?;

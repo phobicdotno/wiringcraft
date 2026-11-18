@@ -107,15 +107,26 @@ impl SweDrawings {
         let sections = dwg::read_sections(bytes)?;
         let read = dwg::objects::dxf_drawing(&sections)?;
         let damaged = read.skipped.get(dwg::objects::DAMAGED).copied().unwrap_or(0);
-        for (k, n) in read.skipped {
-            *self.skipped.entry(k).or_default() += n;
+        for (k, n) in &read.skipped {
+            *self.skipped.entry(k.clone()).or_default() += n;
+        }
+        // A class section that could not be read: its custom entities are not counted. Its
+        // reason comes first in `damaged`, before those of the objects.
+        let classes_damaged = read.skipped.contains_key(dwg::objects::CLASSES_DAMAGED);
+        let (classes_why, objects_why) = match read.damaged.split_first() {
+            Some((first, rest)) if classes_damaged => (first.as_str(), rest),
+            _ => ("", read.damaged.as_slice()),
+        };
+        if classes_damaged {
+            self.warnings
+                .push(format!("{what}: {classes_why}; its custom entities are not counted"));
         }
         for w in &read.warnings {
             self.warnings.push(format!("{what}: {w}"));
         }
         // A drawing read in part is used; why the rest is missing is said once per file.
         if damaged > 0 {
-            let first = read.damaged.first().map(String::as_str).unwrap_or("");
+            let first = objects_why.first().map(String::as_str).unwrap_or("");
             self.warnings.push(format!(
                 "{what}: {damaged} object(s) could not be read and are not drawn, the first because of: {first}"
             ));

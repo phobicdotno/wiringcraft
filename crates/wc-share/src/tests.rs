@@ -3307,6 +3307,81 @@ fn a_page_edit_with_a_wire_on_a_pin_an_update_dropped_is_refused() -> TestResult
 }
 
 #[test]
+fn pages_set_with_a_wire_on_a_pin_an_update_dropped_are_refused_with_their_batch() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1", "A2"]), coil_with(&["A1"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.edit_project(update_symbol(&v1, &v2))?;
+    let before = host.project().clone();
+    let was = before.page("p0002").ok_or("page")?.clone();
+    let mut page = was.clone();
+    wired(&mut page, "A2");
+    let set = ProjectEdit::SetPages {
+        pages: vec![page],
+        before: vec![was],
+    };
+    // Alone, and in a batch with a device: refused whole, nothing kept.
+    let err = host.edit_project(set.clone()).err().ok_or("refused")?;
+    assert!(err.to_string().contains("k1:A2"), "{err}");
+    let device = ProjectEdit::SetDevice {
+        tag: wc_core::DeviceTag::parse("-K9")?,
+        device: Some(wc_core::Device::default()),
+        before: None,
+    }
+    .stamped(&before);
+    let err = host
+        .edit_project(ProjectEdit::Batch {
+            edits: vec![device, set],
+        })
+        .err()
+        .ok_or("refused")?;
+    assert!(err.to_string().contains("k1:A2"), "{err}");
+    assert_eq!(host.project(), &before);
+    Ok(())
+}
+
+#[test]
+fn a_guest_writes_its_own_page_only_from_a_change_the_host_can_accept() -> TestResult {
+    let mut guest = Guest::new();
+    let project = demo();
+    let was = project.page("p0002").ok_or("page")?.clone();
+    guest.me = Some(7);
+    guest.locks.insert("p0002".into(), 7);
+    guest.project = Some(project);
+    let mut page = was.clone();
+    page.title = "Renamed".into();
+    let set = ProjectEdit::SetPages {
+        pages: vec![page],
+        before: vec![was],
+    };
+    let title = |g: &Guest| {
+        g.project
+            .as_ref()
+            .and_then(|p| p.page("p0002"))
+            .map(|p| p.title.clone())
+    };
+    // A batch of one edit is refused by the host: nothing is written, nothing waits.
+    let _ = guest.edit_project(ProjectEdit::Batch {
+        edits: vec![set.clone()],
+    });
+    assert_ne!(title(&guest).as_deref(), Some("Renamed"));
+    assert!(!guest.own_page_waits());
+    // Alone, the page is written at once and waits for the answer.
+    let _ = guest.edit_project(set);
+    assert_eq!(title(&guest).as_deref(), Some("Renamed"));
+    assert!(guest.own_page_waits());
+    Ok(())
+}
+
+#[test]
 fn a_page_undo_does_not_put_a_wire_back_on_a_pin_a_later_update_dropped() -> TestResult {
     let mut host = Host::new(
         demo(),
