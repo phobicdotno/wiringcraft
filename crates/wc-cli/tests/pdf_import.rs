@@ -93,3 +93,61 @@ fn in_an_archive_the_warning_names_the_entry_with_control_characters_escaped() -
     );
     Ok(())
 }
+
+#[test]
+fn a_scan_that_cannot_be_read_is_reported_with_control_characters_escaped() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = project(tmp.path())?;
+    // One picture over the whole page, compressed with a filter whose name carries ESC.
+    let content = "q 595 0 0 842 0 0 cm /Im Do Q";
+    let samples = [0u8; 4];
+    let mut b = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /XObject << /Im 5 0 R >> >> >>\nendobj\n".to_vec();
+    b.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n",
+            content.len()
+        )
+        .as_bytes(),
+    );
+    b.extend_from_slice(
+        format!(
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /Odd#1bXDecode /Length {} >>\nstream\n",
+            samples.len()
+        )
+        .as_bytes(),
+    );
+    b.extend_from_slice(&samples);
+    b.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
+    let file = tmp.path().join("scan.pdf");
+    std::fs::write(&file, b)?;
+    let (stdout, stderr) = run(&dir, &["import", "pdf", file.to_str().ok_or("path")?])?;
+    assert!(stderr.contains("Odd\\u{1b}XDecode"), "{stderr:?}");
+    assert!(
+        !stderr.contains('\u{1b}') && !stdout.contains('\u{1b}'),
+        "{stdout:?} {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_drawing_in_an_archive_is_titled_by_its_entry_name_as_it_is() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = project(tmp.path())?;
+    let archive = tmp.path().join("project.zip");
+    {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive)?);
+        zip.start_file("relays\tnorth.dxf", zip::write::SimpleFileOptions::default())?;
+        zip.write_all(b"0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n10\n0\nENDSEC\n0\nEOF\n")?;
+        zip.finish()?;
+    }
+    let (stdout, _) = run(&dir, &["import", "archive", archive.to_str().ok_or("path")?])?;
+    // Printed escaped, stored as it is.
+    assert!(stdout.contains("relays\\tnorth.dxf:"), "{stdout:?}");
+    let project = wc_core::store::load(&dir)?;
+    let titles: Vec<&str> = project.pages.iter().map(|p| p.title.as_str()).collect();
+    assert!(titles.contains(&"relays\tnorth.dxf"), "{titles:?}");
+    // And listed escaped.
+    let (list, _) = run(&dir, &["page", "list"])?;
+    assert!(list.contains("relays\\tnorth.dxf") && !list.contains('\t'), "{list:?}");
+    Ok(())
+}

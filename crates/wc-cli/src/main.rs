@@ -927,7 +927,7 @@ fn run(cli: Cli) -> Res<()> {
                             "{:<10} {:<6} {} ({} symbols, {} wires){}",
                             pg.id,
                             pg.number,
-                            pg.title,
+                            escape_field(&pg.title),
                             pg.symbols.len(),
                             pg.wires.len(),
                             match (pg.cover, pg.overview) {
