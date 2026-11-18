@@ -2485,13 +2485,27 @@ fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestRes
     let mut local = base.clone();
     local.lock.symbols.insert("coil".into(), entry("v2"));
     let auth = Project::new("Demo");
-    let out = new_items(tmp.path(), &local, &base, &auth, &Default::default());
+    let out = new_items(
+        tmp.path(),
+        &local,
+        &base,
+        &auth,
+        &Default::default(),
+        &Default::default(),
+    );
     assert!(out.edits.is_empty(), "{:?}", out.edits);
     assert_eq!(out.stale, ["symbol coil"]);
     // An item the session never had is still sent as an add (here: unreadable, so tried).
     let mut fresh = local.clone();
     fresh.lock.symbols.insert("lamp".into(), entry("l1"));
-    let out = new_items(tmp.path(), &fresh, &base, &auth, &Default::default());
+    let out = new_items(
+        tmp.path(),
+        &fresh,
+        &base,
+        &auth,
+        &Default::default(),
+        &Default::default(),
+    );
     assert_eq!(out.unreadable.len(), 1, "{:?}", out.unreadable);
     assert_eq!(out.unreadable[0].0, "symbol lamp");
     Ok(())
@@ -2678,5 +2692,46 @@ fn undo_of_a_waiting_change_whose_symbol_arrives_first_takes_it_back_in_the_sess
     }
     assert!(!has_placement(&host_open, "p0003", &item), "{:?}", g.notes);
     assert!(!has_placement(&guest_open, "p0003", &item), "{:?}", g.notes);
+    Ok(())
+}
+
+#[test]
+fn items_sent_before_and_not_taken_go_each_in_an_edit_of_its_own() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(tmp.path())?;
+    let before = open.project.clone();
+    open.place(1, "wc.coil", wc_core::Point::new(40.0, 100.0))?;
+    open.place(1, "wc.contact.no", wc_core::Point::new(80.0, 100.0))?;
+    let added = |edits: &[ProjectEdit]| -> Vec<Vec<String>> {
+        edits
+            .iter()
+            .filter_map(|e| match e {
+                ProjectEdit::AddItems { symbols, .. } => Some(symbols.iter().map(|(s, _)| s.id.clone()).collect()),
+                _ => None,
+            })
+            .collect()
+    };
+    let none = Default::default();
+    let out = new_items(&open.dir, &open.project, &before, &before, &none, &none);
+    assert_eq!(
+        added(&out.edits),
+        [vec!["wc.coil", "wc.contact.no"]],
+        "first time: one edit"
+    );
+    // The contact was sent before and the session did not take it: it goes alone, so the coil
+    // gets in even when the session cannot store the contact.
+    let apart = [item_name(ItemKind::Symbol, "wc.contact.no")].into();
+    let out = new_items(&open.dir, &open.project, &before, &before, &none, &apart);
+    assert_eq!(added(&out.edits), [vec!["wc.contact.no"], vec!["wc.coil"]]);
+    Ok(())
+}
+
+#[test]
+fn undo_is_offered_for_a_waiting_change_when_the_session_has_nothing_of_this_persons() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (_h, _log, _host_open, mut g, _guest_open) = session(tmp.path())?;
+    assert!(!g.can_undo(), "nothing of the guest's anywhere");
+    g.holding = vec![item_name(ItemKind::Symbol, "wc.coil")];
+    assert!(g.can_undo(), "the waiting change is undone here");
     Ok(())
 }

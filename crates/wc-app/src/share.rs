@@ -940,14 +940,16 @@ pub struct NewItems {
 /// vendored files from `dir`, as one edit: what this person started using. Then those this
 /// copy updated since the last sync (`base`, see [`updated_here`]), as a second edit that
 /// names the version the session has. Items named in `skip` (sent and not answered yet) are
-/// left out. An item whose file cannot be read is not sent; it is returned with the reason and
-/// tried again next time.
+/// left out. Items named in `apart` (sent before and not taken) go each in an edit of its own,
+/// so one the session cannot store does not keep the others out. An item whose file cannot be
+/// read is not sent; it is returned with the reason and tried again next time.
 pub fn new_items(
     dir: &Path,
     local: &Project,
     base: &Project,
     auth: &Project,
     skip: &std::collections::BTreeSet<String>,
+    apart: &std::collections::BTreeSet<String>,
 ) -> NewItems {
     let mut out = NewItems::default();
     // (id, source, hash here, the session's hash when it is an update)
@@ -1006,6 +1008,31 @@ pub fn new_items(
             }
             Err(e) => out.unreadable.push((item_name(ItemKind::Part, &id), e)),
         }
+    }
+    let alone = |kind: ItemKind, id: &str| apart.contains(&item_name(kind, id));
+    for (s, source) in symbols.extract_if(.., |(s, _)| alone(ItemKind::Symbol, s.id.as_str())) {
+        out.edits.push(ProjectEdit::AddItems {
+            symbols: vec![(s, source)],
+            parts: Vec::new(),
+        });
+    }
+    for (p, source) in parts.extract_if(.., |(p, _)| alone(ItemKind::Part, p.id.as_str())) {
+        out.edits.push(ProjectEdit::AddItems {
+            symbols: Vec::new(),
+            parts: vec![(p, source)],
+        });
+    }
+    for s in new_symbols.extract_if(.., |(s, _, _)| alone(ItemKind::Symbol, s.id.as_str())) {
+        out.edits.push(ProjectEdit::UpdateItems {
+            symbols: vec![s],
+            parts: Vec::new(),
+        });
+    }
+    for p in new_parts.extract_if(.., |(p, _, _)| alone(ItemKind::Part, p.id.as_str())) {
+        out.edits.push(ProjectEdit::UpdateItems {
+            symbols: Vec::new(),
+            parts: vec![p],
+        });
     }
     if !symbols.is_empty() || !parts.is_empty() {
         out.edits.push(ProjectEdit::AddItems { symbols, parts });
@@ -1899,10 +1926,14 @@ impl Share {
 
     /// Whether Undo in the session has a change of this person's to take back.
     pub fn can_undo(&self) -> bool {
-        self.role
-            .as_ref()
-            .and_then(|r| Some(undo_target(&r.history(), r.me()?)))
-            .is_some_and(|t| t.is_some())
+        // A change waiting here is undone here (see `take_back`), even with nothing in the
+        // session's history yet.
+        !self.holding.is_empty()
+            || self
+                .role
+                .as_ref()
+                .and_then(|r| Some(undo_target(&r.history(), r.me()?)))
+                .is_some_and(|t| t.is_some())
     }
 
     /// Whether this window hosts the session.
@@ -2232,7 +2263,10 @@ impl Share {
             .filter(|(_, o)| o.at.elapsed() < if o.gave_up { ITEM_RETRY_LATER } else { ITEM_WAIT })
             .map(|(n, _)| n.clone())
             .collect();
-        let items = new_items(&open.dir, &open.project, base, auth, &skip);
+        // An item sent before and not taken goes alone, so one the session cannot store does
+        // not keep out the others it was sent with.
+        let apart = self.items_out.keys().cloned().collect();
+        let items = new_items(&open.dir, &open.project, base, auth, &skip, &apart);
         let now = std::time::Instant::now();
         for (name, why) in &items.unreadable {
             // A file that cannot be read counts as a try: the changes that may draw the item
@@ -2320,6 +2354,7 @@ impl Share {
         if undo && !held.is_empty() {
             // Undo of a change that never reached the session: taken back here only.
             held.drop_from(&mut open.project);
+            self.holding.clear();
             self.notes.push(format!(
                 "Your change that waited for {} was undone here; it had not reached the session.",
                 held.items.join(", ")
