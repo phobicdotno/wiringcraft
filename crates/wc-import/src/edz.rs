@@ -692,6 +692,7 @@ fn part_of(raw: Raw) -> Option<Part> {
         description,
         symbol: None,
         properties,
+        contacts: None,
     })
 }
 

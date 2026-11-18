@@ -150,6 +150,64 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
         }
     }
 
+    // Contact overflow: a device draws more contacts than its parts have. Only devices whose
+    // main part or accessories list their contacts are checked; overview pages do not count.
+    type Drawn<'p> = (wc_core::Contacts, Vec<(&'p Page, &'p str)>);
+    let mut drawn: BTreeMap<&DeviceTag, Drawn> = BTreeMap::new();
+    for page in p.pages.iter().filter(|pg| !pg.overview) {
+        for s in &page.symbols {
+            let (Some(tag), Some(sym)) = (&s.tag, i.symbols.get(&s.symbol)) else {
+                continue;
+            };
+            if sym.role != SymbolRole::Auxiliary {
+                continue;
+            }
+            let kinds = wc_core::part::contact_kinds(sym.pins.iter().map(|p| p.name.as_str()));
+            if kinds.is_empty() {
+                continue;
+            }
+            let (count, at) = drawn.entry(tag).or_default();
+            for k in kinds {
+                count.add(k);
+            }
+            at.push((page, &s.id));
+        }
+    }
+    for (tag, (count, uses)) in &drawn {
+        let Some(device) = p.devices.get(*tag) else { continue };
+        let fitted = device
+            .part
+            .iter()
+            .map(|id| (id.as_str(), 1))
+            .chain(device.accessories.iter().map(|a| (a.part.as_str(), a.qty)));
+        let mut has = wc_core::Contacts::default();
+        let mut listed = false;
+        for (id, qty) in fitted {
+            if let Some(c) = i.parts.get(id).and_then(|part| part.contacts.as_ref()) {
+                has.add_all(c, qty);
+                listed = true;
+            }
+        }
+        if !listed {
+            continue;
+        }
+        if let Some(over) = has.overflow(count) {
+            for (page, item) in uses {
+                out.push(at(
+                    page,
+                    item,
+                    Severity::Warning,
+                    format!(
+                        "{tag} draws {} contacts, its parts have {} ({} too many)",
+                        count.describe(),
+                        has.describe(),
+                        over.describe()
+                    ),
+                ));
+            }
+        }
+    }
+
     // Contacts without a coil, interruption points without a partner.
     let mut links: BTreeMap<DeviceTag, usize> = BTreeMap::new();
     for page in &p.pages {
