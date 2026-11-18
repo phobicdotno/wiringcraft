@@ -1201,3 +1201,42 @@ fn an_item_this_copy_no_longer_locks_stops_holding_changes() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn a_session_version_that_cannot_be_written_is_not_drawn_with_the_old_one() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_with(tmp.path(), |o| {
+        o.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
+        Ok(())
+    })?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let session_coil = host_open.symbols.get("wc.coil").cloned().ok_or("no coil")?;
+    let mut other = session_coil.clone();
+    other.name = "Coil, edited".into();
+    guest_open.symbols.insert(other.id.clone(), other.clone());
+    if let Some(e) = guest_open.project.lock.symbols.get_mut("wc.coil") {
+        e.hash = other.hash();
+    }
+    // The file cannot be written: a folder stands where it goes.
+    let file = store::vendor_path(&guest_open.dir, ItemKind::Symbol, "wc.coil")?;
+    std::fs::remove_file(&file)?;
+    std::fs::create_dir_all(&file)?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(
+        !guest_open.symbols.contains_key("wc.coil"),
+        "the old version is not kept as if it were the session's"
+    );
+    let notes = g.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("could not be taken") && n.contains("symbol wc.coil")),
+        "{notes:?}"
+    );
+
+    // Writable again: the session's version is taken.
+    std::fs::remove_dir(&file)?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(guest_open.symbols.get("wc.coil"), Some(&session_coil));
+    Ok(())
+}

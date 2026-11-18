@@ -493,7 +493,12 @@ pub fn take_files(
             Ok(_) => {
                 open.symbols.insert(id, s.clone());
             }
-            Err(e) => failed.push((name, e.to_string())),
+            Err(e) => {
+                // A loaded version the lock no longer names is not drawn as if it were the
+                // session's; the next frame tries the write again.
+                open.symbols.remove(&id);
+                failed.push((name, e.to_string()));
+            }
         }
     }
     let wanted: Vec<(String, String)> = open
@@ -515,7 +520,10 @@ pub fn take_files(
             Ok(_) => {
                 open.parts.insert(id, p.clone());
             }
-            Err(e) => failed.push((name, e.to_string())),
+            Err(e) => {
+                open.parts.remove(&id);
+                failed.push((name, e.to_string()));
+            }
         }
     }
     failed
@@ -1302,7 +1310,7 @@ impl Share {
         let conflicting = conflicts(&open.project, auth);
         if !conflicting.is_empty() {
             self.notes.push(format!(
-                "Someone else used {} first in another version; your copy now uses theirs.",
+                "Someone else used {} first in another version; your copy takes theirs.",
                 conflicting.join(", ")
             ));
         }
