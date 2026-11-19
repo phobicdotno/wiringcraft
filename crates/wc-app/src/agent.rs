@@ -4858,6 +4858,88 @@ mod tests {
     }
 
     #[test]
+    fn translations_edited_in_the_dialog_are_saved_and_the_pdf_is_exported_in_the_language_chosen() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let hex = |s: &str| {
+            let mut out = String::from("<");
+            for b in s.bytes() {
+                out.push_str(&format!("{b:02X}"));
+            }
+            out + ">"
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open.as_mut().unwrap().project.pages[1].title = "Pumps".into();
+        a.open.as_mut().unwrap().project.pages[1]
+            .graphics
+            .push(wc_core::Shape::Text {
+                at: Point::new(20.0, 20.0),
+                text: "Spare".into(),
+                height: 2.5,
+                align: Default::default(),
+                angle: 0.0,
+            });
+        // Without a dictionary the PDF is exported at once, as drawn.
+        a.run(Action::ExportPdf);
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.starts_with("Exported")));
+        std::fs::write(
+            dir.join(TRANSLATIONS_FILE),
+            "source = \"en\"\n\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n",
+        )
+        .unwrap();
+
+        a.dialog = None;
+        a.run(Action::Translations);
+        let Some(Dialog::Translations(mut form)) = a.dialog.take() else {
+            unreachable!("the translations dialog opens");
+        };
+        assert_eq!(form.langs, ["nb"]);
+        let row = |f: &crate::translations_form::Form, t: &str| f.rows.iter().position(|r| r.text == t).unwrap();
+        assert_eq!(form.rows[row(&form, "Pumps")].cells, ["Pumper"]);
+        assert_eq!(form.missing(0), form.rows.len() - 1, "every text but Pumps is missing");
+        let spare = row(&form, "Spare");
+        form.rows[spare].cells[0] = "Reserve".into();
+        form.new_lang = "DE".into();
+        form.add_language().unwrap();
+        assert!(form.add_language().is_err(), "an empty code is refused");
+        form.new_lang = "nb".into();
+        assert!(form.add_language().is_err(), "a language already shown is refused");
+        form.rows[spare].cells[1] = "Ersatz".into();
+        // Edited in the file meanwhile: kept, as the dialog did not change it.
+        std::fs::write(
+            dir.join(TRANSLATIONS_FILE),
+            "source = \"en\"\n\n[[text]]\nen = \"Pumps\"\nnb = \"Pumpene\"\n",
+        )
+        .unwrap();
+        assert_eq!(form.save().unwrap(), "Saved 2 translations to translations.toml.");
+        let d = Dictionary::load(&dir).unwrap();
+        assert_eq!(d.lookup("Spare", "nb").as_deref(), Some("Reserve"));
+        assert_eq!(d.lookup("Spare", "de").as_deref(), Some("Ersatz"));
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumpene"));
+
+        // With translations, the export asks for the language.
+        a.run(Action::ExportPdf);
+        let Some(Dialog::PdfLanguage { langs, .. }) = &a.dialog else {
+            unreachable!("the language is asked for");
+        };
+        assert_eq!(langs, &["en", "nb", "de"]);
+        let open = a.open.as_ref().unwrap();
+        let m = crate::export_pdf_in(open, &["nb".into(), "en".into()]);
+        assert!(m.starts_with("Exported"), "{m}");
+        assert!(m.contains("no translation for"), "missing texts are warned about: {m}");
+        assert!(!m.contains("\"Spare\""), "{m}");
+        let pdf_path = std::fs::read_dir(dir.join("export"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "pdf"))
+            .unwrap();
+        let pdf = String::from_utf8_lossy(&std::fs::read(pdf_path).unwrap()).into_owned();
+        assert!(pdf.contains(&hex("Reserve / Spare")), "the texts are in both languages");
+        assert!(pdf.contains(&hex("Pumpene / Pumps")));
+    }
+
+    #[test]
     fn check_rules_added_changed_and_deleted_in_the_dialog_are_kept_checked_and_undone() {
         use crate::rules_form::{Change, RuleRow, change, rows_of};
         use wc_core::check_rule::CheckRule;
