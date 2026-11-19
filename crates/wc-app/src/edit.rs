@@ -131,6 +131,52 @@ pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
     });
 }
 
+/// Selected free drawings a sync took off a page, to be selected again once they are back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitingGraphics {
+    /// The page's id.
+    pub page: String,
+    /// Each drawing, and how many copies of it the page had without it.
+    pub items: Vec<(Shape, usize)>,
+    /// The selection when they were taken off: one made since is the user's, and ends the wait.
+    pub selection: Vec<Selection>,
+}
+
+/// The drawings selected in `before` (positions in `old`) of which `new` has fewer copies, each
+/// with the number of copies `new` has.
+pub fn lost_graphics(before: &[Selection], old: &[Shape], new: &[Shape]) -> Vec<(Shape, usize)> {
+    let copies = |list: &[Shape], item: &Shape| list.iter().filter(|x| *x == item).count();
+    let mut lost: Vec<(Shape, usize)> = Vec::new();
+    for s in before {
+        if let Selection::Graphic(i) = s
+            && let Some(item) = old.get(*i)
+            && copies(new, item) < copies(old, item)
+            && !lost.iter().any(|(x, _)| x == item)
+        {
+            lost.push((item.clone(), copies(new, item)));
+        }
+    }
+    lost
+}
+
+/// Select again the drawings of `items` that are back on the page (`now` has more copies of one
+/// than it had without it): the last copy, where a merged change puts it. They leave `items`.
+pub fn restore_graphics(items: &mut Vec<(Shape, usize)>, sel: &mut Vec<Selection>, now: &[Shape]) {
+    items.retain(|(item, had)| {
+        let at: Vec<usize> = (0..now.len()).filter(|&j| now[j] == *item).collect();
+        if at.len() <= *had {
+            return true;
+        }
+        if let Some(&j) = at.last() {
+            let s = Selection::Graphic(j);
+            if !sel.contains(&s) {
+                sel.push(s);
+            }
+        }
+        false
+    });
+}
+
 fn graphic_ids(sel: &[Selection]) -> BTreeSet<usize> {
     sel.iter()
         .filter_map(|s| match s {
@@ -686,6 +732,29 @@ impl Open {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drawing_taken_off_is_selected_again_where_it_comes_back() {
+        let l = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        // Two copies of a line; the pasted second one is selected, and a sync takes it off.
+        let old = vec![l(1.0), l(2.0), l(1.0)];
+        let new = vec![l(1.0), l(2.0)];
+        let mut items = lost_graphics(&[Selection::Graphic(2), Selection::Graphic(1)], &old, &new);
+        assert_eq!(items, vec![(l(1.0), 1)], "only what went is waited for");
+        // Not back yet: nothing is selected for it.
+        let mut sel = Vec::new();
+        restore_graphics(&mut items, &mut sel, &new);
+        assert!(sel.is_empty());
+        assert_eq!(items.len(), 1);
+        // Back, after a line someone else added: the last copy is the pasted one.
+        let now = vec![l(1.0), l(2.0), l(3.0), l(1.0)];
+        restore_graphics(&mut items, &mut sel, &now);
+        assert_eq!(sel, vec![Selection::Graphic(3)]);
+        assert!(items.is_empty());
+    }
 
     #[test]
     fn a_graphic_selection_follows_its_item_when_the_list_is_merged() {

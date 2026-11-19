@@ -3220,6 +3220,14 @@ impl Share {
                 .is_some_and(|t| t.is_some())
     }
 
+    /// How many of this person's changes the host has not answered yet (none for the host).
+    pub fn unanswered_edits(&self) -> usize {
+        match &self.role {
+            Some(Role::Guest(j)) => j.guest.unanswered_edits(),
+            _ => 0,
+        }
+    }
+
     /// Whether this window hosts the session.
     pub fn is_host(&self) -> bool {
         matches!(self.role, Some(Role::Host(_)))
@@ -4464,4 +4472,4 @@ fn author_email() -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

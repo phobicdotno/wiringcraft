@@ -84,6 +84,9 @@ pub struct Editor {
     /// Findings of the check that runs while drawing, marked on their items; empty when it is
     /// off.
     pub live: Vec<wc_report::Finding>,
+    /// Selected free drawings a sync showed the page without while this person's change was
+    /// on its way to the host: selected again when the host accepts it.
+    pub waiting_graphics: Option<crate::edit::WaitingGraphics>,
 }
 
 impl Default for Editor {
@@ -113,6 +116,7 @@ impl Default for Editor {
             held_by: Default::default(),
             layers: Default::default(),
             live: Vec::new(),
+            waiting_graphics: None,
         }
     }
 }

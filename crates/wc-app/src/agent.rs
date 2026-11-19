@@ -4280,6 +4280,84 @@ mod tests {
         assert_eq!(graphics(&a), vec![rect, line(2.0), line(4.0)]);
     }
 
+    /// A guest window over the session of `crate::share::tests::session`, showing a panel
+    /// over page 3: it holds no page, so a change of page 3 waits for the host.
+    fn guest_window(tmp: &std::path::Path) -> (tempfile::TempDir, App, crate::share::Share, Open) {
+        let (mut h, _log, mut host_open, mut g, mut guest_open) = crate::share::tests::session(tmp).unwrap();
+        crate::share::tests::frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        let (dir, mut a) = app(vec![]);
+        a.open = Some(guest_open);
+        a.share = g;
+        a.ed.page = 2;
+        a.ed.panel = Some(0);
+        a.sync_session_now(false);
+        (dir, a, h, host_open)
+    }
+
+    /// The guest pastes a line on page 3 and selects it.
+    fn paste_line(a: &mut App) -> Shape {
+        let line = Shape::Line {
+            a: Point::new(7.0, 0.0),
+            b: Point::new(7.0, 5.0),
+        };
+        let page = a.open.as_mut().unwrap().project.page_mut("p0003").unwrap();
+        page.graphics.push(line.clone());
+        a.ed.selection = vec![Selection::Graphic(page.graphics.len() - 1)];
+        line
+    }
+
+    fn graphics3(a: &App) -> Vec<Shape> {
+        a.open.as_ref().unwrap().project.page("p0003").unwrap().graphics.clone()
+    }
+
+    #[test]
+    fn a_guests_pasted_drawing_is_selected_again_once_the_host_accepts_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        let line = paste_line(&mut a);
+        // Sent: until the host answers, the page shows the session's copy without it.
+        a.sync_session_now(false);
+        a.sync_session_now(false);
+        assert!(graphics3(&a).is_empty());
+        assert!(a.ed.selection.is_empty(), "no stale index stays selected");
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        a.sync_session_now(false);
+        assert_eq!(graphics3(&a), vec![line]);
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(0)]);
+        assert!(a.ed.waiting_graphics.is_none());
+    }
+
+    #[test]
+    fn a_selection_made_while_a_paste_waits_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        paste_line(&mut a);
+        a.sync_session_now(false);
+        a.ed.selection = vec![Selection::Symbol("other".into())];
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        a.sync_session_now(false);
+        assert_eq!(graphics3(&a).len(), 1);
+        assert_eq!(a.ed.selection, vec![Selection::Symbol("other".into())]);
+    }
+
+    #[test]
+    fn a_guests_paste_the_host_refuses_leaves_nothing_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        // The host opens page 3 before the guest's paste reaches it.
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        paste_line(&mut a);
+        a.sync_session_now(false);
+        assert!(a.ed.waiting_graphics.is_some(), "the paste waits for the host");
+        for _ in 0..3 {
+            h.frame(Some(&mut host_open), Some("p0003".into()), false);
+            a.sync_session_now(false);
+        }
+        assert!(graphics3(&a).is_empty());
+        assert!(a.ed.selection.is_empty());
+        assert!(a.ed.waiting_graphics.is_none(), "nothing waits once the host refused");
+    }
+
     #[test]
     fn graphic_ids_are_checked_for_every_tool_and_page_they_name() {
         let line = |x: f64| Shape::Line {
