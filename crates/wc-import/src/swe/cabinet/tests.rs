@@ -52,9 +52,9 @@ fn a_cabinet_layout_page_becomes_a_panel() {
             .items
             .iter()
             .find_map(|i| match i {
-                PanelItem::Device { tag, at, width, height } if tag.to_string().ends_with(end) => {
-                    Some((*at, *width, *height))
-                }
+                PanelItem::Device {
+                    tag, at, width, height, ..
+                } if tag.to_string().ends_with(end) => Some((*at, *width, *height)),
                 _ => None,
             })
             .unwrap()
@@ -255,9 +255,9 @@ INSERT INTO tew_symbol VALUES (40, 12, 105, 'FP_SWITCH', 300, 640, 0, 1, 1, NULL
             .items
             .iter()
             .find_map(|i| match i {
-                PanelItem::Device { tag, at, width, height } if tag.to_string().ends_with(end) => {
-                    Some((*at, *width, *height))
-                }
+                PanelItem::Device {
+                    tag, at, width, height, ..
+                } if tag.to_string().ends_with(end) => Some((*at, *width, *height)),
                 _ => None,
             })
             .unwrap()
@@ -337,9 +337,9 @@ INSERT INTO tew_symbol VALUES (40, 12, 105, 'FP_SWITCH', 300, 640, 0, 0.5, 1, NU
             .items
             .iter()
             .find_map(|i| match i {
-                PanelItem::Device { tag, at, width, height } if tag.to_string().ends_with(end) => {
-                    Some((*at, *width, *height))
-                }
+                PanelItem::Device {
+                    tag, at, width, height, ..
+                } if tag.to_string().ends_with(end) => Some((*at, *width, *height)),
                 _ => None,
             })
             .unwrap()

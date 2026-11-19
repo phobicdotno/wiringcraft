@@ -277,6 +277,7 @@ pub fn layouts(
                 at: at(Point::new(a.x, b.y)),
                 width: round(b.x - a.x),
                 height: round(b.y - a.y),
+                rotation: wc_core::geom::Rotation::R0,
             });
         }
         out.rails += rails.len();

@@ -2869,7 +2869,8 @@ impl Held {
                             at,
                             width,
                             height,
-                        } if t == tag => Some(format!("{at:?} {width} {height}")),
+                            rotation,
+                        } if t == tag => Some(format!("{at:?} {width} {height} {rotation:?}")),
                         _ => None,
                     })
                     .collect()

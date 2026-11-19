@@ -1383,6 +1383,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
         at: Point::new(at.x + 10.0, at.y - 20.0),
         width: 5.2,
         height: 40.0,
+        rotation: wc_core::geom::Rotation::R0,
     });
     p.panels.push(plate);
 
