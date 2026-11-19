@@ -24,6 +24,9 @@ pub struct ProjectFiles {
     pub roots: Vec<PathBuf>,
     /// The identity of each project file ([`file_id`]), so a hard link to one is known too.
     pub files: HashSet<(u64, u64)>,
+    /// The identity of each project folder, so an output folder opened through a link is
+    /// known to be the project's whatever name reached it.
+    pub dirs: HashSet<(u64, u64)>,
     /// Why a project file's identity could not be read, if one could not: a hard link to that
     /// file would go unseen, so no output file is taken as safe then.
     pub unknown: Option<String>,
@@ -34,6 +37,7 @@ impl ProjectFiles {
     pub fn new(project: &Path) -> Self {
         let (roots, mut unknown) = project_roots(project);
         let mut files = HashSet::new();
+        let mut dirs = HashSet::new();
         let mut todo = roots.clone();
         // A folder that cannot be listed, or an entry that cannot be looked at, hides files
         // too, so it is recorded like a file whose identity cannot be read.
@@ -50,6 +54,13 @@ impl ProjectFiles {
                 }
             };
             if m.is_dir() {
+                match file_id(&at) {
+                    Ok(Some(id)) => {
+                        dirs.insert(id);
+                    }
+                    Ok(None) => {}
+                    Err(e) => note(&at, e),
+                }
                 let entries = match std::fs::read_dir(&at) {
                     Ok(entries) => entries,
                     Err(e) => {
@@ -74,7 +85,12 @@ impl ProjectFiles {
                 }
             }
         }
-        Self { roots, files, unknown }
+        Self {
+            roots,
+            files,
+            dirs,
+            unknown,
+        }
     }
 
     /// The project named by [`GUARD_ENV`], when it is set.
@@ -118,9 +134,11 @@ impl ProjectFiles {
     /// Nothing already at `path` is opened or changed: the bytes go to a new file of their
     /// own next to it, which then takes the name. A link or a hard link at `path`, also one
     /// made after the look before, loses only its name there; the file behind it stays as it
-    /// was. The new file is checked before it takes the name: it must not be in the project
-    /// (a folder above swapped for a link into it shows here) and must still be the file that
-    /// was made. A refused file is removed again.
+    /// was. The output folder must not be the project's: on unix it is opened once and known
+    /// by its identity, and the new file is made and renamed relative to it, so a folder above
+    /// swapped for a link into the project after the checks changes nothing (#471). Elsewhere
+    /// the new file is checked by where its name leads before it takes the name. A refused
+    /// file is removed again.
     pub fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         let refuse = |why: &str| {
             io::Error::new(
@@ -140,26 +158,65 @@ impl ProjectFiles {
                 )));
             }
         }
+        self.put(path, bytes).map_err(|fail| match fail {
+            Fail::Refused(why) => refuse(&why),
+            // Any other failure (a full disk, a rename across devices) is the plain I/O error
+            // with its path.
+            Fail::Io(e) => io::Error::new(e.kind(), format!("{}: {e}", path.display())),
+        })
+    }
+
+    /// Write `bytes` as a new file in the folder of `path` and give it the name (#471). The
+    /// folder is opened once, checked by its identity, and the file is made, checked and
+    /// renamed relative to that open folder: a folder above swapped for a link afterwards
+    /// changes nothing, since no name is looked up again.
+    #[cfg(unix)]
+    fn put(&self, path: &Path, bytes: &[u8]) -> Result<(), Fail> {
+        let (folder, name) = folder_and_name(path)?;
+        let dir = at::Dir::open(folder)?;
+        if self.dirs.contains(&dir.id) || inside(&self.roots, folder) {
+            return Err(Fail::Refused("is in the project folder".into()));
+        }
+        let (staged, mut file) = dir.create_new(&name)?;
+        let id = handle_id(&file).ok().flatten();
+        let done = (|| {
+            use std::io::Write;
+            if !file.metadata()?.is_file() {
+                return Err(Fail::Refused("is not a plain file".into()));
+            }
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            tests::before_rename(folder, &staged);
+            dir.rename(&staged, &name)?;
+            Ok(())
+        })();
+        if done.is_err() && id.is_some() && dir.id_of(&staged) == id {
+            // Only the file this call made goes: the name is looked up in the opened folder.
+            let _ = dir.remove(&staged);
+        }
+        done
+    }
+
+    /// Write `bytes` as a new file next to `path`, checked by where its name leads, and give it
+    /// the name.
+    #[cfg(not(unix))]
+    fn put(&self, path: &Path, bytes: &[u8]) -> Result<(), Fail> {
         let (staged, file) = stage_next_to(path)?;
         let id = handle_id(&file).ok().flatten();
-        // A refusal says why the file must not be written; any other failure (a full disk, a
-        // rename across devices) is the plain I/O error with its path.
         let done = match self.check_staged(&staged, &file, id) {
             Err(why) => {
                 // Closed first, so Windows can remove it.
                 drop(file);
-                Err(refuse(&why))
+                Err(Fail::Refused(why))
             }
             Ok(()) => {
                 use std::io::Write;
                 let mut file = file;
                 file.write_all(bytes)
                     .and_then(|()| file.sync_all())
-                    .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
-                    .and_then(|()| {
-                        std::fs::rename(&staged, path)
-                            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
-                    })
+                    .and_then(|()| std::fs::rename(&staged, path))
+                    .map_err(Fail::Io)
             }
         };
         if done.is_err() {
@@ -174,6 +231,7 @@ impl ProjectFiles {
 
     /// Why the new file `file` (identity `id`), just made at `staged`, must not be written, if
     /// it must not.
+    #[cfg(not(unix))]
     fn check_staged(&self, staged: &Path, file: &File, id: Option<(u64, u64)>) -> Result<(), String> {
         let meta = file.metadata().map_err(|e| format!("could not be looked at ({e})"))?;
         if !meta.is_file() {
@@ -202,11 +260,151 @@ pub fn write_output(guard: Option<&ProjectFiles>, path: &Path, bytes: impl AsRef
     }
 }
 
-/// A new, empty file in the folder of `path`, with a name nothing had: a name already there,
-/// a link too, is never opened.
-fn stage_next_to(path: &Path) -> io::Result<(PathBuf, File)> {
+/// Why [`ProjectFiles::put`] did not write: refused, or an I/O failure of its own.
+#[derive(Debug)]
+enum Fail {
+    Refused(String),
+    Io(io::Error),
+}
+
+impl From<io::Error> for Fail {
+    fn from(e: io::Error) -> Self {
+        Fail::Io(e)
+    }
+}
+
+/// The folder `path` is in (`.` for a bare name) and its file name.
+#[cfg(unix)]
+fn folder_and_name(path: &Path) -> io::Result<(&Path, std::ffi::OsString)> {
+    let folder = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the output path names no file"))?;
+    Ok((folder, name.to_owned()))
+}
+
+/// A name for a staging file next to the file named `name`, unused so far by this process.
+fn staging_name(name: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!(".{name}.{}-{n}-{nanos}.wc-tmp", std::process::id())
+}
+
+/// Files made, looked at, renamed and removed relative to an opened folder (`openat` and
+/// friends), so that no folder name is looked up again after the folder was checked.
+#[cfg(unix)]
+mod at {
+    use std::ffi::{CString, OsStr, OsString};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Path;
+
+    /// An opened folder and its identity (device and inode).
+    pub(super) struct Dir {
+        file: File,
+        pub(super) id: (u64, u64),
+    }
+
+    fn c_name(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name holds a NUL byte"))
+    }
+
+    impl Dir {
+        /// Open the folder at `path` (links in it followed: what counts is the folder reached).
+        pub(super) fn open(path: &Path) -> io::Result<Dir> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(path)?;
+            let m = file.metadata()?;
+            if !m.is_dir() {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
+            }
+            Ok(Dir {
+                id: (m.dev(), m.ino()),
+                file,
+            })
+        }
+
+        /// A new, empty file in this folder with an unused name made from `name`: a name
+        /// already there, a link too, is never opened.
+        pub(super) fn create_new(&self, name: &OsStr) -> io::Result<(OsString, File)> {
+            let mut last = None;
+            for _ in 0..16 {
+                let staged = OsString::from(super::staging_name(&name.to_string_lossy()));
+                let c = c_name(&staged)?;
+                // SAFETY: the folder's descriptor is open and `c` is a NUL-terminated name.
+                let fd = unsafe {
+                    libc::openat(
+                        self.file.as_raw_fd(),
+                        c.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        0o666 as libc::c_uint,
+                    )
+                };
+                if fd >= 0 {
+                    // SAFETY: `fd` was just opened and is owned by nothing else.
+                    return Ok((staged, unsafe { File::from_raw_fd(fd) }));
+                }
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+                last = Some(e);
+            }
+            Err(last.unwrap_or_else(|| io::Error::other("no free name for the output file")))
+        }
+
+        /// Give the file named `from` in this folder the name `to` in this folder.
+        pub(super) fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+            let (from, to) = (c_name(from)?, c_name(to)?);
+            let fd = self.file.as_raw_fd();
+            // SAFETY: the folder's descriptor is open and both names are NUL-terminated.
+            if unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        /// The identity of the entry `name` in this folder, a link not followed.
+        pub(super) fn id_of(&self, name: &OsStr) -> Option<(u64, u64)> {
+            let c = c_name(name).ok()?;
+            // SAFETY: an all-zero `stat` is a valid value (plain integers).
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: the folder's descriptor is open, `c` is NUL-terminated and `st` is a
+            // valid place to write to.
+            let r = unsafe { libc::fstatat(self.file.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+            #[allow(clippy::unnecessary_cast)] // the field types differ between systems
+            (r == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+        }
+
+        /// Remove the file `name` from this folder.
+        pub(super) fn remove(&self, name: &OsStr) -> io::Result<()> {
+            let c = c_name(name)?;
+            // SAFETY: the folder's descriptor is open and `c` is NUL-terminated.
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A new, empty file in the folder of `path`, with a name nothing had: a name already there,
+/// a link too, is never opened.
+#[cfg(not(unix))]
+fn stage_next_to(path: &Path) -> io::Result<(PathBuf, File)> {
     let folder = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -217,11 +415,7 @@ fn stage_next_to(path: &Path) -> io::Result<(PathBuf, File)> {
         .unwrap_or_default();
     let mut last = None;
     for _ in 0..16 {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let staged = folder.join(format!(".{name}.{}-{n}-{nanos}.wc-tmp", std::process::id()));
+        let staged = folder.join(staging_name(&name));
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&staged) {
             Ok(f) => return Ok((staged, f)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
@@ -436,6 +630,7 @@ mod tests {
         ProjectFiles {
             roots: vec![],
             files: HashSet::new(),
+            dirs: HashSet::new(),
             unknown: None,
         }
     }
@@ -501,16 +696,60 @@ mod tests {
         let file = sub.join("list.csv");
         assert!(!g.holds(&file)?);
         std::os::unix::fs::symlink(p.path().join("pages"), &sub)?;
-        // Past the look, as if the swap came right after it.
-        let (staged, f) = stage_next_to(&file)?;
-        let id = handle_id(&f)?;
-        assert!(g.check_staged(&staged, &f, id).is_err());
-        drop(f);
-        std::fs::remove_file(&staged)?;
-        // Through `write` as a whole: refused and nothing left in the project.
-        assert!(g.write(&file, b"x").is_err());
+        // Past the look, as if the swap came right after it: the opened folder is the
+        // project's by its identity, refused and nothing left in the project.
+        let e = g.write(&file, b"x").err().ok_or("written into the project")?;
+        assert!(e.to_string().contains("project folder"), "{e}");
         assert!(!p.path().join("pages").join("list.csv").exists());
         assert!(no_temp_left(&p.path().join("pages"))?);
+        Ok(())
+    }
+
+    /// What to do in the next write right before its rename, on this thread.
+    #[cfg(unix)]
+    type Swap = Box<dyn FnOnce(&Path, &std::ffi::OsStr) -> io::Result<()>>;
+
+    #[cfg(unix)]
+    thread_local! {
+        static SWAP: std::cell::RefCell<Option<Swap>> = std::cell::RefCell::new(None);
+    }
+
+    /// Called by [`ProjectFiles::put`] after its checks, right before the rename.
+    #[cfg(unix)]
+    pub(super) fn before_rename(folder: &Path, staged: &std::ffi::OsStr) {
+        if let Some(swap) = SWAP.with(|s| s.borrow_mut().take()) {
+            let done = swap(folder, staged);
+            assert!(done.is_ok(), "the swap failed: {done:?}");
+        }
+    }
+
+    /// The output folder swapped for a link into the project after every check, with an entry
+    /// of the staging file's name planted there: the rename still happens in the folder that
+    /// was opened and checked, and the project's files stay as they were (#471).
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_after_the_checks_does_not_redirect_the_rename() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let sub = out.path().join("exports");
+        std::fs::create_dir(&sub)?;
+        let file = sub.join("p1.page.json");
+        let pages = p.path().join("pages");
+        let moved = out.path().join("exports-old");
+        let (pages2, moved2, sub2) = (pages.clone(), moved.clone(), sub.clone());
+        SWAP.with(|s| {
+            *s.borrow_mut() = Some(Box::new(move |_folder: &Path, staged: &std::ffi::OsStr| {
+                std::fs::rename(&sub2, &moved2)?;
+                std::os::unix::fs::symlink(&pages2, &sub2)?;
+                std::fs::write(pages2.join(staged), "planted")?;
+                Ok(())
+            }))
+        });
+        g.write(&file, b"exported")?;
+        assert_eq!(std::fs::read_to_string(pages.join("p1.page.json"))?, "page one");
+        assert_eq!(std::fs::read_to_string(moved.join("p1.page.json"))?, "exported");
+        assert!(no_temp_left(&moved)?);
         Ok(())
     }
 
