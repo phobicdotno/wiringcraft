@@ -3181,6 +3181,43 @@ mod tests {
         assert!(dir.join(".git").exists(), "made and recorded all the same");
     }
 
+    #[test]
+    fn an_assistant_edit_is_checked_while_drawing() {
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let mut ids = Vec::new();
+        for x in [20.0, 60.0] {
+            let id = o.place(1, "wc.coil", Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+            ids.push(id);
+        }
+        o.touch();
+        let ctx = egui::Context::default();
+        let drawn_twice = |a: &App| a.ed.live.iter().filter(|f| f.message.contains("-K1 is drawn")).count();
+        // Well within the sweep: only the edit's own revision can start the check.
+        let until = |a: &mut App, want: usize| {
+            for _ in 0..100 {
+                a.live_check(&ctx);
+                if drawn_twice(a) == want && !a.live.busy() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        until(&mut a, 2);
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // The assistant renames the second coil: no input in any frame.
+        call(
+            &mut a,
+            "update_symbol",
+            json!({"page": "p0002", "id": ids[1], "tag": "-K2"}),
+        )
+        .unwrap();
+        until(&mut a, 0);
+        assert_eq!(drawn_twice(&a), 0, "{:?}", a.ed.live);
+    }
+
     fn until_fetched_once(a: &mut App) {
         a.poll_fetch(&egui::Context::default());
     }

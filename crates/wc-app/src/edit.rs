@@ -479,7 +479,7 @@ impl Open {
                 *g = g.translate(d);
             }
         }
-        self.dirty = true;
+        self.edited();
     }
 
     /// Delete several items in one undo step. Wires on deleted symbols go too.
