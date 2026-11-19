@@ -231,6 +231,9 @@ pub(super) struct Placed {
     /// Some geometry was converted by the file's length unit, as its own context's unit was not
     /// known (or there are no placements, and the whole file is in the file's unit).
     pub file_unit_used: bool,
+    /// Of that, geometry or a placement drawn in a representation whose context names no
+    /// single length unit of its own.
+    pub context_unit_unknown: bool,
 }
 
 /// Move each point, given with the instance it was measured from, into the coordinates of the
@@ -301,6 +304,14 @@ pub(super) fn place(
     }
     // Millimetres per unit of a representation's context, when known.
     let rep_mm = |rep: u64| context.get(&rep).and_then(|c| context_mm(*c));
+    // Whether a representation's unit was not known and the file's was used instead.
+    let unknown = std::cell::Cell::new(false);
+    let unit_of = |rep: u64| {
+        rep_mm(rep).unwrap_or_else(|| {
+            unknown.set(true);
+            file_mm
+        })
+    };
     let mut frames = Frames(items.keys().map(|id| (*id, *id)).collect());
     // Relationships: (child, parent, transformation), the transformation absent when both are
     // drawn in the same coordinates.
@@ -352,7 +363,7 @@ pub(super) fn place(
         let Some(t) = transformation else { continue };
         // Each placement's move in its own representation's unit; a frame only joins
         // representations of one context, so the representation's unit is its frame's.
-        let (child_mm, parent_mm) = (rep_mm(child).unwrap_or(file_mm), rep_mm(parent).unwrap_or(file_mm));
+        let (child_mm, parent_mm) = (unit_of(child), unit_of(parent));
         let (child, parent) = (frames.find(child), frames.find(parent));
         let Some((kind, args)) = simple(instances, t) else {
             continue;
@@ -396,12 +407,11 @@ pub(super) fn place(
                 (kind == "REPRESENTATION_MAP").then_some(())?;
                 let mapped = map.get(1)?.as_ref_id()?;
                 items.contains_key(&mapped).then_some(())?;
-                let from = axis_placement(instances, map.first()?.as_ref_id()?, point)?
-                    .moved_in(rep_mm(mapped).unwrap_or(file_mm));
+                let from = axis_placement(instances, map.first()?.as_ref_id()?, point)?.moved_in(unit_of(mapped));
                 let target = args.get(2)?.as_ref_id()?;
                 let to = axis_placement(instances, target, point)
                     .or_else(|| operator_placement(instances, target, point))?
-                    .moved_in(rep_mm(*rep).unwrap_or(file_mm));
+                    .moved_in(unit_of(*rep));
                 Some((mapped, from.inverse().then(&to)))
             })();
             if let Some((mapped, placement)) = found {
@@ -487,15 +497,10 @@ pub(super) fn place(
         .collect();
     let pieces = |list: &[u64]| -> Vec<&Geom> { list.iter().filter_map(|id| geom_of.get(id)).flatten().collect() };
     // Each frame's geometry in millimetres; the file's unit when its own is not known.
-    let frame_mm: BTreeMap<u64, f64> = own
-        .keys()
-        .map(|frame| {
-            let mm = rep_mm(*frame);
-            out.file_unit_used |= mm.is_none();
-            (*frame, mm.unwrap_or(file_mm))
-        })
-        .collect();
+    let frame_mm: BTreeMap<u64, f64> = own.keys().map(|frame| (*frame, unit_of(*frame))).collect();
     let to_mm = |frame: u64| Placement::scaling(frame_mm.get(&frame).copied().unwrap_or(file_mm));
+    out.context_unit_unknown = unknown.get();
+    out.file_unit_used |= out.context_unit_unknown;
 
     // Walk down from the frames no one places.
     let placed: BTreeSet<u64> = children.values().flatten().map(|(c, _)| *c).collect();

@@ -283,8 +283,13 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     };
     let placed = assembly::place(text, &instances, pts, &point, mm, &context_mm);
     // The file's unit is only a guess for geometry not measured in its own context's unit.
-    if placed.file_unit_used {
-        warnings.extend(unit_warning);
+    match unit_warning {
+        Some(w) if placed.file_unit_used => warnings.push(w),
+        // The file's one unit, taken for a part whose own context names none: a guess too.
+        None if placed.context_unit_unknown => warnings.push(format!(
+            "some parts of the assembly name no length unit of their own; the file's ({mm} mm) is used for them"
+        )),
+        _ => {}
     }
     if placed.missed > 0 {
         warnings.push(format!(

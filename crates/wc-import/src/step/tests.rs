@@ -891,13 +891,12 @@ fn an_operator_axis2_all_but_along_its_axes_keeps_y_square() {
     assert!(warnings.is_empty(), "{warnings:?}");
 }
 
-#[test]
-fn an_inch_part_placed_in_a_millimetre_assembly_is_converted_before_it_is_placed() {
-    // The part, 1 x 2 x 3 inches, is drawn in an inch context and placed twice, at x 0 and 50 mm,
-    // in a millimetre assembly: 50 + 25.4 = 75.4 mm across.
+/// A part, 1 x 2 x 3 inches, drawn in an inch context (#905) and placed twice, at x 0 and 50
+/// mm, in a millimetre assembly (#400 in #901).
+fn inch_part_in_millimetre_assembly() -> String {
     let part = box_vertices([0.0; 3], [1.0, 2.0, 3.0]);
     let vertices: Vec<String> = (1..=8).map(|k| format!("#{}", 2 * k)).collect();
-    let text = step(
+    step(
         MM,
         &format!(
             "{part}#321=CARTESIAN_POINT('',(0.,0.,0.));\n#320=AXIS2_PLACEMENT_3D('',#321,$,$);\n\
@@ -914,7 +913,13 @@ fn an_inch_part_placed_in_a_millimetre_assembly_is_converted_before_it_is_placed
             placed_by_relationship(500, 320, 410),
             placed_by_relationship(510, 320, 420)
         ),
-    );
+    )
+}
+
+#[test]
+fn an_inch_part_placed_in_a_millimetre_assembly_is_converted_before_it_is_placed() {
+    // 50 + 25.4 = 75.4 mm across.
+    let text = inch_part_in_millimetre_assembly();
     let (s, warnings) = size(&text);
     let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
     assert!(
@@ -944,4 +949,37 @@ fn an_inch_part_placed_in_a_millimetre_assembly_is_converted_before_it_is_placed
         "{s:?}"
     );
     assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_part_or_placement_without_a_unit_of_its_own_is_warned_about() {
+    let text = inch_part_in_millimetre_assembly();
+    // The part's context names no unit: the file's one unit (mm) is taken, with a warning.
+    let no_part_unit = text.replace(
+        "#905=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#912)) REPRESENTATION_CONTEXT('',''));",
+        "#905=(GEOMETRIC_REPRESENTATION_CONTEXT(3) REPRESENTATION_CONTEXT('',''));",
+    );
+    assert_ne!(no_part_unit, text);
+    let (s, warnings) = size(&no_part_unit);
+    assert!((s.width - 51.0).abs() < 1e-9, "{s:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("some parts of the assembly name no length unit of their own")),
+        "{warnings:?}"
+    );
+    // The assembly's context names no unit: its placements' moves take the file's unit (the
+    // part's inch, the unit of the context holding the geometry), which is a guess too.
+    let no_assembly_unit = text.replace(
+        "#400=SHAPE_REPRESENTATION('',(#410,#420),#901);",
+        "#906=(GEOMETRIC_REPRESENTATION_CONTEXT(3) REPRESENTATION_CONTEXT('',''));\n#400=SHAPE_REPRESENTATION('',(#410,#420),#906);",
+    );
+    assert_ne!(no_assembly_unit, text);
+    let (_, warnings) = size(&no_assembly_unit);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("some parts of the assembly name no length unit of their own")),
+        "{warnings:?}"
+    );
 }
