@@ -129,10 +129,11 @@ pub(super) fn axis_placement(
 fn x_axis(z: [f64; 3], reference: Option<[f64; 3]>) -> Option<[f64; 3]> {
     match reference.and_then(|r| square_to(z, r)) {
         Some((x, _)) => Some(x),
+        // The first that can be made square: its length may underflow to nothing for a tilt
+        // of 1e-200, yet the direction is still there.
         None => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
             .into_iter()
-            .filter_map(|r| square_to(z, r))
-            .find(|(_, len)| *len > 0.0)
+            .find_map(|r| square_to(z, r))
             .map(|(x, _)| x),
     }
 }

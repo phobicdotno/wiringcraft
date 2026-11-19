@@ -827,3 +827,66 @@ fn a_loose_point_that_is_also_an_operator_origin_is_still_measured() {
         }
     );
 }
+
+/// The box placed by an axis placement with axis `z` and no reference direction.
+fn placed_on_axis(z: [f64; 3]) -> String {
+    assembly(
+        &["#410"],
+        &format!(
+            "#410=AXIS2_PLACEMENT_3D('',#411,#412,$);\n#411=CARTESIAN_POINT('',(0.,0.,0.));\n#412=DIRECTION('',({:?},{:?},{:?}));\n{}",
+            z[0],
+            z[1],
+            z[2],
+            placed_by_relationship(500, 320, 410)
+        ),
+        "",
+    )
+}
+
+#[test]
+fn an_axis_all_but_along_x_still_takes_the_world_x_as_reference() {
+    // Without a reference direction the world's x, made square to the axis, is the part's x
+    // (here world -z) however little the axis leans off x; its y stays the world's y.
+    for tilt in [1e-15, 1e-200] {
+        let (s, warnings) = size(&placed_on_axis([1.0, 0.0, tilt]));
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(
+            near(s.width, 5.0) && near(s.height, 20.0) && near(s.depth, 10.0),
+            "tilt {tilt}: {s:?}"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+    // Exactly along x the world's y is the part's x and z its y.
+    let (s, _) = size(&placed_on_axis([1.0, 0.0, 0.0]));
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 5.0,
+            height: 10.0,
+            depth: 20.0
+        }
+    );
+}
+
+#[test]
+fn an_operator_axis2_all_but_along_its_axes_keeps_y_square() {
+    // axis3 and axis1 lie in the world's xy; axis2 leans 1e-17 off them toward world z, so
+    // y is world z, and the box's 20 mm stand up whole.
+    let text = assembly(
+        &["#600"],
+        "#601=REPRESENTATION_MAP(#320,#300);\n\
+         #600=MAPPED_ITEM('',#601,#602);\n\
+         #602=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',#604,#605,#603,$,#606);\n\
+         #603=CARTESIAN_POINT('',(0.,0.,0.));\n\
+         #604=DIRECTION('',(-1.,1.,0.));\n\
+         #605=DIRECTION('',(1.,1.,1.E-17));\n\
+         #606=DIRECTION('',(1.,1.,0.));\n",
+        "",
+    );
+    let (s, warnings) = size(&text);
+    let diagonal = 15.0 / 2f64.sqrt();
+    assert!((s.width - diagonal).abs() < 1e-6, "{s:?}");
+    assert!((s.height - diagonal).abs() < 1e-6, "{s:?}");
+    assert!((s.depth - 20.0).abs() < 1e-6, "{s:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
