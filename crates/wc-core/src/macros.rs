@@ -226,6 +226,52 @@ impl Macro {
         Ok(out)
     }
 
+    /// Write `{{new}}` for each `{{old}}` in its texts (names matched without regard to case),
+    /// so a renamed placeholder keeps its uses. The placeholder and value sets are left to
+    /// the caller.
+    pub fn rename_placeholder(&mut self, old: &str, new: &str) {
+        self.rename_placeholders(&[(old, new)]);
+    }
+
+    /// [`Macro::rename_placeholder`] for several at once: each `(old, new)` is applied to the
+    /// texts as they were, so a swap (`a` to `b`, `b` to `a`) or a chain renames each use once.
+    pub fn rename_placeholders(&mut self, renames: &[(&str, &str)]) {
+        let map: BTreeMap<String, String> = renames
+            .iter()
+            .map(|(old, new)| (key(old), new.trim().to_owned()))
+            .collect();
+        if map.is_empty() {
+            return;
+        }
+        self.for_each_text_mut(|t| {
+            if !placeholder_names(t).iter().any(|n| map.contains_key(&key(n))) {
+                return;
+            }
+            let mut out = String::with_capacity(t.len());
+            let mut rest = t.as_str();
+            while let Some(start) = rest.find("{{") {
+                let Some(after) = rest.get(start + 2..) else { break };
+                let Some(end) = after.find("}}") else { break };
+                let (Some(before), Some(name), Some(token), Some(next)) = (
+                    rest.get(..start),
+                    after.get(..end),
+                    rest.get(start..start + 2 + end + 2),
+                    after.get(end + 2..),
+                ) else {
+                    break;
+                };
+                out.push_str(before);
+                match map.get(&key(name)) {
+                    Some(new) => out.push_str(&format!("{{{{{new}}}}}")),
+                    None => out.push_str(token),
+                }
+                rest = next;
+            }
+            out.push_str(rest);
+            *t = out;
+        });
+    }
+
     fn for_each_text(&self, mut f: impl FnMut(&str)) {
         let mut copy = self.clone();
         copy.for_each_text_mut(|t| f(t));
@@ -287,7 +333,7 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
 }
 
 /// How placeholder and value set names are compared: trimmed, without regard to case.
-fn key(name: &str) -> String {
+pub fn key(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
@@ -586,6 +632,31 @@ mod tests {
         assert_eq!(d.properties["Setting"], "5.5 A");
         let wrong: BTreeMap<String, String> = [("voltage".to_owned(), "400".to_owned())].into_iter().collect();
         assert!(m.apply(Some("3 kW"), &wrong).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_placeholder_keeps_its_uses() -> Result<()> {
+        let mut m = starter()?;
+        m.rename_placeholder(" KW ", "power");
+        assert_eq!(m.used_placeholders(), ["power", "part", "current", "section"]);
+        let d = &m.devices[&DeviceTag::parse("-Q1")?];
+        assert_eq!(d.description, "Motor starter {{power}} kW");
+        // Other placeholders and plain braces are left as written.
+        assert_eq!(d.properties["Setting"], "{{ current }} A");
+        Ok(())
+    }
+
+    #[test]
+    fn placeholders_renamed_together_are_each_renamed_once() -> Result<()> {
+        // A swap: each use takes the other's name, not both the same one.
+        let mut m = starter()?;
+        m.rename_placeholders(&[("kW", "part"), ("part", "kW")]);
+        assert_eq!(m.used_placeholders(), ["part", "kW", "current", "section"]);
+        // A chain: kW becomes current and current becomes amps, each use once.
+        let mut m = starter()?;
+        m.rename_placeholders(&[("kW", "current"), ("current", "amps")]);
+        assert_eq!(m.used_placeholders(), ["current", "part", "amps", "section"]);
         Ok(())
     }
 

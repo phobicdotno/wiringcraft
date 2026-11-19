@@ -16,6 +16,7 @@ mod icons;
 mod import_symbols;
 mod layers;
 mod live_check;
+mod macro_form;
 mod panel_view;
 mod panels;
 mod prefs;
@@ -184,6 +185,11 @@ enum Dialog {
     },
     /// Macros to insert.
     Macros(Vec<state::MacroEntry>),
+    /// A project macro's placeholders and value sets (Insert macro, Placeholders…).
+    MacroEdit {
+        form: Box<macro_form::Form>,
+        error: Option<String>,
+    },
     /// Library, Import symbols: the library folders to import into and the one chosen.
     ImportSymbols {
         targets: Vec<import_symbols::ImportTarget>,
@@ -1226,6 +1232,7 @@ impl App {
             Dialog::Fetching(_) => "New project",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
+            Dialog::MacroEdit { .. } => "Macro placeholders",
             Dialog::ImportSymbols { .. } => "Import symbols",
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
@@ -1311,7 +1318,7 @@ impl App {
                         );
                     }
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                        egui::Grid::new("macros").striped(true).num_columns(3).show(ui, |ui| {
+                        egui::Grid::new("macros").striped(true).num_columns(4).show(ui, |ui| {
                             for m in list.iter() {
                                 ui.vertical(|ui| {
                                     ui.set_min_width(320.0);
@@ -1323,6 +1330,21 @@ impl App {
                                     }
                                 });
                                 ui.label(m.source.as_str());
+                                // A project macro's placeholders and variants are edited here; a
+                                // library's macros belong to the library.
+                                if m.project {
+                                    if ui
+                                        .button("Placeholders…")
+                                        .on_hover_text("Declare its placeholders and the value sets of its variants")
+                                        .clicked()
+                                    {
+                                        let path = m.path.clone();
+                                        then = Some(Box::new(move |app: &mut App| app.edit_macro(&path)));
+                                        keep = false;
+                                    }
+                                } else {
+                                    ui.label("");
+                                }
                                 if m.value_sets.is_empty() || m.error.is_some() {
                                     if ui.add_enabled(m.error.is_none(), egui::Button::new("Insert")).clicked() {
                                         let path = m.path.clone();
@@ -1353,6 +1375,40 @@ impl App {
                     if ui.button("Close").clicked() {
                         keep = false;
                     }
+                }
+                Dialog::MacroEdit { form, error } => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("macro-edit-scroll")
+                        .max_height(ui.ctx().screen_rect().height() * 0.6)
+                        .show(ui, |ui| macro_form::show(ui, form));
+                    if let Some(e) = error {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            match form.save() {
+                                Ok(path) => {
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        app.ed.message = format!("Saved macro {}", path.display());
+                                        if let Some(open) = &app.open {
+                                            app.dialog = Some(Dialog::Macros(open.macros()));
+                                        }
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            then = Some(Box::new(|app: &mut App| {
+                                if let Some(open) = &app.open {
+                                    app.dialog = Some(Dialog::Macros(open.macros()));
+                                }
+                            }));
+                            keep = false;
+                        }
+                    });
                 }
                 Dialog::Report { log, include } => {
                     ui.label(
@@ -2957,6 +3013,17 @@ impl App {
     }
 
     /// Insert a macro on the current page, selected so it can be dragged into place.
+    /// Open the placeholders dialog on the project macro in `path`.
+    fn edit_macro(&mut self, path: &std::path::Path) {
+        self.dialog = Some(match macro_form::Form::open(path) {
+            Ok(form) => Dialog::MacroEdit {
+                form: Box::new(form),
+                error: None,
+            },
+            Err(e) => Dialog::Message(format!("The macro could not be read:\n{e}")),
+        });
+    }
+
     fn insert_macro(&mut self, path: &std::path::Path, name: &str, value_set: Option<&str>) {
         let page = self.ed.page;
         let Some(open) = self.open.as_mut() else { return };
