@@ -851,6 +851,18 @@ fn through_fit_points_closed(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f
     if !fit.iter().all(|pt| pt.0.is_finite() && pt.1.is_finite()) {
         return None;
     }
+    // Degree 1 is the closed polygon through the points as given, every one of them kept.
+    if degree == 1 {
+        if !(3..=MAX_FIT_POINTS).contains(&fit.len()) {
+            return None;
+        }
+        let mut out = fit.to_vec();
+        let first = *fit.first()?;
+        if fit.last() != Some(&first) {
+            out.push(first);
+        }
+        return Some(out);
+    }
     let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1) <= 1e-12;
     let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
     for &pt in fit {
@@ -866,17 +878,12 @@ fn through_fit_points_closed(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f
         return None;
     }
     let p = if degree == 0 { 3 } else { degree }.min(MAX_SPLINE_DEGREE).min(n - 1);
-    if p == 1 {
-        let mut out = q.clone();
-        out.push(*q.first()?);
-        return Some(out);
-    }
     // Chord-length parameters around the loop, period 1.
     let mut params = Vec::with_capacity(n);
     let mut total = 0.0;
-    for k in 0..n {
+    for (k, a) in q.iter().enumerate() {
         params.push(total);
-        let (a, b) = (q[k], q[(k + 1) % n]);
+        let b = q.get((k + 1) % n)?;
         total += (b.0 - a.0).hypot(b.1 - a.1);
     }
     if !(total.is_finite() && total > 0.0) {
@@ -886,23 +893,25 @@ fn through_fit_points_closed(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f
         *t /= total;
     }
     // The parameter of point j for any j, one period further for each loop.
-    let param = |j: i64| {
+    let param = |j: i64| -> Option<f64> {
         let k = j.rem_euclid(n as i64);
-        params[k as usize] + (j - k).div_euclid(n as i64) as f64
+        Some(params.get(k as usize)? + (j - k).div_euclid(n as i64) as f64)
     };
     // Periodic knot j: at a parameter for an odd degree, halfway to the next for an even one.
-    let tau = |j: i64| {
+    let tau = |j: i64| -> Option<f64> {
         if p % 2 == 1 {
             param(j)
         } else {
-            (param(j) + param(j + 1)) / 2.0
+            Some((param(j)? + param(j + 1)?) / 2.0)
         }
     };
     // n + p control points (the last p repeat the first p) over n + 2p + 1 knots; the curve's
     // range [knot p, knot n + p] is one period, from the first point's parameter (odd degree)
     // or from halfway to the second (even degree).
-    let knots: Vec<f64> = (0..n + 2 * p + 1).map(|m| tau(m as i64 - p as i64)).collect();
-    let (u0, u1) = (knots[p], knots[n + p]);
+    let knots: Vec<f64> = (0..n + 2 * p + 1)
+        .map(|m| tau(m as i64 - p as i64))
+        .collect::<Option<_>>()?;
+    let (u0, u1) = (*knots.get(p)?, *knots.get(n + p)?);
     // One row per fit point: the basis functions at its parameter, folded onto the n
     // control points.
     let mut a = vec![0.0; n * n];
@@ -916,7 +925,7 @@ fn through_fit_points_closed(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f
         }
     }
     let ctrl = solve_dense(a, &q)?;
-    let ext: Vec<(f64, f64)> = (0..n + p).map(|i| ctrl[i % n]).collect();
+    let ext: Vec<(f64, f64)> = ctrl.iter().chain(ctrl.iter().take(p)).copied().collect();
     let mut out = bspline_points(&ext, &knots, &[], p)?;
     // The curve ends where it starts; snap the rounding away.
     let first = *out.first()?;
@@ -936,10 +945,16 @@ fn solve_dense(mut a: Vec<f64>, rhs: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
     if a.len() != n * n {
         return None;
     }
+    let at = |a: &[f64], i: usize, c: usize| a.get(i * n + c).copied();
     let mut b: Vec<(f64, f64)> = rhs.to_vec();
     for j in 0..n {
-        let pivot = (j..n).max_by(|&x, &y| a[x * n + j].abs().total_cmp(&a[y * n + j].abs()))?;
-        if a[pivot * n + j].abs() < 1e-14 {
+        let mut pivot = j;
+        for i in j + 1..n {
+            if at(&a, i, j)?.abs() > at(&a, pivot, j)?.abs() {
+                pivot = i;
+            }
+        }
+        if at(&a, pivot, j)?.abs() < 1e-14 {
             return None;
         }
         if pivot != j {
@@ -948,27 +963,31 @@ fn solve_dense(mut a: Vec<f64>, rhs: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
             }
             b.swap(pivot, j);
         }
-        let d = a[j * n + j];
+        let d = at(&a, j, j)?;
+        let bj = *b.get(j)?;
         for i in j + 1..n {
-            let f = a[i * n + j] / d;
+            let f = at(&a, i, j)? / d;
             if f == 0.0 {
                 continue;
             }
             for c in j..n {
-                a[i * n + c] -= f * a[j * n + c];
+                let v = at(&a, j, c)?;
+                *a.get_mut(i * n + c)? -= f * v;
             }
-            b[i].0 -= f * b[j].0;
-            b[i].1 -= f * b[j].1;
+            let bi = b.get_mut(i)?;
+            bi.0 -= f * bj.0;
+            bi.1 -= f * bj.1;
         }
     }
     for j in (0..n).rev() {
-        let (mut x, mut y) = b[j];
+        let (mut x, mut y) = *b.get(j)?;
         for c in j + 1..n {
-            x -= a[j * n + c] * b[c].0;
-            y -= a[j * n + c] * b[c].1;
+            let (v, bc) = (at(&a, j, c)?, *b.get(c)?);
+            x -= v * bc.0;
+            y -= v * bc.1;
         }
-        let d = a[j * n + j];
-        b[j] = (x / d, y / d);
+        let d = at(&a, j, j)?;
+        *b.get_mut(j)? = (x / d, y / d);
     }
     b.iter().all(|(x, y)| x.is_finite() && y.is_finite()).then_some(b)
 }
@@ -1994,11 +2013,35 @@ mod tests {
                 assert!(d < 0.05, "degree {degree}: {f:?} is {d} away");
             }
         }
-        // Degree 1 is the closed polygon.
+        // Degree 1 is the closed polygon, every vertex kept, even ones closer than the
+        // repeat tolerance.
         assert_eq!(
             through_fit_points_closed(&square, 1),
             Some(vec![square[0], square[1], square[2], square[3], square[0]])
         );
+        let tiny = [(0.0, 0.0), (0.0, 5e-13), (2e-12, 0.0), (4e-12, 0.0)];
+        assert_eq!(
+            through_fit_points_closed(&tiny, 1),
+            Some(vec![tiny[0], tiny[1], tiny[2], tiny[3], tiny[0]])
+        );
+        // Degrees 4 and 5 need more than four points to be used as asked: eight on a circle.
+        let ring: Vec<(f64, f64)> = (0..8)
+            .map(|k| {
+                let t = k as f64 * std::f64::consts::TAU / 8.0;
+                (10.0 * t.cos(), 10.0 * t.sin())
+            })
+            .collect();
+        for degree in [4, 5] {
+            let a = through_fit_points_closed(&ring, degree).unwrap_or_default();
+            assert!(a.len() > 10, "degree {degree}");
+            assert_eq!(a.first(), a.last(), "degree {degree}");
+            for f in &ring {
+                let d = a.iter().map(|q| (q.0 - f.0).hypot(q.1 - f.1)).fold(f64::MAX, f64::min);
+                assert!(d < 0.05, "degree {degree}: {f:?} is {d} away");
+            }
+            // A round curve: close to the circle everywhere.
+            assert!(a.iter().all(|q| (q.0.hypot(q.1) - 10.0).abs() < 0.2), "degree {degree}");
+        }
         // Too few distinct points, or points that are not numbers, give none.
         assert!(through_fit_points_closed(&[(0.0, 0.0), (1.0, 1.0), (0.0, 0.0)], 3).is_none());
         assert!(through_fit_points_closed(&[(0.0, 0.0), (f64::NAN, 1.0), (2.0, 0.0)], 3).is_none());
