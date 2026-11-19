@@ -495,27 +495,24 @@ pub fn draw_network_page(
             warnings.push(w);
         }
     };
-    for n in &net.nodes {
-        if let Err(why) = n.device.trim().parse::<wc_core::DeviceTag>() {
-            warn(format!("node {:?}: {why}", n.device.trim()));
+    // Warnings name nodes and links by their number, not by text that failed to parse: the
+    // app writes them to its local log, and unparsed text can be any drawing text.
+    for (i, n) in net.nodes.iter().enumerate() {
+        if n.device.trim().parse::<wc_core::DeviceTag>().is_err() {
+            warn(format!("node {} is not a device tag", i + 1));
         }
     }
     for (k, l) in net.links.iter().enumerate() {
-        for end in [&l.from, &l.to] {
-            if let Err(why) = Port::parse(end) {
-                warn(format!("link {}: {why}", k + 1));
+        for (side, end) in [("from", &l.from), ("to", &l.to)] {
+            if Port::parse(end).is_err() {
+                warn(format!("link {}: its {side} end is not a device or port", k + 1));
             }
         }
     }
     let topo = layout_network(net);
     for &k in &topo.unplaced {
-        if let Some(l) = net.links.get(k) {
-            warn(format!(
-                "link {} ({} to {}) is not drawn: an end names no device",
-                k + 1,
-                l.from.trim(),
-                l.to.trim()
-            ));
+        if k < net.links.len() {
+            warn(format!("link {} is not drawn: an end names no device", k + 1));
         }
     }
     let g = grid(&topo, w, h, band);

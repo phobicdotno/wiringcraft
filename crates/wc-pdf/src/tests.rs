@@ -1873,13 +1873,13 @@ fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about
     let text = String::from_utf8_lossy(&pdf);
     assert!(text.contains(&writer::pdf_text("P1 - P2 -W9")));
     assert!(text.contains(&writer::pdf_text("P3 - P4 -W8")));
-    // Drawn as written, and why it is not a tag is a warning.
+    // Drawn as written; the warning names the node by number, not by its text.
     assert!(text.contains(&writer::pdf_text("K 10?")));
     assert!(
         report
             .warnings
             .iter()
-            .any(|w| w.starts_with("network PN2: node \"K 10?\"")),
+            .any(|w| w.starts_with("network PN2: node ") && w.ends_with(" is not a device tag")),
         "{:?}",
         report.warnings
     );
@@ -1918,7 +1918,12 @@ fn a_link_with_an_empty_end_is_warned_about_and_the_others_are_drawn() {
         report
             .warnings
             .iter()
-            .any(|w| w.starts_with("network PN3: link 2 (-K10:P2 to ) is not drawn")),
+            .any(|w| w == "network PN3: link 2 is not drawn: an end names no device"),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("-K10:P2")),
         "{:?}",
         report.warnings
     );
