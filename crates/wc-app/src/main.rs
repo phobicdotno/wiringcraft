@@ -2132,7 +2132,7 @@ impl App {
                                     {
                                         open.checkpoint();
                                         open.project.meta.libraries.insert(0, source);
-                                        open.dirty = true;
+                                        open.edited();
                                     }
                                     open.refresh_library();
                                 }
@@ -3198,8 +3198,8 @@ impl App {
             self.ed.live.clear();
             return;
         };
-        // A keystroke, a click or a drag may edit: while the project differs from what was
-        // checked, each one starts the wait again.
+        // A keystroke, a click or a drag may edit (even one that does not report itself in the
+        // revision): each one starts the wait again.
         let editing = ctx.input(|i| {
             i.pointer.any_down()
                 || i.events.iter().any(|e| {
@@ -3213,9 +3213,14 @@ impl App {
                     )
                 })
         });
-        let poll = self
-            .live
-            .poll(&o.project, &o.symbols, &o.parts, editing, std::time::Instant::now());
+        let poll = self.live.poll(
+            &o.project,
+            &o.symbols,
+            &o.parts,
+            o.revision(),
+            editing,
+            std::time::Instant::now(),
+        );
         // Show findings only once they are of exactly these inputs: a finished check, or the
         // checker's findings after the editor was replaced (the same project opened again, a
         // session joined). While a check is pending they may be of other inputs (another

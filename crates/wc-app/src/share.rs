@@ -17,6 +17,8 @@
 //! (the logo, page underlays) do the same: a guest gets the project's pictures when it joins,
 //! and a picture someone starts using goes out as an `AddPicture` edit before the change that
 //! names it, so every copy shows it and the host's folder keeps it with that change's commit.
+//! A change that picks a picture whose name the session has for another file waits until this
+//! copy has given its file a name of its own, so the pick is still one change.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, UdpSocket};
@@ -253,7 +255,7 @@ fn take_back_pages(
     if let Some(base) = base {
         base.sort_pages();
     }
-    open.dirty = true;
+    open.edited();
     notes.push(format!(
         "Your change to page {} was not kept, nor what you did on it after it.",
         ids.iter().map(|id| number_of(auth, id)).collect::<Vec<_>>().join(", ")
@@ -892,7 +894,7 @@ fn follow_take_backs(
         return;
     }
     // The lock changed, not yet in this copy's files.
-    open.dirty = true;
+    open.edited();
     delist.extend(dropped.iter().cloned());
     unload.extend(dropped);
     unload_taken_back(unload, open);
@@ -1235,11 +1237,14 @@ pub fn take_files(
                     }
                 }
                 open.symbols.insert(id, s.clone());
+                open.touch();
             }
             Err(e) => {
                 // A loaded version the lock no longer names is not drawn as if it were the
                 // session's; the next frame tries the write again.
-                open.symbols.remove(&id);
+                if open.symbols.remove(&id).is_some() {
+                    open.touch();
+                }
                 failed.push((name, e.to_string()));
             }
         }
@@ -1269,9 +1274,12 @@ pub fn take_files(
                     }
                 }
                 open.parts.insert(id, p.clone());
+                open.touch();
             }
             Err(e) => {
-                open.parts.remove(&id);
+                if open.parts.remove(&id).is_some() {
+                    open.touch();
+                }
                 failed.push((name, e.to_string()));
             }
         }
@@ -1424,6 +1432,54 @@ fn note_withdrawn(
         let seq = sent.get(&file).copied().flatten();
         withdrawn.insert(file, seq);
     }
+}
+
+/// The name a picture waits under among the items changes wait for ([`Held`]).
+fn picture_name(file: &str) -> String {
+    format!("picture {file}")
+}
+
+/// The pictures that logos and underlays picked in `open` since `base` wait for, by
+/// [`picture_name`]: each the session (`session`) has another file under the name of, read
+/// here, unless this copy took the session's and has not changed it since (`taken`). Those are
+/// renamed here at the sync ([`take_pictures`]), and the pick then goes out under the new name.
+/// A picture missing or unreadable here waits for nothing: it cannot be sent. Nor does one not
+/// compared now (`skip`): its change goes out, as before the comparison.
+fn waiting_pictures(
+    open: &Open,
+    base: &Project,
+    session: &BTreeMap<String, Vec<u8>>,
+    taken: &BTreeMap<String, PictureVersion>,
+    skip: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (r, file) in pic_refs(&open.project) {
+        if pic_ref_file(base, &r) == Some(file.as_str()) || out.contains(&picture_name(&file)) || skip.contains(&file) {
+            continue;
+        }
+        let Some(theirs) = session.get(&file) else {
+            continue;
+        };
+        let unchanged = taken
+            .get(&file)
+            .is_some_and(|was| still_taken(picture_version(&open.dir, &file).as_ref(), was));
+        // One that cannot be shared (empty, too big) is never renamed nor sent: it waits for
+        // nothing either.
+        let waits = !unchanged
+            && match wc_pdf::read_picture(&open.dir, &file) {
+                Ok(Some(data)) if data != *theirs => Picture {
+                    file: file.clone(),
+                    data,
+                }
+                .problem()
+                .is_none(),
+                _ => false,
+            };
+        if waits {
+            out.insert(picture_name(&file));
+        }
+    }
+    out
 }
 
 /// What [`new_pictures`] found.
@@ -1607,7 +1663,7 @@ fn rename_picture(open: &mut Open, file: &str, only: Option<&BTreeSet<PicRef>>) 
             u.file = new.clone();
         }
     }
-    open.dirty = true;
+    open.edited();
     Ok((new, picture.data))
 }
 
@@ -2347,7 +2403,7 @@ pub struct Share {
     /// session took their item back (`stale <name>`), reported once each.
     unreadable: std::collections::BTreeSet<String>,
     /// Pictures looked at for the session and not taken yet, by project path, with when: each
-    /// is looked at again only after [`ITEM_RETRY_LATER`]. Changes never wait for a picture.
+    /// is looked at again only after [`ITEM_RETRY_LATER`].
     pictures_out: BTreeMap<String, std::time::Instant>,
     /// Pictures this copy sent to the session, by project path, with the `seq` of the latest
     /// edit that sent each (a guest's): only a refusal of one of these makes this copy give a
@@ -2595,6 +2651,21 @@ impl Held {
         if !jumper_parts.is_empty() {
             items.extend(jumper_parts.iter().map(|id| item_name(ItemKind::Part, id)));
             held.now.meta = Some(Box::new(local.meta.clone()));
+        }
+        // A logo or underlay picked here waits for its picture ([`waiting_pictures`]).
+        for (r, file) in pic_refs(local) {
+            let name = picture_name(&file);
+            if pic_ref_file(base, &r) == Some(file.as_str()) || !waiting.contains(&name) {
+                continue;
+            }
+            items.insert(name);
+            match r {
+                PicRef::Logo => held.now.meta = Some(Box::new(local.meta.clone())),
+                PicRef::Underlay(id) => {
+                    let page = local.page(&id).cloned();
+                    held.now.pages.insert(id, page);
+                }
+            }
         }
         // A device new since `base` that a waiting page names waits with it: placing the symbol
         // made its record, and Undo of the placement takes both back here alone.
@@ -3729,6 +3800,7 @@ impl Share {
         note_withdrawn(&mut self.withdrawn_picks, &self.pictures_sent, withdrawn);
         let mut taken = names_to_rename(role.picture_names_taken(), &self.pictures_sent, &self.withdrawn_picks);
         taken.append(&mut self.clashes);
+        let refs_before: BTreeMap<PicRef, String> = pic_refs(&open.project).into_iter().collect();
         let renamed = rename_pictures(
             open,
             taken,
@@ -3746,6 +3818,15 @@ impl Share {
         // picture sent twice) renames nothing, not even a reference to the session's file of
         // that name that came in since.
         note_withdrawn(&mut self.withdrawn_picks, &self.pictures_sent, renamed);
+        // A pick that waited under the old name is held under the new one: an Undo asked for
+        // meanwhile still takes it back.
+        for (r, new) in pic_refs(&open.project) {
+            if let Some(old) = refs_before.get(&r).filter(|old| **old != new)
+                && let Some(i) = self.holding.iter().position(|h| *h == picture_name(old))
+            {
+                self.holding[i] = picture_name(&new);
+            }
+        }
         // Pictures used for the first time go out before the change that names them. Changes do
         // not wait for them: without its picture a page still works, it just shows a gap.
         let session_pictures = role.pictures();
@@ -3814,6 +3895,23 @@ impl Share {
         if undo {
             waiting.extend(self.holding.iter().cloned());
         }
+        // A logo or underlay picked here under a name the session has for another file waits
+        // until this copy gives its file a name of its own: the pick then goes out as one
+        // change, and one Undo takes it back.
+        let skip: BTreeSet<String> = self
+            .pictures_failed
+            .iter()
+            .chain(&self.renames_due)
+            .filter(|(_, at)| at.elapsed() < ITEM_RETRY_LATER)
+            .map(|(f, _)| f.clone())
+            .collect();
+        waiting.extend(waiting_pictures(
+            open,
+            self.base.as_ref()?,
+            role.pictures(),
+            &self.pictures_taken,
+            &skip,
+        ));
         note_renames(
             &mut self.device_renames,
             open.take_device_renames(),
@@ -3835,7 +3933,7 @@ impl Share {
             }
             if open.project != before {
                 // Also after a save: the copy on disk still has the change.
-                open.dirty = true;
+                open.edited();
             }
             // A rename taken back now ends at the tag it went back to, before anything else
             // can take the tag it left.
@@ -4058,7 +4156,7 @@ impl Share {
         }
         if changed {
             // Others' changes are in the window, not yet in this copy's files.
-            open.dirty = true;
+            open.edited();
         }
         if let Some(synced) = synced {
             if changed || sent || !out.dropped.is_empty() {

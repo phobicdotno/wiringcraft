@@ -17,6 +17,11 @@ pub const SETTLE: Duration = Duration::from_millis(300);
 /// How often the window looks for the result of a check that is running.
 const POLL: Duration = Duration::from_millis(50);
 
+/// How often the inputs are compared with the copy last checked even when no edit was seen, in
+/// frames that come anyway: a backstop for an edit that reached the project some way that
+/// does not change [`Open::revision`](crate::state::Open::revision).
+pub const SWEEP: Duration = Duration::from_secs(2);
+
 /// The inputs of one check.
 struct Snapshot {
     project: Project,
@@ -30,14 +35,28 @@ impl Snapshot {
     }
 }
 
+/// The inputs may differ from the ones last checked.
+#[derive(Debug, Clone, Copy)]
+struct Wait {
+    /// The latest edit seen was at this time. The check waits until nothing has been edited
+    /// for [`SETTLE`].
+    since: Instant,
+    /// An edit is known (the revision changed); otherwise only input was seen, which may or
+    /// may not have edited anything.
+    known: bool,
+}
+
 /// The background check and its latest findings.
 #[derive(Default)]
 pub struct LiveCheck {
     /// The inputs of the latest check started.
     started: Option<Arc<Snapshot>>,
-    /// The project differs from `started`; the latest edit to it was at this time. The check
-    /// waits until nothing has been edited for [`SETTLE`].
-    pending: Option<Instant>,
+    /// The revision ([`Open::revision`](crate::state::Open::revision)) seen at the latest poll.
+    seen: Option<u64>,
+    /// When the inputs were last compared with `started`, for [`SWEEP`].
+    compared: Option<Instant>,
+    /// The inputs may differ from `started`.
+    pending: Option<Wait>,
     /// The check running now.
     job: Option<Receiver<Vec<Finding>>>,
     /// The findings of the latest check that finished.
@@ -61,27 +80,49 @@ impl LiveCheck {
         *self = Self::default();
     }
 
-    /// A check is running or waiting for the project to settle.
+    /// A check is running, or an edit waits for the project to settle.
     pub fn busy(&self) -> bool {
-        self.job.is_some() || self.pending.is_some()
+        self.job.is_some() || self.pending.is_some_and(|w| w.known)
+    }
+
+    /// Note an edit, or input that may have made one, at `now`: `editing` starts the wait
+    /// again, while an edit without input waits from when it was first seen.
+    fn note(&mut self, known: bool, editing: bool, now: Instant) {
+        self.pending = Some(match self.pending {
+            Some(w) => Wait {
+                since: if editing { now } else { w.since },
+                known: w.known || known,
+            },
+            None => Wait { since: now, known },
+        });
     }
 
     /// Take a finished check's findings, and start a new check once nothing has been edited
-    /// for [`SETTLE`]. `editing` says the user typed, clicked or dragged in this frame: while
-    /// the project differs from what was checked, that starts the wait again. Edits that come
-    /// without input (the assistant, a shared session) wait from when they were first seen.
+    /// for [`SETTLE`]. An edit is seen by `revision` ([`Open::revision`]) changing, or by
+    /// `editing`: the user typed, clicked or dragged in this frame, which starts the wait
+    /// again (a drag edits in each frame of one undo step). Edits that come without input (the
+    /// assistant, a shared session) wait from when they were first seen.
     ///
-    /// On the window thread this costs one comparison of the inputs with the copy last
-    /// checked per frame, and one copy of them per check started, never one per edit. Only one
-    /// check runs at a time; an edit made while it runs is checked after it.
+    /// On the window thread a frame without an edit costs two number comparisons. The inputs
+    /// are compared with the copy last checked once an edit has settled (input alone may have
+    /// changed nothing), and every [`SWEEP`] as a backstop; they are copied once per check
+    /// started, never once per edit. Only one check runs at a time; an edit made while it
+    /// runs is checked after it.
+    ///
+    /// [`Open::revision`]: crate::state::Open::revision
     pub fn poll(
         &mut self,
         project: &Project,
         symbols: &BTreeMap<String, Symbol>,
         parts: &BTreeMap<String, Part>,
+        revision: u64,
         editing: bool,
         now: Instant,
     ) -> Poll {
+        let edited = self.seen.replace(revision) != Some(revision);
+        if edited || editing {
+            self.note(edited, editing, now);
+        }
         let mut changed = false;
         if let Some(rx) = &self.job {
             match rx.try_recv() {
@@ -92,10 +133,7 @@ impl LiveCheck {
                     self.job = None;
                 }
                 Err(TryRecvError::Empty) => {
-                    // An edit while the check runs: its wait starts at the latest edit.
-                    if editing {
-                        self.pending = Some(now);
-                    }
+                    // An edit while the check runs waits for it ([`LiveCheck::note`] above).
                     return Poll {
                         changed,
                         again: Some(POLL),
@@ -110,15 +148,23 @@ impl LiveCheck {
                 }
             }
         }
-        if self.started.as_ref().is_some_and(|s| s.same(project, symbols, parts)) {
-            self.pending = None;
+        let same = |s: &Option<Arc<Snapshot>>| s.as_ref().is_some_and(|s| s.same(project, symbols, parts));
+        let Some(wait) = self.pending else {
+            // The backstop: an edit no revision told of.
+            if self.compared.is_none_or(|t| now.saturating_duration_since(t) >= SWEEP) {
+                self.compared = Some(now);
+                if !same(&self.started) {
+                    self.note(true, false, now);
+                    return Poll {
+                        changed,
+                        again: Some(SETTLE),
+                    };
+                }
+            }
+            // No repaint is asked for this: the sweep rides on frames that come anyway.
             return Poll { changed, again: None };
-        }
-        let since = match self.pending {
-            Some(t) if !editing => t,
-            _ => *self.pending.insert(now),
         };
-        let waited = now.saturating_duration_since(since);
+        let waited = now.saturating_duration_since(wait.since);
         if waited < SETTLE {
             return Poll {
                 changed,
@@ -126,6 +172,10 @@ impl LiveCheck {
             };
         }
         self.pending = None;
+        self.compared = Some(now);
+        if same(&self.started) {
+            return Poll { changed, again: None };
+        }
         let snap = Arc::new(Snapshot {
             project: project.clone(),
             symbols: symbols.clone(),
@@ -167,8 +217,9 @@ impl LiveCheck {
     /// The findings to show for these inputs: the latest check's when it was of exactly
     /// them and no newer edit waits; `None` while a check is pending, when the findings may be
     /// of other inputs (another project, say).
+    /// Input that may have edited counts too, though it does not show as busy.
     pub fn settled(&self) -> Option<&[Finding]> {
-        (!self.busy()).then_some(self.findings.as_slice())
+        (self.job.is_none() && self.pending.is_none()).then_some(self.findings.as_slice())
     }
 
     /// The status bar text for the findings `shown` on the canvas: their errors and warnings,
@@ -217,7 +268,7 @@ mod tests {
     fn settle(live: &mut LiveCheck, o: &Open, now: &mut Instant) -> bool {
         let mut changed = false;
         for _ in 0..1000 {
-            let p = live.poll(&o.project, &o.symbols, &o.parts, false, *now);
+            let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, *now);
             changed |= p.changed;
             if p.again.is_none() {
                 return changed;
@@ -243,6 +294,7 @@ mod tests {
     fn rename_second_coil(o: &mut Open, tag: &str) {
         let s = o.project.pages[1].symbols.last_mut().unwrap();
         s.tag = Some(DeviceTag::parse(tag).unwrap());
+        o.touch();
     }
 
     fn duplicate_tag_errors(f: &[Finding]) -> usize {
@@ -266,7 +318,7 @@ mod tests {
 
         // Rename the second coil: nothing is checked until the edit has settled.
         rename_second_coil(&mut o, "-K2");
-        let p = live.poll(&o.project, &o.symbols, &o.parts, true, now);
+        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
         assert!(!p.changed);
         assert!(p.again.is_some_and(|d| d <= SETTLE), "{p:?}");
         assert!(live.busy());
@@ -281,9 +333,165 @@ mod tests {
         assert_eq!(duplicate_tag_errors(&live.findings), 0, "{:?}", live.findings);
         assert!(!live.busy());
 
-        // Unchanged: no new check is started.
-        let p = live.poll(&o.project, &o.symbols, &o.parts, true, now);
+        // Unchanged: no frame compares anything, and input that changed nothing (a click on
+        // the empty sheet) starts no new check once it settles.
+        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
         assert_eq!(p, Poll::default());
+        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
+        assert!(p.again.is_some());
+        assert!(!live.busy(), "input alone is not an edit");
+        now += SETTLE;
+        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        assert_eq!(p, Poll::default());
+        assert!(live.job.is_none());
+    }
+
+    /// After an edit made without input, from a checked state: the edit is seen at once and
+    /// checked once it has settled.
+    fn checks_the_edit(live: &mut LiveCheck, o: &Open, now: &mut Instant) {
+        assert!(!live.busy());
+        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, *now);
+        assert!(live.busy(), "the edit is seen");
+        assert!(p.again.is_some());
+        *now += SETTLE;
+        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, *now);
+        assert!(live.job.is_some(), "the check started");
+        settle(live, o, now);
+    }
+
+    #[test]
+    fn edits_on_the_canvas_are_checked() {
+        let (_dir, mut o) = coil_twice();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        settle(&mut live, &o, &mut now);
+        // Placing a symbol.
+        o.place(1, "wc.coil", Point::new(100.0, 20.0)).unwrap();
+        checks_the_edit(&mut live, &o, &mut now);
+        // A drag: one undo step, then a move in each frame.
+        let sel = [crate::state::Selection::Symbol(
+            o.project.pages[1].symbols[0].id.clone(),
+        )];
+        o.checkpoint();
+        o.move_by(1, &sel, Point::new(5.0, 0.0));
+        checks_the_edit(&mut live, &o, &mut now);
+        o.move_by(1, &sel, Point::new(5.0, 0.0));
+        checks_the_edit(&mut live, &o, &mut now);
+    }
+
+    #[test]
+    fn an_edit_in_a_frame_with_input_is_checked_even_without_a_new_revision() {
+        let (_dir, mut o) = coil_twice();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        settle(&mut live, &o, &mut now);
+        let s = o.project.pages[1].symbols.last_mut().unwrap();
+        s.tag = Some(DeviceTag::parse("-K2").unwrap());
+        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
+        now += SETTLE;
+        settle(&mut live, &o, &mut now);
+        assert_eq!(duplicate_tag_errors(&live.findings), 0, "{:?}", live.findings);
+    }
+
+    #[test]
+    fn findings_are_not_settled_while_input_made_during_a_check_waits() {
+        let (_dir, mut o) = coil_twice();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        // A check of the clash starts.
+        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        now += SETTLE;
+        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        assert!(live.job.is_some());
+        // While it runs, a drag frame fixes the clash without a new revision.
+        let s = o.project.pages[1].symbols.last_mut().unwrap();
+        s.tag = Some(DeviceTag::parse("-K2").unwrap());
+        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
+        // The check finishes before the input settles: its findings are of other inputs.
+        for _ in 0..1000 {
+            live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+            if live.job.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(live.job.is_none());
+        assert_eq!(duplicate_tag_errors(&live.findings), 2);
+        assert!(live.settled().is_none(), "not shown for the changed inputs");
+        assert_eq!(
+            live.status(&[]),
+            "Check: no problems",
+            "input alone does not say checking"
+        );
+        now += SETTLE;
+        settle(&mut live, &o, &mut now);
+        assert_eq!(live.settled().map(duplicate_tag_errors), Some(0));
+    }
+
+    #[test]
+    fn an_edit_nothing_told_of_is_found_by_the_sweep() {
+        let (_dir, mut o) = coil_twice();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        settle(&mut live, &o, &mut now);
+        let s = o.project.pages[1].symbols.last_mut().unwrap();
+        s.tag = Some(DeviceTag::parse("-K2").unwrap());
+        // Not compared in every frame...
+        assert_eq!(
+            live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now),
+            Poll::default()
+        );
+        assert!(!live.busy());
+        // ...but once a sweep is due.
+        now += SWEEP;
+        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        assert_eq!(p.again, Some(SETTLE));
+        assert!(live.busy());
+        now += SETTLE;
+        settle(&mut live, &o, &mut now);
+        assert_eq!(duplicate_tag_errors(&live.findings), 0, "{:?}", live.findings);
+    }
+
+    #[test]
+    fn edits_in_the_properties_form_are_checked() {
+        let (_dir, mut o) = coil_twice();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        settle(&mut live, &o, &mut now);
+        let fields = |c: &str| vec![("customer".to_owned(), c.to_owned())];
+        // The form's first change makes its undo step; later typing joins that step.
+        o.set_project_props_live("Pumps", &fields("A"));
+        checks_the_edit(&mut live, &o, &mut now);
+        o.set_project_props_live("Pumps", &fields("AC"));
+        checks_the_edit(&mut live, &o, &mut now);
+    }
+
+    #[test]
+    fn undo_and_redo_are_checked() {
+        let (_dir, mut o) = coil_twice();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        o.checkpoint();
+        rename_second_coil(&mut o, "-K2");
+        settle(&mut live, &o, &mut now);
+        assert_eq!(duplicate_tag_errors(&live.findings), 0);
+        assert!(o.undo());
+        checks_the_edit(&mut live, &o, &mut now);
+        assert_eq!(duplicate_tag_errors(&live.findings), 2, "the clash is back");
+        assert!(o.redo());
+        checks_the_edit(&mut live, &o, &mut now);
+        assert_eq!(duplicate_tag_errors(&live.findings), 0);
+    }
+
+    #[test]
+    fn a_library_reload_is_checked() {
+        let (_dir, mut o) = coil_twice();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        settle(&mut live, &o, &mut now);
+        o.refresh_library();
+        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        assert!(live.busy() && p.again.is_some(), "the reload is seen");
     }
 
     #[test]
@@ -295,13 +503,13 @@ mod tests {
         // Keystrokes 100 ms apart: each one only pushes the check back.
         for tag in ["-K", "-K2", "-K22"] {
             rename_second_coil(&mut o, tag);
-            let p = live.poll(&o.project, &o.symbols, &o.parts, true, now);
+            let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
             assert!(p.again.is_some());
             now += Duration::from_millis(100);
         }
         assert!(live.job.is_none(), "no check ran while typing");
         // 300 ms after the first keystroke but only 100 ms after the last: still waiting.
-        let p = live.poll(&o.project, &o.symbols, &o.parts, false, now);
+        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
         assert!(p.again.is_some_and(|d| d > Duration::ZERO), "{p:?}");
         assert!(live.job.is_none(), "the wait starts again at each edit");
         assert!(live.settled().is_none(), "the findings are not of these inputs yet");
@@ -320,10 +528,14 @@ mod tests {
         // The assistant renames the coil: no keystroke, so later frames do not push it back.
         rename_second_coil(&mut o, "-K2");
         for _ in 0..3 {
-            assert!(live.poll(&o.project, &o.symbols, &o.parts, false, now).again.is_some());
+            assert!(
+                live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now)
+                    .again
+                    .is_some()
+            );
             now += Duration::from_millis(100);
         }
-        live.poll(&o.project, &o.symbols, &o.parts, false, now);
+        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
         assert!(live.job.is_some(), "the check started 300 ms after the edit was seen");
     }
 
@@ -337,7 +549,7 @@ mod tests {
         assert!(duplicate_tag_errors(live.settled().unwrap()) > 0);
         // Project B is opened: until its own check is done, A's findings are not shown for it,
         // and the status bar does not count them.
-        live.poll(&b.project, &b.symbols, &b.parts, false, now);
+        live.poll(&b.project, &b.symbols, &b.parts, b.revision(), false, now);
         assert!(live.settled().is_none());
         assert_eq!(live.status(&[]), "Check: checking");
         now += SETTLE;
