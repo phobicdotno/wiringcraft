@@ -222,12 +222,17 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
         ));
     }
     if pts.is_empty() {
-        // Else every loose point that is not the origin of a placement.
+        // Else every loose point that is not the origin of a placement or of a transformation
+        // operator (its local origin, third of its last five attributes).
         let origins: BTreeSet<u64> = instances
             .values()
             .flatten()
-            .filter(|(name, _)| name == "AXIS2_PLACEMENT_3D")
-            .filter_map(|(_, args)| args.get(1).and_then(Value::as_ref_id))
+            .filter_map(|(name, args)| match name.as_str() {
+                "AXIS2_PLACEMENT_3D" => args.get(1),
+                "CARTESIAN_TRANSFORMATION_OPERATOR_3D" => args.len().checked_sub(3).and_then(|i| args.get(i)),
+                _ => None,
+            })
+            .filter_map(Value::as_ref_id)
             .collect();
         for id in instances.keys().filter(|id| !origins.contains(id)) {
             if let Some(p) = point(*id) {

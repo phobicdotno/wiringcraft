@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Geom, Instance, NOISE, Value, coords, cross, dot, refs_in, simple, square_to, statements, unit};
+use super::{Geom, Instance, Value, coords, cross, dot, refs_in, simple, square_to, statements, unit};
 
 const WITH: &str = "REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION";
 
@@ -89,7 +89,8 @@ impl Placement {
     }
 }
 
-/// A direction parameter: `Some(None)` when it is not given (`$`).
+/// A direction parameter: `Some(None)` when it is not given (`$`), `None` when it is not a
+/// direction, so the placement counts as not applied rather than taking the default.
 fn direction(instances: &BTreeMap<u64, Instance>, v: Option<&Value>) -> Option<Option<[f64; 3]>> {
     match v {
         Some(Value::Ref(id)) => {
@@ -97,7 +98,8 @@ fn direction(instances: &BTreeMap<u64, Instance>, v: Option<&Value>) -> Option<O
             (kind == "DIRECTION").then_some(())?;
             Some(Some(coords(d.get(1)?)?))
         }
-        _ => Some(None),
+        None | Some(Value::Unset) => Some(None),
+        Some(_) => None,
     }
 }
 
@@ -122,14 +124,15 @@ pub(super) fn axis_placement(
 }
 
 /// The x axis square to the unit axis `z`: the reference direction made square, or, when it is
-/// not given or lies on the axis, the first of the world's x and y that does not.
+/// not given or lies on the axis, the world's x made square, or its y when x lies exactly on
+/// the axis.
 fn x_axis(z: [f64; 3], reference: Option<[f64; 3]>) -> Option<[f64; 3]> {
     match reference.and_then(|r| square_to(z, r)) {
         Some((x, _)) => Some(x),
         None => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
             .into_iter()
             .filter_map(|r| square_to(z, r))
-            .find(|(_, len)| *len > NOISE)
+            .find(|(_, len)| *len > 0.0)
             .map(|(x, _)| x),
     }
 }
@@ -157,11 +160,12 @@ pub(super) fn operator_placement(
     };
     let z = unit(direction(instances, Some(axis3))?.unwrap_or([0.0, 0.0, 1.0]))?;
     let x = x_axis(z, direction(instances, Some(axis1))?)?;
-    // axis2, or the world's y when it is not given, made square to both: it keeps its side,
-    // so the operator can mirror. Only when it lies along them is y taken to the right of x.
+    // axis2, or the world's y when it is not given, picks the side of y, so the operator can
+    // mirror; when it lies along x or z, y is to the right of x.
+    // Square to both by construction: the normal of x and z, on axis2's side.
     let v = direction(instances, Some(axis2))?.unwrap_or([0.0, 1.0, 0.0]);
-    let (vz, vx) = (dot(v, z), dot(v, x));
-    let y = unit([0, 1, 2].map(|k| v[k] - vz * z[k] - vx * x[k])).unwrap_or_else(|| cross(z, x));
+    let right = cross(z, x);
+    let y = if dot(v, right) < 0.0 { right.map(|c| -c) } else { right };
     let [x, y, z] = [x, y, z].map(|a| a.map(|c| c * scale));
     Some(Placement {
         r: [[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]],
@@ -217,13 +221,29 @@ pub(super) fn place(
     point: &impl Fn(u64) -> Option<[f64; 3]>,
 ) -> Placed {
     let named = |id: u64, name: &str| instances.get(&id).is_some_and(|i| i.iter().any(|(n, _)| n == name));
+    // A relationship with a transformation names it in its ..._WITH_TRANSFORMATION record:
+    // alone in a complex instance, last of five attributes in a simple one.
+    let transformation_of = |inst: &Instance| {
+        inst.iter().find_map(|(name, args)| {
+            (name == WITH).then_some(())?;
+            if args.len() >= 5 { args.get(4) } else { args.first() }?.as_ref_id()
+        })
+    };
+    // Placements found, a relationship whose transformation is not there among them.
     let placements = instances
         .values()
         .filter(|i| {
             i.iter()
                 .any(|(n, _)| n == "MAPPED_ITEM" || n == "ITEM_DEFINED_TRANSFORMATION")
         })
-        .count();
+        .count()
+        + instances
+            .values()
+            .filter(|i| {
+                i.iter().any(|(n, _)| n == WITH)
+                    && transformation_of(i).is_none_or(|t| !named(t, "ITEM_DEFINED_TRANSFORMATION"))
+            })
+            .count();
     if placements == 0 {
         return Placed {
             points: pts.into_iter().map(|(_, p)| p).collect(),
@@ -233,6 +253,8 @@ pub(super) fn place(
 
     // Representations and their items.
     let mut items: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    // The context each representation's items are drawn in.
+    let mut context: BTreeMap<u64, u64> = BTreeMap::new();
     for (id, inst) in instances {
         for (name, args) in inst {
             if name.ends_with("REPRESENTATION")
@@ -242,6 +264,9 @@ pub(super) fn place(
                     .entry(*id)
                     .or_default()
                     .extend(list.iter().filter_map(Value::as_ref_id));
+                if let Some(c) = args.get(2).and_then(Value::as_ref_id) {
+                    context.insert(*id, c);
+                }
             }
         }
     }
@@ -265,11 +290,10 @@ pub(super) fn place(
         }) else {
             continue;
         };
-        let transformation = inst.iter().find_map(|(name, args)| {
-            (name == WITH).then_some(())?;
-            if args.len() >= 5 { args.get(4) } else { args.first() }?.as_ref_id()
-        });
-        if transformation.is_none() {
+        let transformation = transformation_of(inst);
+        // Without a transformation, two representations share coordinates only in the same
+        // context; in different ones they stay apart.
+        if transformation.is_none() && context.get(&parent).is_some_and(|c| context.get(&child) == Some(c)) {
             frames.join(parent, child);
         }
         links.push((child, parent, transformation));
@@ -372,15 +396,24 @@ pub(super) fn place(
     };
     // An item can be listed by more than one representation, so each frame keeps its own
     // geometry: once in a frame however many paths reach it, but in every frame that reaches it.
+    // Many frames sharing large geometry would hold many entries: past MAX_POINTS in all the
+    // rest is left out and the assembly counts as cut short.
     let mut seen: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    let mut entries = 0usize;
+    let mut owning_cut = false;
     let reps: Vec<u64> = items.keys().copied().collect();
-    for rep in reps {
+    'reps: for rep in reps {
         let frame = frames.find(rep);
         let seen = seen.entry(frame).or_default();
         let mut todo: Vec<u64> = items.get(&rep).cloned().unwrap_or_default();
         while let Some(id) = todo.pop() {
             if stop(id) || !seen.insert(id) {
                 continue;
+            }
+            entries += 1;
+            if entries > MAX_POINTS {
+                owning_cut = true;
+                break 'reps;
             }
             if let Some(next) = graph.get(&id) {
                 todo.extend(next.iter().filter(|n| !seen.contains(n)));
@@ -390,6 +423,7 @@ pub(super) fn place(
     let mut out = Placed {
         placements,
         missed: placements.saturating_sub(applied.len()),
+        cut: owning_cut,
         ..Placed::default()
     };
     // Each instance's geometry is kept once; a frame lists the instances it holds, and the
@@ -466,8 +500,16 @@ pub(super) fn place(
                 }
             }
         }
-        for (child, placement) in children.get(&frame).into_iter().flatten() {
-            todo.push((*child, placement.then(&at), depth + 1));
+        // A frame at the deepest level measures its own geometry; its children would be too
+        // deep, so they are not composed at all.
+        if depth == MAX_DEPTH {
+            if children.get(&frame).is_some_and(|c| !c.is_empty()) {
+                out.cut = true;
+            }
+        } else {
+            for (child, placement) in children.get(&frame).into_iter().flatten() {
+                todo.push((*child, placement.then(&at), depth + 1));
+            }
         }
     }
     // Parts only placed in a loop of placements: as drawn.
