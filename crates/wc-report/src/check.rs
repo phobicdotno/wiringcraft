@@ -442,8 +442,8 @@ fn rules(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet], out: &mut Vec
         Some(name) => format!("check rule {n} \"{name}\""),
         None => format!("check rule {n}"),
     };
-    // Each rule to run with how its findings name it.
-    let mut all: Vec<(String, &CheckRule)> = Vec::new();
+    // Each rule to run with how its findings name it, and whether a library holds it.
+    let mut all: Vec<(String, &CheckRule, bool)> = Vec::new();
     let mut off_used = vec![false; p.meta.rules_off.len()];
     for set in library {
         let rules = match &set.rules {
@@ -467,7 +467,7 @@ fn rules(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet], out: &mut Vec
                 }
             }
             if !off {
-                all.push((format!("{} of library {}", named(k + 1, rule), set.source), rule));
+                all.push((format!("{} of library {}", named(k + 1, rule), set.source), rule, true));
             }
         }
     }
@@ -487,9 +487,18 @@ fn rules(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet], out: &mut Vec
             });
         }
     }
-    all.extend(p.meta.rules.iter().enumerate().map(|(k, r)| (named(k + 1, r), r)));
-    for (label, rule) in all {
+    all.extend(
+        p.meta
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(k, r)| (named(k + 1, r), r, false)),
+    );
+    for (label, rule, library) in all {
         let label = label.as_str();
+        // The finding's text: a library rule's own message still names the rule and its
+        // source, since the project does not show where it comes from.
+        let text = |tag: &DeviceTag, default: String| say(rule, tag, default, label, library);
         if let Some(key) = rule.unknown.keys().next() {
             out.push(broken(
                 label,
@@ -545,7 +554,7 @@ fn rules(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet], out: &mut Vec
             })
             .collect();
         match kind.as_str() {
-            "cable" => cable_rule(label, rule, severity, &picked, p, out),
+            "cable" => cable_rule(label, library, rule, severity, &picked, p, out),
             "tag" => {
                 let Some(pattern) = rule.pattern.as_deref().filter(|x| !x.trim().is_empty()) else {
                     out.push(broken(label, "a tag rule needs a pattern".into()));
@@ -558,7 +567,7 @@ fn rules(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet], out: &mut Vec
                             page,
                             &s.id,
                             severity,
-                            rule.text(tag, format!("{tag} does not match {pattern} ({label})")),
+                            text(tag, format!("{tag} does not match {pattern} ({label})")),
                         ));
                     }
                 }
@@ -584,7 +593,7 @@ fn rules(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet], out: &mut Vec
                             page,
                             &s.id,
                             severity,
-                            rule.text(
+                            text(
                                 tag,
                                 format!("{tag}:{pin} has {count} wires, at most {max} allowed ({label})"),
                             ),
@@ -595,8 +604,18 @@ fn rules(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet], out: &mut Vec
         }
     }
 
+    fn say(rule: &CheckRule, tag: &DeviceTag, default: String, label: &str, library: bool) -> String {
+        let t = rule.text(tag, default);
+        if library && rule.message.is_some() {
+            format!("{t} ({label})")
+        } else {
+            t
+        }
+    }
+
     fn cable_rule(
         label: &str,
+        library: bool,
         rule: &CheckRule,
         severity: Severity,
         picked: &[(&Page, &wc_core::project::PlacedSymbol, &DeviceTag)],
@@ -630,7 +649,7 @@ fn rules(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet], out: &mut Vec
                     page,
                     item,
                     severity,
-                    rule.text(tag, format!("{tag} has no cable ({label})")),
+                    say(rule, tag, format!("{tag} has no cable ({label})"), label, library),
                 ));
             }
         }

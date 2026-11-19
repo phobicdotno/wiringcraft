@@ -652,23 +652,35 @@ pub fn write_part(root: &Path, p: &Part) -> Result<PathBuf> {
 
 /// The check rules of the project's library sources ([`wc_core::check_rule`]), in the order
 /// the project lists the sources: each source with a `rules.toml` in its folder, read now. A
-/// source that cannot be found on this computer (a git source never synced) or has no rules
-/// file adds nothing; one whose file cannot be read or parsed says why.
+/// source whose folder is not there (a git source never synced) or has no rules file adds
+/// nothing; one that cannot be resolved (an unknown kind, say), or whose file cannot be read
+/// or parsed, says why.
 pub fn library_rules(project_dir: &Path, project: &Project) -> Vec<wc_core::check_rule::RuleSet> {
     use wc_core::check_rule::{LIBRARY_RULES_FILE, RuleSet, parse_rules};
     project
         .meta
         .libraries
         .iter()
-        .filter_map(|s| Source::resolve(project_dir, s).ok())
         .filter_map(|s| {
-            let path = s.root.join(LIBRARY_RULES_FILE);
+            let root = match Source::resolve(project_dir, s) {
+                Ok(source) => source.root,
+                Err(e) => {
+                    return Some(RuleSet {
+                        source: s.name.clone(),
+                        rules: Err(e.to_string()),
+                    });
+                }
+            };
+            let path = root.join(LIBRARY_RULES_FILE);
             let rules = match std::fs::read_to_string(&path) {
                 Ok(text) => parse_rules(&text),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
                 Err(e) => Err(e.to_string()),
             };
-            Some(RuleSet { source: s.name, rules })
+            Some(RuleSet {
+                source: s.name.clone(),
+                rules,
+            })
         })
         .collect()
 }

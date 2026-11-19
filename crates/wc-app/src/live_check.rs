@@ -3,10 +3,12 @@
 //! slowing typing or dragging.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
+use wc_core::check_rule::RuleSet;
 use wc_core::{Part, Project, Symbol};
 use wc_report::Finding;
 
@@ -27,11 +29,20 @@ struct Snapshot {
     project: Project,
     symbols: BTreeMap<String, Symbol>,
     parts: BTreeMap<String, Part>,
+    /// The project's folder, which its library sources resolve against.
+    dir: PathBuf,
+    /// The library sources' check rules, as last loaded
+    /// ([`Open::library_rules`](crate::state::Open::library_rules)).
+    library: Vec<RuleSet>,
 }
 
 impl Snapshot {
-    fn same(&self, project: &Project, symbols: &BTreeMap<String, Symbol>, parts: &BTreeMap<String, Part>) -> bool {
-        self.project == *project && self.symbols == *symbols && self.parts == *parts
+    fn same(&self, open: &crate::state::Open) -> bool {
+        self.project == open.project
+            && self.symbols == open.symbols
+            && self.parts == open.parts
+            && self.dir.as_path() == open.dir.as_path()
+            && self.library == open.library_rules
     }
 }
 
@@ -111,7 +122,6 @@ impl LiveCheck {
     ///
     /// [`Open::revision`]: crate::state::Open::revision
     pub fn poll(&mut self, open: &crate::state::Open, editing: bool, now: Instant) -> Poll {
-        let (project, symbols, parts, dir) = (&open.project, &open.symbols, &open.parts, open.dir.as_path());
         let revision = open.revision();
         let edited = self.seen.replace(revision) != Some(revision);
         if edited || editing {
@@ -142,7 +152,7 @@ impl LiveCheck {
                 }
             }
         }
-        let same = |s: &Option<Arc<Snapshot>>| s.as_ref().is_some_and(|s| s.same(project, symbols, parts));
+        let same = |s: &Option<Arc<Snapshot>>| s.as_ref().is_some_and(|s| s.same(open));
         let Some(wait) = self.pending else {
             // The backstop: an edit no revision told of.
             if self.compared.is_none_or(|t| now.saturating_duration_since(t) >= SWEEP) {
@@ -171,24 +181,22 @@ impl LiveCheck {
             return Poll { changed, again: None };
         }
         let snap = Arc::new(Snapshot {
-            project: project.clone(),
-            symbols: symbols.clone(),
-            parts: parts.clone(),
+            project: open.project.clone(),
+            symbols: open.symbols.clone(),
+            parts: open.parts.clone(),
+            dir: open.dir.clone(),
+            library: open.library_rules.clone(),
         });
         let (tx, rx) = channel();
         let input = Arc::clone(&snap);
-        let dir = dir.to_path_buf();
         let spawned = std::thread::Builder::new().name("live-check".into()).spawn(move || {
-            // The library sources' rules are read here, off the window thread; a change to
-            // one is seen with the next check.
-            let library = wc_library::library_rules(&dir, &input.project);
             let found = wc_report::check_with(
                 &wc_report::Inputs {
                     project: &input.project,
                     symbols: &input.symbols,
                     parts: &input.parts,
                 },
-                &library,
+                &input.library,
             );
             // The window may have moved on; then nobody waits for this.
             let _ = tx.send(found);
@@ -363,7 +371,7 @@ mod tests {
             location: house.display().to_string(),
             reference: None,
         });
-        o.touch();
+        o.refresh_library();
         let house_rule = |f: &[Finding]| {
             f.iter()
                 .filter(|f| f.message == "-K1 does not match -K#.# (check rule 1 of library house)")
@@ -376,6 +384,21 @@ mod tests {
         now += SETTLE;
         settle(&mut live, &o, &mut now);
         assert_eq!(house_rule(&live.findings), 1, "{:?}", live.findings);
+
+        // Only the rules file changes: reloading the library checks again with the new rule.
+        std::fs::write(
+            house.join(wc_core::check_rule::LIBRARY_RULES_FILE),
+            "[[rule]]\nkind = \"tag\"\ndevices = \"-K*\"\npattern = \"-K#\"\n",
+        )
+        .unwrap();
+        o.refresh_library();
+        checks_the_edit(&mut live, &o, &mut now);
+        assert_eq!(house_rule(&live.findings), 0, "{:?}", live.findings);
+        assert!(
+            !live.findings.iter().any(|f| f.message.contains("of library house")),
+            "{:?}",
+            live.findings
+        );
     }
 
     /// After an edit made without input, from a checked state: the edit is seen at once and

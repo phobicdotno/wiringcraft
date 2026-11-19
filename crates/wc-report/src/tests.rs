@@ -2462,6 +2462,50 @@ fn library_rules_run_before_the_projects_name_their_source_and_can_be_turned_off
 }
 
 #[test]
+fn a_library_rules_own_message_still_names_the_rule_and_its_source() {
+    use wc_core::check_rule::{CheckRule, RuleSet};
+    let (p, s, parts) = fixture();
+    let library = vec![RuleSet {
+        source: "house".into(),
+        rules: Ok(vec![
+            CheckRule {
+                kind: "cable".into(),
+                devices: Some("-P*".into()),
+                message: Some("{tag} wants a house cable".into()),
+                ..CheckRule::default()
+            },
+            CheckRule {
+                kind: "tag".into(),
+                role: Some("terminal".into()),
+                pattern: Some("-X#.#".into()),
+                message: Some("{tag} breaks the house tags".into()),
+                ..CheckRule::default()
+            },
+        ]),
+    }];
+    let found: Vec<String> = check_with(
+        &Inputs {
+            project: &p,
+            symbols: &s,
+            parts: &parts,
+        },
+        &library,
+    )
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(
+        has("-P1 wants a house cable (check rule 1 of library house)"),
+        "{found:?}"
+    );
+    assert!(
+        has("-X2 breaks the house tags (check rule 2 of library house)"),
+        "{found:?}"
+    );
+}
+
+#[test]
 fn plc_card_overview_lays_out_three_cards_like_the_io_list() {
     use wc_core::plc_rack::{PlcCard, PlcRack};
     let (mut p, mut s, parts) = fixture();

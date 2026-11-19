@@ -477,5 +477,19 @@ fn a_folder_source_with_a_rules_file_gives_its_rules_in_source_order() -> Result
     assert_eq!(rules[0].name.as_deref(), Some("motor-cable"));
     assert_eq!(sets[1].source, "personal");
     assert!(sets[1].rules.is_err(), "a file that does not parse says so");
+
+    // A source that cannot be resolved says why, under its name, rather than vanishing.
+    let mut project = f.project.clone();
+    project.meta.libraries.push(wc_core::project::LibrarySource {
+        name: "odd".into(),
+        kind: "zip".into(),
+        location: "x".into(),
+        reference: None,
+    });
+    let sets = library_rules(&f.proj, &project);
+    assert_eq!(sets.len(), 3);
+    assert_eq!(sets[2].source, "odd");
+    let why = sets[2].rules.as_ref().err().cloned().unwrap_or_default();
+    assert!(why.contains("unknown kind"), "{why}");
     Ok(())
 }
