@@ -133,6 +133,33 @@ impl Network {
             .find(|n| n.device.parse::<DeviceTag>().ok().as_ref() == Some(device))
     }
 
+    /// Make the nodes, link ends (keeping their port) and link cables that name device `from`
+    /// name `to` instead, so a renamed device stays on its network.
+    pub fn rename_device(&mut self, from: &DeviceTag, to: &DeviceTag) {
+        let is_from = |s: &str| s.parse::<DeviceTag>().ok().as_ref() == Some(from);
+        for n in &mut self.nodes {
+            if is_from(&n.device) {
+                n.device = to.to_string();
+            }
+        }
+        for l in &mut self.links {
+            for end in [&mut l.from, &mut l.to] {
+                if let Ok(p) = Port::parse(end)
+                    && &p.device == from
+                {
+                    *end = Port {
+                        device: to.clone(),
+                        port: p.port,
+                    }
+                    .to_string();
+                }
+            }
+            if is_from(&l.cable) {
+                l.cable = to.to_string();
+            }
+        }
+    }
+
     /// The links of this network that could be read, each with its two ends.
     pub fn ports(&self) -> Vec<(Port, Port, &Link)> {
         self.links
@@ -249,6 +276,21 @@ cable = "-W20"
         let again: Network = toml::from_str(&toml::to_string(&n)?)?;
         assert_eq!(again, n);
         assert!(again.unknown.contains_key("colour"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_device_stays_on_its_network() -> R {
+        let mut p = crate::Project::new("t");
+        p.meta.networks.push(toml::from_str(TOML)?);
+        p.rename_device(&"-K10".parse()?, &"-K20".parse()?);
+        p.rename_device(&"-W20".parse()?, &"-W30".parse()?);
+        let n = &p.meta.networks[0];
+        assert_eq!(n.nodes[1].device, "-K20");
+        assert_eq!(n.links[0].from, "-A1:X1P1");
+        assert_eq!(n.links[0].to, "-K20:X1P1");
+        assert_eq!(n.links[0].cable, "-W30");
+        assert!(n.warnings().is_empty(), "{:?}", n.warnings());
         Ok(())
     }
 

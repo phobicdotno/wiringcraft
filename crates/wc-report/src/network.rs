@@ -32,7 +32,14 @@ pub fn network_list(i: &Inputs<'_>) -> Table {
             let Ok(tag) = node.device.parse::<wc_core::DeviceTag>() else {
                 continue;
             };
-            let uses = index.get(&tag).map(Vec::as_slice).unwrap_or(&[]);
+            // Schematic pages only: an overview shows the device again.
+            let uses: Vec<(String, String)> = index
+                .get(&tag)
+                .into_iter()
+                .flatten()
+                .filter(|(pid, _)| p.page(pid).is_some_and(|pg| !pg.overview))
+                .cloned()
+                .collect();
             let first_page = uses
                 .iter()
                 .filter_map(|(pid, _)| p.page(pid))
@@ -61,7 +68,7 @@ pub fn network_list(i: &Inputs<'_>) -> Table {
             for l in links {
                 let mut row = head.clone();
                 row.extend(l);
-                row.push(pages_of(p, uses));
+                row.push(pages_of(p, &uses));
                 if !first_page.is_empty() {
                     t.row_pages.resize(t.rows.len(), String::new());
                     t.row_pages.push(first_page.clone());

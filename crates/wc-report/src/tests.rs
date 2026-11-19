@@ -562,6 +562,11 @@ fn the_network_list_shows_each_device_with_its_address_ports_and_cables() {
     let mut p = Project::new("t");
     let mut page = Page::new("p3", "3", "PLC");
     page.symbols.push(place("s1", "plc", 20.0, Some("-A1")));
+    // An overview drawn before it shows -A1 again; the list keeps to schematic pages.
+    let mut overview = Page::new("p1", "1", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("s1", "plc", 20.0, Some("-A1")));
+    p.pages.push(overview);
     p.pages.push(page);
     for (t, d) in [
         ("-K10", "Drive pump 1"),

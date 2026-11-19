@@ -1992,6 +1992,9 @@ impl Project {
                 j.strip = to.clone();
             }
         }
+        for net in &mut self.meta.networks {
+            net.rename_device(from, to);
+        }
         n
     }
 
