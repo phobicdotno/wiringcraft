@@ -1319,29 +1319,62 @@ fn pic_refs(project: &Project) -> Vec<(PicRef, String)> {
         .collect()
 }
 
-/// The pages and whether the project settings a refused change touched.
-type Refused = (BTreeSet<String>, bool);
+/// The pages and whether the project settings a refused change touched, and the `seq` of
+/// each refused edit.
+type Refused = (BTreeSet<String>, bool, BTreeSet<u64>);
+
+/// The picks of `picks` that no change has carried yet (none in `carriers`) and that the
+/// change being sent carries (`carried`: the reference and the picture).
+fn first_carried(
+    picks: &BTreeMap<String, BTreeSet<PicRef>>,
+    carriers: &BTreeMap<(String, PicRef), Option<u64>>,
+    carried: impl Fn(&PicRef, &str) -> bool,
+) -> Vec<(String, PicRef)> {
+    picks
+        .iter()
+        .flat_map(|(file, refs)| refs.iter().map(move |r| (file.clone(), r.clone())))
+        .filter(|key| !carriers.contains_key(key) && carried(&key.1, &key.0))
+        .collect()
+}
+
+/// Whether `edit` points reference `r` at picture `file`: the edit that carries a pick there.
+fn carries(edit: &ProjectEdit, r: &PicRef, file: &str) -> bool {
+    let underlay =
+        |page: &wc_core::Page, id: &str| page.id == id && page.underlay.as_ref().is_some_and(|u| u.file == file);
+    match (edit, r) {
+        (ProjectEdit::SetMeta { meta, .. }, PicRef::Logo) => meta.logo.as_ref().is_some_and(|l| l.file == file),
+        (ProjectEdit::AddPage { page }, PicRef::Underlay(id)) => underlay(page, id),
+        (ProjectEdit::SetPages { pages, .. }, PicRef::Underlay(id)) => pages.iter().any(|p| underlay(p, id)),
+        (ProjectEdit::Batch { edits }, _) => edits.iter().any(|e| carries(e, r, file)),
+        _ => false,
+    }
+}
 
 /// Drop the picks (of [`Share::picks`]) the session refused (`refused`: the pages and whether
-/// the project settings a refused change touched, then the picks made since that change was
-/// sent, which it does not touch) and those that name another file now. A picture left with
-/// no pick gets no name of its own: it is taken out of what waits to be renamed
-/// (`renames_due`, `clashes`), and returned.
+/// the project settings a refused change touched, and the refused edits, then the picks made
+/// since that change was sent, which it does not touch) and those that name another file now.
+/// A pick whose carrying project edit is known (`carriers`) is dropped only with that edit's refusal:
+/// a later refused change that touches the same target leaves a pick the session took. A
+/// picture left with no pick gets no name of its own: it is taken out of what waits to be
+/// renamed (`renames_due`, `clashes`), and returned.
 fn withdraw_picks(
     picks: &mut BTreeMap<String, BTreeSet<PicRef>>,
+    carriers: &mut BTreeMap<(String, PicRef), Option<u64>>,
     renames_due: &mut BTreeMap<String, std::time::Instant>,
     clashes: &mut Vec<String>,
     open: &Open,
     refused: (Refused, &BTreeSet<(String, PicRef)>),
 ) -> BTreeSet<String> {
-    let ((pages, meta), fresh) = refused;
+    let ((pages, meta, edits), fresh) = refused;
     let mut withdrawn = BTreeSet::new();
     for (file, refs) in picks.iter_mut() {
         refs.retain(|r| {
-            let refused = !fresh.contains(&(file.clone(), r.clone()))
-                && match r {
-                    PicRef::Logo => meta,
-                    PicRef::Underlay(id) => pages.contains(id),
+            let key = (file.clone(), r.clone());
+            let refused = !fresh.contains(&key)
+                && match (carriers.get(&key).copied().flatten(), r) {
+                    (Some(seq), _) => edits.contains(&seq),
+                    (None, PicRef::Logo) => meta,
+                    (None, PicRef::Underlay(id)) => pages.contains(id),
                 };
             !refused && pic_ref_file(&open.project, r) == Some(file.as_str())
         });
@@ -1353,6 +1386,7 @@ fn withdraw_picks(
         picks.remove(file);
         renames_due.remove(file);
     }
+    carriers.retain(|(f, r), _| picks.get(f).is_some_and(|refs| refs.contains(r)));
     clashes.retain(|f| !withdrawn.contains(f));
     withdrawn
 }
@@ -1863,12 +1897,13 @@ impl Role {
     /// ([`wc_share::Refusal::PictureNameTaken`]), since the last call.
     /// The pages and whether the project settings a refused change of this person's touched,
     /// since the last call ([`wc_share::Guest::refused_pages`]). The host's own are never refused.
-    fn refused_targets(&mut self) -> (BTreeSet<String>, bool) {
+    fn refused_targets(&mut self) -> Refused {
         match self {
             Role::Host(_) => Default::default(),
             Role::Guest(j) => (
                 std::mem::take(&mut j.guest.refused_pages),
                 std::mem::take(&mut j.guest.refused_meta),
+                std::mem::take(&mut j.guest.refused_edits),
             ),
         }
     }
@@ -2277,6 +2312,10 @@ pub struct Share {
     /// Pictures whose name the session has for another file and that could not be given a new
     /// name here, with when: tried again after [`ITEM_RETRY_LATER`] while the project uses them.
     renames_due: BTreeMap<String, std::time::Instant>,
+    /// Devices renamed here and not in the session yet, each with the tags it was renamed to
+    /// ([`note_renames`]). [`Held::hold_renames`] pairs them ([`renames_now`]) even when
+    /// nothing draws the device.
+    device_renames: RenamePaths,
     /// Pictures picked here under a name the session has for another file, found while taking
     /// the session's pictures: they get a name of their own at the next sync, before what goes
     /// out is worked out.
@@ -2286,6 +2325,12 @@ pub struct Share {
     /// once the session refused the change that made them (the reference is the session's
     /// again) or they name another file.
     picks: BTreeMap<String, BTreeSet<PicRef>>,
+    /// The change that first carried each pick of [`Share::picks`] to the session, once sent: a
+    /// project edit (its `seq`), whose refusal alone withdraws the pick, or `None` for a page
+    /// edit (which has no `seq`). A pick sent with a page edit, or not sent yet, is withdrawn by
+    /// any refused change of its target. Only the first carrier counts: a later edit that names
+    /// the picture there again does not make an earlier pick its own.
+    pick_carriers: BTreeMap<(String, PicRef), Option<u64>>,
     /// Pictures whose last pick was withdrawn ([`withdraw_picks`]), until this copy picks them
     /// again, or that were renamed after a refusal, with the `seq` of the latest edit that had
     /// sent each then: a refusal of such a picture renames nothing, unless it is of a later
@@ -2378,10 +2423,100 @@ fn join_groups(groups: Vec<RenameGroup>) -> Vec<RenameGroup> {
     out
 }
 
+/// Devices renamed here and not in the session yet: each first tag with the tags it was
+/// renamed to since, in order ([`note_renames`]).
+type RenamePaths = BTreeMap<wc_core::DeviceTag, Vec<wc_core::DeviceTag>>;
+
+/// Add the device renames made here (`made`: old tag to new, one map per change, in order) to
+/// `renames`: a rename of a renamed device (from its tag now) goes on from its first tag, and
+/// one back to it is no rename; the renames of one change are taken together, so `-K1` ->
+/// `-K11` and `-K11` -> `-K111` at once stay two renames. Renames the session has (`base` has
+/// the last tag, or no longer the first) are dropped first, so a later rename never goes on
+/// from one of those. A device that went back to an earlier tag here (Undo) keeps its tags up
+/// to that one; one of which this copy has no tag any more (undone or removed) is dropped: a
+/// device that later gets one of those tags is another device.
+fn note_renames(
+    renames: &mut RenamePaths,
+    made: Vec<BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>>,
+    base: &Project,
+    local: &Project,
+) {
+    // The new tag may be in the session still as the old tag of another rename (`-K1` ->
+    // `-K11` while `-K11` -> `-K111`): that is no sign the session has this rename.
+    let olds: BTreeSet<wc_core::DeviceTag> = renames.keys().cloned().collect();
+    renames.retain(|first, path| {
+        base.devices.contains_key(first)
+            && !path
+                .last()
+                .is_some_and(|last| base.devices.contains_key(last) && !olds.contains(last))
+    });
+    for change in made {
+        // Each new tag is set once all of the change's renames are looked up, so one never
+        // goes on from another made at the same time.
+        let mut next: Vec<(wc_core::DeviceTag, Vec<wc_core::DeviceTag>)> = Vec::new();
+        for (from, to) in change {
+            // Only the device's tag now goes on: a tag it had before may be another device's.
+            let found = renames
+                .iter()
+                .find(|(_, path)| path.last() == Some(&from))
+                .map(|(first, _)| first.clone());
+            let (first, mut path) = match found.and_then(|f| renames.remove_entry(&f)) {
+                Some(entry) => entry,
+                None => (from, Vec::new()),
+            };
+            path.push(to);
+            next.push((first, path));
+        }
+        for (first, path) in next {
+            if path.last() != Some(&first) {
+                renames.insert(first, path);
+            }
+        }
+    }
+    cut_renames(renames, local);
+}
+
+/// A device whose latest tag this copy (`local`) no longer has went back to an earlier one
+/// (Undo): the tags after it are no longer its own, so a device that takes one later is
+/// another. One with none of its tags here (undone or removed since) is dropped.
+fn cut_renames(renames: &mut RenamePaths, local: &Project) {
+    renames.retain(|_, path| {
+        let Some(at) = path.iter().rposition(|t| local.devices.contains_key(t)) else {
+            return false;
+        };
+        path.truncate(at + 1);
+        true
+    });
+}
+
+/// Each recorded rename as it stands in `local`: its first tag and its tag now (after an Undo,
+/// the one between it went back to, [`note_renames`]).
+fn renames_now(renames: &RenamePaths, local: &Project) -> BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag> {
+    renames
+        .iter()
+        .filter_map(|(first, path)| {
+            let now = path.last().filter(|t| local.devices.contains_key(*t))?;
+            Some((first.clone(), now.clone()))
+        })
+        .collect()
+}
+
 impl Held {
-    /// The targets of `local` that use, for the first time since `base`, an item named in
-    /// `waiting`.
+    /// [`Held::find_renamed`] with no renames recorded.
+    #[cfg(test)]
     fn find(local: &Project, base: &Project, waiting: &BTreeSet<String>) -> Held {
+        Held::find_renamed(local, base, waiting, &BTreeMap::new())
+    }
+
+    /// The targets of `local` that use, for the first time since `base`, an item named in
+    /// `waiting`. A device rename made here (`renamed`, old tag to new) that waits, or whose
+    /// new tag a waiting target names, waits whole.
+    fn find_renamed(
+        local: &Project,
+        base: &Project,
+        waiting: &BTreeSet<String>,
+        renamed: &BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>,
+    ) -> Held {
         let waits = |kind: ItemKind, id: &str| waiting.contains(&item_name(kind, id));
         let fresh = FreshUses::find(local, base);
         let mut held = Held::default();
@@ -2419,7 +2554,7 @@ impl Held {
             .collect();
         held.now.devices.extend(new_devices);
         // After those, so a rename to a tag only a waiting page names is held as a pair.
-        held.hold_renames(local, base);
+        held.hold_renames(local, base, renamed);
         // A new device goes back with the waiting pages, panels and jumpers that name it, or not
         // at all: the session may have made a device of its own under the same tag meanwhile
         // (tags are chosen from this copy alone), and none of them may then name the session's
@@ -2496,7 +2631,44 @@ impl Held {
     /// A held device the base does not have may be a rename: the old device going away and
     /// what was retagged to the new tag wait with it, so the session never has the new tag
     /// without its device, nor loses the old one first.
-    fn hold_renames(&mut self, local: &Project, base: &Project) {
+    fn hold_renames(
+        &mut self,
+        local: &Project,
+        base: &Project,
+        renamed: &BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>,
+    ) {
+        // Renames made here that this copy still has and the session does not: the new tag
+        // also waits when a waiting page or the waiting jumpers name it, so the session never
+        // has the new tag while that target still names the old one.
+        // The old tag may be here still, and the new one in the session, as the new and the old
+        // tag of another rename made at the same time (`-K1` -> `-K11`, `-K11` -> `-K111`).
+        let recorded: Vec<(&wc_core::DeviceTag, &wc_core::DeviceTag)> = renamed
+            .iter()
+            .filter(|(old, new)| {
+                base.devices.contains_key(*old)
+                    && local.devices.contains_key(*new)
+                    && (!local.devices.contains_key(*old) || renamed.values().any(|n| n == *old))
+                    && (!base.devices.contains_key(*new) || renamed.contains_key(*new))
+            })
+            .collect();
+        for (_, new) in &recorded {
+            let named_by_waiting = self
+                .now
+                .pages
+                .values()
+                .flatten()
+                .any(|p| page_mentions(p, &|t| t == *new))
+                || self
+                    .now
+                    .meta
+                    .as_ref()
+                    .is_some_and(|m| m.jumpers.iter().any(|j| &j.strip == *new));
+            if named_by_waiting && !self.now.devices.contains_key(*new) {
+                self.now
+                    .devices
+                    .insert((*new).clone(), local.devices.get(*new).cloned());
+            }
+        }
         let new_tags: Vec<wc_core::DeviceTag> = self
             .now
             .devices
@@ -2504,10 +2676,13 @@ impl Held {
             .filter(|t| !base.devices.contains_key(*t))
             .cloned()
             .collect();
-        if new_tags.is_empty() {
+        if new_tags.is_empty() && recorded.is_empty() {
             return;
         }
         let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
+        // A recorded rename's tags that wait now: its new tag may be in the session already as
+        // the old tag of another rename made with it, and wait for its own part.
+        let waits_now: BTreeSet<wc_core::DeviceTag> = self.now.devices.keys().cloned().collect();
         let gone: Vec<wc_core::DeviceTag> = base
             .devices
             .keys()
@@ -2598,6 +2773,26 @@ impl Held {
                 pairs.insert((old.clone(), new.clone()));
             }
         }
+        // A rename recorded here is a pair also when nothing draws the device. Renames that
+        // share a tag go together: when one's new tag waits, all of them wait.
+        let mut chained: Vec<BTreeSet<&wc_core::DeviceTag>> = Vec::new();
+        for (old, new) in &recorded {
+            let (hit, rest): (Vec<_>, Vec<_>) = chained.drain(..).partition(|c| c.contains(*old) || c.contains(*new));
+            let mut c: BTreeSet<&wc_core::DeviceTag> = hit.into_iter().flatten().collect();
+            c.extend([*old, *new]);
+            chained = rest;
+            chained.push(c);
+        }
+        pairs.extend(
+            recorded
+                .iter()
+                .filter(|(old, _)| {
+                    chained
+                        .iter()
+                        .any(|c| c.contains(*old) && c.iter().any(|t| waits_now.contains(*t)))
+                })
+                .map(|(old, new)| ((*old).clone(), (*new).clone())),
+        );
         // Each rename is its own group; renames that share a tag or a target wait as one.
         let mut groups: Vec<RenameGroup> = Vec::new();
         let join = |groups: &mut Vec<RenameGroup>, tags: &[&wc_core::DeviceTag]| -> usize {
@@ -2622,10 +2817,17 @@ impl Held {
             into
         };
         for (old, new) in &pairs {
-            self.now.devices.insert(old.clone(), None);
+            // Gone here, or (renamed onto at the same time) as this copy has it now.
+            self.now.devices.insert(old.clone(), local.devices.get(old).cloned());
+            if !self.now.devices.contains_key(new) {
+                self.now.devices.insert(new.clone(), local.devices.get(new).cloned());
+            }
             join(&mut groups, &[old, new]);
         }
         let paired: Vec<wc_core::DeviceTag> = pairs.iter().map(|(_, n)| n.clone()).collect();
+        // What a waiting rename retags waits with it, also under a new tag the session has as
+        // another device's.
+        let named = |t: &wc_core::DeviceTag| named(t) || paired.contains(t);
         // The paired new tags among those a target names.
         let renamed_in = |names: &dyn Fn(&wc_core::DeviceTag) -> bool| -> Vec<&wc_core::DeviceTag> {
             paired.iter().filter(|t| names(t)).collect()
@@ -2827,7 +3029,27 @@ fn latest_waiting_step(open: &Open, base: &Project, held: &Held) -> Option<wc_sh
         .collect();
     keys.devices.extend(named_before);
     let step = wc_share::Parts::read(prev, &keys);
-    (step != wc_share::Parts::read(&open.project, &keys)).then_some(step)
+    if step == wc_share::Parts::read(&open.project, &keys) {
+        return None;
+    }
+    // A waiting rename of a rename (`-K1` -> `-K2`, then `-K2` -> `-K3` here) waits as one
+    // pair, `-K1` to `-K3`: taking back the second brings `-K2` back too, though nothing
+    // draws it. Only a device the action took away that the session never had.
+    if held.renames.is_empty() {
+        return Some(step);
+    }
+    let taken_away: Vec<_> = prev
+        .devices
+        .keys()
+        .filter(|tag| {
+            !keys.devices.contains_key(*tag)
+                && !base.devices.contains_key(*tag)
+                && !open.project.devices.contains_key(*tag)
+        })
+        .map(|tag| (tag.clone(), None))
+        .collect();
+    keys.devices.extend(taken_away);
+    Some(wc_share::Parts::read(prev, &keys))
 }
 
 /// Whether a symbol or cable on `page` names a device `tag` picks.
@@ -3118,8 +3340,10 @@ impl Share {
         self.holding.clear();
         self.drop_held = false;
         self.renames_due.clear();
+        self.device_renames.clear();
         self.clashes.clear();
         self.picks.clear();
+        self.pick_carriers.clear();
         self.withdrawn_picks.clear();
         self.repair_reads.clear();
     }
@@ -3425,6 +3649,7 @@ impl Share {
             if pic_ref_file(base, &r) != Some(file.as_str()) {
                 self.withdrawn_picks.remove(&file);
                 if self.picks.entry(file.clone()).or_default().insert(r.clone()) {
+                    self.pick_carriers.remove(&(file.clone(), r.clone()));
                     fresh.insert((file, r));
                 }
             }
@@ -3433,6 +3658,7 @@ impl Share {
         // must not rename the references that are not this copy's.
         let withdrawn = withdraw_picks(
             &mut self.picks,
+            &mut self.pick_carriers,
             &mut self.renames_due,
             &mut self.clashes,
             open,
@@ -3526,7 +3752,14 @@ impl Share {
         if undo {
             waiting.extend(self.holding.iter().cloned());
         }
-        let held = Held::find(&open.project, self.base.as_ref()?, &waiting);
+        note_renames(
+            &mut self.device_renames,
+            open.take_device_renames(),
+            self.base.as_ref()?,
+            &open.project,
+        );
+        let renamed = renames_now(&self.device_renames, &open.project);
+        let held = Held::find_renamed(&open.project, self.base.as_ref()?, &waiting, &renamed);
         if undo && !held.is_empty() {
             // Undo of a change that never reached the session: taken back here only, and only
             // the latest action. What waited before it waits still.
@@ -3542,6 +3775,9 @@ impl Share {
                 // Also after a save: the copy on disk still has the change.
                 open.dirty = true;
             }
+            // A rename taken back now ends at the tag it went back to, before anything else
+            // can take the tag it left.
+            cut_renames(&mut self.device_renames, &open.project);
             self.holding.clear();
             self.notes.push(format!(
                 "Your change that waited for {} was undone here; it had not reached the session.",
@@ -3579,9 +3815,19 @@ impl Share {
         // One action, one change: the edits that can go together are checked and recorded by
         // the host as one batch, all or nothing.
         for edit in ProjectEdit::batched(out.edits) {
+            // The pick this edit carries is answered by its refusal or its taking, nothing else.
+            let carried = first_carried(&self.picks, &self.pick_carriers, |r, f| carries(&edit, r, f));
             role.edit_project(edit, &mut self.notes);
+            let seq = role.last_edit();
+            self.pick_carriers.extend(carried.into_iter().map(|key| (key, seq)));
         }
         if let Some(p) = out.page {
+            // A page edit has no `seq`: its pick keeps the target rule, also once a later
+            // project edit names the picture there again.
+            let carried = first_carried(&self.picks, &self.pick_carriers, |r, f| {
+                matches!(r, PicRef::Underlay(id) if *id == p.id) && p.underlay.as_ref().is_some_and(|u| u.file == f)
+            });
+            self.pick_carriers.extend(carried.into_iter().map(|key| (key, None)));
             role.edit_page(p, &mut self.notes);
         }
         if sent {
@@ -3644,6 +3890,7 @@ impl Share {
         // next frame is a fresh pick there, which that refusal leaves.
         let gone = withdraw_picks(
             &mut self.picks,
+            &mut self.pick_carriers,
             &mut self.renames_due,
             &mut self.clashes,
             open,

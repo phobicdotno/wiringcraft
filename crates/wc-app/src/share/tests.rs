@@ -2953,6 +2953,133 @@ fn a_picked_picture_whose_change_the_session_refused_is_neither_renamed_nor_shar
 }
 
 #[test]
+fn a_pick_is_withdrawn_by_the_refusal_of_the_edit_that_carried_it_only() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(tmp.path(), |_| Ok(()), BTreeMap::new())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The guest picks its own a.png as the logo; the change that carries it goes out.
+    let file = "pictures/a.png".to_owned();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join(&file), PNG)?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: file.clone(),
+        cover: None,
+    });
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    let key = (file.clone(), PicRef::Logo);
+    let carrier = g
+        .pick_carriers
+        .get(&key)
+        .copied()
+        .flatten()
+        .ok_or("no carrier recorded")?;
+    let Some(Role::Guest(j)) = g.role.as_ref() else {
+        return Err("not a guest".into());
+    };
+    assert_eq!(carrier, j.guest.last_edit(), "the logo went out last");
+    let refuse = |g: &mut Share, seq: u64| -> TestResult {
+        let Some(Role::Guest(j)) = g.role.as_mut() else {
+            return Err("not a guest".into());
+        };
+        j.guest.refused_meta = true;
+        j.guest.refused_edits.insert(seq);
+        Ok(())
+    };
+    // A refused later change of the project settings (a rename, say) leaves the pick: the
+    // session took the edit that carried it.
+    refuse(&mut g, carrier + 1)?;
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(
+        g.picks.get(&file).is_some_and(|refs| refs.contains(&PicRef::Logo)),
+        "{:?}",
+        g.notes
+    );
+    // The refusal of the carrying edit withdraws it.
+    refuse(&mut g, carrier)?;
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(!g.picks.contains_key(&file), "{:?}", g.notes);
+    assert!(!g.pick_carriers.contains_key(&key));
+    Ok(())
+}
+
+#[test]
+fn a_pick_sent_with_a_page_edit_keeps_the_target_rule() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(tmp.path(), |_| Ok(()), BTreeMap::new())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The guest picks its own a.png as the underlay of the page it has open: that goes out with
+    // the page edit, which has no number.
+    let file = "pictures/a.png".to_owned();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join(&file), PNG)?;
+    guest_open.project.page_mut("p0003").ok_or("no page")?.underlay = Some(wc_core::Underlay {
+        file: file.clone(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(10.0, 10.0),
+    });
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    let key = (file.clone(), PicRef::Underlay("p0003".into()));
+    assert_eq!(g.pick_carriers.get(&key), Some(&None), "{:?}", g.pick_carriers);
+    // A later project edit that names the picture there again does not take the pick over.
+    let later = ProjectEdit::SetPages {
+        pages: vec![guest_open.project.page("p0003").ok_or("no page")?.clone()],
+        before: Vec::new(),
+    };
+    assert!(super::first_carried(&g.picks, &g.pick_carriers, |r, f| super::carries(&later, r, f)).is_empty());
+    // So a refused change of the page withdraws it, whatever edit was refused.
+    let Some(Role::Guest(j)) = g.role.as_mut() else {
+        return Err("not a guest".into());
+    };
+    j.guest.refused_pages.insert("p0003".into());
+    j.guest.refused_edits.insert(99);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(
+        !g.picks.get(&file).is_some_and(|refs| refs.contains(&key.1)),
+        "{:?}",
+        g.picks
+    );
+    Ok(())
+}
+
+#[test]
+fn a_carried_pick_is_withdrawn_only_with_its_own_edit() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(tmp.path())?;
+    let a = "pictures/a.png".to_owned();
+    open.project.meta.logo = Some(wc_core::Logo {
+        file: a.clone(),
+        cover: None,
+    });
+    let mut picks: BTreeMap<String, BTreeSet<PicRef>> = [(a.clone(), [PicRef::Logo].into())].into();
+    let mut carriers: BTreeMap<(String, PicRef), Option<u64>> = [((a.clone(), PicRef::Logo), Some(5))].into();
+    let mut due = BTreeMap::new();
+    let mut clashes = Vec::new();
+    // A refused edit 7 touched the project settings: the pick edit 5 carried stays.
+    let gone = withdraw_picks(
+        &mut picks,
+        &mut carriers,
+        &mut due,
+        &mut clashes,
+        &open,
+        ((BTreeSet::new(), true, [7].into()), &BTreeSet::new()),
+    );
+    assert!(gone.is_empty());
+    assert_eq!(carriers.len(), 1);
+    // Edit 5 itself refused: the pick goes, and so does its carrier.
+    let gone = withdraw_picks(
+        &mut picks,
+        &mut carriers,
+        &mut due,
+        &mut clashes,
+        &open,
+        ((BTreeSet::new(), false, [5].into()), &BTreeSet::new()),
+    );
+    assert_eq!(gone, [a].into());
+    assert!(picks.is_empty() && carriers.is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_session_picture_replaced_here_after_a_withdrawn_pick_of_its_name_is_renamed_and_shared() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session_sharing(
@@ -3341,10 +3468,11 @@ fn a_pick_refused_or_pointed_elsewhere_is_withdrawn_with_its_waiting_rename() ->
     // The logo's change was refused: a.png keeps its underlay pick; b.png's logo names a.png.
     let gone = withdraw_picks(
         &mut picks,
+        &mut BTreeMap::new(),
         &mut due,
         &mut clashes,
         &open,
-        ((BTreeSet::new(), true), &BTreeSet::new()),
+        ((BTreeSet::new(), true, BTreeSet::new()), &BTreeSet::new()),
     );
     assert_eq!(gone, [b.clone()].into());
     assert_eq!(picks, [(a.clone(), [PicRef::Underlay(id.clone())].into())].into());
@@ -3353,10 +3481,11 @@ fn a_pick_refused_or_pointed_elsewhere_is_withdrawn_with_its_waiting_rename() ->
     // Then the underlay's page: nothing is left to rename.
     let gone = withdraw_picks(
         &mut picks,
+        &mut BTreeMap::new(),
         &mut due,
         &mut clashes,
         &open,
-        (([id].into(), false), &BTreeSet::new()),
+        (([id].into(), false, BTreeSet::new()), &BTreeSet::new()),
     );
     assert_eq!(gone, [a].into());
     assert!(picks.is_empty() && clashes.is_empty() && due.is_empty());
@@ -5058,6 +5187,382 @@ fn a_device_removed_beside_a_waiting_rename_with_jumpers_goes_out_at_once() -> T
     assert!(held.now.devices.contains_key(&x1));
     assert!(held.now.devices.contains_key(&x2));
     assert!(!held.now.devices.contains_key(&x9));
+    Ok(())
+}
+
+#[test]
+fn a_recorded_rename_of_a_device_nothing_draws_waits_as_a_pair() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let mut base = Project::new("Test");
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k2);
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
+    let renamed: BTreeMap<_, _> = [(k1.clone(), k2.clone())].into_iter().collect();
+    let held = Held::find_renamed(&local, &base, &parts, &renamed);
+    // The old device's removal waits with the new one: the session keeps -K1 meanwhile.
+    assert_eq!(held.now.devices.get(&k1), Some(&None));
+    assert!(held.now.devices.contains_key(&k2));
+    assert_eq!(held.renames.len(), 1);
+    assert_eq!(held.renames[0].devices, [k1.clone(), k2.clone()].into_iter().collect());
+    let mut sendable = local.clone();
+    held.drop_from(&mut sendable);
+    assert_eq!(sendable.devices, base.devices);
+    // A rename taken back here is no pair: -K1 is here again.
+    let held = Held::find_renamed(&base, &base, &parts, &renamed);
+    assert!(held.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_recorded_strip_rename_waits_while_its_jumpers_wait_for_another_part() -> TestResult {
+    let x1 = wc_core::DeviceTag::parse("-X1")?;
+    let x2 = wc_core::DeviceTag::parse("-X2")?;
+    let mut base = Project::new("Test");
+    base.meta.jumpers.push(wc_core::project::Jumper {
+        strip: x1.clone(),
+        terminals: vec!["1".into(), "2".into()],
+        part: None,
+    });
+    base.devices.insert(x1.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&x1, &x2);
+    // A new jumper on the strip waits for its part; the strip's own part is in the session.
+    local.meta.jumpers.push(wc_core::project::Jumper {
+        strip: x2.clone(),
+        terminals: vec!["3".into(), "4".into()],
+        part: Some("acme.bridge".into()),
+    });
+    let parts = waiting(&[item_name(ItemKind::Part, "acme.bridge")]);
+    let renamed: BTreeMap<_, _> = [(x1.clone(), x2.clone())].into_iter().collect();
+    let held = Held::find_renamed(&local, &base, &parts, &renamed);
+    assert!(held.now.meta.is_some(), "the jumpers wait");
+    // The rename waits with them, or the session would have -X2 while its jumpers name -X1.
+    assert!(held.now.devices.contains_key(&x2));
+    assert_eq!(held.now.devices.get(&x1), Some(&None));
+    assert_eq!(held.renames.len(), 1);
+    assert!(held.renames[0].meta);
+    Ok(())
+}
+
+#[test]
+fn a_device_nothing_draws_renamed_to_a_waiting_placements_tag_stays_in_the_session_meanwhile() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    let q5 = wc_core::DeviceTag::parse("-Q5")?;
+    let q6 = wc_core::DeviceTag::parse("-Q6")?;
+    host_open.project.devices.insert(q5.clone(), wc_core::Device::default());
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(guest_open.project.devices.contains_key(&q5));
+    // The guest renames the undrawn -Q5 to -Q6 and gives the waiting placement that tag.
+    let opts = wc_core::find::FindOptions::default();
+    let hits = wc_core::find::find(&guest_open.project, "Q5", opts);
+    assert_eq!(guest_open.replace_found(&hits, "Q5", "Q6", opts), Ok(1));
+    guest_open.checkpoint();
+    let placed = guest_open
+        .project
+        .page_mut("p0003")
+        .and_then(|p| p.symbols.iter_mut().find(|s| s.id == item))
+        .ok_or("no placement")?;
+    placed.tag = Some(q6.clone());
+    for _ in 0..2 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The rename waits with the placement: the session keeps -Q5 and has no -Q6 yet.
+    assert!(host_open.project.devices.contains_key(&q5), "{:?}", g.notes);
+    assert!(!host_open.project.devices.contains_key(&q6));
+    assert!(guest_open.project.devices.contains_key(&q6));
+    assert!(!guest_open.project.devices.contains_key(&q5));
+    Ok(())
+}
+
+#[test]
+fn renames_made_here_are_followed_to_their_last_tag_until_the_session_has_them() -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3, k5) = (tag("-K1")?, tag("-K2")?, tag("-K3")?, tag("-K5")?);
+    let one = |a: &wc_core::DeviceTag, b: &wc_core::DeviceTag| -> BTreeMap<_, _> {
+        [(a.clone(), b.clone())].into_iter().collect()
+    };
+    let mut base = Project::new("Test");
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k5.clone(), wc_core::Device::default());
+    let mut renames = BTreeMap::new();
+    let mut local = base.clone();
+    local.rename_device(&k1, &k3);
+    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &local);
+    assert_eq!(renames_now(&renames, &local), one(&k1, &k3));
+    // Renamed back: no rename.
+    note_renames(&mut renames, vec![one(&k3, &k1)], &base, &base);
+    assert!(renames.is_empty());
+    // One the session has is dropped.
+    let mut local = base.clone();
+    local.rename_device(&k5, &k2);
+    note_renames(&mut renames, vec![one(&k5, &k2)], &base, &local);
+    assert_eq!(renames.len(), 1);
+    note_renames(&mut renames, Vec::new(), &local, &local);
+    assert!(renames.is_empty());
+    // So is one taken back here (Undo): a device that gets -K2 later is another device.
+    note_renames(&mut renames, vec![one(&k5, &k2)], &base, &local);
+    assert_eq!(renames.len(), 1);
+    note_renames(&mut renames, Vec::new(), &base, &base);
+    assert!(renames.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_rename_of_a_rename_the_session_has_is_a_rename_of_its_own() -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3) = (tag("-K1")?, tag("-K2")?, tag("-K3")?);
+    let mut base = Project::new("Test");
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    let mut renames = BTreeMap::new();
+    let mut renamed = base.clone();
+    renamed.rename_device(&k1, &k2);
+    note_renames(
+        &mut renames,
+        vec![[(k1.clone(), k2.clone())].into_iter().collect()],
+        &base,
+        &renamed,
+    );
+    assert_eq!(
+        renames_now(&renames, &renamed),
+        [(k1.clone(), k2.clone())].into_iter().collect()
+    );
+    // The session takes -K1 -> -K2; then -K2 is renamed -K3 here.
+    let synced = renamed;
+    note_renames(
+        &mut renames,
+        vec![[(k2.clone(), k3.clone())].into_iter().collect()],
+        &synced,
+        &{
+            let mut l = synced.clone();
+            l.rename_device(&k2, &k3);
+            l
+        },
+    );
+    // And it waits as a pair while the undrawn -K3 waits for its part.
+    let mut local = synced.clone();
+    local.rename_device(&k2, &k3);
+    local.devices.get_mut(&k3).ok_or("no -K3")?.part = Some("acme.relay".into());
+    let now = renames_now(&renames, &local);
+    assert_eq!(now, [(k2.clone(), k3.clone())].into_iter().collect());
+    let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
+    let held = Held::find_renamed(&local, &synced, &parts, &now);
+    assert_eq!(held.now.devices.get(&k2), Some(&None));
+    assert!(held.now.devices.contains_key(&k3));
+    Ok(())
+}
+
+#[test]
+fn undo_of_a_rename_of_a_waiting_rename_brings_the_device_between_back() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(tmp.path())?;
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3) = (tag("-K1")?, tag("-K2")?, tag("-K3")?);
+    open.project.devices.insert(k1.clone(), wc_core::Device::default());
+    let base = open.project.clone();
+    // -K1 renamed -K2 and given a part the session lacks, then -K2 renamed -K3: nothing
+    // draws them.
+    open.checkpoint();
+    open.project.rename_device(&k1, &k2);
+    open.project.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    open.checkpoint();
+    open.project.rename_device(&k2, &k3);
+    let mut renames = BTreeMap::new();
+    let one = |a: &wc_core::DeviceTag, b: &wc_core::DeviceTag| -> BTreeMap<_, _> {
+        [(a.clone(), b.clone())].into_iter().collect()
+    };
+    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &open.project);
+    let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
+    let held = Held::find_renamed(&open.project, &base, &parts, &renames_now(&renames, &open.project));
+    assert_eq!(held.renames.len(), 1);
+    // Undo of the latest action brings -K2 back as it was before it.
+    let step = latest_waiting_step(&open, &base, &held).ok_or("a step")?;
+    step.apply(&mut open.project);
+    assert!(!open.project.devices.contains_key(&k3));
+    assert_eq!(
+        open.project.devices.get(&k2).and_then(|d| d.part.as_deref()),
+        Some("acme.relay")
+    );
+    assert!(!open.project.devices.contains_key(&k1));
+    // At the next sync -K1's removal still waits with -K2: the rename is -K1 -> -K2 now.
+    note_renames(&mut renames, Vec::new(), &base, &open.project);
+    assert_eq!(renames_now(&renames, &open.project), one(&k1, &k2));
+    let held = Held::find_renamed(&open.project, &base, &parts, &renames_now(&renames, &open.project));
+    assert_eq!(held.now.devices.get(&k1), Some(&None));
+    assert!(held.now.devices.contains_key(&k2));
+    Ok(())
+}
+
+#[test]
+fn a_tag_a_renamed_device_had_before_is_another_devices_once_reused() -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3, k4, k9) = (tag("-K1")?, tag("-K2")?, tag("-K3")?, tag("-K4")?, tag("-K9")?);
+    let one = |a: &wc_core::DeviceTag, b: &wc_core::DeviceTag| -> BTreeMap<_, _> {
+        [(a.clone(), b.clone())].into_iter().collect()
+    };
+    let mut base = Project::new("Test");
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k9.clone(), wc_core::Device::default());
+    // -K1 renamed -K2, then -K3; then -K9 takes the free -K2 and goes on to -K4.
+    let mut local = base.clone();
+    local.rename_device(&k1, &k3);
+    let mut renames = BTreeMap::new();
+    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &local);
+    local.rename_device(&k9, &k2);
+    note_renames(&mut renames, vec![one(&k9, &k2)], &base, &local);
+    local.rename_device(&k2, &k4);
+    note_renames(&mut renames, vec![one(&k2, &k4)], &base, &local);
+    let pairs: BTreeMap<_, _> = [(k1.clone(), k3.clone()), (k9.clone(), k4.clone())]
+        .into_iter()
+        .collect();
+    assert_eq!(renames_now(&renames, &local), pairs);
+    Ok(())
+}
+
+#[test]
+fn a_tag_an_undone_rename_left_is_another_devices_once_reused() -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3, k9) = (tag("-K1")?, tag("-K2")?, tag("-K3")?, tag("-K9")?);
+    let one = |a: &wc_core::DeviceTag, b: &wc_core::DeviceTag| -> BTreeMap<_, _> {
+        [(a.clone(), b.clone())].into_iter().collect()
+    };
+    let mut base = Project::new("Test");
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k9.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k3);
+    let mut renames = BTreeMap::new();
+    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &local);
+    // Undo takes -K3 back to -K2; at the next sync -K9 takes the free -K3.
+    local.rename_device(&k3, &k2);
+    note_renames(&mut renames, Vec::new(), &base, &local);
+    local.rename_device(&k9, &k3);
+    note_renames(&mut renames, vec![one(&k9, &k3)], &base, &local);
+    let pairs: BTreeMap<_, _> = [(k1.clone(), k2.clone()), (k9.clone(), k3.clone())]
+        .into_iter()
+        .collect();
+    assert_eq!(renames_now(&renames, &local), pairs);
+    // So -K1's removal waits with -K2 while only -K2 waits for its part.
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
+    let held = Held::find_renamed(&local, &base, &parts, &pairs);
+    assert_eq!(held.now.devices.get(&k1), Some(&None));
+    assert!(held.now.devices.contains_key(&k2));
+    Ok(())
+}
+
+#[test]
+fn a_tag_a_waiting_rename_left_on_undo_is_another_devices_at_once() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (q5, k9) = (tag("-Q5")?, tag("-K9")?);
+    host_open.project.devices.insert(q5.clone(), wc_core::Device::default());
+    host_open.project.devices.insert(k9.clone(), wc_core::Device::default());
+    let sync = |h: &mut Share, ho: &mut Open, g: &mut Share, go: &mut Open| {
+        for _ in 0..2 {
+            frames((h, ho, "p0002"), (g, go, "p0003"));
+        }
+    };
+    sync(&mut h, &mut host_open, &mut g, &mut guest_open);
+    let opts = wc_core::find::FindOptions::default();
+    let replace = |o: &mut Open, from: &str, to: &str| -> Result<usize, String> {
+        let hits = wc_core::find::find(&o.project, from, opts);
+        o.replace_found(&hits, from, to, opts)
+    };
+    // The undrawn -Q5 is renamed -K2 and the waiting placement given that tag; then -K2 is
+    // renamed -K3. The rename waits with the placement.
+    assert_eq!(replace(&mut guest_open, "Q5", "K2"), Ok(1));
+    guest_open.checkpoint();
+    guest_open
+        .project
+        .page_mut("p0003")
+        .and_then(|p| p.symbols.iter_mut().find(|s| s.id == item))
+        .ok_or("no placement")?
+        .tag = Some(tag("-K2")?);
+    sync(&mut h, &mut host_open, &mut g, &mut guest_open);
+    assert_eq!(replace(&mut guest_open, "K2", "K3"), Ok(1));
+    sync(&mut h, &mut host_open, &mut g, &mut guest_open);
+    assert!(host_open.project.devices.contains_key(&q5), "{:?}", g.notes);
+    // Undo takes -K3 back to -K2; before the next sync -K9 takes the free -K3.
+    g.undo()?;
+    g.frame(Some(&mut guest_open), Some("p0003".to_owned()), false);
+    assert!(guest_open.project.devices.contains_key(&tag("-K2")?), "{:?}", g.notes);
+    assert_eq!(replace(&mut guest_open, "K9", "K3"), Ok(1));
+    sync(&mut h, &mut host_open, &mut g, &mut guest_open);
+    // -Q5 stays in the session while -K2 waits with the placement.
+    assert!(host_open.project.devices.contains_key(&q5), "{:?}", g.notes);
+    assert!(!host_open.project.devices.contains_key(&tag("-K2")?));
+    Ok(())
+}
+
+#[test]
+fn devices_renamed_onto_each_other_at_once_wait_together() -> TestResult {
+    renamed_onto_each_other("-K111")
+}
+
+#[test]
+fn devices_renamed_onto_each_other_at_once_wait_together_when_the_first_ones_part_waits() -> TestResult {
+    renamed_onto_each_other("-K11")
+}
+
+/// One replace renames -K1 (drawn on page 1) to -K11 and -K11 to -K111; device `waits`
+/// waits for its part.
+fn renamed_onto_each_other(waits: &str) -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k11) = (tag("-K1")?, tag("-K11")?);
+    let mut base = Project::new("Test");
+    base.devices.insert(
+        k1.clone(),
+        wc_core::Device {
+            description: "first".into(),
+            ..Default::default()
+        },
+    );
+    base.devices.insert(
+        k11.clone(),
+        wc_core::Device {
+            description: "second".into(),
+            ..Default::default()
+        },
+    );
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    let opts = wc_core::find::FindOptions::default();
+    let mut local = base.clone();
+    let hits = wc_core::find::find(&local, "K1", opts);
+    let (_, made) = wc_core::find::replace_renaming(&mut local, &hits, "K1", "K11", opts)?;
+    assert_eq!(made.len(), 2, "{made:?}");
+    assert_eq!(local.pages[0].symbols[0].tag.as_ref(), Some(&k11));
+    local.devices.get_mut(&tag(waits)?).ok_or("no device")?.part = Some("acme.relay".into());
+    let mut renames = BTreeMap::new();
+    note_renames(&mut renames, vec![made], &base, &local);
+    assert_eq!(renames.len(), 2, "two renames, not one chain: {renames:?}");
+    // Still two at the next sync: the session has -K11, but as the old side of the second.
+    note_renames(&mut renames, Vec::new(), &base, &local);
+    assert_eq!(renames.len(), 2, "{renames:?}");
+    let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
+    let held = Held::find_renamed(&local, &base, &parts, &renames_now(&renames, &local));
+    // What goes out meanwhile: both devices, and the page retagged to -K11, as the session
+    // has them.
+    let mut sendable = local.clone();
+    held.drop_from(&mut sendable);
+    assert_eq!(sendable.devices, base.devices);
+    assert_eq!(sendable.pages, base.pages);
+    assert_eq!(held.renames.len(), 1);
+    // Kept here while they wait.
+    let mut session = sendable.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session, local);
     Ok(())
 }
 

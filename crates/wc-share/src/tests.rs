@@ -3731,3 +3731,18 @@ fn a_shared_file_holding_another_symbol_is_the_file_of_neither() {
     assert!(missing.contains(&(ItemKind::Symbol, "b".into())), "{missing:?}");
     assert!(host.files().0.is_empty());
 }
+
+#[test]
+fn a_refused_edit_is_named_by_its_seq() {
+    let mut g = Guest::new();
+    let refused = |edit| HostMsg::Refused {
+        refusal: Refusal::Invalid { reason: "no".into() },
+        take_back: false,
+        edit,
+        put_back: None,
+    };
+    g.handle(refused(Some(3)));
+    g.handle(refused(None));
+    g.handle(refused(Some(7)));
+    assert_eq!(g.refused_edits, [3, 7].into());
+}
