@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use wc_core::{DeviceTag, Part, Project};
+use wc_core::{Contacts, DeviceTag, Part, Project};
 
 use crate::{Error, Result};
 
@@ -101,12 +101,46 @@ enum Col {
     OrderNumber,
     Description,
     Symbol,
+    /// A count of one kind of contact.
+    Count(ContactKind),
+    /// Contacts written out, such as `3NO+1NC`.
+    Contacts,
     Other,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ContactKind {
+    Main,
+    No,
+    Nc,
+    Co,
+}
+
 fn classify(h: &str) -> Col {
+    // `NO`, `NC` and `CO` only in capitals: `No.` is a row number in many lists.
+    match h.trim() {
+        "NO" => return Col::Count(ContactKind::No),
+        "NC" => return Col::Count(ContactKind::Nc),
+        "CO" => return Col::Count(ContactKind::Co),
+        _ => {}
+    }
     let k: String = h.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
     match k.as_str() {
+        "maincontacts" | "main" | "poles" | "hauptkontakte" | "pole" | "polzahl" | "hovedkontakter" | "poler" => {
+            Col::Count(ContactKind::Main)
+        }
+        "nocontacts" | "normallyopen" | "schließer" | "schliesser" | "sluttekontakter" | "sluttekontakt" => {
+            Col::Count(ContactKind::No)
+        }
+        "nccontacts" | "normallyclosed" | "öffner" | "oeffner" | "brytekontakter" | "brytekontakt" => {
+            Col::Count(ContactKind::Nc)
+        }
+        "cocontacts" | "changeover" | "changeovercontacts" | "wechsler" | "vekselkontakter" | "vekselkontakt" => {
+            Col::Count(ContactKind::Co)
+        }
+        "contacts" | "contactconfiguration" | "kontakte" | "kontaktbestückung" | "kontaktbestueckung" | "kontakter" => {
+            Col::Contacts
+        }
         "manufacturer" | "maker" | "brand" | "vendor" | "hersteller" | "produsent" | "leverandor" | "leverandør"
         | "fabrikant" => Col::Manufacturer,
         "ordernumber" | "orderno" | "ordernr" | "partnumber" | "partno" | "articlenumber" | "article" | "articleno"
@@ -174,7 +208,71 @@ pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
     parts_from_rows(&records(text, guess_delimiter(first_line)))
 }
 
+/// The most contacts of one kind a part may have.
+const MAX_CONTACTS: u32 = 1000;
+
+/// A count of contacts: a whole number from 0 to [`MAX_CONTACTS`], also as a spreadsheet
+/// writes it (`3.0`). Fails with the reason.
+fn contact_count(v: &str) -> std::result::Result<u32, String> {
+    let n: f64 = v
+        .trim()
+        .replace(',', ".")
+        .parse()
+        .map_err(|_| "not a number".to_owned())?;
+    if n.fract() != 0.0 {
+        return Err("not a whole number".into());
+    }
+    if !(0.0..=f64::from(MAX_CONTACTS)).contains(&n) {
+        return Err(format!("not between 0 and {MAX_CONTACTS}"));
+    }
+    Ok(n as u32)
+}
+
+/// Contacts written out, such as `3NO+1NC`, `1 NO, 1 NC`, `3 main + 1 CO` or German `1S+1Ö`:
+/// pieces split at `+`, `,`, `;` or `/`, each a count (1 when left out) and a kind; the same
+/// kind may come more than once (`1NO+2NO`). Fails with the reason for a piece that cannot be
+/// read, a total over [`MAX_CONTACTS`] for a kind, or text that names no contact at all.
+fn contacts_text(v: &str) -> std::result::Result<Contacts, String> {
+    let mut c = Contacts::default();
+    let mut named = false;
+    for piece in v.split(['+', ',', ';', '/']) {
+        let piece: String = piece
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+            .to_uppercase();
+        if piece.is_empty() {
+            continue;
+        }
+        let digits = piece.chars().take_while(char::is_ascii_digit).count();
+        let (count, kind) = piece.split_at(digits);
+        let n = if count.is_empty() {
+            1
+        } else {
+            contact_count(count).map_err(|why| format!("{piece:?}: {why}"))?
+        };
+        let field = match kind {
+            "MAIN" | "P" | "POLE" | "POLES" | "HK" => &mut c.main,
+            "NO" | "S" => &mut c.no,
+            "NC" | "Ö" | "OE" => &mut c.nc,
+            "CO" | "W" => &mut c.co,
+            _ => return Err(format!("{piece:?}: not a kind of contact (main, NO, NC or CO)")),
+        };
+        *field = field
+            .checked_add(n)
+            .filter(|t| *t <= MAX_CONTACTS)
+            .ok_or_else(|| format!("more than {MAX_CONTACTS} contacts of one kind"))?;
+        named = true;
+    }
+    if named { Ok(c) } else { Err("names no contact".into()) }
+}
+
 /// [`parts`] for rows already split into cells: an Excel worksheet's, or [`file_rows`]'.
+///
+/// A part's contacts come from count columns (`Main contacts`, `NO`, `NC`, `CO`, and their
+/// German and Norwegian names) and from a `Contacts` column written out (`3NO+1NC`); a count
+/// column wins over the same kind in the written-out one. A row whose contacts cannot be read
+/// is imported without them, with a warning naming the row.
 pub fn parts_from_rows(rows: &[Vec<String>]) -> Result<(Vec<Part>, Vec<String>)> {
     let Some((header, body)) = rows.split_first() else {
         return Err(Error::Format("the file is empty".into()));
@@ -187,6 +285,9 @@ pub fn parts_from_rows(rows: &[Vec<String>]) -> Result<(Vec<Part>, Vec<String>)>
     let mut warnings = Vec::new();
     for (i, row) in body.iter().enumerate() {
         let mut p = Part::default();
+        let mut contacts: Option<Contacts> = None;
+        let mut counts: Vec<(ContactKind, u32)> = Vec::new();
+        let mut unread: Vec<String> = Vec::new();
         for ((col, h), v) in cols.iter().zip(header).zip(row) {
             let v = v.trim();
             if v.is_empty() {
@@ -197,6 +298,14 @@ pub fn parts_from_rows(rows: &[Vec<String>]) -> Result<(Vec<Part>, Vec<String>)>
                 Col::OrderNumber => p.order_number = v.into(),
                 Col::Description => p.description = v.into(),
                 Col::Symbol => p.symbol = Some(v.into()),
+                Col::Count(kind) => match contact_count(v) {
+                    Ok(n) => counts.push((*kind, n)),
+                    Err(why) => unread.push(format!("{} {v:?}: {why}", h.trim())),
+                },
+                Col::Contacts => match contacts_text(v) {
+                    Ok(c) => contacts = Some(c),
+                    Err(why) => unread.push(format!("{} {v:?}: {why}", h.trim())),
+                },
                 Col::Other => {
                     p.properties.insert(h.trim().into(), v.into());
                 }
@@ -205,6 +314,26 @@ pub fn parts_from_rows(rows: &[Vec<String>]) -> Result<(Vec<Part>, Vec<String>)>
         if p.order_number.is_empty() {
             warnings.push(format!("row {}: no order number, skipped", i + 2));
             continue;
+        }
+        if unread.is_empty() {
+            if !counts.is_empty() {
+                let c = contacts.get_or_insert_default();
+                for (kind, n) in counts {
+                    *match kind {
+                        ContactKind::Main => &mut c.main,
+                        ContactKind::No => &mut c.no,
+                        ContactKind::Nc => &mut c.nc,
+                        ContactKind::Co => &mut c.co,
+                    } = n;
+                }
+            }
+            p.contacts = contacts;
+        } else {
+            warnings.push(format!(
+                "row {}: contacts not read ({}), the part is imported without them",
+                i + 2,
+                unread.join(", ")
+            ));
         }
         crate::add_part(&mut out, p, &format!("row {}", i + 2), &mut warnings);
     }
@@ -418,6 +547,80 @@ mod tests {
         assert_eq!(r.properties.get("Spannung").map(String::as_str), Some("24 V DC"));
         assert_eq!(parts[1].description, "Klemme \"grau\"");
         Ok(())
+    }
+
+    #[test]
+    fn contacts_are_read_from_count_columns_and_written_out() -> Result<()> {
+        let c = |main, no, nc, co| Some(Contacts { main, no, nc, co });
+        let (p, w) = parts(
+            "Order number;Main contacts;NO;NC;CO;No.\n\
+             LC1D09;3;1;1;;7\n\
+             CA2;;2.0;2;0;8\n\
+             PLAIN;;;;;9\n",
+        )?;
+        assert!(w.is_empty(), "{w:?}");
+        let by = |n: &str| p.iter().find(|p| p.order_number == n).and_then(|p| p.contacts);
+        assert_eq!(by("LC1D09"), c(3, 1, 1, 0));
+        assert_eq!(by("CA2"), c(0, 2, 2, 0));
+        // No contact cells: not known, not zero.
+        assert_eq!(by("PLAIN"), None);
+        // `No.` is a row number, not normally open contacts.
+        assert_eq!(
+            p.iter()
+                .find(|p| p.order_number == "LC1D09")
+                .and_then(|p| p.properties.get("No."))
+                .map(String::as_str),
+            Some("7")
+        );
+
+        let (p, w) = parts(
+            "Bestellnummer;Kontakte;Öffner\n\
+             K1;3 main + 1 NO;\n\
+             K2;1S+1Ö;2\n\
+             K3;2CO;\n\
+             K4;3NO+lots;\n\
+             K5;;two\n",
+        )?;
+        let by = |n: &str| p.iter().find(|p| p.order_number == n).and_then(|p| p.contacts);
+        assert_eq!(by("K1"), c(3, 1, 0, 0));
+        // The count column wins over the same kind written out.
+        assert_eq!(by("K2"), c(0, 1, 2, 0));
+        assert_eq!(by("K3"), c(0, 0, 0, 2));
+        // Unreadable contacts: the part comes in without them, and the row is named.
+        assert_eq!(p.len(), 5);
+        assert_eq!((by("K4"), by("K5")), (None, None));
+        assert_eq!(
+            w,
+            [
+                "row 5: contacts not read (Kontakte \"3NO+lots\": \"LOTS\": not a kind of contact (main, NO, NC or CO)), \
+                 the part is imported without them",
+                "row 6: contacts not read (Öffner \"two\": not a number), the part is imported without them",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn written_out_contacts_add_up_and_say_why_they_cannot_be_read() {
+        let c = |main, no, nc, co| Ok(Contacts { main, no, nc, co });
+        assert_eq!(contacts_text("1NO+2NO"), c(0, 3, 0, 0));
+        assert_eq!(contacts_text("0NO"), c(0, 0, 0, 0));
+        // Separators alone name nothing: unknown, not zero.
+        assert_eq!(contacts_text("+"), Err("names no contact".into()));
+        assert_eq!(contacts_text(" , "), Err("names no contact".into()));
+        // A total over the limit is refused, also when it would overflow.
+        assert_eq!(
+            contacts_text("1000NO+1NO"),
+            Err("more than 1000 contacts of one kind".into())
+        );
+        let many = ["1000NO"; 5].join("+");
+        assert_eq!(contacts_text(&many), Err("more than 1000 contacts of one kind".into()));
+        assert_eq!(
+            contacts_text("1001NC"),
+            Err("\"1001NC\": not between 0 and 1000".into())
+        );
+        assert_eq!(contact_count("2.5"), Err("not a whole number".into()));
+        assert_eq!(contact_count("-1"), Err("not between 0 and 1000".into()));
     }
 
     #[test]
