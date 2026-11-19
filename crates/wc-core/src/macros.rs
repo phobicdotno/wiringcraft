@@ -274,81 +274,16 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
     let Some(index) = project.pages.iter().position(|p| p.id == page) else {
         return Err(Error::Invalid(format!("no page {page}")));
     };
-    let d = Point::new(at.x - m.anchor.x, at.y - m.anchor.y);
-    let mut used: BTreeSet<DeviceTag> = project.tag_index().into_keys().collect();
-    used.extend(project.devices.keys().cloned());
-    let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
-    let mut ids: BTreeMap<String, String> = BTreeMap::new();
-    let mut out = Vec::new();
-    for s in &m.symbols {
-        let mut s = s.clone();
-        if let Some(old) = s.tag.take() {
-            let t = match renamed.get(&old) {
-                Some(t) => t.clone(),
-                None => {
-                    let letter = old.letter_code();
-                    let t = (1..10_000)
-                        .find_map(|n| {
-                            let mut t = old.clone();
-                            *t.product.last_mut()? = format!("{letter}{n}");
-                            (!used.contains(&t)).then_some(t)
-                        })
-                        .ok_or_else(|| Error::Invalid(format!("no free tag like {old}")))?;
-                    used.insert(t.clone());
-                    project
-                        .devices
-                        .insert(t.clone(), m.devices.get(&old).cloned().unwrap_or_default());
-                    renamed.insert(old, t.clone());
-                    t
-                }
-            };
-            s.tag = Some(t);
-        }
-        let p = project
-            .pages
-            .get_mut(index)
-            .ok_or_else(|| Error::Invalid(format!("no page {page}")))?;
-        let id = p.next_id("s");
-        ids.insert(s.id.clone(), id.clone());
-        s.id = id.clone();
-        s.at = s.at + d;
-        p.symbols.push(s);
-        out.push(id);
-    }
-    let p = project
-        .pages
-        .get_mut(index)
-        .ok_or_else(|| Error::Invalid(format!("no page {page}")))?;
-    for w in &m.wires {
-        let mut w = w.clone();
-        // A core of a cable the macro holds runs in that cable under its new tag.
-        if let Some(c) = &mut w.cable
-            && let Some(t) = renamed.get(&c.cable)
-        {
-            c.cable = t.clone();
-        }
-        w.id = p.next_id("w");
-        w.number = None;
-        for v in &mut w.via {
-            *v = *v + d;
-        }
-        for e in [&mut w.from, &mut w.to] {
-            match e {
-                Endpoint::Point { at } => *at = *at + d,
-                Endpoint::Pin { item, .. } => {
-                    if let Some(n) = ids.get(item.as_str()) {
-                        *item = n.clone();
-                    }
-                }
-            }
-        }
-        out.push(w.id.clone());
-        p.wires.push(w);
-    }
-    for g in &m.graphics {
-        p.graphics.push(g.translate(d));
-    }
-    Ok(out)
+    let group = crate::placement::Group {
+        symbols: &m.symbols,
+        wires: &m.wires,
+        graphics: &m.graphics,
+        devices: &m.devices,
+        anchor: m.anchor,
+    };
+    use crate::placement::{DeviceData, OutOfTags};
+    let placed = crate::placement::place(project, index, group, at, DeviceData::GroupOnly, OutOfTags::Fail)?;
+    Ok(placed.symbols.into_iter().chain(placed.wires).collect())
 }
 
 /// How placeholder and value set names are compared: trimmed, without regard to case.
@@ -772,6 +707,27 @@ mod tests {
         assert_eq!(cable.as_ref().map(ToString::to_string).as_deref(), Some("-W2"));
         let wire = page.wires.iter().find(|w| w.id == ids[2]).and_then(|w| w.cable.clone());
         assert_eq!(wire.map(|c| c.cable), cable, "the core runs in the placed cable");
+        Ok(())
+    }
+
+    #[test]
+    fn placing_fails_untouched_when_no_tag_like_a_device_is_left() -> Result<()> {
+        let m = starter()?.apply(Some("3 kW"), &BTreeMap::new())?;
+        let mut p = Project::new("x");
+        p.pages.push(crate::project::Page::new("p1", "1", "Motors"));
+        for n in 1..10_000 {
+            p.devices
+                .insert(DeviceTag::parse(&format!("-Q{n}"))?, Device::default());
+        }
+        let before = p.clone();
+        let err = place(&mut p, "p1", &m, Point::new(0.0, 0.0))
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("no free tag like -Q1")),
+            "{err:?}"
+        );
+        assert_eq!(p, before, "nothing is placed");
         Ok(())
     }
 }

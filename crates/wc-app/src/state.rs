@@ -2019,19 +2019,7 @@ impl Open {
 
     /// A free tag with the same function, location and letter code as `like`.
     pub(crate) fn free_tag_like(&self, like: &DeviceTag) -> Option<DeviceTag> {
-        let letter = like.letter_code();
-        let used: std::collections::BTreeSet<DeviceTag> = self
-            .project
-            .tag_index()
-            .into_keys()
-            .chain(self.project.devices.keys().cloned())
-            .collect();
-        (1..10_000).find_map(|n| {
-            let mut t = like.clone();
-            let last = t.product.last_mut()?;
-            *last = format!("{letter}{n}");
-            (!used.contains(&t)).then_some(t)
-        })
+        wc_core::placement::free_tag_like(&wc_core::placement::used_tags(&self.project), like)
     }
 
     fn next_page_number(&self) -> String {
