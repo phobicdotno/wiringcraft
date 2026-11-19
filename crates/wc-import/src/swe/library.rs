@@ -11,7 +11,9 @@
 //! column pointing at another table's row is `<prefix>_<other prefix>_id` (`wir_cab_id`,
 //! `caw_cab_id` in the project database). The prefixes of these library tables are not fixed
 //! here: each table's prefix is the one most of its columns share, and fields are found by their
-//! name after the prefix (`reference`, `manufacturer`, `txt`, ...). A table without the fields
+//! name after the prefix (`reference`, `manufacturer`, `txt`, ...). Archives from other installations
+//! mix prefixes in one table (#293), so a field without the table's prefix is taken from the one
+//! column that has it under another prefix. A table without the fields
 //! this needs is skipped with a warning, so one odd table never stops the rest.
 //!
 //! Parts become WiringCraft parts (`<manufacturer>.<reference>` ids, as [`Part::make_id`]
@@ -152,26 +154,110 @@ impl Table {
     }
 
     /// The column for the first of `fields` the table has (case-insensitive).
+    ///
+    /// The table's own `<prefix>_<field>` (or a bare `<field>`) comes first. Archives from other
+    /// installations mix prefixes within one table (#293): when no field has the table's prefix,
+    /// a column `<other prefix>_<field>` is taken, but only when exactly one column has that
+    /// field, so a guess between two candidates is never made.
     fn field(&self, fields: &[&str]) -> Option<&str> {
-        fields.iter().find_map(|f| {
-            let want = format!("{}_{f}", self.prefix);
-            self.columns
-                .iter()
-                .find(|c| c.eq_ignore_ascii_case(&want))
-                .map(String::as_str)
-        })
+        fields
+            .iter()
+            .find_map(|f| self.own_field(f))
+            .or_else(|| fields.iter().find_map(|f| self.other_prefix_field(f)))
     }
 
-    /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`.
+    /// `<prefix>_<field>` or a bare `<field>`.
+    fn own_field(&self, field: &str) -> Option<&str> {
+        let want = format!("{}_{field}", self.prefix);
+        self.columns
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(&want))
+            .or_else(|| self.columns.iter().find(|c| c.eq_ignore_ascii_case(field)))
+            .map(String::as_str)
+    }
+
+    /// The one column named `<any prefix>_<field>`; `None` when none or several are.
+    fn other_prefix_field(&self, field: &str) -> Option<&str> {
+        self.other_prefix_field_except(field, None)
+    }
+
+    /// Like [`Table::other_prefix_field`], leaving the column `except` out.
+    fn other_prefix_field_except(&self, field: &str, except: Option<&str>) -> Option<&str> {
+        let mut found = self.columns.iter().map(String::as_str).filter(|c| {
+            Some(*c) != except
+                && c.split_once('_')
+                    .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(field))
+        });
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
+
+    /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`. The other prefix
+    /// is the one the other table's id column carries, then the other table's own when that
+    /// differs.
+    ///
+    /// The table's own id is never taken for a link: when both tables share a prefix, the bare
+    /// `<other prefix>_id` would be it. Its own `<prefix>_id` (or bare `id`) is always left out.
+    /// An id found only under another prefix may as well be a bare foreign key (`ele_id` in a
+    /// terminal table), so it is left out only while another candidate is there to take.
     fn link(&self, other: &Table) -> Option<&str> {
-        self.field(&[&format!("{}_id", other.prefix)])
+        self.link_from(other, None)
     }
 
-    /// The column for `fields`, or an error naming what is missing.
+    /// Like [`Table::link`] for a table whose own id column the caller knows (`id`): that
+    /// column is never the link, even as the only candidate.
+    fn link_from(&self, other: &Table, id: Option<&str>) -> Option<&str> {
+        let mut prefixes = Vec::new();
+        if let Some((p, _)) = other.field(&["id"]).and_then(|c| c.split_once('_')) {
+            prefixes.push(p);
+        }
+        if !prefixes.iter().any(|q| q.eq_ignore_ascii_case(&other.prefix)) {
+            prefixes.push(other.prefix.as_str());
+        }
+        // A table's prefix taken from its `<p>_id` column alone (`ele_id, no, txt`) is not its
+        // own: that column is a bare foreign key there, not the table's id.
+        let own_id = self.own_field("id").filter(|c| !self.prefix_only_from(c));
+        let maybe_own_id = self.field(&["id"]);
+        let mut candidates: Vec<&str> = Vec::new();
+        for p in &prefixes {
+            let f = format!("{p}_id");
+            for c in [self.own_field(&f), self.other_prefix_field_except(&f, own_id)]
+                .into_iter()
+                .flatten()
+            {
+                if Some(c) != own_id && Some(c) != id && !candidates.contains(&c) {
+                    candidates.push(c);
+                }
+            }
+        }
+        candidates
+            .iter()
+            .find(|c| Some(**c) != maybe_own_id)
+            .or_else(|| candidates.first())
+            .copied()
+    }
+
+    /// Whether `column` is `<prefix>_...` and the only column with the table's prefix, so the
+    /// prefix came from it alone.
+    fn prefix_only_from(&self, column: &str) -> bool {
+        let has_prefix = |c: &str| {
+            c.split_once('_')
+                .is_some_and(|(p, _)| p.eq_ignore_ascii_case(&self.prefix))
+        };
+        has_prefix(column) && self.columns.iter().filter(|c| has_prefix(c)).count() == 1
+    }
+
+    /// The column for `fields`, or an error naming what is missing and the columns there are,
+    /// so a report from an unknown layout says what to map.
     fn need(&self, fields: &[&str]) -> std::result::Result<&str, String> {
+        const SHOWN: usize = 16;
         self.field(fields).ok_or_else(|| {
+            let mut columns = self.columns.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+            if self.columns.len() > SHOWN {
+                columns.push_str(&format!(", ... ({} in all)", self.columns.len()));
+            }
             format!(
-                "{} has no {}_{} column",
+                "{} has no {}_{} column (its columns: {columns})",
                 self.name,
                 self.prefix,
                 fields.first().copied().unwrap_or_default()
@@ -320,7 +406,7 @@ fn catalog_terminals(
     let found = (|| -> std::result::Result<_, String> {
         let el_id = elements.need(&["id"])?.to_owned();
         let el_ref = elements
-            .link(refs)
+            .link_from(refs, Some(&el_id))
             .ok_or_else(|| format!("tew_catelement has no {}_{}_id column", elements.prefix, refs.prefix))?
             .to_owned();
         let t_el = terms

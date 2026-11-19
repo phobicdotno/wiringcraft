@@ -154,6 +154,191 @@ fn other_prefixes_are_found_and_missing_fields_are_warnings() {
     assert_eq!(lib.warnings.len(), 3, "{:?}", lib.warnings);
 }
 
+/// The same rows as [`CATALOG`] and [`APP_DATA`] in a layout like the one newer installations
+/// write (#293): the key fields keep one prefix while most columns carry another, so the
+/// table's prefix is not the one its id and name columns use. Terminals use bare names.
+const OTHER_LAYOUT: &str = "
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT, cre_description TEXT,
+  cre_typedesignation TEXT, cre_width TEXT, cre_deleted INTEGER, cre_guid TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ter_ele_id INTEGER, no INTEGER, txt TEXT);
+INSERT INTO tew_catreference VALUES
+  (1, 'RLY-24', 'Maker A', 'Relay 24 V DC', 'R24', '18 mm', 0, 'a'),
+  (2, 'MCB C10', 'Maker B', NULL, NULL, NULL, 0, 'b'),
+  (3, '', 'Maker C', 'no reference', NULL, NULL, 0, 'c'),
+  (4, 'RLY-24', 'Maker A', 'same again', NULL, NULL, 0, 'd');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil'), (11, 1, 2, 'CO'), (20, 2, 1, '');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2'), (11, 3, '14'), (11, 1, '11'), (11, 2, '12'),
+  (20, 1, '1'), (20, 2, '2'), (99, 1, 'X');
+CREATE TABLE tew_cablereference (cbr_id INTEGER, cbr_reference TEXT, cbr_manufacturer TEXT, car_description TEXT,
+  car_guid TEXT, car_deleted INTEGER, car_family TEXT);
+CREATE TABLE tew_cablereferencewire (crw_cbr_id INTEGER, crw_no TEXT, crw_color TEXT, crw_section TEXT);
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blo_description TEXT, blo_guid TEXT, blo_path TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_cablereference VALUES (1, 'CBL-3G1', 'Maker C', 'Control cable 3G1', 'g', 0, ''),
+  (2, 'CBL-2', 'Maker C', NULL, 'h', 0, '');
+INSERT INTO tew_cablereferencewire VALUES (1, '1', 'BN', '1 mm2'), (1, '2', 'BU', '1 mm2'), (1, '3', 'GNYE', '1 mm2'),
+  (2, '1', '', ''), (2, '2', '', '');
+INSERT INTO tew_block VALUES (1, 'Coil', 'Relay coil', 'x', ''), (2, 'Frame A3', '', 'y', ''),
+  (3, 'Coil', 'Another coil', 'z', '');
+INSERT INTO tew_blockpt VALUES (1, 2, 'A2', 0, -5), (1, 1, 'A1', 0, 5), (3, 1, '', 0, 0);
+";
+
+#[test]
+fn a_layout_with_mixed_prefixes_gives_the_same_library() {
+    let known = read(Some(&db(CATALOG)), Some(&db(APP_DATA))).unwrap();
+    let other = db(OTHER_LAYOUT);
+    let lib = read(Some(&other), Some(&other)).unwrap();
+    assert_eq!(lib.parts, known.parts);
+    assert_eq!(lib.symbols, known.symbols);
+    assert_eq!(lib.report, known.report);
+    assert!(!lib.warnings.iter().any(|w| w.contains("column")), "{:?}", lib.warnings);
+}
+
+#[test]
+fn a_link_is_never_the_tables_own_id() {
+    // Both tables carry the prefix `cre`: the element table's bare-looking `cre_id` is its own
+    // id (10, 20), not the part's (1, 2); its link to the part is `cre_ref_id`.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT, cre_a TEXT, cre_b TEXT,
+  cre_c TEXT, cre_d TEXT);
+CREATE TABLE tew_catelement (cre_id INTEGER, cre_ref_id INTEGER, cre_orderno INTEGER, cre_name TEXT);
+CREATE TABLE tew_catterminal (ter_cre_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A', '', '', '', ''), (2, 'MCB', 'Maker B', '', '', '', '');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil'), (20, 2, 1, '');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2'), (20, 1, '1');
+");
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    let terminals: Vec<(&str, &str)> = parts
+        .iter()
+        .map(|p| (p.id.as_str(), p.properties[PROP_TERMINALS].as_str()))
+        .collect();
+    assert_eq!(terminals, [("maker-a.rly-24", "Coil: A1 A2"), ("maker-b.mcb", "1")]);
+
+    // Without a link column the element table's own id is not taken for one: a warning.
+    let c = db("
+CREATE TABLE tew_catreference (cre_id INTEGER, cre_reference TEXT, cre_manufacturer TEXT);
+CREATE TABLE tew_catelement (cre_id INTEGER, cre_orderno INTEGER, cre_name TEXT);
+CREATE TABLE tew_catterminal (ter_cre_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (1, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert!(
+        !parts[0].properties.contains_key(PROP_TERMINALS),
+        "{:?}",
+        parts[0].properties
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("tew_catelement has no")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_bare_foreign_key_or_one_past_the_own_id_is_a_link() {
+    // Terminals whose only `id` column is the link to the element (`ele_id`): it is a link,
+    // not the terminal table's own id.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ele_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2');
+");
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1 A2");
+    assert!(!warnings.iter().any(|w| w.contains("has no")), "{warnings:?}");
+
+    // The same with no prefix on the terminal table's other columns: `ele_id` is the only
+    // prefixed column, and still the link rather than the terminal table's own id.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ele_id INTEGER, no INTEGER, txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1 A2", "{warnings:?}");
+    assert!(!warnings.iter().any(|w| w.contains("has no")), "{warnings:?}");
+
+    // Elements whose own id is the bare `ref_id`: the link is the one other `*_ref_id` column.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ref_id INTEGER, x_ref_id INTEGER, ref_orderno INTEGER, ref_name TEXT);
+CREATE TABLE tew_catterminal (ter_ref_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1", "{warnings:?}");
+
+    // The same with the element table's other columns under `ele`: its id `ref_id` is found
+    // only under another prefix, and the link is still `x_ref_id`.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ref_id INTEGER, x_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT,
+  ele_description TEXT);
+CREATE TABLE tew_catterminal (ter_ref_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil', '');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1", "{warnings:?}");
+
+    // Without `x_ref_id` the element's id `ref_id` is not taken for its link, even though it
+    // could name a part (element 1, part 1): a warning, no terminals.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT, ele_description TEXT);
+CREATE TABLE tew_catterminal (ter_ref_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (1, 1, 'Coil', '');
+INSERT INTO tew_catterminal VALUES (1, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert!(
+        !parts[0].properties.contains_key(PROP_TERMINALS),
+        "{:?}",
+        parts[0].properties
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("tew_catelement has no")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_field_two_columns_could_be_is_not_guessed() {
+    // Neither `a_reference` nor `b_reference` has the table's prefix `c`: no guess, and the
+    // warning lists the columns so the layout can be mapped.
+    let c = db(
+        "CREATE TABLE tew_catreference (c_id INTEGER, a_reference TEXT, b_reference TEXT, c_manufacturer TEXT);
+         INSERT INTO tew_catreference VALUES (1, 'X-1', 'X-2', 'M');",
+    );
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert!(parts.is_empty());
+    assert!(
+        warnings.iter().any(|w| w.contains("has no c_reference column")
+            && w.contains("its columns: c_id, a_reference, b_reference, c_manufacturer")),
+        "{warnings:?}"
+    );
+}
+
 #[test]
 fn rows_of_the_wrong_type_are_counted_not_fatal() {
     let c = db(CATALOG);
