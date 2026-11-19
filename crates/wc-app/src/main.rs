@@ -207,6 +207,8 @@ struct BaseFetch {
     source: String,
     /// The project that was open when the fetch started: the new one replaces only that one.
     was_open: Option<PathBuf>,
+    /// The project is made and waits to be opened: Cancel no longer applies.
+    made: bool,
     /// Set to stop the fetch: nothing is made then.
     cancel: std::sync::Arc<AtomicBool>,
     /// The outcome: made, why not, or `None` when it was cancelled.
@@ -2207,9 +2209,14 @@ impl App {
             return;
         };
         if let Some(f) = &self.fetch {
-            // The running fetch keeps its note and Cancel.
-            self.dialog = Some(Dialog::Fetching(f.source.clone()));
-            self.ed.message = "A base project is being fetched already; wait for it or cancel it first.".into();
+            if f.made {
+                self.dialog = None;
+                self.ed.message = "The last new project is made and opens once the open project's work is done; create this one after that.".into();
+            } else {
+                // The running fetch keeps its note and Cancel.
+                self.dialog = Some(Dialog::Fetching(f.source.clone()));
+                self.ed.message = "A base project is being fetched already; wait for it or cancel it first.".into();
+            }
             return;
         }
         let name = Self::project_name(dir, name);
@@ -2227,6 +2234,7 @@ impl App {
             dir: dir.to_path_buf(),
             source: source.to_owned(),
             was_open: self.open.as_ref().map(|o| o.dir.clone()),
+            made: false,
             cancel,
             done,
         });
@@ -2235,65 +2243,96 @@ impl App {
 
     /// Stop the base project being fetched: nothing is made.
     fn cancel_fetch(&mut self) {
-        if let Some(f) = &self.fetch {
-            f.cancel.store(true, Ordering::Relaxed);
-            self.ed.message = "Cancelling the new project…".into();
+        match &self.fetch {
+            Some(f) if f.made => {
+                self.ed.message =
+                    "The new project is made already; it opens once the open project's work is done.".into();
+            }
+            Some(f) => {
+                f.cancel.store(true, Ordering::Relaxed);
+                self.ed.message = "Cancelling the new project…".into();
+            }
+            None => {}
         }
     }
 
     /// Take in the base project fetched for a new project, once it is there: the project opens,
     /// or the reason it could not be made shows. Until then the window keeps drawing.
     fn poll_fetch(&mut self, ctx: &egui::Context) {
-        let Some(f) = &self.fetch else { return };
-        // The open project is not saved or replaced while something still works on it: an
-        // assistant turn or command, an open dialog, or the symbol or terminal strip editor.
-        // The outcome waits until they are done.
+        let Some(f) = self.fetch.as_mut() else { return };
+        if !f.made {
+            let failed = match f.done.try_recv() {
+                Ok(Ok(())) => {
+                    f.made = true;
+                    None
+                }
+                Ok(Err(e)) => Some(e),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Some("the fetch stopped without an answer".into()))
+                }
+            };
+            // Cancelled or failed: said at once, whatever else is open.
+            if let Some(why) = failed {
+                let Some(f) = self.fetch.take() else { return };
+                let fetching = matches!(self.dialog, Some(Dialog::Fetching(_)));
+                if fetching {
+                    self.dialog = None;
+                }
+                match why {
+                    None => self.ed.message = "Cancelled: the new project was not made.".into(),
+                    Some(e) => {
+                        let m = format!("Could not create the project in\n{}:\n{e}", f.dir.display());
+                        if fetching || self.dialog.is_none() {
+                            self.dialog = Some(Dialog::Message(m));
+                        } else {
+                            self.ed.message = m.replace('\n', " ");
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        // Made. The open project is not saved or replaced while something still works on it:
+        // an assistant turn or command, an open dialog, or the symbol or terminal strip editor.
+        // The new project waits until they are done, and Cancel is no longer offered.
         if self.assistant.busy()
             || self.assistant.command_running()
             || self.symbol_editor.is_some()
             || self.strip_editor.is_some()
             || self.dialog.as_ref().is_some_and(|d| !matches!(d, Dialog::Fetching(_)))
         {
+            if matches!(self.dialog, Some(Dialog::Fetching(_))) {
+                self.dialog = None;
+            }
+            self.ed.message = "The new project is made; it opens once the open project's work is done.".into();
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return;
         }
-        let outcome = match f.done.try_recv() {
-            Ok(r) => r,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                return;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(Some("the fetch stopped without an answer".into())),
-        };
         let Some(f) = self.fetch.take() else { return };
         if matches!(self.dialog, Some(Dialog::Fetching(_))) {
             self.dialog = None;
         }
-        match outcome {
-            Ok(()) if self.open.as_ref().map(|o| &o.dir) != f.was_open.as_ref() => {
-                // Another project was opened meanwhile: it stays, and the new one waits.
-                let recorded = record_new_project(&f.dir);
-                self.prefs.remember(f.dir.clone());
-                self.prefs.save();
-                self.dialog = Some(Dialog::Message(match recorded {
-                    Ok(()) => format!(
-                        "The new project is ready in\n{}\nOpen it from File, Open when you want it.",
-                        f.dir.display()
-                    ),
-                    Err(e) => format!(
-                        "The new project is in\n{}\nbut its first version could not be recorded:\n{e}",
-                        f.dir.display()
-                    ),
-                }));
-            }
-            Ok(()) => self.finish_new_project(&f.dir, false),
-            Err(None) => self.ed.message = "Cancelled: the new project was not made.".into(),
-            Err(Some(e)) => {
-                self.dialog = Some(Dialog::Message(format!(
-                    "Could not create the project in\n{}:\n{e}",
+        if self.open.as_ref().map(|o| &o.dir) != f.was_open.as_ref() {
+            // Another project was opened meanwhile: it stays, and the new one waits.
+            let recorded = record_new_project(&f.dir);
+            self.prefs.remember(f.dir.clone());
+            self.prefs.save();
+            self.dialog = Some(Dialog::Message(match recorded {
+                Ok(()) => format!(
+                    "The new project is ready in\n{}\nOpen it from File, Open when you want it.",
                     f.dir.display()
-                )));
-            }
+                ),
+                Err(e) => format!(
+                    "The new project is in\n{}\nbut its first version could not be recorded:\n{e}",
+                    f.dir.display()
+                ),
+            }));
+        } else {
+            self.finish_new_project(&f.dir, false);
         }
     }
 

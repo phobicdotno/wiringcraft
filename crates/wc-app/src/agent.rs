@@ -2795,6 +2795,7 @@ mod tests {
             dir: tmp.path().join("new"),
             source: "file:///slow".into(),
             was_open: Some(before.clone()),
+            made: false,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             done,
         });
@@ -2826,6 +2827,7 @@ mod tests {
             dir: tmp.path().join("new"),
             source: "file:///slow".into(),
             was_open: None,
+            made: false,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             done,
         });
@@ -2864,6 +2866,7 @@ mod tests {
             dir: dir.clone(),
             source: "file:///base".into(),
             was_open: Some(before.clone()),
+            made: false,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             done,
         });
@@ -2937,6 +2940,7 @@ mod tests {
             dir: dir.clone(),
             source: "file:///base".into(),
             was_open: Some(before.clone()),
+            made: false,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             done,
         });
@@ -2965,6 +2969,53 @@ mod tests {
         a.symbol_editor = None;
         until_fetched(&mut a);
         assert_eq!(a.open.as_ref().unwrap().dir, dir);
+    }
+
+    #[test]
+    fn a_fetch_outcome_is_taken_in_while_the_symbol_editor_is_open() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        let fetch = |a: &mut App, outcome: Result<(), Option<String>>| {
+            let (tx, done) = std::sync::mpsc::channel();
+            tx.send(outcome).unwrap();
+            a.fetch = Some(crate::BaseFetch {
+                dir: tmp.path().join("pump"),
+                source: "file:///base".into(),
+                was_open: Some(before.clone()),
+                made: false,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                done,
+            });
+            a.dialog = Some(Dialog::Fetching("file:///base".into()));
+        };
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        // Cancelled and failed fetches are said at once, and a new one can start.
+        fetch(&mut a, Err(None));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_none());
+        assert!(a.ed.message.contains("not made"), "{}", a.ed.message);
+        fetch(&mut a, Err(Some("no such server".into())));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_none());
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("no such server")));
+        // A made project waits for the editor, without a Cancel that would do nothing.
+        wc_core::store::create(&tmp.path().join("pump"), "Pump station").unwrap();
+        fetch(&mut a, Ok(()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.as_ref().unwrap().made);
+        assert!(a.dialog.is_none(), "the Fetching note with Cancel is gone");
+        a.cancel_fetch();
+        assert!(
+            !a.fetch
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(a.ed.message.contains("made already"), "{}", a.ed.message);
+        a.symbol_editor = None;
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, tmp.path().join("pump"));
     }
 
     #[test]
