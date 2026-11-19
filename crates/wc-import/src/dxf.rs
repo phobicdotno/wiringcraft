@@ -271,9 +271,51 @@ impl Xf {
     fn det(&self) -> f64 {
         self.m[0] * self.m[3] - self.m[1] * self.m[2]
     }
+    /// Each axis's largest entry and the determinant of the matrix with each axis divided by
+    /// it, so a huge or tiny scale does not overflow or underflow when multiplied, and a tiny axis
+    /// next to a huge one is not lost. None when an entry is not a number.
+    fn normalized_det(&self) -> Option<(f64, f64, f64)> {
+        let [a, b, c, d] = self.m;
+        let (nx, ny) = (a.abs().max(c.abs()), b.abs().max(d.abs()));
+        if !nx.is_finite() || !ny.is_finite() {
+            return None;
+        }
+        if nx == 0.0 || ny == 0.0 {
+            return Some((nx, ny, 0.0));
+        }
+        Some((nx, ny, (a / nx) * (d / ny) - (b / ny) * (c / nx)))
+    }
     /// How lengths grow (the mean of the two axes' scales): radii and text heights.
     fn len_scale(&self) -> f64 {
-        self.det().abs().sqrt()
+        let Some((nx, ny, det)) = self.normalized_det() else {
+            return self.det().abs().sqrt();
+        };
+        // Multiplied first where that stays in range, so a plain scale of 2 gives exactly 2.
+        let both = nx * ny;
+        if both.is_normal() {
+            (both * det.abs()).sqrt()
+        } else {
+            nx.sqrt() * ny.sqrt() * det.abs().sqrt()
+        }
+    }
+    /// Whether the placement mirrors, so arcs run the other way round; read from the normalized
+    /// matrix so a tiny mirrored scale does not underflow to a determinant of -0.
+    fn mirrors(&self) -> bool {
+        self.normalized_det()
+            .map_or_else(|| self.det() < 0.0, |(_, _, det)| det < 0.0)
+    }
+    /// Whether every direction grows alike (turns, mirrors and one scale), so a circle stays a
+    /// circle. A placement scaled differently along x and y makes it an ellipse.
+    fn keeps_circles(&self) -> bool {
+        // Normalized first, so a tiny or huge scale does not underflow or overflow when squared.
+        let big = self.m.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        if big == 0.0 || !big.is_finite() {
+            return true;
+        }
+        let [a, b, c, d] = self.m.map(|v| v / big);
+        let (x, y) = (a * a + c * c, b * b + d * d);
+        let tol = 1e-9 * x.max(y);
+        (x - y).abs() <= tol && (a * b + c * d).abs() <= tol
     }
     /// Where the direction at angle 0 points once placed, in degrees, written as close to the
     /// sum of the turns as possible so plain turns keep their angles as written.
@@ -309,6 +351,34 @@ fn shapes(
         Point::new(x * scale, -y * scale)
     };
     let r_scale = xf.len_scale() * scale;
+    // A circle or arc under a placement that stretches it: `unit` holds its points on the unit
+    // circle, which are placed as the centre plus the placed radius vectors, so a huge centre and
+    // radius that place within range never overflow on the way. Left out and counted when the
+    // placed points are not numbers.
+    let stretched = |e: &Entity, unit: &[(f64, f64)], closed: bool, skipped: &mut BTreeMap<String, usize>| {
+        let flip = e.f_or(230, 1.0) < 0.0;
+        let r = e.f(40);
+        let (cx, cy) = (e.f(10), e.f(20));
+        let center = if flip { p(-cx, cy) } else { p(cx, cy) };
+        // The linear part of the placement on the page (y flipped), on a vector in the entity's
+        // own coordinates.
+        let lin = |dx: f64, dy: f64| {
+            let dx = if flip { -dx } else { dx };
+            let m = &xf.m;
+            ((m[0] * dx + m[1] * dy) * scale, -(m[2] * dx + m[3] * dy) * scale)
+        };
+        let (u, v) = (lin(r, 0.0), lin(0.0, r));
+        let pts: Vec<Point> = unit
+            .iter()
+            .map(|(c, s)| Point::new(center.x + c * u.0 + s * v.0, center.y + c * u.1 + s * v.1))
+            .collect();
+        // Angles that are not numbers give no points at all.
+        if pts.len() < 2 || !pts.iter().all(|q| q.x.is_finite() && q.y.is_finite()) {
+            *skipped.entry(STRETCHED_NOT_NUMBERS.to_owned()).or_default() += 1;
+            return None;
+        }
+        polyline(pts, closed, false)
+    };
     for (i, e) in ents.iter().enumerate() {
         if *budget == 0 {
             // This entity and every one after it at this level are left out.
@@ -329,11 +399,25 @@ fn shapes(
                 a: p(e.f(10), e.f(20)),
                 b: p(e.f(11), e.f(21)),
             }),
+            // Scaled differently along x and y, a circle is an ellipse: drawn by its points.
+            "CIRCLE" if !xf.keeps_circles() => {
+                // On a pin layer it marks a pin at its centre, which a symbol takes from the
+                // points as it does for POINT; the outline is drawn on a page like any other.
+                if is_pin_layer(&layer) {
+                    points.push((layer.clone(), q(e.f(10), e.f(20))));
+                }
+                let (unit, closed) = ellipse_points((0.0, 0.0), (1.0, 0.0), 1.0, 0.0, std::f64::consts::TAU);
+                stretched(e, &unit, closed, skipped)
+            }
             "CIRCLE" => Some(Shape::Circle {
                 center: q(e.f(10), e.f(20)),
                 radius: e.f(40) * r_scale,
                 filled: false,
             }),
+            "ARC" if !xf.keeps_circles() => {
+                let unit = arc_points((0.0, 0.0), 1.0, e.f(50), e.f(51), true);
+                stretched(e, &unit, false, skipped)
+            }
             "ARC" => {
                 // Mirrored in x, the arc from s to e runs from 180 - e to 180 - s.
                 let (s, en) = if flip {
@@ -344,7 +428,7 @@ fn shapes(
                 // A mirroring placement turns the angle a into x_angle - a, so the arc runs the
                 // other way round; any other placement turns it by x_angle.
                 let turn = xf.x_angle();
-                let (s, en) = if xf.det() < 0.0 {
+                let (s, en) = if xf.mirrors() {
                     (turn - en, turn - s)
                 } else {
                     (s + turn, en + turn)
@@ -668,6 +752,10 @@ const SPLINE_NOT_NUMBERS: &str = "SPLINE whose points are not numbers once place
 
 /// The key under which splines with too few points to draw are counted.
 const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
+
+/// The key under which circles and arcs of a stretched block are counted when their angles or
+/// their placed points are not numbers.
+const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
@@ -1921,6 +2009,182 @@ mod tests {
                 if (*start + 90.0).abs() < 1e-9 && end.abs() < 1e-9)),
             "{shapes:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_circle_scaled_differently_along_x_and_y_is_an_ellipse() -> Result<()> {
+        // A radius-10 circle and a quarter arc, inserted at scale (4, 1) and at scale 2 (#307).
+        let blocks = "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n0\n20\n0\n40\n10\n\
+                      0\nARC\n10\n0\n20\n0\n40\n10\n50\n0\n51\n90\n0\nENDBLK\n";
+        let d = parse(&dxf(
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n0\nINSERT\n2\nB\n10\n100\n20\n0\n41\n2\n42\n2\n",
+            blocks,
+        ))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        let polylines: Vec<(&Vec<Point>, bool)> = shapes
+            .iter()
+            .filter_map(|(_, s)| match s {
+                Shape::Polyline { points, closed, .. } => Some((points, *closed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polylines.len(), 2, "{shapes:?}");
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // The circle: 80 x 20 around the insertion point, closed.
+        let (circle, closed) = polylines[0];
+        assert!(closed);
+        let (min_x, max_x) = circle
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.x), b.max(p.x)));
+        let (min_y, max_y) = circle
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.y), b.max(p.y)));
+        assert!(
+            near(min_x, -40.0) && near(max_x, 40.0) && near(min_y, -10.0) && near(max_y, 10.0),
+            "{circle:?}"
+        );
+        // The arc runs from (40, 0) to (0, 10), which is (0, -10) on the y-down page.
+        let (arc, closed) = polylines[1];
+        assert!(!closed);
+        let (first, last) = (arc[0], arc[arc.len() - 1]);
+        assert!(near(first.x, 40.0) && near(first.y, 0.0), "{first:?}");
+        assert!(near(last.x, 0.0) && near(last.y, -10.0), "{last:?}");
+        // A uniform scale keeps them a circle and an arc.
+        assert!(
+            shapes
+                .iter()
+                .any(|(_, s)| matches!(s, Shape::Circle { radius, .. } if near(*radius, 20.0))),
+            "{shapes:?}"
+        );
+        assert!(
+            shapes
+                .iter()
+                .any(|(_, s)| matches!(s, Shape::Arc { radius, .. } if near(*radius, 20.0))),
+            "{shapes:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pin_circle_in_a_stretched_block_is_still_a_pin() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nP\n0\nCIRCLE\n8\nPIN\n10\n0\n20\n5\n40\n1\n\
+                      0\nLINE\n8\n0\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
+        // A closed outline drawn on the pin layer is not a pin.
+        let ents = "0\nINSERT\n2\nP\n10\n0\n20\n0\n41\n4\n42\n1\n0\nPOINT\n8\nPIN\n10\n0\n20\n0\n\
+                    0\nLWPOLYLINE\n8\nPIN\n70\n1\n10\n10\n20\n10\n10\n12\n20\n10\n10\n12\n20\n12\n";
+        let s = symbol(&dxf(ents, blocks), "my.stretched", "Stretched")?;
+        assert_eq!(s.pins.len(), 2, "{:?}", s.pins);
+        assert_eq!(s.pins[0].at.distance(s.pins[1].at), 5.0, "{:?}", s.pins);
+        Ok(())
+    }
+
+    #[test]
+    fn a_huge_stretched_circle_that_places_in_range_is_drawn() -> Result<()> {
+        // Centre and radius 1e308 at scale (0.5, 0.25): adding them in the block overflows, but
+        // the placed ellipse is in range.
+        let blocks = "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n1e308\n20\n0\n40\n1e308\n\
+                      0\nARC\n10\n1e308\n20\n0\n40\n1e308\n50\n0\n51\n90\n0\nENDBLK\n";
+        let d = parse(&dxf("0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n0.5\n42\n0.25\n", blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        assert_eq!(shapes.len(), 2, "{shapes:?} {skipped:?}");
+        for (_, s) in &shapes {
+            assert!(
+                matches!(s, Shape::Polyline { points, .. } if points.iter().all(|p| p.x.is_finite() && p.y.is_finite())),
+                "{s:?}"
+            );
+        }
+        // One whose placed points are out of range is left out and counted.
+        let d = parse(&dxf("0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n", blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        assert!(shapes.is_empty(), "{shapes:?}");
+        assert_eq!(skipped.get(STRETCHED_NOT_NUMBERS), Some(&2), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn stretched_circles_on_a_page_tiny_scales_and_lost_arcs() -> Result<()> {
+        type Drawn = (Vec<(String, Shape)>, BTreeMap<String, usize>);
+        let draw = |blocks: &str, insert: &str| -> Result<Drawn> {
+            let d = parse(&dxf(insert, blocks))?;
+            let mut skipped = BTreeMap::new();
+            let mut budget = MAX_DRAWN;
+            let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+            Ok((shapes, skipped))
+        };
+        // On a page, a circle on a pin layer is drawn like any other: stretched to 80 x 20.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nCIRCLE\n8\nPIN\n10\n0\n20\n0\n40\n10\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n",
+        )?;
+        let width = |s: &Shape| match s {
+            Shape::Polyline { points, .. } => {
+                let xs = points.iter().map(|p| p.x);
+                xs.clone().fold(f64::MIN, f64::max) - xs.fold(f64::MAX, f64::min)
+            }
+            _ => 0.0,
+        };
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert!((width(&shapes[0].1) - 80.0).abs() < 1e-9, "{shapes:?}");
+        // Scales (1e-200, 2e-200) on a radius of 1e200: an ellipse 2 x 4, not a circle of radius 0.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n0\n20\n0\n40\n1e200\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n1e-200\n42\n2e-200\n",
+        )?;
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert!((width(&shapes[0].1) - 2.0).abs() < 1e-9, "{shapes:?}");
+        // A uniform scale of 1e200 on a radius of 1e-200: a circle and an arc of radius 1.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n0\n20\n0\n40\n1e-200\n\
+             0\nARC\n10\n0\n20\n0\n40\n1e-200\n50\n0\n51\n90\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n1e200\n42\n1e200\n",
+        )?;
+        assert_eq!(shapes.len(), 2, "{shapes:?}");
+        assert!(
+            shapes.iter().all(|(_, s)| matches!(s,
+                Shape::Circle { radius, .. } | Shape::Arc { radius, .. } if (*radius - 1.0).abs() < 1e-9)),
+            "{shapes:?}"
+        );
+        // Scales (1e200, 1e-200) keep a text's mean scale of 1, not a height of 0.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nTEXT\n10\n0\n20\n0\n40\n2.5\n1\nT\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n1e200\n42\n1e-200\n",
+        )?;
+        assert!(
+            matches!(&shapes[..], [(_, Shape::Text { height, .. })] if (*height - 2.5).abs() < 1e-9),
+            "{shapes:?}"
+        );
+        // Mirrored at scales (-1e-200, 1e-200), a quarter arc of radius 1e200 runs like one of
+        // radius 1 mirrored at (-1, 1), not the other way round.
+        let arc = |r: &str, sx: &str, sy: &str| {
+            draw(
+                &format!("0\nBLOCK\n2\nB\n0\nARC\n10\n0\n20\n0\n40\n{r}\n50\n0\n51\n90\n0\nENDBLK\n"),
+                &format!("0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n{sx}\n42\n{sy}\n"),
+            )
+            .map(|(s, _)| s)
+        };
+        let (tiny, plain) = (arc("1e200", "-1e-200", "1e-200")?, arc("1", "-1", "1")?);
+        assert!(
+            matches!((&tiny[..], &plain[..]), (
+                [(_, Shape::Arc { radius: r1, start: s1, end: e1, .. })],
+                [(_, Shape::Arc { radius: r2, start: s2, end: e2, .. })],
+            ) if (r1 - r2).abs() < 1e-9 && (s1 - s2).abs() < 1e-9 && (e1 - e2).abs() < 1e-9),
+            "{tiny:?} {plain:?}"
+        );
+        // An arc whose angles give no points is left out and said, next to a line that is drawn.
+        let (shapes, skipped) = draw(
+            "0\nBLOCK\n2\nB\n0\nARC\n10\n0\n20\n0\n40\n1\n50\n-1e308\n51\n1e308\n\
+             0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n",
+        )?;
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert_eq!(skipped.get(STRETCHED_NOT_NUMBERS), Some(&1), "{skipped:?}");
         Ok(())
     }
 
