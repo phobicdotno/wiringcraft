@@ -1808,6 +1808,7 @@ fn run(cli: Cli) -> Res<()> {
                 symbols: &symbols,
                 parts: &parts,
             };
+            warn_report_layouts(&inputs);
             let tables = report_kinds(&reports)?
                 .into_iter()
                 .map(|k| wc_report::build(k, &inputs))
@@ -1964,6 +1965,7 @@ fn run(cli: Cli) -> Res<()> {
                 symbols: &symbols,
                 parts: &parts,
             };
+            warn_report_layouts(&inputs);
             let kinds = report_kinds(std::slice::from_ref(&kind))?;
             if format == "xlsx" {
                 let Some(path) = out else {
@@ -2800,6 +2802,14 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// Warns about the project's report layouts that name a report or column it does not have.
+fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
+    for w in wc_report::layout_warnings(inputs) {
+        // The layout comes from the project file: written so it cannot send control sequences.
+        eprintln!("warning: {}", escape_field(&w));
+    }
 }
 
 /// `import pdf`: the pages of `file` as trace pages numbered from `first_page`. `source` names

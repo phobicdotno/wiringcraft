@@ -1900,3 +1900,125 @@ fn a_csv_header_that_looks_like_a_formula_is_written_as_text_too() {
     assert!(t.to_csv_with(';').starts_with("'=1+2;Tag\r\n"));
     assert!(t.to_csv_raw_with(';').starts_with("=1+2;Tag\r\n"));
 }
+
+#[test]
+fn a_report_layout_picks_orders_renames_and_sorts_columns() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let (mut p, s, mut parts) = fixture();
+    // A second part, so the rows have something to sort.
+    let part = Part {
+        id: "zeta.lamp".into(),
+        manufacturer: "Zeta".into(),
+        order_number: "L-1".into(),
+        description: "Lamp".into(),
+        ..Default::default()
+    };
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            part: Some(part.id.clone()),
+            ..Default::default()
+        },
+    );
+    parts.insert(part.id.clone(), part);
+    let column = |from: &str, heading: Option<&str>| ReportColumn {
+        from: from.into(),
+        heading: heading.map(Into::into),
+    };
+    p.meta.reports.push(ReportLayout {
+        kind: "parts".into(),
+        title: Some("Bill of materials".into()),
+        columns: vec![
+            column("Order number", Some("Art. no.")),
+            column("Manufacturer", None),
+            column("Qty", None),
+        ],
+        sort: vec!["-Manufacturer".into()],
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::Parts, &i);
+    assert_eq!(t.title, "Bill of materials");
+    assert_eq!(t.columns, ["Art. no.", "Manufacturer", "Qty"]);
+    // Descending by maker: Zeta, Acme, then the devices without a part (no maker).
+    assert_eq!(t.rows[0], ["L-1", "Zeta", "1"]);
+    assert_eq!(t.rows[1], ["R-24, DC", "Acme", "1"]);
+    assert_eq!(t.rows.len(), 5);
+    assert_eq!(
+        t.to_csv().lines().take(3).collect::<Vec<_>>(),
+        ["Art. no.,Manufacturer,Qty", "L-1,Zeta,1", "\"R-24, DC\",Acme,1"]
+    );
+    assert!(layout_warnings(&i).is_empty());
+    // The built-in layout is still there for whoever asks for it.
+    assert_eq!(build_builtin(Kind::Parts, &i).columns[0], "Pos");
+    // Other reports keep theirs.
+    assert_eq!(build(Kind::Devices, &i), device_list(&i));
+}
+
+#[test]
+fn a_report_layout_keeps_page_links_with_their_rows_and_sorts_numbers_by_value() {
+    use wc_core::report_layout::ReportLayout;
+    let t = Table {
+        title: "T".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows: vec![
+            vec!["2".into(), "b".into()],
+            vec!["10".into(), "c".into()],
+            vec!["1".into(), "a".into()],
+        ],
+        row_pages: vec!["p2".into(), "p10".into()],
+        front: true,
+    };
+    let sorted = t.with_layout(&ReportLayout {
+        kind: "contents".into(),
+        sort: vec!["Page".into()],
+        ..Default::default()
+    });
+    assert_eq!(
+        sorted.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+        ["1", "2", "10"]
+    );
+    assert_eq!(sorted.row_pages, ["", "p2", "p10"]);
+    assert!(sorted.front);
+}
+
+#[test]
+fn report_layouts_that_name_nothing_are_reported() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let (mut p, s, parts) = fixture();
+    p.meta.reports = vec![
+        ReportLayout {
+            kind: "bom".into(),
+            ..Default::default()
+        },
+        ReportLayout {
+            kind: "wires".into(),
+            columns: vec![ReportColumn {
+                from: "Shade".into(),
+                heading: None,
+            }],
+            sort: vec!["-Length".into()],
+            ..Default::default()
+        },
+        ReportLayout {
+            kind: "wires".into(),
+            ..Default::default()
+        },
+    ];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = layout_warnings(&i);
+    assert_eq!(w.len(), 4, "{w:?}");
+    assert!(w[0].contains("\"bom\": no such report"));
+    assert!(w[1].contains("no column \"Shade\""));
+    assert!(w[2].contains("cannot sort by \"Length\""));
+    assert!(w[3].contains("a second one"));
+    // The unknown column is left out; the report still builds.
+    assert!(build(Kind::Wires, &i).columns.is_empty());
+}

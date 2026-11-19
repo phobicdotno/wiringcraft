@@ -316,6 +316,37 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
 }
 
 #[test]
+fn a_report_in_the_project_s_own_layout_prints_that_layout() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    project.meta.reports.push(ReportLayout {
+        kind: "parts".into(),
+        title: Some("Bill of materials".into()),
+        columns: vec![ReportColumn {
+            from: "Order number".into(),
+            heading: Some("Art. no.".into()),
+        }],
+        ..Default::default()
+    });
+    let none = BTreeMap::new();
+    let inputs = wc_report::Inputs {
+        project: &project,
+        symbols: &none,
+        parts: &BTreeMap::new(),
+    };
+    let opts = Options {
+        reports: vec![wc_report::build(wc_report::Kind::Parts, &inputs)],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &none, &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("R1 Bill of materials"))));
+    assert!(text.contains(&writer::pdf_text("Art. no.")));
+    assert!(!text.contains(&writer::pdf_text("Manufacturer")));
+}
+
+#[test]
 fn underlay_pictures_go_under_the_page_on_their_own_layer() {
     let mut png = Vec::new();
     let img =
