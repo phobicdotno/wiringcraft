@@ -2325,6 +2325,8 @@ struct RenameGroup {
     meta: bool,
     /// Whether a device rename is among them, for the note when they are lost.
     rename: bool,
+    /// The new devices among them that are no part of a rename, named in that note.
+    new_devices: BTreeSet<wc_core::DeviceTag>,
 }
 
 impl RenameGroup {
@@ -2334,6 +2336,7 @@ impl RenameGroup {
         self.panels.extend(other.panels);
         self.meta |= other.meta;
         self.rename |= other.rename;
+        self.new_devices.extend(other.new_devices);
     }
 
     fn overlaps(&self, other: &RenameGroup) -> bool {
@@ -2409,6 +2412,7 @@ impl Held {
         // (tags are chosen from this copy alone), and none of them may then name the session's
         // device.
         let mut groups = std::mem::take(&mut held.renames);
+        let renamed: BTreeSet<wc_core::DeviceTag> = groups.iter().flat_map(|g| g.devices.iter().cloned()).collect();
         for (tag, device) in &held.now.devices {
             if device.is_none() || base.devices.contains_key(tag) {
                 continue;
@@ -2438,6 +2442,7 @@ impl Held {
                     panels,
                     meta,
                     devices: [tag.clone()].into_iter().collect(),
+                    new_devices: [tag.clone()].into_iter().filter(|t| !renamed.contains(t)).collect(),
                     ..Default::default()
                 });
             }
@@ -2709,6 +2714,13 @@ impl Held {
             }
             if group.rename {
                 lost.push("the device rename that waited with it".into());
+                // A new device that went with the rename (through a page, panel or the jumpers
+                // they share) is named too.
+                for tag in group.new_devices.iter().filter(|t| !gone.devices.contains(*t)) {
+                    if keep.devices.contains_key(tag) {
+                        lost.push(format!("device {tag}"));
+                    }
+                }
             } else {
                 // A new device and what names it: each one not lost itself is named.
                 for id in group.pages.iter().filter(|id| !gone.pages.contains(*id)) {
