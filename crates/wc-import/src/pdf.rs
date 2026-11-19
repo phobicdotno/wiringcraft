@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use wc_core::geom::{Align, Point, Shape};
 
+use crate::pdf_codecs;
 use crate::raster::{Orientation, Raster, RasterFormat, samples_to_png, upright};
 use crate::{Error, Result};
 
@@ -908,6 +909,60 @@ impl Interp<'_> {
                         format: RasterFormat::Jpeg,
                         bytes,
                     });
+                }
+                "CCITTFaxDecode" | "CCF" => {
+                    let pnum = |k: &str| parms.and_then(|p| p.get(k)).and_then(|o| self.doc.get(o).num());
+                    let pbool = |k: &str, default: bool| match parms.and_then(|p| p.get(k)).map(|o| self.doc.get(o)) {
+                        Some(Obj::Bool(b)) => *b,
+                        _ => default,
+                    };
+                    let width = get("Width").and_then(Obj::num);
+                    let columns = pnum("Columns").or(width).unwrap_or(1728.0);
+                    if width.is_some_and(|w| w != columns) {
+                        return Err("the fax picture's columns do not match its width".into());
+                    }
+                    let rows = pnum("Rows")
+                        .filter(|r| *r >= 1.0)
+                        .or_else(|| get("Height").and_then(Obj::num))
+                        .unwrap_or(0.0);
+                    let in_range = |v: f64| (1.0..=1e6).contains(&v);
+                    if !in_range(columns) || !in_range(rows) {
+                        return Err("the fax picture has no size or is too large".into());
+                    }
+                    bytes = pdf_codecs::ccitt(
+                        &bytes,
+                        &pdf_codecs::FaxParms {
+                            k: pnum("K").unwrap_or(0.0) as i64,
+                            columns: columns as u32,
+                            rows: rows as u32,
+                            end_of_line: pbool("EndOfLine", false),
+                            encoded_byte_align: pbool("EncodedByteAlign", false),
+                            end_of_block: pbool("EndOfBlock", true),
+                            black_is_1: pbool("BlackIs1", false),
+                        },
+                    )?;
+                }
+                "JBIG2Decode" => {
+                    let globals = parms
+                        .and_then(|p| p.get("JBIG2Globals"))
+                        .map(|o| match self.doc.get(o) {
+                            Obj::Stream(gd, gdata) => {
+                                decode_stream(gd, gdata).ok_or("the shared part of the JBIG2 picture is damaged")
+                            }
+                            _ => Err("the shared part of the JBIG2 picture is missing"),
+                        })
+                        .transpose()?;
+                    let (w, h, samples) = pdf_codecs::jbig2(&bytes, globals.as_deref())?;
+                    let num = |k: &str| get(k).and_then(Obj::num);
+                    if num("Width") != Some(f64::from(w)) || num("Height") != Some(f64::from(h)) {
+                        return Err("the JBIG2 picture's size does not match the picture's".into());
+                    }
+                    bytes = samples;
+                }
+                "JPXDecode" if i + 1 == filters.len() => {
+                    let jpx = pdf_codecs::jpx(&bytes)?;
+                    return samples_to_png(jpx.width, jpx.height, jpx.channels, 8, false, &jpx.samples)
+                        .ok_or_else(|| "the JPEG 2000 picture could not be converted".to_owned());
                 }
                 other => return Err(format!("pictures compressed as {other} are not supported yet")),
             }
@@ -1868,6 +1923,97 @@ mod tests {
         Some((img.width(), img.height(), img.into_raw()))
     }
 
+    /// Group 4 (T.6) data for two 8-pixel rows, each black from pixel 2 to 4: the first row in
+    /// horizontal mode (white 2, black 3) and V0 to its end, the second in three V0 codes.
+    const G4_ROWS: [u8; 2] = [0b0010_1111, 0b0111_1000];
+    /// What those rows look like once decoded, as grey levels.
+    const G4_LUMA: [u8; 16] = [255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255];
+
+    /// A JBIG2 page in the embedded organization: page information (8 x 2) and one immediate
+    /// lossless generic region coded with MMR, holding [`G4_ROWS`].
+    fn jbig2_page() -> Vec<u8> {
+        let mut b = Vec::new();
+        // Segment 0, page information (type 48), page 1, 19 bytes.
+        b.extend_from_slice(&[0, 0, 0, 0, 48, 0, 1, 0, 0, 0, 19]);
+        b.extend_from_slice(&[0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Segment 1, immediate lossless generic region (type 38), page 1, 20 bytes.
+        b.extend_from_slice(&[0, 0, 0, 1, 38, 0, 1, 0, 0, 0, 20]);
+        b.extend_from_slice(&[0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b.push(1); // MMR
+        b.extend_from_slice(&G4_ROWS);
+        b
+    }
+
+    /// A 3 x 2 grey JPEG 2000 codestream, lossless: 10 20 30 / 40 50 60 (written by OpenJPEG).
+    const JPX_GREY: [u8; 136] = [
+        0xFF, 0x4F, 0xFF, 0x51, 0x00, 0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x01, 0xFF, 0x52, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x01, 0x04, 0x04, 0x00, 0x01, 0xFF, 0x5C, 0x00, 0x07, 0x40, 0x40, 0x48, 0x48, 0x50, 0xFF, 0x64, 0x00, 0x25,
+        0x00, 0x01, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x64, 0x20, 0x62, 0x79, 0x20, 0x4F, 0x70, 0x65, 0x6E, 0x4A,
+        0x50, 0x45, 0x47, 0x20, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E, 0x20, 0x32, 0x2E, 0x35, 0x2E, 0x34, 0xFF,
+        0x90, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1B, 0x00, 0x01, 0xFF, 0x93, 0xCF, 0xB4, 0x0C, 0x08, 0x2B,
+        0x1F, 0xA0, 0xF9, 0xC1, 0x80, 0x01, 0x9F, 0x7F, 0xFF, 0xD9,
+    ];
+
+    #[test]
+    fn scanner_pictures_in_fax_jbig2_and_jpeg_2000_are_read() -> Result<()> {
+        let full = "q 595 0 0 842 0 0 cm /Im Do Q";
+        type Seen = (Option<(u32, u32, Vec<u8>)>, Option<String>);
+        let scan = |dict: &str, data: &[u8]| -> Result<Seen> {
+            let p = pages(&picture_pdf(0, dict, data, full))?;
+            Ok((p[0].scan.as_ref().and_then(luma), p[0].scan_problem.clone()))
+        };
+        let bilevel = "/Width 8 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 1";
+
+        // Group 4 fax, as office scanners write it: 0 samples are black.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 /Rows 2 >>");
+        assert_eq!(scan(&g4, &G4_ROWS)?.0, Some((8, 2, G4_LUMA.to_vec())));
+        // Without Rows the picture's height is used.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>");
+        assert_eq!(scan(&g4, &G4_ROWS)?.0, Some((8, 2, G4_LUMA.to_vec())));
+        // BlackIs1 turns the samples round.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 /BlackIs1 true >>");
+        let inverted: Vec<u8> = G4_LUMA.iter().map(|v| 255 - v).collect();
+        assert_eq!(scan(&g4, &G4_ROWS)?.0, Some((8, 2, inverted)));
+        // Columns that disagree with the width are refused with the reason.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 16 >>");
+        let (picture, problem) = scan(&g4, &G4_ROWS)?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("columns")));
+        // Data that is not fax at all is refused, never a panic.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 >>");
+        let (picture, problem) = scan(&g4, &[0, 0, 0, 0])?;
+        assert!(picture.is_none() && problem.is_some(), "{problem:?}");
+
+        // JBIG2, embedded: black pixels come out as 0 samples, like the fax.
+        let jbig2 = format!("{bilevel} /Filter /JBIG2Decode");
+        assert_eq!(scan(&jbig2, &jbig2_page())?.0, Some((8, 2, G4_LUMA.to_vec())));
+        // A size that disagrees with the page is refused.
+        let wrong = "/Width 9 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode";
+        let (picture, problem) = scan(wrong, &jbig2_page())?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("JBIG2")));
+        // Shared segments that are not a stream: refused with the reason.
+        let jbig2 = format!("{bilevel} /Filter /JBIG2Decode /DecodeParms << /JBIG2Globals 3 0 R >>");
+        let (picture, problem) = scan(&jbig2, &jbig2_page())?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("shared part")));
+        // Damaged data.
+        let jbig2 = format!("{bilevel} /Filter /JBIG2Decode");
+        let (picture, problem) = scan(&jbig2, &jbig2_page()[..15])?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("JBIG2")));
+
+        // JPEG 2000: the codestream says its own size and channels.
+        let jpx = "/Width 3 /Height 2 /Filter /JPXDecode";
+        assert_eq!(scan(jpx, &JPX_GREY)?.0, Some((3, 2, vec![10, 20, 30, 40, 50, 60])));
+        let (picture, problem) = scan(jpx, &JPX_GREY[..40])?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("JPEG 2000")));
+        Ok(())
+    }
+
     #[test]
     fn scanned_sheets_become_upright_pictures() -> Result<()> {
         // 3 x 2 grey picture: 10 20 30 / 40 50 60, filling the whole page; a small logo too.
@@ -1896,13 +2042,14 @@ mod tests {
         let p = pages(&picture_pdf(0, grey, &samples, "q 50 0 0 50 10 10 cm /Logo Do Q"))?;
         assert!(p[0].scan.is_none());
 
-        // A JPEG is kept byte for byte; a fax-compressed one is reported, not guessed at.
+        // A JPEG is kept byte for byte.
         let jpeg = [0xFFu8, 0xD8, 0xFF, 0xD9];
         let p = pages(&picture_pdf(0, "/Width 3 /Height 2 /Filter /DCTDecode", &jpeg, full))?;
         assert_eq!(p[0].scan.as_ref().map(|s| s.raster.bytes.clone()), Some(jpeg.to_vec()));
+        // A filter the reader does not know is reported, not guessed at.
         let p = pages(&picture_pdf(
             0,
-            "/Width 3 /Height 2 /Filter /CCITTFaxDecode",
+            "/Width 3 /Height 2 /Filter /RunLengthDecode",
             &jpeg,
             full,
         ))?;
@@ -1910,7 +2057,7 @@ mod tests {
         assert!(
             p[0].scan_problem
                 .as_deref()
-                .is_some_and(|m| m.contains("CCITTFaxDecode"))
+                .is_some_and(|m| m.contains("RunLengthDecode"))
         );
 
         // Short sample data never panics.
