@@ -3931,6 +3931,44 @@ mod tests {
     }
 
     #[test]
+    fn the_black_box_tool_puts_a_tagged_box_with_its_points_on_the_page() {
+        use crate::black_box_tool::BoxDraft;
+        use wc_core::BoxSide;
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.page = 1;
+        a.run(Action::BlackBoxTool);
+        assert_eq!(a.ed.tool, crate::state::Tool::BlackBox);
+        assert!(a.add_black_box("-A7").is_err(), "nothing drawn yet");
+
+        let page_id = a.open.as_ref().unwrap().project.pages[1].id.clone();
+        let mut d = BoxDraft::new(&page_id, Point::new(30.0, 30.0));
+        d.to = Some(Point::new(50.0, 40.0));
+        d.add_pin(BoxSide::Left, 5.0, "1").unwrap();
+        d.add_pin(BoxSide::Right, 5.0, "2").unwrap();
+        a.ed.black_box = Some(d);
+        let err = a.add_black_box("not a tag").unwrap_err();
+        assert!(!err.is_empty());
+        assert!(a.ed.black_box.is_some(), "a refused tag keeps the box being drawn");
+
+        a.add_black_box("-A7").unwrap();
+        assert!(a.ed.black_box.is_none());
+        let o = a.open.as_ref().unwrap();
+        let [crate::state::Selection::Symbol(id)] = a.ed.selection.as_slice() else {
+            unreachable!("the new box is selected: {:?}", a.ed.selection)
+        };
+        let placed = o.project.pages[1].symbol(id).unwrap();
+        assert_eq!(placed.tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-A7"));
+        let pins: Vec<&str> = o.symbols[&placed.symbol].pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(pins, ["1", "2"]);
+
+        // Undo takes the whole box away in one step.
+        a.run(Action::Undo);
+        let o = a.open.as_ref().unwrap();
+        assert!(o.project.pages[1].symbols.is_empty());
+    }
+
+    #[test]
     fn editing_actions_are_off_and_do_nothing_on_a_page_someone_else_holds() {
         use crate::chrome::Status;
         let (_tmp, mut a) = app(vec![]);
@@ -3969,6 +4007,7 @@ mod tests {
             Action::ArcTool,
             Action::PolylineTool,
             Action::DimensionTool,
+            Action::BlackBoxTool,
             Action::PageProps,
         ];
         for act in editing {

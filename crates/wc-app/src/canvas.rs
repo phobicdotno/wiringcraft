@@ -61,6 +61,13 @@ pub struct Editor {
     pub ask_text: Option<Point>,
     /// The comment tool was clicked here; the app asks for the comment.
     pub ask_comment: Option<Point>,
+    /// A black box being drawn with the black box tool.
+    pub black_box: Option<crate::black_box_tool::BoxDraft>,
+    /// The black box tool was clicked on an edge of its box; the app asks for the connection
+    /// point's name.
+    pub ask_box_pin: Option<(wc_core::BoxSide, f64)>,
+    /// The black box tool is done adding connection points; the app asks for the tag.
+    pub ask_box_tag: bool,
     /// The review comment shown in the properties panel, by id.
     pub comment: Option<String>,
     pub message: String,
@@ -106,6 +113,9 @@ impl Default for Editor {
             last_shape_click: None,
             ask_text: None,
             ask_comment: None,
+            black_box: None,
+            ask_box_pin: None,
+            ask_box_tag: false,
             comment: None,
             message: String::new(),
             marking_strip: None,
@@ -984,6 +994,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         ed.tool = Tool::Select;
         ed.wire = None;
         ed.shape_points.clear();
+        ed.black_box = None;
     }
     leave_unpickable_layer(ed);
 
@@ -1014,6 +1025,111 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         }
         Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline | Tool::Dimension => {
             shape_tool(&painter, &resp, open, ed, &xf, &shown, &t, finish, snap_step)
+        }
+        Tool::BlackBox => black_box_tool(&painter, &resp, ed, &page, &xf, &t, finish, tol),
+    }
+}
+
+/// The black box tool: a drag (or two clicks) draws the rectangle; then a click on an edge
+/// asks for a connection point there, and a click inside the box (or Enter) asks for the tag.
+#[allow(clippy::too_many_arguments)]
+fn black_box_tool(
+    painter: &egui::Painter,
+    resp: &egui::Response,
+    ed: &mut Editor,
+    page: &Page,
+    xf: &Xf,
+    t: &theme::Theme,
+    enter: bool,
+    tol: f64,
+) {
+    use crate::black_box_tool::{BoxDraft, edge_at, hint, inside};
+    if ed.black_box.as_ref().is_some_and(|d| d.page_id != page.id) {
+        ed.black_box = None;
+        ed.message = hint(None).into();
+    }
+    // A dialog for this box is waiting: the canvas takes no clicks for it meanwhile.
+    let asking = ed.ask_box_pin.is_some() || ed.ask_box_tag;
+    let cur = ed.cursor;
+    match ed.black_box.as_mut() {
+        None if !asking => {
+            if (resp.drag_started_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary))
+                && let Some(at) = cur
+            {
+                ed.black_box = Some(BoxDraft::new(&page.id, at));
+                ed.message = hint(ed.black_box.as_ref()).into();
+            }
+        }
+        Some(d) if d.to.is_none() && !asking => {
+            let released =
+                resp.drag_stopped_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary);
+            if released && let Some(at) = cur.filter(|at| at.x != d.from.x && at.y != d.from.y) {
+                d.to = Some(at);
+                ed.message = hint(Some(d)).into();
+            }
+        }
+        Some(d) if !asking => {
+            let Some((min, max)) = d.rect() else { return };
+            if resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
+            {
+                if let Some(hit) = edge_at(min, max, at, tol) {
+                    // Snapped along the edge, like every other point on the page.
+                    let snapped = cur.and_then(|c| edge_at(min, max, c, f64::INFINITY));
+                    ed.ask_box_pin = Some(match snapped {
+                        Some((side, off)) if side == hit.0 => (side, off),
+                        _ => hit,
+                    });
+                } else if inside(min, max, at, tol) {
+                    ed.ask_box_tag = true;
+                }
+            } else if enter {
+                ed.ask_box_tag = true;
+            }
+        }
+        _ => {}
+    }
+
+    // The box so far, its points, and where a click on an edge would put the next one.
+    let ghost = Stroke::new(1.5_f32, t.ghost);
+    let Some(d) = ed.black_box.as_ref() else { return };
+    let (min, max) = match d.rect() {
+        Some(r) => r,
+        None => match cur {
+            Some(c) => crate::black_box_tool::corners(d.from, c),
+            None => return,
+        },
+    };
+    painter.rect_stroke(
+        Rect::from_two_pos(xf.s(min), xf.s(max)),
+        0.0,
+        ghost,
+        egui::StrokeKind::Middle,
+    );
+    for pin in &d.pins {
+        if let Some(at) = d.pin_at(pin) {
+            painter.circle_filled(xf.s(at), 3.0, t.accent);
+            painter.text(
+                xf.s(at) + Vec2::new(4.0, -4.0),
+                Align2::LEFT_BOTTOM,
+                &pin.name,
+                FontId::proportional(11.0),
+                t.ink,
+            );
+        }
+    }
+    if d.to.is_some()
+        && !asking
+        && let Some(c) = cur
+        && let Some((side, off)) = edge_at(min, max, c, tol.max(1.0))
+    {
+        let at = d.pin_at(&wc_core::BoxPin {
+            name: String::new(),
+            side,
+            offset: off,
+        });
+        if let Some(at) = at {
+            painter.circle_stroke(xf.s(at), 4.0, Stroke::new(1.5_f32, t.accent));
         }
     }
 }
@@ -1111,7 +1227,7 @@ fn leave_unpickable_layer(ed: &mut Editor) {
             Layer::Drawings
         }
         Tool::Comment => Layer::Comments,
-        Tool::Select | Tool::Place | Tool::Wire => return,
+        Tool::Select | Tool::Place | Tool::Wire | Tool::BlackBox => return,
     };
     let Some(why) = ed.layers.refusal(layer) else {
         return;
