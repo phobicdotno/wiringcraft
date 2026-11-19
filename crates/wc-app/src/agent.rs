@@ -4517,6 +4517,75 @@ mod tests {
     }
 
     #[test]
+    fn check_rules_added_changed_and_deleted_in_the_dialog_are_kept_checked_and_undone() {
+        use crate::rules_form::{RuleRow, rows_of};
+        let (_tmp, mut a) = app(vec![]);
+        let rules = |a: &App| a.open.as_ref().unwrap().project.meta.rules.clone();
+        let broken = |a: &App| match &a.dialog {
+            Some(Dialog::Check(found)) => Some(found.iter().filter(|f| f.message.contains("house rule")).count()),
+            _ => None,
+        };
+        a.open.as_mut().unwrap().project.pages[1]
+            .symbols
+            .push(wc_core::project::PlacedSymbol {
+                id: "s1".into(),
+                symbol: "wc.coil".into(),
+                at: Point::new(50.0, 50.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: DeviceTag::parse("-K1").ok(),
+            });
+        assert!(rules(&a).is_empty());
+        // Add: every tag must match a pattern none does.
+        a.edit_rules();
+        let Some(Dialog::Rules { mut rows, loaded }) = a.dialog.take() else {
+            unreachable!("the rules dialog opens");
+        };
+        let mut row = RuleRow::new("tag");
+        row.pattern = "-ZZ#".into();
+        row.severity = "error".into();
+        row.message = "{tag} breaks the house rule".into();
+        rows.push(row);
+        a.apply_rules(&rows, &loaded).unwrap();
+        assert_eq!(rules(&a).len(), 1);
+        assert!(
+            broken(&a).unwrap() > 0,
+            "the check list has the rule's findings at once"
+        );
+        a.open.as_mut().unwrap().save().unwrap();
+        let toml = std::fs::read_to_string(a.open.as_ref().unwrap().dir.join("project.toml")).unwrap();
+        assert!(toml.contains("[[rule]]") && toml.contains("-ZZ#"), "{toml}");
+
+        // Change: a pattern every tag matches leaves no finding.
+        let loaded = rules(&a);
+        let mut rows = rows_of(&loaded);
+        rows[0].pattern = "*".into();
+        a.apply_rules(&rows, &loaded).unwrap();
+        assert_eq!(rules(&a)[0].pattern.as_deref(), Some("*"));
+        assert_eq!(broken(&a), Some(0));
+
+        // Delete, then undo back to each earlier list.
+        let loaded = rules(&a);
+        a.apply_rules(&[], &loaded).unwrap();
+        assert!(rules(&a).is_empty());
+        let o = a.open.as_mut().unwrap();
+        assert!(o.undo());
+        assert_eq!(o.project.meta.rules[0].pattern.as_deref(), Some("*"));
+        assert!(o.undo());
+        assert_eq!(o.project.meta.rules[0].pattern.as_deref(), Some("-ZZ#"));
+        assert!(o.undo());
+        assert!(o.project.meta.rules.is_empty());
+
+        // Rows left as loaded keep a change made meanwhile, and are no undo step.
+        let o = a.open.as_mut().unwrap();
+        o.project.meta.rules = loaded.clone();
+        let mark = o.undo_mark();
+        a.apply_rules(&rows_of(&[]), &[]).unwrap();
+        assert_eq!(rules(&a), loaded);
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+    }
+
+    #[test]
     fn graphic_ids_from_the_screen_context_and_from_add_graphic_are_guarded() {
         let line = |x: f64| Shape::Line {
             a: Point::new(x, 0.0),

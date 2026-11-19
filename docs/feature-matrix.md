@@ -206,7 +206,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | Project check with errors and warnings | yes | yes | yes, in the app and the CLI | done |
 | Online check while drawing | yes | partly | yes: the check runs again shortly after each edit, off the window thread; problems are ringed on the canvas and counted in the status bar (File → Check while drawing turns it off) | done (#269) |
-| User-defined check rules | yes | no | yes: `[[rule]]` tables in `project.toml` (a cable on matching devices, a tag pattern, at most N wires per pin), run with the built-in check in the app and `wiringcraft check`; see `wc_core::check_rule` | done (#274) |
+| User-defined check rules | yes | no | yes: `[[rule]]` tables in `project.toml` (a cable on matching devices, a tag pattern, at most N wires per pin), run with the built-in check in the app and `wiringcraft check`; added, changed, reordered and deleted in the Rules dialog next to the check list (one undo step); see `wc_core::check_rule` | done (#274, #429) |
 
 ## 13. Data exchange
 
