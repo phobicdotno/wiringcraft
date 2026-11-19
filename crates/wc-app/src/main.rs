@@ -2496,7 +2496,10 @@ impl App {
         if form.edited() {
             if now != form.loaded {
                 self.dialog = Some(Dialog::ReportLayout {
+                    // Against the layout as it is now: OK keeps the draft whenever it differs
+                    // from that one, even if it went back to the layout the dialog opened on.
                     form: Box::new(report_layout_form::Form {
+                        initial: report_layout_form::Form::new(form.kind, form.builtin.clone(), now.as_ref()).layout(),
                         loaded: now,
                         ..form.clone()
                     }),

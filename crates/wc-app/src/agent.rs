@@ -5156,6 +5156,22 @@ mod tests {
         a.apply_report_layout(&again, &dir).unwrap();
         assert_eq!(reports(&a)[0].title.as_deref(), Some("Mine"));
 
+        // Saved "Mine", draft "B", someone saves "Theirs", the draft goes back to "Mine": OK
+        // keeps "Mine", the layout shown, in place of "Theirs".
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { mut form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        form.title = "B".into();
+        a.open.as_mut().unwrap().project.meta.reports[0].title = Some("Theirs".into());
+        assert!(a.apply_report_layout(&form, &dir).is_err());
+        let Some(Dialog::ReportLayout { form: mut again, .. }) = a.dialog.take() else {
+            unreachable!("the draft stays open");
+        };
+        again.title = "Mine".into();
+        a.apply_report_layout(&again, &dir).unwrap();
+        assert_eq!(reports(&a)[0].title.as_deref(), Some("Mine"));
+
         // Back to the built-in layout drops it; another project gets nothing.
         let cleared = crate::report_layout_form::Form::new(Kind::Parts, builtin.clone(), reports(&a).first()).cleared();
         let err = a.apply_report_layout(&cleared, Path::new("elsewhere")).err().unwrap();
