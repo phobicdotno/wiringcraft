@@ -198,9 +198,16 @@ fn loop_room(topo: &Topology) -> f64 {
 }
 
 /// The `nth` same-device loop over a box at `(bx, by)` `box_w` wide, and where its label goes:
-/// each one wider and higher than the one before, so they nest without touching.
-pub fn own_path(bx: f64, by: f64, box_w: f64, nth: usize) -> ([(f64, f64); 4], (f64, f64)) {
-    let spread = 1.5 * nth as f64;
+/// each one wider and higher than the one before, so they nest without touching. `count` is
+/// how many loops the box has.
+pub fn own_path(bx: f64, by: f64, box_w: f64, nth: usize, count: usize) -> ([(f64, f64); 4], (f64, f64)) {
+    // Each loop's legs step 1.5 mm out from the one inside it, closer when there are many, so
+    // the outermost still ends on the box, half a millimetre in from its corners.
+    let step = match count {
+        0 | 1 => 0.0,
+        n => 1.5f64.min((box_w * 0.15 - 0.5) / (n - 1) as f64),
+    };
+    let spread = step * nth as f64;
     let (l, r) = (bx + box_w * 0.15 - spread, bx + box_w * 0.85 + spread);
     let y = by - 3.0 - LINE * nth as f64;
     ([(l, by), (l, y), (r, y), (r, by)], ((l + r) / 2.0, y - 0.8))
@@ -402,7 +409,8 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
         // around it; the outermost one has the width of the box.
         let nth = topo.own.iter().take(n).filter(|o| o.0 == a).count();
         let outer = topo.own.iter().skip(n + 1).all(|o| o.0 != a);
-        let (path, label_at) = own_path(bx, by, g.box_w, nth);
+        let count = topo.own.iter().filter(|o| o.0 == a).count();
+        let (path, label_at) = own_path(bx, by, g.box_w, nth, count);
         let room = match (outer, path.first(), path.last()) {
             (false, Some(l), Some(r)) => r.0 - l.0 - 1.0,
             _ => g.box_w - 2.0,
@@ -771,8 +779,8 @@ mod tests {
         let (_, g, t) = fits_its_sheet(&two);
         assert_eq!(t.own, [(0, 0), (0, 1)]);
         let (bx, by) = g.spot(0, 0);
-        let (inner, inner_label) = own_path(bx, by, g.box_w, 0);
-        let (outer, outer_label) = own_path(bx, by, g.box_w, 1);
+        let (inner, inner_label) = own_path(bx, by, g.box_w, 0, 2);
+        let (outer, outer_label) = own_path(bx, by, g.box_w, 1, 2);
         assert!(
             outer[0].0 < inner[0].0 && outer[3].0 > inner[3].0,
             "the outer loop is wider"
@@ -783,5 +791,29 @@ mod tests {
         );
         assert!(inner_label.1 < inner[1].1 && outer_label.1 < outer[1].1);
         assert!(outer_label.1 - TEXT > MARGIN + layout::HEADER + 10.0, "below the title");
+
+        // Many loops on one box all end on its top edge, each leg apart from the next.
+        let many = Network {
+            links: (0..12)
+                .map(|i| link(&format!("-K10:P{}", 2 * i + 1), &format!("-K10:P{}", 2 * i + 2)))
+                .collect(),
+            ..Network::default()
+        };
+        let (_, g, t) = fits_its_sheet(&many);
+        assert_eq!(t.own.len(), 12);
+        let (bx, by) = g.spot(0, 0);
+        let mut legs: Vec<f64> = Vec::new();
+        for nth in 0..12 {
+            let (path, _) = own_path(bx, by, g.box_w, nth, 12);
+            for p in [path[0], path[3]] {
+                assert!(
+                    p.0 > bx && p.0 < bx + g.box_w && p.1 == by,
+                    "loop {nth} ends on the box: {p:?}"
+                );
+                legs.push(p.0);
+            }
+        }
+        legs.sort_by(f64::total_cmp);
+        assert!(legs.windows(2).all(|w| w[1] - w[0] > 0.1), "{legs:?}");
     }
 }
