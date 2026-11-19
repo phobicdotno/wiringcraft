@@ -2405,17 +2405,28 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 let winner = library.locate(ItemKind::Part, &part);
                 // A copy changed in the project since it was pinned is not overwritten: those
                 // edits must be removed or merged first.
-                let edited = store::read_vendored_part(dir, &part)
-                    .ok()
-                    .is_some_and(|copy| p.lock.parts.get(&part).is_some_and(|pin| pin.hash != copy.hash()));
+                // A copy that is there but cannot be read is not overwritten either.
+                let vendored = store::vendor_path(dir, ItemKind::Part, &part).map_err(e)?;
+                let kept: Option<String> = if vendored.exists() {
+                    match store::read_vendored_part(dir, &part) {
+                        Ok(copy) if p.lock.parts.get(&part).is_some_and(|pin| pin.hash != copy.hash()) => {
+                            Some(format!(
+                                "it has local changes since it was pinned; remove or merge them, then take {part} again"
+                            ))
+                        }
+                        Ok(_) => None,
+                        Err(err) => Some(format!(
+                            "it cannot be read ({err}); fix or remove it, then take {part} again"
+                        )),
+                    }
+                } else {
+                    None
+                };
                 // Read first, so a failed refresh puts the copy back as it was: the lock on disk
                 // is only saved after a refresh that worked, and must keep matching the copy.
-                let vendored = store::vendor_path(dir, ItemKind::Part, &part).map_err(e)?;
                 let before = std::fs::read(&vendored).ok();
                 let refreshed = match &winner {
-                    _ if edited => Err(format!(
-                        "it has local changes since it was pinned; remove or merge them, then take {part} again"
-                    )),
+                    _ if kept.is_some() => Err(kept.clone().unwrap_or_default()),
                     Some(loc) if same(&loc.path, &path) => wc_library::take(dir, p, &library, ItemKind::Part, &part)
                         .map_err(|err| err.to_string())
                         .and_then(|_| {
@@ -4825,6 +4836,12 @@ mod tests {
         cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
         assert_eq!(store::read_vendored_part(&dir, "maker.io-8").unwrap(), edited);
         assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+        // Nor is a copy that cannot be read.
+        let copy_path = store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap();
+        std::fs::write(&copy_path, "{ broken").unwrap();
+        cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&copy_path).unwrap(), "{ broken");
+        store::write_vendored_part(&dir, &edited).unwrap();
         // An unreadable project does not stop an import into a named library folder.
         let broken = tmp.path().join("broken");
         std::fs::create_dir_all(&broken).unwrap();
