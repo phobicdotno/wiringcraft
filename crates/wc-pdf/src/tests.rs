@@ -382,6 +382,15 @@ fn grouped_report_pages_print_a_heading_per_group_and_the_header_values() {
     // The line of header values takes one line of each page.
     table.header = vec!["project.name".into(), "revision".into()];
     assert_eq!(layout::table_pages(&table, 4)[0], vec![g("+A", false), Row(0), Row(1)]);
+    // No page holds more lines than it has room for: without room for a heading and a row,
+    // the headings are left out.
+    for per_page in 1..6 {
+        let pages = layout::table_pages(&table, per_page);
+        let cap = (per_page - 1).max(1);
+        assert!(pages.iter().all(|p| p.len() <= cap), "{per_page}: {pages:?}");
+        assert_eq!(pages.iter().flatten().filter(|l| matches!(l, Row(_))).count(), 4);
+    }
+    assert_eq!(layout::table_pages(&table, 2)[0], vec![Row(0)]);
 
     let mut project = Project::new("Plant 7");
     project.pages = vec![Page::new("p1", "1", "Mains")];
@@ -1501,10 +1510,10 @@ fn report_pages_move_to_a_larger_sheet_when_the_first_page_is_too_short() {
         height: 100,
     };
     // Room for a few rows under the usual title block: the report keeps the sheet.
-    assert_eq!(layout::report_size(short, 30.0), short);
+    assert_eq!(layout::report_size(short, 30.0, 1), short);
     // A 60 mm title block leaves no row on it: the smallest ISO sheet with room is used.
-    assert_eq!(layout::report_size(short, 60.0), PageSize::A4);
-    assert_eq!(layout::report_size(PageSize::A3, 60.0), PageSize::A3);
+    assert_eq!(layout::report_size(short, 60.0, 1), PageSize::A4);
+    assert_eq!(layout::report_size(PageSize::A3, 60.0, 1), PageSize::A3);
 }
 
 #[test]
@@ -1547,7 +1556,7 @@ fn a_report_after_a_short_first_page_prints_on_the_larger_sheet() {
     let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
     assert_eq!(report.pages, 3);
     let text = String::from_utf8_lossy(&pdf);
-    let want = layout::report_size(project.pages[0].size, project.meta.template.band_height());
+    let want = layout::report_size(project.pages[0].size, project.meta.template.band_height(), 1);
     assert_eq!(want, PageSize::A4);
     let pt = |mm: f64| mm / 25.4 * 72.0;
     let media = |(w, h): (f64, f64)| format!("[0 0 {:.2} {:.2}]", pt(w), pt(h));
@@ -1695,7 +1704,7 @@ fn a_rack_of_three_cards_gives_plc_card_overview_pages() {
     // The overview runs on over as many report sheets as its rows need, after the one
     // schematic page.
     let band = project.meta.template.band_height();
-    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band), band);
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 1), band);
     let sheets = 72usize.div_ceil(per_page);
     assert!(sheets >= 2, "72 rows fit on one sheet of {per_page}");
     assert_eq!(report.pages, 1 + sheets);

@@ -282,6 +282,19 @@ fn merge_segments(mut segs: Vec<(f64, f64, f64)>) -> Vec<(f64, f64, f64)> {
     out
 }
 
+/// The value of title-block field `key` on sheet `index` of `total`: the page's own fields
+/// (its revision, date, ...) win over the project's, and a blank date is `date`.
+fn title_value(project: &Project, page: &Page, index: usize, total: usize, date: &str, key: &str) -> String {
+    match key {
+        template::PROJECT_NAME => project.meta.name.clone(),
+        template::PAGE_TITLE => page.title.clone(),
+        template::PAGE_NUMBER => page.number.clone(),
+        template::SHEET => format!("{} / {}", index + 1, total),
+        "date" if page.title_field(&project.meta, "date").trim().is_empty() => date.to_owned(),
+        k => page.title_field(&project.meta, k).to_owned(),
+    }
+}
+
 pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, date: &str) -> Vec<FrameMark> {
     let (w, h) = page.size.mm();
     let (x0, y0, x1, y1) = (MARGIN, MARGIN, w - MARGIN, h - MARGIN);
@@ -389,18 +402,7 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
     for (y, a, b) in merge_segments(across) {
         line((a, y), (b, y), Ink::Thin, &mut out);
     }
-    // The page's own fields (its revision, date, ...) win over the project's.
-    let sheet = format!("{} / {}", index + 1, total);
-    let value = |key: &str| -> String {
-        match key {
-            template::PROJECT_NAME => project.meta.name.clone(),
-            template::PAGE_TITLE => page.title.clone(),
-            template::PAGE_NUMBER => page.number.clone(),
-            template::SHEET => sheet.clone(),
-            "date" if page.title_field(&project.meta, "date").trim().is_empty() => date.to_owned(),
-            k => page.title_field(&project.meta, k).to_owned(),
-        }
-    };
+    let value = |key: &str| title_value(project, page, index, total, date, key);
     for (b, (l, t, r, bottom)) in &boxes {
         let top = ty + t;
         let bottom = ty + bottom;
@@ -1008,12 +1010,13 @@ fn report_rows(size: PageSize, band: f64) -> f64 {
 }
 
 /// The sheet report pages are printed on: `wanted` (the first schematic page's size) when it
-/// has room for its title block and at least one table row, otherwise the smallest ISO sheet
-/// that does (A3 when none does).
-pub fn report_size(wanted: PageSize, band: f64) -> PageSize {
+/// has room for its title block and at least `lines` table lines, otherwise the smallest ISO
+/// sheet that does (A3 when none does). A grouped table needs two (a heading and a row), and
+/// one more for its header values.
+pub fn report_size(wanted: PageSize, band: f64, lines: usize) -> PageSize {
     std::iter::once(wanted)
         .chain(PageSize::NAMED)
-        .find(|s| report_rows(*s, band) >= 1.0)
+        .find(|s| report_rows(*s, band) >= lines.max(1) as f64)
         .unwrap_or(PageSize::A3)
 }
 
@@ -1068,17 +1071,19 @@ pub enum TableLine {
 /// The lines of each report page of `table`, with `per_page` lines on a page: its rows, and a
 /// heading above each group when it is grouped (again, marked as continued, at the top of a
 /// page a group runs onto; never alone at the foot of a page). A page fewer for the line of
-/// header values the table prints ([`wc_report::Table::header`]). An empty table has one empty
-/// page.
+/// header values the table prints ([`wc_report::Table::header`]). A page never holds more
+/// than `per_page` lines: when it has no room for a heading and a row, the headings are left
+/// out ([`report_size`] picks a sheet with room for them). An empty table has one empty page.
 pub fn table_pages(table: &wc_report::Table, per_page: usize) -> Vec<Vec<TableLine>> {
     let cap = per_page.saturating_sub(usize::from(!table.header.is_empty())).max(1);
+    let headings = table.group.is_some() && cap > 1;
     let mut pages: Vec<Vec<TableLine>> = vec![Vec::new()];
     let mut current: Option<&str> = None;
     for (n, row) in table.rows.iter().enumerate() {
         let value = table.group.and_then(|g| row.get(g)).map(String::as_str);
-        let new_group = table.group.is_some() && value != current;
-        // A heading takes the last line of a page only when nothing else fits anyway.
-        let need = if new_group && cap > 1 { 2 } else { 1 };
+        let new_group = headings && value != current;
+        // A heading never takes the last line of a page: its first row goes with it.
+        let need = if new_group { 2 } else { 1 };
         if pages.last().is_some_and(|p| p.len() + need > cap) {
             pages.push(Vec::new());
         }
@@ -1089,7 +1094,7 @@ pub fn table_pages(table: &wc_report::Table, per_page: usize) -> Vec<Vec<TableLi
                 continued: false,
             });
             current = value;
-        } else if page.is_empty() && table.group.is_some() && cap > 1 {
+        } else if page.is_empty() && headings {
             page.push(TableLine::Group {
                 value: value.unwrap_or_default().to_owned(),
                 continued: true,
@@ -1129,19 +1134,11 @@ pub fn draw_table_page(
     y += 4.0;
     if !table.header.is_empty() {
         // The title-block values the layout asks for, as on the page's title block.
-        let sheet = format!("{} / {}", index + 1, total);
         let fields: Vec<String> = table
             .header
             .iter()
             .map(|key| {
-                let value = match key.as_str() {
-                    template::PROJECT_NAME => project.meta.name.clone(),
-                    template::PAGE_TITLE => page.title.clone(),
-                    template::PAGE_NUMBER => page.number.clone(),
-                    template::SHEET => sheet.clone(),
-                    "date" if page.title_field(&project.meta, "date").trim().is_empty() => date.to_owned(),
-                    k => page.title_field(&project.meta, k).to_owned(),
-                };
+                let value = title_value(project, page, index, total, date, key);
                 format!("{}: {value}", template::value_label(key))
             })
             .collect();

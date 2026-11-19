@@ -2185,6 +2185,36 @@ fn a_sorted_cable_list_keeps_each_core_with_its_cable() {
 }
 
 #[test]
+fn a_cable_list_grouped_by_cable_without_a_sort_keeps_each_core_in_its_cable_group() {
+    use wc_core::report_layout::ReportLayout;
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w2 = DeviceTag::parse("-W2").unwrap();
+    for (id, cable, core) in [("w1", &w1, "1"), ("w2", &w1, "2"), ("w3", &w2, "1"), ("w4", &w2, "2")] {
+        if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: cable.clone(),
+                core: core.into(),
+            });
+        }
+    }
+    p.meta.reports.push(ReportLayout {
+        kind: "cables".into(),
+        group: Some("Cable".into()),
+        ..Default::default()
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::Cables, &i);
+    let g = t.group.unwrap();
+    let pairs: Vec<(&str, &str)> = t.rows.iter().map(|r| (r[g].as_str(), r[3].as_str())).collect();
+    assert_eq!(pairs, [("-W1", "1"), ("-W1", "2"), ("-W2", "1"), ("-W2", "2")]);
+}
+
+#[test]
 fn a_layout_sorts_by_every_key_in_turn_and_keeps_the_built_in_order_on_ties() {
     use wc_core::report_layout::ReportLayout;
     let row = |a: &str, b: &str, n: &str| vec![a.to_string(), b.to_string(), n.to_string()];

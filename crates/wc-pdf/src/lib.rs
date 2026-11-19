@@ -100,7 +100,14 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     // Report pages use the size of the first schematic page (a larger one when that is too
     // short for a table) and are counted in the sheet total. Panel layouts keep that page's size.
     let first_size = pages.first().map(|p| p.size).unwrap_or_default();
-    let size = layout::report_size(first_size, project.meta.template.band_height());
+    // Room for a grouped table's heading with its first row, and its line of header values.
+    let lines = options
+        .reports
+        .iter()
+        .map(|t| usize::from(t.group.is_some()) + usize::from(!t.header.is_empty()) + 1)
+        .max()
+        .unwrap_or(1);
+    let size = layout::report_size(first_size, project.meta.template.band_height(), lines);
     let per_page = layout::rows_per_page(size, project.meta.template.band_height());
     // The lines of each report table's pages.
     let paged: Vec<Vec<Vec<layout::TableLine>>> = options

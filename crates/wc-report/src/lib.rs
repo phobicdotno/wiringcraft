@@ -163,16 +163,14 @@ impl Table {
         }
         if let Some(g) = group {
             // Each group where its first row is; within it, the sorted order.
-            let mut order: Vec<String> = Vec::new();
+            let mut first_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             for (r, _) in &rows {
-                let v = r.get(g).cloned().unwrap_or_default();
-                if !order.contains(&v) {
-                    order.push(v);
-                }
+                let next = first_seen.len();
+                first_seen.entry(r.get(g).cloned().unwrap_or_default()).or_insert(next);
             }
             let rank = |r: &[String]| {
                 let v = r.get(g).map(String::as_str).unwrap_or_default();
-                order.iter().position(|o| o == v).unwrap_or(usize::MAX)
+                first_seen.get(v).copied().unwrap_or(usize::MAX)
             };
             rows.sort_by_key(|(r, _)| rank(r));
         }
@@ -341,9 +339,9 @@ pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
     let mut table = build_builtin(kind, i);
     match layout_for(i.project, kind) {
         Some(layout) => {
-            // The cable list names a cable only on its first core's row. A sort can move
-            // the other rows away from it, so each row then names its cable itself.
-            if kind == Kind::Cables && !layout.sort.is_empty() {
+            // The cable list names a cable only on its first core's row. A sort or a grouping
+            // can move the other rows away from it, so each row then names its cable itself.
+            if kind == Kind::Cables && (!layout.sort.is_empty() || layout.group.is_some()) {
                 table.fill_down(3);
             }
             table.with_layout(layout)
