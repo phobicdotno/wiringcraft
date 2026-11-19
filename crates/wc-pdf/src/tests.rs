@@ -1862,6 +1862,12 @@ fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about
                 cable: "-W8".into(),
                 ..NetLink::default()
             },
+            NetLink {
+                from: "-K10:P5".into(),
+                to: "secret label!:P1".into(),
+                cable: "-W7".into(),
+                ..NetLink::default()
+            },
         ],
         ..Network::default()
     };
@@ -1880,6 +1886,21 @@ fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about
             && w.ends_with(" is not a device tag: only letters, digits, '.', '_' allowed")),
         "{:?}",
         report.warnings
+    );
+    // A bad link end: the reason, by link number, and never the text written there.
+    assert!(
+        report.warnings.contains(
+            &"network PN2: link 3: its to end is not a device or port: only letters, digits, '.', '_' allowed"
+                .to_owned()
+        ),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("secret") || w.contains("K 10?"))
     );
 }
 
