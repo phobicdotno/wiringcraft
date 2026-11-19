@@ -701,6 +701,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_save_reports_a_used_box_symbol_it_cannot_resolve_and_removes_nothing() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let dir = tmp.path();
+        let mut p = Project::new("Loop");
+        let mut page = Page::new("p1", "1", "One");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "box.p1.s1".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        });
+        p.pages.push(page);
+        let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+        fs::create_dir_all(&folder).map_err(|e| Error::io(&folder, e))?;
+        fs::write(folder.join("box.p1.s2.json"), "{}").map_err(|e| Error::io("write", e))?;
+        // The used name is a link to itself: resolving it fails with something other than
+        // NotFound.
+        std::os::unix::fs::symlink("box.p1.s1.json", folder.join("box.p1.s1.json"))
+            .map_err(|e| Error::io("link", e))?;
+        assert!(save(dir, &p).is_err(), "the resolution error is reported");
+        assert!(
+            folder.join("box.p1.s2.json").exists(),
+            "nothing is removed when a used name cannot be resolved"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_save_removes_an_unused_case_duplicate_but_keeps_a_link_target() -> Result<()> {
         let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
         let dir = tmp.path();
