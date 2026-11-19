@@ -81,7 +81,7 @@ For the other areas, the chapter to read in each help is:
 | Project templates and base projects | yes | yes (project templates) | yes: `wiringcraft new <dir> --template <folder or git URL>` and "Start from" in New project; `{name}` and `{date}` filled in | done (#270) |
 | Project properties (customer, dates, revision ...) | yes | yes | yes | done |
 | Project archive (pack and unpack) | yes | yes (.tewzip) | yes: import of archives, projects are plain folders | done |
-| Multi-language project texts and translation dictionary | yes | yes | no | later |
+| Multi-language project texts and translation dictionary | yes | yes | partly: `translations.toml` dictionary, `wiringcraft pdf --lang nb` (or `nb,en` for two), `wiringcraft translations --lang nb` lists missing texts; no editing in the app yet | done for the CLI (#276) |
 
 ## 2. Editing on the sheet
 
@@ -175,7 +175,7 @@ For the other areas, the chapter to read in each help is:
 | PLC addresses from a CSV list | yes | yes | yes | done |
 | PLC variable list export (structured text) | yes | partly | yes | done |
 | PLC card overview pages and rack configuration | yes | yes | partly: `[[rack]]` tables with their `[[rack.card]]`s in `project.toml` (slot, tag, type, channels, start address); the `plc-cards` report lists every card channel by channel with the device, connection and page from the PLC I/O list, as a table in the PDF (`pdf --report plc-cards`) and the app; see `wc_core::plc_rack`. No drawn card pictures and no rack editor in the app yet | partly (#275) |
-| Fieldbus (PROFINET, EtherCAT) topology | yes | partly | no | later |
+| Fieldbus (PROFINET, EtherCAT) topology | yes | partly | partly: `[[network]]` tables in `project.toml` (devices, addresses, station names, cabled ports), Networks report (`--report networks`) with checks; no drawn topology page yet | network list done (#278) |
 | Exchange with PLC engineering tools (AutomationML) | yes | partly | yes (export) | done |
 
 ## 10. Reports

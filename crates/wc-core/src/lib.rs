@@ -14,6 +14,7 @@ pub mod geom;
 pub mod hash;
 pub mod lock;
 pub mod macros;
+pub mod network;
 pub mod numbering;
 pub mod panel;
 pub mod part;
@@ -27,6 +28,7 @@ pub mod store;
 pub mod symbol;
 pub mod tag;
 pub mod template;
+pub mod translate;
 
 pub use error::{Error, Result};
 pub use geom::{Point, Shape};

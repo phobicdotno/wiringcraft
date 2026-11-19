@@ -17,6 +17,7 @@ pub mod aml;
 pub mod check;
 pub mod configurator;
 pub mod marking;
+pub mod network;
 pub mod plc;
 pub mod step;
 #[cfg(test)]
@@ -30,6 +31,7 @@ pub use marking::{
     LEVEL_SEPARATOR, Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,
     marking_list_with, parse_kinds, parse_lines, terminal_strips, to_smartscript_csv,
 };
+pub use network::{network_list, network_warnings};
 pub use plc::{PlcVariables, plc_card_overview, plc_rack_warnings, plc_variables};
 
 /// A finished report: a title, column headings and rows of text.
@@ -254,10 +256,11 @@ pub enum Kind {
     PlcCards,
     Contents,
     Locations,
+    Networks,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 10] = [
+    pub const ALL: [Kind; 11] = [
         Kind::Contents,
         Kind::Parts,
         Kind::Devices,
@@ -268,6 +271,7 @@ impl Kind {
         Kind::Plc,
         Kind::PlcCards,
         Kind::Locations,
+        Kind::Networks,
     ];
 
     pub fn name(self) -> &'static str {
@@ -282,6 +286,7 @@ impl Kind {
             Kind::PlcCards => "plc-cards",
             Kind::Contents => "contents",
             Kind::Locations => "locations",
+            Kind::Networks => "networks",
         }
     }
 
@@ -382,6 +387,7 @@ pub fn build_builtin(kind: Kind, i: &Inputs<'_>) -> Table {
         Kind::PlcCards => plc_card_overview(i),
         Kind::Contents => contents(i),
         Kind::Locations => location_list(i),
+        Kind::Networks => network_list(i),
     }
 }
 

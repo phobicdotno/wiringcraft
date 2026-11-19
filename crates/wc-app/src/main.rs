@@ -2668,6 +2668,7 @@ fn report_title(k: wc_report::Kind) -> &'static str {
         wc_report::Kind::PlcCards => "PLC cards",
         wc_report::Kind::Contents => "Contents",
         wc_report::Kind::Locations => "Locations",
+        wc_report::Kind::Networks => "Networks",
     }
 }
 
