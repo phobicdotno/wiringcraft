@@ -170,6 +170,19 @@ enum Cmd {
         /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, or all.
         #[arg(long = "report")]
         reports: Vec<String>,
+        /// Print the project's texts in this language from `translations.toml`, such as `nb`,
+        /// or in two (`nb,en`: each text with the second language after it). Texts without a
+        /// translation are printed as drawn and listed as warnings.
+        #[arg(long)]
+        lang: Option<String>,
+    },
+    /// The project's translation dictionary (`translations.toml`): list the texts that have no
+    /// translation into a language. Exits with an error when any is missing, so it can guard a
+    /// release.
+    Translations {
+        /// The language to check, such as `nb`.
+        #[arg(long)]
+        lang: String,
     },
     /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
     /// drawn like the PDF (frame, title block, symbols, wires, cross-references).
@@ -897,6 +910,16 @@ fn cover_moved(ids: Vec<String>) {
 
 fn load(dir: &Path) -> Res<Project> {
     store::load(dir).map_err(e)
+}
+
+/// The project with its texts in `lang` (one language code, or two joined by `,`) from the
+/// project's `translations.toml`, and the texts that have no translation.
+fn translated(dir: &Path, p: &Project, lang: &str) -> Res<(Project, Vec<wc_core::translate::Missing>)> {
+    use wc_core::translate::{Dictionary, parse_languages, translate};
+    let langs = parse_languages(lang)
+        .ok_or_else(|| format!("bad language {lang:?}: use a code such as nb, or two as nb,en"))?;
+    let dict = Dictionary::load(dir).map_err(e)?;
+    Ok(translate(p, &dict, &langs))
 }
 
 /// Save the project. Jumpers and strip layouts first follow their terminals: what the command
@@ -1805,8 +1828,23 @@ fn run(cli: Cli) -> Res<()> {
             pages,
             date,
             reports,
+            lang,
         } => {
             let p = load(dir)?;
+            let p = match lang {
+                Some(lang) => {
+                    let (p, missing) = translated(dir, &p, &lang)?;
+                    for m in &missing {
+                        eprintln!(
+                            "warning: no translation for {:?} ({})",
+                            escape_field(&m.text),
+                            escape_field(&m.used.join(", "))
+                        );
+                    }
+                    p
+                }
+                None => p,
+            };
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
@@ -1845,6 +1883,17 @@ fn run(cli: Cli) -> Res<()> {
                 eprintln!("warning: {}", escape_field(w));
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
+        }
+        Cmd::Translations { lang } => {
+            let p = load(dir)?;
+            let (_, missing) = translated(dir, &p, &lang)?;
+            for m in &missing {
+                println!("{}\t{}", escape_field(&m.text), escape_field(&m.used.join(", ")));
+            }
+            if !missing.is_empty() {
+                return Err(format!("{} text(s) have no translation into {lang}", missing.len()));
+            }
+            println!("every text has a translation into {lang}");
         }
         Cmd::Drawing {
             out,
@@ -5074,6 +5123,59 @@ mod tests {
         save(&dir, &p).unwrap();
         assert_eq!(load(&dir).unwrap().meta.racks, p.meta.racks);
         assert!(has_overview("all"));
+    }
+
+    #[test]
+    fn pdf_prints_the_texts_in_the_language_asked_for_and_translations_lists_what_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.pages.push(wc_core::Page::new("p9", "9", "Pumps"));
+        p.devices.insert(
+            "-Q1".parse().unwrap(),
+            wc_core::Device {
+                description: "Main switch".into(),
+                ..Default::default()
+            },
+        );
+        save(&dir, &p).unwrap();
+        std::fs::write(
+            dir.join(wc_core::translate::TRANSLATIONS_FILE),
+            "source = \"en\"\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n",
+        )
+        .unwrap();
+        // Text as the PDF writes it: a hex string.
+        let hex = |t: &str| -> String {
+            std::iter::once("<".to_string())
+                .chain(t.bytes().map(|b| format!("{b:02X}")))
+                .chain(std::iter::once(">".to_string()))
+                .collect()
+        };
+        let pdf = |args: &[&str]| {
+            let out = dir.join("out.pdf");
+            let mut all = vec!["pdf", out.to_str().unwrap(), "--page", "p9"];
+            all.extend_from_slice(args);
+            cli(&dir, &all).unwrap();
+            String::from_utf8_lossy(&std::fs::read(&out).unwrap()).into_owned()
+        };
+        let en = pdf(&[]);
+        assert!(en.contains(&hex("Pumps")) && !en.contains(&hex("Pumper")));
+        let nb = pdf(&["--lang", "nb"]);
+        assert!(nb.contains(&hex("Pumper")) && !nb.contains(&hex("Pumps")));
+        assert!(pdf(&["--lang", "nb,en"]).contains(&hex("Pumper / Pumps")));
+        assert!(cli(&dir, &["pdf", "x.pdf", "--lang", "nb,en,de"]).is_err());
+
+        // The new project's cover page title and the device description have none yet.
+        let err = cli(&dir, &["translations", "--lang", "nb"]).unwrap_err();
+        assert!(err.contains("2 text(s)"), "{err}");
+        assert!(cli(&dir, &["translations", "--lang", "en"]).is_ok());
+        std::fs::write(
+            dir.join(wc_core::translate::TRANSLATIONS_FILE),
+            "[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n[[text]]\nen = \"Main switch\"\nnb = \"Hovedbryter\"\n[[text]]\nen = \"Cover\"\nnb = \"Forside\"\n",
+        )
+        .unwrap();
+        assert!(cli(&dir, &["translations", "--lang", "nb"]).is_ok());
     }
 
     #[test]
