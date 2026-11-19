@@ -7,8 +7,11 @@
 //! the first device) is drawn once, routed beside the boxes to a lane under them; a link
 //! between two ports of one device is a small loop over its box. The sheet grows (a larger
 //! ISO size, else a custom one) until every box has room.
+//!
+//! Each vertical run between the columns gets a track of its own when its span meets another
+//! one's, so two cables never share a line and look connected (#486).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use wc_core::network::{Network, Port};
 use wc_core::{Page, PageSize, Project};
@@ -189,6 +192,13 @@ const GAP_Y: f64 = 8.0;
 const LANE: f64 = 4.0;
 /// A lane at least this long has a label at each end and one in the middle.
 const LONG_LANE: f64 = 24.0;
+/// Room between two vertical runs side by side in one gap, at most.
+const TRACK: f64 = 1.5;
+/// How close two runs may come end to end on one track.
+const TRACK_CLEAR: f64 = 1.0;
+/// How far above its middle a box's tree links leave it when a branch of another box runs
+/// into the next column at the height of its middle.
+const EXIT_SHIFT: f64 = 2.5;
 
 /// Where the boxes go on a sheet: the top left of column 0, row 0, the steps between columns
 /// and rows, the size of a box, and how far each row is pushed down by the loops over the rows
@@ -220,11 +230,19 @@ impl Grid {
         )
     }
 
-    /// Where the link lanes leave the side of a box of column `c`: in the room left of it,
-    /// clear of the boxes and of the labels of the links into and out of that room.
-    fn side(&self, c: usize) -> f64 {
+    /// The room left of the boxes of column `c` that vertical runs use: the x of its first
+    /// track, and the least x a track may take. The first track is the middle of the gap
+    /// between two columns; the labels of the links into column `c` start just right of it,
+    /// and further tracks step left from it, so no run crosses a label. Left of column 0
+    /// the tracks keep clear of the frame.
+    fn gap(&self, c: usize) -> (f64, f64) {
         let x = self.x0 + c as f64 * self.step_x;
-        (x - (self.step_x - self.box_w) / 2.0 - 1.5).max(MARGIN + 2.0)
+        if c == 0 {
+            ((x - 2.0).max(MARGIN + 2.0), MARGIN + 2.0)
+        } else {
+            let prev = x - self.step_x + self.box_w;
+            ((prev + x) / 2.0, prev + 1.5)
+        }
     }
 }
 
@@ -340,17 +358,125 @@ pub fn grid(topo: &Topology, w: f64, h: f64, band: f64) -> Grid {
     }
 }
 
+/// The height of lane `lane` under the boxes, the lowest edge of which is `bottom`.
+fn lane_y(bottom: f64, lane: usize) -> f64 {
+    bottom + LANE * (lane as f64 + 1.0)
+}
+
+/// Where the under links of a box whose top is at `y` leave its left side.
+fn attach(g: &Grid, y: f64) -> f64 {
+    y + g.box_h - 1.5
+}
+
 /// The path of a link drawn in lane `lane` under the boxes, from the box at `a` to the one
-/// at `b` (column, row): out of the lower left of each box into the room left of its column,
-/// down that room to the lane, and along it.
-pub fn under_path(g: &Grid, a: (usize, usize), b: (usize, usize), bottom: f64, lane: usize) -> Vec<(f64, f64)> {
+/// at `b` (column, row): out of the lower left of each box to its run at `xa` and `xb` in
+/// the room left of its column ([`routes`]), down that run to the lane, and along it.
+pub fn under_path(
+    g: &Grid,
+    a: (usize, usize),
+    b: (usize, usize),
+    bottom: f64,
+    lane: usize,
+    (xa, xb): (f64, f64),
+) -> Vec<(f64, f64)> {
     let (ax, ay) = g.spot(a.0, a.1);
     let (bx, by) = g.spot(b.0, b.1);
-    let y = bottom + LANE * (lane as f64 + 1.0);
-    let (sa, sb) = (ay + g.box_h - 1.5, by + g.box_h - 1.5);
-    // The two ends' runs down a shared room stay apart.
-    let (xa, xb) = (g.side(a.0), g.side(b.0) + 1.5);
+    let y = lane_y(bottom, lane);
+    let (sa, sb) = (attach(g, ay), attach(g, by));
     vec![(ax, sa), (xa, sa), (xa, y), (xb, y), (xb, sb), (bx, sb)]
+}
+
+/// A vertical run in the room left of a column: the one the tree links out of a box share,
+/// or the one that takes a box's under links down to their lanes (box indexes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Run {
+    Tree(usize),
+    Under(usize),
+}
+
+/// Where the links of a layout run between the columns.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Routes {
+    /// The x of each run.
+    x: BTreeMap<Run, f64>,
+    /// The height at which the tree links of a box (by index) leave its right side.
+    exit: BTreeMap<usize, f64>,
+}
+
+/// The tracks of every vertical run of `topo` on grid `g`, with lanes under `bottom` (#486).
+///
+/// Runs in one gap whose spans meet (within [`TRACK_CLEAR`]) get separate tracks, the one
+/// that starts highest nearest the middle; runs whose spans are apart may share one. The
+/// tree links of one box share a run as one bus, and so do the under links of one box. A
+/// box's tree links leave it a little higher when a branch of another box runs into the
+/// next column at the height of its middle, so the two do not read as one line.
+fn routes(topo: &Topology, g: &Grid, bottom: f64) -> Routes {
+    let place = |b: usize| topo.boxes.get(b).map(|bx| (bx.1, bx.2, g.spot(bx.1, bx.2).1));
+    let centre = |y: f64| y + g.box_h / 2.0;
+    let mut routes = Routes::default();
+    for &(a, _, _) in &topo.tree {
+        let Some((c, r, y)) = place(a) else { continue };
+        let crossed = topo
+            .tree
+            .iter()
+            .any(|&(s, t, _)| s != a && place(t).is_some_and(|(tc, tr, _)| tc == c + 1 && tr == r));
+        let shift = if crossed { EXIT_SHIFT } else { 0.0 };
+        routes.exit.insert(a, centre(y) - shift);
+    }
+    // Each run's gap (by the column right of it) and the top and bottom of its span.
+    let mut spans: BTreeMap<Run, (usize, f64, f64)> = BTreeMap::new();
+    let mut add = |run: Run, gap: usize, y: f64| {
+        let e = spans.entry(run).or_insert((gap, y, y));
+        e.1 = e.1.min(y);
+        e.2 = e.2.max(y);
+    };
+    for &(a, b, _) in &topo.tree {
+        let (Some(&ey), Some((tc, _, ty))) = (routes.exit.get(&a), place(b)) else {
+            continue;
+        };
+        add(Run::Tree(a), tc, ey);
+        add(Run::Tree(a), tc, centre(ty));
+    }
+    for (lane, &(a, b, _)) in topo.under.iter().enumerate() {
+        for e in [a, b] {
+            let Some((c, _, y)) = place(e) else { continue };
+            add(Run::Under(e), c, attach(g, y));
+            add(Run::Under(e), c, lane_y(bottom, lane));
+        }
+    }
+    let mut by_gap: BTreeMap<usize, Vec<(f64, f64, Run)>> = BTreeMap::new();
+    for (run, (gap, lo, hi)) in spans {
+        by_gap.entry(gap).or_default().push((lo, hi, run));
+    }
+    for (gap, mut runs) in by_gap {
+        // First fit by top: the fewest tracks for spans on a line.
+        runs.sort_by(|p, q| p.0.total_cmp(&q.0).then(p.2.cmp(&q.2)));
+        let mut ends: Vec<f64> = Vec::new();
+        let mut tracks = Vec::with_capacity(runs.len());
+        for &(lo, hi, run) in &runs {
+            let t = match ends.iter().position(|&end| end + TRACK_CLEAR < lo) {
+                Some(t) => t,
+                None => {
+                    ends.push(hi);
+                    ends.len() - 1
+                }
+            };
+            if let Some(end) = ends.get_mut(t) {
+                *end = hi;
+            }
+            tracks.push((run, t));
+        }
+        let (first, least) = g.gap(gap);
+        // Closer together when there are more than the gap holds at the full step.
+        let step = match ends.len() {
+            0 | 1 => TRACK,
+            n => TRACK.min((first - least).max(0.0) / (n - 1) as f64),
+        };
+        for (run, t) in tracks {
+            routes.x.insert(run, first - step * t as f64);
+        }
+    }
+    routes
 }
 
 /// The lowest edge of any box.
@@ -364,15 +490,16 @@ fn bottom_of(topo: &Topology, g: &Grid) -> f64 {
 /// A point on the sheet, in mm.
 type Pt = (f64, f64);
 
-/// The path of a tree link from the box at `a` to the box at `b` (top left corners), and where
-/// its `from` port, `to` port and cable labels go. Links fanning out of one box share its
-/// right edge, so the labels sit on the link's own branch at the height of `b`: the port
+/// The path of a tree link from the box at `a` to the box at `b` (top left corners), leaving
+/// `a` at height `exit` and running down the track at `x`, and where its `from` port, `to`
+/// port and cable labels go. Links fanning out of one box share its run, so the labels sit
+/// on the link's own branch at the height of `b`, right of every track of the gap: the port
 /// names over it, one at each end, and the cable under it.
-fn tree_path(g: &Grid, a: Pt, b: Pt) -> (Vec<Pt>, [Pt; 3]) {
-    let start = (a.0 + g.box_w, a.1 + g.box_h / 2.0);
+fn tree_path(g: &Grid, a: Pt, b: Pt, exit: f64, x: f64) -> (Vec<Pt>, [Pt; 3]) {
+    let start = (a.0 + g.box_w, exit);
     let end = (b.0, b.1 + g.box_h / 2.0);
     let mid = (start.0 + end.0) / 2.0;
-    let path = vec![start, (mid, start.1), (mid, end.1), end];
+    let path = vec![start, (x, start.1), (x, end.1), end];
     let labels = [
         (mid + 1.0, end.1 - 1.0),
         (end.0 - 1.0, end.1 - 1.0),
@@ -448,11 +575,17 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
         Some((p, q, l.cable.trim().to_owned()))
     };
     let (mut paths, mut labels) = (Vec::new(), Vec::new());
+    let bottom = bottom_of(topo, g);
+    let routes = routes(topo, g, bottom);
+    let track = |run: Run| routes.x.get(&run).copied();
     for &(a, b, k) in &topo.tree {
         let (Some(pa), Some(qa), Some((from_port, to_port, cable))) = (at(a), at(b), ends(a, k)) else {
             continue;
         };
-        let (path, [from_at, to_at, cable_at]) = tree_path(g, pa, qa);
+        let (Some(&exit), Some(x)) = (routes.exit.get(&a), track(Run::Tree(a))) else {
+            continue;
+        };
+        let (path, [from_at, to_at, cable_at]) = tree_path(g, pa, qa, exit, x);
         // The two port names share the branch from the junction to the box.
         let branch = to_at.0 + 1.0 - from_at.0 + 1.0;
         let half = branch / 2.0 - 1.5;
@@ -461,7 +594,6 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
         labels.push(Label::new(cable_at, 0, &cable, branch - 2.0));
         paths.push(path);
     }
-    let bottom = bottom_of(topo, g);
     let (left, right) = (MARGIN + 1.0, w - MARGIN - 1.0);
     for (lane, &(a, b, k)) in topo.under.iter().enumerate() {
         let (Some(ba), Some(bb), Some((from_port, to_port, cable))) =
@@ -469,7 +601,10 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
         else {
             continue;
         };
-        let path = under_path(g, (ba.1, ba.2), (bb.1, bb.2), bottom, lane);
+        let (Some(xa), Some(xb)) = (track(Run::Under(a)), track(Run::Under(b))) else {
+            continue;
+        };
+        let path = under_path(g, (ba.1, ba.2), (bb.1, bb.2), bottom, lane, (xa, xb));
         // The labels go over the link's own lane, so links that leave one box apart from
         // each other (and share the run beside it) are told apart by their lanes.
         if let (Some(&(lx, ly)), Some(&(rx, _))) = (path.get(2), path.get(3)) {
@@ -766,12 +901,13 @@ mod tests {
         // The switch's two ports are labelled on their own branches, not on top of each other.
         let g = grid(&t, 420.0, 297.0, 30.0);
         let spot = |i: usize| g.spot(t.boxes[i].1, t.boxes[i].2);
+        let r = routes(&t, &g, bottom_of(&t, &g));
         let from_labels: Vec<(f64, f64)> = t
             .tree
             .iter()
             .filter(|e| t.boxes[e.0].0 == "-K10")
             .map(|&(a, b, _)| {
-                let (path, labels) = tree_path(&g, spot(a), spot(b));
+                let (path, labels) = tree_path(&g, spot(a), spot(b), r.exit[&a], r.x[&Run::Tree(a)]);
                 let end = path[path.len() - 1];
                 assert!(
                     (labels[0].1 - (end.1 - 1.0)).abs() < 1e-9,
@@ -989,9 +1125,11 @@ mod tests {
         let (_, g, topo) = fits_its_sheet(&ring());
         assert_eq!(topo.under.len(), 1);
         let bottom = bottom_of(&topo, &g);
+        let r = routes(&topo, &g, bottom);
         for (lane, &(a, b, _)) in topo.under.iter().enumerate() {
             let (ba, bb) = (&topo.boxes[a], &topo.boxes[b]);
-            let path = under_path(&g, (ba.1, ba.2), (bb.1, bb.2), bottom, lane);
+            let xs = (r.x[&Run::Under(a)], r.x[&Run::Under(b)]);
+            let path = under_path(&g, (ba.1, ba.2), (bb.1, bb.2), bottom, lane, xs);
             for seg in path.windows(2) {
                 for bx in &topo.boxes {
                     let (x, y) = g.spot(bx.1, bx.2);
@@ -1154,5 +1292,188 @@ mod tests {
         let (_, y0) = g.spot(c, r - 2);
         let (_, y1) = g.spot(c, r - 1);
         assert!((y1 - y0 - g.step_y).abs() < 1e-9);
+    }
+
+    /// A link's path, with the two devices (box indexes) it joins.
+    type LinkPath = ((usize, usize), Vec<Pt>);
+
+    /// Each link of `net` drawn on its sheet, and the labels.
+    fn drawn_links(net: &Network) -> (Grid, Topology, Vec<LinkPath>, Vec<Label>) {
+        let (size, g, topo) = fits_its_sheet(net);
+        let (paths, labels) = link_drawing(&topo, &g, net, size.mm().0);
+        let owners = topo
+            .tree
+            .iter()
+            .chain(&topo.under)
+            .map(|e| (e.0, e.1))
+            .chain(topo.own.iter().map(|o| (o.0, o.0)));
+        let links = owners.zip(paths).collect();
+        (g, topo, links, labels)
+    }
+
+    /// Whether two axis-aligned segments lie on one line and overlap or touch there.
+    fn on_top(p: Pt, q: Pt, r: Pt, s: Pt) -> bool {
+        let eps = 1e-6;
+        let meet =
+            |a0: f64, a1: f64, b0: f64, b1: f64| a0.min(a1) <= b0.max(b1) + eps && b0.min(b1) <= a0.max(a1) + eps;
+        let vertical = |a: Pt, b: Pt| (a.0 - b.0).abs() < eps;
+        let horizontal = |a: Pt, b: Pt| (a.1 - b.1).abs() < eps;
+        if vertical(p, q) && vertical(r, s) && (p.0 - r.0).abs() < eps {
+            meet(p.1, q.1, r.1, s.1)
+        } else if horizontal(p, q) && horizontal(r, s) && (p.1 - r.1).abs() < eps {
+            meet(p.0, q.0, r.0, s.0)
+        } else {
+            false
+        }
+    }
+
+    /// No two links that do not share a device have a segment on top of each other's, and
+    /// no link runs through a box. Links of one device may share its run, as a bus.
+    fn kept_apart(net: &Network) {
+        let (g, topo, links, labels) = drawn_links(net);
+        for (i, (ea, pa)) in links.iter().enumerate() {
+            for seg in pa.windows(2) {
+                for bx in &topo.boxes {
+                    let (x, y) = g.spot(bx.1, bx.2);
+                    assert!(
+                        !crosses(seg[0], seg[1], (x, y), (x + g.box_w, y + g.box_h)),
+                        "{seg:?} crosses {}",
+                        bx.0
+                    );
+                }
+            }
+            for (eb, pb) in links.iter().skip(i + 1) {
+                let shared = [ea.0, ea.1].iter().any(|d| *d == eb.0 || *d == eb.1);
+                if shared {
+                    continue;
+                }
+                for s in pa.windows(2) {
+                    for t in pb.windows(2) {
+                        let (na, nb) = (&topo.boxes[ea.0].0, &topo.boxes[eb.0].0);
+                        assert!(
+                            !on_top(s[0], s[1], t[0], t[1]),
+                            "the link from {na} ({s:?}) lies on the one from {nb} ({t:?})"
+                        );
+                    }
+                }
+            }
+        }
+        apart(&labels);
+    }
+
+    #[test]
+    fn tree_links_of_two_boxes_in_one_column_get_their_own_tracks() {
+        // B and C are in one column; B-F runs over rows 0-2 and C-G over rows 1-3 (#486).
+        let net = Network {
+            links: vec![
+                link("-A:P1", "-B:P1"),
+                link("-A:P2", "-C:P1"),
+                link("-B:P2", "-D:P1"),
+                link("-B:P3", "-E:P1"),
+                link("-B:P4", "-F:P1"),
+                link("-C:P2", "-G:P1"),
+            ],
+            ..Network::default()
+        };
+        let topo = layout_network(&net);
+        let at = |n: &str| topo.boxes.iter().find(|b| b.0 == n).map(|b| (b.1, b.2)).unwrap();
+        assert_eq!(
+            (at("-B"), at("-C"), at("-F"), at("-G")),
+            ((1, 0), (1, 1), (2, 2), (2, 3))
+        );
+        kept_apart(&net);
+        // C leaves above its middle: the branch of B into E runs at that height.
+        let (g, topo, links, _) = drawn_links(&net);
+        let c = topo.boxes.iter().position(|b| b.0 == "-C").unwrap();
+        let (_, cy) = g.spot(1, 1);
+        let out_of_c = links.iter().find(|(e, _)| e.0 == c).unwrap();
+        assert!((out_of_c.1[0].1 - (cy + g.box_h / 2.0 - EXIT_SHIFT)).abs() < 1e-9);
+        // A plain line keeps its links straight through the middle of the boxes.
+        let line = Network {
+            links: vec![link("-A:P1", "-B:P1"), link("-B:P2", "-C:P1")],
+            ..Network::default()
+        };
+        let (_, _, links, _) = drawn_links(&line);
+        for (_, p) in links {
+            assert!(p.iter().all(|q| (q.1 - p[0].1).abs() < 1e-9), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn ring_approaches_and_tree_branches_get_their_own_tracks() {
+        // A to B, C, D and E, then B-D and C-E: the approaches of the two ring links overlap
+        // beside the boxes (#486).
+        let fan = |extra: &[(&str, &str)]| Network {
+            links: [
+                ("-A:P1", "-B:P1"),
+                ("-A:P2", "-C:P1"),
+                ("-A:P3", "-D:P1"),
+                ("-A:P4", "-E:P1"),
+            ]
+            .iter()
+            .chain(extra)
+            .map(|(a, b)| link(a, b))
+            .collect(),
+            ..Network::default()
+        };
+        let net = fan(&[("-B:P2", "-D:P2"), ("-C:P2", "-E:P2")]);
+        let topo = layout_network(&net);
+        assert_eq!(topo.under.len(), 2);
+        kept_apart(&net);
+        // An under link and the tree branch from A to E would share a run below C.
+        let net = fan(&[("-B:P2", "-C:P2")]);
+        assert_eq!(layout_network(&net).under.len(), 1);
+        kept_apart(&net);
+        // The runs of one gap stay between the columns, clear of the boxes either side.
+        let (g, topo, _, _) = drawn_links(&net);
+        let r = routes(&topo, &g, bottom_of(&topo, &g));
+        let (x1, _) = g.spot(1, 0);
+        for x in r.x.values() {
+            assert!(*x > x1 - (g.step_x - g.box_w) && *x < x1, "{x} is in the gap");
+        }
+    }
+
+    #[test]
+    fn many_runs_in_one_gap_stay_inside_it() {
+        // Ten devices in one column, each linked under to the one five rows down: every run
+        // overlaps the others, and they still fit between the columns.
+        let mut links: Vec<NetLink> = (1..=10)
+            .map(|n| link(&format!("-A:P{n}"), &format!("-T{n}:X1")))
+            .collect();
+        links.extend((1..=5).map(|n| link(&format!("-T{n}:X2"), &format!("-T{}:X2", n + 5))));
+        let net = Network {
+            links,
+            ..Network::default()
+        };
+        assert_eq!(layout_network(&net).under.len(), 5);
+        kept_apart(&net);
+
+        // Twenty under runs and a tree bus need more tracks than the gap holds at the full
+        // step: they close up instead of running into the box of the column before.
+        let mut links: Vec<NetLink> = (1..=20)
+            .map(|n| link(&format!("-A:P{n}"), &format!("-T{n}:X1")))
+            .collect();
+        links.extend((1..=10).map(|n| link(&format!("-T{n}:X2"), &format!("-T{}:X2", n + 10))));
+        let net = Network {
+            links,
+            ..Network::default()
+        };
+        let topo = layout_network(&net);
+        assert_eq!(topo.under.len(), 10);
+        let (g, topo, _, _) = drawn_links(&net);
+        let r = routes(&topo, &g, bottom_of(&topo, &g));
+        let (first, least) = g.gap(1);
+        assert!(
+            r.x.len() * 3 / 2 > (first - least) as usize,
+            "{} runs fill the gap",
+            r.x.len()
+        );
+        for x in r.x.values() {
+            assert!(
+                *x >= least - 1e-9 && *x <= first + 1e-9,
+                "{x} is outside the gap {least}..{first}"
+            );
+        }
+        kept_apart(&net);
     }
 }
