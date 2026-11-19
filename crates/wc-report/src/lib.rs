@@ -185,9 +185,9 @@ impl Table {
     pub fn to_markdown(&self) -> String {
         let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
         let mut out = format!(
-            "## {}\n\n| {} |\n|{}|\n",
-            self.title,
-            self.columns.join(" | "),
+            "## {}\n\n| {} |\n|{}\n",
+            self.title.replace('\n', " "),
+            self.columns.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | "),
             "---|".repeat(self.columns.len())
         );
         for r in &self.rows {

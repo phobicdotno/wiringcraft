@@ -2052,6 +2052,32 @@ fn a_layout_sorts_by_every_key_in_turn_and_keeps_the_built_in_order_on_ties() {
 }
 
 #[test]
+fn layout_headings_with_a_pipe_or_a_line_break_keep_the_markdown_table_whole() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let mut t = Table::new("T", &["Tag", "Text"]);
+    t.rows.push(vec!["-K1".into(), "Relay".into()]);
+    let t = t.with_layout(&ReportLayout {
+        kind: "devices".into(),
+        title: Some("Two\nlines".into()),
+        columns: vec![
+            ReportColumn {
+                from: "Tag".into(),
+                heading: Some("Part | number".into()),
+            },
+            ReportColumn {
+                from: "Text".into(),
+                heading: Some("Long\ntext".into()),
+            },
+        ],
+        ..Default::default()
+    });
+    assert_eq!(
+        t.to_markdown(),
+        "## Two lines\n\n| Part \\| number | Long text |\n|---|---|\n| -K1 | Relay |\n"
+    );
+}
+
+#[test]
 fn report_layouts_that_name_nothing_are_reported() {
     use wc_core::report_layout::{ReportColumn, ReportLayout};
     let (mut p, s, parts) = fixture();
