@@ -2446,6 +2446,9 @@ pub struct Share {
     /// sent each then: a refusal of such a picture renames nothing, unless it is of a later
     /// edit (the picture sent again since).
     withdrawn_picks: BTreeMap<String, Option<u64>>,
+    /// Pages a change of this person's the session refused touched, since the window last
+    /// asked ([`Share::take_refused_pages`]).
+    refused_pages: BTreeSet<String>,
     /// Files the session lacks ([`repairs_due`]) whose copy here was looked for and could not
     /// be sent (missing, unreadable, or another version), with when and [`repair_stamp`] then:
     /// each is read again only after [`ITEM_WAIT`], or at once once this copy pins or loads
@@ -3291,6 +3294,11 @@ impl Share {
                 .is_some_and(|t| t.is_some())
     }
 
+    /// The pages a change of this person's the session refused touched, since the last call.
+    pub fn take_refused_pages(&mut self) -> BTreeSet<String> {
+        std::mem::take(&mut self.refused_pages)
+    }
+
     /// How many of this person's changes the host has not answered yet (none for the host).
     pub fn unanswered_edits(&self) -> usize {
         match &self.role {
@@ -3789,13 +3797,15 @@ impl Share {
         }
         // A withdrawn pick stays withdrawn for a refusal of its picture that comes later: that
         // must not rename the references that are not this copy's.
+        let refused = role.refused_targets();
+        self.refused_pages.extend(refused.0.iter().cloned());
         let withdrawn = withdraw_picks(
             &mut self.picks,
             &mut self.pick_carriers,
             &mut self.renames_due,
             &mut self.clashes,
             open,
-            (role.refused_targets(), &fresh),
+            (refused, &fresh),
         );
         note_withdrawn(&mut self.withdrawn_picks, &self.pictures_sent, withdrawn);
         let mut taken = names_to_rename(role.picture_names_taken(), &self.pictures_sent, &self.withdrawn_picks);

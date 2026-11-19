@@ -373,6 +373,17 @@ impl App {
             self.ed.page = o.project.pages.len().saturating_sub(1);
         }
         let waiting = self.share.unanswered_edits() > 0;
+        // A refused change of the page ends the wait: what comes back there is not the paste
+        // (the host may have added an equal drawing in the meantime).
+        let refused = self.share.take_refused_pages();
+        if self
+            .ed
+            .waiting_graphics
+            .as_ref()
+            .is_some_and(|w| refused.contains(&w.page))
+        {
+            self.ed.waiting_graphics = None;
+        }
         // A selection made since the last sync is the user's, and ends the wait (looked at
         // before this sync moves selected drawings to where they are now).
         if self
