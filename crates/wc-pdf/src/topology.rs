@@ -10,6 +10,10 @@
 //!
 //! Each vertical run between the columns gets a track of its own when its span meets another
 //! one's, so two cables never share a line and look connected (#486).
+//!
+//! Device tags and link labels are never cut: one too long for its place is drawn in smaller
+//! type, down to [`LABEL_MIN`], and past that it is keyed `[n]` there and written whole in a
+//! legend under the drawing (#493).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -181,6 +185,10 @@ const TEXT: f64 = 2.2;
 const LINE: f64 = 3.2;
 /// Smallest type an address is shrunk to so that it fits its box whole, in mm.
 const ADDRESS_MIN: f64 = 1.6;
+/// Smallest type a device tag or link label is shrunk to before it is keyed to the legend.
+const LABEL_MIN: f64 = 1.6;
+/// The type of a device tag in its box.
+const TAG_TEXT: f64 = TEXT + 0.4;
 /// A box: four lines of text.
 const BOX_H: f64 = 4.0 * LINE + 2.0;
 /// The narrowest a box gets, and the room between two columns for a link's labels.
@@ -289,30 +297,63 @@ pub fn own_path(bx: f64, by: f64, box_w: f64, nth: usize, count: usize) -> ([(f6
     ([(l, by), (l, y), (r, y), (r, by)], ((l + r) / 2.0, y - 0.8))
 }
 
-/// The space `topo` needs on a sheet, in millimetres, with a title block `band` high.
-fn needed(topo: &Topology, band: f64) -> (f64, f64) {
+/// The height of a legend of `keys` lines under the lanes.
+fn legend_height(keys: usize) -> f64 {
+    if keys == 0 { 0.0 } else { keys as f64 * LINE + 2.0 }
+}
+
+/// The space `topo` needs on a sheet, in millimetres, with a title block `band` high and a
+/// legend of `keys` lines.
+fn needed(topo: &Topology, band: f64, keys: usize) -> (f64, f64) {
     let (cols, rows) = extent(topo);
     let w = 2.0 * (MARGIN + 10.0) + cols as f64 * (MIN_BOX_W + GAP_X);
     let lanes = (topo.under.len() + 1) as f64 * LANE;
     let loops: f64 = loop_rooms(topo).iter().sum();
-    let h = top() + rows as f64 * (BOX_H + GAP_Y) + loops + lanes + 6.0 + band + MARGIN;
+    let h = top() + rows as f64 * (BOX_H + GAP_Y) + loops + lanes + legend_height(keys) + 6.0 + band + MARGIN;
     (w, h)
+}
+
+/// The legend `net` laid out as `topo` gets on a sheet `w` mm wide. The room of every tag and
+/// label depends only on the width of the sheet, so this is the legend the page draws.
+fn legend_for(topo: &Topology, net: &Network, w: f64) -> Legend {
+    let (_, h) = needed(topo, 0.0, 0);
+    let g = grid(topo, w, h, 0.0, 0);
+    let mut legend = Legend::default();
+    for b in &topo.boxes {
+        tag_label(&b.0, &g, &mut legend);
+    }
+    link_drawing(topo, &g, net, w, &mut legend);
+    legend
+}
+
+/// How wide the legend's lines may run on a sheet `w` mm wide.
+fn legend_width(w: f64) -> f64 {
+    w - 2.0 * (MARGIN + 10.0)
+}
+
+/// How many lines the legend of `net` laid out as `topo` takes on a sheet `w` mm wide.
+fn legend_lines(topo: &Topology, net: &Network, w: f64) -> usize {
+    legend_for(topo, net, w).lines(legend_width(w)).len()
 }
 
 /// The sheet a network is drawn on: `wanted` (the size of the first schematic page) when the
 /// layout fits it, else the first ISO size that fits, else a custom sheet. A layout too large
 /// even for the largest custom sheet gets that, with a warning.
 pub fn sheet(wanted: PageSize, band: f64, net: &Network) -> (PageSize, Option<String>) {
-    let (w, h) = needed(&layout_network(net), band);
+    let topo = layout_network(net);
+    let (w, _) = needed(&topo, band, 0);
+    // The legend, and so the height, depends on how wide the sheet is.
+    let height = |sw: f64| needed(&topo, band, legend_lines(&topo, net, sw)).1;
     let fits = |s: &PageSize| {
         let (sw, sh) = s.mm();
-        sw >= w && sh >= h
+        sw >= w && sh >= height(sw)
     };
     if let Some(s) = std::iter::once(wanted).chain(PageSize::NAMED).find(fits) {
         return (s, None);
     }
     let (lo, hi) = (f64::from(PageSize::MIN_MM), f64::from(PageSize::MAX_MM));
     let side = |v: f64| v.ceil().clamp(lo, hi) as u32;
+    let h = height(f64::from(side(w)));
     let size = PageSize::Custom {
         width: side(w),
         height: side(h),
@@ -326,9 +367,10 @@ pub fn sheet(wanted: PageSize, band: f64, net: &Network) -> (PageSize, Option<St
     (size, warn)
 }
 
-/// The grid for `topo` on a sheet `w` by `h` mm with a title block `band` high: columns and
-/// rows spread over the room there is, never closer than a box and its labels need.
-pub fn grid(topo: &Topology, w: f64, h: f64, band: f64) -> Grid {
+/// The grid for `topo` on a sheet `w` by `h` mm with a title block `band` high and a legend
+/// of `keys` lines: columns and rows spread over the room there is, never closer than a box
+/// and its labels need.
+pub fn grid(topo: &Topology, w: f64, h: f64, band: f64, keys: usize) -> Grid {
     let (cols, rows) = extent(topo);
     let (x0, x1) = (MARGIN + 10.0, w - MARGIN - 10.0);
     // Each row is pushed down by the loops over it and over the rows above: the sheet's
@@ -342,7 +384,7 @@ pub fn grid(topo: &Topology, w: f64, h: f64, band: f64) -> Grid {
         .collect();
     let loops = loops_above.last().copied().unwrap_or(0.0);
     let (y0, y1) = (top(), h - MARGIN - band - 6.0);
-    let lanes = (topo.under.len() + 1) as f64 * LANE;
+    let lanes = (topo.under.len() + 1) as f64 * LANE + legend_height(keys);
     let step_x = ((x1 - x0) / cols as f64).clamp(MIN_BOX_W + GAP_X, 88.0);
     let box_w = (step_x - GAP_X).clamp(MIN_BOX_W, 48.0);
     let low = BOX_H + GAP_Y;
@@ -508,28 +550,109 @@ fn tree_path(g: &Grid, a: Pt, b: Pt, exit: f64, x: f64) -> (Vec<Pt>, [Pt; 3]) {
     (path, labels)
 }
 
+/// The type `s` is drawn in to fit `room` mm whole: `size`, else smaller down to
+/// [`LABEL_MIN`]; `None` when it does not fit even then.
+fn whole_size(s: &str, room: f64, size: f64) -> Option<f64> {
+    let need = crate::writer::text_width_mm(s, size);
+    if need <= room {
+        return Some(size);
+    }
+    // Widths scale with the type; a hair under, so rounding never makes it overrun.
+    let fit = size * room / need * 0.999;
+    (fit >= LABEL_MIN).then_some(fit)
+}
+
+/// The names too long for their place even in the smallest type, in the order they were
+/// keyed: each is keyed `[n]` where it belongs (n from 1) and written whole under the drawing.
+/// A name keyed twice keeps its first key.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Legend(pub Vec<String>);
+
+impl Legend {
+    /// Its lines, each entry `[n] name` wrapped to `width` mm without dropping a character,
+    /// a line that goes on indented past its key: how far in each line starts, and its text.
+    pub fn lines(&self, width: f64) -> Vec<(f64, String)> {
+        let width_of = |t: &str| crate::writer::text_width_mm(t, TEXT);
+        let mut out = Vec::new();
+        for (i, name) in self.0.iter().enumerate() {
+            let key = format!("[{}] ", i + 1);
+            let indent = width_of(&key);
+            let mut line = key;
+            let mut first = true;
+            for c in name.chars() {
+                let room = if first { width } else { width - indent };
+                line.push(c);
+                // Always keep one character on a line, so a very narrow legend still ends.
+                if width_of(&line) > room && line.chars().count() > 1 {
+                    line.pop();
+                    out.push((if first { 0.0 } else { indent }, std::mem::take(&mut line)));
+                    first = false;
+                    line.push(c);
+                }
+            }
+            out.push((if first { 0.0 } else { indent }, line));
+        }
+        out
+    }
+
+    /// The key of `s`, adding it when it is new.
+    fn key(&mut self, s: &str) -> String {
+        let n = match self.0.iter().position(|x| x == s) {
+            Some(i) => i + 1,
+            None => {
+                self.0.push(s.to_owned());
+                self.0.len()
+            }
+        };
+        format!("[{n}]")
+    }
+}
+
+/// `s` as drawn in `room` mm at most: whole, in smaller type if it must be, else its key in
+/// `legend`. Returns the text and its type size.
+fn fitted(s: &str, room: f64, size: f64, legend: &mut Legend) -> (String, f64) {
+    let room = room.max(0.0);
+    // A name written like a key goes to the legend too, so it is never taken for one.
+    let like_key = |t: &str| {
+        t.strip_prefix('[')
+            .and_then(|t| t.strip_suffix(']'))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    match whole_size(s, room, size).filter(|_| !like_key(s)) {
+        Some(size) => (s.to_owned(), size),
+        None => {
+            let key = legend.key(s);
+            let size = whole_size(&key, room, size).unwrap_or(LABEL_MIN);
+            (key, size)
+        }
+    }
+}
+
+/// A device's tag as its box `g.box_w` wide shows it ([`fitted`]), and its type size.
+fn tag_label(name: &str, g: &Grid, legend: &mut Legend) -> (String, f64) {
+    fitted(&shown(name), g.box_w - 3.0, TAG_TEXT, legend)
+}
+
 /// A link label: where it goes, how it is aligned there (0 left, 1 centred, 2 right, as for
-/// [`Pen::text`]) and its text, already cut to the room it has.
+/// [`Pen::text`]), its text and its type size. The text is whole, or its key in the legend.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Label {
     pub at: Pt,
     pub align: u8,
     pub text: String,
+    pub size: f64,
 }
 
 impl Label {
-    fn new(at: Pt, align: u8, s: &str, room: f64) -> Self {
-        Label {
-            at,
-            align,
-            text: fit_at(s.trim(), room.max(0.0), TEXT),
-        }
+    fn new(at: Pt, align: u8, s: &str, room: f64, legend: &mut Legend) -> Self {
+        let (text, size) = fitted(s.trim(), room, TEXT, legend);
+        Label { at, align, text, size }
     }
 
     /// Its left and right ends on the sheet.
     #[cfg(test)]
     fn span(&self) -> (f64, f64) {
-        let tw = crate::writer::text_width_mm(&self.text, TEXT);
+        let tw = crate::writer::text_width_mm(&self.text, self.size);
         match self.align {
             0 => (self.at.0, self.at.0 + tw),
             1 => (self.at.0 - tw / 2.0, self.at.0 + tw / 2.0),
@@ -538,29 +661,23 @@ impl Label {
     }
 }
 
-/// A link's port names and cable on one line, `P1 - P2 -W1`, `room` mm wide at most. When it
-/// is too long each of the three is cut to a third of the room, so none is lost.
-fn joined(from: &str, to: &str, cable: &str, room: f64) -> String {
-    let (from, to, cable) = (from.trim(), to.trim(), cable.trim());
-    let whole = format!("{from} - {to} {cable}");
-    if crate::writer::text_width_mm(whole.trim(), TEXT) <= room {
-        return whole.trim().to_owned();
-    }
-    let gaps = crate::writer::text_width_mm(" -  ", TEXT);
-    let third = ((room - gaps) / 3.0).max(0.0);
-    let cut = |s: &str| {
-        if s.is_empty() {
-            String::new()
-        } else {
-            fit_at(s, third, TEXT)
-        }
-    };
-    format!("{} - {} {}", cut(from), cut(to), cut(cable)).trim().to_owned()
+/// A link's port names and cable on one line, `P1 - P2 -W1`.
+fn joined(from: &str, to: &str, cable: &str) -> String {
+    format!("{} - {} {}", from.trim(), to.trim(), cable.trim())
+        .trim()
+        .to_owned()
 }
 
 /// The lines of every link of `net` laid out as `topo` on grid `g`, on a sheet `w` mm wide,
-/// and their port and cable labels, each cut to the room beside its line.
-pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Vec<Pt>>, Vec<Label>) {
+/// and their port and cable labels, each fitted to the room beside its line; what does not fit
+/// is keyed in `legend`.
+pub fn link_drawing(
+    topo: &Topology,
+    g: &Grid,
+    net: &Network,
+    w: f64,
+    legend: &mut Legend,
+) -> (Vec<Vec<Pt>>, Vec<Label>) {
     let at = |i: usize| topo.boxes.get(i).map(|b| g.spot(b.1, b.2));
     let port = |s: &str| Port::parse(s).map(|p| p.port).unwrap_or_default();
     // A link's port names and cable, its `from` end first when that is at box `a`.
@@ -589,9 +706,9 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
         // The two port names share the branch from the junction to the box.
         let branch = to_at.0 + 1.0 - from_at.0 + 1.0;
         let half = branch / 2.0 - 1.5;
-        labels.push(Label::new(from_at, 0, &from_port, half));
-        labels.push(Label::new(to_at, 2, &to_port, half));
-        labels.push(Label::new(cable_at, 0, &cable, branch - 2.0));
+        labels.push(Label::new(from_at, 0, &from_port, half, legend));
+        labels.push(Label::new(to_at, 2, &to_port, half, legend));
+        labels.push(Label::new(cable_at, 0, &cable, branch - 2.0, legend));
         paths.push(path);
     }
     let (left, right) = (MARGIN + 1.0, w - MARGIN - 1.0);
@@ -613,16 +730,16 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
                 // Each port name at its own end of the lane, the cable between them.
                 let (from_align, to_align, dir) = if lx <= rx { (0, 2, 1.0) } else { (2, 0, -1.0) };
                 let quarter = len / 4.0 - 1.0;
-                labels.push(Label::new((lx + dir, y), from_align, &from_port, quarter));
-                labels.push(Label::new((rx - dir, y), to_align, &to_port, quarter));
-                labels.push(Label::new(((lx + rx) / 2.0, y), 1, &cable, len / 2.0 - 2.0));
+                labels.push(Label::new((lx + dir, y), from_align, &from_port, quarter, legend));
+                labels.push(Label::new((rx - dir, y), to_align, &to_port, quarter, legend));
+                labels.push(Label::new(((lx + rx) / 2.0, y), 1, &cable, len / 2.0 - 2.0, legend));
             } else {
                 // A short lane: one label over it, as wide as a gap.
                 let c = (lx + rx) / 2.0;
                 let half = (g.step_x - g.box_w) / 2.0 - 1.0;
                 let half = half.min(c - left).min(right - c);
-                let label = joined(&from_port, &to_port, &cable, 2.0 * half);
-                labels.push(Label::new((c, y), 1, &label, 2.0 * half));
+                let label = joined(&from_port, &to_port, &cable);
+                labels.push(Label::new((c, y), 1, &label, 2.0 * half, legend));
             }
         }
         paths.push(path);
@@ -633,15 +750,14 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
         };
         // Loops over the same box nest, one above the other, each label on its own line in
         // the room over the box. A label may run across the legs of the loops around it and
-        // into half of the gaps either side, so even on a narrow box each of its port names
-        // and cable keeps a few letters.
+        // into half of the gaps either side.
         let nth = topo.own.iter().take(n).filter(|o| o.0 == a).count();
         let count = topo.own.iter().filter(|o| o.0 == a).count();
         let (path, label_at) = own_path(bx, by, g.box_w, nth, count);
         let c = label_at.0;
         let room = 2.0 * (g.step_x / 2.0 - 1.0).min(c - left).min(right - c);
-        let label = joined(&from_port, &to_port, &cable, room);
-        labels.push(Label::new(label_at, 1, &label, room));
+        let label = joined(&from_port, &to_port, &cable);
+        labels.push(Label::new(label_at, 1, &label, room, legend));
         paths.push(path.to_vec());
     }
     (paths, labels)
@@ -708,7 +824,9 @@ pub fn draw_network_page(
             warn(format!("link {} is not drawn: an end names no device", k + 1));
         }
     }
-    let g = grid(&topo, w, h, band);
+    let keys = legend_lines(&topo, net, w);
+    let g = grid(&topo, w, h, band, keys);
+    let mut legend = Legend::default();
 
     let tags = project.tag_index();
     let mut links = Vec::new();
@@ -737,17 +855,22 @@ pub fn draw_network_page(
             node.map(|n| n.station.trim().to_owned()).unwrap_or_default(),
         ];
         for (i, t) in lines.iter().enumerate() {
-            let size = if i == 0 { TEXT + 0.4 } else { TEXT };
+            if i == 0 {
+                // A tag is only useful whole, so it is never cut.
+                let (text, size) = tag_label(name, &g, &mut legend);
+                pen.text((bx + 1.5, by + 1.0 + LINE), size, 0, &text);
+                continue;
+            }
             // An address is only useful whole: smaller type before it is cut.
             let size = if i == 2 {
                 let room = g.box_w - 3.0;
-                let mut s = size;
+                let mut s = TEXT;
                 while s > ADDRESS_MIN && crate::writer::text_width_mm(t, s) > room {
                     s = (s - 0.05).max(ADDRESS_MIN);
                 }
                 s
             } else {
-                size
+                TEXT
             };
             pen.text(
                 (bx + 1.5, by + 1.0 + LINE * (i as f64 + 1.0)),
@@ -769,12 +892,17 @@ pub fn draw_network_page(
             });
         }
     }
-    let (paths, labels) = link_drawing(&topo, &g, net, w);
+    let (paths, labels) = link_drawing(&topo, &g, net, w, &mut legend);
     for path in &paths {
         pen.polyline(path, false);
     }
     for l in &labels {
-        pen.text(l.at, TEXT, l.align, &l.text);
+        pen.text(l.at, l.size, l.align, &l.text);
+    }
+    // The names keyed on the drawing, whole, under the lanes.
+    let start = bottom_of(&topo, &g) + (topo.under.len() + 1) as f64 * LANE;
+    for (i, (indent, line)) in legend.lines(x1 - x0).iter().enumerate() {
+        pen.text((x0 + indent, start + LINE * (i as f64 + 1.0)), TEXT, 0, line);
     }
     if topo.boxes.is_empty() {
         pen.colour(0.45, 0.45, 0.45);
@@ -851,7 +979,7 @@ mod tests {
         assert!(warn.is_none());
         let (w, h) = size.mm();
         let topo = layout_network(net);
-        let g = grid(&topo, w, h, band);
+        let g = grid(&topo, w, h, band, legend_lines(&topo, net, w));
         let rects: Vec<((f64, f64), (f64, f64))> = topo
             .boxes
             .iter()
@@ -899,7 +1027,7 @@ mod tests {
         assert_eq!(t.tree.len(), 3);
         assert!(t.under.is_empty());
         // The switch's two ports are labelled on their own branches, not on top of each other.
-        let g = grid(&t, 420.0, 297.0, 30.0);
+        let g = grid(&t, 420.0, 297.0, 30.0, 0);
         let spot = |i: usize| g.spot(t.boxes[i].1, t.boxes[i].2);
         let r = routes(&t, &g, bottom_of(&t, &g));
         let from_labels: Vec<(f64, f64)> = t
@@ -944,8 +1072,8 @@ mod tests {
     fn every_ring_link_is_stroked_not_only_labelled() {
         let net = ring();
         let t = layout_network(&net);
-        let g = grid(&t, 420.0, 297.0, 30.0);
-        let (paths, _) = link_drawing(&t, &g, &net, 420.0);
+        let g = grid(&t, 420.0, 297.0, 30.0, 0);
+        let (paths, _) = link_drawing(&t, &g, &net, 420.0, &mut Legend::default());
         assert_eq!(paths.len(), 3, "{paths:?}");
         for p in &paths {
             assert!(p.len() >= 2, "{p:?}");
@@ -1002,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn long_port_and_cable_names_are_cut_to_the_room_beside_their_line() {
+    fn long_port_and_cable_names_are_keyed_to_a_legend_not_cut() {
         let long = |s: &str| format!("{s}-PORT-WITH-A-VERY-LONG-NAME");
         let mut net = Network {
             nodes: ["-A1", "-K10", "-T1", "-T2"].into_iter().map(node).collect(),
@@ -1023,24 +1151,29 @@ mod tests {
         let (size, g, topo) = fits_its_sheet(&net);
         assert_eq!((topo.under.len(), topo.own.len()), (1, 2));
         let (w, _) = size.mm();
-        let (_, labels) = link_drawing(&topo, &g, &net, w);
+        let mut legend = Legend::default();
+        let (_, labels) = link_drawing(&topo, &g, &net, w, &mut legend);
         // Three tree links with three labels each; the ring link joins two devices of one
         // column, so its short lane has one label; and a label per loop.
         assert_eq!(labels.len(), 3 * 3 + 1 + 2);
-        // A label holding both port names and the cable keeps a piece of each.
-        let joined: Vec<&Label> = labels.iter().filter(|l| l.text.contains(" - ")).collect();
-        assert_eq!(joined.len(), 3, "{labels:?}");
-        for l in joined {
-            let (ports, cable) = l.text.rsplit_once(' ').unwrap();
-            let (from, to) = ports.split_once(" - ").unwrap();
-            assert!(from.len() > 3 && to.len() > 3, "{l:?} shows both ports");
-            assert!(
-                cable.starts_with("-W") && cable.ends_with("..."),
-                "{l:?} shows the cable"
-            );
-        }
+        // Every label is a key into the legend, which holds each name once and whole: the
+        // port names, the cable, and the three lines of both ports and the cable.
         for l in &labels {
-            assert!(l.text.ends_with("..."), "{l:?} is cut");
+            let n: usize = l.text.trim_start_matches('[').trim_end_matches(']').parse().unwrap();
+            assert!(n >= 1 && n <= legend.0.len(), "{l:?}");
+        }
+        for name in [long("X1"), long("P1"), long("P2"), long("X2")] {
+            assert_eq!(legend.0.iter().filter(|e| **e == name).count(), 1, "{legend:?}");
+        }
+        assert!(
+            legend
+                .0
+                .contains(&"-W1-A-CABLE-TAG-FAR-TOO-LONG-FOR-ANY-GAP".to_owned())
+        );
+        let lines = legend.0.iter().filter(|e| e.contains(" - ")).count();
+        assert_eq!(lines, 3, "{legend:?}");
+        assert!(legend.0.iter().all(|e| !e.ends_with("...")));
+        for l in &labels {
             let (x0, x1) = l.span();
             assert!(x0 >= MARGIN && x1 <= w - MARGIN, "{l:?} is inside the frame");
             // The text runs from its baseline up one text height.
@@ -1079,7 +1212,7 @@ mod tests {
         };
         let (size, g, topo) = fits_its_sheet(&net);
         assert_eq!(topo.under.len(), 2);
-        let (_, labels) = link_drawing(&topo, &g, &net, size.mm().0);
+        let (_, labels) = link_drawing(&topo, &g, &net, size.mm().0, &mut Legend::default());
         // B1's two ring ports are each on a label of their own lane, under the boxes.
         let bottom = bottom_of(&topo, &g);
         let with = |t: &str| {
@@ -1108,7 +1241,7 @@ mod tests {
         }
         let (size, g, topo) = fits_its_sheet(&net);
         assert_eq!(topo.under.len(), 1);
-        let (_, labels) = link_drawing(&topo, &g, &net, size.mm().0);
+        let (_, labels) = link_drawing(&topo, &g, &net, size.mm().0, &mut Legend::default());
         let bottom = bottom_of(&topo, &g);
         let mut lane: Vec<&str> = labels
             .iter()
@@ -1170,17 +1303,17 @@ mod tests {
         }
         let (size, g, topo) = fits_its_sheet(&looped);
         assert!((g.box_w - MIN_BOX_W).abs() < 1e-9, "{g:?}");
-        let (_, labels) = link_drawing(&topo, &g, &looped, size.mm().0);
-        let joined: Vec<&Label> = labels.iter().filter(|l| l.text.contains(" - ")).collect();
-        assert_eq!(joined.len(), 2, "{labels:?}");
-        for l in joined {
-            let (ports, cable) = l.text.rsplit_once(' ').unwrap();
-            let (from, to) = ports.split_once(" - ").unwrap();
-            for (part, start) in [(from, "P"), (to, "P"), (cable, "-W1")] {
-                let kept = part.trim_end_matches("...");
-                assert!(kept.starts_with(start) && kept.len() >= 2, "{part:?} in {l:?}");
-            }
-        }
+        let mut legend = Legend::default();
+        let (_, labels) = link_drawing(&topo, &g, &looped, size.mm().0, &mut legend);
+        let keyed: Vec<&Label> = labels.iter().filter(|l| l.text.starts_with('[')).collect();
+        assert_eq!(keyed.len(), 2, "{labels:?}");
+        assert_eq!(
+            legend.0,
+            [
+                "P7-A-VERY-LONG-PORT - P8-A-VERY-LONG-PORT -W123-A-VERY-LONG-CABLE-TAG",
+                "P9-A-VERY-LONG-PORT - P10-A-VERY-LONG-PORT -W123-A-VERY-LONG-CABLE-TAG"
+            ]
+        );
         apart(&labels);
 
         let star = Network {
@@ -1272,7 +1405,7 @@ mod tests {
         assert_eq!(rooms.iter().filter(|r| **r > 0.0).count(), 1, "{rooms:?}");
         let loops: f64 = rooms.iter().sum();
         assert_eq!(loops, 9.0 * LINE);
-        let (_, h) = needed(&topo, band);
+        let (_, h) = needed(&topo, band, 0);
         let per_row = top() + rows as f64 * (BOX_H + GAP_Y) + loops;
         assert!(h <= per_row + (topo.under.len() + 1) as f64 * LANE + 6.0 + band + MARGIN + 1e-9);
         assert!(h < f64::from(PageSize::MAX_MM), "{h}");
@@ -1300,7 +1433,7 @@ mod tests {
     /// Each link of `net` drawn on its sheet, and the labels.
     fn drawn_links(net: &Network) -> (Grid, Topology, Vec<LinkPath>, Vec<Label>) {
         let (size, g, topo) = fits_its_sheet(net);
-        let (paths, labels) = link_drawing(&topo, &g, net, size.mm().0);
+        let (paths, labels) = link_drawing(&topo, &g, net, size.mm().0, &mut Legend::default());
         let owners = topo
             .tree
             .iter()
@@ -1475,5 +1608,159 @@ mod tests {
             );
         }
         kept_apart(&net);
+    }
+
+    /// A topology page for `net` on the sheet it gets, with its warnings.
+    fn page_of(net: &Network) -> (Drawn, Vec<String>) {
+        let band = Project::new("x").meta.template.band_height();
+        let (size, warn) = sheet(PageSize::A3, band, net);
+        assert!(warn.is_none());
+        let mut page = Page::new("network-n", "N1", "Network");
+        page.size = size;
+        let mut warnings = Vec::new();
+        let drawn = draw_network_page(
+            &Project::new("x"),
+            &page,
+            0,
+            1,
+            net,
+            "",
+            &Default::default(),
+            &mut warnings,
+        );
+        (drawn, warnings)
+    }
+
+    #[test]
+    fn port_names_a_little_too_long_for_their_branch_are_drawn_whole() {
+        // Each name needs about 9.2 mm at the full type, the branch gives 8.5 (#493).
+        let net = Network {
+            links: vec![link("-K1:X1P10", "-T1:X1"), link("-K1:X1P11", "-T2:X1")],
+            ..Network::default()
+        };
+        let (size, g, topo) = fits_its_sheet(&net);
+        let mut legend = Legend::default();
+        let (_, labels) = link_drawing(&topo, &g, &net, size.mm().0, &mut legend);
+        assert!(legend.0.is_empty(), "{legend:?}");
+        for name in ["X1P10", "X1P11"] {
+            let l = labels.iter().find(|l| l.text == name).unwrap();
+            assert!(l.size < TEXT && l.size >= LABEL_MIN, "{l:?}");
+        }
+        apart(&labels);
+        let (drawn, _) = page_of(&net);
+        for name in ["X1P10", "X1P11"] {
+            assert!(
+                drawn.ops.contains(&crate::writer::pdf_text(name)),
+                "{name} is drawn whole"
+            );
+        }
+        assert!(!drawn.ops.contains("X1P..."));
+    }
+
+    #[test]
+    fn long_device_tags_in_narrow_boxes_are_drawn_whole() {
+        // A 30-device line leaves the narrowest boxes, 19 mm for the tag.
+        let mut names: Vec<String> = (1..=28).map(|n| format!("-A{n}")).collect();
+        names.insert(10, "=PUMP+CAB1-K1".into());
+        names.insert(11, "=PUMP+CAB1-K2".into());
+        let net = Network {
+            nodes: names.iter().map(|n| node(n)).collect(),
+            links: names
+                .windows(2)
+                .map(|p| link(&format!("{}:P2", p[0]), &format!("{}:P1", p[1])))
+                .collect(),
+            ..Network::default()
+        };
+        let (_, g, _) = fits_its_sheet(&net);
+        assert!((g.box_w - MIN_BOX_W).abs() < 1e-9, "{g:?}");
+        let (drawn, _) = page_of(&net);
+        for tag in ["=PUMP+CAB1-K1", "=PUMP+CAB1-K2"] {
+            assert!(
+                drawn.ops.contains(&crate::writer::pdf_text(tag)),
+                "{tag} is drawn whole"
+            );
+        }
+
+        // A tag too long even for the smallest type is keyed, and written whole in the legend
+        // under the drawing, inside the sheet.
+        let long = "=PUMPSTATION-NORTH+CABINET-ONE-K1";
+        let mut net = net;
+        net.nodes[0].device = long.into();
+        net.links[0].from = format!("{long}:P2");
+        let mut legend = Legend::default();
+        let (_, g, _) = fits_its_sheet(&net);
+        let (text, size) = tag_label(long, &g, &mut legend);
+        assert_eq!((text.as_str(), size), ("[1]", TAG_TEXT));
+        let (drawn, _) = page_of(&net);
+        assert!(drawn.ops.contains(&crate::writer::pdf_text(&format!("[1] {long}"))));
+        assert!(!drawn.ops.contains("=PUMPSTATION..."));
+    }
+
+    #[test]
+    fn a_long_legend_makes_the_sheet_taller() {
+        let topo_of = |n: usize| Network {
+            links: (1..=n)
+                .map(|i| link(&format!("-K1:PORT-{i}-WITH-A-NAME-FAR-TOO-LONG"), &format!("-T{i}:X1")))
+                .collect(),
+            ..Network::default()
+        };
+        let band = 30.0;
+        let net = topo_of(12);
+        let topo = layout_network(&net);
+        let keys = legend_for(&topo, &net, PageSize::A3.mm().0).0.len();
+        assert_eq!(keys, 12);
+        let (size, warn) = sheet(PageSize::A4, band, &net);
+        assert!(warn.is_none());
+        let (w, h) = size.mm();
+        assert!(h >= needed(&topo, band, legend_lines(&topo, &net, w)).1);
+        assert!(needed(&topo, band, keys).1 > needed(&topo, band, 0).1);
+    }
+
+    #[test]
+    fn a_legend_entry_wider_than_the_sheet_wraps_whole() {
+        let cable = format!("-W{}", "W".repeat(400));
+        let mut net = Network {
+            links: vec![link("-K1:P1", "-T1:X1")],
+            ..Network::default()
+        };
+        net.links[0].cable = cable.clone();
+        let topo = layout_network(&net);
+        let w = PageSize::A3.mm().0;
+        let legend = legend_for(&topo, &net, w);
+        assert_eq!(legend.0, std::slice::from_ref(&cable));
+        let lines = legend.lines(legend_width(w));
+        assert!(lines.len() > 1, "{lines:?}");
+        let joined: String = lines.iter().map(|l| l.1.as_str()).collect();
+        assert_eq!(joined, format!("[1] {cable}"));
+        for (indent, line) in &lines {
+            assert!(indent + crate::writer::text_width_mm(line, TEXT) <= legend_width(w) + 1e-9);
+        }
+        // The page draws every line, and the sheet makes room for them.
+        fits_its_sheet(&net);
+        let (drawn, _) = page_of(&net);
+        for (_, line) in &lines {
+            assert!(drawn.ops.contains(&crate::writer::pdf_text(line)), "{line}");
+        }
+        assert!(!drawn.ops.contains("WWW..."));
+    }
+
+    #[test]
+    fn a_name_written_like_a_key_is_keyed_too() {
+        let mut net = Network {
+            links: vec![link("-K1:P1", "-T1:X1"), link("-K1:P2", "-T2:X1")],
+            ..Network::default()
+        };
+        net.links[0].cable = "[1]".into();
+        net.links[1].cable = "-W1-A-CABLE-TAG-FAR-TOO-LONG-FOR-ANY-GAP".into();
+        let (size, g, topo) = fits_its_sheet(&net);
+        let mut legend = Legend::default();
+        let (_, labels) = link_drawing(&topo, &g, &net, size.mm().0, &mut legend);
+        assert_eq!(legend.0, ["[1]", "-W1-A-CABLE-TAG-FAR-TOO-LONG-FOR-ANY-GAP"]);
+        let keys: Vec<&str> = labels
+            .iter()
+            .map(|l| l.text.as_str())
+            .filter(|t| t.starts_with('['))
+            .collect();
+        assert_eq!(keys, ["[1]", "[2]"]);
     }
 }
