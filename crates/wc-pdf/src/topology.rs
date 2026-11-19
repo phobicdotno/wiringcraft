@@ -144,7 +144,7 @@ const LINE: f64 = 3.2;
 const BOX_H: f64 = 4.0 * LINE + 2.0;
 /// The narrowest a box gets, and the room between two columns for a link's labels.
 const MIN_BOX_W: f64 = 22.0;
-const GAP_X: f64 = 18.0;
+const GAP_X: f64 = 40.0;
 /// Room between two rows, for a loop over a box and its label.
 const GAP_Y: f64 = 8.0;
 /// Room for each lane under the boxes.
@@ -201,7 +201,7 @@ fn loop_room(topo: &Topology) -> f64 {
 /// each one wider and higher than the one before, so they nest without touching.
 pub fn own_path(bx: f64, by: f64, box_w: f64, nth: usize) -> ([(f64, f64); 4], (f64, f64)) {
     let spread = 1.5 * nth as f64;
-    let (l, r) = (bx + box_w * 0.3 - spread, bx + box_w * 0.7 + spread);
+    let (l, r) = (bx + box_w * 0.15 - spread, bx + box_w * 0.85 + spread);
     let y = by - 3.0 - LINE * nth as f64;
     ([(l, by), (l, y), (r, y), (r, by)], ((l + r) / 2.0, y - 0.8))
 }
@@ -250,7 +250,7 @@ pub fn grid(topo: &Topology, w: f64, h: f64, band: f64) -> Grid {
     let extra = loop_room(topo);
     let (y0, y1) = (top() + extra, h - MARGIN - band - 6.0);
     let lanes = (topo.under.len() + 1) as f64 * LANE;
-    let step_x = ((x1 - x0) / cols as f64).clamp(MIN_BOX_W + GAP_X, 70.0);
+    let step_x = ((x1 - x0) / cols as f64).clamp(MIN_BOX_W + GAP_X, 88.0);
     let box_w = (step_x - GAP_X).clamp(MIN_BOX_W, 48.0);
     let low = BOX_H + GAP_Y + extra;
     let step_y = ((y1 - y0 - lanes) / rows as f64).clamp(low, low + 8.0);
@@ -290,7 +290,8 @@ type Pt = (f64, f64);
 
 /// The path of a tree link from the box at `a` to the box at `b` (top left corners), and where
 /// its `from` port, `to` port and cable labels go. Links fanning out of one box share its
-/// right edge, so both port labels sit on the link's own branch, at the height of `b`.
+/// right edge, so the labels sit on the link's own branch at the height of `b`: the port
+/// names over it, one at each end, and the cable under it.
 fn tree_path(g: &Grid, a: Pt, b: Pt) -> (Vec<Pt>, [Pt; 3]) {
     let start = (a.0 + g.box_w, a.1 + g.box_h / 2.0);
     let end = (b.0, b.1 + g.box_h / 2.0);
@@ -299,9 +300,118 @@ fn tree_path(g: &Grid, a: Pt, b: Pt) -> (Vec<Pt>, [Pt; 3]) {
     let labels = [
         (mid + 1.0, end.1 - 1.0),
         (end.0 - 1.0, end.1 - 1.0),
-        (mid + 1.0, (start.1 + end.1) / 2.0 + LINE),
+        (mid + 1.0, end.1 + TEXT + 0.6),
     ];
     (path, labels)
+}
+
+/// A link label: where it goes, how it is aligned there (0 left, 1 centred, 2 right, as for
+/// [`Pen::text`]) and its text, already cut to the room it has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Label {
+    pub at: Pt,
+    pub align: u8,
+    pub text: String,
+}
+
+impl Label {
+    fn new(at: Pt, align: u8, s: &str, room: f64) -> Self {
+        Label {
+            at,
+            align,
+            text: text_fit(s.trim(), TEXT, room.max(0.0)),
+        }
+    }
+
+    /// Its left and right ends on the sheet.
+    #[cfg(test)]
+    fn span(&self) -> (f64, f64) {
+        let tw = crate::writer::text_width_mm(&self.text, TEXT);
+        match self.align {
+            0 => (self.at.0, self.at.0 + tw),
+            1 => (self.at.0 - tw / 2.0, self.at.0 + tw / 2.0),
+            _ => (self.at.0 - tw, self.at.0),
+        }
+    }
+}
+
+/// The lines of every link of `net` laid out as `topo` on grid `g`, on a sheet `w` mm wide,
+/// and their port and cable labels, each cut to the room beside its line.
+pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Vec<Pt>>, Vec<Label>) {
+    let at = |i: usize| topo.boxes.get(i).map(|b| g.spot(b.1, b.2));
+    let port = |s: &str| Port::parse(s).map(|p| p.port).unwrap_or_default();
+    // A link's port names and cable, its `from` end first when that is at box `a`.
+    let ends = |a: usize, k: usize| -> Option<(String, String, String)> {
+        let l = net.links.get(k)?;
+        let a_is_from = topo.boxes.get(a).is_some_and(|b| key(&l.from) == b.0);
+        let (p, q) = if a_is_from {
+            (port(&l.from), port(&l.to))
+        } else {
+            (port(&l.to), port(&l.from))
+        };
+        Some((p, q, l.cable.trim().to_owned()))
+    };
+    let (mut paths, mut labels) = (Vec::new(), Vec::new());
+    for &(a, b, k) in &topo.tree {
+        let (Some(pa), Some(qa), Some((from_port, to_port, cable))) = (at(a), at(b), ends(a, k)) else {
+            continue;
+        };
+        let (path, [from_at, to_at, cable_at]) = tree_path(g, pa, qa);
+        // The two port names share the branch from the junction to the box.
+        let branch = to_at.0 + 1.0 - from_at.0 + 1.0;
+        let half = branch / 2.0 - 1.5;
+        labels.push(Label::new(from_at, 0, &from_port, half));
+        labels.push(Label::new(to_at, 2, &to_port, half));
+        labels.push(Label::new(cable_at, 0, &cable, branch - 2.0));
+        paths.push(path);
+    }
+    let bottom = bottom_of(topo, g);
+    let (left, right) = (MARGIN + 1.0, w - MARGIN - 1.0);
+    for (lane, &(a, b, k)) in topo.under.iter().enumerate() {
+        let (Some(ba), Some(bb), Some((from_port, to_port, cable))) =
+            (topo.boxes.get(a), topo.boxes.get(b), ends(a, k))
+        else {
+            continue;
+        };
+        let path = under_path(g, (ba.1, ba.2), (bb.1, bb.2), bottom, lane);
+        if let (Some(&s), Some(&(xa, _)), Some(&(lx, ly)), Some(&(rx, _)), Some(&(xb, _)), Some(&e)) = (
+            path.first(),
+            path.get(1),
+            path.get(2),
+            path.get(3),
+            path.get(4),
+            path.get(5),
+        ) {
+            // Each port name sits between its box and the run down beside it.
+            labels.push(Label::new((s.0 - 1.0, s.1 - 0.6), 2, &from_port, s.0 - xa - 2.0));
+            labels.push(Label::new((e.0 - 1.0, e.1 - 0.6), 2, &to_port, e.0 - xb - 2.0));
+            // The cable over its lane: as wide as the lane, or a gap when that is shorter.
+            let c = (lx + rx) / 2.0;
+            let half = ((rx - lx).abs().max(g.step_x - g.box_w) / 2.0 - 1.0)
+                .min(c - left)
+                .min(right - c);
+            labels.push(Label::new((c, ly - 0.8), 1, &cable, 2.0 * half));
+        }
+        paths.push(path);
+    }
+    for (n, &(a, k)) in topo.own.iter().enumerate() {
+        let (Some((bx, by)), Some((from_port, to_port, cable))) = (at(a), ends(a, k)) else {
+            continue;
+        };
+        // Loops over the same box nest, one above the other. A label stays inside the loop
+        // around it; the outermost one has the width of the box.
+        let nth = topo.own.iter().take(n).filter(|o| o.0 == a).count();
+        let outer = topo.own.iter().skip(n + 1).all(|o| o.0 != a);
+        let (path, label_at) = own_path(bx, by, g.box_w, nth);
+        let room = match (outer, path.first(), path.last()) {
+            (false, Some(l), Some(r)) => r.0 - l.0 - 1.0,
+            _ => g.box_w - 2.0,
+        };
+        let label = format!("{from_port} - {to_port} {cable}");
+        labels.push(Label::new(label_at, 1, &label, room));
+        paths.push(path.to_vec());
+    }
+    (paths, labels)
 }
 
 /// One topology page for `net`: frame and title block, a box per device with its tag,
@@ -364,7 +474,6 @@ pub fn draw_network_page(
         }
     }
     let g = grid(&topo, w, h, band);
-    let at = |i: usize| topo.boxes.get(i).map(|b| g.spot(b.1, b.2));
 
     let tags = project.tag_index();
     let mut links = Vec::new();
@@ -402,55 +511,12 @@ pub fn draw_network_page(
             });
         }
     }
-    let port = |s: &str| Port::parse(s).map(|p| p.port).unwrap_or_default();
-    // A link's port names and cable, its `from` end first when that is at box `a`.
-    let ends = |a: usize, k: usize| -> Option<(String, String, String)> {
-        let l = net.links.get(k)?;
-        let a_is_from = topo.boxes.get(a).is_some_and(|b| key(&l.from) == b.0);
-        let (p, q) = if a_is_from {
-            (port(&l.from), port(&l.to))
-        } else {
-            (port(&l.to), port(&l.from))
-        };
-        Some((p, q, l.cable.trim().to_owned()))
-    };
-    for &(a, b, k) in &topo.tree {
-        let (Some((pa, pb)), Some((qa, qb)), Some((from_port, to_port, cable))) = (at(a), at(b), ends(a, k)) else {
-            continue;
-        };
-        let (path, [from_at, to_at, cable_at]) = tree_path(&g, (pa, pb), (qa, qb));
-        pen.polyline(&path, false);
-        pen.text(from_at, TEXT, 0, &from_port);
-        pen.text(to_at, TEXT, 2, &to_port);
-        pen.text(cable_at, TEXT, 0, &cable);
+    let (paths, labels) = link_drawing(&topo, &g, net, w);
+    for path in &paths {
+        pen.polyline(path, false);
     }
-    let bottom = bottom_of(&topo, &g);
-    for (lane, &(a, b, k)) in topo.under.iter().enumerate() {
-        let (Some(ba), Some(bb), Some((from_port, to_port, cable))) =
-            (topo.boxes.get(a), topo.boxes.get(b), ends(a, k))
-        else {
-            continue;
-        };
-        let path = under_path(&g, (ba.1, ba.2), (bb.1, bb.2), bottom, lane);
-        pen.polyline(&path, false);
-        if let (Some(&s), Some(&e), Some(&(lx, ly)), Some(&(rx, _))) =
-            (path.first(), path.last(), path.get(2), path.get(3))
-        {
-            pen.text((s.0 - 1.0, s.1 - 0.6), TEXT, 2, &from_port);
-            pen.text((e.0 - 1.0, e.1 - 0.6), TEXT, 2, &to_port);
-            pen.text(((lx + rx) / 2.0, ly - 0.8), TEXT, 1, &cable);
-        }
-    }
-    for (n, &(a, k)) in topo.own.iter().enumerate() {
-        let (Some((bx, by)), Some((from_port, to_port, cable))) = (at(a), ends(a, k)) else {
-            continue;
-        };
-        // Loops over the same box nest, one above the other.
-        let nth = topo.own.iter().take(n).filter(|o| o.0 == a).count();
-        let (path, label_at) = own_path(bx, by, g.box_w, nth);
-        pen.polyline(&path, false);
-        let label = format!("{from_port} - {to_port} {cable}");
-        pen.text(label_at, TEXT, 1, label.trim());
+    for l in &labels {
+        pen.text(l.at, TEXT, l.align, &l.text);
     }
     if topo.boxes.is_empty() {
         pen.colour(0.45, 0.45, 0.45);
@@ -591,6 +657,52 @@ mod tests {
         let mut drawn: Vec<usize> = t.tree.iter().chain(&t.under).map(|e| e.2).collect();
         drawn.sort_unstable();
         assert_eq!(drawn, [0, 1, 2]);
+    }
+
+    #[test]
+    fn long_port_and_cable_names_are_cut_to_the_room_beside_their_line() {
+        let long = |s: &str| format!("{s}-PORT-WITH-A-VERY-LONG-NAME");
+        let mut net = Network {
+            nodes: ["-A1", "-K10", "-T1", "-T2"].into_iter().map(node).collect(),
+            links: vec![
+                link(&long("-A1:X1"), &long("-K10:P1")),
+                link(&long("-K10:P2"), &long("-T1:X1")),
+                link(&long("-K10:P3"), &long("-T2:X1")),
+                // Back to the start: drawn under the boxes.
+                link(&long("-T2:X2"), &long("-A1:X2")),
+                link(&long("-K10:P4"), &long("-K10:P5")),
+                link(&long("-K10:P6"), &long("-K10:P7")),
+            ],
+            ..Network::default()
+        };
+        for l in &mut net.links {
+            l.cable = "-W1-A-CABLE-TAG-FAR-TOO-LONG-FOR-ANY-GAP".into();
+        }
+        let (size, g, topo) = fits_its_sheet(&net);
+        assert_eq!((topo.under.len(), topo.own.len()), (1, 2));
+        let (w, _) = size.mm();
+        let (_, labels) = link_drawing(&topo, &g, &net, w);
+        assert_eq!(labels.len(), 3 * 4 + 2);
+        for l in &labels {
+            assert!(l.text.ends_with("..."), "{l:?} is cut");
+            let (x0, x1) = l.span();
+            assert!(x0 >= MARGIN && x1 <= w - MARGIN, "{l:?} is inside the frame");
+            // The text runs from its baseline up one text height.
+            let (y0, y1) = (l.at.1 - TEXT, l.at.1);
+            for b in &topo.boxes {
+                let (bx, by) = g.spot(b.1, b.2);
+                let apart = x1 <= bx || x0 >= bx + g.box_w || y1 <= by || y0 >= by + g.box_h;
+                assert!(apart, "{l:?} overlaps {}", b.0);
+            }
+        }
+        // No two labels overlap.
+        for (i, a) in labels.iter().enumerate() {
+            for b in labels.iter().skip(i + 1) {
+                let ((a0, a1), (b0, b1)) = (a.span(), b.span());
+                let apart = a1 <= b0 || b1 <= a0 || a.at.1 <= b.at.1 - TEXT || b.at.1 <= a.at.1 - TEXT;
+                assert!(apart, "{a:?} overlaps {b:?}");
+            }
+        }
     }
 
     #[test]
