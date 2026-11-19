@@ -491,6 +491,55 @@ impl Open {
         self.part_library = parts.into_iter().collect();
     }
 
+    /// Make the maker's outline drawing in the DXF file `dxf` (front view, mm at 1:1) the
+    /// footprint of part `id` (#484), as `wiringcraft import footprint-dxf` does: the part is
+    /// stored with the footprint in the library source the project takes it from, and the
+    /// project's pinned copy follows as one undo step, so the layouts draw the outline at once.
+    /// Returns what was done, with the drawing's warnings.
+    pub fn attach_footprint(&mut self, id: &str, dxf: &Path) -> Result<String, String> {
+        let text = std::fs::read(dxf).map_err(|e| format!("{}: {e}", dxf.display()))?;
+        let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text))
+            .map_err(|e| format!("{}: {e}", dxf.display()))?;
+        let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
+        let path = lib
+            .locate(ItemKind::Part, id)
+            .ok_or_else(|| format!("part {id} is in none of the project's libraries"))?
+            .path;
+        let mut part: Part = store::read_json(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if part.id != id {
+            return Err(format!("{} holds part {:?}, not {id:?}", path.display(), part.id));
+        }
+        let (w, h) = (footprint.width, footprint.height);
+        part.footprint = Some(footprint);
+        let json = store::to_json(&part).map_err(|e| e.to_string())?;
+        store::write_if_changed(&path, &json).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut msg = format!(
+            "Footprint of {id}: {} x {} mm, stored in {}",
+            wc_core::geom::format_length(w),
+            wc_core::geom::format_length(h),
+            path.display()
+        );
+        // The project's pinned copy follows, through the same update as Library → Update, so
+        // a copy changed in the project is not overwritten and the step can be undone.
+        if self.project.lock.parts.contains_key(id) {
+            let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
+            let only = [id.to_owned()];
+            let updated = self.update_library(&lib, Some(&only));
+            let follows = self.parts.get(id).is_some_and(|p| p.footprint == part.footprint);
+            match updated {
+                Ok(_) if follows => {}
+                Ok(_) => msg.push_str(&format!(
+                    ". The project's copy of {id} was not updated (it differs from the library's); update it from the library"
+                )),
+                Err(e) => msg.push_str(&format!(". The project's copy of {id} was not updated: {e}")),
+            }
+        }
+        for w in &warnings {
+            msg.push_str(&format!(". Warning: {w}"));
+        }
+        Ok(msg)
+    }
+
     /// Give a device a part (taken from the library into the project when needed), or none.
     pub fn set_device_part(&mut self, tag: &DeviceTag, part: Option<&str>) -> Result<(), String> {
         let current = self.project.devices.get(tag).and_then(|d| d.part.as_deref());
@@ -3447,6 +3496,68 @@ pub(crate) mod tests {
         )
         .unwrap();
         part
+    }
+
+    #[test]
+    fn a_maker_dxf_is_attached_as_a_parts_footprint_and_the_projects_copy_follows() {
+        let (tmp, mut o) = project();
+        let pid = "maker.io-8";
+        let mine = tmp.path().join("mine");
+        let part = Part {
+            id: pid.into(),
+            manufacturer: "Maker".into(),
+            order_number: "IO-8".into(),
+            ..Part::default()
+        };
+        wc_library::write_part(&mine, &part).unwrap();
+        o.project.meta.libraries.insert(
+            0,
+            LibrarySource {
+                name: "mine".into(),
+                kind: "folder".into(),
+                location: mine.display().to_string(),
+                reference: None,
+            },
+        );
+        let tag = DeviceTag::parse("-A1").unwrap();
+        o.set_device_part(&tag, Some(pid)).unwrap();
+        o.refresh_library();
+        let pin = o.project.lock.parts[pid].hash.clone();
+        assert!(o.parts[pid].footprint.is_none());
+
+        // A 22.5 x 100 mm outline drawn away from the origin, with an entity it cannot read.
+        let dxf = tmp.path().join("io-8.dxf");
+        std::fs::write(
+            &dxf,
+            "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\n0\n90\n4\n70\n1\n\
+             10\n200\n20\n50\n10\n222.5\n20\n50\n10\n222.5\n20\n150\n10\n200\n20\n150\n\
+             0\n3DFACE\n8\n0\n10\n0\n20\n0\n30\n0\n\
+             0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+        let err = o.attach_footprint("no.such", &dxf).unwrap_err();
+        assert!(err.contains("none of the project's libraries"), "{err}");
+        let msg = o.attach_footprint(pid, &dxf).unwrap();
+        assert!(msg.contains("22.5 x 100 mm"), "{msg}");
+        assert!(msg.contains("3DFACE"), "the entity not read is named: {msg}");
+        assert!(!msg.contains("not updated"), "{msg}");
+        // Stored with the part in its library, and the project's copy follows at once.
+        let in_lib: Part = store::read_json(&mine.join("parts").join(format!("{pid}.json"))).unwrap();
+        let f = in_lib.footprint.as_ref().unwrap();
+        assert_eq!((f.width, f.height), (22.5, 100.0));
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), in_lib);
+        assert_eq!(o.parts[pid].footprint, in_lib.footprint, "the layout draws it now");
+        assert_ne!(o.project.lock.parts[pid].hash, pin);
+        // One undo step takes the project's pin back.
+        assert!(o.undo());
+        assert_eq!(o.project.lock.parts[pid].hash, pin);
+
+        // A drawing it cannot read changes nothing.
+        let bad = tmp.path().join("bad.dxf");
+        std::fs::write(&bad, "0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n").unwrap();
+        assert!(o.attach_footprint(pid, &bad).is_err());
+        let still: Part = store::read_json(&mine.join("parts").join(format!("{pid}.json"))).unwrap();
+        assert_eq!(still, in_lib);
     }
 
     #[test]
