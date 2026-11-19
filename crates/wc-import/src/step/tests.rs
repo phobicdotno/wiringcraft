@@ -66,6 +66,25 @@ fn metres_and_inches_are_turned_into_millimetres() {
     let (s, _) = size(&step(inches, &box_vertices([0.0; 3], [1.0, 2.0, 3.0])));
     assert!((s.width - 25.4).abs() < 1e-9 && (s.height - 50.8).abs() < 1e-9 && (s.depth - 76.2).abs() < 1e-9);
 
+    // A second, unrelated context in millimetres with a lower id: the inch context the shape
+    // representation is drawn in still wins.
+    let competing = "#880=(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNIT_ASSIGNED_CONTEXT((#881))REPRESENTATION_CONTEXT('',''));\n\
+                     #881=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));\n\
+                     #882=SHAPE_REPRESENTATION('other',(),#880);\n";
+    let shape = "#990=ADVANCED_BREP_SHAPE_REPRESENTATION('part',(#1),#905);";
+    let (s, _) = size(&step(
+        &format!("{competing}{inches}\n{shape}"),
+        &box_vertices([0.0; 3], [1.0, 2.0, 3.0]),
+    ));
+    assert!((s.width - 25.4).abs() < 1e-9 && (s.height - 50.8).abs() < 1e-9 && (s.depth - 76.2).abs() < 1e-9);
+    // And the other way round: the shape in the millimetre context is read in millimetres.
+    let shape_mm = "#990=ADVANCED_BREP_SHAPE_REPRESENTATION('part',(#1),#880);";
+    let (s, _) = size(&step(
+        &format!("{competing}{inches}\n{shape_mm}"),
+        &box_vertices([0.0; 3], [1.0, 2.0, 3.0]),
+    ));
+    assert!((s.width - 1.0).abs() < 1e-9 && (s.depth - 3.0).abs() < 1e-9);
+
     // A unit only known by its measure.
     let custom = "#900=(CONVERSION_BASED_UNIT('thou',#901)LENGTH_UNIT()NAMED_UNIT(*));\n\
                   #901=LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(0.0254),#903);\n\

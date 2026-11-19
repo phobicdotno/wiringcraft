@@ -324,13 +324,34 @@ fn unit(v: [f64; 3]) -> Option<[f64; 3]> {
 /// a context falls back to every length unit it defines (a conversion-based unit names its base
 /// unit too, so that would find both).
 fn length_unit(instances: &BTreeMap<u64, Instance>) -> (f64, Option<String>) {
-    let assigned: Vec<u64> = instances
+    // The contexts the shape representations (with items) are drawn in; when none is
+    // named, every context that assigns units.
+    let used_contexts: Vec<u64> = instances
         .values()
         .flatten()
-        .filter(|(name, _)| name == "GLOBAL_UNIT_ASSIGNED_CONTEXT")
-        .filter_map(|(_, args)| args.first().and_then(Value::as_list))
-        .flat_map(|units| units.iter().filter_map(Value::as_ref_id))
+        .filter(|(name, args)| {
+            name.ends_with("REPRESENTATION")
+                && args
+                    .get(1)
+                    .and_then(Value::as_list)
+                    .is_some_and(|items| !items.is_empty())
+        })
+        .filter_map(|(_, args)| args.get(2).and_then(Value::as_ref_id))
         .collect();
+    let units_of = |id: &u64| -> Vec<u64> {
+        instances
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| name == "GLOBAL_UNIT_ASSIGNED_CONTEXT")
+            .filter_map(|(_, args)| args.first().and_then(Value::as_list))
+            .flat_map(|units| units.iter().filter_map(Value::as_ref_id))
+            .collect()
+    };
+    let mut assigned: Vec<u64> = used_contexts.iter().flat_map(units_of).collect();
+    if assigned.is_empty() {
+        assigned = instances.keys().flat_map(units_of).collect();
+    }
     let candidates: Vec<u64> = if assigned.is_empty() {
         instances.keys().copied().collect()
     } else {
@@ -434,6 +455,7 @@ fn parse(text: &str) -> (BTreeMap<u64, Instance>, usize) {
         // Only instances that hold something read here are parsed.
         let wanted = READ.iter().any(|name| body.contains(name))
             || body.contains("LENGTH_UNIT")
+            || body.contains("REPRESENTATION")
             || body.contains("B_SPLINE_CURVE");
         if !wanted {
             continue;
