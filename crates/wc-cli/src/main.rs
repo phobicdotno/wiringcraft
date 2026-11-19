@@ -3064,6 +3064,8 @@ fn update_library_part(
     // id, that source's part is not the one that changed.
     if let Ok(p) = &mut project
         && p.lock.parts.contains_key(&part)
+        // A pin the project keeps for a part it no longer uses stays as it is.
+        && p.used_parts().contains(&part)
     {
         let library = wc_library::Library::open(dir, p).map_err(e)?;
         let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
@@ -4981,6 +4983,27 @@ mod tests {
         assert_eq!(
             std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.relay").unwrap()).unwrap(),
             copy_before
+        );
+
+        // A part the project pins but no longer uses: the library changes, the pinned copy and
+        // its pin stay as they are.
+        let spare = wc_core::Part {
+            id: "maker.spare".into(),
+            ..wc_core::Part::default()
+        };
+        wc_library::write_part(&lib, &spare).unwrap();
+        cli(&dir, &["device", "--part", "maker.spare", "--", "+CAB1-K2"]).unwrap();
+        cli(&dir, &["lib", "lock"]).unwrap();
+        cli(&dir, &["device", "--part", "maker.relay", "--", "+CAB1-K2"]).unwrap();
+        let spare_pin = load(&dir).unwrap().lock.parts["maker.spare"].hash.clone();
+        let spare_copy = std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.spare").unwrap()).unwrap();
+        cli(&dir, &["import", "model-step", file, "--part", "maker.spare"]).unwrap();
+        let spare_lib: wc_core::Part = store::read_json(&lib.join("parts").join("maker.spare.json")).unwrap();
+        assert!(spare_lib.model.is_some(), "the library part changes");
+        assert_eq!(load(&dir).unwrap().lock.parts["maker.spare"].hash, spare_pin);
+        assert_eq!(
+            std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.spare").unwrap()).unwrap(),
+            spare_copy
         );
 
         // Not a STEP file: refused, the part is left as it was.

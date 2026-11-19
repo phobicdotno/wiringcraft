@@ -73,6 +73,7 @@ const READ: &[&str] = &[
     "QUASI_UNIFORM_CURVE",
     "UNIFORM_CURVE",
     "BEZIER_CURVE",
+    "POLYLINE",
     "COORDINATES_LIST",
     "CONVERSION_BASED_UNIT",
     "LENGTH_MEASURE_WITH_UNIT",
@@ -140,6 +141,8 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
                     curves.extend(curve_points(args.get(2), &point));
                 }
                 "B_SPLINE_CURVE" => curves.extend(curve_points(args.get(1), &point)),
+                // A wireframe's straight edges: its corner points.
+                "POLYLINE" => curves.extend(curve_points(args.get(1), &point)),
                 _ => {}
             }
         }
@@ -274,8 +277,12 @@ fn conic_extent(
     // The reference direction made square to the axis; without a usable one, any direction in
     // the curve's plane (the standard's own default).
     let along = |r: [f64; 3]| {
+        let r = unit(r)?;
         let d = dot(r, n);
-        unit([r[0] - d * n[0], r[1] - d * n[1], r[2] - d * n[2]])
+        let square = [r[0] - d * n[0], r[1] - d * n[1], r[2] - d * n[2]];
+        // Along the axis itself: no direction in the plane.
+        (dot(square, square).sqrt() > 1e-9).then_some(())?;
+        unit(square)
     };
     let u = direction(placement.get(3))?
         .and_then(along)
@@ -300,10 +307,16 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-/// `v` scaled to length 1, if it has a usable length.
+/// `v` scaled to length 1, if it is not zero. Scaled by its largest component first, so a
+/// direction given in tiny or huge ratios keeps its way.
 fn unit(v: [f64; 3]) -> Option<[f64; 3]> {
-    let len = dot(v, v).sqrt();
-    (len.is_finite() && len > 1e-12).then(|| [v[0] / len, v[1] / len, v[2] / len])
+    let big = v.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+    if !(big.is_finite() && big > 0.0) {
+        return None;
+    }
+    let w = [v[0] / big, v[1] / big, v[2] / big];
+    let len = dot(w, w).sqrt();
+    Some([w[0] / len, w[1] / len, w[2] / len])
 }
 
 /// Millimetres per length unit of the file, and a warning when that is a guess. The units the

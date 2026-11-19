@@ -127,6 +127,38 @@ fn a_wireframe_circle_without_vertices_is_measured() {
 }
 
 #[test]
+fn a_wireframe_measures_its_polylines_next_to_its_circles() {
+    let data = "#5=CARTESIAN_POINT('',(0.,0.,0.));#6=DIRECTION('',(1.,1.,1.));\n\
+                #8=AXIS2_PLACEMENT_3D('',#5,#6,$);#9=CIRCLE('',#8,5.);\n\
+                #20=CARTESIAN_POINT('',(0.,0.,0.));#21=CARTESIAN_POINT('',(100.,20.,30.));\n\
+                #22=POLYLINE('',(#20,#21));";
+    let (s, _) = size(&step(MM, data));
+    let r = 5.0 * (2.0f64 / 3.0).sqrt();
+    assert!((s.width - (100.0 + r)).abs() < 1e-9, "{s:?}");
+    assert!((s.height - (20.0 + r)).abs() < 1e-9, "{s:?}");
+    assert!((s.depth - (30.0 + r)).abs() < 1e-9, "{s:?}");
+}
+
+#[test]
+fn directions_in_tiny_ratios_keep_their_way() {
+    let turned = |y: &str| {
+        format!(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));#2=VERTEX_POINT('',#1);#3=VERTEX_POINT('',#20);\n\
+             #20=CARTESIAN_POINT('',(0.,0.,3.));\n\
+             #5=CARTESIAN_POINT('',(0.,0.,0.));#6=DIRECTION('',(0.,0.,1E-20));#7=DIRECTION('',(0.,{y},0.));\n\
+             #8=AXIS2_PLACEMENT_3D('',#5,#6,#7);#9=ELLIPSE('',#8,20.,5.);"
+        )
+    };
+    for y in ["1.", "1E-13", "1E+200"] {
+        let (s, _) = size(&step(MM, &turned(y)));
+        assert!(
+            (s.width - 10.0).abs() < 1e-9 && (s.height - 40.0).abs() < 1e-9 && (s.depth - 3.0).abs() < 1e-9,
+            "{y}: {s:?}"
+        );
+    }
+}
+
+#[test]
 fn a_file_cut_short_is_refused() {
     let whole = step(MM, &box_vertices([0.0; 3], [10.0, 20.0, 30.0]));
     assert!(model_size(&whole).is_ok());
