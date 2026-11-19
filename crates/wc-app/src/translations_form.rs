@@ -39,6 +39,9 @@ pub struct Form {
     /// The row whose cell has the keyboard: it stays shown under "Only missing" until the
     /// edit ends, though its cells are no longer blank.
     pub editing: Option<usize>,
+    /// The languages added in this dialog. Only these are declared again on saving, so a
+    /// column removed from the file meanwhile stays removed.
+    added: Vec<String>,
 }
 
 impl Form {
@@ -71,6 +74,7 @@ impl Form {
             only_missing: false,
             error: None,
             editing: None,
+            added: Vec::new(),
         })
     }
 
@@ -88,7 +92,8 @@ impl Form {
         if lang == self.source || self.langs.contains(&lang) {
             return Err(format!("{lang} is already a column."));
         }
-        self.langs.push(lang);
+        self.langs.push(lang.clone());
+        self.added.push(lang);
         for r in &mut self.rows {
             r.cells.push(String::new());
             r.loaded.push(String::new());
@@ -125,11 +130,13 @@ impl Form {
         }
         // A language added with no translation yet is kept as a column.
         let known = dict.languages();
-        let new_langs = self.langs.iter().filter(|l| !known.contains(l)).count();
+        let new_langs = self.added.iter().filter(|l| !known.contains(l)).count();
         if new_langs > 0 {
-            // Every column named in the dialog's order, so the columns keep it when reopened.
+            // The columns named in the dialog's order, so they keep it when reopened. One
+            // that was loaded but is gone from the file now was removed there: it stays gone.
             for l in &self.langs {
-                if !dict.languages.contains(l) {
+                let kept = known.contains(l) || self.added.contains(l);
+                if kept && !dict.languages.contains(l) {
                     dict.languages.push(l.clone());
                 }
             }
@@ -276,6 +283,27 @@ mod tests {
         let again = Form::open(tmp.path(), &project()).unwrap();
         assert_eq!(again.langs, ["de"]);
         assert_eq!(again.missing(0), 2);
+    }
+
+    #[test]
+    fn a_language_removed_meanwhile_is_not_declared_again() {
+        let (tmp, f) = form("source = \"en\"\nlanguages = [\"nb\"]\n");
+        assert_eq!(f.langs, ["nb"]);
+        let removed = "source = \"en\"\n";
+        std::fs::write(tmp.path().join(TRANSLATIONS_FILE), removed).unwrap();
+        assert_eq!(f.save().unwrap(), "No translation was changed.");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(TRANSLATIONS_FILE)).unwrap(),
+            removed
+        );
+
+        // Adding another language keeps the new one but still not the removed one.
+        let mut f = f;
+        f.new_lang = "de".into();
+        f.add_language().unwrap();
+        f.save().unwrap();
+        let again = Form::open(tmp.path(), &project()).unwrap();
+        assert_eq!(again.langs, ["de"]);
     }
 
     #[test]
