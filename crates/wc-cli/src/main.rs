@@ -2423,26 +2423,42 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     None
                 };
                 // Read first, so a failed refresh puts the copy back as it was: the lock on disk
-                // is only saved after a refresh that worked, and must keep matching the copy.
-                let before = std::fs::read(&vendored).ok();
-                let refreshed = match &winner {
-                    _ if kept.is_some() => Err(kept.clone().unwrap_or_default()),
-                    Some(loc) if same(&loc.path, &path) => wc_library::take(dir, p, &library, ItemKind::Part, &part)
-                        .map_err(|err| err.to_string())
-                        .and_then(|_| {
-                            let copy = store::read_vendored_part(dir, &part).map_err(|err| err.to_string())?;
-                            if copy.footprint == item.footprint {
-                                Ok(())
-                            } else {
-                                Err("the copy taken has another footprint".to_owned())
-                            }
-                        }),
-                    Some(loc) => Err(format!(
+                // is only saved after a refresh that worked, and must keep matching the copy. A
+                // copy whose bytes cannot be read is refused, never replaced or removed.
+                let before: Result<Option<Vec<u8>>, String> = match std::fs::read(&vendored) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                };
+                let refused = kept.or_else(|| {
+                    before
+                        .as_ref()
+                        .err()
+                        .map(|err| format!("it cannot be read ({err}); fix or remove it, then take {part} again"))
+                });
+                // Whether `take` ran, so only its own writes are undone.
+                let mut tried = false;
+                let refreshed = match (&refused, &winner) {
+                    (Some(why), _) => Err(why.clone()),
+                    (None, Some(loc)) if same(&loc.path, &path) => {
+                        tried = true;
+                        wc_library::take(dir, p, &library, ItemKind::Part, &part)
+                            .map_err(|err| err.to_string())
+                            .and_then(|_| {
+                                let copy = store::read_vendored_part(dir, &part).map_err(|err| err.to_string())?;
+                                if copy.footprint == item.footprint {
+                                    Ok(())
+                                } else {
+                                    Err("the copy taken has another footprint".to_owned())
+                                }
+                            })
+                    }
+                    (None, Some(loc)) => Err(format!(
                         "the project takes {part} from source {:?} ({}), not from the file written",
                         loc.source,
                         loc.path.display()
                     )),
-                    None => Err(format!("{part} is in none of the project's library sources")),
+                    (None, None) => Err(format!("{part} is in none of the project's library sources")),
                 };
                 match refreshed {
                     Ok(()) => {
@@ -2451,12 +2467,14 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     }
                     Err(why) => {
                         let restored = match &before {
-                            Some(bytes) if std::fs::read(&vendored).ok().as_ref() != Some(bytes) => {
+                            _ if !tried => Ok(()),
+                            Ok(Some(bytes)) if std::fs::read(&vendored).ok().as_ref() != Some(bytes) => {
                                 std::fs::write(&vendored, bytes).map_err(|err| err.to_string())
                             }
-                            Some(_) => Ok(()),
-                            None if vendored.exists() => std::fs::remove_file(&vendored).map_err(|err| err.to_string()),
-                            None => Ok(()),
+                            Ok(None) if vendored.exists() => {
+                                std::fs::remove_file(&vendored).map_err(|err| err.to_string())
+                            }
+                            _ => Ok(()),
                         };
                         eprintln!(
                             "warning: the project's copy of {part} was not updated: {}",
@@ -4841,6 +4859,12 @@ mod tests {
         std::fs::write(&copy_path, "{ broken").unwrap();
         cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
         assert_eq!(std::fs::read_to_string(&copy_path).unwrap(), "{ broken");
+        // Nor one whose bytes cannot be read at all (here a folder in its place).
+        std::fs::remove_file(&copy_path).unwrap();
+        std::fs::create_dir(&copy_path).unwrap();
+        cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+        assert!(copy_path.is_dir(), "left as it was");
+        std::fs::remove_dir(&copy_path).unwrap();
         store::write_vendored_part(&dir, &edited).unwrap();
         // An unreadable project does not stop an import into a named library folder.
         let broken = tmp.path().join("broken");
