@@ -135,6 +135,7 @@ pub(crate) fn make_symbol(
         });
     }
     Ok(wc_core::Symbol {
+        source: String::new(),
         id: id.into(),
         name: name.into(),
         category: String::new(),

@@ -5,6 +5,7 @@ use wc_core::symbol::{Pin, PinDir, SymbolRole};
 
 fn sym(id: &str, pin_y: f64) -> Symbol {
     Symbol {
+        source: String::new(),
         id: id.into(),
         name: "Coil".into(),
         category: "relays".into(),

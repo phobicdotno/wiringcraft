@@ -4121,6 +4121,18 @@ fn add_built(
             }
         }
     }
+    // A new version replaces the project's copy only when both are the same item of their
+    // library: ids given by name can move to another block in another catalog (#301).
+    for symbol in &built.symbols {
+        if replace == Replace::No || !p.lock.symbols.get(&symbol.id).is_some_and(|e| e.hash != symbol.hash()) {
+            continue;
+        }
+        if let Ok(have) = store::read_vendored_symbol(dir, &symbol.id)
+            && let Some(why) = wc_core::symbol::replace_refused(&have, symbol)
+        {
+            return Err(format!("{why}; import into a fresh project, or remove the copy first"));
+        }
+    }
     // A library item already in the project may come again unchanged (same content hash), or
     // in a new version when the project's copy is still the one its lock pinned: nobody changed
     // it in the project, so the import replaces it (a block now drawn, a newer catalog). Every
@@ -5507,6 +5519,7 @@ mod tests {
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let coil = |pins: &[&str]| wc_core::Symbol {
+            source: String::new(),
             id: "swe.lib.coil".into(),
             name: "Coil".into(),
             category: String::new(),
@@ -5591,12 +5604,81 @@ mod tests {
         );
     }
 
+    /// #301: an id given by name can move to another block in a later catalog; the import then
+    /// refuses to replace the project's copy with that other block.
+    #[test]
+    fn an_import_does_not_replace_a_copy_with_another_block_of_the_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let coil = |source: &str, name: &str| wc_core::Symbol {
+            source: source.into(),
+            id: "swe.lib.coil".into(),
+            name: name.into(),
+            category: String::new(),
+            letter_code: "K".into(),
+            role: Default::default(),
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let built = |s: wc_core::Symbol| wc_import::aml::Built {
+            symbols: vec![s],
+            ..Default::default()
+        };
+        let first = coil("solidworks-electrical:block:guid:aaa", "Coil");
+        let mut p = load(&dir).unwrap();
+        add_built(
+            &dir,
+            &mut p,
+            built(first.clone()),
+            "import:a.tewzip",
+            Replace::Unchanged,
+        )
+        .unwrap();
+        save(&dir, &p).unwrap();
+
+        // Another block took the id: refused, the copy stays.
+        let mut p = load(&dir).unwrap();
+        let other = coil("solidworks-electrical:block:guid:000", "Coil (new)");
+        let err = add_built(&dir, &mut p, built(other), "import:a.tewzip", Replace::Unchanged).unwrap_err();
+        assert!(err.contains("another one of its library"), "{err}");
+        // Which block it is cannot be told: refused too.
+        let mut p = load(&dir).unwrap();
+        let unsure = coil(
+            &format!(
+                "{}solidworks-electrical:block:name:Coil",
+                wc_core::symbol::AMBIGUOUS_SOURCE
+            ),
+            "Coil 2",
+        );
+        let err = add_built(&dir, &mut p, built(unsure), "import:a.tewzip", Replace::Unchanged).unwrap_err();
+        assert!(err.contains("cannot be told"), "{err}");
+        assert_eq!(store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap(), first);
+
+        // The same block in a new version replaces it.
+        let mut p = load(&dir).unwrap();
+        let newer = coil("solidworks-electrical:block:guid:aaa", "Coil, drawn");
+        add_built(
+            &dir,
+            &mut p,
+            built(newer.clone()),
+            "import:a.tewzip",
+            Replace::Unchanged,
+        )
+        .unwrap();
+        save(&dir, &p).unwrap();
+        assert_eq!(store::read_vendored_symbol(&dir, "swe.lib.coil").unwrap(), newer);
+    }
+
     #[test]
     fn an_import_replaces_an_item_the_project_has_not_changed_and_refuses_one_it_has() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let coil = |name: &str| wc_core::Symbol {
+            source: String::new(),
             id: "swe.lib.coil".into(),
             name: name.into(),
             category: String::new(),
@@ -5927,6 +6009,7 @@ mod tests {
         let mut p = load(&dir).unwrap();
         // A terminal symbol in the project, so terminals tagged with only their strip count.
         let term = wc_core::Symbol {
+            source: String::new(),
             id: "test.term".into(),
             name: "Terminal".into(),
             category: String::new(),
@@ -5987,6 +6070,7 @@ mod tests {
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let term = |id: &str| wc_core::Symbol {
+            source: String::new(),
             id: id.into(),
             name: "Terminal".into(),
             category: String::new(),
@@ -6042,6 +6126,7 @@ mod tests {
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let term = |id: &str| wc_core::Symbol {
+            source: String::new(),
             id: id.into(),
             name: "Terminal".into(),
             category: String::new(),
@@ -6094,6 +6179,7 @@ mod tests {
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let term = wc_core::Symbol {
+            source: String::new(),
             id: "test.term".into(),
             name: "Terminal".into(),
             category: String::new(),
@@ -7091,6 +7177,7 @@ mod tests {
             reference: None,
         });
         let term = wc_core::Symbol {
+            source: String::new(),
             id: "test.term".into(),
             name: "Terminal".into(),
             category: String::new(),
@@ -7347,6 +7434,7 @@ mod tests {
 
         let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
         let term = wc_core::Symbol {
+            source: String::new(),
             id: "test.term".into(),
             name: "Terminal".into(),
             category: String::new(),

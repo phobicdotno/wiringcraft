@@ -2812,6 +2812,7 @@ pub(crate) mod tests {
     fn putting_back_a_pinned_terminal_copy_keeps_jumpers_on_their_terminals() {
         let (_tmp, mut o) = project();
         let terminal = |id: &str, role| Symbol {
+            source: String::new(),
             id: id.into(),
             name: "Terminal".into(),
             category: String::new(),
@@ -2868,6 +2869,7 @@ pub(crate) mod tests {
     fn a_terminal_copy_put_back_by_a_paste_that_fails_later_leaves_jumpers_alone() {
         let (_tmp, mut o) = project();
         let terminal = |id: &str, role| Symbol {
+            source: String::new(),
             id: id.into(),
             name: "Terminal".into(),
             category: String::new(),
@@ -4978,6 +4980,7 @@ pub(crate) mod tests {
         let (_tmp, mut o) = project();
         let root = o.dir.join("library");
         let sym = wc_core::Symbol {
+            source: String::new(),
             id: "test.imported".into(),
             name: "Imported".into(),
             category: String::new(),

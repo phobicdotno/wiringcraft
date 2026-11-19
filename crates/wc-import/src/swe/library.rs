@@ -659,6 +659,21 @@ pub fn read_blocks(
         .collect())
 }
 
+/// What names a SolidWorks Electrical block in [`wc_core::Symbol::source`]: its GUID when it
+/// has one, else its path in the library, else its name as the source spells it.
+fn block_identity(name: &str, guid: &str, path: &str) -> String {
+    let (kind, value) = [("guid", guid), ("path", path), ("name", name)]
+        .into_iter()
+        .find(|(_, v)| !v.trim().is_empty())
+        .unwrap_or(("name", name));
+    let value = if kind == "guid" {
+        value.trim().trim_matches(['{', '}']).to_ascii_lowercase()
+    } else {
+        value.trim().to_owned()
+    };
+    format!("solidworks-electrical:block:{kind}:{value}")
+}
+
 /// [`read_blocks`], each symbol with its block's name as the source has it (an empty name gets
 /// another symbol name), which is the name its drawing is found under.
 fn read_named_blocks(
@@ -699,8 +714,12 @@ fn read_named_blocks(
         .field(&["description", "label"])
         .map(text)
         .unwrap_or_else(|| "''".into());
+    // What names a block across catalogs (#301): its GUID, else its path in the library, else
+    // its name as the source spells it.
+    let guid = blocks.field(&["guid", "uuid"]).map(text).unwrap_or_else(|| "''".into());
+    let path = blocks.field(&["path"]).map(text).unwrap_or_else(|| "''".into());
     let q = format!(
-        "SELECT {}, {}, {description} FROM tew_block ORDER BY {}",
+        "SELECT {}, {}, {description}, {guid}, {path} FROM tew_block ORDER BY {}",
         quoted(&id),
         text(&name),
         quoted(&id)
@@ -708,13 +727,33 @@ fn read_named_blocks(
     let mut st = conn.prepare(&q).map_err(sql)?;
     let rows = st
         .query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
         })
         .map_err(sql)?;
     // Every row the source has counts, also one that cannot be read.
     let rows: Vec<rusqlite::Result<_>> = rows.collect();
     report.blocks_in = rows.len();
-    let rows = readable(rows.into_iter(), "symbol block", warnings);
+    let mut rows: Vec<(i64, String, String, String)> = readable(rows.into_iter(), "symbol block", warnings)
+        .into_iter()
+        .map(|(row, name, description, guid, path)| {
+            let identity = block_identity(&name, &guid, &path);
+            (row, name, description, identity)
+        })
+        .collect();
+    // Blocks whose names clean up alike are numbered in the order of what names them, not of
+    // their rows, so another catalog with the same blocks in another order gives each block
+    // the same id.
+    rows.sort_by(|a, b| (&a.3, a.0).cmp(&(&b.3, b.0)));
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &rows {
+        *seen.entry(r.3.clone()).or_default() += 1;
+    }
 
     let no = points.field(&["no", "orderno"]);
     let pin_name = points.field(&["txt", "name", "label", "tag"]);
@@ -772,7 +811,7 @@ fn read_named_blocks(
     // Blocks boxed, and blocks drawn only in part, because that budget ran out.
     let (mut over_budget, mut cut_short) = (0usize, 0usize);
     let mut drawn_blocks = 0usize;
-    for (row, name, description) in rows {
+    for (row, name, description, identity) in rows {
         let Some(points) = pts.remove(&row).filter(|p| !p.is_empty()) else {
             skipped += 1;
             continue;
@@ -802,11 +841,18 @@ fn read_named_blocks(
             }
         };
         let source = name.clone();
+        // Two blocks named the same way cannot be told apart by a later import.
+        let identity = if seen.get(&identity).copied().unwrap_or(0) > 1 {
+            format!("{}{identity}", wc_core::symbol::AMBIGUOUS_SOURCE)
+        } else {
+            identity
+        };
         by_id.insert(
             sid.clone(),
             (
                 source,
                 Symbol {
+                    source: identity,
                     id: sid,
                     name: if name.is_empty() {
                         "SolidWorks Electrical block".into()

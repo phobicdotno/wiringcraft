@@ -103,6 +103,7 @@ fn an_imported_jumper_stays_on_the_sources_terminals_when_the_import_renumbers_t
     // The project's own strip: -X1.1, then two terminals tagged with only the strip (numbered 2
     // and 3), jumpered.
     let term = wc_core::Symbol {
+        source: String::new(),
         id: "test.term".into(),
         name: "Terminal".into(),
         category: String::new(),

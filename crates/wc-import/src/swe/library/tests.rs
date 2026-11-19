@@ -190,9 +190,87 @@ fn a_layout_with_mixed_prefixes_gives_the_same_library() {
     let other = db(OTHER_LAYOUT);
     let lib = read(Some(&other), Some(&other)).unwrap();
     assert_eq!(lib.parts, known.parts);
-    assert_eq!(lib.symbols, known.symbols);
+    // The same blocks, only what names them differs: this layout has GUIDs.
+    let unsourced = |l: &SweLibrary| -> Vec<Symbol> {
+        l.symbols
+            .iter()
+            .cloned()
+            .map(|s| Symbol {
+                source: String::new(),
+                ..s
+            })
+            .collect()
+    };
+    assert_eq!(unsourced(&lib), unsourced(&known));
+    let sources: Vec<&str> = lib.symbols.iter().map(|s| s.source.as_str()).collect();
+    assert_eq!(
+        sources,
+        [
+            "solidworks-electrical:block:guid:x",
+            "solidworks-electrical:block:guid:z"
+        ]
+    );
     assert_eq!(lib.report, known.report);
     assert!(!lib.warnings.iter().any(|w| w.contains("column")), "{:?}", lib.warnings);
+}
+
+/// Blocks with GUIDs: `Coil` twice and `COIL` once, all cleaning up to `swe.lib.coil`.
+fn guid_blocks(rows: &str) -> Connection {
+    db(&format!(
+        "CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT, blk_guid TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES {rows};
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 1), (2, 1, 'B1', 0, 2), (3, 1, 'C1', 0, 3);"
+    ))
+}
+
+/// Which block each id names, by the pin it has.
+fn ids_to_pins(conn: &Connection) -> Vec<(String, String, String)> {
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let mut out: Vec<_> = read_blocks(conn, None, &mut report, &mut warnings)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.id, s.pins[0].name.clone(), s.source))
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn an_id_stays_on_its_block_when_another_catalog_lists_the_blocks_in_another_order() {
+    // #301: the same three blocks, the second catalog with their rows in another order and a
+    // GUID spelled in braces and capitals.
+    let first = guid_blocks("(1, 'Coil', '', 'aaa'), (2, 'COIL', '', 'bbb'), (3, 'Coil', '', 'ccc')");
+    let second = guid_blocks("(3, 'Coil', '', 'ccc'), (1, 'Coil', '', '{AAA}'), (2, 'COIL', '', 'bbb')");
+    let a = ids_to_pins(&first);
+    assert_eq!(
+        a.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(),
+        ["swe.lib.coil", "swe.lib.coil.2", "swe.lib.coil.3"]
+    );
+    assert_eq!(a, ids_to_pins(&second));
+    // A block with a GUID that sorts before the others, added in a later catalog, takes the
+    // plain id: the source tells the import it is another block (see `replace_refused`).
+    let later = guid_blocks("(1, 'Coil', '', 'aaa'), (2, 'COIL', '', 'bbb'), (3, 'Coil', '', '000')");
+    let b = ids_to_pins(&later);
+    assert_eq!(b[0].0, "swe.lib.coil");
+    assert_eq!(b[0].2, "solidworks-electrical:block:guid:000");
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let old = read_blocks(&first, None, &mut report, &mut warnings).unwrap();
+    let new = read_blocks(&later, None, &mut report, &mut warnings).unwrap();
+    let (old, new) = (&old[0], &new[0]);
+    assert_eq!((old.id.as_str(), new.id.as_str()), ("swe.lib.coil", "swe.lib.coil"));
+    assert!(wc_core::symbol::replace_refused(old, new).is_some());
+    assert!(wc_core::symbol::replace_refused(old, old).is_none());
+}
+
+#[test]
+fn blocks_named_alike_without_a_guid_or_path_are_ambiguous() {
+    // APP_DATA has two blocks named `Coil` and no GUIDs.
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let symbols = read_blocks(&db(APP_DATA), None, &mut report, &mut warnings).unwrap();
+    for s in &symbols {
+        assert!(s.source.starts_with(wc_core::symbol::AMBIGUOUS_SOURCE), "{}", s.source);
+    }
 }
 
 #[test]

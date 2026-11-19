@@ -2052,6 +2052,7 @@ pub fn build_with(
                             }
                         };
                         built.symbols.push(Symbol {
+                            source: String::new(),
                             id: id.clone(),
                             name: if s.block.is_empty() {
                                 "SolidWorks Electrical symbol".to_owned()

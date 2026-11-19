@@ -1649,6 +1649,7 @@ fn lib_coil(id: &str, a2_at: f64) -> Symbol {
         dir,
     };
     Symbol {
+        source: String::new(),
         id: id.into(),
         name: "Relay coil".into(),
         category: "relays".into(),

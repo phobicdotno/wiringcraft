@@ -1774,6 +1774,7 @@ mod template_tests {
         use wc_core::geom::Point;
         use wc_core::symbol::{Pin, PinDir, SymbolRole};
         let coil = Symbol {
+            source: String::new(),
             id: "coil".into(),
             name: "coil".into(),
             category: String::new(),
