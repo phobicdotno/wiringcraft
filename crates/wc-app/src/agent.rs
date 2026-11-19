@@ -1654,8 +1654,18 @@ impl App {
                     }
                 }
                 let cover = new.cover;
+                let shown = page == self.ed.page;
                 if let Some(p) = open.project.pages.get_mut(page) {
-                    *p = new;
+                    let old = std::mem::replace(p, new);
+                    // On the shown page, what the user had selected follows its graphic or
+                    // cloud, and one no longer there is let go. Another page is shown after
+                    // this one: its selection does not carry over.
+                    if shown {
+                        crate::edit::remap_graphics(&mut self.ed.selection, &old.graphics, &p.graphics);
+                        crate::edit::remap_clouds(&mut self.ed.selection, &old.clouds, &p.clouds);
+                    } else {
+                        self.ed.selection.clear();
+                    }
                 }
                 // One cover page per project: a new cover takes the mark from any other page.
                 if cover {
@@ -6014,6 +6024,50 @@ mod tests {
         call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
         assert!(page2(&a).clouds.is_empty());
         assert_eq!(page2(&a).revision_table, None);
+    }
+
+    #[test]
+    fn a_page_edit_lets_go_of_a_selected_cloud_it_removes() {
+        let (_tmp, mut a) = app(vec![]);
+        let cloud = |x: f64| wc_core::revision::RevisionCloud {
+            min: wc_core::Point::new(x, 10.0),
+            max: wc_core::Point::new(x + 20.0, 30.0),
+            revision: "B".into(),
+        };
+        if let Some(p) = a.open.as_mut().unwrap().project.page_mut("p0002") {
+            p.clouds = vec![cloud(10.0), cloud(50.0)];
+        }
+        let i = a.open.as_ref().unwrap().find_page("p0002").unwrap();
+        a.ed.page = i;
+        a.ed.selection = vec![Selection::Cloud(0)];
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        content["clouds"] = json!([cloud(50.0)]);
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert!(
+            a.ed.selection.is_empty(),
+            "the remaining cloud is not taken for the removed one"
+        );
+        // The one that stays stays selected.
+        a.ed.selection = vec![Selection::Cloud(0)];
+        content["clouds"] = json!([cloud(90.0), cloud(50.0)]);
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert_eq!(a.ed.selection, vec![Selection::Cloud(1)]);
+        // Editing another page than the shown one lets go of the shown page's selection.
+        a.ed.page = a.open.as_ref().unwrap().find_page("p0001").unwrap();
+        a.ed.selection = vec![Selection::Cloud(0)];
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert!(a.ed.selection.is_empty());
     }
 
     #[test]
