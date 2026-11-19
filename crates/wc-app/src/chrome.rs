@@ -654,6 +654,52 @@ mod tests {
     }
 
     #[test]
+    fn a_ribbon_press_stays_with_its_button_below_the_smallest_window_width() {
+        // Narrower than the window's minimum of 900 points (#351): the groups wrap onto more
+        // rows there, and a press on Undo released over the button that took its place is
+        // still no click on either.
+        let undo = undo_index();
+        for (from, to) in [(740.0, 750.0), (750.0, 740.0)] {
+            let at = ribbon_icons(0, from)[undo].center();
+            let there = ribbon_icons(0, to)
+                .iter()
+                .position(|r| r.contains(at))
+                .map(|i| start_order()[i]);
+            assert!(
+                there.is_some_and(|a| a != Action::Undo),
+                "{from} to {to}: {there:?} at {at:?}"
+            );
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let (_, out) = ribbon_frames(
+                0,
+                &[
+                    (from, Vec::new()),
+                    (from, vec![egui::Event::PointerMoved(at)]),
+                    (from, vec![button(true)]),
+                    (to, vec![button(false)]),
+                ],
+            );
+            assert!(out.is_empty(), "{from} to {to}: {out:?}");
+            // Released where it was pressed, at that width, it is a click on Undo.
+            let (_, out) = ribbon_frames(
+                0,
+                &[
+                    (from, Vec::new()),
+                    (from, vec![egui::Event::PointerMoved(at)]),
+                    (from, vec![button(true)]),
+                    (from, vec![button(false)]),
+                ],
+            );
+            assert_eq!(out, [Action::Undo], "{from}");
+        }
+    }
+
+    #[test]
     fn a_ribbon_release_counts_where_it_happened_not_where_the_pointer_went_after() {
         let undo = undo_index();
         let (narrow, wide) = (1210.0, 1220.0);
