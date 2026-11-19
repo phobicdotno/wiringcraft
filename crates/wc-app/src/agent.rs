@@ -4079,6 +4079,7 @@ mod tests {
             .unwrap()
             .take_device_renames()
             .into_iter()
+            .flatten()
             .map(|(f, t)| (f.to_string(), t.to_string()))
             .collect();
         assert_eq!(noted, [("=PUMP-K1".to_owned(), "=PUMP-K7".to_owned())]);

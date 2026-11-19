@@ -239,9 +239,10 @@ pub struct Open {
     /// saved it in between.
     #[cfg(test)]
     rewrite_after_snapshot: Option<(PathBuf, String)>,
-    /// Devices renamed here, old tag and new, in order; a shared session takes them
+    /// Devices renamed here, old tag to new, one map per change in order (one change may
+    /// rename several devices at once); a shared session takes them
     /// ([`Open::take_device_renames`]) to keep a rename that waits together.
-    device_renames: Vec<(DeviceTag, DeviceTag)>,
+    device_renames: Vec<BTreeMap<DeviceTag, DeviceTag>>,
     /// Why the last Undo or Redo was not done, when it failed.
     undo_error: Option<String>,
     /// Parts the last Undo or Redo could not load, with the reason, though the step was done.
@@ -768,14 +769,16 @@ impl Open {
         }
     }
 
-    /// The devices renamed here since the last call, old tag and new, in order.
-    pub fn take_device_renames(&mut self) -> Vec<(DeviceTag, DeviceTag)> {
+    /// The devices renamed here since the last call: old tag to new, one map per change, in
+    /// order.
+    pub fn take_device_renames(&mut self) -> Vec<BTreeMap<DeviceTag, DeviceTag>> {
         std::mem::take(&mut self.device_renames)
     }
 
     /// Note that device `from` was renamed to `to` here.
     pub(crate) fn note_device_rename(&mut self, from: &DeviceTag, to: &DeviceTag) {
-        self.device_renames.push((from.clone(), to.clone()));
+        self.device_renames
+            .push([(from.clone(), to.clone())].into_iter().collect());
     }
 
     /// A mark in the undo history, for [`Open::squash_undo`].
@@ -1803,7 +1806,9 @@ impl Open {
         if n > 0 {
             self.checkpoint();
             self.project = project;
-            self.device_renames.extend(renamed);
+            if !renamed.is_empty() {
+                self.device_renames.push(renamed);
+            }
         }
         Ok(n)
     }
