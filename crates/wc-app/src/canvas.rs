@@ -1064,6 +1064,9 @@ fn black_box_tool(
     let released_at = primary_release_pos(&resp.ctx)
         .or(resp.interact_pointer_pos())
         .map(|p| shown.mm(p));
+    // How near an edge a click must land, in that view too; `tol` (the view drawn now) is
+    // for the hover ring.
+    let click_tol = (6.0 / f64::from(shown.zoom)).max(0.8);
     match ed.black_box.as_mut() {
         None if !asking => {
             // A drag is only seen once the pointer has moved: its corner is where the button
@@ -1097,14 +1100,14 @@ fn black_box_tool(
             if resp.clicked_by(egui::PointerButton::Primary)
                 && let Some(at) = released_at
             {
-                if let Some(hit) = edge_at(min, max, at, tol) {
+                if let Some(hit) = edge_at(min, max, at, click_tol) {
                     // Snapped along the edge, like every other point on the page.
                     let snapped = edge_at(min, max, snap(at, snap_step), f64::INFINITY);
                     ed.ask_box_pin = Some(match snapped {
                         Some((side, off)) if side == hit.0 => (side, off),
                         _ => hit,
                     });
-                } else if inside(min, max, at, tol) {
+                } else if inside(min, max, at, click_tol) {
                     ed.ask_box_tag = true;
                 }
             } else if enter {
@@ -2265,6 +2268,48 @@ mod tests {
         );
         assert!(ed.view.zoom > zoom, "the view zoomed");
         assert_eq!(ed.black_box.as_ref().and_then(|d| d.to), Some(other));
+
+        // A click near an edge, released as the view zooms in: it is judged at the zoom the
+        // user saw, so it still lands on the edge (at the new zoom it would be inside).
+        ed.view = View {
+            zoom: 1.0,
+            offset: Vec2::ZERO,
+            fit: false,
+        };
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.5,
+            vec![egui::Event::PointerMoved(egui::pos2(100.0, 100.0))],
+        );
+        let seen = ed.cursor.unwrap();
+        let origin = egui::pos2(100.0 - seen.x as f32, 100.0 - seen.y as f32);
+        let mut d = crate::black_box_tool::BoxDraft::new(&open.project.pages[0].id, Point::new(50.0, 50.0));
+        d.to = Some(Point::new(150.0, 150.0));
+        ed.black_box = Some(d);
+        let near_top = origin + Vec2::new(100.0, 54.0);
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.6,
+            vec![egui::Event::PointerMoved(near_top), button(near_top, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.62,
+            vec![
+                button(near_top, false),
+                egui::Event::PointerMoved(origin + Vec2::new(400.0, 400.0)),
+                egui::Event::Zoom(2.0),
+            ],
+        );
+        assert!(ed.view.zoom > 1.5, "the view zoomed");
+        assert!(!ed.ask_box_tag, "not taken for a click inside");
+        assert_eq!(ed.ask_box_pin.take().map(|(side, _)| side), Some(wc_core::BoxSide::Top));
 
         // Another tool drops the box being drawn.
         ed.ask_box_tag = false;
