@@ -4475,6 +4475,26 @@ mod tests {
     }
 
     #[test]
+    fn an_equal_drawing_that_comes_with_a_late_refusal_is_not_taken_for_the_paste() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        let line = paste_line(&mut a);
+        a.sync_session_now(false);
+        assert!(a.ed.waiting_graphics.is_some(), "the paste waits for the host");
+        // The host refuses the paste and draws the same line itself; the refusal reaches the
+        // guest only after its frame looked at the picks (in the frame's late pump).
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        host_open.project.page_mut("p0003").unwrap().graphics.push(line.clone());
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        a.share.refusals_come_late = true;
+        a.sync_session_now(false);
+        assert_eq!(graphics3(&a), vec![line]);
+        assert!(a.ed.selection.is_empty(), "the host's line is not the guest's paste");
+        assert!(a.ed.waiting_graphics.is_none());
+    }
+
+    #[test]
     fn a_guests_paste_the_host_refuses_leaves_nothing_selected() {
         let tmp = tempfile::tempdir().unwrap();
         let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());

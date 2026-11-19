@@ -2452,6 +2452,10 @@ pub struct Share {
     /// Refusals taken from the session after the picks were looked at this frame (by
     /// [`Share::take_refused_pages`]): the picks look at them next frame, as they would have.
     refused_later: Refused,
+    /// Tests only: refusals already in the session when a frame looks at the picks are left
+    /// for [`Share::take_refused_pages`], as if they had come in the frame's late pump.
+    #[cfg(test)]
+    pub(crate) refusals_come_late: bool,
     /// Files the session lacks ([`repairs_due`]) whose copy here was looked for and could not
     /// be sent (missing, unreadable, or another version), with when and [`repair_stamp`] then:
     /// each is read again only after [`ITEM_WAIT`], or at once once this copy pins or loads
@@ -3808,6 +3812,13 @@ impl Share {
         }
         // A withdrawn pick stays withdrawn for a refusal of its picture that comes later: that
         // must not rename the references that are not this copy's.
+        #[cfg(test)]
+        let mut refused = if self.refusals_come_late {
+            Refused::default()
+        } else {
+            role.refused_targets()
+        };
+        #[cfg(not(test))]
         let mut refused = role.refused_targets();
         self.refused_pages.extend(refused.0.iter().cloned());
         let (pages, meta, edits) = std::mem::take(&mut self.refused_later);
