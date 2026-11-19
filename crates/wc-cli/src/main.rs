@@ -2488,14 +2488,21 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                         // The new pin must reach the disk with the copy, or both go back: `save`
                         // can fail after it wrote the lock.
                         if let Err(err) = save(dir, p) {
-                            let back = match &before {
+                            // Both are tried, and every failure is named.
+                            let copy_back = match &before {
                                 Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
                                 Err(_) => Ok(()),
-                            }
-                            .and(match &lock_before {
+                            };
+                            let lock_back = match &lock_before {
                                 Ok(bytes) => put_file_back(&lock_path, bytes.as_deref()),
                                 Err(_) => Ok(()),
-                            });
+                            };
+                            let back = match (copy_back, lock_back) {
+                                (Ok(()), Ok(())) => Ok(()),
+                                (Err(a), Ok(())) => Err(a),
+                                (Ok(()), Err(b)) => Err(b),
+                                (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+                            };
                             return Err(match back {
                                 Ok(()) => format!("the project's copy of {part} was not updated: {err}"),
                                 Err(why) => format!(
