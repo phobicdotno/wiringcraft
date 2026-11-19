@@ -136,38 +136,62 @@ pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
 pub struct WaitingGraphics {
     /// The page's id.
     pub page: String,
-    /// Each drawing, and how many copies of it the page had without it.
-    pub items: Vec<(Shape, usize)>,
-    /// The selection when they were taken off: one made since is the user's, and ends the wait.
+    /// The drawings waited for.
+    pub items: Vec<Lost>,
+    /// The selection after the last sync: one made since is the user's, and ends the wait.
     pub selection: Vec<Selection>,
 }
 
-/// The drawings selected in `before` (positions in `old`) of which `new` has fewer copies, each
-/// with the number of copies `new` has.
-pub fn lost_graphics(before: &[Selection], old: &[Shape], new: &[Shape]) -> Vec<(Shape, usize)> {
+/// A selected drawing a sync took off a page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lost {
+    /// The drawing.
+    pub shape: Shape,
+    /// How many copies of it the page had without it.
+    pub had: usize,
+    /// How many of its copies were selected and taken off (a paste of two equal lines is two).
+    pub selected: usize,
+}
+
+/// The drawings selected in `before` (positions in `old`) of which `new` has fewer copies.
+pub fn lost_graphics(before: &[Selection], old: &[Shape], new: &[Shape]) -> Vec<Lost> {
     let copies = |list: &[Shape], item: &Shape| list.iter().filter(|x| *x == item).count();
-    let mut lost: Vec<(Shape, usize)> = Vec::new();
+    let mut lost: Vec<Lost> = Vec::new();
     for s in before {
-        if let Selection::Graphic(i) = s
-            && let Some(item) = old.get(*i)
-            && copies(new, item) < copies(old, item)
-            && !lost.iter().any(|(x, _)| x == item)
-        {
-            lost.push((item.clone(), copies(new, item)));
+        let Selection::Graphic(i) = s else { continue };
+        let Some(item) = old.get(*i) else { continue };
+        let (had, was) = (copies(new, item), copies(old, item));
+        if had >= was {
+            continue;
+        }
+        match lost.iter_mut().find(|l| l.shape == *item) {
+            // No more of them than went.
+            Some(l) => l.selected = (l.selected + 1).min(was - had),
+            None => lost.push(Lost {
+                shape: item.clone(),
+                had,
+                selected: 1,
+            }),
         }
     }
     lost
 }
 
 /// Select again the drawings of `items` that are back on the page (`now` has more copies of one
-/// than it had without it): the last copy, where a merged change puts it. They leave `items`.
-pub fn restore_graphics(items: &mut Vec<(Shape, usize)>, sel: &mut Vec<Selection>, now: &[Shape]) {
-    items.retain(|(item, had)| {
-        let at: Vec<usize> = (0..now.len()).filter(|&j| now[j] == *item).collect();
-        if at.len() <= *had {
+/// than it had without it): the last copies, where a merged change puts them. They leave `items`.
+pub fn restore_graphics(items: &mut Vec<Lost>, sel: &mut Vec<Selection>, now: &[Shape]) {
+    items.retain(|l| {
+        let at: Vec<usize> = now
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| **x == l.shape)
+            .map(|(j, _)| j)
+            .collect();
+        let back = at.len().saturating_sub(l.had);
+        if back == 0 {
             return true;
         }
-        if let Some(&j) = at.last() {
+        for &j in at.iter().rev().take(back.min(l.selected)) {
             let s = Selection::Graphic(j);
             if !sel.contains(&s) {
                 sel.push(s);
@@ -743,7 +767,12 @@ mod tests {
         let old = vec![l(1.0), l(2.0), l(1.0)];
         let new = vec![l(1.0), l(2.0)];
         let mut items = lost_graphics(&[Selection::Graphic(2), Selection::Graphic(1)], &old, &new);
-        assert_eq!(items, vec![(l(1.0), 1)], "only what went is waited for");
+        let one = Lost {
+            shape: l(1.0),
+            had: 1,
+            selected: 1,
+        };
+        assert_eq!(items, vec![one], "only what went is waited for");
         // Not back yet: nothing is selected for it.
         let mut sel = Vec::new();
         restore_graphics(&mut items, &mut sel, &new);
@@ -753,6 +782,29 @@ mod tests {
         let now = vec![l(1.0), l(2.0), l(3.0), l(1.0)];
         restore_graphics(&mut items, &mut sel, &now);
         assert_eq!(sel, vec![Selection::Graphic(3)]);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn two_equal_drawings_taken_off_are_both_selected_again() {
+        let l = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        // A copy was there before; a paste of two more, both selected, goes.
+        let old = vec![l(1.0), l(2.0), l(1.0), l(1.0)];
+        let new = vec![l(1.0), l(2.0)];
+        let mut items = lost_graphics(&[Selection::Graphic(2), Selection::Graphic(3)], &old, &new);
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].had, items[0].selected), (1, 2));
+        let mut sel = Vec::new();
+        let now = vec![l(1.0), l(2.0), l(1.0), l(1.0)];
+        restore_graphics(&mut items, &mut sel, &now);
+        assert_eq!(
+            sel,
+            vec![Selection::Graphic(3), Selection::Graphic(2)],
+            "not the copy that stayed"
+        );
         assert!(items.is_empty());
     }
 

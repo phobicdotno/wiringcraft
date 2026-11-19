@@ -4396,6 +4396,67 @@ mod tests {
     }
 
     #[test]
+    fn a_later_paste_ends_the_wait_for_an_earlier_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        let first = paste_line(&mut a);
+        a.sync_session_now(false);
+        // A second paste, selected on its own, also waits for the host.
+        let page = a.open.as_mut().unwrap().project.page_mut("p0003").unwrap();
+        page.graphics.push(Shape::Line {
+            a: Point::new(8.0, 0.0),
+            b: Point::new(8.0, 5.0),
+        });
+        a.ed.selection = vec![Selection::Graphic(page.graphics.len() - 1)];
+        a.sync_session_now(false);
+        for _ in 0..3 {
+            h.frame(Some(&mut host_open), Some("p0002".into()), false);
+            a.sync_session_now(false);
+        }
+        // The first paste is back, but the user had moved on from it: it is not selected.
+        assert!(graphics3(&a).contains(&first));
+        let at = graphics3(&a).iter().position(|g| *g == first).unwrap();
+        assert!(
+            !a.ed.selection.contains(&Selection::Graphic(at)),
+            "{:?}",
+            a.ed.selection
+        );
+    }
+
+    #[test]
+    fn a_selected_drawing_that_moves_does_not_end_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        // A drawing already on the page, then a paste; both are selected.
+        let page = host_open.project.page_mut("p0003").unwrap();
+        page.graphics.push(line(1.0));
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        a.sync_session_now(false);
+        assert_eq!(graphics3(&a), vec![line(1.0)]);
+        let pasted = paste_line(&mut a);
+        a.ed.selection = vec![Selection::Graphic(0), Selection::Graphic(1)];
+        a.sync_session_now(false);
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(0)]);
+        // The host takes the paste and puts another drawing in front before the guest looks.
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        let page = host_open.project.page_mut("p0003").unwrap();
+        page.graphics.insert(0, line(2.0));
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        a.sync_session_now(false);
+        let now = graphics3(&a);
+        let at = |g: &Shape| Selection::Graphic(now.iter().position(|x| x == g).unwrap());
+        let mut sel = a.ed.selection.clone();
+        sel.sort_by_key(|s| format!("{s:?}"));
+        let mut want = vec![at(&line(1.0)), at(&pasted)];
+        want.sort_by_key(|s| format!("{s:?}"));
+        assert_eq!(sel, want, "{now:?}");
+    }
+
+    #[test]
     fn a_guests_paste_the_host_refuses_leaves_nothing_selected() {
         let tmp = tempfile::tempdir().unwrap();
         let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());

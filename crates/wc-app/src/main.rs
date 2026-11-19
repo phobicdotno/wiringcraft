@@ -373,6 +373,16 @@ impl App {
             self.ed.page = o.project.pages.len().saturating_sub(1);
         }
         let waiting = self.share.unanswered_edits() > 0;
+        // A selection made since the last sync is the user's, and ends the wait (looked at
+        // before this sync moves selected drawings to where they are now).
+        if self
+            .ed
+            .waiting_graphics
+            .as_ref()
+            .is_some_and(|w| w.selection != self.ed.selection)
+        {
+            self.ed.waiting_graphics = None;
+        }
         if let Some((id, old)) = &graphics_before {
             match self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page)) {
                 Some(p) if &p.id == id => {
@@ -390,7 +400,6 @@ impl App {
                         });
                         if &w.page == id {
                             w.items.extend(lost);
-                            w.selection = self.ed.selection.clone();
                         }
                     }
                 }
@@ -399,7 +408,6 @@ impl App {
             }
         }
         if let Some(mut w) = self.ed.waiting_graphics.take()
-            && w.selection == self.ed.selection
             && let Some(p) = self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page))
             && p.id == w.page
         {
