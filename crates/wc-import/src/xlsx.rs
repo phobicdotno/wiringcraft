@@ -41,7 +41,7 @@ pub fn is_legacy_xls(bytes: &[u8]) -> bool {
 
 /// The first visible worksheet as rows of cell text. Rows with no text are left out; a row is
 /// as long as its last cell, and cells a row skips are empty strings.
-pub fn rows(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
+pub fn rows(bytes: &[u8]) -> Result<crate::csv::Rows> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(xml_error)?;
     let workbook = part(&mut zip, "xl/workbook.xml")?
         .ok_or_else(|| Error::Format("xlsx: no xl/workbook.xml, not an Excel workbook".into()))?;
@@ -687,27 +687,30 @@ impl Cell {
 
 #[cfg(test)]
 fn sheet_rows(xml: &str, strings: &[String]) -> Result<Vec<Vec<String>>> {
-    sheet_rows_styled(xml, strings, &Styles::default(), MAX_TEXT_BYTES)
+    sheet_rows_styled(xml, strings, &Styles::default(), MAX_TEXT_BYTES).map(|r| r.cells)
 }
 
 #[cfg(test)]
 fn sheet_rows_within(xml: &str, strings: &[String], max_text: usize) -> Result<Vec<Vec<String>>> {
-    sheet_rows_styled(xml, strings, &Styles::default(), max_text)
+    sheet_rows_styled(xml, strings, &Styles::default(), max_text).map(|r| r.cells)
 }
 
 /// A worksheet's rows with its numbers shown through `styles`, keeping at most `max_text` bytes
-/// of cell text.
-fn sheet_rows_styled(xml: &str, strings: &[String], styles: &Styles, max_text: usize) -> Result<Vec<Vec<String>>> {
+/// of cell text. Each row keeps its worksheet row number: its `r`, else one after the row
+/// before it.
+fn sheet_rows_styled(xml: &str, strings: &[String], styles: &Styles, max_text: usize) -> Result<crate::csv::Rows> {
     let mut text_bytes = 0usize;
     let mut r = Reader::from_str(xml);
-    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut out = crate::csv::Rows::default();
+    // The worksheet row being read (0 before the first).
+    let mut number = 0usize;
     let mut row: BTreeMap<usize, String> = BTreeMap::new();
     let mut cell: Option<Cell> = None;
     let mut next_column = 0;
     // Inside `<v>`, inside an inline string's `<t>`, inside a phonetic run.
     let (mut in_v, mut in_t, mut in_phonetic) = (false, false, false);
     let mut cells_read = 0usize;
-    let mut finish_row = |row: &mut BTreeMap<usize, String>, out: &mut Vec<Vec<String>>| -> Result<()> {
+    let mut finish_row = |row: &mut BTreeMap<usize, String>, number: usize, out: &mut crate::csv::Rows| -> Result<()> {
         if row.values().any(|v| !v.trim().is_empty()) {
             if out.len() >= MAX_ROWS {
                 return Err(Error::Format(format!("xlsx: more than {MAX_ROWS} rows")));
@@ -721,7 +724,8 @@ fn sheet_rows_styled(xml: &str, strings: &[String], styles: &Styles, max_text: u
             for (c, v) in std::mem::take(row) {
                 cells[c] = v;
             }
-            out.push(cells);
+            out.cells.push(cells);
+            out.numbers.push(number.max(1));
         }
         row.clear();
         Ok(())
@@ -730,7 +734,8 @@ fn sheet_rows_styled(xml: &str, strings: &[String], styles: &Styles, max_text: u
         match r.read_event().map_err(xml_error)? {
             Event::Start(e) => match e.local_name().as_ref() {
                 b"row" => {
-                    finish_row(&mut row, &mut out)?;
+                    finish_row(&mut row, number, &mut out)?;
+                    number = row_number(&e, number)?;
                     next_column = 0;
                 }
                 b"c" => {
@@ -744,8 +749,13 @@ fn sheet_rows_styled(xml: &str, strings: &[String], styles: &Styles, max_text: u
             Event::Empty(e) if e.local_name().as_ref() == b"c" => {
                 start_cell(&e, &mut next_column)?;
             }
+            // An empty row still takes its number.
+            Event::Empty(e) if e.local_name().as_ref() == b"row" => {
+                finish_row(&mut row, number, &mut out)?;
+                number = row_number(&e, number)?;
+            }
             Event::End(e) => match e.local_name().as_ref() {
-                b"row" => finish_row(&mut row, &mut out)?,
+                b"row" => finish_row(&mut row, number, &mut out)?,
                 b"c" => {
                     if let Some(c) = cell.take() {
                         let column = c.column;
@@ -790,8 +800,16 @@ fn sheet_rows_styled(xml: &str, strings: &[String], styles: &Styles, max_text: u
             _ => {}
         }
     }
-    finish_row(&mut row, &mut out)?;
+    finish_row(&mut row, number, &mut out)?;
     Ok(out)
+}
+
+/// The number of worksheet row `e`: its `r` when it has a usable one, else one after `before`.
+fn row_number(e: &BytesStart, before: usize) -> Result<usize> {
+    Ok(attr(e, b"r")?
+        .and_then(|r| r.trim().parse::<usize>().ok())
+        .filter(|r| *r > 0)
+        .unwrap_or(before.saturating_add(1)))
 }
 
 fn start_cell(e: &BytesStart, next_column: &mut usize) -> Result<Cell> {
@@ -827,6 +845,11 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    /// [`super::rows`]' cells, for comparing with a list.
+    fn rows(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
+        super::rows(bytes).map(|r| r.cells)
+    }
 
     /// A workbook built by hand the way spreadsheet programs write one: shared strings, a
     /// hidden first sheet, a rich text run and every cell type.
@@ -1127,6 +1150,33 @@ mod tests {
 
     const ONE_CELL: &str =
         r#"<worksheet><sheetData><row><c t="inlineStr"><is><t>x</t></is></c></row></sheetData></worksheet>"#;
+
+    #[test]
+    fn row_warnings_name_the_worksheet_row_past_blank_rows() -> Result<()> {
+        let cell = |r: &str, t: &str| format!(r#"<c r="{r}" t="inlineStr"><is><t>{t}</t></is></c>"#);
+        // Row 2 is left out of the sheet, row 3 is empty, row 4 has only a blank cell; row 6
+        // has no `r` and follows row 5; row 8 is a bad row after another gap.
+        let sheet = format!(
+            r#"<worksheet><sheetData><row r="1">{}{}</row><row r="3"/><row r="4">{}</row><row r="5">{}{}</row><row>{}</row><row r="8">{}{}</row></sheetData></worksheet>"#,
+            cell("A1", "Order number"),
+            cell("B1", "NO"),
+            cell("A4", " "),
+            cell("A5", "LC1D09"),
+            cell("B5", "1"),
+            cell("B6", "2"),
+            cell("A8", "X"),
+            cell("B8", "two"),
+        );
+        let bytes = one_sheet("worksheets/sheet1.xml", "xl/worksheets/sheet1.xml", &sheet);
+        let rows = crate::csv::file_rows(&bytes)?;
+        assert_eq!(rows.numbers, [1, 5, 6, 8]);
+        let (parts, warnings) = crate::csv::parts_from_rows(&rows)?;
+        assert_eq!(parts.len(), 2);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings[0], "row 6: no order number, skipped");
+        assert!(warnings[1].starts_with("row 8: contacts not read"), "{warnings:?}");
+        Ok(())
+    }
 
     #[test]
     fn relationship_targets_with_dot_segments_resolve() -> Result<()> {
