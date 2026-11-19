@@ -2901,7 +2901,8 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         _ => 1,
     };
     let more = args.iter().skip(words).any(|a| !a.starts_with('-'));
-    if more && project.holds(cwd) {
+    // When that cannot be told, the command is not run from there either.
+    if more && project.holds(cwd).unwrap_or(true) {
         return Some(format!(
             "`wiringcraft {}` is not run while {who} has a page open in the shared session: this program runs \
              from inside the project folder, so an output file could land on a page. Start it from another folder.",
@@ -2934,9 +2935,11 @@ fn split_flag(a: &str) -> (&str, &str) {
 struct Guarded {
     /// See [`project_roots`].
     roots: Vec<PathBuf>,
-    /// Device and file number of each project file, so a hard link to one is known too.
-    #[cfg(unix)]
+    /// The identity of each project file ([`file_id`]), so a hard link to one is known too.
     files: std::collections::HashSet<(u64, u64)>,
+    /// Why a project file's identity could not be read, if one could not: a hard link to that
+    /// file would go unseen, so no output file is taken as safe then.
+    unknown: Option<String>,
 }
 
 /// How many files in an output folder are looked at; a bigger folder is not used while a
@@ -2945,49 +2948,78 @@ const OUTPUT_FOLDER_FILES: usize = 10_000;
 
 impl Guarded {
     fn new(project: &Path) -> Self {
-        let roots = project_roots(project);
-        #[cfg(unix)]
+        let (roots, unknown) = project_roots(project);
         let files = {
-            use std::os::unix::fs::MetadataExt;
             let mut files = std::collections::HashSet::new();
+            let mut unknown = unknown;
             let mut todo = roots.clone();
+            // A folder that cannot be listed, or an entry that cannot be looked at, hides
+            // files too, so it is recorded like a file whose identity cannot be read.
+            let mut note = |at: &Path, e: std::io::Error| {
+                unknown.get_or_insert_with(|| format!("{}: {e}", at.display()));
+            };
             while let Some(at) = todo.pop() {
-                let Ok(m) = std::fs::symlink_metadata(&at) else {
-                    continue;
+                let m = match std::fs::symlink_metadata(&at) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        note(&at, e);
+                        continue;
+                    }
                 };
                 if m.is_dir() {
-                    let entries = std::fs::read_dir(&at).into_iter().flatten().flatten();
-                    todo.extend(entries.filter(|e| e.file_name() != ".git").map(|e| e.path()));
+                    let entries = match std::fs::read_dir(&at) {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            note(&at, e);
+                            continue;
+                        }
+                    };
+                    for entry in entries {
+                        match entry {
+                            Ok(e) if e.file_name() == ".git" => {}
+                            Ok(e) => todo.push(e.path()),
+                            Err(e) => note(&at, e),
+                        }
+                    }
                 } else if m.is_file() {
-                    files.insert((m.dev(), m.ino()));
+                    match file_id(&at) {
+                        Ok(Some(id)) => {
+                            files.insert(id);
+                        }
+                        Ok(None) => {}
+                        Err(e) => note(&at, e),
+                    }
                 }
             }
-            files
+            (files, unknown)
         };
-        Self {
-            roots,
-            #[cfg(unix)]
-            files,
-        }
+        let (files, unknown) = files;
+        Self { roots, files, unknown }
     }
 
     /// Whether `path`, as the file system resolves it, is in the project or is one of its
-    /// files under another name.
-    fn holds(&self, path: &Path) -> bool {
-        inside(&self.roots, path) || self.same_file(path)
+    /// files under another name. An error when that cannot be told.
+    fn holds(&self, path: &Path) -> std::io::Result<bool> {
+        Ok(inside(&self.roots, path) || self.same_file(path)?)
     }
 
-    /// Whether `path` is a project file under another name (a hard link to it).
-    #[cfg(unix)]
-    fn same_file(&self, path: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).is_ok_and(|m| m.is_file() && self.files.contains(&(m.dev(), m.ino())))
-    }
-
-    /// Hard links are not told apart here.
-    #[cfg(not(unix))]
-    fn same_file(&self, _path: &Path) -> bool {
-        false
+    /// Whether `path` is a project file under another name (a hard link to it). Nothing there,
+    /// or a folder, is not; a file whose identity, or a project file's, cannot be read is an
+    /// error, with the reason.
+    fn same_file(&self, path: &Path) -> std::io::Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        if let Some(why) = &self.unknown {
+            return Err(std::io::Error::other(format!(
+                "the identity of a project file could not be read ({why})"
+            )));
+        }
+        Ok(file_id(path)?.is_some_and(|id| self.files.contains(&id)))
     }
 
     /// Whether writing to `value` could land on a project file: it is a path into the project
@@ -3008,7 +3040,7 @@ impl Guarded {
         } else {
             return Ok(false);
         };
-        if self.holds(&path) {
+        if self.holds(&path)? {
             return Ok(true);
         }
         let mut todo = vec![real(&path)];
@@ -3025,7 +3057,7 @@ impl Guarded {
             for e in entries {
                 let e = e?;
                 seen += 1;
-                if seen > OUTPUT_FOLDER_FILES || self.holds(&e.path()) {
+                if seen > OUTPUT_FOLDER_FILES || self.holds(&e.path())? {
                     return Ok(true);
                 }
                 if e.file_type()?.is_dir() {
@@ -3037,6 +3069,47 @@ impl Guarded {
     }
 }
 
+/// What names one file on this machine whatever path reaches it, links followed: device and
+/// file number on unix.
+#[cfg(unix)]
+fn file_id(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map(|m| Some((m.dev(), m.ino())))
+}
+
+/// What names one file on this machine whatever path reaches it, links followed: the volume
+/// serial number and the file index on Windows (#459). The file is opened without read or
+/// write access, which only lets its attributes be read.
+#[cfg(windows)]
+fn file_id(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)?;
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value (plain integers).
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the whole call and `info` is a valid place to write to.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    )))
+}
+
+/// Elsewhere hard links are not told apart: no identity, which is not an error.
+#[cfg(not(any(unix, windows)))]
+fn file_id(_path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+    Ok(None)
+}
+
 /// Whether `path`, as the file system resolves it, is in one of `roots`.
 fn inside(roots: &[PathBuf], path: &Path) -> bool {
     let path = normalize(&real(path));
@@ -3045,18 +3118,52 @@ fn inside(roots: &[PathBuf], path: &Path) -> bool {
 
 /// Where the project's files really are: the project folder, and where each link in it
 /// points (a `pages` folder linked to elsewhere is the project's too), followed through
-/// further links. `.git` is left out.
-fn project_roots(project: &Path) -> Vec<PathBuf> {
+/// further links. `.git` is left out. With them, why a folder or link could not be looked at,
+/// if one could not: a root behind it would go unseen.
+fn project_roots(project: &Path) -> (Vec<PathBuf>, Option<String>) {
     let mut roots = vec![real(project)];
+    let mut unknown = None;
+    // A folder or link that cannot be looked at may hide a root, so why is kept (a link to
+    // nothing hides nothing).
+    let mut note = |at: &Path, e: std::io::Error| {
+        unknown.get_or_insert_with(|| format!("{}: {e}", at.display()));
+    };
     let mut todo = vec![project.to_path_buf()];
     while let Some(d) = todo.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let Ok(kind) = e.file_type() else { continue };
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) => {
+                note(&d, e);
+                continue;
+            }
+        };
+        for e in entries {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    note(&d, err);
+                    continue;
+                }
+            };
             if e.file_name() == ".git" {
                 continue;
             }
+            let kind = match e.file_type() {
+                Ok(kind) => kind,
+                Err(err) => {
+                    note(&e.path(), err);
+                    continue;
+                }
+            };
             if kind.is_symlink() {
-                let Ok(to) = e.path().canonicalize() else { continue };
+                let to = match e.path().canonicalize() {
+                    Ok(to) => to,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        note(&e.path(), err);
+                        continue;
+                    }
+                };
                 if roots.iter().any(|r| to.starts_with(r)) {
                     continue;
                 }
@@ -3069,7 +3176,7 @@ fn project_roots(project: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    roots
+    (roots, unknown)
 }
 
 /// `path` with links and `..` worked out as the file system does, as far as it exists (a link
@@ -6104,6 +6211,96 @@ mod tests {
     }
 
     #[test]
+    fn a_file_whose_identity_cannot_be_read_is_refused_with_the_reason() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("project.toml"), "x").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(out.path().join("a.svg"), "y").unwrap();
+        let out_path = out.path().display().to_string();
+        // A project file whose identity could not be read: a hard link to it would go unseen,
+        // so an output folder with a file in it is refused, with the reason.
+        let mut guarded = Guarded::new(project.path());
+        assert!(guarded.unknown.is_none());
+        assert!(!guarded.reached_by(out.path(), &out_path).unwrap());
+        guarded.unknown = Some("project.toml: access denied".into());
+        let e = guarded.reached_by(out.path(), &out_path).unwrap_err();
+        assert!(e.to_string().contains("project.toml: access denied"), "{e}");
+        // A folder with nothing in it, or a path not there yet, is still fine.
+        let empty = tempfile::tempdir().unwrap();
+        let empty_path = empty.path().display().to_string();
+        assert!(!guarded.reached_by(empty.path(), &empty_path).unwrap());
+        let new_file = empty.path().join("new.svg").display().to_string();
+        assert!(!guarded.reached_by(empty.path(), &new_file).unwrap());
+        // An output file that cannot be looked at (its folder can be listed but not entered)
+        // is an error with the system's reason, not "no match". Run as root it can be.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let guarded = Guarded::new(project.path());
+            let shut = out.path().join("shut");
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(shut.join("b.svg"), "z").unwrap();
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let looked = std::fs::metadata(shut.join("b.svg")).is_ok();
+            let r = guarded.reached_by(out.path(), &out_path);
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !looked {
+                let e = r.unwrap_err();
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            }
+            // A project folder that cannot be listed hides its files, so a hard link to one of
+            // them is refused with the reason rather than taken as no match.
+            let pages = project.path().join("pages");
+            std::fs::create_dir(&pages).unwrap();
+            std::fs::write(pages.join("p0001.page.json"), "{}").unwrap();
+            let linked = tempfile::tempdir().unwrap();
+            std::fs::hard_link(pages.join("p0001.page.json"), linked.path().join("a.json")).unwrap();
+            let linked_path = linked.path().display().to_string();
+            std::fs::set_permissions(&pages, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let listed = std::fs::read_dir(&pages).is_ok();
+            let blind = Guarded::new(project.path());
+            let r = blind.reached_by(linked.path(), &linked_path);
+            std::fs::set_permissions(&pages, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !listed {
+                let e = r.unwrap_err();
+                assert!(e.to_string().contains("pages"), "{e}");
+            }
+            // Listed, the link is found and an unrelated copy is still fine.
+            let seen = Guarded::new(project.path());
+            assert!(seen.unknown.is_none());
+            assert!(seen.reached_by(linked.path(), &linked_path).unwrap());
+            let copy = tempfile::tempdir().unwrap();
+            std::fs::write(copy.path().join("a.json"), "{}").unwrap();
+            let copy_path = copy.path().display().to_string();
+            assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
+            // The same through a link in the project to a folder elsewhere whose parent cannot
+            // be searched: where it points is not known, so a hard link to a page there is
+            // refused with the reason rather than taken as no match.
+            let ext = tempfile::tempdir().unwrap();
+            let inner = ext.path().join("inner");
+            std::fs::create_dir_all(inner.join("more")).unwrap();
+            std::fs::write(inner.join("more/p0002.page.json"), "{}").unwrap();
+            std::os::unix::fs::symlink(inner.join("more"), project.path().join("more")).unwrap();
+            let far = tempfile::tempdir().unwrap();
+            std::fs::hard_link(inner.join("more/p0002.page.json"), far.path().join("b.json")).unwrap();
+            let far_path = far.path().display().to_string();
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let searched = inner.join("more").canonicalize().is_ok();
+            let blind = Guarded::new(project.path());
+            let r = blind.reached_by(far.path(), &far_path);
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !searched {
+                let e = r.unwrap_err();
+                assert!(e.to_string().contains("more"), "{e}");
+            }
+            let seen = Guarded::new(project.path());
+            assert!(seen.unknown.is_none());
+            assert!(seen.reached_by(far.path(), &far_path).unwrap());
+            assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
+        }
+    }
+
+    #[test]
     fn commands_that_read_the_project_still_run_while_a_page_is_held() {
         let (_tmp, mut a) = app(vec![]);
         let dir = a.open.as_ref().unwrap().dir.clone();
@@ -6182,16 +6379,14 @@ mod tests {
         assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
         // An export writes its own file names into the folder it is given: a file there that
         // links to a held page, by name or as the same file, is a way onto the page.
-        #[cfg(unix)]
+        // A hard link is the same file under another name, on unix and on Windows alike (#459).
         {
             let page = dir.join("pages").join("p0002.page.json");
             let before = std::fs::read(&page).unwrap();
-            let linked = tempfile::tempdir().unwrap();
-            std::os::unix::fs::symlink(&page, linked.path().join("2.svg")).unwrap();
             let hard = tempfile::tempdir().unwrap();
             std::fs::create_dir(hard.path().join("deep")).unwrap();
             std::fs::hard_link(&page, hard.path().join("deep").join("2.svg")).unwrap();
-            for to in [linked.path(), hard.path(), &hard.path().join("deep").join("2.svg")] {
+            for to in [hard.path(), &hard.path().join("deep").join("2.svg")] {
                 let to = to.display().to_string();
                 let e = command_runs(&mut a, &["drawing", to.as_str()]).unwrap_err();
                 assert!(e.contains("links to a file in it"), "{to}: {e}");
@@ -6200,6 +6395,22 @@ mod tests {
             // Named bare, from the folder it is in.
             let args: Vec<String> = ["drawing", "deep"].map(String::from).to_vec();
             assert!(writes_while_held(&args, &dir, &held, hard.path()).is_some());
+            // A copy of the page is another file.
+            let copied = tempfile::tempdir().unwrap();
+            std::fs::copy(&page, copied.path().join("2.svg")).unwrap();
+            let args = vec!["drawing".to_owned(), copied.path().display().to_string()];
+            assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
+        }
+        #[cfg(unix)]
+        {
+            let page = dir.join("pages").join("p0002.page.json");
+            let before = std::fs::read(&page).unwrap();
+            let linked = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(&page, linked.path().join("2.svg")).unwrap();
+            let to = linked.path().display().to_string();
+            let e = command_runs(&mut a, &["drawing", to.as_str()]).unwrap_err();
+            assert!(e.contains("links to a file in it"), "{to}: {e}");
+            assert_eq!(std::fs::read(&page).unwrap(), before);
             // A folder that cannot be listed could hide such a link.
             let shut = tempfile::tempdir().unwrap();
             std::fs::set_permissions(shut.path(), std::os::unix::fs::PermissionsExt::from_mode(0o300)).unwrap();
