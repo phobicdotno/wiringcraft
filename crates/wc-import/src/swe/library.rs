@@ -186,16 +186,23 @@ impl Table {
         found.next().is_none().then_some(first.as_str())
     }
 
-    /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`, where the other
-    /// prefix is the other table's own, or the one its id column carries when that differs.
+    /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`. The other prefix
+    /// is the one the other table's id column carries, then the other table's own when that
+    /// differs. The table's own id column is never taken for a link: when both tables share a
+    /// prefix, the bare `<other prefix>_id` would be it.
     fn link(&self, other: &Table) -> Option<&str> {
-        let mut prefixes = vec![other.prefix.as_str()];
-        if let Some((p, _)) = other.field(&["id"]).and_then(|c| c.split_once('_'))
-            && !prefixes.iter().any(|q| q.eq_ignore_ascii_case(p))
-        {
+        let mut prefixes = Vec::new();
+        if let Some((p, _)) = other.field(&["id"]).and_then(|c| c.split_once('_')) {
             prefixes.push(p);
         }
-        prefixes.iter().find_map(|p| self.field(&[&format!("{p}_id")]))
+        if !prefixes.iter().any(|q| q.eq_ignore_ascii_case(&other.prefix)) {
+            prefixes.push(other.prefix.as_str());
+        }
+        let own_id = self.field(&["id"]);
+        prefixes
+            .iter()
+            .filter_map(|p| self.field(&[&format!("{p}_id")]))
+            .find(|c| Some(*c) != own_id)
     }
 
     /// The column for `fields`, or an error naming what is missing and the columns there are,

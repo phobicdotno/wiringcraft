@@ -196,6 +196,49 @@ fn a_layout_with_mixed_prefixes_gives_the_same_library() {
 }
 
 #[test]
+fn a_link_is_never_the_tables_own_id() {
+    // Both tables carry the prefix `cre`: the element table's bare-looking `cre_id` is its own
+    // id (10, 20), not the part's (1, 2); its link to the part is `cre_ref_id`.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT, cre_a TEXT, cre_b TEXT,
+  cre_c TEXT, cre_d TEXT);
+CREATE TABLE tew_catelement (cre_id INTEGER, cre_ref_id INTEGER, cre_orderno INTEGER, cre_name TEXT);
+CREATE TABLE tew_catterminal (ter_cre_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A', '', '', '', ''), (2, 'MCB', 'Maker B', '', '', '', '');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil'), (20, 2, 1, '');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2'), (20, 1, '1');
+");
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    let terminals: Vec<(&str, &str)> = parts
+        .iter()
+        .map(|p| (p.id.as_str(), p.properties[PROP_TERMINALS].as_str()))
+        .collect();
+    assert_eq!(terminals, [("maker-a.rly-24", "Coil: A1 A2"), ("maker-b.mcb", "1")]);
+
+    // Without a link column the element table's own id is not taken for one: a warning.
+    let c = db("
+CREATE TABLE tew_catreference (cre_id INTEGER, cre_reference TEXT, cre_manufacturer TEXT);
+CREATE TABLE tew_catelement (cre_id INTEGER, cre_orderno INTEGER, cre_name TEXT);
+CREATE TABLE tew_catterminal (ter_cre_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (1, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert!(
+        !parts[0].properties.contains_key(PROP_TERMINALS),
+        "{:?}",
+        parts[0].properties
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("tew_catelement has no")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn a_field_two_columns_could_be_is_not_guessed() {
     // Neither `a_reference` nor `b_reference` has the table's prefix `c`: no guess, and the
     // warning lists the columns so the layout can be mapped.
