@@ -102,6 +102,15 @@ pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     }
+    replace_whole(path, content.as_bytes())?;
+    Ok(true)
+}
+
+/// Replace the file at `path` with `bytes` as a whole: staged next to it in `<file>.tmp`, then
+/// renamed over it, so a failed write leaves the file as it was rather than cut short. The
+/// staging file is one this call creates itself (opened with `create_new`): a link left at that
+/// path is never written through. The folder must exist.
+pub fn replace_whole(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -112,7 +121,7 @@ pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
             let _ = fs::remove_file(&tmp);
         }
     };
-    if let Err(e) = write_staging(&tmp, content) {
+    if let Err(e) = write_staging(&tmp, bytes) {
         drop_tmp();
         return Err(Error::io(&tmp, e));
     }
@@ -120,7 +129,7 @@ pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
         drop_tmp();
         return Err(Error::io(path, e));
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Write `content` to a staging file at `tmp` that this call creates itself.
@@ -130,7 +139,7 @@ pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
 /// link that shows up again before the file is created makes the write fail instead of writing
 /// through it. A regular file left by an earlier failed write is replaced the same way. Anything
 /// else in the way, such as a folder, is not ours to remove and fails the write.
-fn write_staging(tmp: &Path, content: &str) -> std::io::Result<()> {
+fn write_staging(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Ok(meta) = fs::symlink_metadata(tmp)
         && (meta.is_symlink() || meta.is_file())
@@ -138,7 +147,7 @@ fn write_staging(tmp: &Path, content: &str) -> std::io::Result<()> {
         fs::remove_file(tmp)?;
     }
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
-    file.write_all(content.as_bytes())
+    file.write_all(content)
 }
 
 /// Load a whole project folder.
