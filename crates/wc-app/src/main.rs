@@ -352,6 +352,8 @@ impl chrome::Status for StatusView<'_> {
             Action::Redo => self.open.is_some_and(Open::can_redo),
             Action::Delete if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
             Action::Delete | Action::Copy | Action::Cut | Action::SaveMacro => has && !self.ed.selection.is_empty(),
+            Action::Rotate if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
+            Action::Mirror if self.ed.panel.is_some() => false,
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
             }
@@ -404,6 +406,16 @@ impl App {
             .as_ref()
             .and_then(|o| o.project.pages.get(self.ed.page))
             .map(|p| p.id.clone());
+        // The panel shown and its picked device, found again by id and tag after the sync: a
+        // merge replaces whole panels, so their places in the lists can change.
+        let panel_before = self.open.as_ref().and_then(|o| {
+            let p = o.project.panels.get(self.ed.panel?)?;
+            let tag = self.ed.panel_pick.and_then(|i| match p.items.get(i)? {
+                wc_core::panel::PanelItem::Device { tag, .. } => Some(tag.clone()),
+                _ => None,
+            });
+            Some((p.id.clone(), tag))
+        });
         // The shown page's graphics, so a selection follows its items when a merge moves them.
         let graphics_before = self
             .open
@@ -430,6 +442,8 @@ impl App {
             self.open = Some(joined);
             // The id belonged to the project left behind.
             shown = None;
+        } else if let (Some((id, tag)), Some(o)) = (&panel_before, &self.open) {
+            follow_panel_pick(&mut self.ed, &o.project, id, tag.as_ref());
         }
         // Others may have added or removed pages before this one: keep showing the same page.
         if let (Some(id), Some(o)) = (&shown, &self.open)
@@ -855,6 +869,13 @@ impl App {
             Action::Delete => {
                 let sel = std::mem::take(&mut self.ed.selection);
                 open.delete_many(page, &sel);
+            }
+            Action::Rotate if self.ed.panel.is_some() => {
+                if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick)
+                    && !open.rotate_panel_device(pi, item)
+                {
+                    self.ed.message = "Turned, the device would not fit on the plate.".into();
+                }
             }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),
             Action::Mirror => open.mirror_many(page, &self.ed.selection),
@@ -4330,15 +4351,31 @@ fn confirm_page_props(
     o.set_page_props(i, number, title, size, overview, Some(fields))
 }
 
+/// After a shared-session sync: show panel `id` and pick the device `tag` on it again, wherever
+/// they are now; a panel or device that is gone is no longer shown or picked.
+fn follow_panel_pick(ed: &mut Editor, project: &wc_core::Project, id: &str, tag: Option<&wc_core::DeviceTag>) {
+    let Some((pi, panel)) = project.panels.iter().enumerate().find(|(_, p)| p.id == id) else {
+        ed.panel = None;
+        ed.panel_pick = None;
+        return;
+    };
+    ed.panel = Some(pi);
+    ed.panel_pick = tag.and_then(|tag| {
+        panel
+            .items
+            .iter()
+            .position(|i| matches!(i, wc_core::panel::PanelItem::Device { tag: t, .. } if t == tag))
+    });
+}
+
 /// Who holds the page action `a` would change, in a shared session: then it is refused. Page
 /// actions (properties, delete, move up or down) are about the current page even while a panel
 /// is shown; canvas actions only when the page itself is shown, as in the panel view they work
 /// on the panel.
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
-    // With a panel shown these still work on the schematic page under it (Delete goes to the
-    // panel first), so they follow that page's hold.
-    let on_page_under_panel =
-        ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Rotate | Action::Mirror);
+    // With a panel shown these still work on the schematic page under it (Delete and Rotate go
+    // to the panel's picked device instead), so they follow that page's hold.
+    let on_page_under_panel = ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Mirror);
     let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
         // Moving a page up or down renumbers its neighbour too.
@@ -5083,5 +5120,54 @@ fn side_name(side: wc_core::BoxSide) -> &'static str {
         wc_core::BoxSide::Bottom => "bottom",
         wc_core::BoxSide::Left => "left",
         wc_core::BoxSide::Right => "right",
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+
+    #[test]
+    fn rotate_on_a_panel_is_not_held_by_the_page_under_it() {
+        let mut project = wc_core::Project::new("x");
+        project.pages.push(wc_core::Page::new("p1", "1", "Mains"));
+        let mut ed = Editor::default();
+        ed.page = project.pages.len() - 1;
+        ed.held_by.insert("p1".into(), "Kim".into());
+        // On the page itself, Rotate turns its symbols: held.
+        assert_eq!(held_for(Action::Rotate, &ed, &project).as_deref(), Some("Kim"));
+        // With a panel shown, Rotate turns the picked panel device: not held; Paste still is.
+        ed.panel = Some(0);
+        ed.panel_pick = Some(0);
+        assert_eq!(held_for(Action::Rotate, &ed, &project), None);
+        assert_eq!(held_for(Action::Paste, &ed, &project).as_deref(), Some("Kim"));
+    }
+
+    #[test]
+    fn the_panel_pick_follows_its_device_after_a_sync() {
+        use wc_core::panel::{Panel, PanelItem};
+        let device = |tag: &str, x: f64| PanelItem::Device {
+            tag: wc_core::DeviceTag::parse(tag).unwrap_or_default(),
+            at: wc_core::Point::new(x, 0.0),
+            width: 10.0,
+            height: 10.0,
+            rotation: wc_core::geom::Rotation::R0,
+        };
+        let mut project = wc_core::Project::new("x");
+        let mut a = Panel::new("a", "A", 100.0, 100.0);
+        a.items = vec![device("-K2", 30.0), device("-K1", 0.0)];
+        project.panels = vec![Panel::new("0", "first", 10.0, 10.0), a];
+        let mut ed = Editor::default();
+        let k1 = wc_core::DeviceTag::parse("-K1").ok();
+        // Another panel came first and the devices were reordered: still panel "a", still -K1.
+        follow_panel_pick(&mut ed, &project, "a", k1.as_ref());
+        assert_eq!((ed.panel, ed.panel_pick), (Some(1), Some(1)));
+        // The device was taken off the plate: nothing picked, so Rotate and Delete do nothing.
+        project.panels[1].items.remove(1);
+        follow_panel_pick(&mut ed, &project, "a", k1.as_ref());
+        assert_eq!((ed.panel, ed.panel_pick), (Some(1), None));
+        // The panel was removed.
+        follow_panel_pick(&mut ed, &project, "gone", k1.as_ref());
+        assert_eq!((ed.panel, ed.panel_pick), (None, None));
     }
 }

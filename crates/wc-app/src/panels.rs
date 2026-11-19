@@ -1803,7 +1803,16 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
     ui.label(RichText::new(&panel.name).strong());
     ui.label(RichText::new(format!("Mounting plate {} x {} mm", panel.width, panel.height)).color(t.faint));
     ui.add_space(6.0);
-    if let Some(PanelItem::Device { tag, at, width, height }) = ed.panel_pick.and_then(|i| panel.items.get(i)) {
+    // Set when the Rotate button is pressed, applied once the panel is no longer borrowed.
+    let mut turn: Option<usize> = None;
+    if let Some(PanelItem::Device {
+        tag,
+        at,
+        width,
+        height,
+        rotation,
+    }) = ed.panel_pick.and_then(|i| panel.items.get(i))
+    {
         let dev = open.project.devices.get(tag);
         egui::Grid::new("panel-dev")
             .num_columns(2)
@@ -1820,6 +1829,23 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
                 ui.end_row();
                 ui.label(RichText::new("Size").color(t.muted));
                 ui.label(format!("{width} x {height} mm"));
+                ui.end_row();
+                ui.label(RichText::new("Rotation").color(t.muted));
+                ui.horizontal(|ui| {
+                    ui.label(match rotation {
+                        wc_core::geom::Rotation::R0 => "0°",
+                        wc_core::geom::Rotation::R90 => "90°",
+                        wc_core::geom::Rotation::R180 => "180°",
+                        wc_core::geom::Rotation::R270 => "270°",
+                    });
+                    if ui
+                        .small_button("Rotate 90°")
+                        .on_hover_text("Turn the device a quarter clockwise on the plate (R)")
+                        .clicked()
+                    {
+                        turn = ed.panel_pick;
+                    }
+                });
                 ui.end_row();
                 ui.label(RichText::new("Position").color(t.muted));
                 ui.label(format!("x {:.0}, y {:.0} mm", at.x, at.y));
@@ -1879,6 +1905,11 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
     }
     if let Some((part, file)) = attach {
         ed.message = open.attach_footprint(&part, &file).unwrap_or_else(|e| e);
+    }
+    if let Some(item) = turn
+        && !open.rotate_panel_device(pi, item)
+    {
+        ed.message = "Turned, the device would not fit on the plate.".into();
     }
 }
 

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::geom::Point;
+use crate::geom::{Point, Rotation};
 use crate::tag::DeviceTag;
 use crate::{Part, Project};
 
@@ -41,13 +41,69 @@ pub enum PanelItem {
     Rail { at: Point, length: f64 },
     /// A wire duct over a rectangle.
     Duct { min: Point, max: Point },
-    /// A device's footprint; `at` is its top-left corner.
+    /// A device's footprint. `width` and `height` are the part's size as it stands upright;
+    /// `rotation` turns it clockwise on the plate in quarter steps, so at 90 or 270 degrees it
+    /// covers `height` x `width`. `at` is the top-left corner of the turned outline.
     Device {
         tag: DeviceTag,
         at: Point,
         width: f64,
         height: f64,
+        #[serde(default, skip_serializing_if = "Rotation::is_default")]
+        rotation: Rotation,
     },
+}
+
+/// The size a `width` x `height` footprint covers on the plate when turned by `rotation`.
+pub fn turned_size(width: f64, height: f64, rotation: Rotation) -> (f64, f64) {
+    match rotation {
+        Rotation::R0 | Rotation::R180 => (width, height),
+        Rotation::R90 | Rotation::R270 => (height, width),
+    }
+}
+
+/// Where a shape drawn in an upright `width` x `height` box with its top-left corner at (0, 0)
+/// lands when that box is turned by `rotation` and its turned outline put with its top-left
+/// corner at `at`.
+pub fn turn_into_place(shape: &crate::Shape, at: Point, width: f64, height: f64, rotation: Rotation) -> crate::Shape {
+    // Point::transform turns (0, 0)-(w, h) into a box with one corner at the origin; shift it so
+    // its top-left corner is at `at`.
+    let offset = match rotation {
+        Rotation::R0 => at,
+        Rotation::R90 => Point::new(at.x + height, at.y),
+        Rotation::R180 => Point::new(at.x + width, at.y + height),
+        Rotation::R270 => Point::new(at.x, at.y + width),
+    };
+    shape.placed(offset, rotation, false)
+}
+
+/// The next quarter turn clockwise.
+pub fn next_quarter(rotation: Rotation) -> Rotation {
+    match rotation {
+        Rotation::R0 => Rotation::R90,
+        Rotation::R90 => Rotation::R180,
+        Rotation::R180 => Rotation::R270,
+        Rotation::R270 => Rotation::R0,
+    }
+}
+
+impl PanelItem {
+    /// A device's outline on the plate, as (top-left, bottom-right), turned by its rotation.
+    pub fn device_bounds(&self) -> Option<(Point, Point)> {
+        match self {
+            PanelItem::Device {
+                at,
+                width,
+                height,
+                rotation,
+                ..
+            } => {
+                let (w, h) = turned_size(*width, *height, *rotation);
+                Some((*at, Point::new(at.x + w, at.y + h)))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Panel {
@@ -95,6 +151,37 @@ impl Panel {
             }
         }
         p
+    }
+
+    /// Turn the device at `index` a quarter clockwise about its middle, keeping it on the plate.
+    /// Returns false, changing nothing, when `index` is not a device or the turned device would
+    /// not fit on the plate.
+    pub fn rotate_device(&mut self, index: usize) -> bool {
+        let (pw, ph) = (self.width, self.height);
+        let Some(PanelItem::Device {
+            at,
+            width,
+            height,
+            rotation,
+            ..
+        }) = self.items.get_mut(index)
+        else {
+            return false;
+        };
+        let (w, h) = turned_size(*width, *height, *rotation);
+        let middle = Point::new(at.x + w / 2.0, at.y + h / 2.0);
+        let next = next_quarter(*rotation);
+        let (w, h) = turned_size(*width, *height, next);
+        // A turn whose outline is wider or taller than the plate would stick out of it.
+        if w > pw || h > ph {
+            return false;
+        }
+        *rotation = next;
+        *at = Point::new(
+            (middle.x - w / 2.0).clamp(0.0, (pw - w).max(0.0)),
+            (middle.y - h / 2.0).clamp(0.0, (ph - h).max(0.0)),
+        );
+        true
     }
 
     /// Tags of the devices on the plate.
@@ -244,12 +331,9 @@ pub fn arrange(
                 let used_to = panel
                     .items
                     .iter()
-                    .filter_map(|d| match d {
-                        PanelItem::Device {
-                            at: da, width, height, ..
-                        } if da.y <= at.y && da.y + height >= at.y && da.x + width > at.x => Some(da.x + width + GAP),
-                        _ => None,
-                    })
+                    .filter_map(|d| d.device_bounds())
+                    .filter(|(min, max)| min.y <= at.y && max.y >= at.y && max.x > at.x)
+                    .map(|(_, max)| max.x + GAP)
                     .fold(at.x, f64::max);
                 Some((*at, *length, used_to))
             }
@@ -269,6 +353,7 @@ pub fn arrange(
                     at: Point::new(*cursor, at.y - h / 2.0),
                     width: w,
                     height: h,
+                    rotation: Rotation::R0,
                 });
                 *cursor += w + GAP;
                 placed = true;
@@ -515,6 +600,138 @@ mod tests {
             Footprint::from_shapes(vec![outline(0.0, 10.0)]).is_none(),
             "a flat drawing has no size"
         );
+    }
+
+    #[test]
+    fn a_turned_device_is_stored_with_its_rotation_and_an_upright_one_without() {
+        let Some(t) = tag("+CAB1-G1") else { unreachable!() };
+        let device = |rotation| PanelItem::Device {
+            tag: t.clone(),
+            at: Point::new(10.0, 20.0),
+            width: 22.5,
+            height: 100.0,
+            rotation,
+        };
+        let Ok(upright) = serde_json::to_string(&device(Rotation::R0)) else {
+            unreachable!()
+        };
+        assert!(!upright.contains("rotation"), "existing files do not change: {upright}");
+        let Ok(turned) = serde_json::to_string(&device(Rotation::R90)) else {
+            unreachable!()
+        };
+        assert!(turned.contains(r#""rotation":"90""#), "{turned}");
+        let Ok(back) = serde_json::from_str::<PanelItem>(&turned) else {
+            unreachable!()
+        };
+        assert_eq!(back, device(Rotation::R90));
+        let Ok(old) = serde_json::from_str::<PanelItem>(&upright) else {
+            unreachable!()
+        };
+        assert_eq!(old, device(Rotation::R0));
+        // Turned a quarter, it covers 100 x 22.5 mm on the plate.
+        assert_eq!(
+            device(Rotation::R90).device_bounds(),
+            Some((Point::new(10.0, 20.0), Point::new(110.0, 42.5)))
+        );
+        assert_eq!(
+            device(Rotation::R180).device_bounds(),
+            Some((Point::new(10.0, 20.0), Point::new(32.5, 120.0)))
+        );
+    }
+
+    #[test]
+    fn rotating_a_device_turns_it_about_its_middle_and_keeps_it_on_the_plate() {
+        let Some(t) = tag("-G1") else { unreachable!() };
+        let mut p = Panel::new("p", "P", 300.0, 200.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(0.0, 100.0),
+            length: 300.0,
+        });
+        p.items.push(PanelItem::Device {
+            tag: t,
+            at: Point::new(100.0, 50.0),
+            width: 20.0,
+            height: 100.0,
+            rotation: Rotation::R0,
+        });
+        assert!(!p.rotate_device(0), "a rail does not turn");
+        assert!(p.rotate_device(1));
+        // Middle (110, 100) stays; the outline is now 100 x 20.
+        assert_eq!(
+            p.items[1].device_bounds(),
+            Some((Point::new(60.0, 90.0), Point::new(160.0, 110.0)))
+        );
+        assert!(p.rotate_device(1) && p.rotate_device(1) && p.rotate_device(1));
+        assert_eq!(
+            p.items[1].device_bounds(),
+            Some((Point::new(100.0, 50.0), Point::new(120.0, 150.0)))
+        );
+        // Near the edge, turning keeps the outline on the plate.
+        if let PanelItem::Device { at, .. } = &mut p.items[1] {
+            *at = Point::new(0.0, 50.0);
+        }
+        assert!(p.rotate_device(1));
+        assert_eq!(
+            p.items[1].device_bounds(),
+            Some((Point::new(0.0, 90.0), Point::new(100.0, 110.0)))
+        );
+        assert!(!p.rotate_device(9));
+        // Turned, a device longer than the plate is wide would stick out: refused.
+        let mut narrow = Panel::new("n", "N", 60.0, 120.0);
+        let Some(t) = tag("-G2") else { unreachable!() };
+        narrow.items.push(PanelItem::Device {
+            tag: t,
+            at: Point::new(20.0, 10.0),
+            width: 20.0,
+            height: 100.0,
+            rotation: Rotation::R0,
+        });
+        let before = narrow.clone();
+        assert!(!narrow.rotate_device(0));
+        assert_eq!(narrow, before);
+    }
+
+    #[test]
+    fn a_footprint_turns_with_its_device() {
+        // A line along the part's top edge, and its frame.
+        let Some(f) = crate::part::Footprint::from_shapes(vec![
+            crate::Shape::Rect {
+                min: Point::new(0.0, 0.0),
+                max: Point::new(20.0, 100.0),
+            },
+            crate::Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(20.0, 0.0),
+            },
+        ]) else {
+            unreachable!()
+        };
+        let at = Point::new(10.0, 30.0);
+        assert_eq!(
+            f.placed_turned(at, 20.0, 100.0, Rotation::R0),
+            f.placed(at, 20.0, 100.0)
+        );
+        let frame_and_edge = |r| {
+            let shapes = f.placed_turned(at, 20.0, 100.0, r);
+            let (crate::Shape::Rect { min, max }, crate::Shape::Line { a, b }) = (shapes[0].clone(), shapes[1].clone())
+            else {
+                unreachable!()
+            };
+            (min, max, a, b)
+        };
+        let close = |p: Point, x: f64, y: f64| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9;
+        // A quarter clockwise: the frame lies on its side and the top edge becomes the right edge.
+        let (min, max, a, b) = frame_and_edge(Rotation::R90);
+        assert!(close(min, 10.0, 30.0) && close(max, 110.0, 50.0), "{min:?} {max:?}");
+        assert!(close(a, 110.0, 30.0) && close(b, 110.0, 50.0), "{a:?} {b:?}");
+        // Half a turn: the top edge is at the bottom.
+        let (min, max, a, b) = frame_and_edge(Rotation::R180);
+        assert!(close(min, 10.0, 30.0) && close(max, 30.0, 130.0));
+        assert!(close(a, 30.0, 130.0) && close(b, 10.0, 130.0), "{a:?} {b:?}");
+        // Three quarters: the top edge is the left edge.
+        let (min, max, a, b) = frame_and_edge(Rotation::R270);
+        assert!(close(min, 10.0, 30.0) && close(max, 110.0, 50.0));
+        assert!(close(a, 10.0, 50.0) && close(b, 10.0, 30.0), "{a:?} {b:?}");
     }
 
     #[test]
