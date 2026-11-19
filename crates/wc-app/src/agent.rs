@@ -4612,10 +4612,31 @@ mod tests {
         assert_eq!(rules(&a), [odd.clone(), two.clone()].concat());
         assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
 
+        // A row edited while another rule changed in the project: nothing is written, and
+        // the dialog stays open with the edit, now against the project's rules.
+        let mut rows = rows_of(&two);
+        rows[0].devices = "-M*".into();
+        let now = rules(&a);
+        let err = a.apply_rules(&rows, &two, &dir).err().unwrap();
+        assert!(err.contains("changed while you edited"), "{err}");
+        assert_eq!(rules(&a), now);
+        let Some(Dialog::Rules {
+            rows: kept,
+            loaded: against,
+            ..
+        }) = a.dialog.take()
+        else {
+            unreachable!("the draft stays open");
+        };
+        assert_eq!((kept.clone(), against.clone()), (rows, now));
+        // OK again keeps the draft.
+        a.apply_rules(&kept, &against, &dir).unwrap();
+        assert_eq!(rules(&a)[0].devices.as_deref(), Some("-M*"));
+
         // Another project open now does not get the rules.
         let err = a.apply_rules(&[], &odd, Path::new("elsewhere")).err().unwrap();
         assert!(err.contains("another project"), "{err}");
-        assert_eq!(rules(&a).len(), 3);
+        assert_eq!(rules(&a).len(), 2);
     }
 
     #[test]

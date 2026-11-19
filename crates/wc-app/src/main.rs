@@ -2266,6 +2266,20 @@ impl App {
         };
         // Compared as rows: a value the dialog does not write (a cable rule's max) is no edit.
         if rows != rules_form::rows_of(loaded) {
+            // The rules changed since the dialog opened (the assistant, someone in a shared
+            // session): the draft would put back what they changed. It stays open on the
+            // rules as they are now, so OK again keeps the draft and Cancel theirs.
+            if o.project.meta.rules != loaded {
+                self.dialog = Some(Dialog::Rules {
+                    rows: rows.to_vec(),
+                    loaded: o.project.meta.rules.clone(),
+                    dir: dir.to_path_buf(),
+                });
+                return Err(
+                    "The check rules changed while you edited them. Your edits are still open: OK keeps them in place of the new rules, Cancel keeps the new rules."
+                        .into(),
+                );
+            }
             o.set_check_rules(rules);
         }
         self.show_check();

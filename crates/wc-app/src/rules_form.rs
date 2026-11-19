@@ -55,7 +55,9 @@ impl RuleRow {
     /// The rule this row stands for; `n` is its number in the list (from 1), for the error.
     pub fn rule(&self, n: usize) -> Result<CheckRule, String> {
         let set = |v: &str| Some(v.trim().to_owned()).filter(|v| !v.is_empty());
-        let kind = self.kind.trim();
+        // Any case, as the check reads it.
+        let kind = self.kind.trim().to_ascii_lowercase();
+        let kind = kind.as_str();
         if !KINDS.contains(&kind) {
             return Err(format!("Rule {n}: pick a kind ({}).", KINDS.join(", ")));
         }
@@ -339,6 +341,16 @@ mod tests {
         row.devices = "-X1*".into();
         assert_eq!(unset_role(&row), "any");
         assert_eq!(unset_role(&RuleRow::new("cable")), "any");
+    }
+
+    #[test]
+    fn a_kind_in_another_case_is_kept_as_the_check_reads_it() {
+        let rule = CheckRule {
+            kind: "TAG".into(),
+            pattern: Some("-X*".into()),
+            ..CheckRule::default()
+        };
+        assert_eq!(RuleRow::of(&rule).rule(1).map(|r| r.kind), Ok("tag".into()));
     }
 
     #[test]
