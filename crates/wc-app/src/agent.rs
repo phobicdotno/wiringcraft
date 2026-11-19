@@ -2852,6 +2852,38 @@ mod tests {
     }
 
     #[test]
+    fn a_fetched_project_waits_for_a_running_command_and_an_open_dialog() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        // The fetch is in and the project made.
+        let dir = tmp.path().join("pump");
+        wc_core::store::create(&dir, "Pump station").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        a.fetch = Some(crate::BaseFetch {
+            dir: dir.clone(),
+            source: "file:///base".into(),
+            was_open: Some(before.clone()),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        // A command works on the open project's files: it is not saved or replaced under it.
+        let open = a.open.as_ref().unwrap();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        a.assistant.command_base = None;
+        // A dialog open on the project: the same, until it is closed.
+        a.dialog = Some(Dialog::Message("about the open project".into()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+        a.dialog = None;
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+    }
+
+    #[test]
     fn a_project_opened_while_fetching_stays_open() {
         let (tmp, mut a) = app(vec![]);
         let base = tmp.path().join("base");

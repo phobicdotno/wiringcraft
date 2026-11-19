@@ -191,6 +191,13 @@ struct App {
     fetch: Option<BaseFetch>,
 }
 
+/// Make a new project's folder a repository with its first version.
+fn record_new_project(dir: &std::path::Path) -> Result<(), wc_vcs::Error> {
+    let git = wc_vcs::Git::new(dir);
+    git.init()?;
+    git.commit("New project").map(|_| ())
+}
+
 /// A new project's base project being fetched from a git repository on a thread of its own
 /// ([`App::start_new_project`]), so a slow server does not hold the window up.
 struct BaseFetch {
@@ -2238,6 +2245,12 @@ impl App {
     /// or the reason it could not be made shows. Until then the window keeps drawing.
     fn poll_fetch(&mut self, ctx: &egui::Context) {
         let Some(f) = &self.fetch else { return };
+        // The open project is not saved or replaced while an assistant command works on its
+        // files or a dialog is open on it: the outcome waits until they are done.
+        if self.assistant.command_running() || self.dialog.as_ref().is_some_and(|d| !matches!(d, Dialog::Fetching(_))) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
         let outcome = match f.done.try_recv() {
             Ok(r) => r,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -2253,14 +2266,19 @@ impl App {
         match outcome {
             Ok(()) if self.open.as_ref().map(|o| &o.dir) != f.was_open.as_ref() => {
                 // Another project was opened meanwhile: it stays, and the new one waits.
-                let git = wc_vcs::Git::new(&f.dir);
-                let _ = git.init().and_then(|()| git.commit("New project").map(|_| ()));
+                let recorded = record_new_project(&f.dir);
                 self.prefs.remember(f.dir.clone());
                 self.prefs.save();
-                self.dialog = Some(Dialog::Message(format!(
-                    "The new project is ready in\n{}\nOpen it from File, Open when you want it.",
-                    f.dir.display()
-                )));
+                self.dialog = Some(Dialog::Message(match recorded {
+                    Ok(()) => format!(
+                        "The new project is ready in\n{}\nOpen it from File, Open when you want it.",
+                        f.dir.display()
+                    ),
+                    Err(e) => format!(
+                        "The new project is in\n{}\nbut its first version could not be recorded:\n{e}",
+                        f.dir.display()
+                    ),
+                }));
             }
             Ok(()) => self.finish_new_project(&f.dir, false),
             Err(None) => self.ed.message = "Cancelled: the new project was not made.".into(),
@@ -2309,8 +2327,7 @@ impl App {
             });
             let _ = wc_core::store::save(dir, &p);
         }
-        let git = wc_vcs::Git::new(dir);
-        let _ = git.init().and_then(|()| git.commit("New project").map(|_| ()));
+        let recorded = record_new_project(dir);
         // The new project replaces the open one: keep its unsaved work first.
         if let Some(o) = self.open.as_mut()
             && o.dirty
@@ -2325,6 +2342,13 @@ impl App {
         let mut prefs = std::mem::take(&mut self.prefs);
         self.open_dir(dir, &mut prefs);
         self.prefs = prefs;
+        if let Err(e) = recorded
+            && self.dialog.is_none()
+        {
+            self.dialog = Some(Dialog::Message(format!(
+                "The new project is open, but its first version could not be recorded:\n{e}"
+            )));
+        }
     }
 
     /// Insert a macro on the current page, selected so it can be dragged into place.
