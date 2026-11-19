@@ -317,6 +317,33 @@ fn shapes(
         Point::new(x * scale, -y * scale)
     };
     let r_scale = xf.len_scale() * scale;
+    // A circle or arc under a placement that stretches it: `unit` holds its points on the unit
+    // circle, which are placed as the centre plus the placed radius vectors, so a huge centre and
+    // radius that place within range never overflow on the way. Left out and counted when the
+    // placed points are not numbers.
+    let stretched = |e: &Entity, unit: &[(f64, f64)], closed: bool, skipped: &mut BTreeMap<String, usize>| {
+        let flip = e.f_or(230, 1.0) < 0.0;
+        let r = e.f(40);
+        let (cx, cy) = (e.f(10), e.f(20));
+        let center = if flip { p(-cx, cy) } else { p(cx, cy) };
+        // The linear part of the placement on the page (y flipped), on a vector in the entity's
+        // own coordinates.
+        let lin = |dx: f64, dy: f64| {
+            let dx = if flip { -dx } else { dx };
+            let m = &xf.m;
+            ((m[0] * dx + m[1] * dy) * scale, -(m[2] * dx + m[3] * dy) * scale)
+        };
+        let (u, v) = (lin(r, 0.0), lin(0.0, r));
+        let pts: Vec<Point> = unit
+            .iter()
+            .map(|(c, s)| Point::new(center.x + c * u.0 + s * v.0, center.y + c * u.1 + s * v.1))
+            .collect();
+        if !pts.iter().all(|q| q.x.is_finite() && q.y.is_finite()) {
+            *skipped.entry(STRETCHED_NOT_NUMBERS.to_owned()).or_default() += 1;
+            return None;
+        }
+        polyline(pts, closed, false)
+    };
     for (i, e) in ents.iter().enumerate() {
         if *budget == 0 {
             // This entity and every one after it at this level are left out.
@@ -337,10 +364,11 @@ fn shapes(
                 a: p(e.f(10), e.f(20)),
                 b: p(e.f(11), e.f(21)),
             }),
-            // Scaled differently along x and y, a circle is an ellipse: drawn by its points.
-            "CIRCLE" if !xf.keeps_circles() => {
-                let (pts, closed) = ellipse_points((e.f(10), e.f(20)), (e.f(40), 0.0), 1.0, 0.0, std::f64::consts::TAU);
-                polyline(pts.into_iter().map(|(x, y)| q(x, y)).collect(), closed, false)
+            // Scaled differently along x and y, a circle is an ellipse: drawn by its points. A
+            // circle on a pin layer only marks a pin (its centre), so it stays a circle.
+            "CIRCLE" if !xf.keeps_circles() && !is_pin_layer(&layer) => {
+                let (unit, closed) = ellipse_points((0.0, 0.0), (1.0, 0.0), 1.0, 0.0, std::f64::consts::TAU);
+                stretched(e, &unit, closed, skipped)
             }
             "CIRCLE" => Some(Shape::Circle {
                 center: q(e.f(10), e.f(20)),
@@ -348,8 +376,8 @@ fn shapes(
                 filled: false,
             }),
             "ARC" if !xf.keeps_circles() => {
-                let pts = arc_points((e.f(10), e.f(20)), e.f(40), e.f(50), e.f(51), true);
-                polyline(pts.into_iter().map(|(x, y)| q(x, y)).collect(), false, false)
+                let unit = arc_points((0.0, 0.0), 1.0, e.f(50), e.f(51), true);
+                stretched(e, &unit, false, skipped)
             }
             "ARC" => {
                 // Mirrored in x, the arc from s to e runs from 180 - e to 180 - s.
@@ -685,6 +713,10 @@ const SPLINE_NOT_NUMBERS: &str = "SPLINE whose points are not numbers once place
 
 /// The key under which splines with too few points to draw are counted.
 const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
+
+/// The key under which circles and arcs of a stretched block whose points are not numbers once
+/// placed are counted.
+const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC whose points are not numbers once placed";
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
@@ -1994,6 +2026,44 @@ mod tests {
                 .any(|(_, s)| matches!(s, Shape::Arc { radius, .. } if near(*radius, 20.0))),
             "{shapes:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pin_circle_in_a_stretched_block_is_still_a_pin() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nP\n0\nCIRCLE\n8\nPIN\n10\n0\n20\n5\n40\n1\n\
+                      0\nLINE\n8\n0\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nP\n10\n0\n20\n0\n41\n4\n42\n1\n0\nPOINT\n8\nPIN\n10\n0\n20\n0\n";
+        let s = symbol(&dxf(ents, blocks), "my.stretched", "Stretched")?;
+        assert_eq!(s.pins.len(), 2, "{:?}", s.pins);
+        assert_eq!(s.pins[0].at.distance(s.pins[1].at), 5.0, "{:?}", s.pins);
+        Ok(())
+    }
+
+    #[test]
+    fn a_huge_stretched_circle_that_places_in_range_is_drawn() -> Result<()> {
+        // Centre and radius 1e308 at scale (0.5, 0.25): adding them in the block overflows, but
+        // the placed ellipse is in range.
+        let blocks = "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n1e308\n20\n0\n40\n1e308\n\
+                      0\nARC\n10\n1e308\n20\n0\n40\n1e308\n50\n0\n51\n90\n0\nENDBLK\n";
+        let d = parse(&dxf("0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n0.5\n42\n0.25\n", blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        assert_eq!(shapes.len(), 2, "{shapes:?} {skipped:?}");
+        for (_, s) in &shapes {
+            assert!(
+                matches!(s, Shape::Polyline { points, .. } if points.iter().all(|p| p.x.is_finite() && p.y.is_finite())),
+                "{s:?}"
+            );
+        }
+        // One whose placed points are out of range is left out and counted.
+        let d = parse(&dxf("0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n", blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        assert!(shapes.is_empty(), "{shapes:?}");
+        assert_eq!(skipped.get(STRETCHED_NOT_NUMBERS), Some(&2), "{skipped:?}");
         Ok(())
     }
 
