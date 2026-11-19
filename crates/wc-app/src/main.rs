@@ -26,6 +26,7 @@ mod strip_editor;
 mod symbol_editor;
 mod template_form;
 mod theme;
+mod translations_form;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,6 +101,15 @@ enum Dialog {
         error: Option<String>,
     },
     DeletePage(usize),
+    /// The project's texts with their translations, saved to `translations.toml`.
+    Translations(translations_form::Form),
+    /// The language to export the PDF in: an index into `langs` (the dictionary's languages,
+    /// the source first), and a second one shown with it (`second - 1`; 0 for none).
+    PdfLanguage {
+        langs: Vec<String>,
+        first: usize,
+        second: usize,
+    },
     /// Project check findings.
     Check(Vec<wc_report::Finding>),
     /// The project's check rules, edited as rows; `loaded` is how the project had them when
@@ -900,7 +910,25 @@ impl App {
                     seen: open.history_count(),
                 });
             }
-            Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
+            Action::ExportPdf => {
+                // A project with translations is asked which language to print; one without is
+                // exported at once, in the language it is drawn in.
+                self.dialog = Some(match wc_core::translate::Dictionary::load(&open.dir) {
+                    Ok(d) if d.languages().len() > 1 => Dialog::PdfLanguage {
+                        langs: d.languages(),
+                        first: 0,
+                        second: 0,
+                    },
+                    Ok(_) => Dialog::Message(export_pdf(open)),
+                    Err(e) => Dialog::Message(format!("Export failed: {e}")),
+                });
+            }
+            Action::Translations => {
+                self.dialog = Some(match translations_form::Form::open(&open.dir, &open.project) {
+                    Ok(f) => Dialog::Translations(f),
+                    Err(e) => Dialog::Message(format!("The translations could not be read:\n{e}")),
+                });
+            }
             Action::SaveMacro => {
                 let clip = open.copy(page, &self.ed.selection);
                 if !clip.is_empty() {
@@ -1122,6 +1150,8 @@ impl App {
             Dialog::PageHistory(..) => "Page history",
             Dialog::Reports(_) => "Reports",
             Dialog::Check(_) => "Project check",
+            Dialog::Translations(_) => "Translations",
+            Dialog::PdfLanguage { .. } => "Export PDF",
             Dialog::Rules { .. } => "Check rules",
             Dialog::Commit(_) => "Record a version",
             Dialog::NewBranch(_) => "New branch",
@@ -1135,7 +1165,7 @@ impl App {
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
-        let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_));
+        let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_) | Dialog::Translations(_));
         let screen = ctx.screen_rect();
         egui::Window::new(title)
             .collapsible(false)
@@ -1445,6 +1475,72 @@ impl App {
                             let n = name.trim().to_owned();
                             let b = Some(base.trim().to_owned()).filter(|b| !b.is_empty());
                             then = Some(Box::new(move |app: &mut App| app.start_new_project(&d, &n, b.as_deref())));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::Translations(form) => {
+                    translations_form::show(ui, form);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            match form.save() {
+                                Ok(m) => {
+                                    then = Some(Box::new(move |app: &mut App| app.ed.message = m));
+                                    keep = false;
+                                }
+                                Err(e) => form.error = Some(format!("Saving failed: {e}")),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::PdfLanguage { langs, first, second } => {
+                    egui::Grid::new("pdflang").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        ui.label("Language");
+                        egui::ComboBox::from_id_salt("pdflang1")
+                            .selected_text(langs.get(*first).cloned().unwrap_or_default())
+                            .show_ui(ui, |ui| {
+                                for (k, l) in langs.iter().enumerate() {
+                                    ui.selectable_value(first, k, l);
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Shown with");
+                        let none = "(none)".to_owned();
+                        egui::ComboBox::from_id_salt("pdflang2")
+                            .selected_text(if *second == 0 { none.clone() } else { langs.get(*second - 1).cloned().unwrap_or(none.clone()) })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(second, 0, none);
+                                for (k, l) in langs.iter().enumerate() {
+                                    ui.selectable_value(second, k + 1, l);
+                                }
+                            });
+                        ui.end_row();
+                    });
+                    ui.label(
+                        RichText::new("Texts without a translation are printed as drawn and listed as warnings.")
+                            .color(theme::Theme::of(ui.ctx()).faint),
+                    );
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Export").clicked() {
+                            let mut chosen: Vec<String> = langs.get(*first).cloned().into_iter().collect();
+                            if let Some(l) = second.checked_sub(1).and_then(|k| langs.get(k))
+                                && !chosen.contains(l)
+                            {
+                                chosen.push(l.clone());
+                            }
+                            then = Some(Box::new(move |app: &mut App| {
+                                if let Some(open) = app.open.as_ref() {
+                                    app.dialog = Some(Dialog::Message(export_pdf_in(open, &chosen)));
+                                }
+                            }));
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() {
@@ -2913,8 +3009,25 @@ fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(Strin
 }
 
 fn export_pdf(open: &Open) -> String {
-    let name: String = open
-        .project
+    export_pdf_in(open, &[])
+}
+
+/// [`export_pdf`] with the project's texts in `langs` (one language, or two shown together)
+/// from its `translations.toml`; empty prints them as drawn. Texts without a translation are
+/// listed as warnings.
+fn export_pdf_in(open: &Open, langs: &[String]) -> String {
+    let (translated, missing) = if langs.is_empty() {
+        (std::borrow::Cow::Borrowed(&open.project), Vec::new())
+    } else {
+        let dict = match wc_core::translate::Dictionary::load(&open.dir) {
+            Ok(d) => d,
+            Err(e) => return format!("Export failed: {e}"),
+        };
+        let (p, m) = wc_core::translate::translate(&open.project, &dict, langs);
+        (std::borrow::Cow::Owned(p), m)
+    };
+    let project: &wc_core::Project = &translated;
+    let name: String = project
         .meta
         .name
         .chars()
@@ -2925,11 +3038,11 @@ fn export_pdf(open: &Open) -> String {
     // The table of contents goes before the schematic pages and the other reports after them,
     // as in a finished drawing set.
     let inputs = wc_report::Inputs {
-        project: &open.project,
+        project,
         symbols: &open.symbols,
         parts: &open.parts,
     };
-    let pictures = wc_pdf::read_pictures(&open.dir, &open.project);
+    let pictures = wc_pdf::read_pictures(&open.dir, project);
     let options = wc_pdf::Options {
         reports: wc_report::Kind::ALL
             .into_iter()
@@ -2938,16 +3051,25 @@ fn export_pdf(open: &Open) -> String {
             .collect(),
         underlays: pictures.files,
         unreadable: pictures.unreadable,
-        panels: open.project.panels.clone(),
+        panels: project.panels.clone(),
         ..Default::default()
     };
-    let (bytes, report) = wc_pdf::export(&open.project, &open.symbols, &options);
+    let (bytes, report) = wc_pdf::export(project, &open.symbols, &options);
+    let mut warnings = report.warnings;
+    // The text itself stays out: this message goes to the diagnostic log, which never holds
+    // drawing content. File, Translations, "Only missing" lists the texts.
+    warnings.extend(missing.iter().map(|m| {
+        format!(
+            "no translation for a text ({}); see File, Translations, Only missing",
+            m.used.join(", ")
+        )
+    }));
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes)) {
         Ok(()) => {
             let mut m = format!("Exported {} pages to\n{}", report.pages, path.display());
-            if !report.warnings.is_empty() {
+            if !warnings.is_empty() {
                 m.push_str("\n\nWarnings:\n");
-                m.push_str(&report.warnings.join("\n"));
+                m.push_str(&warnings.join("\n"));
             }
             m
         }
