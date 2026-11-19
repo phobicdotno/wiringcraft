@@ -2468,13 +2468,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     Err(why) => {
                         let restored = match &before {
                             _ if !tried => Ok(()),
-                            Ok(Some(bytes)) if std::fs::read(&vendored).ok().as_ref() != Some(bytes) => {
-                                std::fs::write(&vendored, bytes).map_err(|err| err.to_string())
-                            }
-                            Ok(None) if vendored.exists() => {
-                                std::fs::remove_file(&vendored).map_err(|err| err.to_string())
-                            }
-                            _ => Ok(()),
+                            Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
+                            Err(_) => Ok(()),
                         };
                         eprintln!(
                             "warning: the project's copy of {part} was not updated: {}",
