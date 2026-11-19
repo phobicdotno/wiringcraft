@@ -148,10 +148,11 @@ pub(crate) fn ccitt(data: &[u8], parms: &FaxParms) -> Result<(Vec<u8>, Option<St
 /// Decodes a JBIG2 picture in the embedded organization PDF uses, with the segments of its
 /// `JBIG2Globals` stream if it has one. Returns its width, height and 1-bit samples (0 black).
 pub(crate) fn jbig2(data: &[u8], globals: Option<&[u8]>) -> Result<(u32, u32, Vec<u8>), String> {
-    // The decoder keeps every intermediate region of a page until the page is done and checks
-    // each only against its own size limit, so the regions are added up here before it runs.
-    let regions = jbig2_region_area(data)?.saturating_add(globals.map_or(Ok(0), jbig2_region_area)?);
-    if regions > MAX_PIXELS {
+    // The decoder keeps every intermediate region and pattern dictionary of a page until the
+    // page is done and checks each only against its own size limit, so what they take is
+    // added up here before it runs.
+    let kept = jbig2_retained_bytes(data)?.saturating_add(globals.map_or(Ok(0), jbig2_retained_bytes)?);
+    if kept > JBIG2_BUDGET {
         return Err("the JBIG2 picture's regions are too large".into());
     }
     guarded("JBIG2", || {
@@ -191,30 +192,40 @@ pub(crate) fn jbig2(data: &[u8], globals: Option<&[u8]>) -> Result<(u32, u32, Ve
     })
 }
 
-/// The pixels of all region segments (T.88 7.4.1: generic, refinement, text and halftone
-/// regions, intermediate or immediate) in JBIG2 data in the embedded organization, read from
-/// their segment headers. Data the headers do not describe is left to the decoder.
-fn jbig2_region_area(data: &[u8]) -> Result<u64, String> {
+/// The most memory the JBIG2 decoder may keep for one picture's region bitmaps and pattern
+/// dictionaries, in bytes.
+const JBIG2_BUDGET: u64 = 256 << 20;
+
+/// The bytes the JBIG2 decoder keeps for the region bitmaps (T.88 7.4.1: generic, refinement,
+/// text and halftone regions, intermediate or immediate) and pattern dictionaries (7.4.4) of
+/// JBIG2 data in the embedded organization, from their segment headers, the way `hayro-jbig2`
+/// 0.4 stores them: one bit per pixel in rows of whole 32-bit words, and for each pattern of a
+/// dictionary also 64 words per pattern row. The walk follows the decoder's own segment parser,
+/// including regions of unknown length. Data it cannot follow is left to the decoder.
+fn jbig2_retained_bytes(data: &[u8]) -> Result<u64, String> {
     const REGIONS: [u8; 12] = [4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43];
+    const PATTERNS: u8 = 16;
     let be32 = |at: usize| -> Option<u32> {
         data.get(at..at.checked_add(4)?)
             .and_then(|b| b.try_into().ok())
             .map(u32::from_be_bytes)
     };
+    let bitmap = |w: u64, h: u64| w.div_ceil(32).saturating_mul(4).saturating_mul(h);
     let mut total: u64 = 0;
     let mut at = 0usize;
     while at < data.len() {
         let Some(number) = be32(at) else { break };
         let Some(&flags) = data.get(at + 4) else { break };
         let Some(&refs) = data.get(at + 5) else { break };
-        let mut pos = at + 6;
-        let count = if refs >> 5 == 7 {
-            let Some(long) = be32(at + 5) else { break };
-            let count = (long & 0x1FFF_FFFF) as usize;
-            pos = at + 9 + count.div_ceil(8).max(1);
-            count
-        } else {
-            usize::from(refs >> 5)
+        let (count, mut pos) = match refs >> 5 {
+            7 => {
+                let Some(long) = be32(at + 5) else { break };
+                let count = (long & 0x1FFF_FFFF) as usize;
+                // The retain bits: one for this segment and one per referred-to segment.
+                (count, (at + 9).saturating_add((count + 1).div_ceil(8)))
+            }
+            5 | 6 => return Err("the JBIG2 picture has a damaged segment header".into()),
+            short => (usize::from(short), at + 6),
         };
         let ref_size = if number <= 256 {
             1
@@ -227,15 +238,47 @@ fn jbig2_region_area(data: &[u8]) -> Result<u64, String> {
         pos = pos.saturating_add(if flags & 0x40 != 0 { 4 } else { 1 });
         let Some(length) = be32(pos) else { break };
         pos = pos.saturating_add(4);
-        if REGIONS.contains(&(flags & 0x3F)) {
+        let kind = flags & 0x3F;
+        if REGIONS.contains(&kind) {
             let (Some(w), Some(h)) = (be32(pos), be32(pos + 4)) else {
                 break;
             };
-            total = total.saturating_add(u64::from(w) * u64::from(h));
+            total = total.saturating_add(bitmap(u64::from(w), u64::from(h)));
+        } else if kind == PATTERNS {
+            // Flags, pattern width, pattern height, GRAYMAX: GRAYMAX + 1 patterns, each kept
+            // as its own bitmap and in 32 shifted copies of two words per row, plus the
+            // collective bitmap they are cut from.
+            let (Some(&w), Some(&h), Some(gray_max)) = (data.get(pos + 1), data.get(pos + 2), be32(pos + 3)) else {
+                break;
+            };
+            let (w, h, n) = (u64::from(w), u64::from(h), u64::from(gray_max) + 1);
+            let each = bitmap(w, h).saturating_add(h.saturating_mul(64 * 4));
+            total = total
+                .saturating_add(n.saturating_mul(each))
+                .saturating_add(bitmap(n.saturating_mul(w), h));
         }
         if length == u32::MAX {
-            // An immediate generic region of unknown length runs to the end of the stripe.
-            break;
+            // An immediate generic region of unknown length ends with a marker and a 4-byte
+            // row count (7.2.7, 7.4.6.4), searched for after its region info, flags and AT
+            // pixels, as the decoder does.
+            let Some(&region_flags) = data.get(pos + 17) else { break };
+            let mmr = region_flags & 1 != 0;
+            let at_bytes = match (mmr, (region_flags >> 1) & 3, region_flags & 0x10 != 0) {
+                (true, _, _) => 0,
+                (false, 0, false) => 8,
+                (false, 0, true) => 24,
+                (false, _, _) => 2,
+            };
+            let marker: [u8; 2] = if mmr { [0x00, 0x00] } else { [0xFF, 0xAC] };
+            let from = pos + 18 + at_bytes;
+            let Some(end) = data
+                .get(from..)
+                .and_then(|rest| rest.windows(6).position(|w| w[..2] == marker))
+            else {
+                break;
+            };
+            at = from + end + 6;
+            continue;
         }
         at = pos.saturating_add(length as usize);
     }
@@ -364,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn jbig2_regions_are_added_up_from_their_headers() {
+    fn jbig2_regions_and_pattern_dictionaries_are_added_up_from_their_headers() {
         let segment = |number: u32, kind: u8, data: &[u8]| {
             let mut b = number.to_be_bytes().to_vec();
             b.extend_from_slice(&[kind, 0, 1]);
@@ -379,10 +422,39 @@ mod tests {
             d
         };
         let mut data = segment(0, 48, &[0; 19]);
+        // 100 x 200: 4 words a row.
         data.extend(segment(1, 36, &region(100, 200)));
+        // 10 x 10: 1 word a row.
         data.extend(segment(2, 38, &region(10, 10)));
-        assert_eq!(jbig2_region_area(&data), Ok(20_100));
+        assert_eq!(jbig2_retained_bytes(&data), Ok(16 * 200 + 4 * 10));
         // A cut-off header stops the count without an error.
-        assert_eq!(jbig2_region_area(&data[..30]), Ok(0));
+        assert_eq!(jbig2_retained_bytes(&data[..30]), Ok(0));
+
+        // A pattern dictionary of 65 536 patterns of 1 x 32 pixels is far over the budget.
+        let patterns = segment(3, 16, &[0, 1, 32, 0, 0, 0xFF, 0xFF]);
+        assert!(jbig2_retained_bytes(&patterns).is_ok_and(|n| n > JBIG2_BUDGET));
+        // A small one is not.
+        let small = segment(3, 16, &[0, 8, 8, 0, 0, 0, 15]);
+        assert!(jbig2_retained_bytes(&small).is_ok_and(|n| n < 1 << 20));
+
+        // Eight referred-to segments take the long form with two retain bytes; the region
+        // after such a segment is still counted.
+        let mut long = 9u32.to_be_bytes().to_vec();
+        long.extend_from_slice(&[62, 0xE0, 0, 0, 8, 0, 0]); // extension, count 8, 2 retain bytes
+        long.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]); // referred-to segments
+        long.push(1); // page
+        long.extend_from_slice(&4u32.to_be_bytes());
+        long.extend_from_slice(&[0; 4]);
+        long.extend(segment(10, 36, &region(65535, 65535)));
+        assert!(jbig2_retained_bytes(&long).is_ok_and(|n| n > JBIG2_BUDGET));
+
+        // A region of unknown length does not hide the regions after it.
+        let mut unknown = 4u32.to_be_bytes().to_vec();
+        unknown.extend_from_slice(&[38, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF]);
+        unknown.extend_from_slice(&region(8, 2)[..17]);
+        unknown.push(1); // MMR
+        unknown.extend_from_slice(&[0x2F, 0x78, 0x00, 0x00, 0, 0, 0, 2]); // data, end marker, rows
+        unknown.extend(segment(5, 36, &region(65535, 65535)));
+        assert!(jbig2_retained_bytes(&unknown).is_ok_and(|n| n > JBIG2_BUDGET));
     }
 }
