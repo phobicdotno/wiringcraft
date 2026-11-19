@@ -2311,6 +2311,91 @@ fn undoing_an_added_item_takes_back_its_lock_entry() -> TestResult {
     Ok(())
 }
 
+/// Ola adds coil (named `name`), places it on page 2, and undoes the placement: the session
+/// and the id of that undo.
+fn coil_placed_and_undone(
+    s: &mut Session,
+    link_a: &GuestLink,
+    a: &mut Guest,
+    link_b: &GuestLink,
+    b: &mut Guest,
+) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+    link_a.send(a.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(symbol("coil", "Coil"), "starter".into())],
+        parts: vec![],
+    }))?;
+    link_a.send(a.open(Some("p0002")))?;
+    s.pump(&mut [(link_a, a), (link_b, b)]);
+    let mut page = a
+        .project
+        .as_ref()
+        .and_then(|p| p.page("p0002"))
+        .cloned()
+        .ok_or("page")?;
+    place_symbol(&mut page, "s1", 10.0, "coil");
+    link_a.send(a.edit_page(page).ok_or("lock")?)?;
+    link_a.send(GuestMsg::Undo)?;
+    s.pump(&mut [(link_a, a), (link_b, b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    s.host
+        .history()
+        .iter()
+        .rev()
+        .find(|c| c.message.starts_with("Undo: Edit page"))
+        .map(|c| c.id)
+        .ok_or_else(|| "no undo of the page edit".into())
+}
+
+#[test]
+fn taking_back_an_undo_that_brings_a_page_back_against_another_version_of_its_symbol_is_refused() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    let (_b, link_b, mut b) = s.join("Kari")?;
+    let undo_page = coil_placed_and_undone(&mut s, &link_a, &mut a, &link_b, &mut b)?;
+    // Ola also undoes adding coil; Kari then adds coil in another version.
+    link_a.send(GuestMsg::Undo)?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    link_b.send(b.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(symbol("coil", "Other coil"), "starter".into())],
+        parts: vec![],
+    }))?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(
+        a.refusals.is_empty() && b.refusals.is_empty(),
+        "{:?} {:?}",
+        a.refusals,
+        b.refusals
+    );
+    // "Undo this change" on the page's undo would bring back the coil drawn with the first
+    // version against the second.
+    let changes = s.log.0.borrow().len();
+    link_a.send(GuestMsg::Revert { change: undo_page })?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    let refused = a.refusals.last().map(ToString::to_string).unwrap_or_default();
+    assert!(
+        refused.contains("drawn with another version of symbol coil"),
+        "{refused}"
+    );
+    assert_eq!(s.log.0.borrow().len(), changes, "nothing recorded");
+    let page = s.host.project().page("p0002").ok_or("page")?;
+    assert!(page.symbols.is_empty(), "the page stays as it was");
+    Ok(())
+}
+
+#[test]
+fn taking_back_an_undo_whose_symbol_versions_are_still_locked_goes_through() -> TestResult {
+    let mut s = Session::new();
+    let (_a, link_a, mut a) = s.join("Ola")?;
+    let (_b, link_b, mut b) = s.join("Kari")?;
+    let undo_page = coil_placed_and_undone(&mut s, &link_a, &mut a, &link_b, &mut b)?;
+    link_a.send(GuestMsg::Revert { change: undo_page })?;
+    s.pump(&mut [(&link_a, &mut a), (&link_b, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    let page = s.host.project().page("p0002").ok_or("page")?;
+    assert_eq!(page.symbols.len(), 1, "the coil is back");
+    Ok(())
+}
+
 #[test]
 fn a_redo_is_refused_once_the_session_has_another_version_of_the_item() -> TestResult {
     let mut s = Session::new();

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::{Page, Project};
 
+use crate::history::Uses;
 use crate::protocol::check_edit;
 use crate::{Change, GuestMsg, HostMsg, Journal, Peer, PeerId, ProjectEdit, Refusal, Snapshot, apply_edit};
 use crate::{ChangeInfo, ChangeKind, Parts, redo_target, undo_target};
@@ -72,12 +73,15 @@ pub struct Host {
     added_pictures: (usize, usize),
 }
 
-/// A recorded change and the parts of the project it changed, before and after.
+/// A recorded change and the parts of the project it changed, before and after, with the
+/// versions of the symbols and parts each side was drawn with ([`Parts::uses`]).
 #[derive(Debug, Clone)]
 struct Entry {
     info: ChangeInfo,
     before: Parts,
     after: Parts,
+    before_uses: Uses,
+    after_uses: Uses,
 }
 
 /// Keep a name or email usable in a git author line (`Name <email>`).
@@ -521,8 +525,18 @@ impl Host {
             ..Parts::default()
         };
         let (before, after) = (parts(before), parts(page.clone()));
+        // A page edit leaves the lock as it was: both sides were drawn with its versions.
+        let uses = (before.uses(&self.project.lock), after.uses(&self.project.lock));
         self.send_others(HOST, HostMsg::PageChanged { page, by });
-        self.remember(by, Some(id.clone()), message, ChangeKind::Edit, None, before, after);
+        self.remember(
+            by,
+            Some(id.clone()),
+            message,
+            ChangeKind::Edit,
+            None,
+            (before, uses.0),
+            (after, uses.1),
+        );
         Ok(())
     }
 
@@ -670,7 +684,8 @@ impl Host {
         }
         // A file put back alone (the project as it was) is no step to undo.
         if self.project != before {
-            self.remember(by, page, message, ChangeKind::Edit, None, was, now);
+            let uses = (was.uses(&before.lock), now.uses(&self.project.lock));
+            self.remember(by, page, message, ChangeKind::Edit, None, (was, uses.0), (now, uses.1));
         }
         Ok(true)
     }
@@ -804,6 +819,17 @@ impl Host {
                 dangling.join(", ")
             ));
         }
+        // What it brings back was drawn with the versions it used then: one locked in another
+        // version now (someone added the symbol again, updated) would be drawn with that one.
+        let other = Parts::other_versions(&entry.before_uses, &self.project.lock);
+        if !other.is_empty() {
+            self.project = before;
+            return invalid(format!(
+                "\"{}\" cannot be taken back: it was drawn with another version of {} than the project has now",
+                entry.info.message,
+                other.join(", ")
+            ));
+        }
         // The message names the edit itself: a redo of "Undo X" is "Redo X".
         let what = match kind {
             ChangeKind::Redo => entry
@@ -904,7 +930,15 @@ impl Host {
                 },
             ));
         }
-        self.remember(by, entry.info.page, message, kind, Some(id), entry.after, entry.before);
+        self.remember(
+            by,
+            entry.info.page,
+            message,
+            kind,
+            Some(id),
+            (entry.after, entry.after_uses),
+            (entry.before, entry.before_uses),
+        );
         Ok(())
     }
 
@@ -917,8 +951,8 @@ impl Host {
         message: String,
         kind: ChangeKind,
         reverts: Option<u64>,
-        before: Parts,
-        after: Parts,
+        (before, before_uses): (Parts, Uses),
+        (after, after_uses): (Parts, Uses),
     ) {
         let info = ChangeInfo {
             id: self.next_change,
@@ -940,6 +974,8 @@ impl Host {
             info: info.clone(),
             before,
             after,
+            before_uses,
+            after_uses,
         });
         if self.history.len() > crate::MAX_HISTORY {
             let extra = self.history.len() - crate::MAX_HISTORY;
