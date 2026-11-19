@@ -332,6 +332,41 @@ struct Doc {
 
 const MAX_INFLATE: usize = 64 * 1024 * 1024;
 
+/// Undo PDF's run-length compression (`RunLengthDecode`): a length byte `n` below 128 is
+/// followed by `n + 1` bytes to copy, one above 128 by a byte to repeat `257 - n` times, and 128
+/// ends the data. Fails with the reason for a run that goes past the end of the data, data
+/// without its end mark, or output over [`MAX_INFLATE`].
+fn run_length_decode(data: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let past_end = || "the RunLength data is damaged (a run goes past the end of the data)".to_owned();
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        let Some(&n) = data.get(i) else {
+            return Err("the RunLength data is damaged (it has no end mark)".into());
+        };
+        i += 1;
+        let more = match n {
+            128 => return Ok(out),
+            ..128 => usize::from(n) + 1,
+            _ => 257 - usize::from(n),
+        };
+        if out.len() + more > MAX_INFLATE {
+            return Err(format!(
+                "the RunLength data unpacks to more than {} MiB",
+                MAX_INFLATE / (1024 * 1024)
+            ));
+        }
+        if n < 128 {
+            out.extend_from_slice(data.get(i..i + more).ok_or_else(past_end)?);
+            i += more;
+        } else {
+            let &b = data.get(i).ok_or_else(past_end)?;
+            out.resize(out.len() + more, b);
+            i += 1;
+        }
+    }
+}
+
 /// Undo PDF's LZW compression (`LZWDecode`): codes of 9 to 12 bits, most significant bit
 /// first, 256 clears the table and 257 ends the data. With `early_change` (the default) the
 /// code length grows one code early. Fails with the reason for a code that is not in the table,
@@ -914,6 +949,7 @@ impl Interp<'_> {
                         != 0.0;
                     bytes = unpredict(lzw_decode(&bytes, early)?, parms)?;
                 }
+                "RunLengthDecode" | "RL" => bytes = run_length_decode(&bytes)?,
                 "DCTDecode" | "DCT" if i + 1 == filters.len() => {
                     return Ok((
                         Raster {
@@ -1813,6 +1849,59 @@ mod tests {
         assert_eq!(lzw_decode(&clears, true), Ok(vec![]));
     }
 
+    /// Run-length compress `data` as PDF's `RunLengthDecode` reads it: runs of three or more
+    /// equal bytes repeated, the rest copied, with the end mark.
+    fn run_length_encode(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < data.len() {
+            let run = data[i..].iter().take(128).take_while(|b| **b == data[i]).count();
+            if run >= 3 {
+                out.extend([(257 - run) as u8, data[i]]);
+                i += run;
+            } else {
+                let start = i;
+                while i < data.len()
+                    && i - start < 128
+                    && data[i..].iter().take(3).filter(|b| **b == data[i]).count() < 3
+                {
+                    i += 1;
+                }
+                out.push((i - start - 1) as u8);
+                out.extend_from_slice(&data[start..i]);
+            }
+        }
+        out.push(128);
+        out
+    }
+
+    #[test]
+    fn run_length_data_is_read() {
+        // A copy of three bytes, a run of four, the end mark; what follows it is not read.
+        assert_eq!(
+            run_length_decode(&[2, b'a', b'b', b'c', 253, b'x', 128, 9, 9]).as_deref(),
+            Ok(&b"abcxxxx"[..])
+        );
+        // The longest copy and the longest run.
+        let mut long: Vec<u8> = (0..128u8).collect();
+        long.extend([7u8; 128]);
+        long.extend((0..1000u32).map(|i| (i * 31 % 7) as u8));
+        assert_eq!(run_length_decode(&run_length_encode(&long)), Ok(long));
+        assert_eq!(run_length_decode(&[128]), Ok(vec![]));
+        // Damaged data gives a reason: a copy or a run past the end, or no end mark.
+        for (damaged, why) in [
+            (&[5u8, b'a', b'b'][..], "goes past the end"),
+            (&[250], "goes past the end"),
+            (&[1, b'a', b'b'], "no end mark"),
+            (&[], "no end mark"),
+        ] {
+            assert!(
+                run_length_decode(damaged).is_err_and(|e| e.contains("RunLength data is damaged") && e.contains(why)),
+                "{damaged:?}"
+            );
+        }
+    }
+
     #[test]
     fn lzw_cmyk_and_16_bit_pictures_are_read() -> Result<()> {
         let full = "q 595 0 0 842 0 0 cm /Im Do Q";
@@ -1845,6 +1934,29 @@ mod tests {
                 &lzw_encode(&predicted, true)
             )?,
             want
+        );
+
+        // RunLength alone, and before Flate (the run-length stage gives the Flate data).
+        assert_eq!(
+            scan(&format!("{gray} /Filter /RunLengthDecode"), &run_length_encode(&grey))?,
+            want
+        );
+        let rl_of_flate = run_length_encode(&miniz_oxide::deflate::compress_to_vec_zlib(&grey, 6));
+        assert_eq!(scan(&format!("{gray} /Filter [/RL /FlateDecode]"), &rl_of_flate)?, want);
+        // Damaged run data is reported with its reason.
+        let p = pages(&picture_pdf(
+            0,
+            &format!("{gray} /Filter /RunLengthDecode"),
+            &[5, 10, 20],
+            full,
+        ))?;
+        assert!(p[0].scan.is_none());
+        assert!(
+            p[0].scan_problem
+                .as_deref()
+                .is_some_and(|m| m.contains("RunLength data is damaged")),
+            "{:?}",
+            p[0].scan_problem
         );
 
         // Two filters, the predictor in the second one's parameters (a null placeholder first).
@@ -2169,17 +2281,12 @@ mod tests {
         let p = pages(&picture_pdf(0, "/Width 3 /Height 2 /Filter /DCTDecode", &jpeg, full))?;
         assert_eq!(p[0].scan.as_ref().map(|s| s.raster.bytes.clone()), Some(jpeg.to_vec()));
         // A filter the reader does not know is reported, not guessed at.
-        let p = pages(&picture_pdf(
-            0,
-            "/Width 3 /Height 2 /Filter /RunLengthDecode",
-            &jpeg,
-            full,
-        ))?;
+        let p = pages(&picture_pdf(0, "/Width 3 /Height 2 /Filter /AHx", &jpeg, full))?;
         assert!(p[0].scan.is_none());
         assert!(
             p[0].scan_problem
                 .as_deref()
-                .is_some_and(|m| m.contains("RunLengthDecode"))
+                .is_some_and(|m| m.contains("compressed as AHx"))
         );
 
         // Short sample data never panics.
