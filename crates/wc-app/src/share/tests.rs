@@ -4113,6 +4113,42 @@ fn undo_of_a_waiting_change_takes_it_back_here_and_not_an_older_one_there() -> T
 }
 
 #[test]
+fn a_waiting_placement_does_not_take_a_device_the_session_made_under_its_tag() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    let tag = guest_open
+        .project
+        .page("p0003")
+        .and_then(|p| p.symbols.iter().find(|s| s.id == item))
+        .and_then(|s| s.tag.clone())
+        .ok_or("the placement has no tag")?;
+    assert!(!host_open.project.devices.contains_key(&tag));
+    // The host makes a device of its own under the same tag while the placement waits.
+    let theirs = wc_core::Device {
+        description: "Theirs".into(),
+        ..Default::default()
+    };
+    host_open.project.devices.insert(tag.clone(), theirs.clone());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(guest_open.project.devices.get(&tag), Some(&theirs));
+    assert!(
+        !has_placement(&guest_open, "p0003", &item),
+        "the placement is not kept naming the session's device"
+    );
+    let notes = g.take_notes();
+    assert!(notes.iter().any(|n| n.contains("was not kept")), "{notes:?}");
+    // Once the item could go, nothing of the placement reaches the session.
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(!has_placement(&host_open, "p0003", &item));
+    assert_eq!(host_open.project.devices.get(&tag), Some(&theirs));
+    Ok(())
+}
+
+#[test]
 fn undo_of_a_second_waiting_placement_takes_back_only_that_one() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
@@ -4639,6 +4675,47 @@ fn a_new_page_that_waits_for_its_symbol_is_kept_while_others_changes_come_in() -
     session.pages.push(Page::new("p9", "9", "Theirs"));
     assert_eq!(held.put_back(&mut session), ["page 9"]);
     assert_eq!(session.page("p9").map(|p| p.title.as_str()), Some("Theirs"));
+    Ok(())
+}
+
+#[test]
+fn a_waiting_page_and_its_new_device_go_back_together_or_not_at_all() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    // A symbol the session does not have placed here, with the new device it made.
+    let mut local = base.clone();
+    local
+        .page_mut("p1")
+        .ok_or("no page")?
+        .symbols
+        .push(wc_core::PlacedSymbol {
+            tag: Some(k1.clone()),
+            ..symbol("s9", 40.0)
+        });
+    local.devices.insert(k1.clone(), wc_core::Device::default());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert!(held.now.devices.contains_key(&k1));
+    // The session made a device of its own under the same tag meanwhile: the placement must not
+    // come back naming it.
+    let theirs = wc_core::Device {
+        description: "Theirs".into(),
+        ..Default::default()
+    };
+    let mut session = base.clone();
+    session.devices.insert(k1.clone(), theirs.clone());
+    assert_eq!(held.put_back(&mut session), ["device -K1", "page 1"]);
+    assert_eq!(session.devices.get(&k1), Some(&theirs));
+    assert_eq!(session.page("p1"), base.page("p1"));
+    // The session changed the page meanwhile: the device does not stay without it.
+    let mut session = base.clone();
+    session.page_mut("p1").ok_or("no page")?.title = "Theirs".into();
+    assert_eq!(held.put_back(&mut session), ["page 1", "device -K1"]);
+    assert!(!session.devices.contains_key(&k1));
+    // Neither: both come back.
+    let mut session = base.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session, local);
     Ok(())
 }
 

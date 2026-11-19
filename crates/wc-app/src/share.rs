@@ -2310,8 +2310,9 @@ struct Held {
     was: wc_share::Parts,
     /// The items they wait for, by [`item_name`].
     items: Vec<String>,
-    /// The targets of each device rename that waits ([`Held::hold_renames`]): each group is
-    /// put back all together or not at all; separate renames are kept or lost on their own.
+    /// The targets of each device rename that waits ([`Held::hold_renames`]), and of each new
+    /// device with the waiting pages that name it: each group is put back all together or not
+    /// at all; separate groups are kept or lost on their own.
     renames: Vec<RenameGroup>,
 }
 
@@ -2322,6 +2323,8 @@ struct RenameGroup {
     devices: BTreeSet<wc_core::DeviceTag>,
     panels: BTreeSet<String>,
     meta: bool,
+    /// Whether a device rename is among them, for the note when they are lost.
+    rename: bool,
 }
 
 impl RenameGroup {
@@ -2330,7 +2333,33 @@ impl RenameGroup {
         self.devices.extend(other.devices);
         self.panels.extend(other.panels);
         self.meta |= other.meta;
+        self.rename |= other.rename;
     }
+
+    fn overlaps(&self, other: &RenameGroup) -> bool {
+        !self.pages.is_disjoint(&other.pages)
+            || !self.devices.is_disjoint(&other.devices)
+            || !self.panels.is_disjoint(&other.panels)
+            || (self.meta && other.meta)
+    }
+}
+
+/// `groups` with each two that share a target made one, so each target is in one group only.
+fn join_groups(groups: Vec<RenameGroup>) -> Vec<RenameGroup> {
+    let mut out: Vec<RenameGroup> = Vec::new();
+    for mut group in groups {
+        // A group may join several made so far: all of them become one.
+        let mut i = 0;
+        while i < out.len() {
+            if out[i].overlaps(&group) {
+                group.merge(out.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        out.push(group);
+    }
+    out
 }
 
 impl Held {
@@ -2375,6 +2404,30 @@ impl Held {
         held.now.devices.extend(new_devices);
         // After those, so a rename to a tag only a waiting page names is held as a pair.
         held.hold_renames(local, base);
+        // A new device goes back with the waiting pages that name it, or not at all: the
+        // session may have made a device of its own under the same tag meanwhile (tags are
+        // chosen from this copy alone), and the page must not then name the session's device.
+        let mut groups = std::mem::take(&mut held.renames);
+        for (tag, device) in &held.now.devices {
+            if device.is_none() || base.devices.contains_key(tag) {
+                continue;
+            }
+            let pages: BTreeSet<String> = held
+                .now
+                .pages
+                .iter()
+                .filter(|(_, p)| p.as_ref().is_some_and(|p| page_mentions(p, &|t| t == tag)))
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !pages.is_empty() {
+                groups.push(RenameGroup {
+                    pages,
+                    devices: [tag.clone()].into_iter().collect(),
+                    ..Default::default()
+                });
+            }
+        }
+        held.renames = join_groups(groups);
         // A new page's comments wait with it, however it came to wait: the session has no page
         // to put them on.
         let new_pages: Vec<String> = held
@@ -2558,6 +2611,9 @@ impl Held {
                 groups[g].meta = true;
             }
         }
+        for g in &mut groups {
+            g.rename = true;
+        }
         self.renames = groups;
     }
 
@@ -2640,6 +2696,21 @@ impl Held {
             if !hit {
                 continue;
             }
+            if group.rename {
+                lost.push("the device rename that waited with it".into());
+            } else {
+                // A new device and the pages that name it: each one not lost itself is named.
+                for id in group.pages.iter().filter(|id| !gone.pages.contains(*id)) {
+                    if let Some(Some(page)) = keep.pages.get(id) {
+                        lost.push(format!("page {}", page.number));
+                    }
+                }
+                for tag in group.devices.iter().filter(|t| !gone.devices.contains(*t)) {
+                    if keep.devices.contains_key(tag) {
+                        lost.push(format!("device {tag}"));
+                    }
+                }
+            }
             keep.pages.retain(|id, _| !group.pages.contains(id));
             keep.comments.retain(|id, _| !group.pages.contains(id));
             keep.devices.retain(|tag, _| !group.devices.contains(tag));
@@ -2647,7 +2718,6 @@ impl Held {
             if group.meta {
                 keep.meta = None;
             }
-            lost.push("the device rename that waited with it".into());
         }
         keep.apply(project);
         // The items they use stay locked here: `incoming` keeps entries the session lacks.
