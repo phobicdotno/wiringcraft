@@ -12,6 +12,10 @@ toml.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
+# Writing an output file relative to its opened folder (`openat`, `renameat`; `guard`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # File identity (volume serial and file index) for telling a hard link to a project file apart (`guard`).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
