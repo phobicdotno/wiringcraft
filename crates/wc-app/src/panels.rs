@@ -619,7 +619,7 @@ fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
             ps.shape_error = None;
             ps.shape_refused.clear();
         }
-        None => {}
+        Some(Selection::Cloud(_) | Selection::RevisionTable) | None => {}
     }
 }
 
@@ -1068,6 +1068,45 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 let names: Vec<&str> = sym.pins.iter().map(|p| p.name.as_str()).collect();
                 ui.label(names.join("  "));
             }
+        }
+        Some(Selection::Cloud(i)) => {
+            let Some(cloud) = open.project.pages.get(page_idx).and_then(|p| p.clouds.get(i)).cloned() else {
+                ed.selection.clear();
+                return;
+            };
+            ui.strong("Revision cloud");
+            let letters: Vec<String> = open.project.meta.revisions.iter().map(|r| r.letter.clone()).collect();
+            let mut chosen = cloud.revision.clone();
+            ui.horizontal(|ui| {
+                ui.label("Revision");
+                egui::ComboBox::from_id_salt("cloud-revision")
+                    .selected_text(chosen.as_str())
+                    .show_ui(ui, |ui| {
+                        for l in &letters {
+                            ui.selectable_value(&mut chosen, l.clone(), l.as_str());
+                        }
+                    });
+            });
+            if chosen != cloud.revision {
+                open.set_cloud_revision(page_idx, i, &chosen);
+            }
+            if let Some(r) = open.project.cloud_revision(&cloud.revision) {
+                ui.label(RichText::new(format!("{} {}", r.date, r.text)).color(t.faint));
+            } else {
+                ui.colored_label(t.warning, format!("No revision {} in the project.", cloud.revision));
+            }
+            ui.label(RichText::new("Drag to move it; Delete takes it off.").color(t.faint));
+        }
+        Some(Selection::RevisionTable) => {
+            ui.strong("Revision table");
+            ui.label(format!("{} revisions", open.project.meta.revisions.len()));
+            ui.label(
+                RichText::new(
+                    "Drag to move it; Delete takes it off the page. Revisions are listed in File → Project \
+                     properties.",
+                )
+                .color(t.faint),
+            );
         }
         Some(Selection::Graphic(i)) => {
             let Some(g) = open
@@ -1686,6 +1725,8 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
             Tool::Arc => "Arc",
             Tool::Polyline => "Polyline",
             Tool::Dimension => "Dimension",
+            Tool::Cloud => "Revision cloud",
+            Tool::RevisionTable => "Revision table",
         };
         // The current tool as an accent pill.
         let g = ui

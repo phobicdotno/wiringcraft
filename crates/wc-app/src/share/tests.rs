@@ -1308,6 +1308,31 @@ fn an_edit_on_a_page_the_undo_restored_is_kept_where_they_do_not_overlap() -> Te
 }
 
 #[test]
+fn a_cloud_and_the_revision_table_drawn_here_are_kept_beside_the_sessions_edit() -> TestResult {
+    use wc_core::geom::Point;
+    let (mut base, mut auth, mut local) = three_copies()?;
+    auth.pages[0].title = "Restored".into();
+    local.pages[0].clouds.push(wc_core::RevisionCloud::new(
+        Point::new(10.0, 10.0),
+        Point::new(40.0, 30.0),
+        "A",
+    ));
+    local.pages[0].revision_table = Some(Point::new(200.0, 150.0));
+    let lost = yield_to_session(&mut local, &mut base, &auth);
+    assert!(lost.is_empty(), "{lost:?}");
+    let page = &local.pages[0];
+    assert_eq!(page.title, "Restored");
+    assert_eq!(page.clouds.len(), 1, "the cloud is not lost");
+    assert_eq!(page.revision_table, Some(Point::new(200.0, 150.0)));
+    // The table moved on both sides to different places is a clash.
+    let (mut base, mut auth, mut local) = three_copies()?;
+    auth.pages[0].revision_table = Some(Point::new(1.0, 1.0));
+    local.pages[0].revision_table = Some(Point::new(2.0, 2.0));
+    assert_eq!(yield_to_session(&mut local, &mut base, &auth), ["page 1"]);
+    Ok(())
+}
+
+#[test]
 fn an_element_changed_on_both_sides_takes_the_sessions_page() -> TestResult {
     let (mut base, mut auth, mut local) = three_copies()?;
     auth.pages[0].symbols[0].at.x = -10.0;

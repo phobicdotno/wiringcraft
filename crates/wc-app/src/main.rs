@@ -67,6 +67,10 @@ enum Dialog {
         /// The locations as the dialog opened with them: when they are unchanged, OK leaves the
         /// project's own (an assistant command may have changed them meanwhile).
         loaded_locations: Vec<(String, String)>,
+        /// The project's revisions, edited in place; left alone on OK while unchanged, as
+        /// the locations are.
+        revisions: Vec<state::RevisionRow>,
+        loaded_revisions: Vec<state::RevisionRow>,
     },
     /// The cover page form: changes show on the page as they are typed; `since` is the undo
     /// mark from when it opened, so OK keeps them as one undo step and Cancel takes them back.
@@ -302,6 +306,8 @@ impl chrome::Status for StatusView<'_> {
             Action::ArcTool => self.ed.tool == Tool::Arc,
             Action::PolylineTool => self.ed.tool == Tool::Polyline,
             Action::DimensionTool => self.ed.tool == Tool::Dimension,
+            Action::CloudTool => self.ed.tool == Tool::Cloud,
+            Action::RevisionTableTool => self.ed.tool == Tool::RevisionTable,
             Action::BlackBoxTool => self.ed.tool == Tool::BlackBox,
             Action::ToggleGrid => self.prefs.show_grid,
             Action::Layers => self.show_layers,
@@ -403,7 +409,7 @@ impl App {
             .open
             .as_ref()
             .and_then(|o| o.project.pages.get(self.ed.page))
-            .map(|p| (p.id.clone(), p.graphics.clone()));
+            .map(|p| (p.id.clone(), p.graphics.clone(), p.clouds.clone()));
         if let Some(joined) = self.share.frame(self.open.as_mut(), page, busy) {
             // The joined copy replaces the open project: keep its unsaved work first.
             if let Some(o) = self.open.as_mut()
@@ -459,9 +465,10 @@ impl App {
         {
             self.ed.waiting_graphics = None;
         }
-        if let Some((id, old)) = &graphics_before {
+        if let Some((id, old, old_clouds)) = &graphics_before {
             match self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page)) {
                 Some(p) if &p.id == id => {
+                    edit::remap_clouds(&mut self.ed.selection, old_clouds, &p.clouds);
                     let before = self.ed.selection.clone();
                     edit::remap_graphics(&mut self.ed.selection, old, &p.graphics);
                     // A change of this person's that the host has not answered can show the
@@ -706,6 +713,8 @@ impl App {
             | Action::ArcTool
             | Action::PolylineTool
             | Action::DimensionTool
+            | Action::CloudTool
+            | Action::RevisionTableTool
             | Action::CommentTool => {
                 self.ed.tool = match a {
                     Action::TextTool => Tool::Text,
@@ -715,6 +724,8 @@ impl App {
                     Action::ArcTool => Tool::Arc,
                     Action::PolylineTool => Tool::Polyline,
                     Action::DimensionTool => Tool::Dimension,
+                    Action::CloudTool => Tool::Cloud,
+                    Action::RevisionTableTool => Tool::RevisionTable,
                     _ => Tool::Rect,
                 };
                 self.ed.wire = None;
@@ -725,6 +736,8 @@ impl App {
                     Action::CircleTool => "Click the centre of the circle.",
                     Action::ArcTool => "Click the centre of the arc.",
                     Action::DimensionTool => "Click the first point to measure from.",
+                    Action::CloudTool => "Click one corner of the area the cloud goes around.",
+                    Action::RevisionTableTool => "Click where the revision table's top-left corner goes.",
                     _ => "Click the first point.",
                 }
                 .into();
@@ -856,8 +869,13 @@ impl App {
                     self.copied_text = Some(clip.summary());
                     self.clipboard = clip;
                     if a == Action::Cut {
-                        let sel = std::mem::take(&mut self.ed.selection);
+                        // Revision clouds and the revision table are not copied: they stay,
+                        // selected, rather than go without a way back by Paste.
+                        let (kept, sel): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ed.selection)
+                            .into_iter()
+                            .partition(|s| matches!(s, Selection::Cloud(_) | Selection::RevisionTable));
                         open.delete_many(page, &sel);
+                        self.ed.selection = kept;
                         self.ed.message = format!("Cut {n} items.");
                     } else {
                         self.ed.message = format!("Copied {n} items.");
@@ -924,6 +942,8 @@ impl App {
                     fields: form_fields(&open.project.meta.title_block),
                     loaded_locations: locations.clone(),
                     locations,
+                    revisions: state::RevisionRow::of(&open.project.meta.revisions),
+                    loaded_revisions: state::RevisionRow::of(&open.project.meta.revisions),
                 });
             }
             Action::CoverPage => {
@@ -1700,6 +1720,8 @@ impl App {
                     fields,
                     locations,
                     loaded_locations,
+                    revisions,
+                    loaded_revisions,
                 } => {
                     egui::Grid::new("projprops")
                         .num_columns(2)
@@ -1751,7 +1773,50 @@ impl App {
                     if ui.button("Add location").clicked() {
                         locations.push((String::new(), String::new()));
                     }
-                    let bad = wc_core::project::location_rows(locations).err();
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Revisions").strong());
+                    let mut drop = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("projrevisions-scroll")
+                        .max_height(180.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Grid::new("projrevisions")
+                                .num_columns(5)
+                                .spacing([8.0, 6.0])
+                                .show(ui, |ui| {
+                                    for h in ["Rev.", "Date", "Description", "By", ""] {
+                                        ui.strong(h);
+                                    }
+                                    ui.end_row();
+                                    for (k, r) in revisions.iter_mut().enumerate() {
+                                        // A listed revision keeps its letter: its clouds carry it.
+                                        let new = r.was.trim().is_empty();
+                                        ui.add_enabled(
+                                            new,
+                                            egui::TextEdit::singleline(&mut r.letter).hint_text("A").desired_width(40.0),
+                                        );
+                                        ui.add(egui::TextEdit::singleline(&mut r.date).hint_text("2026-11-19").desired_width(90.0));
+                                        ui.add(egui::TextEdit::singleline(&mut r.text).hint_text("What changed").desired_width(200.0));
+                                        ui.add(egui::TextEdit::singleline(&mut r.author).desired_width(60.0));
+                                        if ui.button("Remove").clicked() {
+                                            drop = Some(k);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    if let Some(k) = drop {
+                        revisions.remove(k);
+                    }
+                    if ui.button("Add revision").clicked() {
+                        revisions.push(state::RevisionRow::default());
+                    }
+                    let rev_bad = self
+                        .open
+                        .as_ref()
+                        .and_then(|o| o.revision_draft_problem(loaded_revisions, revisions));
+                    let bad = wc_core::project::location_rows(locations).err().or(rev_bad);
                     if let Some(why) = &bad {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
                     }
@@ -1764,10 +1829,16 @@ impl App {
                             let f = fields.clone();
                             // Untouched locations are left as the project has them now.
                             let l = (locations != loaded_locations).then(|| locations.clone());
+                            let r = (revisions != loaded_revisions).then(|| revisions.clone());
+                            let loaded = loaded_revisions.clone();
                             then = Some(Box::new(move |app: &mut App| {
-                                if let Some(o) = app.open.as_mut()
-                                    && let Err(e) = o.set_project_props(&n, &f, l.as_deref())
-                                {
+                                let Some(o) = app.open.as_mut() else {
+                                    return;
+                                };
+                                // Checked again: a sync may have come in since the dialog was drawn.
+                                if let Some(why) = r.as_deref().and_then(|r| o.revision_draft_problem(&loaded, r)) {
+                                    app.ed.message = why;
+                                } else if let Err(e) = o.set_project_props(&n, &f, l.as_deref(), r.as_deref()) {
                                     app.ed.message = e;
                                 }
                             }));

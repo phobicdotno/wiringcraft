@@ -676,10 +676,34 @@ fn clip_text(t: String, max: usize) -> String {
     out
 }
 
+/// The id the assistant is given for a revision cloud: what it is (its revision and corners),
+/// not where it is in the page's list, so an id read before someone else removed a cloud
+/// cannot name another one.
+fn cloud_id(c: &wc_core::revision::RevisionCloud) -> String {
+    format!(
+        "cloud {} at {},{} to {},{}",
+        c.revision.trim(),
+        c.min.x,
+        c.min.y,
+        c.max.x,
+        c.max.y
+    )
+}
+
+/// [`selection_id`] for an item on `page`, a revision cloud by [`cloud_id`].
+fn item_id(page: Option<&Page>, sel: &Selection) -> String {
+    match (sel, page) {
+        (Selection::Cloud(i), Some(p)) => p.clouds.get(*i).map(cloud_id).unwrap_or_else(|| selection_id(sel)),
+        _ => selection_id(sel),
+    }
+}
+
 fn selection_id(sel: &Selection) -> String {
     match sel {
         Selection::Symbol(id) | Selection::Wire(id) => id.clone(),
         Selection::Graphic(i) => format!("g{i}"),
+        Selection::Cloud(i) => wc_report::cloud_item(*i),
+        Selection::RevisionTable => "revision table".to_owned(),
     }
 }
 
@@ -699,7 +723,8 @@ impl Open {
             .or_else(|| self.project.pages.iter().position(|p| p.id == key))
     }
 
-    /// Item ids on a page as selections; unknown ids are an error.
+    /// Item ids on a page as selections; unknown ids are an error. A revision cloud is named by
+    /// what it is ([`cloud_id`]); two clouds alike cannot be told apart, so neither is taken.
     fn selections(&self, page: usize, ids: &[String]) -> Result<Vec<Selection>, String> {
         let p = self.project.pages.get(page).ok_or("No such page.")?;
         if ids.is_empty() {
@@ -715,6 +740,26 @@ impl Open {
                     && i < p.graphics.len()
                 {
                     Ok(Selection::Graphic(i))
+                } else if id.trim() == selection_id(&Selection::RevisionTable) && p.revision_table.is_some() {
+                    Ok(Selection::RevisionTable)
+                } else if id.trim().starts_with("cloud ")
+                    && let matching = p
+                        .clouds
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| cloud_id(c) == id.trim())
+                        .map(|(i, _)| i)
+                        .collect::<Vec<_>>()
+                    && let Some(&i) = matching.first()
+                {
+                    if matching.len() == 1 {
+                        Ok(Selection::Cloud(i))
+                    } else {
+                        Err(format!(
+                            "{id:?}: {} clouds are alike, so which one is not known.",
+                            matching.len()
+                        ))
+                    }
                 } else {
                     Err(format!("No item {id:?} on page {}.", p.number))
                 }
@@ -819,6 +864,7 @@ impl Open {
             "size_mm": [w, h],
             "symbols": symbols, "wires": wires, "graphics": graphics,
             "underlay": p.underlay, "comments": comments,
+            "clouds": p.clouds, "revision_table": p.revision_table,
         })
     }
 
@@ -1117,7 +1163,12 @@ impl App {
             out.push_str(&format!(". Showing page {} ({}, id {})", p.number, p.title, p.id));
         }
         if !self.ed.selection.is_empty() {
-            let ids: Vec<String> = self.ed.selection.iter().map(selection_id).collect();
+            let page = if self.ed.panel.is_none() {
+                open.project.pages.get(self.ed.page)
+            } else {
+                None
+            };
+            let ids: Vec<String> = self.ed.selection.iter().map(|s| item_id(page, s)).collect();
             out.push_str(&format!(". Selected: {}", ids.join(", ")));
         }
         out.push('.');
@@ -1163,6 +1214,8 @@ impl App {
             Selection::Symbol(id) => p.symbols.iter().any(|x| &x.id == id),
             Selection::Wire(id) => p.wires.iter().any(|x| &x.id == id),
             Selection::Graphic(i) => *i < p.graphics.len(),
+            Selection::Cloud(i) => *i < p.clouds.len(),
+            Selection::RevisionTable => p.revision_table.is_some(),
         });
     }
 
@@ -1410,7 +1463,17 @@ impl App {
                 let open = need_open(self.open.as_mut())?;
                 let sel = open.selections(page, &ids)?;
                 match name {
-                    "delete_items" => open.delete_many(page, &sel),
+                    "delete_items" => {
+                        let before = open.project.pages.get(page).map(|p| p.clouds.clone());
+                        open.delete_many(page, &sel);
+                        // The clouds after one deleted move up: what the user had selected
+                        // follows its cloud, and a deleted one is let go.
+                        if page == self.ed.page
+                            && let (Some(old), Some(p)) = (before, open.project.pages.get(page))
+                        {
+                            crate::edit::remap_clouds(&mut self.ed.selection, &old, &p.clouds);
+                        }
+                    }
                     "move_items" => {
                         let d = Point::new(need_num(v, "dx")?, need_num(v, "dy")?);
                         open.checkpoint();
@@ -1567,6 +1630,21 @@ impl App {
                         .unwrap_or_default();
                     content["title_block"] = json!(own);
                 }
+                // Nor does one without `clouds` or `revision_table` remove the page's revision
+                // marks. Given, they are used: `[]` clears the clouds and `null` the table.
+                if content.get("clouds").is_none() {
+                    let own = open
+                        .project
+                        .pages
+                        .get(page)
+                        .map(|p| p.clouds.clone())
+                        .unwrap_or_default();
+                    content["clouds"] = json!(own);
+                }
+                if content.get("revision_table").is_none() {
+                    let own = open.project.pages.get(page).and_then(|p| p.revision_table);
+                    content["revision_table"] = json!(own);
+                }
                 let new: Page = serde_json::from_value(content).map_err(|e| format!("Not a page: {e}"))?;
                 open.ensure_page_symbols(&new)?;
                 open.checkpoint();
@@ -1576,8 +1654,18 @@ impl App {
                     }
                 }
                 let cover = new.cover;
+                let shown = page == self.ed.page;
                 if let Some(p) = open.project.pages.get_mut(page) {
-                    *p = new;
+                    let old = std::mem::replace(p, new);
+                    // On the shown page, what the user had selected follows its graphic or
+                    // cloud, and one no longer there is let go. Another page is shown after
+                    // this one: its selection does not carry over.
+                    if shown {
+                        crate::edit::remap_graphics(&mut self.ed.selection, &old.graphics, &p.graphics);
+                        crate::edit::remap_clouds(&mut self.ed.selection, &old.clouds, &p.clouds);
+                    } else {
+                        self.ed.selection.clear();
+                    }
                 }
                 // One cover page per project: a new cover takes the mark from any other page.
                 if cover {
@@ -1639,7 +1727,7 @@ impl App {
                     None => "Project properties set.".to_owned(),
                 };
                 let fields: Vec<(String, String)> = fields.into_iter().collect();
-                open.set_project_props(&name, &fields, None)?;
+                open.set_project_props(&name, &fields, None, None)?;
                 Ok(said)
             }
             "get_template" => {
@@ -1895,7 +1983,12 @@ impl App {
             "strips": strip_list(open, None),
             "open_comments": open.project.comments.iter().filter(|c| !c.resolved).count(),
             "shown": shown,
-            "selection": self.ed.selection.iter().map(selection_id).collect::<Vec<_>>(),
+            "selection": self
+                .ed
+                .selection
+                .iter()
+                .map(|s| item_id(self.ed.panel.is_none().then(|| open.project.pages.get(self.ed.page)).flatten(), s))
+                .collect::<Vec<_>>(),
             // In a session, Undo takes back only this person's changes made in it.
             "can_undo": if self.share.active() { self.share.can_undo() } else { open.can_undo() },
         })))
@@ -4948,6 +5041,147 @@ mod tests {
     }
 
     #[test]
+    fn revision_clouds_and_the_table_are_named_cut_and_followed_safely() {
+        use crate::state::RevisionRow;
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.add_revision("A", "2026-11-19", "First issue", "").unwrap();
+        let p = |x, y| Point::new(x, y);
+        open.add_cloud(1, p(20.0, 20.0), p(60.0, 40.0)).unwrap();
+        open.add_cloud(1, p(100.0, 20.0), p(140.0, 40.0)).unwrap();
+        open.place_revision_table(1, p(200.0, 150.0)).unwrap();
+        let line = Shape::Line {
+            a: p(0.0, 0.0),
+            b: p(5.0, 0.0),
+        };
+        open.project.pages[1].graphics = vec![line.clone()];
+        a.ed.page = 1;
+
+        // The ids the state gives are taken back.
+        let page = a.open.as_ref().unwrap().project.pages[1].number.clone();
+        call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": ["revision table"], "dx": 10, "dy": 0}),
+        )
+        .unwrap();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[1].revision_table,
+            Some(p(210.0, 150.0))
+        );
+        // A cloud is named by what it is, as the state shows it when selected.
+        a.ed.selection = vec![Selection::Cloud(1)];
+        let second = cloud_id(&a.open.as_ref().unwrap().project.pages[1].clouds[1]);
+        assert_eq!(second, "cloud A at 100,20 to 140,40");
+        assert!(a.agent_context().contains(&second), "{}", a.agent_context());
+        // get_state gives the same id.
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["selection"], json!([second]));
+        call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": [second], "dx": 1, "dy": 0}),
+        )
+        .unwrap();
+        assert_eq!(a.open.as_ref().unwrap().project.pages[1].clouds[1].min, p(101.0, 20.0));
+        // An id read before the cloud changed names nothing now, rather than another cloud.
+        let err = call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": [second], "dx": 1, "dy": 0}),
+        )
+        .unwrap_err();
+        assert!(err.contains("No item"), "{err}");
+
+        // Cut of a drawing with a cloud and the table: the drawing goes to the clipboard, the
+        // cloud and the table (which Paste cannot bring back) stay, selected.
+        a.ed.selection = vec![Selection::Graphic(0), Selection::Cloud(0), Selection::RevisionTable];
+        a.run(Action::Cut);
+        let pg = &a.open.as_ref().unwrap().project.pages[1];
+        assert!(pg.graphics.is_empty());
+        assert_eq!((pg.clouds.len(), pg.revision_table.is_some()), (2, true));
+        assert_eq!(a.ed.selection, [Selection::Cloud(0), Selection::RevisionTable]);
+        // Paste brings the drawing back; the cloud and the table were never gone.
+        a.run(Action::Paste);
+        let pg = &a.open.as_ref().unwrap().project.pages[1];
+        assert_eq!(pg.graphics.len(), 1, "the drawing is pasted back");
+        assert_eq!((pg.clouds.len(), pg.revision_table.is_some()), (2, true));
+
+        // The assistant deletes the first cloud while it is selected on screen: the other, now
+        // in the first place, does not become selected.
+        let page = a.open.as_ref().unwrap().project.pages[1].number.clone();
+        let second = a.open.as_ref().unwrap().project.pages[1].clouds[1].clone();
+        a.ed.selection = vec![Selection::Cloud(0)];
+        let pg = &a.open.as_ref().unwrap().project.pages[1];
+        let first = cloud_id(&pg.clouds[0]);
+        call(&mut a, "delete_items", json!({"page": page, "ids": [first]})).unwrap();
+        assert!(
+            a.ed.selection.is_empty(),
+            "the other cloud is not selected: {:?}",
+            a.ed.selection
+        );
+        // The deleted cloud's id, used again, does not name the cloud now in its place.
+        let err = call(&mut a, "delete_items", json!({"page": page, "ids": [first]})).unwrap_err();
+        assert!(err.contains("No item"), "{err}");
+        a.ed.selection.clear();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[1].clouds,
+            std::slice::from_ref(&second)
+        );
+        a.open.as_mut().unwrap().undo();
+
+        // A selected cloud follows its cloud when one before it goes.
+        let old = a.open.as_ref().unwrap().project.pages[1].clouds.clone();
+        let new = vec![old[1].clone()];
+        let mut sel = vec![Selection::Cloud(1), Selection::Cloud(0), Selection::RevisionTable];
+        crate::edit::remap_clouds(&mut sel, &old, &new);
+        assert_eq!(sel, [Selection::Cloud(0), Selection::RevisionTable]);
+
+        // Revision rows edited after someone else changed the revisions are not applied.
+        let open = a.open.as_mut().unwrap();
+        let loaded = RevisionRow::of(&open.project.meta.revisions);
+        let mut draft = loaded.clone();
+        draft[0].text = "First issue, corrected".into();
+        assert_eq!(open.revision_draft_problem(&loaded, &draft), None);
+        open.project
+            .add_revision("B", "2026-11-20", "Added elsewhere", "")
+            .unwrap();
+        let why = open.revision_draft_problem(&loaded, &draft).unwrap();
+        assert!(why.contains("changed by someone else"), "{why}");
+        assert_eq!(
+            open.revision_draft_problem(&loaded, &loaded),
+            None,
+            "rows left alone are not applied"
+        );
+    }
+
+    #[test]
+    fn a_selected_cloud_follows_its_cloud_when_the_session_puts_one_back_before_it() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.add_revision("A", "2026-11-19", "First issue", "").unwrap();
+        for x in [20.0, 100.0, 180.0] {
+            open.add_cloud(1, Point::new(x, 20.0), Point::new(x + 40.0, 40.0))
+                .unwrap();
+        }
+        let clouds = open.project.pages[1].clouds.clone();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        a.ed.page = 1;
+        // Take the first cloud off; the second is then cloud 0, and selected.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].clouds.remove(0);
+        a.sync_session_now(false);
+        a.ed.selection = vec![Selection::Cloud(0)];
+        // The session's undo puts the first cloud back in front: the selection follows the
+        // second cloud rather than staying on the place it had.
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert_eq!(a.open.as_ref().unwrap().project.pages[1].clouds, clouds);
+        assert_eq!(a.ed.selection, vec![Selection::Cloud(1)]);
+    }
+
+    #[test]
     fn the_pdf_export_draws_a_topology_page_per_network() {
         let (_tmp, mut a) = app(vec![]);
         let open = a.open.as_mut().unwrap();
@@ -6088,6 +6322,90 @@ mod tests {
         content["title_block"] = json!({});
         call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
         assert!(page2(&a).title_block.is_empty());
+    }
+
+    #[test]
+    fn a_page_edit_without_revision_marks_keeps_them() {
+        let (_tmp, mut a) = app(vec![]);
+        let cloud = wc_core::revision::RevisionCloud {
+            min: wc_core::Point::new(10.0, 10.0),
+            max: wc_core::Point::new(40.0, 30.0),
+            revision: "B".into(),
+        };
+        if let Some(p) = a.open.as_mut().unwrap().project.page_mut("p0002") {
+            p.clouds.push(cloud.clone());
+            p.revision_table = Some(wc_core::Point::new(300.0, 200.0));
+        }
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        assert_eq!(content["clouds"][0]["revision"], json!("B"), "get_page lists them");
+        let obj = content.as_object_mut().unwrap();
+        obj.remove("clouds");
+        obj.remove("revision_table");
+        content["title"] = json!("Changed");
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).title, "Changed");
+        assert_eq!(page2(&a).clouds, vec![cloud], "kept");
+        assert_eq!(
+            page2(&a).revision_table,
+            Some(wc_core::Point::new(300.0, 200.0)),
+            "kept"
+        );
+        // Given, they are used: `[]` and `null` clear them.
+        content["clouds"] = json!([]);
+        content["revision_table"] = Value::Null;
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert!(page2(&a).clouds.is_empty());
+        assert_eq!(page2(&a).revision_table, None);
+    }
+
+    #[test]
+    fn a_page_edit_lets_go_of_a_selected_cloud_it_removes() {
+        let (_tmp, mut a) = app(vec![]);
+        let cloud = |x: f64| wc_core::revision::RevisionCloud {
+            min: wc_core::Point::new(x, 10.0),
+            max: wc_core::Point::new(x + 20.0, 30.0),
+            revision: "B".into(),
+        };
+        if let Some(p) = a.open.as_mut().unwrap().project.page_mut("p0002") {
+            p.clouds = vec![cloud(10.0), cloud(50.0)];
+        }
+        let i = a.open.as_ref().unwrap().find_page("p0002").unwrap();
+        a.ed.page = i;
+        a.ed.selection = vec![Selection::Cloud(0)];
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        content["clouds"] = json!([cloud(50.0)]);
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert!(
+            a.ed.selection.is_empty(),
+            "the remaining cloud is not taken for the removed one"
+        );
+        // The one that stays stays selected.
+        a.ed.selection = vec![Selection::Cloud(0)];
+        content["clouds"] = json!([cloud(90.0), cloud(50.0)]);
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert_eq!(a.ed.selection, vec![Selection::Cloud(1)]);
+        // Editing another page than the shown one lets go of the shown page's selection.
+        a.ed.page = a.open.as_ref().unwrap().find_page("p0001").unwrap();
+        a.ed.selection = vec![Selection::Cloud(0)];
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert!(a.ed.selection.is_empty());
     }
 
     #[test]

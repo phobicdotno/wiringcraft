@@ -322,8 +322,9 @@ fn fold_own_page(out: &mut Outgoing, base: &Project) {
 /// Page `base` as both this window (`local`) and the session (`auth`) changed it: the session's
 /// page with the local changes on top, or `None` when the two touched the same thing. Symbols
 /// and wires are matched by id, title-block fields by name, the free graphics and texts (which
-/// carry no id) item by item ([`merge_unordered`]); the title, size, underlay, and the overview
-/// and cover marks each count as one thing.
+/// carry no id) and the revision clouds item by item ([`merge_unordered`]); the title, size,
+/// underlay, the overview and cover marks and the revision table's place each count as one
+/// thing.
 /// A wire that ends at a symbol the other side took away is a clash too. The page number is
 /// left as the session's.
 fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
@@ -336,6 +337,9 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
     page.graphics = merge_unordered(&base.graphics, &auth.graphics, &local.graphics, |a, b| {
         std::mem::discriminant(a) == std::mem::discriminant(b)
     })?;
+    // Revision clouds carry no id either; the revision table's place is one thing.
+    page.clouds = merge_unordered(&base.clouds, &auth.clouds, &local.clouds, |_, _| true)?;
+    page.revision_table = pick(&base.revision_table, &auth.revision_table, &local.revision_table)?;
     let names: std::collections::BTreeSet<&String> =
         [base, auth, local].iter().flat_map(|p| p.title_block.keys()).collect();
     let mut title_block = BTreeMap::new();
