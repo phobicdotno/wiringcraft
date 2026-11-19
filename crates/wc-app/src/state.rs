@@ -2076,18 +2076,16 @@ impl Open {
 
     /// Keep `layout` as the project's layout for report `kind`, in place of its first one
     /// (later ones for the kind are left, unused, for [`wc_report::layout_warnings`] to name);
-    /// `None` drops the first one, so the report is built in. One undo step; nothing changes
-    /// when it is the same.
+    /// `None` drops every one of the kind, so the report is built in. One undo step; nothing
+    /// changes when it is the same.
     pub fn set_report_layout(&mut self, kind: wc_report::Kind, layout: Option<wc_core::report_layout::ReportLayout>) {
         let mut reports = self.project.meta.reports.clone();
-        let at = reports.iter().position(|l| l.kind == kind.name());
-        match (at, layout) {
-            (Some(i), Some(l)) => reports[i] = l,
-            (Some(i), None) => {
-                reports.remove(i);
-            }
-            (None, Some(l)) => reports.push(l),
-            (None, None) => {}
+        match layout {
+            Some(l) => match reports.iter_mut().find(|r| r.kind == kind.name()) {
+                Some(slot) => *slot = l,
+                None => reports.push(l),
+            },
+            None => reports.retain(|r| r.kind != kind.name()),
         }
         if reports == self.project.meta.reports {
             return;

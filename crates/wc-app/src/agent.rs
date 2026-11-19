@@ -5065,15 +5065,46 @@ mod tests {
         assert_eq!(reports(&a)[0].title.as_deref(), Some("Mine"));
 
         // Back to the built-in layout drops it; another project gets nothing.
-        let none = crate::report_layout_form::Form::new(Kind::Parts, builtin.clone(), reports(&a).first());
-        let cleared = crate::report_layout_form::Form {
-            loaded: none.loaded.clone(),
-            ..crate::report_layout_form::Form::new(Kind::Parts, builtin.clone(), None)
-        };
+        let cleared = crate::report_layout_form::Form::new(Kind::Parts, builtin.clone(), reports(&a).first()).cleared();
         let err = a.apply_report_layout(&cleared, Path::new("elsewhere")).err().unwrap();
         assert!(err.contains("another project"), "{err}");
+        // A second layout for the kind (unused) and one of another kind: back to the built-in
+        // layout drops both of the kind, keeps the other, and one undo brings them back.
+        let mut second = reports(&a)[0].clone();
+        second.title = Some("Second".into());
+        let other = wc_core::report_layout::ReportLayout {
+            kind: "wires".into(),
+            title: Some("Wires".into()),
+            ..Default::default()
+        };
+        a.open
+            .as_mut()
+            .unwrap()
+            .project
+            .meta
+            .reports
+            .extend([second, other.clone()]);
+        let before = reports(&a);
+        // The preview shows a draft without keeping it.
+        let o = a.open.as_ref().unwrap();
+        let mut draft = before[0].clone();
+        draft.title = Some("Draft".into());
+        let preview = wc_report::build_with(
+            Kind::Parts,
+            &wc_report::Inputs {
+                project: &o.project,
+                symbols: &o.symbols,
+                parts: &o.parts,
+            },
+            Some(&draft),
+        );
+        assert_eq!(preview.title, "Draft");
+        assert_eq!(reports(&a), before);
         a.apply_report_layout(&cleared, &dir).unwrap();
-        assert!(reports(&a).is_empty());
+        assert_eq!(reports(&a), [other]);
+        assert_eq!(inputs_table(&a).columns, builtin);
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), before);
     }
 
     #[test]

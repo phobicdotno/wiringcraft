@@ -116,7 +116,7 @@ enum Dialog {
     Reports(wc_report::Kind),
     /// One report's layout, edited next to a preview of the report in it.
     ReportLayout {
-        form: report_layout_form::Form,
+        form: Box<report_layout_form::Form>,
         /// The folder of the project the layout is of: another project opened meanwhile
         /// does not get it.
         dir: PathBuf,
@@ -1930,17 +1930,24 @@ impl App {
                 }
                 Dialog::ReportLayout { form, dir } => {
                     if let Some(o) = self.open.as_ref() {
-                        report_layout_form::show(ui, form);
-                        ui.separator();
-                        let inputs = wc_report::Inputs {
-                            project: &o.project,
-                            symbols: &o.symbols,
-                            parts: &o.parts,
-                        };
-                        let draft = form.layout();
-                        let table = wc_report::build_with(form.kind, &inputs, draft.as_ref());
-                        ui.label(RichText::new(&table.title).strong());
-                        report_table(ui, &table);
+                        // The form and preview scroll; OK and Cancel stay in view below them.
+                        egui::ScrollArea::vertical()
+                            .id_salt("reportlayout-scroll")
+                            .max_height(ui.ctx().screen_rect().height() * 0.6)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                report_layout_form::show(ui, form);
+                                ui.separator();
+                                let inputs = wc_report::Inputs {
+                                    project: &o.project,
+                                    symbols: &o.symbols,
+                                    parts: &o.parts,
+                                };
+                                let draft = form.layout();
+                                let table = wc_report::build_with(form.kind, &inputs, draft.as_ref());
+                                ui.label(RichText::new(&table.title).strong());
+                                report_table(ui, &table);
+                            });
                         let bad = form.problem();
                         if let Some(why) = &bad {
                             ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
@@ -1948,7 +1955,7 @@ impl App {
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
-                                let (form, dir) = (form.clone(), dir.clone());
+                                let (form, dir) = (form.as_ref().clone(), dir.clone());
                                 then = Some(Box::new(move |app: &mut App| {
                                     if let Err(e) = app.apply_report_layout(&form, &dir) {
                                         app.ed.message = e;
@@ -1957,10 +1964,7 @@ impl App {
                                 keep = false;
                             }
                             if ui.button("Built-in layout").on_hover_text("Clear the form to the report's own columns").clicked() {
-                                *form = report_layout_form::Form {
-                                    loaded: form.loaded.clone(),
-                                    ..report_layout_form::Form::new(form.kind, form.builtin.clone(), None)
-                                };
+                                **form = form.cleared();
                             }
                             if ui.button("Cancel").clicked() {
                                 let k = form.kind;
@@ -2372,7 +2376,11 @@ impl App {
             };
             let builtin = wc_report::build_builtin(kind, &inputs).columns;
             self.dialog = Some(Dialog::ReportLayout {
-                form: report_layout_form::Form::new(kind, builtin, wc_report::layout_for(&o.project, kind)),
+                form: Box::new(report_layout_form::Form::new(
+                    kind,
+                    builtin,
+                    wc_report::layout_for(&o.project, kind),
+                )),
                 dir: o.dir.clone(),
             });
         }
@@ -2389,14 +2397,13 @@ impl App {
             return Err("The report layout was not kept: another project was opened while it was edited.".into());
         };
         let now = wc_report::layout_for(&o.project, form.kind).cloned();
-        let draft = form.layout();
-        if draft != form.loaded {
+        if form.edited() {
             if now != form.loaded {
                 self.dialog = Some(Dialog::ReportLayout {
-                    form: report_layout_form::Form {
+                    form: Box::new(report_layout_form::Form {
                         loaded: now,
                         ..form.clone()
-                    },
+                    }),
                     dir: dir.to_path_buf(),
                 });
                 return Err(
@@ -2404,7 +2411,7 @@ impl App {
                         .into(),
                 );
             }
-            o.set_report_layout(form.kind, draft);
+            o.set_report_layout(form.kind, form.layout());
         }
         self.dialog = Some(Dialog::Reports(form.kind));
         Ok(())

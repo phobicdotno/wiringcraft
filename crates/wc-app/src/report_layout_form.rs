@@ -41,6 +41,9 @@ pub struct Form {
     pub header: String,
     /// The layout the project had for this report when the dialog opened.
     pub loaded: Option<ReportLayout>,
+    /// [`Form::layout`] as the dialog opened: OK changes nothing while the form still gives
+    /// it (a loaded layout listing every built-in column gives none, as it shows the same).
+    pub initial: Option<ReportLayout>,
 }
 
 impl Form {
@@ -88,7 +91,7 @@ impl Form {
                     .collect()
             })
             .unwrap_or_default();
-        Form {
+        let mut form = Form {
             kind,
             builtin,
             title: loaded.and_then(|l| l.title.clone()).unwrap_or_default(),
@@ -97,6 +100,23 @@ impl Form {
             group: loaded.and_then(|l| l.group.clone()).unwrap_or_default(),
             header: loaded.map(|l| l.header.join(", ")).unwrap_or_default(),
             loaded: loaded.cloned(),
+            initial: None,
+        };
+        form.initial = form.layout();
+        form
+    }
+
+    /// Whether the form gives another layout than it did when the dialog opened.
+    pub fn edited(&self) -> bool {
+        self.layout() != self.initial
+    }
+
+    /// The form cleared to the report's built-in layout, still against the layout it opened on.
+    pub fn cleared(&self) -> Form {
+        Form {
+            loaded: self.loaded.clone(),
+            initial: self.initial.clone(),
+            ..Form::new(self.kind, self.builtin.clone(), None)
         }
     }
 
@@ -155,7 +175,8 @@ impl Form {
 
     /// Move column `i` one place up (`-1`) or down (`1`).
     pub fn move_column(&mut self, i: usize, by: isize) {
-        let Some(j) = i.checked_add_signed(by).filter(|j| *j < self.columns.len()) else {
+        let len = self.columns.len();
+        let Some(j) = i.checked_add_signed(by).filter(|j| i < len && *j < len) else {
             return;
         };
         self.columns.swap(i, j);
@@ -318,6 +339,21 @@ mod tests {
         // Opened again on it, the form shows the same layout.
         let again = Form::new(wc_report::Kind::Parts, builtin(), Some(&l));
         assert_eq!(again.layout(), Some(l));
+        assert!(!again.edited());
+        assert!(again.cleared().edited(), "back to the built-in layout is an edit");
+        // A saved layout listing every built-in column as built in shows the same: untouched,
+        // it is no edit although the form leaves the columns out.
+        let all = ReportLayout {
+            kind: "parts".into(),
+            columns: builtin()
+                .into_iter()
+                .map(|from| ReportColumn { from, heading: None })
+                .collect(),
+            ..ReportLayout::default()
+        };
+        let f = Form::new(wc_report::Kind::Parts, builtin(), Some(&all));
+        assert_eq!(f.layout(), None);
+        assert!(!f.edited());
         assert!(!again.columns[2].shown, "the hidden column is listed, unticked");
     }
 
@@ -340,6 +376,11 @@ mod tests {
         assert!(f.problem().is_some());
         f.move_column(0, -1);
         f.move_column(3, 1);
-        assert_eq!(f.columns[0].from, "Colour", "moves past either end do nothing");
+        f.move_column(4, -1);
+        f.move_column(usize::MAX, -1);
+        assert_eq!(
+            f.columns[0].from, "Colour",
+            "moves past either end, or of no column, do nothing"
+        );
     }
 }
