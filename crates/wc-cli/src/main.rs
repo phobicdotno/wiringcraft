@@ -209,8 +209,10 @@ enum Cmd {
     /// device tag and located at its address (`%I*`/`%Q*` when it has none).
     PlcVars { out: PathBuf },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
-    /// potentials, open pins, wires ending in the air, devices without a part. Exits with an
-    /// error when an error is found, so it can guard a commit or a CI job.
+    /// potentials, open pins, wires ending in the air, devices without a part, plus the
+    /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
+    /// pattern, at most N wires on a terminal). Exits with an error when an error is found, so
+    /// it can guard a commit or a CI job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]
