@@ -2922,6 +2922,48 @@ mod tests {
         assert_eq!(o.project.pages[0], page, "the page is unchanged");
     }
 
+    #[test]
+    fn a_selected_cloud_and_revision_table_are_painted_in_the_selection_colour() {
+        let (_tmp, mut o) = project();
+        o.project.add_revision("A", "2026-11-19", "First issue", "").unwrap();
+        o.add_cloud(1, Point::new(20.0, 20.0), Point::new(60.0, 40.0)).unwrap();
+        o.place_revision_table(1, Point::new(200.0, 150.0)).unwrap();
+        let mut ed = Editor {
+            page: 1,
+            ..Editor::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let colour = crate::theme::Theme::of(&ctx).selection;
+        // How many lines of one frame are drawn in the selection colour.
+        let selected_lines = |o: &mut Open, ed: &mut Editor| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, false, 1.0));
+            });
+            out.shapes
+                .iter()
+                .filter(|c| match &c.shape {
+                    EShape::Path(p) => p.stroke.color == egui::epaint::ColorMode::Solid(colour),
+                    EShape::LineSegment { stroke, .. } => stroke.color == colour,
+                    _ => false,
+                })
+                .count()
+        };
+        assert_eq!(selected_lines(&mut o, &mut ed), 0, "nothing selected");
+        ed.selection = vec![Selection::Cloud(0)];
+        let cloud = selected_lines(&mut o, &mut ed);
+        assert!(cloud > 0, "the selected cloud");
+        ed.selection = vec![Selection::RevisionTable];
+        let table = selected_lines(&mut o, &mut ed);
+        assert!(table > 0, "the selected table");
+        ed.selection = vec![Selection::Cloud(0), Selection::RevisionTable];
+        assert_eq!(selected_lines(&mut o, &mut ed), cloud + table, "each in its own colour");
+    }
+
     /// Draw one frame of the canvas with `events`; returns every text painted and where.
     fn painted(
         ctx: &egui::Context,

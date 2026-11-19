@@ -1447,7 +1447,17 @@ impl App {
                 let open = need_open(self.open.as_mut())?;
                 let sel = open.selections(page, &ids, &clouds)?;
                 match name {
-                    "delete_items" => open.delete_many(page, &sel),
+                    "delete_items" => {
+                        let before = open.project.pages.get(page).map(|p| p.clouds.clone());
+                        open.delete_many(page, &sel);
+                        // The clouds after one deleted move up: what the user had selected
+                        // follows its cloud, and a deleted one is let go.
+                        if page == self.ed.page
+                            && let (Some(old), Some(p)) = (before, open.project.pages.get(page))
+                        {
+                            crate::edit::remap_clouds(&mut self.ed.selection, &old, &p.clouds);
+                        }
+                    }
                     "move_items" => {
                         let d = Point::new(need_num(v, "dx")?, need_num(v, "dy")?);
                         open.checkpoint();
@@ -4949,6 +4959,23 @@ mod tests {
         assert!(pg.graphics.is_empty());
         assert_eq!((pg.clouds.len(), pg.revision_table.is_some()), (2, true));
         assert_eq!(a.ed.selection, [Selection::Cloud(0), Selection::RevisionTable]);
+
+        // The assistant deletes the first cloud while both are selected on screen: the other
+        // stays selected as itself, not as the cloud now in the first place.
+        let page = a.open.as_ref().unwrap().project.pages[1].number.clone();
+        let second = a.open.as_ref().unwrap().project.pages[1].clouds[1].clone();
+        a.ed.selection = vec![Selection::Cloud(0)];
+        call(&mut a, "delete_items", json!({"page": page, "ids": ["cloud 0"]})).unwrap();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[1].clouds,
+            std::slice::from_ref(&second)
+        );
+        assert!(
+            a.ed.selection.is_empty(),
+            "the remaining cloud is not selected: {:?}",
+            a.ed.selection
+        );
+        a.open.as_mut().unwrap().undo();
 
         // A selected cloud follows its cloud when one before it goes.
         let old = a.open.as_ref().unwrap().project.pages[1].clouds.clone();
