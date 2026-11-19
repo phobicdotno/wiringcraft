@@ -1117,18 +1117,35 @@ mod tests {
     #[cfg(windows)]
     fn junction(link: &Path, to: &Path) -> io::Result<()> {
         use std::os::windows::process::CommandExt;
-        // Quoted for cmd, so characters such as `&` in a path are taken literally (a path
+        // The paths reach cmd through variables, quoted: cmd expands a variable once and does
+        // not parse its value again, so `&` and `%` in a path are taken literally (a path
         // cannot hold a `"`).
-        let quoted = |p: &Path| format!("\"{}\"", p.display());
         let done = std::process::Command::new("cmd")
             .arg("/C")
-            .raw_arg(format!("mklink /J {} {}", quoted(link), quoted(to)))
+            .raw_arg(r#"mklink /J "%WC_JUNCTION_LINK%" "%WC_JUNCTION_TO%""#)
+            .env("WC_JUNCTION_LINK", link)
+            .env("WC_JUNCTION_TO", to)
             .output()?;
         if done.status.success() {
             Ok(())
         } else {
             Err(io::Error::other(String::from_utf8_lossy(&done.stderr).into_owned()))
         }
+    }
+
+    /// The junction helper takes paths with `&` and `%` in them literally.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_made_for_paths_cmd_would_parse() -> TestResult {
+        let out = tempfile::tempdir()?;
+        let to = out.path().join("a&b %TEMP% c");
+        std::fs::create_dir(&to)?;
+        std::fs::write(to.join("x.txt"), "x")?;
+        let link = out.path().join("l&k %TEMP%");
+        junction(&link, &to)?;
+        assert_eq!(std::fs::read_to_string(link.join("x.txt"))?, "x");
+        std::fs::remove_dir(&link)?;
+        Ok(())
     }
 
     /// The output folder's parent swapped for a junction into the project after the look,
