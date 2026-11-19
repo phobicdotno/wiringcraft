@@ -348,12 +348,21 @@ fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
         .collect::<std::io::Result<Vec<String>>>()
         .map_err(|e| Error::io(&folder, e))?;
     // A used name that is a link keeps the file it points to.
-    let targets: Vec<std::ffi::OsString> = used
-        .iter()
-        .filter_map(|u| resolved.join(u).canonicalize().ok())
-        .filter(|t| t.parent() == Some(resolved.as_path()))
-        .filter_map(|t| t.file_name().map(ToOwned::to_owned))
-        .collect();
+    let mut targets: Vec<std::ffi::OsString> = Vec::new();
+    for u in &used {
+        let path = resolved.join(u);
+        let target = match path.canonicalize() {
+            Ok(target) => target,
+            // A used name with no file (or a dangling link) protects nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::io(&path, e)),
+        };
+        if target.parent() == Some(resolved.as_path())
+            && let Some(name) = target.file_name()
+        {
+            targets.push(name.to_owned());
+        }
+    }
     for name in &listed {
         // A case variant of a used name is kept only when the used name itself is not
         // listed: then the folder ignores case and the variant is the used file. When both are
