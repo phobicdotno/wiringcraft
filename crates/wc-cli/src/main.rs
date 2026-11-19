@@ -2425,9 +2425,15 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 // Read first, so a failed refresh puts the copy back as it was: the lock on disk
                 // is only saved after a refresh that worked, and must keep matching the copy. A
                 // copy whose bytes cannot be read is refused, never replaced or removed.
+                // A link that points nowhere is there, not missing, and is refused like the rest.
                 let before: Result<Option<Vec<u8>>, String> = match std::fs::read(&vendored) {
                     Ok(bytes) => Ok(Some(bytes)),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::NotFound
+                            && std::fs::symlink_metadata(&vendored).is_err() =>
+                    {
+                        Ok(None)
+                    }
                     Err(err) => Err(err.to_string()),
                 };
                 // The lock too, before `take`: if saving the new pin fails, it goes back to these
@@ -4932,6 +4938,15 @@ mod tests {
         cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
         assert!(copy_path.is_dir(), "left as it was");
         std::fs::remove_dir(&copy_path).unwrap();
+        // Nor a link that points nowhere: it stays a link, and the pin is kept.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.path().join("gone.json"), &copy_path).unwrap();
+            cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+            assert!(std::fs::symlink_metadata(&copy_path).unwrap().file_type().is_symlink());
+            assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+            std::fs::remove_file(&copy_path).unwrap();
+        }
         store::write_vendored_part(&dir, &edited).unwrap();
         // An unreadable project does not stop an import into a named library folder.
         let broken = tmp.path().join("broken");
