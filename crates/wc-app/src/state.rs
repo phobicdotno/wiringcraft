@@ -2070,6 +2070,16 @@ impl Open {
         Ok(())
     }
 
+    /// Replace the project's check rules ([`wc_core::check_rule`]). One undo step; nothing
+    /// changes when they are the same.
+    pub fn set_check_rules(&mut self, rules: Vec<wc_core::check_rule::CheckRule>) {
+        if rules == self.project.meta.rules {
+            return;
+        }
+        self.checkpoint();
+        self.project.meta.rules = rules;
+    }
+
     /// Whether [`Open::cover_page`] would mark the first page as the cover: no page is marked
     /// yet, and the first one is an empty page titled Cover.
     pub fn cover_marks_first(&self) -> bool {

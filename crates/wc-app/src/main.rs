@@ -18,6 +18,7 @@ mod live_check;
 mod panel_view;
 mod panels;
 mod prefs;
+mod rules_form;
 mod screenshot;
 mod share;
 mod state;
@@ -101,6 +102,15 @@ enum Dialog {
     DeletePage(usize),
     /// Project check findings.
     Check(Vec<wc_report::Finding>),
+    /// The project's check rules, edited as rows; `loaded` is how the project had them when
+    /// the dialog opened.
+    Rules {
+        rows: Vec<rules_form::RuleRow>,
+        loaded: Vec<wc_core::check_rule::CheckRule>,
+        /// The folder of the project the rules are of: another project opened meanwhile
+        /// does not get them.
+        dir: PathBuf,
+    },
     /// Reports (parts, devices, wires, nets, terminals, cables, PLC I/O, contents, locations) as tables.
     Reports(wc_report::Kind),
     /// Write a new text at this point on the current page.
@@ -1058,6 +1068,7 @@ impl App {
             Dialog::PageHistory(..) => "Page history",
             Dialog::Reports(_) => "Reports",
             Dialog::Check(_) => "Project check",
+            Dialog::Rules { .. } => "Check rules",
             Dialog::Commit(_) => "Record a version",
             Dialog::NewBranch(_) => "New branch",
             Dialog::History(_) => "History",
@@ -1384,6 +1395,29 @@ impl App {
                         }
                         if ui.button("Cancel").clicked() {
                             keep = false;
+                        }
+                    });
+                }
+                Dialog::Rules { rows, loaded, dir } => {
+                    rules_form::show(ui, rows);
+                    let bad = rules_form::rules_of(rows).err();
+                    if let Some(why) = &bad {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
+                            let (rows, loaded, dir) = (rows.clone(), loaded.clone(), dir.clone());
+                            then = Some(Box::new(move |app: &mut App| {
+                                if let Err(e) = app.apply_rules(&rows, &loaded, &dir) {
+                                    app.ed.message = e;
+                                }
+                            }));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                            then = Some(Box::new(|app: &mut App| app.show_check()));
                         }
                     });
                 }
@@ -1733,6 +1767,14 @@ impl App {
                             && let Some(o) = self.open.as_ref()
                         {
                             *found = run_check(o);
+                        }
+                        if ui
+                            .button("Rules…")
+                            .on_hover_text("Add, change, reorder or delete the project's own check rules")
+                            .clicked()
+                        {
+                            keep = false;
+                            then = Some(Box::new(|app: &mut App| app.edit_rules()));
                         }
                         if ui.button("Close").clicked() {
                             keep = false;
@@ -2187,6 +2229,61 @@ impl App {
         if let Some(f) = then {
             f(self);
         }
+    }
+
+    /// Open the check rules dialog on the project's rules.
+    fn edit_rules(&mut self) {
+        if let Some(o) = self.open.as_ref() {
+            let loaded = o.project.meta.rules.clone();
+            self.dialog = Some(Dialog::Rules {
+                rows: rules_form::rows_of(&loaded),
+                loaded,
+                dir: o.dir.clone(),
+            });
+        }
+    }
+
+    /// Show the project check, run now.
+    fn show_check(&mut self) {
+        if let Some(o) = self.open.as_ref() {
+            self.dialog = Some(Dialog::Check(run_check(o)));
+        }
+    }
+
+    /// Keep the rules of the check rules dialog (one undo step), then show the check with
+    /// them. Rows left as they were loaded leave the project's rules as they are now (the
+    /// assistant may have changed them meanwhile). `dir` is the project the dialog opened on:
+    /// when another one is open now, nothing is changed.
+    fn apply_rules(
+        &mut self,
+        rows: &[rules_form::RuleRow],
+        loaded: &[wc_core::check_rule::CheckRule],
+        dir: &std::path::Path,
+    ) -> Result<(), String> {
+        let rules = rules_form::rules_of(rows)?;
+        let Some(o) = self.open.as_mut().filter(|o| o.dir == dir) else {
+            return Err("The rules were not kept: another project was opened while they were edited.".into());
+        };
+        // Compared as rows: a value the dialog does not write (a cable rule's max) is no edit.
+        if rows != rules_form::rows_of(loaded) {
+            // The rules changed since the dialog opened (the assistant, someone in a shared
+            // session): the draft would put back what they changed. It stays open on the
+            // rules as they are now, so OK again keeps the draft and Cancel theirs.
+            if o.project.meta.rules != loaded {
+                self.dialog = Some(Dialog::Rules {
+                    rows: rows.to_vec(),
+                    loaded: o.project.meta.rules.clone(),
+                    dir: dir.to_path_buf(),
+                });
+                return Err(
+                    "The check rules changed while you edited them. Your edits are still open: OK keeps them in place of the new rules, Cancel keeps the new rules."
+                        .into(),
+                );
+            }
+            o.set_check_rules(rules);
+        }
+        self.show_check();
+        Ok(())
     }
 
     /// The name for a new project in `dir`: `name`, or the folder's name when it is blank.
