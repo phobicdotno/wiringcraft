@@ -1197,17 +1197,12 @@ fn run(cli: Cli) -> Res<()> {
                         || p.pages
                             .iter()
                             .any(|pg| pg.symbols.iter().any(|s| s.tag.as_ref() == Some(&tag)));
-                    // A part that cannot be read is named with its reason, so a damaged or
-                    // missing copy is not mistaken for a part without a size.
-                    let size = match p.devices.get(&tag).and_then(|d| d.part.as_ref()) {
-                        Some(part) => match store::read_vendored_part(dir, part) {
-                            Ok(part) => wc_core::panel::part_size(&part),
-                            Err(err) => {
-                                eprintln!("warning: cannot read part {part} of {tag}: {err}");
-                                None
-                            }
-                        },
-                        None => None,
+                    let size = match device_part_size(dir, &p, &tag) {
+                        Ok(size) => size,
+                        Err(warning) => {
+                            eprintln!("warning: {warning}");
+                            None
+                        }
                     };
                     let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
                         return Err(format!("no panel {id:?}"));
@@ -4121,6 +4116,19 @@ fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMa
         .collect()
 }
 
+/// The upright size of the device `tag`'s part, if it has a part with a size. A part that
+/// cannot be read gives an error naming it and the reason, so a damaged or missing copy is not
+/// mistaken for a part without a size.
+fn device_part_size(dir: &Path, p: &wc_core::Project, tag: &DeviceTag) -> Result<Option<(f64, f64)>, String> {
+    let Some(part) = p.devices.get(tag).and_then(|d| d.part.as_ref()) else {
+        return Ok(None);
+    };
+    match store::read_vendored_part(dir, part) {
+        Ok(read) => Ok(wc_core::panel::part_size(&read)),
+        Err(err) => Err(format!("cannot read part {part} of {tag}: {err}")),
+    }
+}
+
 /// `panel show`: the plate, then each device with its place, size and turn, one per line.
 fn panel_show(panel: &wc_core::panel::Panel) -> String {
     let mut out = format!(
@@ -5098,6 +5106,17 @@ mod tests {
             )
             .is_err()
         );
+
+        // A damaged pinned copy of the part: the reason is named, and the device is still
+        // placed, with the default size.
+        let copy = store::vendor_path(&dir, ItemKind::Part, "maker.contactor").unwrap();
+        std::fs::write(&copy, "{ not json").unwrap();
+        let p = load(&dir).unwrap();
+        let prefix = "cannot read part maker.contactor of +CAB1-K1: ";
+        let err = device_part_size(&dir, &p, &k1).unwrap_err();
+        assert!(err.starts_with(prefix) && err.len() > prefix.len(), "{err}");
+        cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--at", "100,200"]).unwrap();
+        assert_eq!(on_plate(), Some((Point::new(100.0, 200.0), 18.0, 90.0, Rotation::R0)));
     }
 
     #[test]
