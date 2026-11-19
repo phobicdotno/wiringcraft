@@ -2378,6 +2378,134 @@ fn check_runs_the_projects_own_rules() {
 }
 
 #[test]
+fn library_rules_run_before_the_projects_name_their_source_and_can_be_turned_off() {
+    use wc_core::check_rule::{CheckRule, RuleSet};
+    let (mut p, s, parts) = fixture();
+    let cable = CheckRule {
+        name: Some("lamp-cable".into()),
+        kind: "cable".into(),
+        devices: Some("-P*".into()),
+        ..CheckRule::default()
+    };
+    let tag = CheckRule {
+        kind: "tag".into(),
+        role: Some("terminal".into()),
+        pattern: Some("-X#.#".into()),
+        severity: Some("error".into()),
+        ..CheckRule::default()
+    };
+    let library = vec![
+        RuleSet {
+            source: "house".into(),
+            rules: Ok(vec![cable, tag]),
+        },
+        RuleSet {
+            source: "broken".into(),
+            rules: Err("expected `]`".into()),
+        },
+    ];
+    // The project's own rule is numbered on its own.
+    p.meta.rules = vec![CheckRule {
+        kind: "cable".into(),
+        devices: Some("-P*".into()),
+        message: Some("{tag} wants a cable".into()),
+        ..CheckRule::default()
+    }];
+    let run = |p: &Project| {
+        check_with(
+            &Inputs {
+                project: p,
+                symbols: &s,
+                parts: &parts,
+            },
+            &library,
+        )
+    };
+    let messages = |p: &Project| run(p).into_iter().map(|f| f.message).collect::<Vec<_>>();
+    let found = messages(&p);
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(
+        has("-P1 has no cable (check rule 1 \"lamp-cable\" of library house)"),
+        "{found:?}"
+    );
+    assert!(
+        has("-X2 does not match -X#.# (check rule 2 of library house)"),
+        "{found:?}"
+    );
+    assert!(has("-P1 wants a cable"), "{found:?}");
+    assert!(
+        has("the check rules of library broken cannot be read: expected `]`"),
+        "{found:?}"
+    );
+    // Without the library, only the project's rule.
+    let alone = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert!(!alone.iter().any(|f| f.message.contains("of library")));
+
+    // Turned off by name and by number; an entry that names nothing is reported, one for
+    // the source that could not be read is not.
+    p.meta.rules_off = vec![
+        "house:lamp-cable".into(),
+        "house:2".into(),
+        "house:9".into(),
+        "broken:1".into(),
+    ];
+    let found = messages(&p);
+    assert!(!found.iter().any(|f| f.contains("of library house")), "{found:?}");
+    assert!(found.iter().any(|f| f == "-P1 wants a cable"));
+    let unknown: Vec<_> = found.iter().filter(|f| f.starts_with("rules_off names")).collect();
+    assert_eq!(unknown.len(), 1, "{found:?}");
+    assert!(unknown[0].contains("\"house:9\""));
+}
+
+#[test]
+fn a_library_rules_own_message_still_names_the_rule_and_its_source() {
+    use wc_core::check_rule::{CheckRule, RuleSet};
+    let (p, s, parts) = fixture();
+    let library = vec![RuleSet {
+        source: "house".into(),
+        rules: Ok(vec![
+            CheckRule {
+                kind: "cable".into(),
+                devices: Some("-P*".into()),
+                message: Some("{tag} wants a house cable".into()),
+                ..CheckRule::default()
+            },
+            CheckRule {
+                kind: "tag".into(),
+                role: Some("terminal".into()),
+                pattern: Some("-X#.#".into()),
+                message: Some("{tag} breaks the house tags".into()),
+                ..CheckRule::default()
+            },
+        ]),
+    }];
+    let found: Vec<String> = check_with(
+        &Inputs {
+            project: &p,
+            symbols: &s,
+            parts: &parts,
+        },
+        &library,
+    )
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(
+        has("-P1 wants a house cable (check rule 1 of library house)"),
+        "{found:?}"
+    );
+    assert!(
+        has("-X2 breaks the house tags (check rule 2 of library house)"),
+        "{found:?}"
+    );
+}
+
+#[test]
 fn plc_card_overview_lays_out_three_cards_like_the_io_list() {
     use wc_core::plc_rack::{PlcCard, PlcRack};
     let (mut p, mut s, parts) = fixture();

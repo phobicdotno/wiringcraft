@@ -194,6 +194,9 @@ pub struct Open {
     pub symbols: BTreeMap<String, Symbol>,
     /// Ids of every symbol in the project's library sources (for the picker).
     pub library: Vec<(String, String)>,
+    /// The check rules of the project's library sources, read with the library
+    /// ([`Open::refresh_library`]) so checks while drawing need not read files.
+    pub library_rules: Vec<wc_core::check_rule::RuleSet>,
     /// The project's vendored parts that devices use.
     pub parts: BTreeMap<String, Part>,
     /// Every part in the project and its library sources, as (id, label), for the part picker.
@@ -289,6 +292,7 @@ impl Open {
             project,
             symbols,
             library: Vec::new(),
+            library_rules: Vec::new(),
             parts: BTreeMap::new(),
             part_library: Vec::new(),
             dirty: false,
@@ -413,6 +417,7 @@ impl Open {
             }
         }
         self.library = items.into_iter().collect();
+        self.library_rules = wc_library::library_rules(&self.dir, &self.project);
         self.touch();
 
         self.parts = self

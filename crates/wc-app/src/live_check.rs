@@ -3,10 +3,12 @@
 //! slowing typing or dragging.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
+use wc_core::check_rule::RuleSet;
 use wc_core::{Part, Project, Symbol};
 use wc_report::Finding;
 
@@ -27,11 +29,20 @@ struct Snapshot {
     project: Project,
     symbols: BTreeMap<String, Symbol>,
     parts: BTreeMap<String, Part>,
+    /// The project's folder, which its library sources resolve against.
+    dir: PathBuf,
+    /// The library sources' check rules, as last loaded
+    /// ([`Open::library_rules`](crate::state::Open::library_rules)).
+    library: Vec<RuleSet>,
 }
 
 impl Snapshot {
-    fn same(&self, project: &Project, symbols: &BTreeMap<String, Symbol>, parts: &BTreeMap<String, Part>) -> bool {
-        self.project == *project && self.symbols == *symbols && self.parts == *parts
+    fn same(&self, open: &crate::state::Open) -> bool {
+        self.project == open.project
+            && self.symbols == open.symbols
+            && self.parts == open.parts
+            && self.dir.as_path() == open.dir.as_path()
+            && self.library == open.library_rules
     }
 }
 
@@ -110,15 +121,8 @@ impl LiveCheck {
     /// runs is checked after it.
     ///
     /// [`Open::revision`]: crate::state::Open::revision
-    pub fn poll(
-        &mut self,
-        project: &Project,
-        symbols: &BTreeMap<String, Symbol>,
-        parts: &BTreeMap<String, Part>,
-        revision: u64,
-        editing: bool,
-        now: Instant,
-    ) -> Poll {
+    pub fn poll(&mut self, open: &crate::state::Open, editing: bool, now: Instant) -> Poll {
+        let revision = open.revision();
         let edited = self.seen.replace(revision) != Some(revision);
         if edited || editing {
             self.note(edited, editing, now);
@@ -148,7 +152,7 @@ impl LiveCheck {
                 }
             }
         }
-        let same = |s: &Option<Arc<Snapshot>>| s.as_ref().is_some_and(|s| s.same(project, symbols, parts));
+        let same = |s: &Option<Arc<Snapshot>>| s.as_ref().is_some_and(|s| s.same(open));
         let Some(wait) = self.pending else {
             // The backstop: an edit no revision told of.
             if self.compared.is_none_or(|t| now.saturating_duration_since(t) >= SWEEP) {
@@ -177,18 +181,23 @@ impl LiveCheck {
             return Poll { changed, again: None };
         }
         let snap = Arc::new(Snapshot {
-            project: project.clone(),
-            symbols: symbols.clone(),
-            parts: parts.clone(),
+            project: open.project.clone(),
+            symbols: open.symbols.clone(),
+            parts: open.parts.clone(),
+            dir: open.dir.clone(),
+            library: open.library_rules.clone(),
         });
         let (tx, rx) = channel();
         let input = Arc::clone(&snap);
         let spawned = std::thread::Builder::new().name("live-check".into()).spawn(move || {
-            let found = wc_report::check(&wc_report::Inputs {
-                project: &input.project,
-                symbols: &input.symbols,
-                parts: &input.parts,
-            });
+            let found = wc_report::check_with(
+                &wc_report::Inputs {
+                    project: &input.project,
+                    symbols: &input.symbols,
+                    parts: &input.parts,
+                },
+                &input.library,
+            );
             // The window may have moved on; then nobody waits for this.
             let _ = tx.send(found);
         });
@@ -268,7 +277,7 @@ mod tests {
     fn settle(live: &mut LiveCheck, o: &Open, now: &mut Instant) -> bool {
         let mut changed = false;
         for _ in 0..1000 {
-            let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, *now);
+            let p = live.poll(o, false, *now);
             changed |= p.changed;
             if p.again.is_none() {
                 return changed;
@@ -318,7 +327,7 @@ mod tests {
 
         // Rename the second coil: nothing is checked until the edit has settled.
         rename_second_coil(&mut o, "-K2");
-        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
+        let p = live.poll(&o, true, now);
         assert!(!p.changed);
         assert!(p.again.is_some_and(|d| d <= SETTLE), "{p:?}");
         assert!(live.busy());
@@ -335,26 +344,72 @@ mod tests {
 
         // Unchanged: no frame compares anything, and input that changed nothing (a click on
         // the empty sheet) starts no new check once it settles.
-        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        let p = live.poll(&o, false, now);
         assert_eq!(p, Poll::default());
-        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
+        let p = live.poll(&o, true, now);
         assert!(p.again.is_some());
         assert!(!live.busy(), "input alone is not an edit");
         now += SETTLE;
-        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        let p = live.poll(&o, false, now);
         assert_eq!(p, Poll::default());
         assert!(live.job.is_none());
+    }
+
+    #[test]
+    fn the_check_and_the_live_check_run_a_library_sources_rules() {
+        let (tmp, mut o) = coil_twice();
+        let house = tmp.path().join("house");
+        std::fs::create_dir_all(&house).unwrap();
+        std::fs::write(
+            house.join(wc_core::check_rule::LIBRARY_RULES_FILE),
+            "[[rule]]\nkind = \"tag\"\ndevices = \"-K*\"\npattern = \"-K#.#\"\n",
+        )
+        .unwrap();
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "house".into(),
+            kind: "folder".into(),
+            location: house.display().to_string(),
+            reference: None,
+        });
+        o.refresh_library();
+        let house_rule = |f: &[Finding]| {
+            f.iter()
+                .filter(|f| f.message == "-K1 does not match -K#.# (check rule 1 of library house)")
+                .count()
+        };
+        assert_eq!(house_rule(&crate::run_check(&o)), 1, "the Check dialog");
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        live.poll(&o, false, now);
+        now += SETTLE;
+        settle(&mut live, &o, &mut now);
+        assert_eq!(house_rule(&live.findings), 1, "{:?}", live.findings);
+
+        // Only the rules file changes: reloading the library checks again with the new rule.
+        std::fs::write(
+            house.join(wc_core::check_rule::LIBRARY_RULES_FILE),
+            "[[rule]]\nkind = \"tag\"\ndevices = \"-K*\"\npattern = \"-K#\"\n",
+        )
+        .unwrap();
+        o.refresh_library();
+        checks_the_edit(&mut live, &o, &mut now);
+        assert_eq!(house_rule(&live.findings), 0, "{:?}", live.findings);
+        assert!(
+            !live.findings.iter().any(|f| f.message.contains("of library house")),
+            "{:?}",
+            live.findings
+        );
     }
 
     /// After an edit made without input, from a checked state: the edit is seen at once and
     /// checked once it has settled.
     fn checks_the_edit(live: &mut LiveCheck, o: &Open, now: &mut Instant) {
         assert!(!live.busy());
-        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, *now);
+        let p = live.poll(o, false, *now);
         assert!(live.busy(), "the edit is seen");
         assert!(p.again.is_some());
         *now += SETTLE;
-        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, *now);
+        live.poll(o, false, *now);
         assert!(live.job.is_some(), "the check started");
         settle(live, o, now);
     }
@@ -387,7 +442,7 @@ mod tests {
         settle(&mut live, &o, &mut now);
         let s = o.project.pages[1].symbols.last_mut().unwrap();
         s.tag = Some(DeviceTag::parse("-K2").unwrap());
-        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
+        live.poll(&o, true, now);
         now += SETTLE;
         settle(&mut live, &o, &mut now);
         assert_eq!(duplicate_tag_errors(&live.findings), 0, "{:?}", live.findings);
@@ -399,17 +454,17 @@ mod tests {
         let mut live = LiveCheck::default();
         let mut now = Instant::now();
         // A check of the clash starts.
-        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        live.poll(&o, false, now);
         now += SETTLE;
-        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        live.poll(&o, false, now);
         assert!(live.job.is_some());
         // While it runs, a drag frame fixes the clash without a new revision.
         let s = o.project.pages[1].symbols.last_mut().unwrap();
         s.tag = Some(DeviceTag::parse("-K2").unwrap());
-        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
+        live.poll(&o, true, now);
         // The check finishes before the input settles: its findings are of other inputs.
         for _ in 0..1000 {
-            live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+            live.poll(&o, false, now);
             if live.job.is_none() {
                 break;
             }
@@ -437,14 +492,11 @@ mod tests {
         let s = o.project.pages[1].symbols.last_mut().unwrap();
         s.tag = Some(DeviceTag::parse("-K2").unwrap());
         // Not compared in every frame...
-        assert_eq!(
-            live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now),
-            Poll::default()
-        );
+        assert_eq!(live.poll(&o, false, now), Poll::default());
         assert!(!live.busy());
         // ...but once a sweep is due.
         now += SWEEP;
-        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        let p = live.poll(&o, false, now);
         assert_eq!(p.again, Some(SETTLE));
         assert!(live.busy());
         now += SETTLE;
@@ -490,7 +542,7 @@ mod tests {
         let mut now = Instant::now();
         settle(&mut live, &o, &mut now);
         o.refresh_library();
-        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        let p = live.poll(&o, false, now);
         assert!(live.busy() && p.again.is_some(), "the reload is seen");
     }
 
@@ -503,13 +555,13 @@ mod tests {
         // Keystrokes 100 ms apart: each one only pushes the check back.
         for tag in ["-K", "-K2", "-K22"] {
             rename_second_coil(&mut o, tag);
-            let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
+            let p = live.poll(&o, true, now);
             assert!(p.again.is_some());
             now += Duration::from_millis(100);
         }
         assert!(live.job.is_none(), "no check ran while typing");
         // 300 ms after the first keystroke but only 100 ms after the last: still waiting.
-        let p = live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        let p = live.poll(&o, false, now);
         assert!(p.again.is_some_and(|d| d > Duration::ZERO), "{p:?}");
         assert!(live.job.is_none(), "the wait starts again at each edit");
         assert!(live.settled().is_none(), "the findings are not of these inputs yet");
@@ -528,14 +580,10 @@ mod tests {
         // The assistant renames the coil: no keystroke, so later frames do not push it back.
         rename_second_coil(&mut o, "-K2");
         for _ in 0..3 {
-            assert!(
-                live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now)
-                    .again
-                    .is_some()
-            );
+            assert!(live.poll(&o, false, now).again.is_some());
             now += Duration::from_millis(100);
         }
-        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        live.poll(&o, false, now);
         assert!(live.job.is_some(), "the check started 300 ms after the edit was seen");
     }
 
@@ -549,7 +597,7 @@ mod tests {
         assert!(duplicate_tag_errors(live.settled().unwrap()) > 0);
         // Project B is opened: until its own check is done, A's findings are not shown for it,
         // and the status bar does not count them.
-        live.poll(&b.project, &b.symbols, &b.parts, b.revision(), false, now);
+        live.poll(&b, false, now);
         assert!(live.settled().is_none());
         assert_eq!(live.status(&[]), "Check: checking");
         now += SETTLE;

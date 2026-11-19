@@ -90,6 +90,7 @@ impl RuleRow {
             return Err(format!("Rule {n}: pick a severity ({}).", SEVERITIES.join(", ")));
         }
         Ok(CheckRule {
+            name: self.base.name.clone(),
             kind: kind.to_owned(),
             devices: set(&self.devices),
             role,

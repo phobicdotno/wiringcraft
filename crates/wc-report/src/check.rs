@@ -51,6 +51,13 @@ fn at(page: &Page, item: &str, severity: Severity, message: String) -> Finding {
 
 /// Run every check. Findings come sorted: errors first, then by page.
 pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
+    check_with(i, &[])
+}
+
+/// [`check`], with the check rules of the project's library sources (read by
+/// `wc_library::library_rules`): they run before the project's own, less the ones the project
+/// turns off.
+pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> Vec<Finding> {
     let p = i.project;
     let mut out = Vec::new();
     let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
@@ -391,7 +398,7 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
         }
     }
 
-    rules(i, &mut out);
+    rules(i, library, &mut out);
 
     let page_order: BTreeMap<&str, usize> = p.pages.iter().enumerate().map(|(n, pg)| (pg.id.as_str(), n)).collect();
     out.sort_by(|a, b| {
@@ -418,37 +425,97 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
     out
 }
 
-/// The project's own check rules ([`wc_core::check_rule`]).
-fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
-    use wc_core::check_rule::{CheckRule, KINDS};
+/// The library sources' check rules, less the ones the project turns off, then the
+/// project's own ([`wc_core::check_rule`]).
+fn rules(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet], out: &mut Vec<Finding>) {
+    use wc_core::check_rule::{CheckRule, KINDS, turned_off};
 
     let p = i.project;
     let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
-    let broken = |n: usize, why: String| Finding {
+    let broken = |label: &str, why: String| Finding {
         severity: Severity::Error,
         page_id: None,
         item: None,
-        message: format!("check rule {n} cannot run: {why}"),
+        message: format!("{label} cannot run: {why}"),
     };
-    for (k, rule) in p.meta.rules.iter().enumerate() {
-        let n = k + 1;
+    let named = |n: usize, rule: &CheckRule| match rule.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => format!("check rule {n} \"{name}\""),
+        None => format!("check rule {n}"),
+    };
+    // Each rule to run with how its findings name it, and whether a library holds it.
+    let mut all: Vec<(String, &CheckRule, bool)> = Vec::new();
+    let mut off_used = vec![false; p.meta.rules_off.len()];
+    for set in library {
+        let rules = match &set.rules {
+            Ok(r) => r,
+            Err(e) => {
+                out.push(Finding {
+                    severity: Severity::Error,
+                    page_id: None,
+                    item: None,
+                    message: format!("the check rules of library {} cannot be read: {e}", set.source),
+                });
+                continue;
+            }
+        };
+        for (k, rule) in rules.iter().enumerate() {
+            let mut off = false;
+            for (o, used) in p.meta.rules_off.iter().zip(off_used.iter_mut()) {
+                if turned_off(std::slice::from_ref(o), &set.source, k + 1, rule) {
+                    *used = true;
+                    off = true;
+                }
+            }
+            if !off {
+                all.push((format!("{} of library {}", named(k + 1, rule), set.source), rule, true));
+            }
+        }
+    }
+    for (o, used) in p.meta.rules_off.iter().zip(&off_used) {
+        // A source whose rules could not be read may hold it: that is reported above.
+        let unread = o
+            .split_once(':')
+            .is_some_and(|(s, _)| library.iter().any(|set| set.source == s.trim() && set.rules.is_err()));
+        if !used && !unread {
+            out.push(Finding {
+                severity: Severity::Warning,
+                page_id: None,
+                item: None,
+                message: format!(
+                    "rules_off names \"{o}\", which is no library check rule here (write source:number or source:name)"
+                ),
+            });
+        }
+    }
+    all.extend(
+        p.meta
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(k, r)| (named(k + 1, r), r, false)),
+    );
+    for (label, rule, library) in all {
+        let label = label.as_str();
+        // The finding's text: a library rule's own message still names the rule and its
+        // source, since the project does not show where it comes from.
+        let text = |tag: &DeviceTag, default: String| say(rule, tag, default, label, library);
         if let Some(key) = rule.unknown.keys().next() {
             out.push(broken(
-                n,
+                label,
                 format!(
-                    "it has a key \"{key}\" it does not know (kind, devices, role, pattern, max, severity and message are known)"
+                    "it has a key \"{key}\" it does not know (name, kind, devices, role, pattern, max, severity and message are known)"
                 ),
             ));
             continue;
         }
         let kind = rule.kind.trim().to_ascii_lowercase();
         if kind.is_empty() {
-            out.push(broken(n, format!("it has no kind ({})", KINDS.join(", "))));
+            out.push(broken(label, format!("it has no kind ({})", KINDS.join(", "))));
             continue;
         }
         if !KINDS.contains(&kind.as_str()) {
             out.push(broken(
-                n,
+                label,
                 format!("kind \"{}\" is not one of {}", rule.kind, KINDS.join(", ")),
             ));
             continue;
@@ -457,7 +524,7 @@ fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
             Ok(r) => r,
             Err(bad) => {
                 out.push(broken(
-                    n,
+                    label,
                     format!("role \"{bad}\" is not one of main, auxiliary, standalone, terminal, interruption"),
                 ));
                 continue;
@@ -469,7 +536,7 @@ fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
             Some(s) if s == "warning" => Severity::Warning,
             Some(s) if s == "note" => Severity::Note,
             Some(s) => {
-                out.push(broken(n, format!("severity \"{s}\" is not error, warning or note")));
+                out.push(broken(label, format!("severity \"{s}\" is not error, warning or note")));
                 continue;
             }
         };
@@ -487,10 +554,10 @@ fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
             })
             .collect();
         match kind.as_str() {
-            "cable" => cable_rule(n, rule, severity, &picked, p, out),
+            "cable" => cable_rule(label, library, rule, severity, &picked, p, out),
             "tag" => {
                 let Some(pattern) = rule.pattern.as_deref().filter(|x| !x.trim().is_empty()) else {
-                    out.push(broken(n, "a tag rule needs a pattern".into()));
+                    out.push(broken(label, "a tag rule needs a pattern".into()));
                     continue;
                 };
                 let mut done: BTreeSet<&DeviceTag> = BTreeSet::new();
@@ -500,14 +567,14 @@ fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
                             page,
                             &s.id,
                             severity,
-                            rule.text(tag, format!("{tag} does not match {pattern} (check rule {n})")),
+                            text(tag, format!("{tag} does not match {pattern} ({label})")),
                         ));
                     }
                 }
             }
             _ => {
                 let Some(max) = rule.max else {
-                    out.push(broken(n, "a max-wires rule needs max".into()));
+                    out.push(broken(label, "a max-wires rule needs max".into()));
                     continue;
                 };
                 for (page, s, tag) in &picked {
@@ -526,9 +593,9 @@ fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
                             page,
                             &s.id,
                             severity,
-                            rule.text(
+                            text(
                                 tag,
-                                format!("{tag}:{pin} has {count} wires, at most {max} allowed (check rule {n})"),
+                                format!("{tag}:{pin} has {count} wires, at most {max} allowed ({label})"),
                             ),
                         ));
                     }
@@ -537,8 +604,18 @@ fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
         }
     }
 
+    fn say(rule: &CheckRule, tag: &DeviceTag, default: String, label: &str, library: bool) -> String {
+        let t = rule.text(tag, default);
+        if library && rule.message.is_some() {
+            format!("{t} ({label})")
+        } else {
+            t
+        }
+    }
+
     fn cable_rule(
-        n: usize,
+        label: &str,
+        library: bool,
         rule: &CheckRule,
         severity: Severity,
         picked: &[(&Page, &wc_core::project::PlacedSymbol, &DeviceTag)],
@@ -572,7 +649,7 @@ fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
                     page,
                     item,
                     severity,
-                    rule.text(tag, format!("{tag} has no cable (check rule {n})")),
+                    say(rule, tag, format!("{tag} has no cable ({label})"), label, library),
                 ));
             }
         }

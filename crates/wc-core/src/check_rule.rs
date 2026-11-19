@@ -31,6 +31,15 @@
 //! (one or more digits). A pattern starting with `-` also matches the product part of a tag with
 //! a function or location, so `-M*` matches `=A1+L2-M3`.
 //!
+//! A library source can carry house rules too: a `rules.toml` in the source's folder with the
+//! same `[[rule]]` tables, run for every project that uses the source, before the project's
+//! own rules. Their findings name the source (`check rule 2 of library house`). A rule may
+//! have a `name`; a project turns a library rule off by number or name in `project.toml`:
+//!
+//! ```toml
+//! rules_off = ["house:2", "house:motor-cable"]
+//! ```
+//!
 //! `severity` is `error`, `warning` (the default) or `note`. `message` replaces the built-in
 //! text; `{tag}` in it is replaced by the device's tag. A rule that cannot run (missing or
 //! unknown kind, a key it does not know such as a misspelt `severty`, missing pattern, bad role)
@@ -47,6 +56,12 @@ use crate::symbol::SymbolRole;
 /// One user-written check rule.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CheckRule {
+    /// A name to turn the rule off by (a library rule, [`ProjectMeta::rules_off`]) and to
+    /// show in its findings.
+    ///
+    /// [`ProjectMeta::rules_off`]: crate::project::ProjectMeta::rules_off
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// What the rule checks: `cable`, `tag` or `max-wires`. Empty when the table leaves it
     /// out, which the check reports.
     #[serde(default)]
@@ -73,6 +88,44 @@ pub struct CheckRule {
     /// and reported by the check instead of being ignored.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unknown: BTreeMap<String, toml::Value>,
+}
+
+/// The file in a library source's folder that holds its check rules.
+pub const LIBRARY_RULES_FILE: &str = "rules.toml";
+
+/// The check rules of one library source: its name, and its rules, or why its
+/// [`LIBRARY_RULES_FILE`] could not be read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleSet {
+    pub source: String,
+    pub rules: Result<Vec<CheckRule>, String>,
+}
+
+/// The `[[rule]]` tables of a rules file.
+pub fn parse_rules(text: &str) -> Result<Vec<CheckRule>, String> {
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        rule: Vec<CheckRule>,
+    }
+    toml::from_str::<File>(text)
+        .map(|f| f.rule)
+        .map_err(|e| e.message().to_owned())
+}
+
+/// Whether `off` (a project's [`ProjectMeta::rules_off`]) turns off rule `n` (from 1) of the
+/// library source `source`: by `source:n` or `source:name`.
+///
+/// [`ProjectMeta::rules_off`]: crate::project::ProjectMeta::rules_off
+pub fn turned_off(off: &[String], source: &str, n: usize, rule: &CheckRule) -> bool {
+    off.iter().any(|o| {
+        let Some((s, which)) = o.trim().split_once(':') else {
+            return false;
+        };
+        let which = which.trim();
+        s.trim() == source
+            && (which.parse::<usize>().ok() == Some(n) || rule.name.as_deref().is_some_and(|nm| nm.trim() == which))
+    })
 }
 
 /// The kinds of rule there are, as written in `kind`.
@@ -170,6 +223,34 @@ mod tests {
 
     fn tag(s: &str) -> DeviceTag {
         DeviceTag::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_rules_file_reads_its_rule_tables_and_says_what_is_wrong() {
+        let rules = parse_rules(
+            "[[rule]]\nname = \"motor-cable\"\nkind = \"cable\"\ndevices = \"-M*\"\n\n[[rule]]\nkind = \"max-wires\"\nmax = 2\n",
+        )
+        .unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].name.as_deref(), Some("motor-cable"));
+        assert_eq!(rules[1].max, Some(2));
+        assert!(parse_rules("").unwrap().is_empty());
+        assert!(parse_rules("[[rule]]\nmax = \"two\"").is_err());
+    }
+
+    #[test]
+    fn a_library_rule_is_turned_off_by_source_and_number_or_name() {
+        let rule = CheckRule {
+            name: Some("motor-cable".into()),
+            ..CheckRule::default()
+        };
+        let off = |o: &[&str]| o.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(turned_off(&off(&["house:2"]), "house", 2, &rule));
+        assert!(turned_off(&off(&[" house : motor-cable "]), "house", 1, &rule));
+        assert!(!turned_off(&off(&["house:2"]), "house", 1, &rule));
+        assert!(!turned_off(&off(&["other:2"]), "house", 2, &rule));
+        assert!(!turned_off(&off(&["house"]), "house", 2, &rule));
+        assert!(!turned_off(&off(&["house:cable"]), "house", 2, &CheckRule::default()));
     }
 
     #[test]
