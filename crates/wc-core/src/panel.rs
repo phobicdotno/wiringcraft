@@ -111,8 +111,8 @@ impl Panel {
 
 /// A part's footprint (width, height) in millimetres, if it has one. Each dimension comes from
 /// the part's `Width` or `Height` property, else from the extents of its footprint drawing
-/// ([`crate::part::Footprint`]); a part with one property and a drawing takes the other
-/// dimension from the drawing.
+/// ([`crate::part::Footprint`]), else from the size of its 3D model ([`crate::ModelSize`]); a
+/// part with one property and a drawing takes the other dimension from the drawing.
 pub fn part_size(part: &Part) -> Option<(f64, f64)> {
     let find = |keys: &[&str]| {
         part.properties
@@ -128,8 +128,36 @@ pub fn part_size(part: &Part) -> Option<(f64, f64)> {
         .footprint
         .as_ref()
         .filter(|f| f.width > 0.0 && f.height > 0.0 && f.width <= 5000.0 && f.height <= 5000.0);
-    Some((w.or(drawn.map(|f| f.width))?, h.or(drawn.map(|f| f.height))?))
+    let model = part.model.filter(crate::ModelSize::is_usable);
+    Some((
+        w.or(drawn.map(|f| f.width)).or(model.map(|m| m.width))?,
+        h.or(drawn.map(|f| f.height)).or(model.map(|m| m.height))?,
+    ))
 }
+
+/// A part's depth (out of the plate) in millimetres, if it has one: its `Depth` property, else
+/// the depth of its 3D model ([`crate::ModelSize`]).
+pub fn part_depth(part: &Part) -> Option<f64> {
+    part.properties
+        .iter()
+        .find(|(k, _)| {
+            matches!(
+                k.trim().to_lowercase().as_str(),
+                "depth" | "depth mm" | "tiefe" | "dybde"
+            )
+        })
+        .and_then(|(_, v)| leading_number(v))
+        .filter(|d| *d > 0.0 && *d <= MAX_DEPTH)
+        .or_else(|| {
+            part.model
+                .filter(crate::ModelSize::is_usable)
+                .map(|m| m.depth)
+                .filter(|d| *d <= MAX_DEPTH)
+        })
+}
+
+/// Deepest a device on a mounting plate may be.
+pub const MAX_DEPTH: f64 = 2000.0;
 
 /// Whether a part goes in the cabinet door (push buttons, pilot lights, meters) rather than
 /// on the mounting plate: its `Mounting` property says `door` or `front`.
@@ -353,6 +381,39 @@ mod tests {
         let done = arrange(&mut small, &project, &parts, None);
         assert_eq!(done.placed, vec!["+CAB1-K1"]);
         assert_eq!(done.did_not_fit.len(), 3);
+    }
+
+    #[test]
+    fn a_part_without_a_size_takes_its_3d_model_size_last() {
+        let model = crate::ModelSize {
+            width: 30.0,
+            height: 80.0,
+            depth: 95.0,
+        };
+        let mut p = Part {
+            model: Some(model),
+            ..Part::default()
+        };
+        assert_eq!(part_size(&p), Some((30.0, 80.0)));
+        assert_eq!(part_depth(&p), Some(95.0));
+        p.properties.insert("Depth".into(), "60 mm".into());
+        p.properties.insert("Width".into(), "45".into());
+        assert_eq!(part_depth(&p), Some(60.0), "the part's own depth wins");
+        assert_eq!(part_size(&p), Some((45.0, 80.0)), "and its own width");
+        p.footprint = crate::Footprint::from_shapes(vec![crate::Shape::Rect {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(22.5, 100.0),
+        }]);
+        assert_eq!(part_size(&p), Some((45.0, 100.0)), "the drawing before the model");
+
+        let mut deep = Part {
+            model: Some(crate::ModelSize { depth: 2500.0, ..model }),
+            ..Part::default()
+        };
+        assert_eq!(part_depth(&deep), None, "deeper than a plate takes");
+        deep.model = Some(crate::ModelSize { width: 0.0, ..model });
+        assert_eq!(part_size(&deep), None, "an unusable model is no size");
+        assert_eq!(part_depth(&deep), None);
     }
 
     #[test]

@@ -30,6 +30,32 @@ pub struct Part {
     /// its CAE data), drawn on layout pages instead of a plain box (#312).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footprint: Option<Footprint>,
+    /// The size of the maker's 3D model of the part (its STEP file), used where the part gives
+    /// no `Width`, `Height` or `Depth` of its own (#313).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSize>,
+}
+
+/// The bounding box of a part's 3D model in millimetres, as the model lies: `width` along its
+/// x axis (across the plate), `height` along y (up the plate) and `depth` along z (out of the
+/// plate).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct ModelSize {
+    pub width: f64,
+    pub height: f64,
+    pub depth: f64,
+}
+
+impl ModelSize {
+    /// Largest extent a part's model may have on any axis.
+    pub const MAX: f64 = 5000.0;
+
+    /// Whether every extent is a usable size: above zero and at most [`Self::MAX`].
+    pub fn is_usable(&self) -> bool {
+        [self.width, self.height, self.depth]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0 && *v <= Self::MAX)
+    }
 }
 
 /// A part's outline drawing for cabinet layouts, in millimetres at 1:1 with y pointing down and

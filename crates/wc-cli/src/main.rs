@@ -654,6 +654,21 @@ enum ImportCmd {
         #[arg(long)]
         lib: Option<PathBuf>,
     },
+    /// A maker's 3D model (STEP) of a part: its bounding box gives the part's width, height and
+    /// depth where the part has no `Width`, `Height` or `Depth` of its own, for cabinet layouts
+    /// and their 3D export. The model's x axis runs across the plate, y up it and z out of it.
+    /// Stored in the library with the part; when the project uses the part, its copy in the
+    /// project is updated too.
+    ModelStep {
+        file: PathBuf,
+        /// The part's library id.
+        #[arg(long)]
+        part: String,
+        /// The library folder that holds the part (default: the project's library source that
+        /// has it).
+        #[arg(long)]
+        lib: Option<PathBuf>,
+    },
     /// A symbol from an SVG drawing. Pins: elements with `id="pin:NAME"` or `data-pin="NAME"`.
     SymbolSvg {
         file: PathBuf,
@@ -2356,187 +2371,46 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             for w in &warnings {
                 eprintln!("warning: {}", escape_field(w));
             }
-            // A library folder can be given outside a project; without one the project is needed.
-            let mut project = load(dir);
-            if lib.is_some()
-                && dir.join(store::PROJECT_FILE).exists()
-                && let Err(err) = &project
-            {
-                eprintln!(
-                    "warning: the project could not be read, so its copy of {part} is not updated: {}",
-                    escape_field(err)
-                );
+            update_library_part(
+                dir,
+                &part,
+                lib.as_deref(),
+                "footprint",
+                |item| {
+                    let summary = format!(
+                        "{} x {} mm, {} shapes",
+                        wc_core::geom::format_length(footprint.width),
+                        wc_core::geom::format_length(footprint.height),
+                        footprint.shapes.len()
+                    );
+                    item.footprint = Some(footprint);
+                    summary
+                },
+                |a, b| a.footprint == b.footprint,
+            )?;
+        }
+        ImportCmd::ModelStep { file, part, lib } => {
+            let text = std::fs::read(&file).map_err(e)?;
+            let (size, warnings) = wc_import::step::model_size(&String::from_utf8_lossy(&text)).map_err(e)?;
+            for w in &warnings {
+                eprintln!("warning: {}", escape_field(w));
             }
-            let path = match &lib {
-                Some(root) => {
-                    store::check_id(&part).map_err(e)?;
-                    root.join("parts").join(format!("{part}.json"))
-                }
-                None => {
-                    let p = project.as_ref().map_err(Clone::clone)?;
-                    let library = wc_library::Library::open(dir, p).map_err(e)?;
-                    library
-                        .locate(ItemKind::Part, &part)
-                        .ok_or_else(|| {
-                            format!("no part {part:?} in the project's libraries; name its folder with --lib")
-                        })?
-                        .path
-                }
-            };
-            let mut item: wc_core::Part =
-                store::read_json(&path).map_err(|err| format!("{}: {err}", path.display()))?;
-            if item.id != part {
-                return Err(format!("{} holds part {:?}, not {part:?}", path.display(), item.id));
-            }
-            let (w, h) = (footprint.width, footprint.height);
-            let shapes = footprint.shapes.len();
-            item.footprint = Some(footprint);
-            store::write_if_changed(&path, &store::to_json(&item).map_err(e)?).map_err(e)?;
-            println!(
-                "wrote the footprint of {part} to {} ({} x {} mm, {shapes} shapes)",
-                path.display(),
-                wc_core::geom::format_length(w),
-                wc_core::geom::format_length(h)
-            );
-            // The project's pinned copy follows, so its layouts draw the new footprint, but only
-            // from the file just written: when another of the project's sources wins for this
-            // id, that source's part is not the one that changed.
-            if let Ok(p) = &mut project
-                && p.lock.parts.contains_key(&part)
-            {
-                let library = wc_library::Library::open(dir, p).map_err(e)?;
-                let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-                    (Ok(a), Ok(b)) => a == b,
-                    _ => false,
-                };
-                let winner = library.locate(ItemKind::Part, &part);
-                // A copy changed in the project since it was pinned is not overwritten: those
-                // edits must be removed or merged first.
-                // A copy that is there but cannot be read is not overwritten either.
-                let vendored = store::vendor_path(dir, ItemKind::Part, &part).map_err(e)?;
-                let kept: Option<String> = if vendored.exists() {
-                    match store::read_vendored_part(dir, &part) {
-                        Ok(copy) if p.lock.parts.get(&part).is_some_and(|pin| pin.hash != copy.hash()) => {
-                            Some(format!(
-                                "it has local changes since it was pinned; remove or merge them, then take {part} again"
-                            ))
-                        }
-                        Ok(_) => None,
-                        Err(err) => Some(format!(
-                            "it cannot be read ({err}); fix or remove it, then take {part} again"
-                        )),
-                    }
-                } else {
-                    None
-                };
-                // Read first, so a failed refresh puts the copy back as it was: the lock on disk
-                // is only saved after a refresh that worked, and must keep matching the copy. A
-                // copy whose bytes cannot be read is refused, never replaced or removed.
-                // A link that points nowhere is there, not missing, and is refused like the rest.
-                let before: Result<Option<Vec<u8>>, String> = match std::fs::read(&vendored) {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::NotFound
-                            && std::fs::symlink_metadata(&vendored).is_err() =>
-                    {
-                        Ok(None)
-                    }
-                    Err(err) => Err(err.to_string()),
-                };
-                // The lock too, before `take`: if saving the new pin fails, it goes back to these
-                // bytes. A lock that exists but cannot be read is never removed or replaced.
-                let lock_path = dir.join(store::LOCK_FILE);
-                let lock_before: Result<Option<Vec<u8>>, String> = match std::fs::read(&lock_path) {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(err) => Err(err.to_string()),
-                };
-                let refused = kept
-                    .or_else(|| {
-                        before
-                            .as_ref()
-                            .err()
-                            .map(|err| format!("it cannot be read ({err}); fix or remove it, then take {part} again"))
-                    })
-                    .or_else(|| {
-                        lock_before.as_ref().err().map(|err| {
-                            format!(
-                                "{} cannot be read ({err}); fix it, then take {part} again",
-                                store::LOCK_FILE
-                            )
-                        })
-                    });
-                // Whether `take` ran, so only its own writes are undone.
-                let mut tried = false;
-                let refreshed = match (&refused, &winner) {
-                    (Some(why), _) => Err(why.clone()),
-                    (None, Some(loc)) if same(&loc.path, &path) => {
-                        tried = true;
-                        wc_library::take(dir, p, &library, ItemKind::Part, &part)
-                            .map_err(|err| err.to_string())
-                            .and_then(|_| {
-                                let copy = store::read_vendored_part(dir, &part).map_err(|err| err.to_string())?;
-                                if copy.footprint == item.footprint {
-                                    Ok(())
-                                } else {
-                                    Err("the copy taken has another footprint".to_owned())
-                                }
-                            })
-                    }
-                    (None, Some(loc)) => Err(format!(
-                        "the project takes {part} from source {:?} ({}), not from the file written",
-                        loc.source,
-                        loc.path.display()
-                    )),
-                    (None, None) => Err(format!("{part} is in none of the project's library sources")),
-                };
-                match refreshed {
-                    Ok(()) => {
-                        // The new pin must reach the disk with the copy, or both go back: `save`
-                        // can fail after it wrote the lock.
-                        if let Err(err) = save(dir, p) {
-                            // Both are tried, and every failure is named.
-                            let copy_back = match &before {
-                                Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
-                                Err(_) => Ok(()),
-                            };
-                            let lock_back = match &lock_before {
-                                Ok(bytes) => put_file_back(&lock_path, bytes.as_deref()),
-                                Err(_) => Ok(()),
-                            };
-                            let back = match (copy_back, lock_back) {
-                                (Ok(()), Ok(())) => Ok(()),
-                                (Err(a), Ok(())) => Err(a),
-                                (Ok(()), Err(b)) => Err(b),
-                                (Err(a), Err(b)) => Err(format!("{a}; {b}")),
-                            };
-                            return Err(match back {
-                                Ok(()) => format!("the project's copy of {part} was not updated: {err}"),
-                                Err(why) => format!(
-                                    "the project's copy of {part} was not updated ({err}) and could not be put back: {why}; run `lib status`"
-                                ),
-                            });
-                        }
-                        println!("updated the project's copy of {part}");
-                    }
-                    Err(why) => {
-                        let restored = match &before {
-                            _ if !tried => Ok(()),
-                            Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
-                            Err(_) => Ok(()),
-                        };
-                        eprintln!(
-                            "warning: the project's copy of {part} was not updated: {}",
-                            escape_field(&why)
-                        );
-                        if let Err(err) = restored {
-                            return Err(format!(
-                                "the project's copy of {part} could not be put back: {err}; run `lib status`"
-                            ));
-                        }
-                    }
-                }
-            }
+            update_library_part(
+                dir,
+                &part,
+                lib.as_deref(),
+                "3D model size",
+                |item| {
+                    item.model = Some(size);
+                    format!(
+                        "{} x {} x {} mm",
+                        wc_core::geom::format_length(size.width),
+                        wc_core::geom::format_length(size.height),
+                        wc_core::geom::format_length(size.depth)
+                    )
+                },
+                |a, b| a.model == b.model,
+            )?;
         }
         ImportCmd::SymbolSvg {
             file,
@@ -3120,6 +2994,188 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             save(dir, &p)?;
             println!("imported {n_g} shapes and {n_s} symbols onto page {page}");
+        }
+    }
+    Ok(())
+}
+
+/// Change part `part` in its library file (in `lib`, else the project's library source that has
+/// it) with `set`, which returns a summary of what it wrote, and bring the project's pinned
+/// copy along when the project uses the part. `what` names the change in messages ("footprint");
+/// `has_change` tells whether a copy taken has the change of the part written.
+fn update_library_part(
+    dir: &Path,
+    part: &str,
+    lib: Option<&Path>,
+    what: &str,
+    set: impl FnOnce(&mut wc_core::Part) -> String,
+    has_change: impl Fn(&wc_core::Part, &wc_core::Part) -> bool,
+) -> Res<()> {
+    let part = part.to_owned();
+    // A library folder can be given outside a project; without one the project is needed.
+    let mut project = load(dir);
+    if lib.is_some()
+        && dir.join(store::PROJECT_FILE).exists()
+        && let Err(err) = &project
+    {
+        eprintln!(
+            "warning: the project could not be read, so its copy of {part} is not updated: {}",
+            escape_field(err)
+        );
+    }
+    let path = match &lib {
+        Some(root) => {
+            store::check_id(&part).map_err(e)?;
+            root.join("parts").join(format!("{part}.json"))
+        }
+        None => {
+            let p = project.as_ref().map_err(Clone::clone)?;
+            let library = wc_library::Library::open(dir, p).map_err(e)?;
+            library
+                .locate(ItemKind::Part, &part)
+                .ok_or_else(|| format!("no part {part:?} in the project's libraries; name its folder with --lib"))?
+                .path
+        }
+    };
+    let mut item: wc_core::Part = store::read_json(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+    if item.id != part {
+        return Err(format!("{} holds part {:?}, not {part:?}", path.display(), item.id));
+    }
+    let summary = set(&mut item);
+    store::write_if_changed(&path, &store::to_json(&item).map_err(e)?).map_err(e)?;
+    println!("wrote the {what} of {part} to {} ({summary})", path.display());
+    // The project's pinned copy follows, so its layouts draw the new footprint, but only
+    // from the file just written: when another of the project's sources wins for this
+    // id, that source's part is not the one that changed.
+    if let Ok(p) = &mut project
+        && p.lock.parts.contains_key(&part)
+    {
+        let library = wc_library::Library::open(dir, p).map_err(e)?;
+        let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        let winner = library.locate(ItemKind::Part, &part);
+        // A copy changed in the project since it was pinned is not overwritten: those
+        // edits must be removed or merged first.
+        // A copy that is there but cannot be read is not overwritten either.
+        let vendored = store::vendor_path(dir, ItemKind::Part, &part).map_err(e)?;
+        let kept: Option<String> = if vendored.exists() {
+            match store::read_vendored_part(dir, &part) {
+                Ok(copy) if p.lock.parts.get(&part).is_some_and(|pin| pin.hash != copy.hash()) => Some(format!(
+                    "it has local changes since it was pinned; remove or merge them, then take {part} again"
+                )),
+                Ok(_) => None,
+                Err(err) => Some(format!(
+                    "it cannot be read ({err}); fix or remove it, then take {part} again"
+                )),
+            }
+        } else {
+            None
+        };
+        // Read first, so a failed refresh puts the copy back as it was: the lock on disk
+        // is only saved after a refresh that worked, and must keep matching the copy. A
+        // copy whose bytes cannot be read is refused, never replaced or removed.
+        // A link that points nowhere is there, not missing, and is refused like the rest.
+        let before: Result<Option<Vec<u8>>, String> = match std::fs::read(&vendored) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(&vendored).is_err() => {
+                Ok(None)
+            }
+            Err(err) => Err(err.to_string()),
+        };
+        // The lock too, before `take`: if saving the new pin fails, it goes back to these
+        // bytes. A lock that exists but cannot be read is never removed or replaced.
+        let lock_path = dir.join(store::LOCK_FILE);
+        let lock_before: Result<Option<Vec<u8>>, String> = match std::fs::read(&lock_path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.to_string()),
+        };
+        let refused = kept
+            .or_else(|| {
+                before
+                    .as_ref()
+                    .err()
+                    .map(|err| format!("it cannot be read ({err}); fix or remove it, then take {part} again"))
+            })
+            .or_else(|| {
+                lock_before.as_ref().err().map(|err| {
+                    format!(
+                        "{} cannot be read ({err}); fix it, then take {part} again",
+                        store::LOCK_FILE
+                    )
+                })
+            });
+        // Whether `take` ran, so only its own writes are undone.
+        let mut tried = false;
+        let refreshed = match (&refused, &winner) {
+            (Some(why), _) => Err(why.clone()),
+            (None, Some(loc)) if same(&loc.path, &path) => {
+                tried = true;
+                wc_library::take(dir, p, &library, ItemKind::Part, &part)
+                    .map_err(|err| err.to_string())
+                    .and_then(|_| {
+                        let copy = store::read_vendored_part(dir, &part).map_err(|err| err.to_string())?;
+                        if has_change(&copy, &item) {
+                            Ok(())
+                        } else {
+                            Err(format!("the copy taken has another {what}"))
+                        }
+                    })
+            }
+            (None, Some(loc)) => Err(format!(
+                "the project takes {part} from source {:?} ({}), not from the file written",
+                loc.source,
+                loc.path.display()
+            )),
+            (None, None) => Err(format!("{part} is in none of the project's library sources")),
+        };
+        match refreshed {
+            Ok(()) => {
+                // The new pin must reach the disk with the copy, or both go back: `save`
+                // can fail after it wrote the lock.
+                if let Err(err) = save(dir, p) {
+                    // Both are tried, and every failure is named.
+                    let copy_back = match &before {
+                        Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
+                        Err(_) => Ok(()),
+                    };
+                    let lock_back = match &lock_before {
+                        Ok(bytes) => put_file_back(&lock_path, bytes.as_deref()),
+                        Err(_) => Ok(()),
+                    };
+                    let back = match (copy_back, lock_back) {
+                        (Ok(()), Ok(())) => Ok(()),
+                        (Err(a), Ok(())) => Err(a),
+                        (Ok(()), Err(b)) => Err(b),
+                        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+                    };
+                    return Err(match back {
+                        Ok(()) => format!("the project's copy of {part} was not updated: {err}"),
+                        Err(why) => format!(
+                            "the project's copy of {part} was not updated ({err}) and could not be put back: {why}; run `lib status`"
+                        ),
+                    });
+                }
+                println!("updated the project's copy of {part}");
+            }
+            Err(why) => {
+                let restored = match &before {
+                    _ if !tried => Ok(()),
+                    Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
+                    Err(_) => Ok(()),
+                };
+                eprintln!(
+                    "warning: the project's copy of {part} was not updated: {}",
+                    escape_field(&why)
+                );
+                if let Err(err) = restored {
+                    return Err(format!(
+                        "the project's copy of {part} could not be put back: {err}; run `lib status`"
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -4819,6 +4875,88 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_maker_step_model_sizes_a_library_part_on_the_plate_and_in_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let lib = tmp.path().join("lib");
+        let part = wc_core::Part {
+            id: "maker.relay".into(),
+            ..wc_core::Part::default()
+        };
+        wc_library::write_part(&lib, &part).unwrap();
+        cli(&dir, &["lib", "add", "shop", "folder", lib.to_str().unwrap()]).unwrap();
+        cli(&dir, &["device", "--part", "maker.relay", "--", "+CAB1-K1"]).unwrap();
+        cli(&dir, &["lib", "lock"]).unwrap();
+
+        // A 22.5 x 90 x 70 mm box in metres, as the maker's model.
+        let mut data = String::new();
+        let mut id = 1;
+        for x in [0.0, 0.0225] {
+            for y in [0.0, 0.09] {
+                for z in [0.0, 0.07] {
+                    data.push_str(&format!(
+                        "#{id}=CARTESIAN_POINT('',({x:?},{y:?},{z:?}));#{}=VERTEX_POINT('',#{id});\n",
+                        id + 1
+                    ));
+                    id += 2;
+                }
+            }
+        }
+        let stp = tmp.path().join("relay.stp");
+        std::fs::write(
+            &stp,
+            format!(
+                "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT($,.METRE.));\n{data}ENDSEC;\nEND-ISO-10303-21;\n"
+            ),
+        )
+        .unwrap();
+        let file = stp.to_str().unwrap();
+        assert!(cli(&dir, &["import", "model-step", file, "--part", "no.such"]).is_err());
+        cli(&dir, &["import", "model-step", file, "--part", "maker.relay"]).unwrap();
+        let in_lib: wc_core::Part = store::read_json(&lib.join("parts").join("maker.relay.json")).unwrap();
+        let Some(m) = in_lib.model else {
+            unreachable!("stored in the library with the part")
+        };
+        assert!((m.width - 22.5).abs() < 1e-9 && (m.height - 90.0).abs() < 1e-9 && (m.depth - 70.0).abs() < 1e-9);
+        // The project's pinned copy follows.
+        let copy = store::read_vendored_part(&dir, "maker.relay").unwrap();
+        assert_eq!(copy, in_lib);
+        assert!((wc_core::panel::part_depth(&copy).unwrap() - 70.0).abs() < 1e-9);
+
+        // The part has no Width/Height: arranging the plate sizes the device from the model.
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        cli(&dir, &["panel", "arrange", "main"]).unwrap();
+        let p = load(&dir).unwrap();
+        let sizes: Vec<(f64, f64)> = p.panels[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                wc_core::panel::PanelItem::Device { width, height, .. } => Some((*width, *height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes.len(), 1);
+        assert!(
+            (sizes[0].0 - 22.5).abs() < 1e-9 && (sizes[0].1 - 90.0).abs() < 1e-9,
+            "{sizes:?}"
+        );
+
+        // Not a STEP file: refused, the part is left as it was.
+        let bad = tmp.path().join("bad.stp");
+        std::fs::write(&bad, "solid nothing").unwrap();
+        assert!(
+            cli(
+                &dir,
+                &["import", "model-step", bad.to_str().unwrap(), "--part", "maker.relay"]
+            )
+            .is_err()
+        );
+        let still: wc_core::Part = store::read_json(&lib.join("parts").join("maker.relay.json")).unwrap();
+        assert_eq!(still, in_lib);
     }
 
     #[test]

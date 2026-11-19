@@ -15,6 +15,7 @@ pub mod pdf;
 mod pdf_codecs;
 pub mod qet;
 pub mod raster;
+pub mod step;
 pub mod svg;
 pub mod swe;
 pub mod wago;

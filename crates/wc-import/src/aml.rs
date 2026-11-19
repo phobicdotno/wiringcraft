@@ -397,6 +397,7 @@ pub fn device_entry(d: &AmlDevice, parts: &mut Vec<wc_core::Part>) -> Option<(De
             properties: d.properties.clone(),
             contacts: None,
             footprint: None,
+            model: None,
         };
         let id = p.id.clone();
         if !parts.iter().any(|q| q.id == id) {

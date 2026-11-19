@@ -35,7 +35,7 @@ pub mod translate;
 pub use error::{Error, Result};
 pub use geom::{Point, Shape};
 pub use lock::{LockEntry, Lockfile};
-pub use part::{ContactKind, Contacts, Footprint, Part};
+pub use part::{ContactKind, Contacts, Footprint, ModelSize, Part};
 pub use project::{
     CableCore, Device, DevicePart, Endpoint, Location, Logo, Page, PageSize, PlacedSymbol, Project, ProjectMeta,
     Underlay, Wire, WireSpec,
