@@ -1957,7 +1957,12 @@ impl App {
             "strips": strip_list(open, None),
             "open_comments": open.project.comments.iter().filter(|c| !c.resolved).count(),
             "shown": shown,
-            "selection": self.ed.selection.iter().map(selection_id).collect::<Vec<_>>(),
+            "selection": self
+                .ed
+                .selection
+                .iter()
+                .map(|s| item_id(self.ed.panel.is_none().then(|| open.project.pages.get(self.ed.page)).flatten(), s))
+                .collect::<Vec<_>>(),
             // In a session, Undo takes back only this person's changes made in it.
             "can_undo": if self.share.active() { self.share.can_undo() } else { open.can_undo() },
         })))
@@ -4954,6 +4959,9 @@ mod tests {
         let second = cloud_id(&a.open.as_ref().unwrap().project.pages[1].clouds[1]);
         assert_eq!(second, "cloud A at 100,20 to 140,40");
         assert!(a.agent_context().contains(&second), "{}", a.agent_context());
+        // get_state gives the same id.
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["selection"], json!([second]));
         call(
             &mut a,
             "move_items",
