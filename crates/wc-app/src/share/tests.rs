@@ -6298,3 +6298,40 @@ fn a_picture_whose_write_time_is_unknown_is_read_again_even_at_the_same_size() {
     assert!(!still_taken(Some(&(5, Some(at))), &(4, Some(at))));
     assert!(!still_taken(None, &(4, Some(at))));
 }
+
+/// A refusal that comes in after the frame looked (in the reply to what it sent) is seen by
+/// the window in the same sync, and the picks still look at it in the next frame.
+#[test]
+fn a_refusal_that_comes_in_late_is_seen_at_once_and_kept_for_the_picks() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // As the late pump of a frame would leave it.
+    let Some(Role::Guest(j)) = g.role.as_mut() else {
+        return Err("not a guest".into());
+    };
+    j.guest.refused_pages.insert("p0003".into());
+    assert!(g.take_refused_pages().contains("p0003"));
+    assert!(g.take_refused_pages().is_empty(), "told once");
+    assert!(g.refused_later.0.contains("p0003"), "kept for the picks");
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(g.refused_later.0.is_empty(), "the picks took it");
+    Ok(())
+}
+
+#[test]
+fn a_refusal_that_comes_with_the_end_of_the_session_is_still_told() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The pump that sees the session end carries a refusal of the guest's.
+    let Some(Role::Guest(j)) = g.role.as_mut() else {
+        return Err("not a guest".into());
+    };
+    j.guest.refused_pages.insert("p0003".into());
+    h.stop();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(g.role.is_none(), "the session ended");
+    assert!(g.take_refused_pages().contains("p0003"));
+    Ok(())
+}

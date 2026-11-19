@@ -2446,6 +2446,16 @@ pub struct Share {
     /// sent each then: a refusal of such a picture renames nothing, unless it is of a later
     /// edit (the picture sent again since).
     withdrawn_picks: BTreeMap<String, Option<u64>>,
+    /// Pages a change of this person's the session refused touched, since the window last
+    /// asked ([`Share::take_refused_pages`]).
+    refused_pages: BTreeSet<String>,
+    /// Refusals taken from the session after the picks were looked at this frame (by
+    /// [`Share::take_refused_pages`]): the picks look at them next frame, as they would have.
+    refused_later: Refused,
+    /// Tests only: refusals already in the session when a frame looks at the picks are left
+    /// for [`Share::take_refused_pages`], as if they had come in the frame's late pump.
+    #[cfg(test)]
+    pub(crate) refusals_come_late: bool,
     /// Files the session lacks ([`repairs_due`]) whose copy here was looked for and could not
     /// be sent (missing, unreadable, or another version), with when and [`repair_stamp`] then:
     /// each is read again only after [`ITEM_WAIT`], or at once once this copy pins or loads
@@ -3291,6 +3301,27 @@ impl Share {
                 .is_some_and(|t| t.is_some())
     }
 
+    /// The pages a change of this person's the session refused touched, since the last call,
+    /// also those of an answer that came in after the frame looked (the reply to what it sent).
+    pub fn take_refused_pages(&mut self) -> BTreeSet<String> {
+        if let Some(role) = self.role.as_mut() {
+            let (pages, meta, edits) = role.refused_targets();
+            self.refused_pages.extend(pages.iter().cloned());
+            self.refused_later.0.extend(pages);
+            self.refused_later.1 |= meta;
+            self.refused_later.2.extend(edits);
+        }
+        std::mem::take(&mut self.refused_pages)
+    }
+
+    /// How many of this person's changes the host has not answered yet (none for the host).
+    pub fn unanswered_edits(&self) -> usize {
+        match &self.role {
+            Some(Role::Guest(j)) => j.guest.unanswered_edits(),
+            _ => 0,
+        }
+    }
+
     /// Whether this window hosts the session.
     pub fn is_host(&self) -> bool {
         matches!(self.role, Some(Role::Host(_)))
@@ -3504,6 +3535,9 @@ impl Share {
             {
                 drain_retaken(role, open, None, &mut self.notes);
             }
+            // So is one the window has not been told of: it still ends what waits for the page.
+            let (pages, _, _) = role.refused_targets();
+            self.refused_pages.extend(pages);
             // A join that was turned away goes back to the Join dialog, which says why: always
             // for another version (the person has to update one side), for a plain decline only
             // while the status window is still open (the note says it otherwise).
@@ -3781,13 +3815,26 @@ impl Share {
         }
         // A withdrawn pick stays withdrawn for a refusal of its picture that comes later: that
         // must not rename the references that are not this copy's.
+        #[cfg(test)]
+        let mut refused = if self.refusals_come_late {
+            Refused::default()
+        } else {
+            role.refused_targets()
+        };
+        #[cfg(not(test))]
+        let mut refused = role.refused_targets();
+        self.refused_pages.extend(refused.0.iter().cloned());
+        let (pages, meta, edits) = std::mem::take(&mut self.refused_later);
+        refused.0.extend(pages);
+        refused.1 |= meta;
+        refused.2.extend(edits);
         let withdrawn = withdraw_picks(
             &mut self.picks,
             &mut self.pick_carriers,
             &mut self.renames_due,
             &mut self.clashes,
             open,
-            (role.refused_targets(), &fresh),
+            (refused, &fresh),
         );
         note_withdrawn(&mut self.withdrawn_picks, &self.pictures_sent, withdrawn);
         let mut taken = names_to_rename(role.picture_names_taken(), &self.pictures_sent, &self.withdrawn_picks);

@@ -382,11 +382,61 @@ impl App {
         {
             self.ed.page = o.project.pages.len().saturating_sub(1);
         }
+        let waiting = self.share.unanswered_edits() > 0;
+        // A refused change of the page ends the wait: what comes back there is not the paste
+        // (the host may have added an equal drawing in the meantime).
+        let refused = self.share.take_refused_pages();
+        if self
+            .ed
+            .waiting_graphics
+            .as_ref()
+            .is_some_and(|w| refused.contains(&w.page))
+        {
+            self.ed.waiting_graphics = None;
+        }
+        // A selection made since the last sync is the user's, and ends the wait (looked at
+        // before this sync moves selected drawings to where they are now).
+        if self
+            .ed
+            .waiting_graphics
+            .as_ref()
+            .is_some_and(|w| w.selection != self.ed.selection)
+        {
+            self.ed.waiting_graphics = None;
+        }
         if let Some((id, old)) = &graphics_before {
             match self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page)) {
-                Some(p) if &p.id == id => edit::remap_graphics(&mut self.ed.selection, old, &p.graphics),
+                Some(p) if &p.id == id => {
+                    let before = self.ed.selection.clone();
+                    edit::remap_graphics(&mut self.ed.selection, old, &p.graphics);
+                    // A change of this person's that the host has not answered can show the
+                    // page without what it added (a whole page waits for the host): what was
+                    // selected of it is selected again once it is back.
+                    let lost = edit::lost_graphics(&before, old, &p.graphics);
+                    if waiting && !lost.is_empty() {
+                        let w = self.ed.waiting_graphics.get_or_insert_with(|| edit::WaitingGraphics {
+                            page: id.clone(),
+                            items: Vec::new(),
+                            selection: Vec::new(),
+                        });
+                        if &w.page == id {
+                            w.items.extend(lost);
+                        }
+                    }
+                }
                 // The page was removed: what was selected on it is not on the page shown now.
                 _ => self.ed.selection.clear(),
+            }
+        }
+        if let Some(mut w) = self.ed.waiting_graphics.take()
+            && let Some(p) = self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page))
+            && p.id == w.page
+        {
+            edit::restore_graphics(&mut w.items, &mut self.ed.selection, &p.graphics);
+            // Still away with every change answered: the host refused it.
+            if !w.items.is_empty() && waiting {
+                w.selection = self.ed.selection.clone();
+                self.ed.waiting_graphics = Some(w);
             }
         }
         self.ed.held_by = self.share.held_by_others();
