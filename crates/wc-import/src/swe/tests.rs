@@ -2370,7 +2370,7 @@ fn refused_drawing_files_count_against_the_archive_total() {
         file,
         total: 2 * (file + 1),
     };
-    let drawings = drawings::drawings_within(buf, "Projects/3", lim).unwrap();
+    let drawings = drawings::drawings_within(buf, "Projects/3", lim, None).unwrap();
     assert!(!drawings.has_block("D"), "{:?}", drawings.warnings);
     assert!(
         drawings
@@ -2634,7 +2634,7 @@ fn archive_names_with_dot_slash_are_read_like_plain_ones() {
         file: 1 << 20,
         total: 1 << 24,
     };
-    let drawings = drawings::drawings_within(buf, "Projects/4", lim).unwrap();
+    let drawings = drawings::drawings_within(buf, "Projects/4", lim, None).unwrap();
     assert!(drawings.warnings.is_empty(), "{:?}", drawings.warnings);
     let (mut budget, mut skipped) = (usize::MAX, BTreeMap::new());
     let coil = drawings.block_graphics("Coil", &mut budget, &mut skipped).unwrap();

@@ -614,3 +614,151 @@ INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5);
     let symbols = read_blocks(&app, Some(&d), &mut report, &mut warnings).unwrap();
     assert_eq!(symbols[0].graphics.len(), 2, "{:?}", symbols[0].graphics);
 }
+
+#[test]
+fn only_drawings_of_imported_blocks_count_against_the_limits() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    use wc_core::geom::Shape;
+    // The coil has connection points; the frame has none and is not imported.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Frame', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let file = drawing.len() as u64;
+    // Room for one drawing only, and many drawings of blocks the library does not import first.
+    let lim = super::super::drawings::Limits { file, total: file + 1 };
+    let names: Vec<String> = (0..20).map(|i| format!("Library/Block/Unused {i}.dwg")).collect();
+    let mut entries: Vec<(&str, &[u8])> = vec![("Database/tew_app_data.sqlite", &app)];
+    entries.extend(names.iter().map(|n| (n.as_str(), drawing.as_slice())));
+    entries.push(("Library/Block/Frame.dwg", &drawing));
+    entries.push(("Library/Block/ Coil .dwg", &drawing));
+    let lib = from_archive_within(archive(&entries), true, lim).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.symbols[0]
+            .graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Circle { radius, .. } if *radius == 4.0)),
+        "{:?}",
+        lib.symbols[0].graphics
+    );
+    assert!(
+        !lib.warnings.iter().any(|w| w.contains("not read")),
+        "{:?}",
+        lib.warnings
+    );
+
+    // Two copies of the coil's drawing and room for one: the second is left out, and no block
+    // stays a box for it. A second imported block left out by the limit is named as a box.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Lamp', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (2, 1, 'X1', 0, 5);
+"));
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/Coil.dwg", &drawing),
+        ("Other/Block/coil.dwg", &drawing),
+        ("Library/Block/Lamp.dwg", &drawing),
+    ]);
+    let lib = from_archive_within(buf, true, lim).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.warnings
+            .iter()
+            .any(|w| w.contains("drawing file(s) were not read") && w.ends_with("; 1 block(s) stay boxes")),
+        "{:?}",
+        lib.warnings
+    );
+}
+
+#[test]
+fn a_block_the_total_refuses_is_counted_as_a_box() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Lamp', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (2, 1, 'X1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let file = drawing.len() as u64;
+    // The coil is read; one byte is left, so the lamp's drawing is refused for the total.
+    let lim = super::super::drawings::Limits { file, total: file + 1 };
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/Coil.dwg", &drawing),
+        ("Library/Block/Lamp.dwg", &drawing),
+    ]);
+    let lib = from_archive_within(buf, true, lim).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.warnings.iter().any(|w| w.contains("1 block(s) stay boxes")),
+        "{:?}",
+        lib.warnings
+    );
+}
+
+#[test]
+fn a_block_without_a_name_finds_its_drawing() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    use wc_core::geom::Shape;
+    // The block's name is empty in the source; its drawing's file name is only a space.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, '', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/ .dwg", &drawing),
+    ]);
+    let lib = from_archive(buf).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.symbols[0]
+            .graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Circle { radius, .. } if *radius == 4.0)),
+        "{:?}",
+        lib.symbols[0].graphics
+    );
+}
+
+#[test]
+fn blocks_sharing_a_name_each_count_as_a_box() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    // Two imported blocks named Coil share one drawing, which the total refuses after the lamp's.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Lamp', ''), (2, 'Coil', ''), (3, 'Coil', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'X1', 0, 5), (2, 1, 'A1', 0, 5), (3, 1, 'A1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let file = drawing.len() as u64;
+    let lim = super::super::drawings::Limits { file, total: file + 1 };
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/Lamp.dwg", &drawing),
+        ("Library/Block/Coil.dwg", &drawing),
+    ]);
+    let lib = from_archive_within(buf, true, lim).unwrap();
+    assert_eq!(
+        (lib.report.blocks_out, lib.report.blocks_drawn),
+        (3, 1),
+        "{:?}",
+        lib.warnings
+    );
+    assert!(
+        lib.warnings.iter().any(|w| w.contains("2 block(s) stay boxes")),
+        "{:?}",
+        lib.warnings
+    );
+}

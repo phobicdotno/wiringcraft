@@ -567,6 +567,20 @@ pub fn read_blocks(
     report: &mut LibraryReport,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Symbol>> {
+    Ok(read_named_blocks(conn, drawings, report, warnings)?
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect())
+}
+
+/// [`read_blocks`], each symbol with its block's name as the source has it (an empty name gets
+/// another symbol name), which is the name its drawing is found under.
+fn read_named_blocks(
+    conn: &Connection,
+    drawings: Option<&SweDrawings>,
+    report: &mut LibraryReport,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<(String, Symbol)>> {
     // The counts are for this call's result, also when the report was used before.
     (report.blocks_in, report.blocks_out, report.blocks_drawn) = (0, 0, 0);
     let Some(blocks) = Table::open(conn, "tew_block")? else {
@@ -664,7 +678,7 @@ pub fn read_blocks(
         ));
     }
 
-    let mut by_id: BTreeMap<String, Symbol> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, (String, Symbol)> = BTreeMap::new();
     let mut skipped = 0usize;
     // One entity budget for every block drawing, like the project import's.
     let mut budget = drawings.map_or(0, SweDrawings::draw_limit);
@@ -701,23 +715,27 @@ pub fn read_blocks(
                 boxed
             }
         };
+        let source = name.clone();
         by_id.insert(
             sid.clone(),
-            Symbol {
-                id: sid,
-                name: if name.is_empty() {
-                    "SolidWorks Electrical block".into()
-                } else {
-                    name
+            (
+                source,
+                Symbol {
+                    id: sid,
+                    name: if name.is_empty() {
+                        "SolidWorks Electrical block".into()
+                    } else {
+                        name
+                    },
+                    category: "SolidWorks Electrical library".to_owned(),
+                    letter_code: String::new(),
+                    role: Default::default(),
+                    graphics,
+                    pins,
+                    tag_at: Point::new(0.0, -super::MARGIN - 1.0),
+                    description,
                 },
-                category: "SolidWorks Electrical library".to_owned(),
-                letter_code: String::new(),
-                role: Default::default(),
-                graphics,
-                pins,
-                tag_at: Point::new(0.0, -super::MARGIN - 1.0),
-                description,
-            },
+            ),
         );
     }
     if skipped > 0 {
@@ -849,6 +867,27 @@ fn read_warnings(d: &SweDrawings) -> Vec<String> {
 }
 
 fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<SweLibrary> {
+    from_archive_within(reader, draw, super::drawings::Limits::ARCHIVE)
+}
+
+/// The block names (trimmed, lower case, as [`super::drawings::block_key`] keys them) of the
+/// blocks [`read_blocks`] imports (those with connection points), each with how many share it.
+/// Only their drawings are read.
+fn importable_blocks(app_data: &Connection) -> Result<BTreeMap<String, usize>> {
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let mut keys: BTreeMap<String, usize> = BTreeMap::new();
+    for (name, _) in read_named_blocks(app_data, None, &mut report, &mut warnings)? {
+        *keys.entry(super::drawings::block_key(&name)).or_default() += 1;
+    }
+    Ok(keys)
+}
+
+/// [`from_archive_with`] with byte limits `lim` on the block drawings read.
+fn from_archive_within<R: Read + std::io::Seek>(
+    reader: R,
+    draw: bool,
+    lim: super::drawings::Limits,
+) -> Result<SweLibrary> {
     let mut zip =
         zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
     let catalog = find_entry(&zip, CATALOG_DB);
@@ -868,14 +907,15 @@ fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<S
     };
     // Block drawings only matter when there are blocks to draw.
     let mut drawing_warnings = Vec::new();
-    let drawings = if draw && app_data.is_some() {
+    let drawings = if draw && let Some(app) = app_data.as_ref() {
+        let blocks = importable_blocks(app)?;
         let mut reader = zip.into_inner();
         // No project folder: only the shared library's block files are read. A rewind that
         // fails leaves the blocks boxes, like a drawing read that fails.
         let read = reader
             .seek(std::io::SeekFrom::Start(0))
             .map_err(|e| Error::Format(format!("archive: {e}")))
-            .and_then(|_| super::drawings_from_archive(reader, ""));
+            .and_then(|_| super::drawings::block_drawings_within(reader, &blocks, lim));
         match read {
             Ok(d) => {
                 drawing_warnings = read_warnings(&d);
