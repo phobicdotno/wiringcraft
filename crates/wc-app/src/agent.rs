@@ -2897,16 +2897,19 @@ impl Guarded {
     /// Whether `path`, as the file system resolves it, is in the project or is one of its
     /// files under another name.
     fn holds(&self, path: &Path) -> bool {
-        if inside(&self.roots, path) {
-            return true;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if let Ok(m) = std::fs::metadata(path) {
-                return m.is_file() && self.files.contains(&(m.dev(), m.ino()));
-            }
-        }
+        inside(&self.roots, path) || self.same_file(path)
+    }
+
+    /// Whether `path` is a project file under another name (a hard link to it).
+    #[cfg(unix)]
+    fn same_file(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && self.files.contains(&(m.dev(), m.ino())))
+    }
+
+    /// Hard links are not told apart here.
+    #[cfg(not(unix))]
+    fn same_file(&self, _path: &Path) -> bool {
         false
     }
 
