@@ -3,6 +3,7 @@
 //! that is removed afterwards; its history does not come along.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use wc_core::Project;
 
@@ -19,13 +20,29 @@ pub fn is_url(source: &str) -> bool {
 /// Create a project in `dir`, named `name` and dated `date`, from the base project in the
 /// folder or git repository `source`.
 pub fn create_from_base(source: &str, dir: &Path, name: &str, date: &str) -> Result<Project> {
+    create_from_base_until(source, dir, name, date, &AtomicBool::new(false))
+}
+
+/// [`create_from_base`] that stops once `cancel` is set, while the repository is fetched or
+/// before the project is made, and then returns [`Error::Cancelled`](crate::Error::Cancelled)
+/// with nothing made in `dir`. Meant to run off the window thread.
+pub fn create_from_base_until(
+    source: &str,
+    dir: &Path,
+    name: &str,
+    date: &str,
+    cancel: &AtomicBool,
+) -> Result<Project> {
     if !is_url(source) {
         return Ok(wc_core::base::create_from(Path::new(source), dir, name, date)?);
     }
     let tmp = private_temp_dir().map_err(|e| wc_core::Error::io(std::env::temp_dir(), e))?;
     let fetched = tmp.path().join("base");
     let target = fetched.to_string_lossy().into_owned();
-    Git::new(tmp.path()).run(&["clone", "-q", "--depth", "1", "--", source, &target])?;
+    Git::new(tmp.path()).run_until(&["clone", "-q", "--depth", "1", "--", source, &target], cancel)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(crate::Error::Cancelled);
+    }
     // A library folder next to the repository was not fetched with it.
     let outside = wc_core::base::outside_libraries(&wc_core::store::load(&fetched)?);
     if !outside.is_empty() {
@@ -121,6 +138,45 @@ mod tests {
         let e = create_from_base(&url, &tmp.path().join("z"), "Z", "2026-11-18").unwrap_err();
         assert!(e.to_string().contains("../library"), "{e}");
         assert!(!tmp.path().join("z").exists());
+    }
+
+    #[test]
+    fn a_cancelled_fetch_makes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        store::create(&base, "ACME base").unwrap();
+        Git::new(&base).init().unwrap();
+        let new = tmp.path().join("new");
+        let cancel = AtomicBool::new(true);
+        let e = create_from_base_until(&file_url(&base), &new, "New", "2026-11-19", &cancel).unwrap_err();
+        assert!(matches!(e, crate::Error::Cancelled), "{e}");
+        assert!(!new.exists());
+        // Not cancelled, the same call makes the project.
+        let cancel = AtomicBool::new(false);
+        create_from_base_until(&file_url(&base), &new, "New", "2026-11-19", &cancel).unwrap();
+        assert_eq!(store::load(&new).unwrap().meta.name, "New");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_command_is_stopped_while_it_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            stop.store(true, Ordering::Relaxed);
+        });
+        // A git command that takes 30 seconds, like a fetch from a server that does not answer.
+        let started = std::time::Instant::now();
+        let r = Git::new(tmp.path()).run_until(&["-c", "alias.wait=!sleep 30", "wait"], &cancel);
+        setter.join().unwrap();
+        assert!(matches!(r, Err(crate::Error::Cancelled)), "{r:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[cfg(unix)]

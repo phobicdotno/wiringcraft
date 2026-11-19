@@ -2733,8 +2733,91 @@ mod tests {
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
+            fetch: None,
         };
         (tmp, app)
+    }
+
+    /// A `file://` URL for a local folder, also with a Windows drive letter.
+    fn file_url(p: &std::path::Path) -> String {
+        let path = p.to_string_lossy().replace('\\', "/");
+        if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        }
+    }
+
+    /// Frames until the base project fetch is over (at most a few seconds).
+    fn until_fetched(a: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..500 {
+            a.poll_fetch(&ctx);
+            if a.fetch.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(a.fetch.is_none(), "the fetch did not end");
+    }
+
+    #[test]
+    fn a_base_project_from_a_repository_is_fetched_off_the_window_thread() {
+        let (tmp, mut a) = app(vec![]);
+        let base = tmp.path().join("base");
+        wc_core::store::create(&base, "ACME base").unwrap();
+        wc_vcs::Git::new(&base).init().unwrap();
+        let dir = tmp.path().join("pump");
+        a.start_new_project(&dir, "Pump station", Some(&file_url(&base)));
+        // The window goes on while it runs: a note with Cancel, and the old project still open.
+        assert!(matches!(a.dialog, Some(Dialog::Fetching(_))));
+        assert!(a.fetch.is_some());
+        until_fetched(&mut a);
+        assert!(a.dialog.is_none(), "{:?}", a.dialog.as_ref().map(|_| ()));
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.dir, dir);
+        assert_eq!(open.project.meta.name, "Pump station");
+        assert!(dir.join(".git").exists(), "recorded as a first version");
+        // A repository that cannot be fetched says why, and makes nothing.
+        let missing = tmp.path().join("missing");
+        a.start_new_project(&missing, "X", Some(&file_url(&tmp.path().join("nowhere"))));
+        until_fetched(&mut a);
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("Could not create")));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_cancelled_fetch_opens_nothing() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        let (tx, done) = std::sync::mpsc::channel();
+        a.fetch = Some(crate::BaseFetch {
+            dir: tmp.path().join("new"),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        a.dialog = Some(Dialog::Fetching("file:///slow".into()));
+        // Cancel sets the flag the fetch stops on.
+        a.cancel_fetch();
+        assert!(
+            a.fetch
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        // Still running: nothing changes.
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        tx.send(Err(None)).unwrap();
+        until_fetched(&mut a);
+        assert!(a.dialog.is_none());
+        assert!(a.ed.message.contains("not made"), "{}", a.ed.message);
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+    }
+
+    fn until_fetched_once(a: &mut App) {
+        a.poll_fetch(&egui::Context::default());
     }
 
     #[test]
