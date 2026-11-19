@@ -1211,7 +1211,17 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                                 ui.end_row();
                             }
                         } else {
-                            let (a, b) = g.bounds();
+                            // A dimension shows the two points it measures and their distance;
+                            // other drawings the corners of their bounds.
+                            let (a, b) = match &g {
+                                Shape::Dimension { a, b, .. } => (*a, *b),
+                                _ => g.bounds(),
+                            };
+                            if matches!(g, Shape::Dimension { .. }) {
+                                ui.label("Length");
+                                ui.label(format!("{} mm", wc_core::geom::format_length(a.distance(b))));
+                                ui.end_row();
+                            }
                             ui.label("From");
                             ui.label(format!("{:.1}, {:.1} mm", a.x, a.y));
                             ui.end_row();
