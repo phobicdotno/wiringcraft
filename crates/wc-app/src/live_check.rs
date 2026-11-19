@@ -217,8 +217,9 @@ impl LiveCheck {
     /// The findings to show for these inputs: the latest check's when it was of exactly
     /// them and no newer edit waits; `None` while a check is pending, when the findings may be
     /// of other inputs (another project, say).
+    /// Input that may have edited counts too, though it does not show as busy.
     pub fn settled(&self) -> Option<&[Finding]> {
-        (!self.busy()).then_some(self.findings.as_slice())
+        (self.job.is_none() && self.pending.is_none()).then_some(self.findings.as_slice())
     }
 
     /// The status bar text for the findings `shown` on the canvas: their errors and warnings,
@@ -390,6 +391,41 @@ mod tests {
         now += SETTLE;
         settle(&mut live, &o, &mut now);
         assert_eq!(duplicate_tag_errors(&live.findings), 0, "{:?}", live.findings);
+    }
+
+    #[test]
+    fn findings_are_not_settled_while_input_made_during_a_check_waits() {
+        let (_dir, mut o) = coil_twice();
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        // A check of the clash starts.
+        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        now += SETTLE;
+        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+        assert!(live.job.is_some());
+        // While it runs, a drag frame fixes the clash without a new revision.
+        let s = o.project.pages[1].symbols.last_mut().unwrap();
+        s.tag = Some(DeviceTag::parse("-K2").unwrap());
+        live.poll(&o.project, &o.symbols, &o.parts, o.revision(), true, now);
+        // The check finishes before the input settles: its findings are of other inputs.
+        for _ in 0..1000 {
+            live.poll(&o.project, &o.symbols, &o.parts, o.revision(), false, now);
+            if live.job.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(live.job.is_none());
+        assert_eq!(duplicate_tag_errors(&live.findings), 2);
+        assert!(live.settled().is_none(), "not shown for the changed inputs");
+        assert_eq!(
+            live.status(&[]),
+            "Check: no problems",
+            "input alone does not say checking"
+        );
+        now += SETTLE;
+        settle(&mut live, &o, &mut now);
+        assert_eq!(live.settled().map(duplicate_tag_errors), Some(0));
     }
 
     #[test]
