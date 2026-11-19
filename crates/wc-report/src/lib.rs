@@ -30,7 +30,7 @@ pub use marking::{
     LEVEL_SEPARATOR, Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,
     marking_list_with, parse_kinds, parse_lines, terminal_strips, to_smartscript_csv,
 };
-pub use plc::{PlcVariables, plc_variables};
+pub use plc::{PlcVariables, plc_card_overview, plc_rack_warnings, plc_variables};
 
 /// A finished report: a title, column headings and rows of text.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -251,12 +251,13 @@ pub enum Kind {
     Terminals,
     Cables,
     Plc,
+    PlcCards,
     Contents,
     Locations,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 9] = [
+    pub const ALL: [Kind; 10] = [
         Kind::Contents,
         Kind::Parts,
         Kind::Devices,
@@ -265,6 +266,7 @@ impl Kind {
         Kind::Terminals,
         Kind::Cables,
         Kind::Plc,
+        Kind::PlcCards,
         Kind::Locations,
     ];
 
@@ -277,6 +279,7 @@ impl Kind {
             Kind::Terminals => "terminals",
             Kind::Cables => "cables",
             Kind::Plc => "plc",
+            Kind::PlcCards => "plc-cards",
             Kind::Contents => "contents",
             Kind::Locations => "locations",
         }
@@ -376,6 +379,7 @@ pub fn build_builtin(kind: Kind, i: &Inputs<'_>) -> Table {
         Kind::Terminals => terminal_plan(i),
         Kind::Cables => cable_list(i),
         Kind::Plc => plc_io_list(i),
+        Kind::PlcCards => plc_card_overview(i),
         Kind::Contents => contents(i),
         Kind::Locations => location_list(i),
     }

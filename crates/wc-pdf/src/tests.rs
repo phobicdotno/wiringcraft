@@ -1599,3 +1599,46 @@ fn an_unlisted_revision_is_reported_only_for_the_page_that_has_the_cloud() -> Re
     );
     Ok(())
 }
+
+#[test]
+fn a_rack_of_three_cards_gives_plc_card_overview_pages() {
+    use wc_core::plc_rack::{PlcCard, PlcRack};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let card = |slot: u32, tag: &str, channels: u32, start: &str| PlcCard {
+        slot,
+        tag: tag.into(),
+        channels,
+        start: start.into(),
+        ..Default::default()
+    };
+    project.meta.racks.push(PlcRack {
+        name: "-A1".into(),
+        cards: vec![
+            card(1, "-A1.DI1", 16, "%IX0.0"),
+            card(2, "-A1.DO1", 16, "%QX4.0"),
+            card(3, "-A1.AI1", 4, "%IW64"),
+        ],
+        ..Default::default()
+    });
+    let none = BTreeMap::new();
+    let inputs = wc_report::Inputs {
+        project: &project,
+        symbols: &none,
+        parts: &BTreeMap::new(),
+    };
+    let table = wc_report::build(wc_report::Kind::PlcCards, &inputs);
+    assert_eq!(table.rows.len(), 36);
+    let opts = Options {
+        reports: vec![table],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &none, &opts);
+    // 36 rows do not fit one A3 sheet's table: the overview runs on to a second page.
+    assert!(report.pages >= 2, "{}", report.pages);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&writer::pdf_text("PLC cards")));
+    for cell in ["-A1.DI1", "-A1.DO1", "-A1.AI1", "%IX1.7", "%QX5.7", "%IW70"] {
+        assert!(text.contains(&writer::pdf_text(cell)), "{cell}");
+    }
+}

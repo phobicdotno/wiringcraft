@@ -68,6 +68,10 @@ pub struct ProjectMeta {
     /// ([`crate::check_rule`]).
     #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<crate::check_rule::CheckRule>,
+    /// PLC racks and the cards in their slots, laid out on the PLC card overview pages
+    /// ([`crate::plc_rack`]).
+    #[serde(default, rename = "rack", skip_serializing_if = "Vec::is_empty")]
+    pub racks: Vec<crate::plc_rack::PlcRack>,
 }
 
 /// The project's logo: a JPEG or PNG file in the project folder. The title block shows it in
@@ -743,6 +747,7 @@ impl ProjectMeta {
             revisions: Vec::new(),
             reports: Vec::new(),
             rules: Vec::new(),
+            racks: Vec::new(),
         }
     }
 

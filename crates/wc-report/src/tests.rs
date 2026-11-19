@@ -2218,3 +2218,128 @@ fn check_runs_the_projects_own_rules() {
     p.pages.push(overview);
     assert!(!run(&p).iter().any(|f| f.message.contains("has no cable")));
 }
+
+#[test]
+fn plc_card_overview_lays_out_three_cards_like_the_io_list() {
+    use wc_core::plc_rack::{PlcCard, PlcRack};
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    input.name = "PLC digital input".into();
+    let mut output = sym("wc.plc.output", SymbolRole::Standalone, &["Q"]);
+    output.category = "plc".into();
+    for y in [input, output] {
+        s.insert(y.id.clone(), y);
+    }
+    let page = &mut p.pages[0];
+    page.symbols.push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    page.symbols.push(place("i2", "wc.plc.input", 310.0, Some("-A1.I2")));
+    page.symbols.push(place("q1", "wc.plc.output", 320.0, Some("-A1.Q1")));
+    page.symbols.push(place("a1", "wc.plc.input", 330.0, Some("-B1")));
+    page.symbols.push(place("x1", "wc.plc.input", 340.0, Some("-B9")));
+    page.wires.push(wire("w9", pin("s6", "X2"), pin("q1", "Q"), None, None));
+    for (tag, addr) in [
+        ("-A1.I1", "I0.1"),
+        ("-A1.I2", "%IX1.0"),
+        ("-A1.Q1", "A4.1"),
+        ("-B1", "IW66"),
+        ("-B9", "%I9.0"),
+    ] {
+        p.devices.insert(
+            DeviceTag::parse(tag).unwrap(),
+            Device {
+                description: format!("point {tag}"),
+                properties: [("Address".to_string(), addr.to_string())].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let card = |slot: u32, tag: &str, kind: &str, channels: u32, start: &str| PlcCard {
+        slot,
+        tag: tag.into(),
+        kind: kind.into(),
+        channels,
+        start: start.into(),
+        ..Default::default()
+    };
+    p.meta.racks.push(PlcRack {
+        name: "-A1".into(),
+        description: "Main PLC".into(),
+        // Out of slot order on purpose; the overview sorts them.
+        cards: vec![
+            card(3, "", "AI 2x 4-20 mA", 2, "%IW64"),
+            card(1, "-A1.DI1", "DI 16", 16, "%IX0.0"),
+            card(2, "-A1.DO1", "DO 8", 8, "%QX4.0"),
+        ],
+        ..Default::default()
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::PlcCards, &i);
+    assert_eq!(t.columns[0..6], ["Rack", "Slot", "Card", "Type", "Channel", "Address"]);
+    assert_eq!(t.rows.len(), 16 + 8 + 2);
+    let row = |addr: &str| t.rows.iter().position(|r| r[5] == addr).unwrap();
+    // Every drawn point on a card shows the same device, description, connection and page as
+    // in the PLC I/O list.
+    let io = build(Kind::Plc, &i);
+    for (addr, tag) in [
+        ("%IX0.1", "-A1.I1"),
+        ("%IX1.0", "-A1.I2"),
+        ("%QX4.1", "-A1.Q1"),
+        ("%IW66", "-B1"),
+    ] {
+        let r = &t.rows[row(addr)];
+        let io_row = io.rows.iter().find(|x| x[2] == tag).unwrap();
+        assert_eq!(r[6..], io_row[2..], "{addr}");
+        assert_eq!(t.row_pages[row(addr)], p.pages[0].id, "{addr}");
+    }
+    assert_eq!(t.rows[row("%QX4.1")][8], "-P1:X2");
+    // Slot order, channel numbers from 0, and an untagged card named by its type.
+    assert_eq!(t.rows[0][..6], ["-A1", "1", "-A1.DI1", "DI 16", "0", "%IX0.0"]);
+    assert_eq!(t.rows[16][..6], ["-A1", "2", "-A1.DO1", "DO 8", "0", "%QX4.0"]);
+    assert_eq!(
+        t.rows[25][..6],
+        ["-A1", "3", "AI 2x 4-20 mA", "AI 2x 4-20 mA", "1", "%IW66"]
+    );
+    // A spare channel is listed empty and links nowhere.
+    assert_eq!(t.rows[0][6..], ["", "", "", ""]);
+    assert_eq!(t.row_pages.first().map(String::as_str).unwrap_or(""), "");
+    // The point at %IX9.0 is on no card.
+    let w = plc_rack_warnings(&i);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("-B9") && w[0].contains("%IX9.0"), "{w:?}");
+
+    // Broken racks are reported, not laid out.
+    p.meta.racks[0].cards.push(card(2, "", "", 4, "%QX4.4"));
+    p.meta.racks[0].cards.push(card(5, "", "", 4, "Slot 5"));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = plc_rack_warnings(&i);
+    assert!(w.iter().any(|w| w.contains("slot 2: a second card")), "{w:?}");
+    assert!(
+        w.iter()
+            .any(|w| w.contains("address %QX4.4 is also on PLC rack \"-A1\" slot 2")),
+        "{w:?}"
+    );
+    assert!(
+        w.iter().any(|w| w.contains("slot 5: start address \"Slot 5\"")),
+        "{w:?}"
+    );
+    assert_eq!(build(Kind::PlcCards, &i).rows.len(), 16 + 8 + 2 + 4);
+
+    // No racks: an empty overview and nothing to warn about.
+    p.meta.racks.clear();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(build(Kind::PlcCards, &i).rows.is_empty());
+    assert!(plc_rack_warnings(&i).is_empty());
+}

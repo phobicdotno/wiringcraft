@@ -7,9 +7,11 @@
 //! `IW64`, `A4.1`); a point without an address, or with one that is not a PLC address, is
 //! declared at `%I*` or `%Q*`, to be linked to the hardware in the PLC tool.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{Inputs, natural_key, plc_io_list};
+use wc_core::plc_rack::PlcAddress;
+
+use crate::{Inputs, Table, natural_key, plc_io_list};
 
 /// What came out of writing the variable list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -209,6 +211,139 @@ pub fn plc_variables(i: &Inputs<'_>) -> PlcVariables {
         lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\r\n"),
         if lines.is_empty() { "" } else { "\r\n" },
     );
+    out
+}
+
+/// The drawn PLC inputs and outputs by address, from the PLC I/O list: (I/O list row, page id).
+fn points_by_address(i: &Inputs<'_>) -> BTreeMap<PlcAddress, Vec<(Vec<String>, String)>> {
+    let page_id: BTreeMap<&str, &str> = i
+        .project
+        .pages
+        .iter()
+        .map(|p| (p.number.as_str(), p.id.as_str()))
+        .collect();
+    let mut out: BTreeMap<PlcAddress, Vec<(Vec<String>, String)>> = BTreeMap::new();
+    for row in plc_io_list(i).rows {
+        let [address, kind, ..] = row.as_slice() else { continue };
+        let Some(a) = PlcAddress::parse(address) else { continue };
+        if a.output != (kind == "Output") {
+            continue;
+        }
+        let page = page_id.get(row[5].as_str()).copied().unwrap_or_default().to_owned();
+        out.entry(a).or_default().push((row, page));
+    }
+    out
+}
+
+/// PLC card overview: every card of every rack in the project ([`wc_core::plc_rack`]), slot by
+/// slot and channel by channel, with the PLC input or output drawn at each channel's address:
+/// the same device, description, connection and page as in the PLC I/O list. A channel with
+/// nothing drawn is listed empty (a spare); two points on one address give two rows. Rows with a
+/// drawn point link to its page. Cards whose channels cannot be worked out are left out
+/// ([`plc_rack_warnings`] says why).
+pub fn plc_card_overview(i: &Inputs<'_>) -> Table {
+    let mut t = Table::new(
+        "PLC cards",
+        &[
+            "Rack",
+            "Slot",
+            "Card",
+            "Type",
+            "Channel",
+            "Address",
+            "Device",
+            "Description",
+            "Connected to",
+            "Page",
+        ],
+    );
+    if i.project.meta.racks.is_empty() {
+        return t;
+    }
+    let points = points_by_address(i);
+    for rack in &i.project.meta.racks {
+        let mut cards: Vec<_> = rack.cards.iter().collect();
+        cards.sort_by_key(|c| c.slot);
+        for card in cards {
+            let Ok(addresses) = card.addresses() else { continue };
+            for (ch, a) in addresses.iter().enumerate() {
+                let head = vec![
+                    rack.name.clone(),
+                    card.slot.to_string(),
+                    card.label(),
+                    card.kind.clone(),
+                    ch.to_string(),
+                    a.iec(),
+                ];
+                match points.get(a) {
+                    Some(drawn) => {
+                        for (row, page) in drawn {
+                            let mut r = head.clone();
+                            r.extend([row[2].clone(), row[3].clone(), row[4].clone(), row[5].clone()]);
+                            t.row_pages.resize(t.rows.len(), String::new());
+                            t.row_pages.push(page.clone());
+                            t.rows.push(r);
+                        }
+                    }
+                    None => {
+                        let mut r = head;
+                        r.extend(std::iter::repeat_n(String::new(), 4));
+                        t.rows.push(r);
+                    }
+                }
+            }
+        }
+    }
+    t
+}
+
+/// What is wrong with the project's PLC racks: a card whose channels cannot be worked out, two
+/// cards in one slot, an address on two cards, and drawn PLC inputs and outputs whose address is
+/// on no card. Empty when there are no racks or they are all fine.
+pub fn plc_rack_warnings(i: &Inputs<'_>) -> Vec<String> {
+    let racks = &i.project.meta.racks;
+    let mut out = Vec::new();
+    if racks.is_empty() {
+        return out;
+    }
+    // address -> the first card that has it, as "rack slot n"
+    let mut owner: BTreeMap<PlcAddress, String> = BTreeMap::new();
+    for rack in racks {
+        let mut slots = BTreeSet::new();
+        for card in &rack.cards {
+            let here = format!("PLC rack \"{}\" slot {}", rack.name, card.slot);
+            if !slots.insert(card.slot) {
+                out.push(format!("{here}: a second card in this slot"));
+            }
+            match card.addresses() {
+                Err(e) => out.push(format!("{here}: {e}, left off the PLC card overview")),
+                Ok(addresses) => {
+                    for a in addresses {
+                        match owner.get(&a) {
+                            Some(first) => out.push(format!("{here}: address {} is also on {first}", a.iec())),
+                            None => {
+                                owner.insert(a, here.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (a, drawn) in points_by_address(i) {
+        if owner.contains_key(&a) {
+            continue;
+        }
+        for (row, _) in drawn {
+            out.push(format!(
+                "PLC {} {} at {} (page {}) is on no card of the PLC racks",
+                row[1].to_ascii_lowercase(),
+                row[2],
+                a.iec(),
+                row[5]
+            ));
+        }
+    }
     out
 }
 
