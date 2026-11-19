@@ -276,6 +276,15 @@ fn a_commit_of_some_paths_leaves_every_other_change() -> Result<()> {
         git.commit_paths_as("Again", "Guest <guest@example.com>", &["pages"])?
             .is_none()
     );
+    // A removal staged with `git rm` is recorded too; a staged file elsewhere stays staged.
+    git.run(&["rm", "-q", "--", "pages/p2.json"])?;
+    git.commit_paths_as("Remove page 2", "Guest <guest@example.com>", &["pages"])?
+        .ok_or("no commit")
+        .map_err(|e| wc_core::Error::Invalid(e.into()))?;
+    let files = git.run(&["show", "--name-status", "--format=", "HEAD"])?;
+    assert_eq!(files.trim(), "D\tpages/p2.json");
+    let left = git.run(&["status", "--porcelain"])?;
+    assert!(left.contains("stray [x].txt"), "{left}");
     // A name with glob characters is taken as it is written.
     assert!(
         git.commit_paths_as("Stray", "Guest <guest@example.com>", &["stray [x].txt"])?

@@ -175,7 +175,7 @@ impl Git {
             return self.commit_as(message, author);
         }
         let changed = self.changed_under(paths)?;
-        if changed.is_empty() && self.head().is_some() {
+        if changed.commit.is_empty() {
             return Ok(None);
         }
         self.commit_inner(message, Some(author), Some(&changed))
@@ -183,9 +183,9 @@ impl Git {
 
     /// The paths with a change (staged, unstaged or untracked) under `paths`, as git names them.
     /// Renames are not paired up, so a moved file is its removal and its addition.
-    fn changed_under(&self, paths: &[&str]) -> Result<Vec<String>> {
+    fn changed_under(&self, paths: &[&str]) -> Result<Changed> {
         if paths.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Changed::default());
         }
         let mut args = vec![
             "--literal-pathspecs",
@@ -198,20 +198,31 @@ impl Git {
         ];
         args.extend(paths);
         let out = self.run(&args)?;
-        let mut changed: Vec<String> = out
-            .split('\0')
-            .filter_map(|entry| entry.get(3..))
-            .filter(|p| !p.is_empty())
-            .map(str::to_owned)
-            .collect();
-        changed.sort();
-        changed.dedup();
+        let mut changed = Changed::default();
+        for entry in out.split('\0') {
+            let (Some(code), Some(path)) = (entry.get(..2), entry.get(3..)) else {
+                continue;
+            };
+            if path.is_empty() {
+                continue;
+            }
+            changed.commit.push(path.to_owned());
+            // A removal staged already (`git rm`) is in neither the index nor the folder, so
+            // `git add` would not find it; the commit takes it as it is staged.
+            if code != "D " {
+                changed.add.push(path.to_owned());
+            }
+        }
+        changed.commit.sort();
+        changed.commit.dedup();
+        changed.add.sort();
+        changed.add.dedup();
         Ok(changed)
     }
 
-    /// Commit every change (`only` is `None`), or only the changes of the paths in `only`, which
-    /// must each have one ([`Git::changed_under`]).
-    fn commit_inner(&self, message: &str, author: Option<&str>, only: Option<&[String]>) -> Result<Option<String>> {
+    /// Commit every change (`only` is `None`), or only the changes in `only`
+    /// ([`Git::changed_under`], with at least one path to commit).
+    fn commit_inner(&self, message: &str, author: Option<&str>, only: Option<&Changed>) -> Result<Option<String>> {
         // What was staged before, so a failed commit can put the index back as it was. This can
         // fail (an unmerged index while resolving a merge has no tree); the commit still goes on,
         // and the reason is kept for the error if the commit then fails.
@@ -225,12 +236,13 @@ impl Git {
                     return Ok(None);
                 }
             }
-            Some(paths) if !paths.is_empty() => {
-                let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
-                add.extend(paths.iter().map(String::as_str));
-                self.run(&add)?;
+            Some(changed) => {
+                if !changed.add.is_empty() {
+                    let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
+                    add.extend(changed.add.iter().map(String::as_str));
+                    self.run(&add)?;
+                }
             }
-            Some(_) => {}
         }
         let author_arg = author.map(|a| format!("--author={a}"));
         let mut args: Vec<&str> = Vec::new();
@@ -245,12 +257,11 @@ impl Git {
         if let Some(a) = &author_arg {
             args.push(a);
         }
-        // Only these paths' changes, whatever else is staged; no paths (a first commit with
-        // nothing under them) records an empty commit.
-        if let Some(paths) = only.filter(|p| !p.is_empty()) {
+        // Only these paths' changes, whatever else is staged.
+        if let Some(changed) = only {
             args.push("--only");
             args.push("--");
-            args.extend(paths.iter().map(String::as_str));
+            args.extend(changed.commit.iter().map(String::as_str));
         }
         if let Err(e) = self.run(&args) {
             let undo = match &index_before {
@@ -418,4 +429,12 @@ impl Git {
     pub fn show(&self, rev: &str, path: &str) -> Option<String> {
         self.run(&["show", &format!("{rev}:{path}")]).ok()
     }
+}
+
+/// What [`Git::commit_paths_as`] records: every path with a change, and the ones of them
+/// `git add` can take (all but removals staged already).
+#[derive(Debug, Default)]
+struct Changed {
+    commit: Vec<String>,
+    add: Vec<String>,
 }
