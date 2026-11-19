@@ -1447,5 +1447,33 @@ mod tests {
         };
         assert_eq!(layout_network(&net).under.len(), 5);
         kept_apart(&net);
+
+        // Twenty under runs and a tree bus need more tracks than the gap holds at the full
+        // step: they close up instead of running into the box of the column before.
+        let mut links: Vec<NetLink> = (1..=20)
+            .map(|n| link(&format!("-A:P{n}"), &format!("-T{n}:X1")))
+            .collect();
+        links.extend((1..=10).map(|n| link(&format!("-T{n}:X2"), &format!("-T{}:X2", n + 10))));
+        let net = Network {
+            links,
+            ..Network::default()
+        };
+        let topo = layout_network(&net);
+        assert_eq!(topo.under.len(), 10);
+        let (g, topo, _, _) = drawn_links(&net);
+        let r = routes(&topo, &g, bottom_of(&topo, &g));
+        let (first, least) = g.gap(1);
+        assert!(
+            r.x.len() * 3 / 2 > (first - least) as usize,
+            "{} runs fill the gap",
+            r.x.len()
+        );
+        for x in r.x.values() {
+            assert!(
+                *x >= least - 1e-9 && *x <= first + 1e-9,
+                "{x} is outside the gap {least}..{first}"
+            );
+        }
+        kept_apart(&net);
     }
 }
