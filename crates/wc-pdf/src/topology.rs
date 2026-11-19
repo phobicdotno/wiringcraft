@@ -191,8 +191,9 @@ const LANE: f64 = 4.0;
 const LONG_LANE: f64 = 24.0;
 
 /// Where the boxes go on a sheet: the top left of column 0, row 0, the steps between columns
-/// and rows, and the size of a box.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// and rows, the size of a box, and how far each row is pushed down by the loops over the rows
+/// up to it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Grid {
     pub x0: f64,
     pub y0: f64,
@@ -200,12 +201,23 @@ pub struct Grid {
     pub step_y: f64,
     pub box_w: f64,
     pub box_h: f64,
+    /// For each row, the loop room of that row and every row above it ([`loop_rooms`]).
+    pub loops_above: Vec<f64>,
 }
 
 impl Grid {
     /// The top left corner of the box in column `c`, row `r`.
     pub fn spot(&self, c: usize, r: usize) -> (f64, f64) {
-        (self.x0 + c as f64 * self.step_x, self.y0 + r as f64 * self.step_y)
+        let loops = self
+            .loops_above
+            .get(r)
+            .or(self.loops_above.last())
+            .copied()
+            .unwrap_or(0.0);
+        (
+            self.x0 + c as f64 * self.step_x,
+            self.y0 + r as f64 * self.step_y + loops,
+        )
     }
 
     /// Where the link lanes leave the side of a box of column `c`: in the room left of it,
@@ -228,13 +240,19 @@ fn top() -> f64 {
     MARGIN + layout::HEADER + 18.0
 }
 
-/// The room over a box its same-device loops take beyond the first: one line each.
-fn loop_room(topo: &Topology) -> f64 {
-    let most = (0..topo.boxes.len())
-        .map(|b| topo.own.iter().filter(|o| o.0 == b).count())
-        .max()
-        .unwrap_or(0);
-    most.saturating_sub(1) as f64 * LINE
+/// The room over each row that its boxes' same-device loops take beyond the first: one line
+/// for each further loop of the box in that row with the most (#492). A row without loops
+/// takes none.
+fn loop_rooms(topo: &Topology) -> Vec<f64> {
+    let (_, rows) = extent(topo);
+    let mut room = vec![0.0f64; rows];
+    for (b, (_, _, r)) in topo.boxes.iter().enumerate() {
+        let loops = topo.own.iter().filter(|o| o.0 == b).count();
+        if let Some(row) = room.get_mut(*r) {
+            *row = row.max(loops.saturating_sub(1) as f64 * LINE);
+        }
+    }
+    room
 }
 
 /// The `nth` same-device loop over a box at `(bx, by)` `box_w` wide, and where its label goes:
@@ -258,7 +276,8 @@ fn needed(topo: &Topology, band: f64) -> (f64, f64) {
     let (cols, rows) = extent(topo);
     let w = 2.0 * (MARGIN + 10.0) + cols as f64 * (MIN_BOX_W + GAP_X);
     let lanes = (topo.under.len() + 1) as f64 * LANE;
-    let h = top() + rows as f64 * (BOX_H + GAP_Y + loop_room(topo)) + lanes + 6.0 + band + MARGIN;
+    let loops: f64 = loop_rooms(topo).iter().sum();
+    let h = top() + rows as f64 * (BOX_H + GAP_Y) + loops + lanes + 6.0 + band + MARGIN;
     (w, h)
 }
 
@@ -294,13 +313,22 @@ pub fn sheet(wanted: PageSize, band: f64, net: &Network) -> (PageSize, Option<St
 pub fn grid(topo: &Topology, w: f64, h: f64, band: f64) -> Grid {
     let (cols, rows) = extent(topo);
     let (x0, x1) = (MARGIN + 10.0, w - MARGIN - 10.0);
-    let extra = loop_room(topo);
-    let (y0, y1) = (top() + extra, h - MARGIN - band - 6.0);
+    // Each row is pushed down by the loops over it and over the rows above: the sheet's
+    // height (`needed`) counts the same rooms.
+    let loops_above: Vec<f64> = loop_rooms(topo)
+        .into_iter()
+        .scan(0.0, |sum, room| {
+            *sum += room;
+            Some(*sum)
+        })
+        .collect();
+    let loops = loops_above.last().copied().unwrap_or(0.0);
+    let (y0, y1) = (top(), h - MARGIN - band - 6.0);
     let lanes = (topo.under.len() + 1) as f64 * LANE;
     let step_x = ((x1 - x0) / cols as f64).clamp(MIN_BOX_W + GAP_X, 88.0);
     let box_w = (step_x - GAP_X).clamp(MIN_BOX_W, 48.0);
-    let low = BOX_H + GAP_Y + extra;
-    let step_y = ((y1 - y0 - lanes) / rows as f64).clamp(low, low + 8.0);
+    let low = BOX_H + GAP_Y;
+    let step_y = ((y1 - y0 - lanes - loops) / rows as f64).clamp(low, low + 8.0);
     Grid {
         x0,
         y0,
@@ -308,6 +336,7 @@ pub fn grid(topo: &Topology, w: f64, h: f64, band: f64) -> Grid {
         step_y,
         box_w,
         box_h: BOX_H,
+        loops_above,
     }
 }
 
@@ -1083,5 +1112,47 @@ mod tests {
         }
         legs.sort_by(f64::total_cmp);
         assert!(legs.windows(2).all(|w| w[1] - w[0] > 0.1), "{legs:?}");
+    }
+
+    /// One looped child among many on a switch: only its row makes room for its loops, so the
+    /// sheet is no taller than the rows and that one row's loops need, and the loops still
+    /// clear the box above (#492).
+    #[test]
+    fn only_the_row_with_loops_makes_room_for_them() {
+        let mut links: Vec<NetLink> = (0..40)
+            .map(|i| link(&format!("-Q1:X1P{}", i + 1), &format!("-A{}:X1", i + 1)))
+            .collect();
+        links.extend((0..10).map(|i| link(&format!("-A7:P{}", 2 * i + 1), &format!("-A7:P{}", 2 * i + 2))));
+        let net = Network {
+            links,
+            ..Network::default()
+        };
+        let band = 30.0;
+        let topo = layout_network(&net);
+        let (_, rows) = extent(&topo);
+        let rooms = loop_rooms(&topo);
+        assert_eq!(rooms.iter().filter(|r| **r > 0.0).count(), 1, "{rooms:?}");
+        let loops: f64 = rooms.iter().sum();
+        assert_eq!(loops, 9.0 * LINE);
+        let (_, h) = needed(&topo, band);
+        let per_row = top() + rows as f64 * (BOX_H + GAP_Y) + loops;
+        assert!(h <= per_row + (topo.under.len() + 1) as f64 * LANE + 6.0 + band + MARGIN + 1e-9);
+        assert!(h < f64::from(PageSize::MAX_MM), "{h}");
+        // Fits a sheet without a warning, every box apart and above the title block.
+        let (_, g, topo) = fits_its_sheet(&net);
+        let Some(&(_, c, r)) = topo.boxes.iter().find(|b| b.0 == "-A7") else {
+            unreachable!("-A7 has a box")
+        };
+        let (bx, by) = g.spot(c, r);
+        let (_, label) = own_path(bx, by, g.box_w, 9, 10);
+        // The outermost loop's label clears every box in the rows above it.
+        for b in topo.boxes.iter().filter(|b| b.2 < r) {
+            let (_, y) = g.spot(b.1, b.2);
+            assert!(y + g.box_h < label.1 - TEXT, "{} overlaps the loops of -A7", b.0);
+        }
+        // A row without loops keeps the plain step.
+        let (_, y0) = g.spot(c, r - 2);
+        let (_, y1) = g.spot(c, r - 1);
+        assert!((y1 - y0 - g.step_y).abs() < 1e-9);
     }
 }
