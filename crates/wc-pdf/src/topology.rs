@@ -326,6 +326,16 @@ fn legend_for(topo: &Topology, net: &Network, w: f64) -> Legend {
     legend
 }
 
+/// How wide the legend's lines may run on a sheet `w` mm wide.
+fn legend_width(w: f64) -> f64 {
+    w - 2.0 * (MARGIN + 10.0)
+}
+
+/// How many lines the legend of `net` laid out as `topo` takes on a sheet `w` mm wide.
+fn legend_lines(topo: &Topology, net: &Network, w: f64) -> usize {
+    legend_for(topo, net, w).lines(legend_width(w)).len()
+}
+
 /// The sheet a network is drawn on: `wanted` (the size of the first schematic page) when the
 /// layout fits it, else the first ISO size that fits, else a custom sheet. A layout too large
 /// even for the largest custom sheet gets that, with a warning.
@@ -333,7 +343,7 @@ pub fn sheet(wanted: PageSize, band: f64, net: &Network) -> (PageSize, Option<St
     let topo = layout_network(net);
     let (w, _) = needed(&topo, band, 0);
     // The legend, and so the height, depends on how wide the sheet is.
-    let height = |sw: f64| needed(&topo, band, legend_for(&topo, net, sw).0.len()).1;
+    let height = |sw: f64| needed(&topo, band, legend_lines(&topo, net, sw)).1;
     let fits = |s: &PageSize| {
         let (sw, sh) = s.mm();
         sw >= w && sh >= height(sw)
@@ -559,6 +569,32 @@ fn whole_size(s: &str, room: f64, size: f64) -> Option<f64> {
 pub struct Legend(pub Vec<String>);
 
 impl Legend {
+    /// Its lines, each entry `[n] name` wrapped to `width` mm without dropping a character,
+    /// a line that goes on indented past its key: how far in each line starts, and its text.
+    pub fn lines(&self, width: f64) -> Vec<(f64, String)> {
+        let width_of = |t: &str| crate::writer::text_width_mm(t, TEXT);
+        let mut out = Vec::new();
+        for (i, name) in self.0.iter().enumerate() {
+            let key = format!("[{}] ", i + 1);
+            let indent = width_of(&key);
+            let mut line = key;
+            let mut first = true;
+            for c in name.chars() {
+                let room = if first { width } else { width - indent };
+                line.push(c);
+                // Always keep one character on a line, so a very narrow legend still ends.
+                if width_of(&line) > room && line.chars().count() > 1 {
+                    line.pop();
+                    out.push((if first { 0.0 } else { indent }, std::mem::take(&mut line)));
+                    first = false;
+                    line.push(c);
+                }
+            }
+            out.push((if first { 0.0 } else { indent }, line));
+        }
+        out
+    }
+
     /// The key of `s`, adding it when it is new.
     fn key(&mut self, s: &str) -> String {
         let n = match self.0.iter().position(|x| x == s) {
@@ -576,7 +612,13 @@ impl Legend {
 /// `legend`. Returns the text and its type size.
 fn fitted(s: &str, room: f64, size: f64, legend: &mut Legend) -> (String, f64) {
     let room = room.max(0.0);
-    match whole_size(s, room, size) {
+    // A name written like a key goes to the legend too, so it is never taken for one.
+    let like_key = |t: &str| {
+        t.strip_prefix('[')
+            .and_then(|t| t.strip_suffix(']'))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    match whole_size(s, room, size).filter(|_| !like_key(s)) {
         Some(size) => (s.to_owned(), size),
         None => {
             let key = legend.key(s);
@@ -782,7 +824,7 @@ pub fn draw_network_page(
             warn(format!("link {} is not drawn: an end names no device", k + 1));
         }
     }
-    let keys = legend_for(&topo, net, w).0.len();
+    let keys = legend_lines(&topo, net, w);
     let g = grid(&topo, w, h, band, keys);
     let mut legend = Legend::default();
 
@@ -859,14 +901,8 @@ pub fn draw_network_page(
     }
     // The names keyed on the drawing, whole, under the lanes.
     let start = bottom_of(&topo, &g) + (topo.under.len() + 1) as f64 * LANE;
-    for (i, name) in legend.0.iter().enumerate() {
-        let line = format!("[{}] {name}", i + 1);
-        pen.text(
-            (x0, start + LINE * (i as f64 + 1.0)),
-            TEXT,
-            0,
-            &fit_at(&line, x1 - x0, TEXT),
-        );
+    for (i, (indent, line)) in legend.lines(x1 - x0).iter().enumerate() {
+        pen.text((x0 + indent, start + LINE * (i as f64 + 1.0)), TEXT, 0, line);
     }
     if topo.boxes.is_empty() {
         pen.colour(0.45, 0.45, 0.45);
@@ -943,7 +979,7 @@ mod tests {
         assert!(warn.is_none());
         let (w, h) = size.mm();
         let topo = layout_network(net);
-        let g = grid(&topo, w, h, band, legend_for(&topo, net, w).0.len());
+        let g = grid(&topo, w, h, band, legend_lines(&topo, net, w));
         let rects: Vec<((f64, f64), (f64, f64))> = topo
             .boxes
             .iter()
@@ -1676,7 +1712,55 @@ mod tests {
         let (size, warn) = sheet(PageSize::A4, band, &net);
         assert!(warn.is_none());
         let (w, h) = size.mm();
-        assert!(h >= needed(&topo, band, legend_for(&topo, &net, w).0.len()).1);
+        assert!(h >= needed(&topo, band, legend_lines(&topo, &net, w)).1);
         assert!(needed(&topo, band, keys).1 > needed(&topo, band, 0).1);
+    }
+
+    #[test]
+    fn a_legend_entry_wider_than_the_sheet_wraps_whole() {
+        let cable = format!("-W{}", "W".repeat(400));
+        let mut net = Network {
+            links: vec![link("-K1:P1", "-T1:X1")],
+            ..Network::default()
+        };
+        net.links[0].cable = cable.clone();
+        let topo = layout_network(&net);
+        let w = PageSize::A3.mm().0;
+        let legend = legend_for(&topo, &net, w);
+        assert_eq!(legend.0, std::slice::from_ref(&cable));
+        let lines = legend.lines(legend_width(w));
+        assert!(lines.len() > 1, "{lines:?}");
+        let joined: String = lines.iter().map(|l| l.1.as_str()).collect();
+        assert_eq!(joined, format!("[1] {cable}"));
+        for (indent, line) in &lines {
+            assert!(indent + crate::writer::text_width_mm(line, TEXT) <= legend_width(w) + 1e-9);
+        }
+        // The page draws every line, and the sheet makes room for them.
+        fits_its_sheet(&net);
+        let (drawn, _) = page_of(&net);
+        for (_, line) in &lines {
+            assert!(drawn.ops.contains(&crate::writer::pdf_text(line)), "{line}");
+        }
+        assert!(!drawn.ops.contains("WWW..."));
+    }
+
+    #[test]
+    fn a_name_written_like_a_key_is_keyed_too() {
+        let mut net = Network {
+            links: vec![link("-K1:P1", "-T1:X1"), link("-K1:P2", "-T2:X1")],
+            ..Network::default()
+        };
+        net.links[0].cable = "[1]".into();
+        net.links[1].cable = "-W1-A-CABLE-TAG-FAR-TOO-LONG-FOR-ANY-GAP".into();
+        let (size, g, topo) = fits_its_sheet(&net);
+        let mut legend = Legend::default();
+        let (_, labels) = link_drawing(&topo, &g, &net, size.mm().0, &mut legend);
+        assert_eq!(legend.0, ["[1]", "-W1-A-CABLE-TAG-FAR-TOO-LONG-FOR-ANY-GAP"]);
+        let keys: Vec<&str> = labels
+            .iter()
+            .map(|l| l.text.as_str())
+            .filter(|t| t.starts_with('['))
+            .collect();
+        assert_eq!(keys, ["[1]", "[2]"]);
     }
 }
