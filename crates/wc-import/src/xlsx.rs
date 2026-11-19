@@ -1154,22 +1154,23 @@ mod tests {
     #[test]
     fn row_warnings_name_the_worksheet_row_past_blank_rows() -> Result<()> {
         let cell = |r: &str, t: &str| format!(r#"<c r="{r}" t="inlineStr"><is><t>{t}</t></is></c>"#);
-        // Row 2 is left out of the sheet, row 3 is empty, row 4 has only a blank cell; row 6
-        // has no `r` and follows row 5; row 8 is a bad row after another gap.
+        // Row 2 is left out of the sheet and row 3 is empty; row 4 has no `r` and must follow
+        // the empty row 3. Row 5 has only a blank cell; row 6 has no `r` and follows row 5;
+        // row 8 is a bad row after another gap.
         let sheet = format!(
-            r#"<worksheet><sheetData><row r="1">{}{}</row><row r="3"/><row r="4">{}</row><row r="5">{}{}</row><row>{}</row><row r="8">{}{}</row></sheetData></worksheet>"#,
+            r#"<worksheet><sheetData><row r="1">{}{}</row><row r="3"/><row>{}{}</row><row r="5">{}</row><row>{}</row><row r="8">{}{}</row></sheetData></worksheet>"#,
             cell("A1", "Order number"),
             cell("B1", "NO"),
-            cell("A4", " "),
-            cell("A5", "LC1D09"),
-            cell("B5", "1"),
+            cell("A4", "LC1D09"),
+            cell("B4", "1"),
+            cell("A5", " "),
             cell("B6", "2"),
             cell("A8", "X"),
             cell("B8", "two"),
         );
         let bytes = one_sheet("worksheets/sheet1.xml", "xl/worksheets/sheet1.xml", &sheet);
         let rows = crate::csv::file_rows(&bytes)?;
-        assert_eq!(rows.numbers, [1, 5, 6, 8]);
+        assert_eq!(rows.numbers, [1, 4, 6, 8]);
         let (parts, warnings) = crate::csv::parts_from_rows(&rows)?;
         assert_eq!(parts.len(), 2);
         assert_eq!(warnings.len(), 2, "{warnings:?}");
