@@ -11,7 +11,7 @@
 //! taken as they are: x across the plate, y up it and z out of it.
 //!
 //! In an assembly each part is measured where it is placed, nested assemblies included (see
-//! [`assembly`]).
+//! the `assembly` module).
 
 use std::collections::{BTreeMap, BTreeSet};
 
