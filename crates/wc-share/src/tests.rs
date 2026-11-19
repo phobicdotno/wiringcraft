@@ -3810,12 +3810,15 @@ fn a_moved_picture_that_cannot_be_read_again_says_why() -> TestResult {
     let dir = tmp.path();
     write_picture(dir, &picture("pictures/logo.png", b"mine"))?;
     // Once compared, the moved file becomes something that cannot be read as a file.
+    let made = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let result = made.clone();
     crate::journal::AFTER_COMPARE.with(|f| {
-        *f.borrow_mut() = Some(Box::new(|aside: &std::path::Path| {
-            let _ = std::fs::remove_file(aside).and_then(|()| std::fs::create_dir(aside));
+        *f.borrow_mut() = Some(Box::new(move |aside: &std::path::Path| {
+            *result.borrow_mut() = Some(std::fs::remove_file(aside).and_then(|()| std::fs::create_dir(aside)));
         }));
     });
     let r = replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"mine");
+    made.borrow_mut().take().ok_or("the hook did not run")??;
     let message = r.err().map(|e| e.to_string()).ok_or("no error")?;
     assert!(message.contains("could not be read again"), "{message}");
     assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
