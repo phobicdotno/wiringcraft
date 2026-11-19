@@ -1727,3 +1727,39 @@ fn a_network_gets_a_topology_page_with_its_devices_addresses_and_cables() {
     // The switch's box links to the page it is drawn on; the others are on no page.
     assert_eq!(text.matches("/Subtype /Link").count(), 1);
 }
+
+#[test]
+fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about() {
+    use wc_core::network::{Link as NetLink, Network, Node};
+    let net = Network {
+        name: "PN2".into(),
+        nodes: vec![Node {
+            device: "K 10?".into(),
+            ..Node::default()
+        }],
+        links: vec![NetLink {
+            from: "-K10:P1".into(),
+            to: "-K10:P2".into(),
+            cable: "-W9".into(),
+            ..NetLink::default()
+        }],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&writer::pdf_text("P1 - P2 -W9")));
+    // Drawn as written, and why it is not a tag is a warning.
+    assert!(text.contains(&writer::pdf_text("K 10?")));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("network PN2: node \"K 10?\"")),
+        "{:?}",
+        report.warnings
+    );
+}

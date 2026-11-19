@@ -202,15 +202,19 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     add_reports(&mut doc, back_pages, &mut sheet);
     // Network topologies close the document, after the network list.
     for (k, net) in options.networks.iter().enumerate() {
+        // A sheet the whole topology fits on: the first page's size, or a larger one.
+        let (size, warn) = topology::sheet(first_size, project.meta.template.band_height(), net);
+        report.warnings.extend(warn);
         let mut page = wc_core::Page::new(
             format!("network-{}", net.name),
             format!("N{}", k + 1),
             format!("Network {}", net.name),
         );
-        page.size = first_size;
-        let mut drawn = topology::draw_network_page(project, &page, sheet, total, net, &options.date);
+        page.size = size;
+        let mut drawn =
+            topology::draw_network_page(project, &page, sheet, total, net, &options.date, &mut report.warnings);
         place_logo(&mut drawn, &page);
-        doc.add_page(first_size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        doc.add_page(size.mm(), &format!("{} {}", page.number, page.title), drawn);
         sheet += 1;
     }
     // Links resolve against the exported page list, so links to pages left out are dropped.

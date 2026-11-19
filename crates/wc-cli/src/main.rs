@@ -5236,6 +5236,11 @@ mod tests {
         assert!(all.contains(&hex("Networks")));
         assert!(all.contains(&hex("192.168.0.10")));
         assert!(all.contains(&hex("-A1:X1P1")));
+        // The network list is followed by a topology page per network; another report has none.
+        let topology = format!("/Title {}", hex("N1 Network PN1"));
+        assert!(all.contains(&topology));
+        assert!(pdf("networks").contains(&topology));
+        assert!(!pdf("parts").contains(&topology));
     }
 
     #[test]

@@ -4,10 +4,14 @@
 //! The devices are laid out from the order of the links: the first node (or the first link
 //! end) on the left, each device it links to one column further right, so a line runs across
 //! the page and a switch fans out into a tree. A link that would close a loop (a ring back to
-//! the first device) is drawn once, routed under the boxes.
+//! the first device) is drawn once, routed beside the boxes to a lane under them; a link
+//! between two ports of one device is a small loop over its box. The sheet grows (a larger
+//! ISO size, else a custom one) until every box has room.
+
+use std::collections::VecDeque;
 
 use wc_core::network::{Network, Port};
-use wc_core::{Page, Project};
+use wc_core::{Page, PageSize, Project};
 
 use crate::layout::{self, MARGIN, frame, text_fit};
 use crate::writer::{Drawn, Link, Pen};
@@ -19,9 +23,13 @@ pub struct Topology {
     pub boxes: Vec<(String, usize, usize)>,
     /// Links between a device and one it was reached from (box indexes), with the link.
     pub tree: Vec<(usize, usize, usize)>,
-    /// Links drawn under the boxes: ones that close a loop, or join two devices of the same
-    /// column (box indexes), with the link.
+    /// Links drawn in lanes under the boxes: ones that close a loop, or join two devices
+    /// already placed (box indexes), with the link.
     pub under: Vec<(usize, usize, usize)>,
+    /// Links between two ports of one device (box index), with the link.
+    pub own: Vec<(usize, usize)>,
+    /// Links an end of which names no device (an empty end), by index.
+    pub unplaced: Vec<usize>,
 }
 
 /// The device a link end or a node names, as written (trimmed); a tag that does not parse is
@@ -55,44 +63,62 @@ pub fn layout_network(net: &Network) -> Topology {
         .iter()
         .map(|l| Some((index(&key(&l.from))?, index(&key(&l.to))?)))
         .collect();
+    let mut topo = Topology {
+        unplaced: ends
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.is_none())
+            .map(|(k, _)| k)
+            .collect(),
+        ..Topology::default()
+    };
     let mut place: Vec<Option<(usize, usize)>> = vec![None; names.len()];
+    // The next free row of each column.
     let mut rows_in: Vec<usize> = Vec::new();
-    let mut used = vec![false; net.links.len()];
-    let mut topo = Topology::default();
+    let mut used = vec![false; ends.len()];
+    let take_row = |rows_in: &mut Vec<usize>, col: usize, at_least: usize| -> usize {
+        if rows_in.len() <= col {
+            rows_in.resize(col + 1, 0);
+        }
+        let slot = rows_in.get_mut(col);
+        let row = slot.as_ref().map_or(0, |n| **n).max(at_least);
+        if let Some(n) = slot {
+            *n = row + 1;
+        }
+        row
+    };
     for start in 0..names.len() {
-        if place[start].is_some() {
+        if !matches!(place.get(start), Some(None)) {
             continue;
         }
         // A part of the network not linked to what is drawn so far starts below it.
-        let row = rows_in.iter().copied().max().unwrap_or(0);
-        if rows_in.is_empty() {
-            rows_in.push(0);
+        let below = rows_in.iter().copied().max().unwrap_or(0);
+        let row = take_row(&mut rows_in, 0, below);
+        if let Some(slot) = place.get_mut(start) {
+            *slot = Some((0, row));
         }
-        place[start] = Some((0, row));
-        rows_in[0] = rows_in[0].max(row + 1);
-        let mut queue = std::collections::VecDeque::from([start]);
+        let mut queue = VecDeque::from([start]);
         while let Some(at) = queue.pop_front() {
-            let Some((col, _)) = place[at] else { continue };
-            for (k, e) in ends.iter().enumerate() {
+            let Some(&Some((col, at_row))) = place.get(at) else {
+                continue;
+            };
+            for (k, (e, done)) in ends.iter().zip(used.iter_mut()).enumerate() {
                 let Some((a, b)) = *e else { continue };
-                if used[k] || (a != at && b != at) {
+                if *done || (a != at && b != at) {
                     continue;
                 }
+                *done = true;
                 let other = if a == at { b } else { a };
-                used[k] = true;
                 if other == at {
+                    topo.own.push((at, k));
                     continue;
                 }
-                if place[other].is_none() {
-                    let c = col + 1;
-                    if rows_in.len() <= c {
-                        rows_in.resize(c + 1, 0);
-                    }
+                if matches!(place.get(other), Some(None)) {
                     // Not above the device it hangs from.
-                    let parent_row = place[at].map_or(0, |p| p.1);
-                    let r = rows_in[c].max(parent_row);
-                    rows_in[c] = r + 1;
-                    place[other] = Some((c, r));
+                    let r = take_row(&mut rows_in, col + 1, at_row);
+                    if let Some(slot) = place.get_mut(other) {
+                        *slot = Some((col + 1, r));
+                    }
                     topo.tree.push((at, other, k));
                     queue.push_back(other);
                 } else {
@@ -114,10 +140,135 @@ pub fn layout_network(net: &Network) -> Topology {
 
 const TEXT: f64 = 2.2;
 const LINE: f64 = 3.2;
+/// A box: four lines of text.
+const BOX_H: f64 = 4.0 * LINE + 2.0;
+/// The narrowest a box gets, and the room between two columns for a link's labels.
+const MIN_BOX_W: f64 = 22.0;
+const GAP_X: f64 = 18.0;
+/// Room between two rows, for a loop over a box and its label.
+const GAP_Y: f64 = 8.0;
+/// Room for each lane under the boxes.
+const LANE: f64 = 4.0;
+
+/// Where the boxes go on a sheet: the top left of column 0, row 0, the steps between columns
+/// and rows, and the size of a box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Grid {
+    pub x0: f64,
+    pub y0: f64,
+    pub step_x: f64,
+    pub step_y: f64,
+    pub box_w: f64,
+    pub box_h: f64,
+}
+
+impl Grid {
+    /// The top left corner of the box in column `c`, row `r`.
+    pub fn spot(&self, c: usize, r: usize) -> (f64, f64) {
+        (self.x0 + c as f64 * self.step_x, self.y0 + r as f64 * self.step_y)
+    }
+
+    /// Where the link lanes leave the side of a box of column `c`: in the room left of it,
+    /// clear of the boxes and of the labels of the links into and out of that room.
+    fn side(&self, c: usize) -> f64 {
+        let x = self.x0 + c as f64 * self.step_x;
+        (x - (self.step_x - self.box_w) / 2.0 - 1.5).max(MARGIN + 2.0)
+    }
+}
+
+/// The columns and rows a layout uses.
+fn extent(topo: &Topology) -> (usize, usize) {
+    let cols = topo.boxes.iter().map(|b| b.1 + 1).max().unwrap_or(1);
+    let rows = topo.boxes.iter().map(|b| b.2 + 1).max().unwrap_or(1);
+    (cols, rows)
+}
+
+/// The top of the drawing area: below the title line.
+fn top() -> f64 {
+    MARGIN + layout::HEADER + 18.0
+}
+
+/// The space `topo` needs on a sheet, in millimetres, with a title block `band` high.
+fn needed(topo: &Topology, band: f64) -> (f64, f64) {
+    let (cols, rows) = extent(topo);
+    let w = 2.0 * (MARGIN + 10.0) + cols as f64 * (MIN_BOX_W + GAP_X);
+    let lanes = (topo.under.len() + 1) as f64 * LANE;
+    let h = top() + rows as f64 * (BOX_H + GAP_Y) + lanes + 6.0 + band + MARGIN;
+    (w, h)
+}
+
+/// The sheet a network is drawn on: `wanted` (the size of the first schematic page) when the
+/// layout fits it, else the first ISO size that fits, else a custom sheet. A layout too large
+/// even for the largest custom sheet gets that, with a warning.
+pub fn sheet(wanted: PageSize, band: f64, net: &Network) -> (PageSize, Option<String>) {
+    let (w, h) = needed(&layout_network(net), band);
+    let fits = |s: &PageSize| {
+        let (sw, sh) = s.mm();
+        sw >= w && sh >= h
+    };
+    if let Some(s) = std::iter::once(wanted).chain(PageSize::NAMED).find(fits) {
+        return (s, None);
+    }
+    let (lo, hi) = (f64::from(PageSize::MIN_MM), f64::from(PageSize::MAX_MM));
+    let side = |v: f64| v.ceil().clamp(lo, hi) as u32;
+    let size = PageSize::Custom {
+        width: side(w),
+        height: side(h),
+    };
+    let warn = (w > hi || h > hi).then(|| {
+        format!(
+            "network {}: its topology needs {w:.0} x {h:.0} mm, more than the largest sheet; some devices are drawn off the sheet",
+            net.name
+        )
+    });
+    (size, warn)
+}
+
+/// The grid for `topo` on a sheet `w` by `h` mm with a title block `band` high: columns and
+/// rows spread over the room there is, never closer than a box and its labels need.
+pub fn grid(topo: &Topology, w: f64, h: f64, band: f64) -> Grid {
+    let (cols, rows) = extent(topo);
+    let (x0, x1) = (MARGIN + 10.0, w - MARGIN - 10.0);
+    let (y0, y1) = (top(), h - MARGIN - band - 6.0);
+    let lanes = (topo.under.len() + 1) as f64 * LANE;
+    let step_x = ((x1 - x0) / cols as f64).clamp(MIN_BOX_W + GAP_X, 70.0);
+    let box_w = (step_x - GAP_X).clamp(MIN_BOX_W, 48.0);
+    let step_y = ((y1 - y0 - lanes) / rows as f64).clamp(BOX_H + GAP_Y, BOX_H + 16.0);
+    Grid {
+        x0,
+        y0,
+        step_x,
+        step_y,
+        box_w,
+        box_h: BOX_H,
+    }
+}
+
+/// The path of a link drawn in lane `lane` under the boxes, from the box at `a` to the one
+/// at `b` (column, row): out of the lower left of each box into the room left of its column,
+/// down that room to the lane, and along it.
+pub fn under_path(g: &Grid, a: (usize, usize), b: (usize, usize), bottom: f64, lane: usize) -> Vec<(f64, f64)> {
+    let (ax, ay) = g.spot(a.0, a.1);
+    let (bx, by) = g.spot(b.0, b.1);
+    let y = bottom + LANE * (lane as f64 + 1.0);
+    let (sa, sb) = (ay + g.box_h - 1.5, by + g.box_h - 1.5);
+    // The two ends' runs down a shared room stay apart.
+    let (xa, xb) = (g.side(a.0), g.side(b.0) + 1.5);
+    vec![(ax, sa), (xa, sa), (xa, y), (xb, y), (xb, sb), (bx, sb)]
+}
+
+/// The lowest edge of any box.
+fn bottom_of(topo: &Topology, g: &Grid) -> f64 {
+    topo.boxes
+        .iter()
+        .map(|b| g.spot(b.1, b.2).1 + g.box_h)
+        .fold(g.y0, f64::max)
+}
 
 /// One topology page for `net`: frame and title block, a box per device with its tag,
 /// description, address and station, and each link once with its port names and cable tag.
-/// A box links to the first page its device is drawn on.
+/// A box links to the first page its device is drawn on. A node or link end that does not
+/// read as a device tag is still drawn as written, and why is added to `warnings`.
 pub fn draw_network_page(
     project: &Project,
     page: &Page,
@@ -125,6 +276,7 @@ pub fn draw_network_page(
     total: usize,
     net: &Network,
     date: &str,
+    warnings: &mut Vec<String>,
 ) -> Drawn {
     let (w, h) = page.size.mm();
     let mut pen = Pen::new(h);
@@ -143,24 +295,44 @@ pub fn draw_network_page(
     };
     pen.text((x0, title_y), 4.0, 0, &text_fit(&title, 4.0, x1 - x0));
 
+    let mut warn = |why: String| {
+        let w = format!("network {}: {why}", net.name);
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    };
+    for n in &net.nodes {
+        if let Err(why) = n.device.trim().parse::<wc_core::DeviceTag>() {
+            warn(format!("node {:?}: {why}", n.device.trim()));
+        }
+    }
+    for (k, l) in net.links.iter().enumerate() {
+        for end in [&l.from, &l.to] {
+            if let Err(why) = Port::parse(end) {
+                warn(format!("link {}: {why}", k + 1));
+            }
+        }
+    }
     let topo = layout_network(net);
-    let cols = topo.boxes.iter().map(|b| b.1 + 1).max().unwrap_or(1);
-    let rows = topo.boxes.iter().map(|b| b.2 + 1).max().unwrap_or(1);
-    let (y0, y1) = (title_y + 8.0, h - MARGIN - band - 6.0);
-    // Room for the lanes of the links drawn under the boxes.
-    let lanes = topo.under.len() as f64 * 4.0;
-    let step_x = ((x1 - x0) / cols as f64).min(70.0);
-    let box_w = (step_x - 18.0).clamp(20.0, 48.0);
-    let box_h = 4.0 * LINE + 2.0;
-    let step_y = ((y1 - y0 - lanes) / rows as f64).min(box_h + 16.0).max(box_h + 4.0);
-    let spot = |c: usize, r: usize| (x0 + c as f64 * step_x, y0 + r as f64 * step_y);
+    for &k in &topo.unplaced {
+        if let Some(l) = net.links.get(k) {
+            warn(format!(
+                "link {} ({} to {}) is not drawn: an end names no device",
+                k + 1,
+                l.from.trim(),
+                l.to.trim()
+            ));
+        }
+    }
+    let g = grid(&topo, w, h, band);
+    let at = |i: usize| topo.boxes.get(i).map(|b| g.spot(b.1, b.2));
 
     let tags = project.tag_index();
     let mut links = Vec::new();
     pen.width(0.25);
     for (name, c, r) in &topo.boxes {
-        let (bx, by) = spot(*c, *r);
-        pen.rect((bx, by), (bx + box_w, by + box_h));
+        let (bx, by) = g.spot(*c, *r);
+        pen.rect((bx, by), (bx + g.box_w, by + g.box_h));
         let tag = name.parse::<wc_core::DeviceTag>().ok();
         let node = tag.as_ref().and_then(|t| net.node(t));
         let description = tag
@@ -180,58 +352,70 @@ pub fn draw_network_page(
                 (bx + 1.5, by + 1.0 + LINE * (i as f64 + 1.0)),
                 size,
                 0,
-                &text_fit(t, size, box_w - 3.0),
+                &text_fit(t, size, g.box_w - 3.0),
             );
         }
         if let Some(target) = tag.as_ref().and_then(|t| tags.get(t)).and_then(|at| at.first()) {
             links.push(Link {
                 min: (bx, by),
-                max: (bx + box_w, by + box_h),
+                max: (bx + g.box_w, by + g.box_h),
                 target_page_id: target.0.clone(),
             });
         }
     }
     let port = |s: &str| Port::parse(s).map(|p| p.port).unwrap_or_default();
-    // Each link's ends: its `from` end at the first box given.
-    let ends = |a: usize, k: usize| {
-        let l = &net.links[k];
-        let a_is_from = key(&l.from) == topo.boxes[a].0;
-        if a_is_from {
+    // A link's port names and cable, its `from` end first when that is at box `a`.
+    let ends = |a: usize, k: usize| -> Option<(String, String, String)> {
+        let l = net.links.get(k)?;
+        let a_is_from = topo.boxes.get(a).is_some_and(|b| key(&l.from) == b.0);
+        let (p, q) = if a_is_from {
             (port(&l.from), port(&l.to))
         } else {
             (port(&l.to), port(&l.from))
-        }
+        };
+        Some((p, q, l.cable.trim().to_owned()))
     };
     for &(a, b, k) in &topo.tree {
-        let (pa, pb) = spot(topo.boxes[a].1, topo.boxes[a].2);
-        let (qa, qb) = spot(topo.boxes[b].1, topo.boxes[b].2);
-        let start = (pa + box_w, pb + box_h / 2.0);
-        let end = (qa, qb + box_h / 2.0);
+        let (Some((pa, pb)), Some((qa, qb)), Some((from_port, to_port, cable))) = (at(a), at(b), ends(a, k)) else {
+            continue;
+        };
+        let start = (pa + g.box_w, pb + g.box_h / 2.0);
+        let end = (qa, qb + g.box_h / 2.0);
         let mid = (start.0 + end.0) / 2.0;
         pen.polyline(&[start, (mid, start.1), (mid, end.1), end], false);
-        let (from_port, to_port) = ends(a, k);
         pen.text((start.0 + 1.0, start.1 - 1.0), TEXT, 0, &from_port);
         pen.text((end.0 - 1.0, end.1 - 1.0), TEXT, 2, &to_port);
-        let cable = net.links[k].cable.trim();
-        pen.text((mid + 1.0, (start.1 + end.1) / 2.0 + LINE), TEXT, 0, cable);
+        pen.text((mid + 1.0, (start.1 + end.1) / 2.0 + LINE), TEXT, 0, &cable);
     }
-    let bottom = topo.boxes.iter().map(|b| spot(b.1, b.2).1 + box_h).fold(y0, f64::max);
+    let bottom = bottom_of(&topo, &g);
     for (lane, &(a, b, k)) in topo.under.iter().enumerate() {
-        let (pa, pb) = spot(topo.boxes[a].1, topo.boxes[a].2);
-        let (qa, qb) = spot(topo.boxes[b].1, topo.boxes[b].2);
-        let y = bottom + 4.0 * (lane as f64 + 1.0);
-        let start = (pa + box_w / 2.0, pb + box_h);
-        let end = (qa + box_w / 2.0 + 2.0, qb + box_h);
-        pen.polyline(&[start, (start.0, y), (end.0, y), end], false);
-        let (from_port, to_port) = ends(a, k);
-        pen.text((start.0 + 1.0, start.1 + LINE), TEXT, 0, &from_port);
-        pen.text((end.0 + 1.0, end.1 + LINE), TEXT, 0, &to_port);
-        let cable = net.links[k].cable.trim();
-        pen.text(((start.0 + end.0) / 2.0, y - 1.0), TEXT, 1, cable);
+        let (Some(ba), Some(bb), Some((from_port, to_port, cable))) =
+            (topo.boxes.get(a), topo.boxes.get(b), ends(a, k))
+        else {
+            continue;
+        };
+        let path = under_path(&g, (ba.1, ba.2), (bb.1, bb.2), bottom, lane);
+        pen.polyline(&path, false);
+        if let (Some(&s), Some(&e), Some(&(lx, ly)), Some(&(rx, _))) =
+            (path.first(), path.last(), path.get(2), path.get(3))
+        {
+            pen.text((s.0 - 1.0, s.1 - 0.6), TEXT, 2, &from_port);
+            pen.text((e.0 - 1.0, e.1 - 0.6), TEXT, 2, &to_port);
+            pen.text(((lx + rx) / 2.0, ly - 0.8), TEXT, 1, &cable);
+        }
+    }
+    for &(a, k) in &topo.own {
+        let (Some((bx, by)), Some((from_port, to_port, cable))) = (at(a), ends(a, k)) else {
+            continue;
+        };
+        let (l, r) = (bx + g.box_w * 0.3, bx + g.box_w * 0.7);
+        pen.polyline(&[(l, by), (l, by - 3.0), (r, by - 3.0), (r, by)], false);
+        let label = format!("{from_port} - {to_port} {cable}");
+        pen.text(((l + r) / 2.0, by - 3.8), TEXT, 1, label.trim());
     }
     if topo.boxes.is_empty() {
         pen.colour(0.45, 0.45, 0.45);
-        pen.text((x0, y0 + LINE), TEXT, 0, "No devices on this network.");
+        pen.text((x0, g.y0 + LINE), TEXT, 0, "No devices on this network.");
     }
     Drawn {
         ops: pen.ops,
@@ -264,6 +448,62 @@ mod tests {
         }
     }
 
+    fn ring() -> Network {
+        Network {
+            links: vec![
+                link("-A1:P1", "-K10:P1"),
+                link("-K10:P2", "-T1:P1"),
+                link("-T1:P2", "-A1:P2"),
+            ],
+            nodes: ["-A1", "-K10", "-T1"].into_iter().map(node).collect(),
+            ..Network::default()
+        }
+    }
+
+    /// Whether an axis-aligned segment runs through the inside of a box.
+    fn crosses(p: (f64, f64), q: (f64, f64), min: (f64, f64), max: (f64, f64)) -> bool {
+        let inside = |v: f64, lo: f64, hi: f64| v > lo && v < hi;
+        let overlaps = |a: f64, b: f64, lo: f64, hi: f64| a.min(b) < hi && a.max(b) > lo;
+        if (p.0 - q.0).abs() < 1e-9 {
+            inside(p.0, min.0, max.0) && overlaps(p.1, q.1, min.1, max.1)
+        } else {
+            inside(p.1, min.1, max.1) && overlaps(p.0, q.0, min.0, max.0)
+        }
+    }
+
+    /// The boxes of a layout on its sheet do not overlap and stay inside the frame.
+    fn fits_its_sheet(net: &Network) -> (PageSize, Grid, Topology) {
+        let band = 30.0;
+        let (size, warn) = sheet(PageSize::A3, band, net);
+        assert!(warn.is_none());
+        let (w, h) = size.mm();
+        let topo = layout_network(net);
+        let g = grid(&topo, w, h, band);
+        let rects: Vec<((f64, f64), (f64, f64))> = topo
+            .boxes
+            .iter()
+            .map(|b| {
+                let (x, y) = g.spot(b.1, b.2);
+                ((x, y), (x + g.box_w, y + g.box_h))
+            })
+            .collect();
+        for (i, a) in rects.iter().enumerate() {
+            assert!(
+                a.0.0 >= MARGIN && a.1.0 <= w - MARGIN,
+                "box {i} is inside the sheet across"
+            );
+            assert!(
+                a.1.1 + (topo.under.len() as f64 + 1.0) * LANE <= h - MARGIN - band,
+                "box {i} is above the title block"
+            );
+            for b in rects.iter().skip(i + 1) {
+                let apart = a.1.0 <= b.0.0 || b.1.0 <= a.0.0 || a.1.1 <= b.0.1 || b.1.1 <= a.0.1;
+                assert!(apart, "{a:?} overlaps {b:?}");
+            }
+        }
+        (size, g, topo)
+    }
+
     #[test]
     fn a_line_runs_across_a_switch_fans_out_and_a_ring_is_drawn_under() {
         // PLC - switch - two drives.
@@ -287,19 +527,69 @@ mod tests {
         assert!(t.under.is_empty());
 
         // A ring: the last device links back to the first. Every link is drawn once.
-        let ring = Network {
-            links: vec![
-                link("-A1:P1", "-K10:P1"),
-                link("-K10:P2", "-T1:P1"),
-                link("-T1:P2", "-A1:P2"),
-            ],
-            nodes: ["-A1", "-K10", "-T1"].into_iter().map(node).collect(),
-            ..Network::default()
-        };
-        let t = layout_network(&ring);
+        let t = layout_network(&ring());
         assert_eq!(t.tree.len() + t.under.len(), 3);
         let mut drawn: Vec<usize> = t.tree.iter().chain(&t.under).map(|e| e.2).collect();
         drawn.sort_unstable();
         assert_eq!(drawn, [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_ring_link_runs_beside_the_boxes_not_through_them() {
+        let (_, g, topo) = fits_its_sheet(&ring());
+        assert_eq!(topo.under.len(), 1);
+        let bottom = bottom_of(&topo, &g);
+        for (lane, &(a, b, _)) in topo.under.iter().enumerate() {
+            let (ba, bb) = (&topo.boxes[a], &topo.boxes[b]);
+            let path = under_path(&g, (ba.1, ba.2), (bb.1, bb.2), bottom, lane);
+            for seg in path.windows(2) {
+                for bx in &topo.boxes {
+                    let (x, y) = g.spot(bx.1, bx.2);
+                    assert!(
+                        !crosses(seg[0], seg[1], (x, y), (x + g.box_w, y + g.box_h)),
+                        "{seg:?} crosses {}",
+                        bx.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_line_and_a_wide_switch_get_a_sheet_they_fit() {
+        let names: Vec<String> = (1..=30).map(|n| format!("-A{n}")).collect();
+        let line = Network {
+            nodes: names.iter().map(|n| node(n)).collect(),
+            links: names
+                .windows(2)
+                .map(|p| link(&format!("{}:P2", p[0]), &format!("{}:P1", p[1])))
+                .collect(),
+            ..Network::default()
+        };
+        let (size, ..) = fits_its_sheet(&line);
+        assert!(size.mm().0 > PageSize::A3.mm().0, "{size:?}");
+
+        let star = Network {
+            nodes: std::iter::once(node("-K1"))
+                .chain((1..=20).map(|n| node(&format!("-T{n}"))))
+                .collect(),
+            links: (1..=20)
+                .map(|n| link(&format!("-K1:P{n}"), &format!("-T{n}:X1")))
+                .collect(),
+            ..Network::default()
+        };
+        let (size, ..) = fits_its_sheet(&star);
+        assert!(size.mm().1 > PageSize::A3.mm().1, "{size:?}");
+    }
+
+    #[test]
+    fn a_link_between_two_ports_of_one_device_is_kept() {
+        let net = Network {
+            links: vec![link("-K10:P1", "-K10:P2")],
+            ..Network::default()
+        };
+        let t = layout_network(&net);
+        assert_eq!(t.own, [(0, 0)]);
+        assert!(t.tree.is_empty() && t.under.is_empty());
     }
 }
