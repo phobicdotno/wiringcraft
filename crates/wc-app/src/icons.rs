@@ -24,6 +24,7 @@ pub enum Icon {
     Arc,
     Polyline,
     Dimension,
+    BlackBox,
     Copy,
     Cut,
     Paste,
@@ -253,6 +254,19 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
                     accent,
                     Stroke::NONE,
                 ));
+            }
+        }
+        Icon::BlackBox => {
+            // A box with connection points sticking out of its sides.
+            p.rect_stroke(
+                Rect::from_min_max(at(6.0, 5.0), at(18.0, 19.0)),
+                0.0,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
+            for y in [9.0, 15.0] {
+                aline((2.0, y), (6.0, y));
+                aline((18.0, y), (22.0, y));
             }
         }
         Icon::Mirror => {

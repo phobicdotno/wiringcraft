@@ -26,6 +26,96 @@ pub struct Part {
     /// contacts with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contacts: Option<Contacts>,
+    /// The maker's drawing of the part as seen on the mounting plate (usually the front view of
+    /// its CAE data), drawn on layout pages instead of a plain box (#312).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint: Option<Footprint>,
+}
+
+/// A part's outline drawing for cabinet layouts, in millimetres at 1:1 with y pointing down and
+/// the drawing's top-left corner at (0, 0), so it can be placed at a device's `at`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Footprint {
+    /// Extents of the drawing: the part's width and height on the plate.
+    pub width: f64,
+    pub height: f64,
+    #[serde(default)]
+    pub shapes: Vec<crate::Shape>,
+}
+
+impl Footprint {
+    /// A footprint from shapes in any position: moved so their extents start at (0, 0).
+    /// `None` when there is nothing to draw or the extents are not a usable size.
+    pub fn from_shapes(shapes: Vec<crate::Shape>) -> Option<Self> {
+        let pts: Vec<crate::Point> = shapes.iter().flat_map(extent_points).collect();
+        if pts.is_empty() {
+            return None;
+        }
+        let (min, max) = crate::geom::bounds_of(&pts);
+        let (width, height) = (max.x - min.x, max.y - min.y);
+        let usable = |v: f64| v.is_finite() && v > 0.0 && v <= 5000.0;
+        if !(usable(width) && usable(height)) {
+            return None;
+        }
+        let shift = crate::Point::new(-min.x, -min.y);
+        Some(Self {
+            width,
+            height,
+            shapes: shapes.iter().map(|s| s.translate(shift)).collect(),
+        })
+    }
+
+    /// The shapes for a device box of `width` x `height` with its top-left corner at `at`: at
+    /// real size when the drawing fits the box, else shrunk evenly until it does, and centred
+    /// in the box either way.
+    pub fn placed(&self, at: crate::Point, width: f64, height: f64) -> Vec<crate::Shape> {
+        let k = (width / self.width).min(height / self.height).min(1.0);
+        let k = if k.is_finite() && k > 0.0 { k } else { 1.0 };
+        let shift = crate::Point::new(
+            at.x + (width - self.width * k) / 2.0,
+            at.y + (height - self.height * k) / 2.0,
+        );
+        self.shapes.iter().map(|s| s.scaled(k).translate(shift)).collect()
+    }
+}
+
+/// Points that span a shape's extents. An arc counts by its end points and the quarter points
+/// its sweep passes, not its whole circle, so a quarter arc of radius 10 spans 10 x 10 mm.
+fn extent_points(s: &crate::Shape) -> Vec<crate::Point> {
+    let crate::Shape::Arc {
+        center,
+        radius,
+        start,
+        end,
+    } = s
+    else {
+        let (a, b) = s.bounds();
+        return vec![a, b];
+    };
+    // Angles run as the editor and the PDF draw them: from `start` to `end`, a point at `a`
+    // being centre + r (cos a, sin a) on the y-down page.
+    // Both into [0, 360), so angles far out of range cannot overflow the quarter count.
+    let mut sweep = (end - start).rem_euclid(360.0);
+    if sweep <= 0.0 {
+        sweep += 360.0;
+    }
+    if !(sweep.is_finite() && start.is_finite()) || sweep >= 360.0 {
+        let (a, b) = s.bounds();
+        return vec![a, b];
+    }
+    let start = &start.rem_euclid(360.0);
+    let at = |deg: f64| {
+        let t = deg.to_radians();
+        crate::Point::new(center.x + radius * t.cos(), center.y + radius * t.sin())
+    };
+    let mut out = vec![at(*start), at(start + sweep)];
+    let first = (start / 90.0).floor() as i64 + 1;
+    let mut k = first;
+    while (k as f64) * 90.0 < start + sweep && k - first < 4 {
+        out.push(at(k as f64 * 90.0));
+        k += 1;
+    }
+    out
 }
 
 /// How many contacts of each kind a part has, or a device draws.

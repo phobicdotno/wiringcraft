@@ -156,6 +156,9 @@ fn parse(text: &str) -> Result<Drawing> {
             if let Some(p) = polyline.as_mut() {
                 p.codes.push((10, e.get(10).unwrap_or("0").into()));
                 p.codes.push((20, e.get(20).unwrap_or("0").into()));
+                if let Some(bulge) = e.get(42) {
+                    p.codes.push((42, bulge.into()));
+                }
             }
         }
         "SEQEND" => {
@@ -441,19 +444,40 @@ fn shapes(
                 })
             }
             "LWPOLYLINE" => {
-                let xs = e.all(10);
-                let ys = e.all(20);
-                let pts: Vec<Point> = xs
-                    .iter()
-                    .zip(&ys)
-                    .filter(|(x, y)| x.is_finite() && y.is_finite())
-                    .map(|(x, y)| q(*x, *y))
-                    .collect();
-                (pts.len() >= 2).then(|| Shape::Polyline {
-                    points: pts,
-                    closed: (e.f(70) as i64) & 1 == 1,
-                    filled: false,
-                })
+                // Vertices in order, each with the bulge (code 42) of the segment it starts: a
+                // bulged segment is an arc, sampled in the entity's own coordinates.
+                let mut vs: Vec<((f64, f64), f64)> = Vec::new();
+                for (code, v) in &e.codes {
+                    let n = v.trim().parse::<f64>().unwrap_or(f64::NAN);
+                    match (*code, vs.last_mut()) {
+                        (10, _) => vs.push(((n, f64::NAN), 0.0)),
+                        (20, Some(last)) => last.0.1 = n,
+                        (42, Some(last)) if n.is_finite() => last.1 = n,
+                        _ => {}
+                    }
+                }
+                vs.retain(|((x, y), _)| x.is_finite() && y.is_finite());
+                let closed = (e.f(70) as i64) & 1 == 1;
+                let raw = if vs.iter().any(|(_, b)| b.abs() >= 1e-9) {
+                    bulged(&vs, closed)
+                } else {
+                    Some(vs.iter().map(|(p, _)| *p).collect())
+                };
+                // A bulge that gives no arc, or points that are not numbers once placed (a huge
+                // INSERT scale), leave the polyline out, and say so.
+                let pts: Option<Vec<Point>> = raw.map(|r| r.into_iter().map(|(x, y)| q(x, y)).collect());
+                match pts {
+                    Some(pts) if pts.len() < 2 => None,
+                    Some(pts) if pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) => Some(Shape::Polyline {
+                        points: pts,
+                        closed,
+                        filled: false,
+                    }),
+                    _ => {
+                        *skipped.entry(POLYLINE_NOT_NUMBERS.to_owned()).or_default() += 1;
+                        None
+                    }
+                }
             }
             "ELLIPSE" => {
                 // The minor axis is the extrusion turned onto the major one, so a downward
@@ -574,7 +598,7 @@ fn shapes(
                 None
             }
             "INSERT" => {
-                if let Some((name, inner)) = e.get(2).and_then(|n| d.blocks.get_key_value(n)) {
+                if let Some((name, inner)) = e.get(2).and_then(|n| d.block(n)) {
                     // The block's base point goes on the insertion point.
                     let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
                     let ixf = Xf::shift((-bx, -by))
@@ -758,6 +782,9 @@ const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
+/// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
+/// placed.
+const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
@@ -1716,6 +1743,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
             } else if kind == SPLINE_NOT_CURVE {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
+            } else if kind == POLYLINE_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} polyline{s} whose points are not numbers once placed, left out")
             } else if kind == HATCH_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
@@ -1810,6 +1840,40 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
     // Top-to-bottom, left-to-right, so the first pin (the origin) is the top one.
     pins.sort_by(|a, b| a.1.y.total_cmp(&b.1.y).then(a.1.x.total_cmp(&b.1.x)));
     Ok((make_symbol(id, name, graphics, pins)?, skipped_warnings(skipped)))
+}
+
+/// Import a maker's outline drawing (usually the front view from its CAE data) as a part's
+/// footprint for cabinet layouts (#312). Units are taken as mm at 1:1; every entity WiringCraft
+/// can read is kept, moved so the drawing's top-left corner is at (0, 0), and the drawing's
+/// extents become the footprint's width and height. Warnings name the kinds of entity not read.
+pub fn footprint(text: &str) -> Result<(wc_core::Footprint, Vec<String>)> {
+    let d = parse(text)?;
+    let mut raw = Vec::new();
+    let mut points = Vec::new();
+    let mut skipped = BTreeMap::new();
+    shapes(
+        &d,
+        &d.entities,
+        Xf::ID,
+        1.0,
+        0,
+        &|_| false,
+        &mut raw,
+        &mut points,
+        &mut skipped,
+        &mut { MAX_DRAWN },
+    );
+    let graphics: Vec<Shape> = raw.into_iter().map(|(_, s)| s).collect();
+    let warnings = skipped_warnings(skipped);
+    let Some(footprint) = wc_core::Footprint::from_shapes(graphics) else {
+        // Say what was left out, which is often why nothing usable is left.
+        let mut why = "the drawing has no outline WiringCraft can read, or it is not a usable size".to_owned();
+        if !warnings.is_empty() {
+            why.push_str(&format!(" ({})", warnings.join("; ")));
+        }
+        return Err(Error::Format(why));
+    };
+    Ok((footprint, warnings))
 }
 
 /// The result of importing a drawing onto a page.
@@ -1968,6 +2032,64 @@ mod tests {
         assert_eq!(p.symbols.len(), 1);
         assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K7"));
         assert_eq!(p.graphics.len(), 3, "logo exploded into two lines plus the polyline");
+        Ok(())
+    }
+
+    #[test]
+    fn a_maker_outline_becomes_a_footprint_at_its_real_size() -> Result<()> {
+        // A 22.5 x 100 mm module drawn with its lower-left corner at (500, 300), a screw circle
+        // near the top, and a 3D face that is not read.
+        let ents = "0\nLWPOLYLINE\n8\nOUTLINE\n90\n4\n70\n1\n10\n500\n20\n300\n10\n522.5\n20\n300\n10\n522.5\n20\n400\n10\n500\n20\n400\n\
+                    0\nCIRCLE\n8\n0\n10\n511.25\n20\n395\n40\n2\n\
+                    0\n3DFACE\n8\n0\n10\n0\n20\n0\n30\n0\n";
+        let (f, warnings) = footprint(&dxf(ents, ""))?;
+        assert!((f.width - 22.5).abs() < 1e-9, "{}", f.width);
+        assert!((f.height - 100.0).abs() < 1e-9, "{}", f.height);
+        assert_eq!(f.shapes.len(), 2);
+        let Shape::Circle { center, .. } = &f.shapes[1] else {
+            unreachable!("the screw is a circle")
+        };
+        assert!(
+            (center.x - 11.25).abs() < 1e-9 && (center.y - 5.0).abs() < 1e-9,
+            "{center:?}"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(footprint(&dxf("", "")).is_err(), "an empty drawing is refused");
+        // Only entities it cannot read: the error names them.
+        let Err(e) = footprint(&dxf("0\n3DFACE\n8\n0\n10\n0\n20\n0\n30\n0\n", "")) else {
+            unreachable!("nothing readable is refused")
+        };
+        assert!(e.to_string().contains("3DFACE"), "{e}");
+        // A bulged side is an arc: a half circle over a 10 mm chord stands 5 mm high.
+        let half = "0\nLWPOLYLINE\n8\n0\n90\n2\n70\n1\n10\n0\n20\n0\n42\n1\n10\n10\n20\n0\n";
+        let (f, _) = footprint(&dxf(half, ""))?;
+        assert!(
+            (f.width - 10.0).abs() < 1e-6 && (f.height - 5.0).abs() < 1e-6,
+            "{} x {}",
+            f.width,
+            f.height
+        );
+        // A block referenced in another case than it is defined in is still drawn.
+        let blocks = "0\nBLOCK\n2\nOUTLINE\n0\nLWPOLYLINE\n90\n4\n70\n1\n10\n0\n20\n0\n10\n20\n20\n0\n10\n20\n20\n40\n10\n0\n20\n40\n0\nENDBLK\n";
+        let (f, _) = footprint(&dxf("0\nINSERT\n2\noutline\n10\n0\n20\n0\n", blocks))?;
+        assert_eq!((f.width, f.height), (20.0, 40.0));
+        // The old POLYLINE/VERTEX form keeps its bulges too.
+        let old_form = "0\nPOLYLINE\n8\n0\n70\n1\n0\nVERTEX\n8\n0\n10\n0\n20\n0\n42\n1\n\
+                        0\nVERTEX\n8\n0\n10\n10\n20\n0\n0\nSEQEND\n";
+        let (f, _) = footprint(&dxf(old_form, ""))?;
+        assert!((f.height - 5.0).abs() < 1e-6, "{}", f.height);
+        // A polyline scaled past the number range is left out and said, the rest still drawn.
+        let huge = "0\nBLOCK\n2\nHUGE\n0\nLWPOLYLINE\n90\n2\n70\n0\n10\n0\n20\n0\n10\n1e308\n20\n0\n0\nENDBLK\n";
+        let ents = format!("{half}0\nINSERT\n2\nHUGE\n10\n0\n20\n0\n41\n10\n42\n10\n");
+        let (f, warnings) = footprint(&dxf(&ents, huge))?;
+        assert!((f.width - 10.0).abs() < 1e-6, "{}", f.width);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("polyline whose points are not numbers")),
+            "{warnings:?}"
+        );
+        assert!(footprint("not a dxf").is_err());
         Ok(())
     }
 

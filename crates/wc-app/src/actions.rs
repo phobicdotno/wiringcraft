@@ -24,6 +24,7 @@ pub enum Action {
     ArcTool,
     PolylineTool,
     DimensionTool,
+    BlackBoxTool,
     Delete,
     Rotate,
     Mirror,
@@ -104,6 +105,7 @@ impl Action {
                 | Action::ArcTool
                 | Action::PolylineTool
                 | Action::DimensionTool
+                | Action::BlackBoxTool
                 | Action::Delete
                 | Action::Rotate
                 | Action::Mirror
@@ -142,6 +144,7 @@ impl Action {
         Action::ArcTool,
         Action::PolylineTool,
         Action::DimensionTool,
+        Action::BlackBoxTool,
         Action::Delete,
         Action::Rotate,
         Action::Mirror,
@@ -319,6 +322,12 @@ impl Action {
                 "Dimension",
                 "Draw a dimension: click both points to measure, then where the dimension line goes",
                 Icon::Dimension,
+                "",
+            ),
+            Action::BlackBoxTool => i(
+                "Black box",
+                "Draw a black box for a device without a symbol: drag its rectangle, click its edges to add connection points, then click inside it (or press Enter) to tag it",
+                Icon::BlackBox,
                 "",
             ),
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
@@ -549,6 +558,7 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::Select,
         Action::PlaceSymbol,
         Action::DrawWire,
+        Action::BlackBoxTool,
         Action::Rotate,
         Action::Mirror,
         Action::Delete,
@@ -633,6 +643,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::Select,
                     Action::PlaceSymbol,
                     Action::DrawWire,
+                    Action::BlackBoxTool,
                     Action::Rotate,
                     Action::Mirror,
                 ],

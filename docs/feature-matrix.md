@@ -121,7 +121,7 @@ For the other areas, the chapter to read in each help is:
 | Device properties and description | yes | yes | yes | done |
 | Part (article) database with manufacturer, order number, data | yes | yes (catalog) | yes | done |
 | Several parts on one device (main part plus accessories) | yes | yes | no: one part per device | todo (#106) |
-| Black box / device box for devices without a symbol | yes | yes | partly: imported, and drawn with connection points from the command line (`wiringcraft box`); no drawing tool in the app yet | partly (#266) |
+| Black box / device box for devices without a symbol | yes | yes | yes: imported, drawn with connection points from the command line (`wiringcraft box`) and with the Black box tool in the app (drag the rectangle, click its edges for connection points, then tag it); resizing a drawn box or editing its points comes later | yes (#266, #371) |
 | Part data from the maker's data portal | add-on (Data Portal) | yes (content portal) | EDZ part data, and macros as symbols with their connection points (multi-line, variant A; or a symbol by `--symbol-map`), and BMEcat | done (#144, #311) |
 | Manufacturer symbol and macro sources | yes | yes | listed in docs | done (#46) |
 
@@ -186,7 +186,7 @@ For the other areas, the chapter to read in each help is:
 | Device, wire, net, terminal, cable, PLC lists | yes | yes | yes | done |
 | Table of contents | yes | yes | yes, linked in the PDF | done |
 | Report pages in the drawing set | yes | yes | yes | done |
-| Report templates the user designs | yes | yes | partly: `[[report]]` layouts in `project.toml` pick, order, rename and sort the columns of any report, in the PDF, CSV, Markdown and Excel output; `group = "<column>"` prints a heading per group in the PDF (one row per record in the CSV), and `header = [...]` prints title-block values above the table | columns and sort done (#273), grouping and page header fields done (#421); an editor in the app later |
+| Report templates the user designs | yes | yes | partly: `[[report]]` layouts in `project.toml` pick, order, rename and sort the columns of any report, in the PDF, CSV, Markdown and Excel output; `group = "<column>"` prints a heading per group in the PDF (one row per record in the CSV), and `header = [...]` prints title-block values above the table | columns and sort done (#273), grouping and page header fields done (#421), an unknown group column or header key warned about (#481); an editor in the app later |
 | Reports as CSV / Markdown / Excel | yes (Excel) | yes (Excel) | yes: `report --format xlsx`, Reports → Save as Excel | done (#264) |
 
 ## 11. Panel layout and 3D
@@ -195,6 +195,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes | done |
 | Place devices onto rails from the schematic | add-on | yes | yes | done |
+| Maker outline drawings as device footprints | yes (2D macros of the part) | yes (2D footprint) | partly: `import footprint-dxf` stores a maker DXF with the part; layout pages in the app and the PDF draw it at real size (shrunk to fit a smaller device box), and a part without a `Width` or `Height` takes it from the drawing. Not yet: attaching it from the app (#484), turning it with a rotated device (#485) | partly (#312) |
 | 3D model export (STEP) | add-on | yes | yes | done |
 | 3D cabinet design with wire routing | add-on (Pro Panel) | yes (Electrical 3D) | no | later: one-way export to SolidCraft (phase 5) |
 | Drilling and NC data for plates | add-on | partly | no | not planned for now: belongs to the 3D side (SolidCraft) |

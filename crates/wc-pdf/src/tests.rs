@@ -711,6 +711,65 @@ fn panel_layouts_print_after_the_schematic_pages() {
 }
 
 #[test]
+fn a_device_with_a_footprint_drawing_is_drawn_with_it_on_the_layout() {
+    use wc_core::panel::{Panel, PanelItem};
+    let Ok(tag) = DeviceTag::parse("+CAB1-A1") else {
+        unreachable!("a valid tag")
+    };
+    let mut project = Project::new("x");
+    project.devices.insert(
+        tag.clone(),
+        wc_core::Device {
+            part: Some("maker.io-module".into()),
+            ..Default::default()
+        },
+    );
+    let mut panel = Panel::new("main", "Cabinet", 600.0, 800.0);
+    panel.items.push(PanelItem::Device {
+        tag,
+        at: Point::new(50.0, 100.0),
+        width: 22.5,
+        height: 100.0,
+    });
+    let Some(footprint) = wc_core::Footprint::from_shapes(vec![
+        Shape::Rect {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(22.5, 100.0),
+        },
+        Shape::Text {
+            at: Point::new(2.0, 10.0),
+            text: "MAKER IO".into(),
+            height: 3.0,
+            align: wc_core::geom::Align::Left,
+            angle: 0.0,
+        },
+    ]) else {
+        unreachable!("the outline has a size")
+    };
+    let part = wc_core::Part {
+        id: "maker.io-module".into(),
+        footprint: Some(footprint),
+        ..Default::default()
+    };
+    let page = Page::new("panel-main", "P1", "Cabinet");
+    let draw = |footprints: &BTreeMap<String, wc_core::Footprint>| {
+        layout::draw_panel_page(&project, &page, 0, 1, &panel, footprints, "")
+    };
+    let plain = draw(&BTreeMap::new());
+    let drawn = draw(&footprints([&part]));
+    let label = writer::pdf_text("MAKER IO");
+    assert!(!plain.ops.contains(&label), "without the drawing the device is a box");
+    assert!(drawn.ops.contains(&label), "the maker's drawing is on the layout");
+    assert!(drawn.ops.contains(&writer::pdf_text("-A1")), "the tag is still printed");
+    // A part without a drawing, and a device without a part, stay boxes.
+    let other = wc_core::Part {
+        id: "other".into(),
+        ..Default::default()
+    };
+    assert!(footprints([&other]).is_empty());
+}
+
+#[test]
 fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
