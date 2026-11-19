@@ -1772,14 +1772,24 @@ impl Project {
 
     /// The device entry of terminal `number` of `strip` that is not a spare (any more): for
     /// taking a spare off a second time, when its entry is still there (restored by hand, say).
-    /// An entry nothing uses is removed (`Ok(true)`); one that is drawn or names the cable of a
-    /// wire core stays, and the error says why. `Ok(false)` when there is no such entry.
-    pub fn remove_unused_terminal_entry(&mut self, strip: &DeviceTag, number: &str) -> Result<bool, String> {
-        let tag = DeviceTag::parse(&format!("{strip}.{}", number.trim())).map_err(|e| e.to_string())?;
+    /// `current` is the strip's rail order (see [`strip_terminals`]), so a terminal drawn with
+    /// just the strip's tag and numbered on the rail counts as drawn. An entry nothing uses is
+    /// removed (`Ok(true)`); one that is drawn or names the cable of a wire core stays, and the
+    /// error says why. `Ok(false)` when there is no such entry. Refused for a number that cannot
+    /// be a terminal of the strip (`2.3`), which names another strip's terminal.
+    pub fn remove_unused_terminal_entry(
+        &mut self,
+        strip: &DeviceTag,
+        number: &str,
+        current: &[(String, bool)],
+    ) -> Result<bool, String> {
+        let number = number.trim();
+        check_terminal_number(strip, number)?;
+        let tag = DeviceTag::parse(&format!("{strip}.{number}")).map_err(|e| e.to_string())?;
         if !self.devices.contains_key(&tag) {
             return Ok(false);
         }
-        if self.is_drawn(&tag) {
+        if self.is_drawn(&tag) || current.iter().any(|(t, spare)| t == number && !spare) {
             return Err(format!("{tag} is drawn, so its device entry stays"));
         }
         if self.is_cable_of_a_core(&tag) {
@@ -3029,15 +3039,33 @@ mod tests {
         assert!(p.devices.contains_key(&w1));
         // Taken off a second time: the cable's entry stays and the reason is given.
         assert!(!p.remove_spare(&x1, "W1", &[]));
-        let err = p.remove_unused_terminal_entry(&x1, "W1").err().unwrap_or_default();
+        let err = p.remove_unused_terminal_entry(&x1, "W1", &[]).err().unwrap_or_default();
         assert!(err.contains("cable of a wire core"), "{err}");
         assert!(p.devices.contains_key(&w1));
         // An entry nothing uses (restored by hand after the spare went) is removed.
         let s1 = DeviceTag::parse("-X1.S1")?;
         p.devices.entry(s1.clone()).or_default().part = Some("wago.2002-1201".into());
-        assert_eq!(p.remove_unused_terminal_entry(&x1, "S1"), Ok(true));
+        assert_eq!(p.remove_unused_terminal_entry(&x1, "S1", &[]), Ok(true));
         assert!(!p.devices.contains_key(&s1));
-        assert_eq!(p.remove_unused_terminal_entry(&x1, "S1"), Ok(false));
+        assert_eq!(p.remove_unused_terminal_entry(&x1, "S1", &[]), Ok(false));
+        // A terminal drawn with just the strip's tag and numbered 1 on the rail keeps its entry.
+        let one = DeviceTag::parse("-X1.1")?;
+        p.devices.entry(one.clone()).or_default().part = Some("wago.2002-1201".into());
+        let err = p
+            .remove_unused_terminal_entry(&x1, "1", &[("1".to_owned(), false)])
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("is drawn"), "{err}");
+        assert!(p.devices.contains_key(&one));
+        // A number of two levels names another strip's terminal (-X1.2's 3) and is refused.
+        let nested = DeviceTag::parse("-X1.2.3")?;
+        p.devices.entry(nested.clone()).or_default().part = Some("wago.2002-1201".into());
+        let err = p
+            .remove_unused_terminal_entry(&x1, "2.3", &[])
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("one tag level"), "{err}");
+        assert!(p.devices.contains_key(&nested));
         Ok(())
     }
 

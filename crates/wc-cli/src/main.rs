@@ -1743,7 +1743,7 @@ fn run(cli: Cli) -> Res<()> {
                     if !p.remove_spare(&strip, terminal, &current) {
                         // Not a spare (any more), but its device entry may be left behind.
                         let no_spare = format!("{strip} has no spare terminal {terminal}");
-                        match p.remove_unused_terminal_entry(&strip, terminal) {
+                        match p.remove_unused_terminal_entry(&strip, terminal, &current) {
                             Ok(true) => println!("{no_spare}; removed its unused device entry"),
                             Ok(false) => return Err(no_spare),
                             Err(why) => return Err(format!("{no_spare}; {why}")),
