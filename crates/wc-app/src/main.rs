@@ -107,6 +107,9 @@ enum Dialog {
     Rules {
         rows: Vec<rules_form::RuleRow>,
         loaded: Vec<wc_core::check_rule::CheckRule>,
+        /// The folder of the project the rules are of: another project opened meanwhile
+        /// does not get them.
+        dir: PathBuf,
     },
     /// Reports (parts, devices, wires, nets, terminals, cables, PLC I/O, contents, locations) as tables.
     Reports(wc_report::Kind),
@@ -1395,7 +1398,7 @@ impl App {
                         }
                     });
                 }
-                Dialog::Rules { rows, loaded } => {
+                Dialog::Rules { rows, loaded, dir } => {
                     rules_form::show(ui, rows);
                     let bad = rules_form::rules_of(rows).err();
                     if let Some(why) = &bad {
@@ -1404,9 +1407,9 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
-                            let (rows, loaded) = (rows.clone(), loaded.clone());
+                            let (rows, loaded, dir) = (rows.clone(), loaded.clone(), dir.clone());
                             then = Some(Box::new(move |app: &mut App| {
-                                if let Err(e) = app.apply_rules(&rows, &loaded) {
+                                if let Err(e) = app.apply_rules(&rows, &loaded, &dir) {
                                     app.ed.message = e;
                                 }
                             }));
@@ -2235,6 +2238,7 @@ impl App {
             self.dialog = Some(Dialog::Rules {
                 rows: rules_form::rows_of(&loaded),
                 loaded,
+                dir: o.dir.clone(),
             });
         }
     }
@@ -2248,16 +2252,20 @@ impl App {
 
     /// Keep the rules of the check rules dialog (one undo step), then show the check with
     /// them. Rows left as they were loaded leave the project's rules as they are now (the
-    /// assistant may have changed them meanwhile).
+    /// assistant may have changed them meanwhile). `dir` is the project the dialog opened on:
+    /// when another one is open now, nothing is changed.
     fn apply_rules(
         &mut self,
         rows: &[rules_form::RuleRow],
         loaded: &[wc_core::check_rule::CheckRule],
+        dir: &std::path::Path,
     ) -> Result<(), String> {
         let rules = rules_form::rules_of(rows)?;
-        if rules != loaded
-            && let Some(o) = self.open.as_mut()
-        {
+        let Some(o) = self.open.as_mut().filter(|o| o.dir == dir) else {
+            return Err("The rules were not kept: another project was opened while they were edited.".into());
+        };
+        // Compared as rows: a value the dialog does not write (a cable rule's max) is no edit.
+        if rows != rules_form::rows_of(loaded) {
             o.set_check_rules(rules);
         }
         self.show_check();

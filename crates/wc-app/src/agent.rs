@@ -4518,7 +4518,8 @@ mod tests {
 
     #[test]
     fn check_rules_added_changed_and_deleted_in_the_dialog_are_kept_checked_and_undone() {
-        use crate::rules_form::{RuleRow, rows_of};
+        use crate::rules_form::{Change, RuleRow, change, rows_of};
+        use wc_core::check_rule::CheckRule;
         let (_tmp, mut a) = app(vec![]);
         let rules = |a: &App| a.open.as_ref().unwrap().project.meta.rules.clone();
         let broken = |a: &App| match &a.dialog {
@@ -4538,7 +4539,7 @@ mod tests {
         assert!(rules(&a).is_empty());
         // Add: every tag must match a pattern none does.
         a.edit_rules();
-        let Some(Dialog::Rules { mut rows, loaded }) = a.dialog.take() else {
+        let Some(Dialog::Rules { mut rows, loaded, dir }) = a.dialog.take() else {
             unreachable!("the rules dialog opens");
         };
         let mut row = RuleRow::new("tag");
@@ -4546,7 +4547,7 @@ mod tests {
         row.severity = "error".into();
         row.message = "{tag} breaks the house rule".into();
         rows.push(row);
-        a.apply_rules(&rows, &loaded).unwrap();
+        a.apply_rules(&rows, &loaded, &dir).unwrap();
         assert_eq!(rules(&a).len(), 1);
         assert!(
             broken(&a).unwrap() > 0,
@@ -4560,13 +4561,13 @@ mod tests {
         let loaded = rules(&a);
         let mut rows = rows_of(&loaded);
         rows[0].pattern = "*".into();
-        a.apply_rules(&rows, &loaded).unwrap();
+        a.apply_rules(&rows, &loaded, &dir).unwrap();
         assert_eq!(rules(&a)[0].pattern.as_deref(), Some("*"));
         assert_eq!(broken(&a), Some(0));
 
         // Delete, then undo back to each earlier list.
         let loaded = rules(&a);
-        a.apply_rules(&[], &loaded).unwrap();
+        a.apply_rules(&[], &loaded, &dir).unwrap();
         assert!(rules(&a).is_empty());
         let o = a.open.as_mut().unwrap();
         assert!(o.undo());
@@ -4576,13 +4577,45 @@ mod tests {
         assert!(o.undo());
         assert!(o.project.meta.rules.is_empty());
 
-        // Rows left as loaded keep a change made meanwhile, and are no undo step.
+        // Reorder two rules: kept in the new order, and undo brings back the old one.
+        let two = vec![
+            CheckRule {
+                kind: "cable".into(),
+                ..CheckRule::default()
+            },
+            CheckRule {
+                kind: "tag".into(),
+                pattern: Some("*".into()),
+                ..CheckRule::default()
+            },
+        ];
+        a.open.as_mut().unwrap().set_check_rules(two.clone());
+        let mut rows = rows_of(&two);
+        change(&mut rows, Change::Up(1));
+        a.apply_rules(&rows, &two, &dir).unwrap();
+        let kinds = |a: &App| rules(a).iter().map(|r| r.kind.clone()).collect::<Vec<_>>();
+        assert_eq!(kinds(&a), ["tag", "cable"]);
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(rules(&a), two);
+
+        // Rows left as loaded keep a change made meanwhile, and are no undo step: also when a
+        // loaded rule has a value the dialog would not write (a cable rule's max).
+        let odd = vec![CheckRule {
+            kind: "cable".into(),
+            max: Some(2),
+            ..CheckRule::default()
+        }];
         let o = a.open.as_mut().unwrap();
-        o.project.meta.rules = loaded.clone();
+        o.project.meta.rules = [odd.clone(), two.clone()].concat();
         let mark = o.undo_mark();
-        a.apply_rules(&rows_of(&[]), &[]).unwrap();
-        assert_eq!(rules(&a), loaded);
+        a.apply_rules(&rows_of(&odd), &odd, &dir).unwrap();
+        assert_eq!(rules(&a), [odd.clone(), two.clone()].concat());
         assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+
+        // Another project open now does not get the rules.
+        let err = a.apply_rules(&[], &odd, Path::new("elsewhere")).err().unwrap();
+        assert!(err.contains("another project"), "{err}");
+        assert_eq!(rules(&a).len(), 3);
     }
 
     #[test]

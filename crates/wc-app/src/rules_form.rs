@@ -59,7 +59,8 @@ impl RuleRow {
         if !KINDS.contains(&kind) {
             return Err(format!("Rule {n}: pick a kind ({}).", KINDS.join(", ")));
         }
-        let max = match set(&self.max) {
+        // Only a max-wires rule uses a maximum: one typed before the kind changed is left.
+        let max = match set(&self.max).filter(|_| kind == "max-wires") {
             None => None,
             Some(m) => Some(
                 m.parse::<u32>()
@@ -73,14 +74,26 @@ impl RuleRow {
         if kind == "tag" && pattern.is_none() {
             return Err(format!("Rule {n}: a tag rule needs the pattern every tag must match."));
         }
+        // The check runs no rule with another role or severity (it reports it instead).
+        let known = |v: &Option<String>, of: &[&str]| {
+            v.as_deref()
+                .is_none_or(|v| of.contains(&v.to_ascii_lowercase().as_str()))
+        };
+        let (role, severity) = (set(&self.role), set(&self.severity));
+        if !known(&role, &ROLES) {
+            return Err(format!("Rule {n}: pick a role ({}), or none.", ROLES.join(", ")));
+        }
+        if !known(&severity, &SEVERITIES) {
+            return Err(format!("Rule {n}: pick a severity ({}).", SEVERITIES.join(", ")));
+        }
         Ok(CheckRule {
             kind: kind.to_owned(),
             devices: set(&self.devices),
-            role: set(&self.role),
-            // Only a tag rule uses a pattern, and only a max-wires rule a maximum.
+            role,
+            // Only a tag rule uses a pattern.
             pattern: if kind == "tag" { pattern } else { None },
-            max: if kind == "max-wires" { max } else { None },
-            severity: set(&self.severity),
+            max,
+            severity,
             message: set(&self.message),
             unknown: self.base.unknown.clone(),
         })
@@ -98,10 +111,33 @@ pub fn rules_of(rows: &[RuleRow]) -> Result<Vec<CheckRule>, String> {
 }
 
 /// What a click in the list asks for.
-enum Change {
+#[derive(Debug, Clone, Copy)]
+pub enum Change {
     Up(usize),
     Down(usize),
     Remove(usize),
+}
+
+/// Move a row up or down, or delete it; a move past either end does nothing.
+pub fn change(rows: &mut Vec<RuleRow>, c: Change) {
+    match c {
+        Change::Up(k) if k > 0 && k < rows.len() => rows.swap(k - 1, k),
+        Change::Down(k) if k + 1 < rows.len() => rows.swap(k, k + 1),
+        Change::Remove(k) if k < rows.len() => {
+            rows.remove(k);
+        }
+        _ => {}
+    }
+}
+
+/// What the role list says when no role is picked: a max-wires rule without devices still
+/// looks at terminals only.
+pub fn unset_role(row: &RuleRow) -> &'static str {
+    if row.kind.trim() == "max-wires" && row.devices.trim().is_empty() {
+        "terminal (when no devices are given)"
+    } else {
+        "any"
+    }
 }
 
 fn choice(ui: &mut egui::Ui, value: &mut String, options: &[&str], unset: Option<&str>, salt: impl std::hash::Hash) {
@@ -125,7 +161,7 @@ fn choice(ui: &mut egui::Ui, value: &mut String, options: &[&str], unset: Option
 /// The rows as a list with their fields, plus buttons to add a rule.
 pub fn show(ui: &mut egui::Ui, rows: &mut Vec<RuleRow>) {
     let faint = crate::theme::Theme::of(ui.ctx()).faint;
-    let mut change = None;
+    let mut clicked = None;
     egui::ScrollArea::vertical()
         .id_salt("rules-scroll")
         .max_height(ui.ctx().screen_rect().height() * 0.5)
@@ -141,13 +177,13 @@ pub fn show(ui: &mut egui::Ui, rows: &mut Vec<RuleRow>) {
                         ui.label(egui::RichText::new(format!("Rule {}", k + 1)).strong());
                         choice(ui, &mut row.kind, &KINDS, None, "kind");
                         if ui.add_enabled(k > 0, egui::Button::new("Up")).clicked() {
-                            change = Some(Change::Up(k));
+                            clicked = Some(Change::Up(k));
                         }
                         if ui.add_enabled(k < last, egui::Button::new("Down")).clicked() {
-                            change = Some(Change::Down(k));
+                            clicked = Some(Change::Down(k));
                         }
                         if ui.button("Delete").clicked() {
-                            change = Some(Change::Remove(k));
+                            clicked = Some(Change::Remove(k));
                         }
                     });
                     egui::Grid::new("rule")
@@ -155,7 +191,8 @@ pub fn show(ui: &mut egui::Ui, rows: &mut Vec<RuleRow>) {
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
                             ui.label("Role");
-                            choice(ui, &mut row.role, &ROLES, Some("any"), "role");
+                            let unset = unset_role(row);
+                            choice(ui, &mut row.role, &ROLES, Some(unset), "role");
                             ui.end_row();
                             ui.label("Devices");
                             ui.add(
@@ -202,13 +239,8 @@ pub fn show(ui: &mut egui::Ui, rows: &mut Vec<RuleRow>) {
                 });
             }
         });
-    match change {
-        Some(Change::Up(k)) => rows.swap(k - 1, k),
-        Some(Change::Down(k)) => rows.swap(k, k + 1),
-        Some(Change::Remove(k)) => {
-            rows.remove(k);
-        }
-        None => {}
+    if let Some(c) = clicked {
+        change(rows, c);
     }
     ui.horizontal(|ui| {
         ui.label("Add a rule:");
@@ -254,6 +286,59 @@ mod tests {
         max.max = String::new();
         assert!(max.rule(1).is_err());
         assert!(RuleRow::default().rule(1).err().unwrap().contains("kind"));
+    }
+
+    #[test]
+    fn a_maximum_typed_before_the_kind_changed_does_not_stop_the_rule() {
+        let mut row = RuleRow::new("max-wires");
+        row.max = "two".into();
+        assert!(row.rule(1).is_err());
+        row.kind = "cable".into();
+        assert_eq!(row.rule(1).map(|r| r.max), Ok(None));
+    }
+
+    #[test]
+    fn a_role_or_severity_the_check_does_not_know_is_refused_and_any_case_of_one_it_does_kept() {
+        let mut row = RuleRow::new("cable");
+        row.role = "bogus".into();
+        assert!(row.rule(3).err().unwrap().starts_with("Rule 3: pick a role"));
+        row.role = "Terminal".into();
+        row.severity = "fatal".into();
+        assert!(row.rule(3).err().unwrap().starts_with("Rule 3: pick a severity"));
+        row.severity = "Error".into();
+        let rule = row.rule(3).unwrap();
+        assert_eq!(
+            (rule.role.as_deref(), rule.severity.as_deref()),
+            (Some("Terminal"), Some("Error"))
+        );
+    }
+
+    #[test]
+    fn rows_move_up_and_down_and_are_deleted() {
+        let rows_of_kinds = |kinds: &[&str]| kinds.iter().map(|k| RuleRow::new(k)).collect::<Vec<_>>();
+        let mut rows = rows_of_kinds(&["cable", "tag", "max-wires"]);
+        change(&mut rows, Change::Up(2));
+        assert_eq!(rows, rows_of_kinds(&["cable", "max-wires", "tag"]));
+        change(&mut rows, Change::Down(0));
+        assert_eq!(rows, rows_of_kinds(&["max-wires", "cable", "tag"]));
+        change(&mut rows, Change::Up(0));
+        change(&mut rows, Change::Down(2));
+        assert_eq!(
+            rows,
+            rows_of_kinds(&["max-wires", "cable", "tag"]),
+            "nothing moves past an end"
+        );
+        change(&mut rows, Change::Remove(1));
+        assert_eq!(rows, rows_of_kinds(&["max-wires", "tag"]));
+    }
+
+    #[test]
+    fn a_max_wires_rule_without_devices_says_it_looks_at_terminals() {
+        let mut row = RuleRow::new("max-wires");
+        assert!(unset_role(&row).starts_with("terminal"));
+        row.devices = "-X1*".into();
+        assert_eq!(unset_role(&row), "any");
+        assert_eq!(unset_role(&RuleRow::new("cable")), "any");
     }
 
     #[test]
