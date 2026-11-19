@@ -112,7 +112,7 @@ pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
             let _ = fs::remove_file(&tmp);
         }
     };
-    if let Err(e) = fs::write(&tmp, content) {
+    if let Err(e) = write_staging(&tmp, content) {
         drop_tmp();
         return Err(Error::io(&tmp, e));
     }
@@ -121,6 +121,24 @@ pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
         return Err(Error::io(path, e));
     }
     Ok(true)
+}
+
+/// Write `content` to a staging file at `tmp` that this call creates itself.
+///
+/// The file is opened with `create_new`, which never follows a link: a symbolic link left at
+/// `tmp` by something else in the project folder is removed (the link, not its target), and a
+/// link that shows up again before the file is created makes the write fail instead of writing
+/// through it. A regular file left by an earlier failed write is replaced the same way. Anything
+/// else in the way, such as a folder, is not ours to remove and fails the write.
+fn write_staging(tmp: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Ok(meta) = fs::symlink_metadata(tmp)
+        && (meta.is_symlink() || meta.is_file())
+    {
+        fs::remove_file(tmp)?;
+    }
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
+    file.write_all(content.as_bytes())
 }
 
 /// Load a whole project folder.
@@ -484,5 +502,58 @@ mod tests {
             assert!(check_id(bad).is_err(), "{bad}");
         }
         assert!(check_id("wc.contact-no_1").is_ok());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod staging_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_staging_path_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.txt");
+        fs::write(&target, "keep me").unwrap();
+        let path = dir.path().join("devices.json");
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::os::unix::fs::symlink(&target, PathBuf::from(&tmp)).unwrap();
+
+        assert!(write_if_changed(&path, "new content\n").unwrap());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new content\n");
+        assert!(fs::symlink_metadata(PathBuf::from(&tmp)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_at_the_staging_path_creates_nothing_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere").join("created.txt");
+        fs::create_dir(dir.path().join("elsewhere")).unwrap();
+        let path = dir.path().join("pages").join("p1.page.json");
+        fs::create_dir(dir.path().join("pages")).unwrap();
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::os::unix::fs::symlink(&target, PathBuf::from(&tmp)).unwrap();
+
+        assert!(write_if_changed(&path, "{}\n").unwrap());
+        assert!(!target.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn a_staging_file_left_by_a_failed_write_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.toml");
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        fs::write(PathBuf::from(&tmp), "stale and much longer than the new content").unwrap();
+
+        assert!(write_if_changed(&path, "x\n").unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "x\n");
+        assert!(!PathBuf::from(&tmp).exists());
     }
 }
