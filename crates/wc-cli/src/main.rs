@@ -2462,12 +2462,16 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 };
                 match refreshed {
                     Ok(()) => {
-                        // The new pin must reach the disk with the copy, or the copy goes back.
+                        // The new pin must reach the disk with the copy, or both go back: `save`
+                        // can fail after it wrote the lock.
+                        let lock_path = dir.join(store::LOCK_FILE);
+                        let lock_before = std::fs::read(&lock_path).ok();
                         if let Err(err) = save(dir, p) {
                             let back = match &before {
                                 Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
                                 Err(_) => Ok(()),
-                            };
+                            }
+                            .and(put_file_back(&lock_path, lock_before.as_deref()));
                             return Err(match back {
                                 Ok(()) => format!("the project's copy of {part} was not updated: {err}"),
                                 Err(why) => format!(
