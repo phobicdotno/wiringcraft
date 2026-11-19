@@ -11,6 +11,7 @@ pub mod error;
 pub mod find;
 pub mod font;
 pub mod geom;
+pub mod guard;
 pub mod hash;
 pub mod lock;
 pub mod macros;

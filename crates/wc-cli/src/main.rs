@@ -898,6 +898,42 @@ fn parse_box_pin(s: &str) -> Res<wc_core::BoxPin> {
     })
 }
 
+/// The project to keep output off while someone else holds one of its pages in a shared
+/// session: the app names it ([`wc_core::guard::GUARD_ENV`]), else none.
+fn output_guard() -> Option<&'static wc_core::guard::ProjectFiles> {
+    static GUARD: std::sync::OnceLock<Option<wc_core::guard::ProjectFiles>> = std::sync::OnceLock::new();
+    GUARD.get_or_init(wc_core::guard::ProjectFiles::from_env).as_ref()
+}
+
+/// Write an output file the user named. Under [`output_guard`] the file is written so that it
+/// cannot land on a project file, a link swapped in after the app's own look included (#458).
+fn write_out(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    wc_core::guard::write_output(output_guard(), path.as_ref(), bytes)
+}
+
+/// Make the output folder `out`; under [`output_guard`] a folder in the project is refused
+/// before any folder is made.
+fn make_out_dir(out: &Path) -> Res<()> {
+    if let Some(g) = output_guard() {
+        match g.holds(out) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(format!(
+                    "{} is in the project folder, and someone else has a page of the project open in the shared session",
+                    out.display()
+                ));
+            }
+            Err(why) => {
+                return Err(format!(
+                    "{} could not be told apart from the project's files ({why})",
+                    out.display()
+                ));
+            }
+        }
+    }
+    std::fs::create_dir_all(out).map_err(e)
+}
+
 fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
@@ -1085,7 +1121,7 @@ fn run(cli: Cli) -> Res<()> {
                     };
                     let parts = vendored_parts(dir, &p);
                     let step = wc_report::step::panel_step(&p, panel, &parts, &utc_now());
-                    std::fs::write(&out, &step).map_err(e)?;
+                    write_out(&out, &step).map_err(e)?;
                     println!(
                         "wrote {} ({} solids)",
                         out.display(),
@@ -1884,7 +1920,7 @@ fn run(cli: Cli) -> Res<()> {
                     panels: p.panels.clone(),
                 },
             );
-            std::fs::write(&out, bytes).map_err(e)?;
+            write_out(&out, bytes).map_err(e)?;
             for w in &report.warnings {
                 eprintln!("warning: {}", escape_field(w));
             }
@@ -1937,14 +1973,14 @@ fn run(cli: Cli) -> Res<()> {
                 };
                 wc_pdf::page_lines(&p, &symbols, &options)
             };
-            std::fs::create_dir_all(&out).map_err(e)?;
+            make_out_dir(&out)?;
             let mut used = std::collections::BTreeSet::new();
             for d in &drawings {
                 let mut stem = file_stem(&d.number, &d.id);
                 while !used.insert(stem.clone()) {
                     stem.push('_');
                 }
-                std::fs::write(out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
+                write_out(out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
             }
             for w in &report.warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -2042,7 +2078,7 @@ fn run(cli: Cli) -> Res<()> {
                 let tables: Vec<wc_report::Table> = kinds.iter().map(|k| wc_report::build(*k, &inputs)).collect();
                 let refs: Vec<&wc_report::Table> = tables.iter().collect();
                 let bytes = wc_report::xlsx::workbook(&refs).map_err(e)?;
-                std::fs::write(&path, bytes).map_err(e)?;
+                write_out(&path, bytes).map_err(e)?;
                 return Ok(());
             }
             let mut text = String::new();
@@ -2057,7 +2093,7 @@ fn run(cli: Cli) -> Res<()> {
                 text.push('\n');
             }
             match out {
-                Some(path) => std::fs::write(&path, text).map_err(e)?,
+                Some(path) => write_out(&path, text).map_err(e)?,
                 None => print!("{text}"),
             }
         }
@@ -2085,7 +2121,7 @@ fn run(cli: Cli) -> Res<()> {
                 parts: &parts,
             };
             let (text, counts) = wc_report::automationml(&inputs, &utc_now());
-            std::fs::write(&out, text).map_err(e)?;
+            write_out(&out, text).map_err(e)?;
             if counts.untagged_pins > 0 {
                 eprintln!(
                     "warning: {} connected pin(s) on symbols without a tag were left out",
@@ -2109,7 +2145,7 @@ fn run(cli: Cli) -> Res<()> {
                 parts: &parts,
             };
             let v = wc_report::plc_variables(&inputs);
-            std::fs::write(&out, &v.text).map_err(e)?;
+            write_out(&out, &v.text).map_err(e)?;
             if v.unlocated > 0 {
                 eprintln!(
                     "warning: {} point(s) have no PLC address and are declared at %I* or %Q*",
@@ -3099,7 +3135,7 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
             let rows = wc_vcs::history(&git, limit).map_err(e)?;
             match svg {
                 Some(path) => {
-                    std::fs::write(&path, wc_vcs::subway_svg(&rows)).map_err(e)?;
+                    write_out(&path, wc_vcs::subway_svg(&rows)).map_err(e)?;
                     println!("wrote {}", path.display());
                 }
                 None => print!("{}", wc_vcs::subway_text(&rows)),
@@ -3319,7 +3355,7 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
             .unwrap_or_else(|| wc_report::LEVEL_SEPARATOR.to_owned()),
     };
     let t = wc_report::marking_list_with(&inputs, &options);
-    std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+    write_out(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::formula_warnings(&t));
     warnings.extend(wc_report::level_warnings(inputs.project));
     Ok(Exported {
@@ -3370,7 +3406,7 @@ fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
     if t.rows.is_empty() {
         warnings.push("the project has no numbered terminals on its schematic pages".into());
     }
-    std::fs::write(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+    write_out(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::level_warnings(inputs.project));
     Ok(Exported {
         markers: t.rows.len(),

@@ -3779,7 +3779,6 @@ dependencies = [
  "wc-share",
  "wc-vcs",
  "wgpu",
- "windows-sys 0.61.2",
  "winresource",
 ]
 
@@ -3814,6 +3813,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml 0.8.23",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
