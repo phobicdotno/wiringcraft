@@ -21,6 +21,9 @@ pub struct Clipboard {
     /// The device data above wins over the project's for the same tag: set for a macro, whose
     /// values were chosen when it was inserted. A copy within a project keeps the project's.
     pub own_devices: bool,
+    /// The folder of the project it was copied in; a paste into another project takes the
+    /// copied device data first.
+    pub from: Option<std::path::PathBuf>,
 }
 
 impl From<wc_core::macros::Macro> for Clipboard {
@@ -32,6 +35,7 @@ impl From<wc_core::macros::Macro> for Clipboard {
             graphics: m.graphics,
             anchor: m.anchor,
             own_devices: true,
+            from: None,
         }
     }
 }
@@ -667,6 +671,7 @@ impl Open {
             graphics,
             anchor,
             own_devices: false,
+            from: Some(self.dir.clone()),
         }
     }
 
@@ -681,73 +686,29 @@ impl Open {
         // those copied from another project are taken from the library when possible.
         let ids: std::collections::BTreeSet<&str> = clip.symbols.iter().map(|s| s.symbol.as_str()).collect();
         self.ensure_symbols(ids)?;
-        self.checkpoint();
-        let d = Point::new(at.x - clip.anchor.x, at.y - clip.anchor.y);
-        let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
-        let mut ids: BTreeMap<String, String> = BTreeMap::new();
-        let mut out = Vec::new();
-        for s in &clip.symbols {
-            let mut s = s.clone();
-            s.tag = s.tag.and_then(|old| {
-                if let Some(t) = renamed.get(&old) {
-                    return Some(t.clone());
-                }
-                let t = self.free_tag_like(&old)?;
-                let (project, copied) = (self.project.devices.get(&old), clip.devices.get(&old));
-                let device = if clip.own_devices {
-                    copied.or(project)
-                } else {
-                    project.or(copied)
-                }
-                .cloned()
-                .unwrap_or_default();
-                self.project.devices.insert(t.clone(), device);
-                renamed.insert(old, t.clone());
-                Some(t)
-            });
-            let Some(p) = self.project.pages.get_mut(page) else {
-                break;
-            };
-            let id = p.next_id("s");
-            ids.insert(s.id.clone(), id.clone());
-            s.id = id.clone();
-            s.at = s.at + d;
-            p.symbols.push(s);
-            out.push(Selection::Symbol(id));
-        }
-        let Some(p) = self.project.pages.get_mut(page) else {
-            return Ok(out);
+        let group = wc_core::placement::Group {
+            symbols: &clip.symbols,
+            wires: &clip.wires,
+            graphics: &clip.graphics,
+            devices: &clip.devices,
+            anchor: clip.anchor,
         };
-        for w in &clip.wires {
-            let mut w = w.clone();
-            // A core of a pasted cable runs in that cable under its new tag.
-            if let Some(c) = &mut w.cable
-                && let Some(t) = renamed.get(&c.cable)
-            {
-                c.cable = t.clone();
-            }
-            w.id = p.next_id("w");
-            w.number = None;
-            for v in &mut w.via {
-                *v = *v + d;
-            }
-            for e in [&mut w.from, &mut w.to] {
-                match e {
-                    Endpoint::Point { at } => *at = *at + d,
-                    Endpoint::Pin { item, .. } => {
-                        if let Some(n) = ids.get(item.as_str()) {
-                            *item = n.clone();
-                        }
-                    }
-                }
-            }
-            out.push(Selection::Wire(w.id.clone()));
-            p.wires.push(w);
-        }
-        for g in &clip.graphics {
-            p.graphics.push(g.translate(d));
-            out.push(Selection::Graphic(p.graphics.len() - 1));
-        }
+        use wc_core::placement::{DeviceData, OutOfTags};
+        // The copied data first for a macro or a copy from another project; within one project
+        // the project's own, which may have changed since the copy.
+        let data = if clip.own_devices || clip.from.as_deref() != Some(self.dir.as_path()) {
+            DeviceData::GroupFirst
+        } else {
+            DeviceData::ProjectFirst
+        };
+        self.checkpoint();
+        // A device for which no tag is left is pasted without one.
+        let placed = wc_core::placement::place(&mut self.project, page, group, at, data, OutOfTags::Untagged)
+            .map_err(|e| e.to_string())?;
+        let out = (placed.symbols.into_iter().map(Selection::Symbol))
+            .chain(placed.wires.into_iter().map(Selection::Wire))
+            .chain(placed.graphics.into_iter().map(Selection::Graphic))
+            .collect();
         Ok(out)
     }
 }
@@ -982,6 +943,49 @@ mod tests {
         // Undo removes the whole paste.
         assert!(o.undo());
         assert_eq!(o.project.pages[page].symbols.len(), 2);
+    }
+
+    #[test]
+    fn a_paste_into_another_project_keeps_the_copied_device_data() {
+        let (_tmp, mut o, page, a, _b) = setup();
+        let k = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        o.project.devices.entry(k.clone()).or_default().part = Some("part-a".into());
+        let clip = o.copy(page, &[Selection::Symbol(a)]);
+        let part_of_new = |o: &Open| {
+            let s = o.project.pages[page].symbols.last().unwrap();
+            o.project.devices[s.tag.as_ref().unwrap()].part.clone()
+        };
+
+        // Within the project, the project's data as it is now.
+        o.project.devices.entry(k.clone()).or_default().part = Some("part-b".into());
+        o.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert_eq!(part_of_new(&o).as_deref(), Some("part-b"));
+
+        // In another project whose device of that tag has another part, the copied one.
+        let (_tmp2, mut other, _, _, _) = setup();
+        other.project.devices.entry(k).or_default().part = Some("part-c".into());
+        other.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert_eq!(part_of_new(&other).as_deref(), Some("part-a"));
+    }
+
+    #[test]
+    fn a_device_no_tag_is_left_for_is_pasted_without_one() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        // Every tag like the copied ones is taken.
+        let like = clip.symbols[0].tag.clone().unwrap();
+        let letter = like.letter_code();
+        for n in 1..10_000 {
+            let mut t = like.clone();
+            *t.product.last_mut().unwrap() = format!("{letter}{n}");
+            o.project.devices.entry(t).or_default();
+        }
+        let pasted = o.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert_eq!(pasted.len(), 3, "the symbols and the wire are pasted all the same");
+        let p = &o.project.pages[page];
+        assert_eq!(p.symbols.len(), 4);
+        assert!(p.symbols[2..].iter().all(|s| s.tag.is_none()), "{:?}", &p.symbols[2..]);
     }
 
     #[test]

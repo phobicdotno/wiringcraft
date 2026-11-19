@@ -19,6 +19,7 @@ pub mod network;
 pub mod numbering;
 pub mod panel;
 pub mod part;
+pub mod placement;
 pub mod plc_rack;
 pub mod project;
 pub mod report_layout;
