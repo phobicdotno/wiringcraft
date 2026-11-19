@@ -5008,6 +5008,32 @@ mod tests {
     }
 
     #[test]
+    fn a_selected_cloud_follows_its_cloud_when_the_session_puts_one_back_before_it() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.add_revision("A", "2026-11-19", "First issue", "").unwrap();
+        for x in [20.0, 100.0, 180.0] {
+            open.add_cloud(1, Point::new(x, 20.0), Point::new(x + 40.0, 40.0))
+                .unwrap();
+        }
+        let clouds = open.project.pages[1].clouds.clone();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        a.ed.page = 1;
+        // Take the first cloud off; the second is then cloud 0, and selected.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].clouds.remove(0);
+        a.sync_session_now(false);
+        a.ed.selection = vec![Selection::Cloud(0)];
+        // The session's undo puts the first cloud back in front: the selection follows the
+        // second cloud rather than staying on the place it had.
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert_eq!(a.open.as_ref().unwrap().project.pages[1].clouds, clouds);
+        assert_eq!(a.ed.selection, vec![Selection::Cloud(1)]);
+    }
+
+    #[test]
     fn translations_edited_in_the_dialog_are_saved_and_the_pdf_is_exported_in_the_language_chosen() {
         use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
         let hex = |s: &str| {
