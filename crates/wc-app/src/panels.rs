@@ -1087,6 +1087,7 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 Shape::Circle { .. } => "Circle",
                 Shape::Arc { .. } => "Arc",
                 Shape::Text { .. } => "Text",
+                Shape::Dimension { .. } => "Dimension",
             };
             // The fields are this drawing's: one being typed in when another is selected goes
             // with its drawing, not into the same field of the next one. Drawings carry no id, so
@@ -1685,6 +1686,7 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
             Tool::Circle => "Circle",
             Tool::Arc => "Arc",
             Tool::Polyline => "Polyline",
+            Tool::Dimension => "Dimension",
         };
         // The current tool as an accent pill.
         let g = ui

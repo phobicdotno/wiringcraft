@@ -311,6 +311,12 @@ fn rounded(sh: &Shape) -> Option<Shape> {
             align: *align,
             angle: round(*angle),
         },
+        Shape::Dimension { a, b, offset, height } => Shape::Dimension {
+            a: p(a),
+            b: p(b),
+            offset: round(*offset),
+            height: round(*height),
+        },
     };
     let (min, max) = shape.bounds();
     [min.x, min.y, max.x, max.y]

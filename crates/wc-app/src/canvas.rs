@@ -284,6 +284,11 @@ fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
 
 pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
     match s {
+        Shape::Dimension { .. } => {
+            for part in s.dimension_parts().unwrap_or_default() {
+                paint_shape(p, xf, &part, stroke);
+            }
+        }
         Shape::Line { a, b } => {
             p.line_segment([xf.s(*a), xf.s(*b)], stroke);
         }
@@ -1007,7 +1012,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
                 ed.ask_comment = Some(at);
             }
         }
-        Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline => {
+        Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline | Tool::Dimension => {
             shape_tool(&painter, &resp, open, ed, &xf, &shown, &t, finish, snap_step)
         }
     }
@@ -1102,7 +1107,9 @@ fn pick(open: &Open, ed: &Editor, page: &Page, at: Point, tol: f64) -> Option<Se
 /// falls back to Select, so nothing is drawn that cannot be seen or picked afterwards.
 fn leave_unpickable_layer(ed: &mut Editor) {
     let layer = match ed.tool {
-        Tool::Text | Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline => Layer::Drawings,
+        Tool::Text | Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline | Tool::Dimension => {
+            Layer::Drawings
+        }
         Tool::Comment => Layer::Comments,
         Tool::Select | Tool::Place | Tool::Wire => return,
     };
@@ -1477,7 +1484,7 @@ fn route_note(changed: usize, style: Route) -> String {
 /// How many clicks a drawing tool takes (`None`: a polyline takes clicks until it is finished).
 pub(crate) fn clicks_needed(tool: Tool) -> Option<usize> {
     match tool {
-        Tool::Arc => Some(3),
+        Tool::Arc | Tool::Dimension => Some(3),
         Tool::Polyline => None,
         _ => Some(2),
     }
@@ -1512,6 +1519,19 @@ pub(crate) fn drawn_shape(tool: Tool, pts: &[Point]) -> Option<Shape> {
                 end: crate::symbol_editor::angle(c, e),
             })
         }
+        // Two clicks show it on the line measured; the third sets how far off the line goes.
+        (Tool::Dimension, &[a, b]) if a != b => Some(Shape::Dimension {
+            a,
+            b,
+            offset: 0.0,
+            height: DIMENSION_TEXT_HEIGHT,
+        }),
+        (Tool::Dimension, &[a, b, at]) if a != b => Some(Shape::Dimension {
+            a,
+            b,
+            offset: dimension_offset(a, b, at),
+            height: DIMENSION_TEXT_HEIGHT,
+        }),
         (Tool::Polyline, pts) if pts.len() >= 2 => {
             // A polyline that ends where it started is closed.
             let mut points = pts.to_vec();
@@ -1529,6 +1549,22 @@ pub(crate) fn drawn_shape(tool: Tool, pts: &[Point]) -> Option<Shape> {
     }
 }
 
+/// Text height of a dimension drawn by hand, in mm.
+pub(crate) const DIMENSION_TEXT_HEIGHT: f64 = 2.5;
+
+/// How far `at` lies to the left of the line from `a` to `b` (as seen on paper; negative: to
+/// the right), in mm: the offset of a dimension line through `at`.
+pub(crate) fn dimension_offset(a: Point, b: Point, at: Point) -> f64 {
+    let len = a.distance(b);
+    if len <= 0.0 {
+        return 0.0;
+    }
+    // Left normal on a y-down page is (uy, -ux).
+    let (ux, uy) = ((b.x - a.x) / len, (b.y - a.y) / len);
+    let off = (at.x - a.x) * uy - (at.y - a.y) * ux;
+    (off * 1e6).round() / 1e6
+}
+
 /// What to click next, for the status line.
 pub(crate) fn shape_hint(tool: Tool, clicks: usize) -> &'static str {
     match (tool, clicks) {
@@ -1537,6 +1573,9 @@ pub(crate) fn shape_hint(tool: Tool, clicks: usize) -> &'static str {
         (Tool::Arc, 0) => "Click the centre of the arc.",
         (Tool::Arc, 1) => "Click where the arc starts (Esc cancels).",
         (Tool::Arc, _) => "Click where the arc ends; it runs clockwise (Esc cancels).",
+        (Tool::Dimension, 0) => "Click the first point to measure from.",
+        (Tool::Dimension, 1) => "Click the second point to measure to (Esc cancels).",
+        (Tool::Dimension, _) => "Click where the dimension line goes (Esc cancels).",
         (Tool::Polyline, 0) => "Click the first point.",
         (Tool::Polyline, _) => {
             "Click the next point; double-click or Enter ends it, a click on the first point closes it (Esc cancels)."
@@ -1674,6 +1713,11 @@ pub(crate) fn shape_click(open: &mut Open, ed: &mut Editor, at: Point) {
     // An arc's start on its centre would refuse every end: ask for another start.
     if ed.tool == Tool::Arc && ed.shape_points.len() == 1 && ed.shape_points[0] == at {
         ed.message = "The start must be away from the centre; click another point (Esc cancels).".into();
+        return;
+    }
+    // A dimension measures between two different points.
+    if ed.tool == Tool::Dimension && ed.shape_points.len() == 1 && ed.shape_points[0] == at {
+        ed.message = "Click a point away from the first to measure to (Esc cancels).".into();
         return;
     }
     if ed.shape_points.is_empty() {
@@ -2089,6 +2133,63 @@ mod tests {
         assert!(ed.view.zoom > zoom, "the view zoomed");
         let want = Point::new(p0.x - 100.0 / f64::from(zoom), p0.y);
         assert!(ed.shape_points[1].distance(want) <= 1.0, "{:?}", ed.shape_points); // 1 mm snap
+    }
+
+    #[test]
+    fn a_dimension_is_drawn_in_three_clicks_and_edited_like_any_drawing() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor::default();
+        let before = open.project.pages[0].graphics.len();
+        // A second click on the first point is refused; the first stays.
+        draw(&mut open, &mut ed, Tool::Dimension, &[(40.0, 120.0), (40.0, 120.0)]);
+        assert_eq!(ed.shape_points.len(), 1);
+        assert!(ed.message.contains("away from the first"), "{}", ed.message);
+        draw(&mut open, &mut ed, Tool::Dimension, &[(65.0, 120.0), (50.0, 110.0)]);
+        assert!(ed.shape_points.is_empty());
+        let page = &open.project.pages[0];
+        assert_eq!(page.graphics.len(), before + 1);
+        let i = page.graphics.len() - 1;
+        let g = page.graphics[i].clone();
+        assert_eq!(
+            g,
+            Shape::Dimension {
+                a: Point::new(40.0, 120.0),
+                b: Point::new(65.0, 120.0),
+                offset: 10.0,
+                height: DIMENSION_TEXT_HEIGHT,
+            }
+        );
+        assert_eq!(
+            ed.selection,
+            vec![Selection::Graphic(i)],
+            "the new dimension is selected"
+        );
+        // Picked on its dimension line, not far from it.
+        assert!(crate::edit::graphic_hit(&g, Point::new(52.0, 110.0), 0.5));
+        assert!(!crate::edit::graphic_hit(&g, Point::new(52.0, 130.0), 0.5));
+        let (min, max) = crate::edit::graphic_bounds(&g);
+        assert!(min.x <= 40.0 && max.x >= 65.0 && min.y < 110.0 && max.y > 115.0);
+        // Moved, then deleted, each one undo step.
+        open.checkpoint();
+        open.move_by(0, &[Selection::Graphic(i)], Point::new(5.0, 0.0));
+        assert!(
+            matches!(open.project.pages[0].graphics[i], Shape::Dimension { a, .. } if a == Point::new(45.0, 120.0))
+        );
+        open.delete_many(0, &[Selection::Graphic(i)]);
+        assert_eq!(open.project.pages[0].graphics.len(), before);
+        assert!(open.undo());
+        assert!(
+            matches!(open.project.pages[0].graphics[i], Shape::Dimension { a, .. } if a == Point::new(45.0, 120.0))
+        );
+        assert!(open.undo());
+        assert_eq!(open.project.pages[0].graphics[i], g);
+        // Kept in the page file.
+        open.save().unwrap();
+        let saved = std::fs::read_dir(open.dir.join("pages"))
+            .unwrap()
+            .filter_map(|e| std::fs::read_to_string(e.ok()?.path()).ok())
+            .any(|text| text.contains("\"kind\": \"dimension\"") || text.contains("\"kind\":\"dimension\""));
+        assert!(saved, "a page file holds the dimension");
     }
 
     #[test]
