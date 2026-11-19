@@ -1772,3 +1772,42 @@ fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about
         report.warnings
     );
 }
+
+#[test]
+fn a_link_with_an_empty_end_is_warned_about_and_the_others_are_drawn() {
+    use wc_core::network::{Link as NetLink, Network};
+    let link = |from: &str, to: &str, cable: &str| NetLink {
+        from: from.into(),
+        to: to.into(),
+        cable: cable.into(),
+        ..NetLink::default()
+    };
+    let net = Network {
+        name: "PN3".into(),
+        links: vec![
+            link("-A1:X1", "-K10:P1", "-W1"),
+            link("-K10:P2", "", "-W2"),
+            link("-K10:P3", "-T1:X1", "-W3"),
+        ],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    // The valid links are drawn with their cables; the one with an empty end is not.
+    for drawn in ["-A1", "-K10", "-T1", "-W1", "-W3"] {
+        assert!(text.contains(&writer::pdf_text(drawn)), "{drawn}");
+    }
+    assert!(!text.contains(&writer::pdf_text("-W2")));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("network PN3: link 2 (-K10:P2 to ) is not drawn")),
+        "{:?}",
+        report.warnings
+    );
+}
