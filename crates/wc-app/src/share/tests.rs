@@ -4469,7 +4469,7 @@ fn a_tag_a_waiting_rename_left_on_undo_is_another_devices_at_once() -> TestResul
     let tmp = tempfile::tempdir()?;
     let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
     let tag = |t: &str| wc_core::DeviceTag::parse(t);
-    let (q5, k9, k3) = (tag("-Q5")?, tag("-K9")?, tag("-K3")?);
+    let (q5, k9) = (tag("-Q5")?, tag("-K9")?);
     host_open.project.devices.insert(q5.clone(), wc_core::Device::default());
     host_open.project.devices.insert(k9.clone(), wc_core::Device::default());
     let sync = |h: &mut Share, ho: &mut Open, g: &mut Share, go: &mut Open| {
