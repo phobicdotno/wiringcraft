@@ -149,6 +149,55 @@ impl GitJournal {
         failed
     }
 
+    /// The black box symbol files (`vendor/symbols/box.*.json`) in the project folder, with
+    /// their content: the ones a save may remove. None when the folder is missing or lies
+    /// outside the project, where a save removes nothing.
+    fn box_symbols(&self) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+        use std::io::ErrorKind;
+        let folder = self
+            .dir
+            .join(wc_core::store::VENDOR_DIR)
+            .join(wc_core::lock::ItemKind::Symbol.dir());
+        let io = |path: &std::path::Path, source: std::io::Error| -> crate::Error {
+            wc_core::Error::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+            .into()
+        };
+        let resolved = match folder.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io(&folder, e)),
+        };
+        let root = self.dir.canonicalize().map_err(|e| io(&self.dir, e))?;
+        if !resolved.starts_with(&root) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&resolved).map_err(|e| io(&folder, e))? {
+            let entry = entry.map_err(|e| io(&folder, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_box = name.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("box.")) && name.ends_with(".json");
+            if !is_box {
+                continue;
+            }
+            let path = folder.join(&name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_file() => {}
+                Ok(_) => continue,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => return Err(io(&path, e)),
+            }
+            match std::fs::read(&path) {
+                Ok(bytes) => out.push((path, bytes)),
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(io(&path, e)),
+            }
+        }
+        Ok(out)
+    }
+
     /// Finish the rollback a failed [`Journal::restore`] left, before anything else is written.
     fn finish_rollback(&mut self) -> Result<()> {
         if self.rollback_left.is_empty() {
@@ -192,7 +241,25 @@ fn replace_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 impl Journal for GitJournal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()> {
         self.finish_rollback()?;
+        // The save removes black box symbol files nothing uses any more (#490): keep each one
+        // as it is, so `restore` can bring it back when the change is not recorded.
+        let boxes = self.box_symbols()?;
+        let kept_from = self.vendored_before.len();
+        for (path, bytes) in boxes {
+            if !self.vendored_before.iter().any(|(p, _)| *p == path) {
+                self.vendored_before.push((path, Some(bytes)));
+            }
+        }
         wc_core::store::save(&self.dir, project)?;
+        // Only the removed ones belong to this change; the rest stay out of its commit (#316).
+        let mut i = kept_from;
+        while i < self.vendored_before.len() {
+            if self.vendored_before[i].0.exists() {
+                self.vendored_before.remove(i);
+            } else {
+                i += 1;
+            }
+        }
         // Only this change's files (#316): a vendored file the host wrote outside the session,
         // before the save that pins it, stays out of a guest's commit and its lock.
         let vendored: Vec<String> = self

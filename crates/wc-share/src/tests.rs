@@ -3714,6 +3714,67 @@ fn a_git_journal_puts_vendored_files_back_when_a_change_is_not_recorded() -> Tes
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn a_git_journal_brings_back_a_box_symbol_a_failed_change_removed() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let mut placed = store::create(dir, "Demo")?;
+    let boxed = wc_core::black_box("box.p0001.s1", "Box", 20.0, 10.0, &[])?;
+    store::write_vendored_symbol(dir, &boxed)?;
+    let mut page = Page::new("p0001", "1", "One");
+    page.symbols.push(PlacedSymbol {
+        id: "s1".into(),
+        symbol: "box.p0001.s1".into(),
+        at: Point::new(0.0, 0.0),
+        rotation: Default::default(),
+        mirror: false,
+        tag: None,
+    });
+    placed.pages = vec![page];
+    store::save(dir, &placed)?;
+    let mut journal = GitJournal::open(dir)?;
+    journal.git().commit("start")?;
+    let file = store::vendor_path(dir, wc_core::lock::ItemKind::Symbol, "box.p0001.s1")?;
+    let change = Change {
+        by: HOST,
+        author: "Gina Guest <gina@example.com>".into(),
+        page: Some("p0001".into()),
+        message: "Delete the box".into(),
+    };
+    let mut deleted = placed.clone();
+    deleted.pages[0].symbols.clear();
+
+    // The commit fails after the save removed the box's file: putting the change back brings
+    // the file back with the placement.
+    let hook = dir.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(dir.join(".git/hooks"))?;
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n")?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    assert!(journal.record(&deleted, &change).is_err());
+    journal.restore(&placed)?;
+    assert_eq!(
+        store::read_vendored_symbol(dir, "box.p0001.s1")?,
+        boxed,
+        "the file is back"
+    );
+    assert_eq!(store::load(dir)?, placed);
+
+    // Recorded, the file goes, and its removal is in the change's commit.
+    std::fs::remove_file(&hook)?;
+    journal.record(&deleted, &change)?;
+    assert!(!file.exists(), "an unused box symbol file is removed");
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["show", "--name-status", "--format=", "HEAD"])
+        .output()?;
+    let committed = String::from_utf8_lossy(&out.stdout);
+    assert!(committed.contains("D\tvendor/symbols/box.p0001.s1.json"), "{committed}");
+    Ok(())
+}
+
 #[test]
 fn a_git_journal_commits_only_the_files_of_the_change_it_records() -> TestResult {
     let tmp = tempfile::tempdir()?;
