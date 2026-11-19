@@ -43,13 +43,49 @@ fn unguard(field: String) -> String {
     }
 }
 
-/// Split CSV text into records. Handles quotes, doubled quotes and newlines inside quotes, and
-/// takes off the `'` WiringCraft's CSV reports put before cells such as `-K1` (`'-K1` reads `-K1`).
-pub fn records(text: &str, delim: char) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
+/// The rows of a list that are not blank, each with the number of the line (CSV, counting line
+/// breaks inside quotes) or worksheet row (Excel) it starts on, from 1. Reads as its rows'
+/// cells; warnings name a row by [`Rows::number`], so a blank row before it does not throw the
+/// count off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rows {
+    pub cells: Vec<Vec<String>>,
+    /// The line or worksheet row of each of `cells`.
+    pub numbers: Vec<usize>,
+}
+
+impl Rows {
+    /// The line or worksheet row that row `i` starts on (rows given without numbers count from 1).
+    pub fn number(&self, i: usize) -> usize {
+        self.numbers.get(i).copied().unwrap_or(i + 1)
+    }
+}
+
+/// Rows given without their numbers, such as a table's: numbered 1, 2, 3 and on.
+impl From<Vec<Vec<String>>> for Rows {
+    fn from(cells: Vec<Vec<String>>) -> Self {
+        let numbers = (1..=cells.len()).collect();
+        Rows { cells, numbers }
+    }
+}
+
+impl std::ops::Deref for Rows {
+    type Target = [Vec<String>];
+    fn deref(&self) -> &Self::Target {
+        &self.cells
+    }
+}
+
+/// Split CSV text into records, leaving out blank ones. Handles quotes, doubled quotes and
+/// newlines inside quotes, and takes off the `'` WiringCraft's CSV reports put before cells
+/// such as `-K1` (`'-K1` reads `-K1`). Each record keeps the line it starts on.
+pub fn records(text: &str, delim: char) -> Rows {
+    let mut out = Rows::default();
     let mut row = Vec::new();
     let mut field = String::new();
     let mut quoted = false;
+    // The line being read, and the one the record being read starts on.
+    let (mut line, mut start) = (1usize, 1usize);
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         if quoted {
@@ -61,6 +97,10 @@ pub fn records(text: &str, delim: char) -> Vec<Vec<String>> {
                     quoted = false;
                 }
             } else {
+                // A line break inside quotes is part of the field, and still a line of the file.
+                if c == '\n' || (c == '\r' && chars.peek() != Some(&'\n')) {
+                    line += 1;
+                }
                 field.push(c);
             }
         } else if c == '"' && field.is_empty() {
@@ -73,17 +113,21 @@ pub fn records(text: &str, delim: char) -> Vec<Vec<String>> {
             }
             row.push(unguard(std::mem::take(&mut field)));
             if row.iter().any(|f| !f.trim().is_empty()) {
-                out.push(std::mem::take(&mut row));
+                out.cells.push(std::mem::take(&mut row));
+                out.numbers.push(start);
             } else {
                 row.clear();
             }
+            line += 1;
+            start = line;
         } else {
             field.push(c);
         }
     }
     row.push(unguard(field));
     if row.iter().any(|f| !f.trim().is_empty()) {
-        out.push(row);
+        out.cells.push(row);
+        out.numbers.push(start);
     }
     out
 }
@@ -187,7 +231,7 @@ pub fn kind_of_rows(rows: &[Vec<String>]) -> Option<CsvKind> {
 
 /// The rows of a list file: an Excel workbook (`.xlsx`, its first visible sheet) or CSV text in
 /// any of the encodings [`decode`] reads. An old binary `.xls` workbook is refused with a hint.
-pub fn file_rows(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
+pub fn file_rows(bytes: &[u8]) -> Result<Rows> {
     if crate::xlsx::is_xlsx(bytes) {
         return crate::xlsx::rows(bytes);
     }
@@ -273,7 +317,7 @@ fn contacts_text(v: &str) -> std::result::Result<Contacts, String> {
 /// German and Norwegian names) and from a `Contacts` column written out (`3NO+1NC`); a count
 /// column wins over the same kind in the written-out one. A row whose contacts cannot be read
 /// is imported without them, with a warning naming the row.
-pub fn parts_from_rows(rows: &[Vec<String>]) -> Result<(Vec<Part>, Vec<String>)> {
+pub fn parts_from_rows(rows: &Rows) -> Result<(Vec<Part>, Vec<String>)> {
     let Some((header, body)) = rows.split_first() else {
         return Err(Error::Format("the file is empty".into()));
     };
@@ -284,6 +328,8 @@ pub fn parts_from_rows(rows: &[Vec<String>]) -> Result<(Vec<Part>, Vec<String>)>
     let mut out: BTreeMap<String, Part> = BTreeMap::new();
     let mut warnings = Vec::new();
     for (i, row) in body.iter().enumerate() {
+        // The header is row 0 of `rows`.
+        let number = rows.number(i + 1);
         let mut p = Part::default();
         let mut contacts: Option<Contacts> = None;
         let mut counts: Vec<(ContactKind, u32)> = Vec::new();
@@ -312,7 +358,7 @@ pub fn parts_from_rows(rows: &[Vec<String>]) -> Result<(Vec<Part>, Vec<String>)>
             }
         }
         if p.order_number.is_empty() {
-            warnings.push(format!("row {}: no order number, skipped", i + 2));
+            warnings.push(format!("row {number}: no order number, skipped"));
             continue;
         }
         if unread.is_empty() {
@@ -330,12 +376,11 @@ pub fn parts_from_rows(rows: &[Vec<String>]) -> Result<(Vec<Part>, Vec<String>)>
             p.contacts = contacts;
         } else {
             warnings.push(format!(
-                "row {}: contacts not read ({}), the part is imported without them",
-                i + 2,
+                "row {number}: contacts not read ({}), the part is imported without them",
                 unread.join(", ")
             ));
         }
-        crate::add_part(&mut out, p, &format!("row {}", i + 2), &mut warnings);
+        crate::add_part(&mut out, p, &format!("row {number}"), &mut warnings);
     }
     Ok((out.into_values().collect(), warnings))
 }
@@ -391,7 +436,7 @@ pub fn plc_addresses(text: &str) -> Result<(Vec<PlcAddress>, Vec<String>)> {
 }
 
 /// [`plc_addresses`] for rows already split into cells: an Excel worksheet's, or [`file_rows`]'.
-pub fn plc_addresses_from_rows(rows: &[Vec<String>]) -> Result<(Vec<PlcAddress>, Vec<String>)> {
+pub fn plc_addresses_from_rows(rows: &Rows) -> Result<(Vec<PlcAddress>, Vec<String>)> {
     let Some((header, body)) = rows.split_first() else {
         return Err(Error::Format("the file is empty".into()));
     };
@@ -406,14 +451,16 @@ pub fn plc_addresses_from_rows(rows: &[Vec<String>]) -> Result<(Vec<PlcAddress>,
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     for (i, row) in body.iter().enumerate() {
+        // The header is row 0 of `rows`.
+        let number = rows.number(i + 1);
         let cell = |c: usize| row.get(c).map(|v| v.trim()).unwrap_or("");
         let (tag, address) = (cell(tag_col), cell(addr_col));
         if tag.is_empty() || tag.ends_with("(no tag)") {
-            warnings.push(format!("row {}: no device, skipped", i + 2));
+            warnings.push(format!("row {number}: no device, skipped"));
             continue;
         }
         let Ok(tag) = DeviceTag::parse(tag) else {
-            warnings.push(format!("row {}: {tag:?} is not a device tag, skipped", i + 2));
+            warnings.push(format!("row {number}: {tag:?} is not a device tag, skipped"));
             continue;
         };
         out.push(PlcAddress {
@@ -519,6 +566,33 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         let tags: Vec<String> = addresses.iter().map(|a| a.tag.to_string()).collect();
         assert_eq!(tags, ["-K1", "-X12", "+C1-K2", "-K3", "-K4"]);
+        Ok(())
+    }
+
+    #[test]
+    fn row_warnings_name_the_line_past_blank_lines_and_quoted_line_breaks() -> Result<()> {
+        // Line 2 is blank, line 3 only has separators; the record on line 4 runs on to line 6
+        // through quoted line breaks (one CRLF, one lone CR).
+        let text = "Order number;Description\r\n\r\n;\r\nA;\"two\r\nline\rtext\"\r\n;no order\r\n\nA;again\n";
+        let rows = records(text, ';');
+        assert_eq!(rows.numbers, [1, 4, 7, 9]);
+        assert_eq!(rows[1], ["A", "two\r\nline\rtext"]);
+        let (_, warnings) = parts(text)?;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings[0], "row 7: no order number, skipped");
+        assert!(warnings[1].starts_with("row 9: "), "{warnings:?}");
+        // A PLC list counts the same way.
+        let (_, warnings) = plc_addresses("Device;Address\n\n\n;%I0.0\n-K1;%I0.1\n\nK 1;%I0.2\n")?;
+        assert_eq!(
+            warnings,
+            [
+                "row 4: no device, skipped",
+                "row 7: \"K 1\" is not a device tag, skipped"
+            ]
+        );
+        // Rows given without numbers count from 1.
+        let given = Rows::from(vec![vec!["Order number".to_owned()], vec![String::new()]]);
+        assert_eq!(parts_from_rows(&given)?.1, ["row 2: no order number, skipped"]);
         Ok(())
     }
 
