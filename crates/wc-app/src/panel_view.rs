@@ -12,11 +12,9 @@ use crate::theme;
 
 /// Which device item lies under a plate position, topmost first.
 fn device_at(items: &[PanelItem], at: Point) -> Option<usize> {
-    items.iter().enumerate().rev().find_map(|(i, item)| match item {
-        PanelItem::Device {
-            at: a, width, height, ..
-        } if at.x >= a.x && at.x <= a.x + width && at.y >= a.y && at.y <= a.y + height => Some(i),
-        _ => None,
+    items.iter().enumerate().rev().find_map(|(i, item)| {
+        let (a, b) = item.device_bounds()?;
+        (at.x >= a.x && at.x <= b.x && at.y >= a.y && at.y <= b.y).then_some(i)
     })
 }
 
@@ -86,7 +84,9 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         let snap = |v: f64| (v / step).round() * step;
         let mut to = Point::new(snap(at.x - grab.x), snap(at.y - grab.y));
         // Near a DIN rail, the device clips onto it: its middle goes on the rail's centre line.
-        if let Some(PanelItem::Device { height, .. }) = p.items.get(i) {
+        if let Some((a, b)) = p.items.get(i).and_then(PanelItem::device_bounds) {
+            // The outline as turned on the plate.
+            let height = b.y - a.y;
             let middle = to.y + height / 2.0;
             let rail = p.items.iter().find_map(|r| match r {
                 PanelItem::Rail { at: ra, length }
@@ -107,14 +107,16 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
                 ed.panel_drag = Some((grab, true));
             }
             if let Some(PanelItem::Device {
-                at: a, width, height, ..
+                at: a,
+                width,
+                height,
+                rotation,
+                ..
             }) = open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
             {
-                // Keep the device on the plate.
-                *a = Point::new(
-                    to.x.clamp(0.0, (pw - *width).max(0.0)),
-                    to.y.clamp(0.0, (ph - *height).max(0.0)),
-                );
+                // Keep the device, as turned, on the plate.
+                let (w, h) = wc_core::panel::turned_size(*width, *height, *rotation);
+                *a = Point::new(to.x.clamp(0.0, (pw - w).max(0.0)), to.y.clamp(0.0, (ph - h).max(0.0)));
                 open.edited();
             }
         }
@@ -191,8 +193,16 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         }
     }
     for (i, item) in p.items.iter().enumerate() {
-        if let PanelItem::Device { tag, at, width, height } = item {
-            let r = Rect::from_two_pos(xf.s(*at), xf.s(Point::new(at.x + width, at.y + height)));
+        if let PanelItem::Device {
+            tag,
+            at,
+            width,
+            height,
+            rotation,
+        } = item
+        {
+            let (w, h) = wc_core::panel::turned_size(*width, *height, *rotation);
+            let r = Rect::from_two_pos(xf.s(*at), xf.s(Point::new(at.x + w, at.y + h)));
             let picked = ed.panel_pick == Some(i);
             painter.rect_filled(r, 1.0, if picked { t.accent_soft } else { t.paper });
             // A part with a maker's outline drawing is drawn with it, inside a faint box (#312).
@@ -205,7 +215,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
                 .and_then(|part| part.footprint.as_ref());
             if let Some(f) = footprint {
                 let st = Stroke::new(1.0_f32, t.ink);
-                for s in f.placed(*at, *width, *height) {
+                for s in f.placed_turned(*at, *width, *height, *rotation) {
                     crate::canvas::paint_shape(&painter, &xf, &s, st);
                 }
             }
@@ -239,9 +249,17 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     }
     // The picked device's full tag and size, at the bottom of the view.
     let info = ed.panel_pick.and_then(|i| p.items.get(i)).and_then(|item| match item {
-        PanelItem::Device { tag, at, width, height } => Some(format!(
-            "{tag}  ·  {width} x {height} mm at x {:.0}, y {:.0}  ·  drag to move, Delete to take it off the plate",
-            at.x, at.y
+        PanelItem::Device {
+            tag,
+            at,
+            width,
+            height,
+            rotation,
+        } => Some(format!(
+            "{tag}  ·  {width} x {height} mm{} at x {:.0}, y {:.0}  ·  drag to move, R to rotate, Delete to take it off the plate",
+            turned_note(*rotation),
+            at.x,
+            at.y
         )),
         _ => None,
     });
@@ -258,6 +276,17 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     );
 }
 
+/// ", turned 90°" for a turned device, nothing for an upright one.
+pub fn turned_note(rotation: wc_core::geom::Rotation) -> String {
+    use wc_core::geom::Rotation;
+    match rotation {
+        Rotation::R0 => String::new(),
+        Rotation::R90 => ", turned 90°".into(),
+        Rotation::R180 => ", turned 180°".into(),
+        Rotation::R270 => ", turned 270°".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +298,7 @@ mod tests {
             at: Point::new(x, 0.0),
             width: 10.0,
             height: 10.0,
+            rotation: wc_core::geom::Rotation::R0,
         };
         let items = vec![
             PanelItem::Rail {
@@ -281,5 +311,19 @@ mod tests {
         assert_eq!(device_at(&items, Point::new(7.0, 5.0)), Some(2));
         assert_eq!(device_at(&items, Point::new(2.0, 5.0)), Some(1));
         assert_eq!(device_at(&items, Point::new(50.0, 5.0)), None);
+    }
+
+    #[test]
+    fn picks_a_turned_device_by_its_turned_outline() {
+        let items = vec![PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-G1").unwrap_or_default(),
+            at: Point::new(0.0, 0.0),
+            width: 10.0,
+            height: 40.0,
+            rotation: wc_core::geom::Rotation::R90,
+        }];
+        // Turned, it covers 40 x 10 mm.
+        assert_eq!(device_at(&items, Point::new(30.0, 5.0)), Some(0));
+        assert_eq!(device_at(&items, Point::new(5.0, 30.0)), None);
     }
 }

@@ -2939,6 +2939,7 @@ mod tests {
             at: Point::default(),
             width: 6.0,
             height: 50.0,
+            rotation: crate::geom::Rotation::R0,
         });
         p.panels.push(panel);
         let role = |_: &str| None;

@@ -579,6 +579,7 @@ mod tests {
             at: Point::new(50.0, 100.0),
             width: 45.0,
             height: 85.0,
+            rotation: crate::geom::Rotation::R0,
         });
         p.panels.push(panel);
         p.add_comment(

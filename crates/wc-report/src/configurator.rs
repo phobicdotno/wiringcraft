@@ -474,8 +474,8 @@ fn mounting(i: &Inputs<'_>, strip: &DeviceTag) -> Vec<Mounting> {
             .items
             .iter()
             .filter_map(|it| match it {
-                PanelItem::Device { tag, at, width, height } if tag == strip || tag.terminal_parts().0 == *strip => {
-                    Some((at.x, at.y, at.x + width, at.y + height))
+                PanelItem::Device { tag, .. } if tag == strip || tag.terminal_parts().0 == *strip => {
+                    it.device_bounds().map(|(a, b)| (a.x, a.y, b.x, b.y))
                 }
                 _ => None,
             })

@@ -747,6 +747,22 @@ impl Open {
         });
     }
 
+    /// Turn device `item` of panel layout `panel` a quarter clockwise, in one undo step.
+    /// Returns false, with no undo step, when it is not a device or would not fit turned.
+    pub fn rotate_panel_device(&mut self, panel: usize, item: usize) -> bool {
+        let Some(mut turned) = self.project.panels.get(panel).cloned() else {
+            return false;
+        };
+        if !turned.rotate_device(item) {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(p) = self.project.panels.get_mut(panel) {
+            *p = turned;
+        }
+        true
+    }
+
     /// Mirror the selected symbols left to right, in one undo step.
     pub fn mirror_many(&mut self, page: usize, sel: &[Selection]) {
         self.change_symbols(page, sel, |s| s.mirror = !s.mirror);

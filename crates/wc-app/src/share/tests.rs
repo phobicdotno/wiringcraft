@@ -5014,6 +5014,7 @@ fn a_new_device_s_footprint_goes_back_with_it_or_not_at_all() -> TestResult {
         at: wc_core::geom::Point::new(10.0, 10.0),
         width: 20.0,
         height: 40.0,
+        rotation: wc_core::geom::Rotation::R0,
     });
     let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
     assert!(held.now.panels.contains_key("pn1"));
@@ -5190,6 +5191,7 @@ fn pages_and_panels_of_a_new_device_lost_with_a_waiting_rename_are_named() -> Te
         at: wc_core::geom::Point::new(10.0, 10.0),
         width: 20.0,
         height: 40.0,
+        rotation: wc_core::geom::Rotation::R0,
     });
     let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
     assert_eq!(held.renames.len(), 1, "one group: the pages join them");
@@ -5291,6 +5293,7 @@ fn a_device_removed_beside_a_waiting_rename_on_a_panel_goes_out_at_once() -> Tes
             at: wc_core::geom::Point::new(x, 10.0),
             width: 20.0,
             height: 40.0,
+            rotation: wc_core::geom::Rotation::R0,
         });
     }
     base.panels.push(panel);

@@ -682,6 +682,7 @@ fn panel_layouts_print_after_the_schematic_pages() {
             at: Point::new(50.0, 100.0),
             width: 45.0,
             height: 85.0,
+            rotation: wc_core::geom::Rotation::R0,
         });
     }
     let parts = wc_report::Table {
@@ -730,6 +731,7 @@ fn a_device_with_a_footprint_drawing_is_drawn_with_it_on_the_layout() {
         at: Point::new(50.0, 100.0),
         width: 22.5,
         height: 100.0,
+        rotation: wc_core::geom::Rotation::R0,
     });
     let Some(footprint) = wc_core::Footprint::from_shapes(vec![
         Shape::Rect {
@@ -767,6 +769,98 @@ fn a_device_with_a_footprint_drawing_is_drawn_with_it_on_the_layout() {
         ..Default::default()
     };
     assert!(footprints([&other]).is_empty());
+}
+
+#[test]
+fn a_turned_device_is_drawn_turned_with_its_footprint() {
+    use wc_core::geom::Rotation;
+    use wc_core::panel::{Panel, PanelItem};
+    let Ok(tag) = DeviceTag::parse("+CAB1-G1") else {
+        unreachable!("a valid tag")
+    };
+    let mut project = Project::new("x");
+    project.devices.insert(
+        tag.clone(),
+        wc_core::Device {
+            part: Some("maker.psu".into()),
+            ..Default::default()
+        },
+    );
+    // The maker's outline: the part's frame and a line along its top edge, 22.5 mm long.
+    let Some(footprint) = wc_core::Footprint::from_shapes(vec![
+        Shape::Rect {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(22.5, 100.0),
+        },
+        Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(22.5, 0.0),
+        },
+    ]) else {
+        unreachable!("the outline has a size")
+    };
+    let part = wc_core::Part {
+        id: "maker.psu".into(),
+        footprint: Some(footprint),
+        ..Default::default()
+    };
+    let page = Page::new("panel-main", "P1", "Cabinet");
+    let draw = |rotation: Rotation| {
+        let mut panel = Panel::new("main", "Cabinet", 600.0, 800.0);
+        panel.items.push(PanelItem::Device {
+            tag: tag.clone(),
+            at: Point::new(50.0, 100.0),
+            width: 22.5,
+            height: 100.0,
+            rotation,
+        });
+        layout::draw_panel_page(&project, &page, 0, 1, &panel, &footprints([&part]), "")
+    };
+    // Open 2-point paths (the top-edge line) and closed 4-point ones (boxes), as their size on
+    // the sheet in mm (width, height).
+    let sizes = |d: &writer::Drawn, closed: bool| -> Vec<(f64, f64)> {
+        d.prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Path { points, closed: c, .. }
+                    if *c == closed && points.len() == if closed { 4 } else { 2 } =>
+                {
+                    let xs = points.iter().map(|q| q.0);
+                    let ys = points.iter().map(|q| q.1);
+                    let w = xs.clone().fold(f64::MIN, f64::max) - xs.fold(f64::MAX, f64::min);
+                    let h = ys.clone().fold(f64::MIN, f64::max) - ys.fold(f64::MAX, f64::min);
+                    Some((w, h))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01;
+    // The plate is drawn at 1:5: 22.5 mm is 4.5 mm on the sheet, 100 mm is 20 mm.
+    let upright = draw(Rotation::R0);
+    assert!(
+        sizes(&upright, false).iter().any(|&s| near(s, (4.5, 0.0))),
+        "the top edge runs across"
+    );
+    assert!(
+        sizes(&upright, true).iter().any(|&s| near(s, (4.5, 20.0))),
+        "the box stands upright"
+    );
+    let turned = draw(Rotation::R90);
+    assert!(
+        sizes(&turned, false).iter().any(|&s| near(s, (0.0, 4.5))),
+        "the top edge runs down"
+    );
+    assert!(!sizes(&turned, false).iter().any(|&s| near(s, (4.5, 0.0))));
+    assert!(
+        sizes(&turned, true).iter().any(|&s| near(s, (20.0, 4.5))),
+        "the box lies on its side"
+    );
+    assert!(!sizes(&turned, true).iter().any(|&s| near(s, (4.5, 20.0))));
+    assert!(
+        turned.ops.contains(&writer::pdf_text("-G1")),
+        "the tag is still printed"
+    );
 }
 
 #[test]
