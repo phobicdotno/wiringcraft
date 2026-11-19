@@ -201,6 +201,12 @@ impl Table {
     /// An id found only under another prefix may as well be a bare foreign key (`ele_id` in a
     /// terminal table), so it is left out only while another candidate is there to take.
     fn link(&self, other: &Table) -> Option<&str> {
+        self.link_from(other, None)
+    }
+
+    /// Like [`Table::link`] for a table whose own id column the caller knows (`id`): that
+    /// column is never the link, even as the only candidate.
+    fn link_from(&self, other: &Table, id: Option<&str>) -> Option<&str> {
         let mut prefixes = Vec::new();
         if let Some((p, _)) = other.field(&["id"]).and_then(|c| c.split_once('_')) {
             prefixes.push(p);
@@ -217,7 +223,7 @@ impl Table {
                 .into_iter()
                 .flatten()
             {
-                if Some(c) != own_id && !candidates.contains(&c) {
+                if Some(c) != own_id && Some(c) != id && !candidates.contains(&c) {
                     candidates.push(c);
                 }
             }
@@ -388,7 +394,7 @@ fn catalog_terminals(
     let found = (|| -> std::result::Result<_, String> {
         let el_id = elements.need(&["id"])?.to_owned();
         let el_ref = elements
-            .link(refs)
+            .link_from(refs, Some(&el_id))
             .ok_or_else(|| format!("tew_catelement has no {}_{}_id column", elements.prefix, refs.prefix))?
             .to_owned();
         let t_el = terms

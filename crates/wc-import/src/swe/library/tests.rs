@@ -282,6 +282,28 @@ INSERT INTO tew_catterminal VALUES (10, 1, 'A1');
     let mut warnings = Vec::new();
     let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
     assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1", "{warnings:?}");
+
+    // Without `x_ref_id` the element's id `ref_id` is not taken for its link, even though it
+    // could name a part (element 1, part 1): a warning, no terminals.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT, ele_description TEXT);
+CREATE TABLE tew_catterminal (ter_ref_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (1, 1, 'Coil', '');
+INSERT INTO tew_catterminal VALUES (1, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert!(
+        !parts[0].properties.contains_key(PROP_TERMINALS),
+        "{:?}",
+        parts[0].properties
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("tew_catelement has no")),
+        "{warnings:?}"
+    );
 }
 
 #[test]
