@@ -1150,6 +1150,165 @@ pub fn draw_table_page(
     }
 }
 
+/// Height of one channel row on a drawn PLC card sheet, in mm.
+const CARD_ROW: f64 = 6.0;
+/// Text height on a drawn PLC card sheet, in mm.
+const CARD_TEXT: f64 = 2.5;
+/// Where the channel rows start below the top of the drawing area, in mm (room for the heading).
+const CARD_TOP: f64 = 22.0;
+
+/// How many rows of a drawn PLC card fit on one sheet of `size`.
+pub fn card_rows_per_page(size: PageSize, band: f64) -> usize {
+    let (_, h) = size.mm();
+    let usable = h - 2.0 * MARGIN - HEADER - band - CARD_TOP - 14.0;
+    ((usable / CARD_ROW).floor() as usize).max(1)
+}
+
+/// The rows of a drawn PLC card: each channel with the point drawn there (`None` for a spare),
+/// a channel with several points on one row each.
+pub fn card_rows(card: &wc_report::PlcCardSheet) -> Vec<(&wc_report::CardChannel, Option<&wc_report::CardPoint>)> {
+    card.channels
+        .iter()
+        .flat_map(|ch| {
+            let points: Vec<Option<&wc_report::CardPoint>> = if ch.points.is_empty() {
+                vec![None]
+            } else {
+                ch.points.iter().map(Some).collect()
+            };
+            points.into_iter().map(move |p| (ch, p))
+        })
+        .collect()
+}
+
+/// A drawn PLC card overview sheet (#437): the card as a box with a terminal per channel, its
+/// channel number and address inside, and the device, description, connection and page of the
+/// point drawn there beside it. Rows `first..` that fit, part `part.0` of `part.1`; a row with a
+/// drawn point links to its page.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_card_page(
+    project: &Project,
+    page: &Page,
+    index: usize,
+    total: usize,
+    card: &wc_report::PlcCardSheet,
+    first: usize,
+    part: (usize, usize),
+    date: &str,
+) -> Drawn {
+    let (w, h) = page.size.mm();
+    let mut pen = Pen::new(h);
+    pen.ops.push_str("1 J 1 j\n");
+    pen.colour(0.0, 0.0, 0.0);
+    frame(&mut pen, project, page, index, total, date);
+    let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
+    let top = MARGIN + HEADER + 10.0;
+    let mut heading = format!("PLC card {}", card.card);
+    if part.1 > 1 {
+        heading.push_str(&format!(" ({} / {})", part.0, part.1));
+    }
+    pen.text((x0, top), 4.0, 0, &heading);
+    let mut about = vec![];
+    if !card.rack.is_empty() {
+        about.push(format!("Rack {}", card.rack));
+    }
+    about.push(format!("slot {}", card.slot));
+    if !card.kind.is_empty() && card.kind != card.card {
+        about.push(card.kind.clone());
+    }
+    about.push(format!("{} channels", card.channels.len()));
+    pen.colour(0.35, 0.35, 0.35);
+    pen.text((x0, top + 6.0), CARD_TEXT, 0, &about.join(", "));
+    pen.colour(0.0, 0.0, 0.0);
+    let rows = card_rows(card);
+    let per = card_rows_per_page(page.size, project.meta.template.band_height());
+    let shown: Vec<_> = rows.iter().skip(first).take(per).collect();
+    // Column positions: the card box, the wire to the terminal, then the point's fields.
+    let (bx0, bx1) = (x0 + 8.0, x0 + 58.0);
+    let lead = bx1 + 18.0;
+    let room = x1 - lead;
+    let (dev_x, desc_x, conn_x, page_x) = (lead + 2.0, lead + room * 0.2, lead + room * 0.55, x1 - 2.0);
+    let y0 = top + CARD_TOP - CARD_ROW;
+    // Column heads.
+    pen.colour(0.35, 0.35, 0.35);
+    for (x, align, text) in [
+        (bx0 + 2.0, 0, "Channel"),
+        (bx1 - 4.0, 2, "Address"),
+        (dev_x, 0, "Device"),
+        (desc_x, 0, "Description"),
+        (conn_x, 0, "Connected to"),
+        (page_x, 2, "Page"),
+    ] {
+        pen.text((x, y0 - 2.0), TABLE_TEXT, align, text);
+    }
+    pen.colour(0.0, 0.0, 0.0);
+    let mut links = Vec::new();
+    let mut last_channel = None;
+    for (k, (ch, point)) in shown.iter().enumerate() {
+        let y = y0 + CARD_ROW * k as f64;
+        let mid = y + CARD_ROW / 2.0;
+        let base = mid + CARD_TEXT / 2.0 - 0.3;
+        // A channel with several points shows its number and terminal once.
+        if last_channel != Some(ch.channel) {
+            pen.text((bx0 + 2.0, base), CARD_TEXT, 0, &ch.channel.to_string());
+            pen.text((bx1 - 4.0, base), CARD_TEXT, 2, &ch.address);
+            pen.width(0.25);
+            pen.circle((bx1, mid), 1.2, false);
+            if k > 0 {
+                pen.colour(0.75, 0.75, 0.75);
+                pen.width(0.12);
+                pen.line((bx0, y), (bx1, y));
+                pen.colour(0.0, 0.0, 0.0);
+            }
+        }
+        last_channel = Some(ch.channel);
+        let Some(point) = point else {
+            pen.colour(0.55, 0.55, 0.55);
+            pen.text((dev_x, base), CARD_TEXT, 0, "spare");
+            pen.colour(0.0, 0.0, 0.0);
+            continue;
+        };
+        pen.width(0.25);
+        pen.line((bx1 + 1.2, mid), (lead, mid));
+        pen.text((dev_x, base), CARD_TEXT, 0, &fit(&point.device, desc_x - dev_x - 2.0));
+        pen.text(
+            (desc_x, base),
+            CARD_TEXT,
+            0,
+            &fit(&point.description, conn_x - desc_x - 2.0),
+        );
+        pen.text(
+            (conn_x, base),
+            CARD_TEXT,
+            0,
+            &fit(&point.connected, page_x - conn_x - 14.0),
+        );
+        pen.text((page_x, base), CARD_TEXT, 2, &point.page_number);
+        if !point.page_id.is_empty() {
+            links.push(Link {
+                min: (lead, y),
+                max: (x1, y + CARD_ROW),
+                target_page_id: point.page_id.clone(),
+            });
+        }
+    }
+    // The card itself: a box around its channel rows on this sheet.
+    let y1 = y0 + CARD_ROW * shown.len().max(1) as f64;
+    pen.width(0.5);
+    pen.rect((bx0, y0), (bx1, y1));
+    if card.channels.is_empty() {
+        pen.colour(0.45, 0.45, 0.45);
+        pen.text((dev_x, y0 + CARD_ROW - 1.4), CARD_TEXT, 0, "No channels.");
+    }
+    Drawn {
+        ops: pen.ops,
+        links,
+        prims: pen.prims,
+        layers: pen.layers,
+        underlay: None,
+        pictures: Vec::new(),
+    }
+}
+
 /// One panel layout page: frame and title block, the mounting plate scaled to fit the drawing
 /// area with its ducts (hatched grey), DIN rails and device footprints labelled with their
 /// tags, and the scale and plate size under it.

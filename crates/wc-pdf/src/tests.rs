@@ -1648,3 +1648,99 @@ fn a_rack_of_three_cards_gives_plc_card_overview_pages() {
         assert!(text.contains(&writer::pdf_text(cell)), "{cell}");
     }
 }
+
+#[test]
+fn plc_cards_are_drawn_one_per_sheet_with_their_points_linked() {
+    use wc_report::{CardChannel, CardPoint, PlcCardSheet};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs"), Page::new("p2", "2", "Outputs")];
+    let point = |device: &str, page: &str| CardPoint {
+        device: device.into(),
+        description: format!("{device} running"),
+        connected: "-X1:3".into(),
+        page_number: page.trim_start_matches('p').into(),
+        page_id: page.into(),
+    };
+    let card = |slot: u32, name: &str, prefix: &str, points: Vec<(usize, CardPoint)>| PlcCardSheet {
+        rack: "-A1".into(),
+        slot,
+        card: name.into(),
+        kind: "DI 8".into(),
+        channels: (0..8)
+            .map(|c| CardChannel {
+                channel: c,
+                address: format!("{prefix}{}.{c}", slot - 1),
+                points: points
+                    .iter()
+                    .filter(|(at, _)| *at == c)
+                    .map(|(_, p)| p.clone())
+                    .collect(),
+            })
+            .collect(),
+    };
+    // Three cards: a point on the first, two points on one channel of the second, none on the third.
+    let cards = vec![
+        card(1, "-K1", "%IX", vec![(0, point("-S1", "p1"))]),
+        card(2, "-K2", "%QX", vec![(3, point("-M1", "p2")), (3, point("-H1", "p2"))]),
+        card(3, "-K3", "%IX", vec![]),
+    ];
+    let opts = Options {
+        plc_cards: cards.clone(),
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 5, "two schematic pages and a sheet per card");
+    for shown in [
+        "PLC card -K1",
+        "PLC card -K2",
+        "PLC card -K3",
+        "-S1",
+        "-M1 running",
+        "-H1",
+        "%QX1.3",
+        "spare",
+        "-X1:3",
+    ] {
+        assert!(text.contains(&writer::pdf_text(shown)), "{shown} is drawn");
+    }
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    assert!(at("2 Outputs") < at("C1 PLC card -K1"));
+    assert!(at("C1 PLC card -K1") < at("C2 PLC card -K2"));
+    assert!(at("C2 PLC card -K2") < at("C3 PLC card -K3"));
+    assert!(at("C3 PLC card -K3") < usize::MAX);
+    // Each drawn point links to its page: -S1 to page 1, -M1 and -H1 to page 2.
+    assert_eq!(text.matches("/Subtype /Link").count(), 3);
+    let rows = |c: &PlcCardSheet| layout::card_rows(c).len();
+    assert_eq!((rows(&cards[0]), rows(&cards[1]), rows(&cards[2])), (8, 9, 8));
+}
+
+#[test]
+fn a_long_plc_card_goes_on_over_several_sheets() {
+    use wc_report::{CardChannel, PlcCardSheet};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs")];
+    let per = layout::card_rows_per_page(project.pages[0].size, project.meta.template.band_height());
+    let card = PlcCardSheet {
+        card: "-K9".into(),
+        channels: (0..per + 1)
+            .map(|c| CardChannel {
+                channel: c,
+                address: format!("%IX{}.{}", c / 8, c % 8),
+                points: Vec::new(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let opts = Options {
+        plc_cards: vec![card],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    assert_eq!(report.pages, 3);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&writer::pdf_text("PLC card -K9 (2 / 2)")));
+}
