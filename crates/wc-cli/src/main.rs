@@ -1193,17 +1193,22 @@ fn run(cli: Cli) -> Res<()> {
                     remove,
                 } => {
                     let tag = DeviceTag::parse(&tag).map_err(e)?;
-                    let parts = vendored_parts(dir, &p);
                     let known = p.devices.contains_key(&tag)
                         || p.pages
                             .iter()
                             .any(|pg| pg.symbols.iter().any(|s| s.tag.as_ref() == Some(&tag)));
-                    let size = p
-                        .devices
-                        .get(&tag)
-                        .and_then(|d| d.part.as_ref())
-                        .and_then(|part| parts.get(part))
-                        .and_then(wc_core::panel::part_size);
+                    // A part that cannot be read is named with its reason, so a damaged or
+                    // missing copy is not mistaken for a part without a size.
+                    let size = match p.devices.get(&tag).and_then(|d| d.part.as_ref()) {
+                        Some(part) => match store::read_vendored_part(dir, part) {
+                            Ok(part) => wc_core::panel::part_size(&part),
+                            Err(err) => {
+                                eprintln!("warning: cannot read part {part} of {tag}: {err}");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
                     let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
                         return Err(format!("no panel {id:?}"));
                     };
@@ -1253,27 +1258,7 @@ fn run(cli: Cli) -> Res<()> {
                     let Some(panel) = p.panels.iter().find(|x| x.id == id) else {
                         return Err(format!("no panel {id:?}"));
                     };
-                    println!("{} {} ({} x {} mm)", panel.id, panel.name, panel.width, panel.height);
-                    for item in &panel.items {
-                        if let wc_core::panel::PanelItem::Device {
-                            tag,
-                            at,
-                            width,
-                            height,
-                            rotation,
-                        } = item
-                        {
-                            println!(
-                                "{:<12} at {},{}  {} x {} mm  turned {}",
-                                tag.to_string(),
-                                at.x,
-                                at.y,
-                                width,
-                                height,
-                                rotation.degrees()
-                            );
-                        }
-                    }
+                    print!("{}", panel_show(panel));
                     return Ok(());
                 }
                 PanelCmd::List => {
@@ -1281,7 +1266,7 @@ fn run(cli: Cli) -> Res<()> {
                         println!(
                             "{:<10} {} ({} x {} mm, {} device(s))",
                             x.id,
-                            x.name,
+                            escape_field(&x.name),
                             x.width,
                             x.height,
                             x.device_tags().len()
@@ -4136,6 +4121,38 @@ fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMa
         .collect()
 }
 
+/// `panel show`: the plate, then each device with its place, size and turn, one per line.
+fn panel_show(panel: &wc_core::panel::Panel) -> String {
+    let mut out = format!(
+        "{} {} ({} x {} mm)\n",
+        panel.id,
+        escape_field(&panel.name),
+        panel.width,
+        panel.height
+    );
+    for item in &panel.items {
+        if let wc_core::panel::PanelItem::Device {
+            tag,
+            at,
+            width,
+            height,
+            rotation,
+        } = item
+        {
+            out.push_str(&format!(
+                "{:<12} at {},{}  {} x {} mm  turned {}\n",
+                escape_field(&tag.to_string()),
+                at.x,
+                at.y,
+                width,
+                height,
+                rotation.degrees()
+            ));
+        }
+    }
+    out
+}
+
 /// A report as aligned plain text for the terminal.
 fn plain_table(t: &wc_report::Table) -> String {
     let mut w: Vec<usize> = t.columns.iter().map(|c| c.chars().count()).collect();
@@ -5060,6 +5077,16 @@ mod tests {
         assert!(cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--rotate", "45"]).is_err());
         assert_eq!(on_plate(), Some((Point::new(300.0, 50.0), 45.0, 85.0, Rotation::R90)));
         cli(&dir, &["panel", "show", "main"]).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.panels[0].name = "Main\u{1b}]52;c;x\u{7}".into();
+        let shown = panel_show(&p.panels[0]);
+        assert!(shown.starts_with("main Main"), "{shown}");
+        assert!(shown.contains("(600 x 800 mm)"), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "control characters are escaped: {shown}");
+        assert!(
+            shown.contains("+CAB1-K1     at 300,50  45 x 85 mm  turned 90"),
+            "{shown}"
+        );
 
         cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--remove"]).unwrap();
         assert_eq!(on_plate(), None);
