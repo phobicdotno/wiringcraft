@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use wc_core::network::{Network, Port};
 use wc_core::{Page, PageSize, Project};
 
-use crate::layout::{self, MARGIN, frame, text_fit};
+use crate::layout::{self, MARGIN, fit_at, frame};
 use crate::writer::{Drawn, Link, Pen};
 
 /// Where each device of a network goes and how its links run.
@@ -328,7 +328,7 @@ impl Label {
         Label {
             at,
             align,
-            text: text_fit(s.trim(), TEXT, room.max(0.0)),
+            text: fit_at(s.trim(), room.max(0.0), TEXT),
         }
     }
 
@@ -358,7 +358,7 @@ fn joined(from: &str, to: &str, cable: &str, room: f64) -> String {
         if s.is_empty() {
             String::new()
         } else {
-            text_fit(s, TEXT, third)
+            fit_at(s, third, TEXT)
         }
     };
     format!("{} - {} {}", cut(from), cut(to), cut(cable)).trim().to_owned()
@@ -473,7 +473,7 @@ pub fn draw_network_page(
         (true, false) => format!("Network {}: {}", net.name, net.description.trim()),
         (false, false) => format!("Network {} ({kind}): {}", net.name, net.description.trim()),
     };
-    pen.text((x0, title_y), 4.0, 0, &text_fit(&title, 4.0, x1 - x0));
+    pen.text((x0, title_y), 4.0, 0, &fit_at(&title, x1 - x0, 4.0));
 
     let mut warn = |why: String| {
         let w = format!("network {}: {why}", net.name);
@@ -531,7 +531,7 @@ pub fn draw_network_page(
                 (bx + 1.5, by + 1.0 + LINE * (i as f64 + 1.0)),
                 size,
                 0,
-                &text_fit(t, size, g.box_w - 3.0),
+                &fit_at(t, g.box_w - 3.0, size),
             );
         }
         if let Some(target) = tag.as_ref().and_then(|t| tags.get(t)).and_then(|at| at.first()) {

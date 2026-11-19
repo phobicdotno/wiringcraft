@@ -8,6 +8,7 @@ pub enum Action {
     NewProject,
     Open,
     ProjectProps,
+    Translations,
     Save,
     Undo,
     Redo,
@@ -22,6 +23,7 @@ pub enum Action {
     CircleTool,
     ArcTool,
     PolylineTool,
+    DimensionTool,
     Delete,
     Rotate,
     Mirror,
@@ -100,6 +102,7 @@ impl Action {
                 | Action::CircleTool
                 | Action::ArcTool
                 | Action::PolylineTool
+                | Action::DimensionTool
                 | Action::Delete
                 | Action::Rotate
                 | Action::Mirror
@@ -122,6 +125,7 @@ impl Action {
         Action::NewProject,
         Action::Open,
         Action::ProjectProps,
+        Action::Translations,
         Action::Save,
         Action::Undo,
         Action::Redo,
@@ -136,6 +140,7 @@ impl Action {
         Action::CircleTool,
         Action::ArcTool,
         Action::PolylineTool,
+        Action::DimensionTool,
         Action::Delete,
         Action::Rotate,
         Action::Mirror,
@@ -215,6 +220,12 @@ impl Action {
             Action::ProjectProps => i(
                 "Project properties",
                 "Project name and title-block fields",
+                Icon::Properties,
+                "",
+            ),
+            Action::Translations => i(
+                "Translations",
+                "Translate the project's texts into other languages (translations.toml)",
                 Icon::Properties,
                 "",
             ),
@@ -300,6 +311,12 @@ impl Action {
                 "Polyline",
                 "Draw a polyline: click each point; double-click or Enter ends it, a click on the first point closes it",
                 Icon::Polyline,
+                "",
+            ),
+            Action::DimensionTool => i(
+                "Dimension",
+                "Draw a dimension: click both points to measure, then where the dimension line goes",
+                Icon::Dimension,
                 "",
             ),
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
@@ -535,6 +552,7 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::CircleTool,
         Action::ArcTool,
         Action::PolylineTool,
+        Action::DimensionTool,
     ],
     &[
         Action::AddPage,
@@ -620,6 +638,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::CircleTool,
                     Action::ArcTool,
                     Action::PolylineTool,
+                    Action::DimensionTool,
                 ],
             ),
         ],

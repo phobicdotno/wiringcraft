@@ -247,6 +247,19 @@ pub fn graphic_bounds(g: &Shape) -> (Point, Point) {
             });
             wc_core::geom::bounds_of(&corners)
         }
+        // Its lines, arrows and the real extent of its text.
+        Shape::Dimension { .. } => {
+            let corners: Vec<Point> = g
+                .dimension_parts()
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|part| {
+                    let (a, b) = graphic_bounds(part);
+                    [a, b]
+                })
+                .collect();
+            wc_core::geom::bounds_of(&corners)
+        }
         // The drawn part of an arc, so a selection box around a quarter arc takes it.
         Shape::Arc {
             center,
@@ -286,6 +299,11 @@ fn inside_outline(at: Point, pts: &[Point]) -> bool {
 pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
     let near_path = |pts: &[Point]| pts.windows(2).any(|ab| seg_dist(at, ab[0], ab[1]) <= tol);
     match g {
+        Shape::Dimension { .. } => g
+            .dimension_parts()
+            .unwrap_or_default()
+            .iter()
+            .any(|part| graphic_hit(part, at, tol)),
         Shape::Line { a, b } => seg_dist(at, *a, *b) <= tol,
         Shape::Polyline { points, closed, filled } => {
             let mut pts = points.clone();

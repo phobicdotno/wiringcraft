@@ -2093,6 +2093,7 @@ fn a_report_layout_picks_orders_renames_and_sorts_columns() {
             column("Qty", None),
         ],
         sort: vec!["-Manufacturer".into()],
+        ..Default::default()
     });
     let i = Inputs {
         project: &p,
@@ -2130,6 +2131,7 @@ fn a_report_layout_keeps_page_links_with_their_rows_and_sorts_numbers_by_value()
         ],
         row_pages: vec!["p2".into(), "p10".into()],
         front: true,
+        ..Default::default()
     };
     let sorted = t.with_layout(&ReportLayout {
         kind: "contents".into(),
@@ -2181,6 +2183,56 @@ fn a_sorted_cable_list_keeps_each_core_with_its_cable() {
     let sorted = build(Kind::Cables, &i3);
     let pairs: Vec<(&str, &str)> = sorted.rows.iter().map(|r| (r[0].as_str(), r[3].as_str())).collect();
     assert_eq!(pairs, [("-W2", "1"), ("-W1", "1"), ("-W2", "2"), ("-W1", "2")]);
+    // A draft layout (the layout dialog's preview) gets the same fill-down without being
+    // kept; no layout given is the built-in one, whatever the project keeps.
+    let saved = p.meta.reports.clone();
+    let draft = ReportLayout {
+        kind: "cables".into(),
+        sort: vec!["Core".into()],
+        ..Default::default()
+    };
+    let i4 = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let preview = build_with(Kind::Cables, &i4, Some(&draft));
+    let pairs: Vec<(&str, &str)> = preview.rows.iter().map(|r| (r[0].as_str(), r[3].as_str())).collect();
+    assert_eq!(pairs, [("-W1", "1"), ("-W2", "1"), ("-W1", "2"), ("-W2", "2")]);
+    let builtin = build_with(Kind::Cables, &i4, None);
+    let firsts: Vec<&str> = builtin.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(firsts, ["-W1", "", "-W2", ""]);
+    assert_eq!(p.meta.reports, saved);
+}
+
+#[test]
+fn a_cable_list_grouped_by_cable_without_a_sort_keeps_each_core_in_its_cable_group() {
+    use wc_core::report_layout::ReportLayout;
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w2 = DeviceTag::parse("-W2").unwrap();
+    for (id, cable, core) in [("w1", &w1, "1"), ("w2", &w1, "2"), ("w3", &w2, "1"), ("w4", &w2, "2")] {
+        if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: cable.clone(),
+                core: core.into(),
+            });
+        }
+    }
+    p.meta.reports.push(ReportLayout {
+        kind: "cables".into(),
+        group: Some("Cable".into()),
+        ..Default::default()
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::Cables, &i);
+    let g = t.group.unwrap();
+    let pairs: Vec<(&str, &str)> = t.rows.iter().map(|r| (r[g].as_str(), r[3].as_str())).collect();
+    assert_eq!(pairs, [("-W1", "1"), ("-W1", "2"), ("-W2", "1"), ("-W2", "2")]);
 }
 
 #[test]
@@ -2208,6 +2260,52 @@ fn a_layout_sorts_by_every_key_in_turn_and_keeps_the_built_in_order_on_ties() {
         sorted.rows.iter().map(|r| r[2].as_str()).collect::<Vec<_>>(),
         ["second", "fourth", "third", "fifth", "first"]
     );
+}
+
+#[test]
+fn a_layout_groups_rows_by_a_column_and_the_csv_keeps_one_row_per_record() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let row = |loc: &str, wire: &str| vec![loc.to_string(), wire.to_string(), format!("page of {wire}")];
+    let t = Table {
+        title: "Wires".into(),
+        columns: vec!["Location".into(), "Wire".into(), "Page".into()],
+        rows: vec![row("B1", "W1"), row("A1", "W3"), row("B1", "W2"), row("A1", "W4")],
+        row_pages: vec!["p1".into(), "p3".into(), "p2".into(), "p4".into()],
+        ..Default::default()
+    };
+    // The group column is left out of the picked columns: it comes first all the same.
+    let grouped = t.clone().with_layout(&ReportLayout {
+        kind: "wires".into(),
+        columns: vec![ReportColumn {
+            from: "Wire".into(),
+            heading: None,
+        }],
+        sort: vec!["-Wire".into()],
+        group: Some("Location".into()),
+        header: vec!["project.name".into(), "revision".into()],
+        ..Default::default()
+    });
+    assert_eq!(grouped.columns, ["Location", "Wire"]);
+    assert_eq!(grouped.group, Some(0));
+    assert_eq!(grouped.header, ["project.name", "revision"]);
+    // Groups in the order of their first row after sorting (W4 of A1 first), each sorted.
+    assert_eq!(
+        grouped.to_csv(),
+        "Location,Wire\r\nA1,W4\r\nA1,W3\r\nB1,W2\r\nB1,W1\r\n"
+    );
+    assert_eq!(
+        grouped.row_pages,
+        ["p4", "p3", "p2", "p1"],
+        "links stay with their rows"
+    );
+    // A group column the table does not have groups nothing.
+    let none = t.with_layout(&ReportLayout {
+        kind: "wires".into(),
+        group: Some("Colour".into()),
+        ..Default::default()
+    });
+    assert_eq!(none.group, None);
+    assert_eq!(none.columns.len(), 3);
 }
 
 #[test]

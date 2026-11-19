@@ -288,6 +288,7 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
         rows: vec![vec!["1".into(), "Mains".into()], vec!["2".into(), "Control".into()]],
         row_pages: vec!["p1".into(), "p2".into()],
         front: true,
+        ..Default::default()
     };
     let parts = wc_report::Table {
         title: "Parts list".into(),
@@ -345,6 +346,79 @@ fn a_report_in_the_project_s_own_layout_prints_that_layout() {
     assert!(text.contains(&format!("/Title {}", writer::pdf_text("R1 Bill of materials"))));
     assert!(text.contains(&writer::pdf_text("Art. no.")));
     assert!(!text.contains(&writer::pdf_text("Manufacturer")));
+}
+
+#[test]
+fn grouped_report_pages_print_a_heading_per_group_and_the_header_values() {
+    use layout::TableLine::{Group, Row};
+    let row = |loc: &str, wire: &str| vec![loc.to_string(), wire.to_string()];
+    let mut table = wc_report::Table {
+        title: "Wires".into(),
+        columns: vec!["Location".into(), "Wire".into()],
+        rows: vec![row("+A", "W1"), row("+A", "W2"), row("+A", "W3"), row("+B", "W4")],
+        group: Some(0),
+        ..Default::default()
+    };
+    let g = |v: &str, continued: bool| Group {
+        value: v.into(),
+        continued,
+    };
+    // Four lines a page: +A runs onto the second page under a continued heading, and +B's
+    // heading does not end a page alone.
+    assert_eq!(
+        layout::table_pages(&table, 4),
+        vec![
+            vec![g("+A", false), Row(0), Row(1), Row(2)],
+            vec![g("+B", false), Row(3)],
+        ]
+    );
+    assert_eq!(
+        layout::table_pages(&table, 3),
+        vec![
+            vec![g("+A", false), Row(0), Row(1)],
+            vec![g("+A", true), Row(2)],
+            vec![g("+B", false), Row(3)],
+        ]
+    );
+    // The line of header values takes one line of each page.
+    table.header = vec!["project.name".into(), "revision".into()];
+    assert_eq!(layout::table_pages(&table, 4)[0], vec![g("+A", false), Row(0), Row(1)]);
+    // No page holds more lines than it has room for: without room for a heading and a row,
+    // the headings are left out.
+    for per_page in 1..6 {
+        let pages = layout::table_pages(&table, per_page);
+        // The whole budget: the header line when it is printed, and the table lines.
+        let header = usize::from(layout::prints_header(&table, per_page));
+        assert!(
+            pages.iter().all(|p| p.len() + header <= per_page),
+            "{per_page}: {pages:?}"
+        );
+        assert_eq!(pages.iter().flatten().filter(|l| matches!(l, Row(_))).count(), 4);
+    }
+    assert_eq!(layout::table_pages(&table, 2)[0], vec![Row(0)]);
+    // One line a page: no room for the header values with a row, so they are not printed.
+    assert!(!layout::prints_header(&table, 1));
+    assert_eq!(layout::table_pages(&table, 1)[0], vec![Row(0)]);
+
+    let mut project = Project::new("Plant 7");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    project.meta.title_block.insert("revision".into(), "C".into());
+    let opts = Options {
+        reports: vec![table],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    for shown in [
+        "Location: +A",
+        "Location: +B",
+        "W4",
+        "Project name: Plant 7    Revision: C",
+    ] {
+        assert!(text.contains(&writer::pdf_text(shown)), "{shown}");
+    }
+    // The location is in the headings, not in a column of its own.
+    assert!(!text.contains(&writer::pdf_text("+A")), "no +A cell");
 }
 
 #[test]
@@ -1444,10 +1518,10 @@ fn report_pages_move_to_a_larger_sheet_when_the_first_page_is_too_short() {
         height: 100,
     };
     // Room for a few rows under the usual title block: the report keeps the sheet.
-    assert_eq!(layout::report_size(short, 30.0), short);
+    assert_eq!(layout::report_size(short, 30.0, 1), short);
     // A 60 mm title block leaves no row on it: the smallest ISO sheet with room is used.
-    assert_eq!(layout::report_size(short, 60.0), PageSize::A4);
-    assert_eq!(layout::report_size(PageSize::A3, 60.0), PageSize::A3);
+    assert_eq!(layout::report_size(short, 60.0, 1), PageSize::A4);
+    assert_eq!(layout::report_size(PageSize::A3, 60.0, 1), PageSize::A3);
 }
 
 #[test]
@@ -1490,7 +1564,7 @@ fn a_report_after_a_short_first_page_prints_on_the_larger_sheet() {
     let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
     assert_eq!(report.pages, 3);
     let text = String::from_utf8_lossy(&pdf);
-    let want = layout::report_size(project.pages[0].size, project.meta.template.band_height());
+    let want = layout::report_size(project.pages[0].size, project.meta.template.band_height(), 1);
     assert_eq!(want, PageSize::A4);
     let pt = |mm: f64| mm / 25.4 * 72.0;
     let media = |(w, h): (f64, f64)| format!("[0 0 {:.2} {:.2}]", pt(w), pt(h));
@@ -1638,7 +1712,7 @@ fn a_rack_of_three_cards_gives_plc_card_overview_pages() {
     // The overview runs on over as many report sheets as its rows need, after the one
     // schematic page.
     let band = project.meta.template.band_height();
-    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band), band);
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 1), band);
     let sheets = 72usize.div_ceil(per_page);
     assert!(sheets >= 2, "72 rows fit on one sheet of {per_page}");
     assert_eq!(report.pages, 1 + sheets);
@@ -1813,4 +1887,201 @@ fn a_link_with_an_empty_end_is_warned_about_and_the_others_are_drawn() {
         "{:?}",
         report.warnings
     );
+}
+
+#[test]
+fn plc_cards_are_drawn_one_per_sheet_with_their_points_linked() {
+    use wc_report::{CardChannel, CardPoint, PlcCardSheet};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs"), Page::new("p2", "2", "Outputs")];
+    let point = |device: &str, page: &str| CardPoint {
+        device: device.into(),
+        description: format!("{device} running"),
+        connected: "-X1:3".into(),
+        page_number: page.trim_start_matches('p').into(),
+        page_id: page.into(),
+    };
+    let card = |slot: u32, name: &str, prefix: &str, points: Vec<(usize, CardPoint)>| PlcCardSheet {
+        rack: "-A1".into(),
+        slot,
+        card: name.into(),
+        kind: "DI 8".into(),
+        channels: (0..8)
+            .map(|c| CardChannel {
+                channel: c,
+                address: format!("{prefix}{}.{c}", slot - 1),
+                points: points
+                    .iter()
+                    .filter(|(at, _)| *at == c)
+                    .map(|(_, p)| p.clone())
+                    .collect(),
+            })
+            .collect(),
+    };
+    // Three cards: a point on the first, two points on one channel of the second, none on the third.
+    let cards = vec![
+        card(1, "-K1", "%IX", vec![(0, point("-S1", "p1"))]),
+        card(2, "-K2", "%QX", vec![(3, point("-M1", "p2")), (3, point("-H1", "p2"))]),
+        card(3, "-K3", "%IX", vec![]),
+    ];
+    let opts = Options {
+        plc_cards: cards.clone(),
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 5, "two schematic pages and a sheet per card");
+    for shown in [
+        "PLC card -K1",
+        "PLC card -K2",
+        "PLC card -K3",
+        "-S1",
+        "-M1 running",
+        "-H1",
+        "%QX1.3",
+        "spare",
+        "-X1:3",
+    ] {
+        assert!(text.contains(&writer::pdf_text(shown)), "{shown} is drawn");
+    }
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    assert!(at("2 Outputs") < at("C1 PLC card -K1"));
+    assert!(at("C1 PLC card -K1") < at("C2 PLC card -K2"));
+    assert!(at("C2 PLC card -K2") < at("C3 PLC card -K3"));
+    assert!(at("C3 PLC card -K3") < usize::MAX);
+    // Each drawn point links to its page: -S1 to page 1, -M1 and -H1 to page 2.
+    assert_eq!(text.matches("/Subtype /Link").count(), 3);
+    let targets = |c: &PlcCardSheet| -> Vec<String> {
+        let mut page = Page::new("c", "C1", "card");
+        page.size = layout::card_size(project.pages[0].size, project.meta.template.band_height());
+        let drawn = layout::draw_card_page(&project, &page, 0, 1, c, 0, (1, 1), "");
+        drawn.links.into_iter().map(|l| l.target_page_id).collect()
+    };
+    assert_eq!(targets(&cards[0]), ["p1"], "-S1 links to page 1");
+    assert_eq!(targets(&cards[1]), ["p2", "p2"], "-M1 and -H1 link to page 2");
+    assert!(targets(&cards[2]).is_empty());
+    let rows = |c: &PlcCardSheet| layout::card_rows_of(c).len();
+    assert_eq!((rows(&cards[0]), rows(&cards[1]), rows(&cards[2])), (8, 9, 8));
+}
+
+#[test]
+fn a_long_plc_card_goes_on_over_several_sheets() {
+    use wc_report::{CardChannel, PlcCardSheet};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs")];
+    let per = layout::card_rows_per_page(project.pages[0].size, project.meta.template.band_height());
+    let card = PlcCardSheet {
+        card: "-K9".into(),
+        channels: (0..per + 1)
+            .map(|c| CardChannel {
+                channel: c,
+                address: format!("%IX{}.{}", c / 8, c % 8),
+                points: Vec::new(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let opts = Options {
+        plc_cards: vec![card],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    assert_eq!(report.pages, 3);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&writer::pdf_text("PLC card -K9 (2 / 2)")));
+}
+
+#[test]
+fn plc_card_sheets_move_to_a_larger_sheet_and_fit_their_fields() {
+    let short = PageSize::Custom {
+        width: 300,
+        height: 100,
+    };
+    // A 60 mm title block leaves no card row on the short sheet: a larger one is used.
+    assert_eq!(layout::card_size(short, 60.0), PageSize::A4);
+    assert_eq!(layout::card_size(PageSize::A3, 60.0), PageSize::A3);
+    assert_eq!(layout::card_size(PageSize::A4Portrait, 60.0), PageSize::A4Portrait);
+    // A tall but narrow sheet has rows to spare and no room for the point columns.
+    let narrow = PageSize::Custom {
+        width: 100,
+        height: 297,
+    };
+    assert_eq!(layout::card_size(narrow, 60.0), PageSize::A4);
+    // A field cut for its column is measured at the height it is drawn at.
+    let long = "-K100 motor protection relay for the main pump in the north basin";
+    for width in [10.0, 25.0, 60.0] {
+        let cut = layout::fit_at(long, width, 2.5);
+        assert!(writer::text_width_mm(&cut, 2.5) <= width, "{cut:?} fits {width} mm");
+    }
+}
+
+#[test]
+fn a_dimension_drawn_by_hand_shows_in_pdf_svg_and_dxf() {
+    let mut project = Project::new("x");
+    let mut page = Page::new("p1", "1", "Cabinet");
+    page.graphics.push(Shape::Dimension {
+        a: wc_core::Point::new(40.0, 120.0),
+        b: wc_core::Point::new(65.0, 120.0),
+        offset: 10.0,
+        height: 2.5,
+    });
+    project.pages = vec![page];
+    let symbols = BTreeMap::new();
+    let (bytes, _) = export(&project, &symbols, &Options::default());
+    let tj = format!("{} Tj", writer::pdf_text("25"));
+    assert!(
+        String::from_utf8_lossy(&bytes).contains(&tj),
+        "the PDF shows the length"
+    );
+    let (pages, _) = page_drawings(&project, &symbols, &Options::default());
+    let svg = crate::vector::svg(&pages[0]);
+    assert!(svg.contains(">25</text>"), "{svg}");
+    let d = dxf(&pages[0]);
+    assert!(d.contains("\n1\n25\n"), "the DXF has the length as text");
+}
+
+#[test]
+fn a_long_page_reference_on_a_plc_card_is_cut_to_its_column() {
+    use wc_report::{CardChannel, CardPoint, PlcCardSheet};
+    let project = Project::new("x");
+    let long_page = "=PLANT+ROOM-17/123456789";
+    let card = PlcCardSheet {
+        card: "-K1".into(),
+        channels: vec![CardChannel {
+            channel: 0,
+            address: "%IX0.0".into(),
+            points: vec![CardPoint {
+                device: "-S1".into(),
+                description: "start".into(),
+                connected: "-X1:3 to the terminal strip in the field box ".repeat(6),
+                page_number: long_page.into(),
+                page_id: "p1".into(),
+            }],
+        }],
+        ..Default::default()
+    };
+    let page = Page::new("c", "C1", "card");
+    let drawn = layout::draw_card_page(&project, &page, 0, 1, &card, 0, (1, 1), "");
+    let cut = layout::fit_at(long_page, layout::CARD_PAGE, 2.5);
+    assert!(writer::text_width_mm(&cut, 2.5) <= layout::CARD_PAGE);
+    assert_ne!(cut, long_page, "the page reference is too long for its column");
+    assert!(
+        drawn.ops.contains(&writer::pdf_text(&cut)),
+        "the cut page reference is drawn"
+    );
+    assert!(!drawn.ops.contains(&writer::pdf_text(long_page)));
+    // The connection text is cut too, and ends before the page column starts.
+    let [_, _, conn_x, page_x] = layout::card_field_x(page.size.mm().0);
+    let connected = &card.channels[0].points[0].connected;
+    let shown = layout::fit_at(connected, page_x - layout::CARD_PAGE - 2.0 - conn_x, 2.5);
+    assert_ne!(&shown, connected, "the connection is too long for its column");
+    assert!(
+        drawn.ops.contains(&writer::pdf_text(&shown)),
+        "the cut connection is drawn"
+    );
+    assert!(!drawn.ops.contains(&writer::pdf_text(connected)));
+    assert!(conn_x + writer::text_width_mm(&shown, 2.5) < page_x - layout::CARD_PAGE);
 }

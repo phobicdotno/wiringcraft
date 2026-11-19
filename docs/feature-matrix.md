@@ -81,7 +81,7 @@ For the other areas, the chapter to read in each help is:
 | Project templates and base projects | yes | yes (project templates) | yes: `wiringcraft new <dir> --template <folder or git URL>` and "Start from" in New project; `{name}` and `{date}` filled in | done (#270) |
 | Project properties (customer, dates, revision ...) | yes | yes | yes | done |
 | Project archive (pack and unpack) | yes | yes (.tewzip) | yes: import of archives, projects are plain folders | done |
-| Multi-language project texts and translation dictionary | yes | yes | partly: `translations.toml` dictionary, `wiringcraft pdf --lang nb` (or `nb,en` for two), `wiringcraft translations --lang nb` lists missing texts; no editing in the app yet | done for the CLI (#276) |
+| Multi-language project texts and translation dictionary | yes | yes | yes: `translations.toml` dictionary, `wiringcraft pdf --lang nb` (or `nb,en` for two), `wiringcraft translations --lang nb` lists missing texts; in the app, File, Translations edits the texts with a column per language (missing ones marked) and the PDF export asks for the language | CLI (#276), app (#451) |
 
 ## 2. Editing on the sheet
 
@@ -92,7 +92,7 @@ For the other areas, the chapter to read in each help is:
 | Grid, snap, zoom, pan, fit page | yes | yes | yes | done |
 | Free graphics: lines, rectangles, texts | yes | yes | yes | done |
 | Circles, arcs and polylines in the editor | yes | yes | yes: drawn by hand (Graphics toolbar), picked, moved, deleted and exported like other drawings | done |
-| Dimensions in the editor | yes | yes | partly: kept from imports (drawn by their block), not drawn by hand | later |
+| Dimensions in the editor | yes | yes | yes: kept from imports (drawn by their block), and drawn by hand with the Dimension tool (Graphics toolbar: two points, then the dimension line); picked, moved, deleted, saved and exported to PDF, SVG and DXF like other drawings | done (#317) |
 | Find and replace texts, tags and wire numbers across the project | yes | yes | yes: Edit → Find (Ctrl+F), `wiringcraft find` | done (#109) |
 | Macros / window macros (save and insert groups) | yes | yes | yes | done |
 | Macro placeholders and value sets (one macro, several variants) | yes | partly | partly: `{{name}}` placeholders in a macro's device descriptions, parts, accessories and properties, wire cross-section, colour and type, and drawn texts, filled from a named value set chosen at insert (Insert > Macro, the assistant, `wiringcraft macro place --set`); placeholders and value sets are written in the macro file, not yet edited in the app | done (#272) |
@@ -186,7 +186,7 @@ For the other areas, the chapter to read in each help is:
 | Device, wire, net, terminal, cable, PLC lists | yes | yes | yes | done |
 | Table of contents | yes | yes | yes, linked in the PDF | done |
 | Report pages in the drawing set | yes | yes | yes | done |
-| Report templates the user designs | yes | yes | partly: `[[report]]` layouts in `project.toml` pick, order, rename and sort the columns of any report, in the PDF, CSV, Markdown and Excel output | columns and sort done (#273); grouping, page header fields and an editor in the app later |
+| Report templates the user designs | yes | yes | partly: `[[report]]` layouts in `project.toml` pick, order, rename and sort the columns of any report, in the PDF, CSV, Markdown and Excel output; `group = "<column>"` prints a heading per group in the PDF (one row per record in the CSV), and `header = [...]` prints title-block values above the table | columns and sort done (#273), grouping and page header fields done (#421); an editor in the app later |
 | Reports as CSV / Markdown / Excel | yes (Excel) | yes (Excel) | yes: `report --format xlsx`, Reports → Save as Excel | done (#264) |
 
 ## 11. Panel layout and 3D

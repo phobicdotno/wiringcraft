@@ -23,6 +23,7 @@ pub enum Icon {
     Circle,
     Arc,
     Polyline,
+    Dimension,
     Copy,
     Cut,
     Paste,
@@ -236,6 +237,22 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
             poly(&[(3.0, 19.0), (8.0, 6.0), (15.0, 15.0), (21.0, 5.0)], false);
             for (x, y) in [(3.0, 19.0), (8.0, 6.0), (15.0, 15.0), (21.0, 5.0)] {
                 p.circle_filled(at(x, y), 1.5 * s, accent);
+            }
+        }
+        Icon::Dimension => {
+            // Two extension lines, the dimension line between them with arrow heads.
+            p.line_segment([at(4.0, 6.0), at(4.0, 20.0)], thin);
+            p.line_segment([at(20.0, 6.0), at(20.0, 20.0)], thin);
+            line((5.0, 12.0), (19.0, 12.0));
+            for tip in [
+                [(4.5, 12.0), (9.0, 9.5), (9.0, 14.5)],
+                [(19.5, 12.0), (15.0, 9.5), (15.0, 14.5)],
+            ] {
+                p.add(Shape::convex_polygon(
+                    tip.iter().map(|&(x, y)| at(x, y)).collect(),
+                    accent,
+                    Stroke::NONE,
+                ));
             }
         }
         Icon::Mirror => {

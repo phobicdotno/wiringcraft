@@ -179,12 +179,92 @@ fn points_by_address(points: &[PlcPoint]) -> BTreeMap<PlcAddress, Vec<&PlcPoint>
     out
 }
 
+/// One card of a PLC rack with what is drawn at each of its channels, for the drawn card
+/// overview sheets.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PlcCardSheet {
+    pub rack: String,
+    pub slot: u32,
+    /// The card's tag, else its type, else `slot N`.
+    pub card: String,
+    pub kind: String,
+    pub channels: Vec<CardChannel>,
+}
+
+/// One channel of a card: its number from 0, its address and the points drawn there (none for a
+/// spare, two or more when several share the address).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CardChannel {
+    pub channel: usize,
+    pub address: String,
+    pub points: Vec<CardPoint>,
+}
+
+/// A PLC input or output drawn at a card's channel.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CardPoint {
+    pub device: String,
+    pub description: String,
+    /// What it is wired to.
+    pub connected: String,
+    /// The number and the id of the page it is drawn on.
+    pub page_number: String,
+    pub page_id: String,
+}
+
+/// Every card of every rack in the project ([`wc_core::plc_rack`]), rack by rack and slot by
+/// slot, with the PLC input or output drawn at each channel's address. Cards whose channels
+/// cannot be worked out are left out ([`plc_rack_warnings`] says why).
+pub fn plc_card_sheets(i: &Inputs<'_>) -> Vec<PlcCardSheet> {
+    if i.project.meta.racks.is_empty() {
+        return Vec::new();
+    }
+    let all = plc_points(i);
+    let points = points_by_address(&all);
+    let mut out = Vec::new();
+    for rack in &i.project.meta.racks {
+        let mut cards: Vec<_> = rack.cards.iter().collect();
+        cards.sort_by_key(|c| c.slot);
+        for card in cards {
+            let Ok(addresses) = card.addresses() else { continue };
+            let channels = addresses
+                .iter()
+                .enumerate()
+                .map(|(channel, a)| CardChannel {
+                    channel,
+                    address: a.iec(),
+                    points: points
+                        .get(a)
+                        .into_iter()
+                        .flatten()
+                        .map(|p| CardPoint {
+                            device: p.device.clone(),
+                            description: p.description.clone(),
+                            connected: p.connected.clone(),
+                            page_number: p.page_number.clone(),
+                            page_id: p.page_id.clone(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            out.push(PlcCardSheet {
+                rack: rack.name.clone(),
+                slot: card.slot,
+                card: card.label(),
+                kind: card.kind.clone(),
+                channels,
+            });
+        }
+    }
+    out
+}
+
 /// PLC card overview: every card of every rack in the project ([`wc_core::plc_rack`]), slot by
 /// slot and channel by channel, with the PLC input or output drawn at each channel's address:
 /// the same device, description, connection and page as in the PLC I/O list. A channel with
 /// nothing drawn is listed empty (a spare); two points on one address give two rows. Rows with a
 /// drawn point link to its page. Cards whose channels cannot be worked out are left out
-/// ([`plc_rack_warnings`] says why).
+/// ([`plc_rack_warnings`] says why). [`plc_card_sheets`] gives the same as drawn cards.
 pub fn plc_card_overview(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "PLC cards",
@@ -201,46 +281,32 @@ pub fn plc_card_overview(i: &Inputs<'_>) -> Table {
             "Page",
         ],
     );
-    if i.project.meta.racks.is_empty() {
-        return t;
-    }
-    let all = plc_points(i);
-    let points = points_by_address(&all);
-    for rack in &i.project.meta.racks {
-        let mut cards: Vec<_> = rack.cards.iter().collect();
-        cards.sort_by_key(|c| c.slot);
-        for card in cards {
-            let Ok(addresses) = card.addresses() else { continue };
-            for (ch, a) in addresses.iter().enumerate() {
-                let head = vec![
-                    rack.name.clone(),
-                    card.slot.to_string(),
-                    card.label(),
-                    card.kind.clone(),
-                    ch.to_string(),
-                    a.iec(),
-                ];
-                match points.get(a) {
-                    Some(drawn) => {
-                        for point in drawn {
-                            let mut r = head.clone();
-                            r.extend([
-                                point.device.clone(),
-                                point.description.clone(),
-                                point.connected.clone(),
-                                point.page_number.clone(),
-                            ]);
-                            t.row_pages.resize(t.rows.len(), String::new());
-                            t.row_pages.push(point.page_id.clone());
-                            t.rows.push(r);
-                        }
-                    }
-                    None => {
-                        let mut r = head;
-                        r.extend(std::iter::repeat_n(String::new(), 4));
-                        t.rows.push(r);
-                    }
-                }
+    for card in plc_card_sheets(i) {
+        for ch in &card.channels {
+            let head = vec![
+                card.rack.clone(),
+                card.slot.to_string(),
+                card.card.clone(),
+                card.kind.clone(),
+                ch.channel.to_string(),
+                ch.address.clone(),
+            ];
+            if ch.points.is_empty() {
+                let mut r = head.clone();
+                r.extend(std::iter::repeat_n(String::new(), 4));
+                t.rows.push(r);
+            }
+            for point in &ch.points {
+                let mut r = head.clone();
+                r.extend([
+                    point.device.clone(),
+                    point.description.clone(),
+                    point.connected.clone(),
+                    point.page_number.clone(),
+                ]);
+                t.row_pages.resize(t.rows.len(), String::new());
+                t.row_pages.push(point.page_id.clone());
+                t.rows.push(r);
             }
         }
     }

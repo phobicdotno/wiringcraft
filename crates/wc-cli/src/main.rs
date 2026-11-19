@@ -1911,6 +1911,12 @@ fn run(cli: Cli) -> Res<()> {
             } else {
                 Vec::new()
             };
+            // The PLC card overview is printed as a table and as a drawn sheet per card.
+            let plc_cards = if kinds.contains(&wc_report::Kind::PlcCards) {
+                wc_report::plc_card_sheets(&inputs)
+            } else {
+                Vec::new()
+            };
             let tables = kinds.into_iter().map(|k| wc_report::build(k, &inputs)).collect();
             let pictures = wc_pdf::read_pictures(dir, &p);
             let (bytes, report) = wc_pdf::export(
@@ -1925,6 +1931,7 @@ fn run(cli: Cli) -> Res<()> {
                     unreadable: pictures.unreadable,
                     panels: p.panels.clone(),
                     networks,
+                    plc_cards,
                 },
             );
             write_out(&out, bytes).map_err(e)?;
@@ -5188,6 +5195,18 @@ mod tests {
         save(&dir, &p).unwrap();
         assert_eq!(load(&dir).unwrap().meta.racks, p.meta.racks);
         assert!(has_overview("all"));
+        // The card is drawn on a sheet of its own too, but only with the PLC card overview.
+        let drawn: String = std::iter::once("<".to_string())
+            .chain("PLC card slot 1".bytes().map(|b| format!("{b:02X}")))
+            .chain(std::iter::once(">".to_string()))
+            .collect();
+        let pdf = |report: &str| {
+            let out = dir.join("out.pdf");
+            cli(&dir, &["pdf", out.to_str().unwrap(), "--report", report]).unwrap();
+            String::from_utf8_lossy(&std::fs::read(&out).unwrap()).into_owned()
+        };
+        assert!(pdf("plc-cards").contains(&drawn));
+        assert!(!pdf("parts").contains(&drawn));
     }
 
     #[test]
