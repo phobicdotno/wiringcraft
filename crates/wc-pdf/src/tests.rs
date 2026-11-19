@@ -1876,10 +1876,8 @@ fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about
     // Drawn as written; the warning names the node by number, not by its text.
     assert!(text.contains(&writer::pdf_text("K 10?")));
     assert!(
-        report
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("network PN2: node ") && w.ends_with(" is not a device tag")),
+        report.warnings.iter().any(|w| w.starts_with("network PN2: node ")
+            && w.ends_with(" is not a device tag: only letters, digits, '.', '_' allowed")),
         "{:?}",
         report.warnings
     );

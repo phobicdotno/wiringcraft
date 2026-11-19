@@ -498,14 +498,17 @@ pub fn draw_network_page(
     // Warnings name nodes and links by their number, not by text that failed to parse: the
     // app writes them to its local log, and unparsed text can be any drawing text.
     for (i, n) in net.nodes.iter().enumerate() {
-        if n.device.trim().parse::<wc_core::DeviceTag>().is_err() {
-            warn(format!("node {} is not a device tag", i + 1));
+        if let Some(why) = tag_reason(&n.device) {
+            warn(format!("node {} is not a device tag: {why}", i + 1));
         }
     }
     for (k, l) in net.links.iter().enumerate() {
         for (side, end) in [("from", &l.from), ("to", &l.to)] {
             if Port::parse(end).is_err() {
-                warn(format!("link {}: its {side} end is not a device or port", k + 1));
+                // The tag part, split as `Port::parse` splits it.
+                let tag = end.trim().rsplit_once(':').map_or(end.trim(), |(tag, _)| tag);
+                let why = tag_reason(tag).unwrap_or("not a device tag");
+                warn(format!("link {}: its {side} end is not a device or port: {why}", k + 1));
             }
         }
     }
@@ -587,6 +590,16 @@ pub fn draw_network_page(
         layers: pen.layers,
         underlay: None,
         pictures: Vec::new(),
+    }
+}
+
+/// Why `text` is not a device tag, as a fixed reason that never quotes the text; `None` when it
+/// is one.
+fn tag_reason(text: &str) -> Option<&'static str> {
+    match text.trim().parse::<wc_core::DeviceTag>() {
+        Ok(_) => None,
+        Err(wc_core::Error::Tag(_, why)) => Some(why),
+        Err(_) => Some("not a device tag"),
     }
 }
 
