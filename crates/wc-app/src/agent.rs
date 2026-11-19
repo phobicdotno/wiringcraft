@@ -144,9 +144,13 @@ impl Staging {
             for _ in 0..100 {
                 let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let dir = place.join(format!(".wiringcraft-command-{}-{n}", std::process::id()));
-                let mut b = std::fs::DirBuilder::new();
+                let b = std::fs::DirBuilder::new();
                 #[cfg(unix)]
-                std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+                let b = {
+                    let mut b = b;
+                    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+                    b
+                };
                 match b.create(&dir) {
                     Ok(()) => {
                         made = Some(dir);
