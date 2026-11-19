@@ -650,7 +650,9 @@ mod win {
         pub(super) fn rename(&self, file: &File, to: &OsStr) -> io::Result<()> {
             let w = wide(to)?;
             let head = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
-            let size = head + w.len() * 2;
+            // At least the whole structure: for a one-letter name the name ends before the
+            // structure's padding does, and a shorter record is refused.
+            let size = (head + w.len() * 2).max(std::mem::size_of::<FILE_RENAME_INFORMATION>());
             // u64 words, so the structure (which holds a handle) is aligned.
             let mut buf = vec![0u64; size.div_ceil(8)];
             let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
@@ -1285,6 +1287,20 @@ mod tests {
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().ends_with(".wc-tmp"));
         assert!(!left);
+        Ok(())
+    }
+
+    /// A one-letter output name is written and replaced (the shortest rename record, #494
+    /// review).
+    #[test]
+    fn a_one_letter_name_is_written_and_replaced() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let file = out.path().join("x");
+        g.write(&file, b"first")?;
+        g.write(&file, b"second")?;
+        assert_eq!(std::fs::read_to_string(&file)?, "second");
         Ok(())
     }
 
