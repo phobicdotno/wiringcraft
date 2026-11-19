@@ -308,13 +308,7 @@ pub fn replace_picture(dir: &std::path::Path, picture: &Picture, was: &[u8]) -> 
     }
     let part = match stage(&folder, name, &picture.data) {
         Ok(part) => part,
-        Err(e) => {
-            // The file it was goes back.
-            if publish(&aside, &path).is_ok() {
-                let _ = std::fs::remove_file(&aside);
-            }
-            return Err(e.into());
-        }
+        Err(e) => return Err(restore_aside(&aside, &path, e)),
     };
     let published = publish(&part, &path);
     let _ = std::fs::remove_file(&part);
@@ -329,12 +323,27 @@ pub fn replace_picture(dir: &std::path::Path, picture: &Picture, was: &[u8]) -> 
             let _ = std::fs::remove_file(&aside);
             Err(changed())
         }
-        Err(e) => {
-            if publish(&aside, &path).is_ok() {
-                let _ = std::fs::remove_file(&aside);
-            }
-            Err(e.into())
+        Err(e) => Err(restore_aside(&aside, &path, e)),
+    }
+}
+
+/// After `failed`, put the file moved `aside` back at `path`. When that fails too, the error
+/// says both, and where the file is kept.
+fn restore_aside(aside: &std::path::Path, path: &std::path::Path, failed: std::io::Error) -> crate::Error {
+    match publish(aside, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(aside);
+            failed.into()
         }
+        Err(e) => std::io::Error::new(
+            failed.kind(),
+            format!(
+                "{failed}; putting {} back failed too ({e}): it is kept as {}",
+                path.display(),
+                aside.display()
+            ),
+        )
+        .into(),
     }
 }
 
