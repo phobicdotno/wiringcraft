@@ -74,14 +74,14 @@ pub struct Host {
 }
 
 /// A recorded change and the parts of the project it changed, before and after, with the
-/// versions of the symbols and parts each side was drawn with ([`Parts::uses`]).
+/// versions of the symbols and parts the "before" side was drawn with ([`Parts::uses`]): what
+/// an undo of it puts back.
 #[derive(Debug, Clone)]
 struct Entry {
     info: ChangeInfo,
     before: Parts,
     after: Parts,
     before_uses: Uses,
-    after_uses: Uses,
 }
 
 /// Keep a name or email usable in a git author line (`Name <email>`).
@@ -525,8 +525,8 @@ impl Host {
             ..Parts::default()
         };
         let (before, after) = (parts(before), parts(page.clone()));
-        // A page edit leaves the lock as it was: both sides were drawn with its versions.
-        let uses = (before.uses(&self.project.lock), after.uses(&self.project.lock));
+        // A page edit leaves the lock as it was: the old page was drawn with its versions.
+        let uses = before.uses(&self.project.lock);
         self.send_others(HOST, HostMsg::PageChanged { page, by });
         self.remember(
             by,
@@ -534,8 +534,8 @@ impl Host {
             message,
             ChangeKind::Edit,
             None,
-            (before, uses.0),
-            (after, uses.1),
+            (before, uses),
+            after,
         );
         Ok(())
     }
@@ -684,8 +684,8 @@ impl Host {
         }
         // A file put back alone (the project as it was) is no step to undo.
         if self.project != before {
-            let uses = (was.uses(&before.lock), now.uses(&self.project.lock));
-            self.remember(by, page, message, ChangeKind::Edit, None, (was, uses.0), (now, uses.1));
+            let uses = was.uses(&before.lock);
+            self.remember(by, page, message, ChangeKind::Edit, None, (was, uses), now);
         }
         Ok(true)
     }
@@ -940,7 +940,7 @@ impl Host {
             // What it replaced was drawn with the versions locked until now (a library update
             // since may have moved them on); what it put back was checked against those above.
             (entry.after, replaced_uses),
-            (entry.before, entry.before_uses),
+            entry.before,
         );
         Ok(())
     }
@@ -955,7 +955,7 @@ impl Host {
         kind: ChangeKind,
         reverts: Option<u64>,
         (before, before_uses): (Parts, Uses),
-        (after, after_uses): (Parts, Uses),
+        after: Parts,
     ) {
         let info = ChangeInfo {
             id: self.next_change,
@@ -978,7 +978,6 @@ impl Host {
             before,
             after,
             before_uses,
-            after_uses,
         });
         if self.history.len() > crate::MAX_HISTORY {
             let extra = self.history.len() - crate::MAX_HISTORY;
