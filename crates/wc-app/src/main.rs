@@ -2795,12 +2795,16 @@ fn subway(ui: &mut egui::Ui, rows: &[wc_vcs::subway::Row]) {
     });
 }
 
+/// The project check, with the check rules of the project's library sources as they are now.
 fn run_check(open: &Open) -> Vec<wc_report::Finding> {
-    wc_report::check(&wc_report::Inputs {
-        project: &open.project,
-        symbols: &open.symbols,
-        parts: &open.parts,
-    })
+    wc_report::check_with(
+        &wc_report::Inputs {
+            project: &open.project,
+            symbols: &open.symbols,
+            parts: &open.parts,
+        },
+        &wc_library::library_rules(&open.dir, &open.project),
+    )
 }
 
 fn report_title(k: wc_report::Kind) -> &'static str {
@@ -3330,14 +3334,7 @@ impl App {
                     )
                 })
         });
-        let poll = self.live.poll(
-            &o.project,
-            &o.symbols,
-            &o.parts,
-            o.revision(),
-            editing,
-            std::time::Instant::now(),
-        );
+        let poll = self.live.poll(o, editing, std::time::Instant::now());
         // Show findings only once they are of exactly these inputs: a finished check, or the
         // checker's findings after the editor was replaced (the same project opened again, a
         // session joined). While a check is pending they may be of other inputs (another

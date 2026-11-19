@@ -68,6 +68,10 @@ pub struct ProjectMeta {
     /// ([`crate::check_rule`]).
     #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<crate::check_rule::CheckRule>,
+    /// Library check rules this project turns off, each as `source:number` or `source:name`
+    /// (a library source's `rules.toml`, [`crate::check_rule`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules_off: Vec<String>,
     /// PLC racks and the cards in their slots, laid out on the PLC card overview pages
     /// ([`crate::plc_rack`]).
     #[serde(default, rename = "rack", skip_serializing_if = "Vec::is_empty")]
@@ -751,6 +755,7 @@ impl ProjectMeta {
             revisions: Vec::new(),
             reports: Vec::new(),
             rules: Vec::new(),
+            rules_off: Vec::new(),
             racks: Vec::new(),
             networks: Vec::new(),
         }

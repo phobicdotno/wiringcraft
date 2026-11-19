@@ -112,5 +112,30 @@ fn check_runs_the_rules_in_project_toml() -> TestResult {
     assert!(!after.contains("has no cable"), "{after}");
     // Saving the project on that edit kept the rules.
     assert!(after.contains("-X2 does not match -X#.# (check rule 2)"), "{after}");
+
+    // The library source's house rules run too, named by their source.
+    std::fs::write(
+        lib.join("rules.toml"),
+        "[[rule]]\nname = \"short-tags\"\nkind = \"tag\"\npattern = \"-?#\"\n\n[[rule]]\nkind = \"max-wires\"\nmax = 1\nseverity = \"note\"\n",
+    )?;
+    let house = String::from_utf8_lossy(&run(&dir, &["check", "--all"])?.stdout).into_owned();
+    assert!(
+        house.contains("warning page 1: -X1.1 does not match -?# (check rule 1 \"short-tags\" of library mine)"),
+        "{house}"
+    );
+    assert!(
+        house.contains("note    page 1: -X1.1:2 has 2 wires, at most 1 allowed (check rule 2 of library mine)"),
+        "{house}"
+    );
+    // The project turns one off by name and one by number.
+    let mut text = std::fs::read_to_string(&toml)?;
+    text = format!("rules_off = [\"mine:short-tags\", \"mine:2\"]\n{text}");
+    std::fs::write(&toml, text)?;
+    let off = String::from_utf8_lossy(&run(&dir, &["check", "--all"])?.stdout).into_owned();
+    assert!(!off.contains("of library mine"), "{off}");
+    assert!(
+        off.contains("(check rule 2)"),
+        "the project's own rules still run: {off}"
+    );
     Ok(())
 }

@@ -224,8 +224,9 @@ enum Cmd {
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
     /// potentials, open pins, wires ending in the air, devices without a part, plus the
     /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
-    /// pattern, at most N wires on a terminal). Exits with an error when an error is found, so
-    /// it can guard a commit or a CI job.
+    /// pattern, at most N wires on a terminal) and the house rules in each library source's
+    /// `rules.toml`, less the ones `rules_off` turns off. Exits with an error when an error is
+    /// found, so it can guard a commit or a CI job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]
@@ -2002,7 +2003,7 @@ fn run(cli: Cli) -> Res<()> {
                 symbols: &symbols,
                 parts: &parts,
             };
-            let found = wc_report::check(&inputs);
+            let found = wc_report::check_with(&inputs, &wc_library::library_rules(dir, &p));
             let count = |s: wc_report::Severity| found.iter().filter(|f| f.severity == s).count();
             for f in found.iter().filter(|f| all || f.severity != wc_report::Severity::Note) {
                 let page = f
