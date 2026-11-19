@@ -4,6 +4,9 @@
 use eframe::egui;
 use wc_core::plc_rack::{MAX_CHANNELS, PlcCard, PlcRack};
 
+/// The highest slot number the form offers, both when adding a card and when editing one.
+pub const MAX_SLOT: u32 = 999;
+
 /// A new, empty rack named after the first PLC tag (`-A1`, `-A2`, ...) no rack has yet.
 pub fn new_rack(racks: &[PlcRack]) -> PlcRack {
     let name = (1..)
@@ -20,7 +23,13 @@ pub fn new_rack(racks: &[PlcRack]) -> PlcRack {
 /// left for the user: the overview warns about it until it is filled in.
 pub fn new_card(rack: &PlcRack) -> PlcCard {
     PlcCard {
-        slot: rack.cards.iter().map(|c| c.slot + 1).max().unwrap_or(1),
+        slot: rack
+            .cards
+            .iter()
+            .map(|c| c.slot.saturating_add(1))
+            .max()
+            .unwrap_or(1)
+            .min(MAX_SLOT),
         channels: 16,
         ..PlcCard::default()
     }
@@ -36,15 +45,20 @@ fn text(ui: &mut egui::Ui, value: &mut String, width: f32, hint: &str) -> bool {
         .changed()
 }
 
+/// A number field limited to `range` while the user drags or types, which leaves a value
+/// loaded from the file outside it alone until then.
+fn number(ui: &mut egui::Ui, v: &mut u32, range: std::ops::RangeInclusive<u32>) -> bool {
+    ui.add(egui::DragValue::new(v).range(range).clamp_existing_to_range(false))
+        .changed()
+}
+
 /// One card's row of the rack's grid; the second value is true when its remove button was
 /// clicked.
 fn card_row(ui: &mut egui::Ui, card: &mut PlcCard, at: (usize, usize)) -> (bool, bool) {
-    let mut changed = ui.add(egui::DragValue::new(&mut card.slot).range(0..=999)).changed();
+    let mut changed = number(ui, &mut card.slot, 0..=MAX_SLOT);
     changed |= text(ui, &mut card.tag, 80.0, "-A1.DI1");
     changed |= text(ui, &mut card.kind, 140.0, "DI 16x24 V DC");
-    changed |= ui
-        .add(egui::DragValue::new(&mut card.channels).range(0..=MAX_CHANNELS))
-        .changed();
+    changed |= number(ui, &mut card.channels, 0..=MAX_CHANNELS);
     changed |= ui
         .add(
             egui::TextEdit::singleline(&mut card.start)
@@ -64,7 +78,7 @@ fn card_row(ui: &mut egui::Ui, card: &mut PlcCard, at: (usize, usize)) -> (bool,
             changed = true;
         }
         if let Some(step) = card.step.as_mut() {
-            changed |= ui.add(egui::DragValue::new(step).range(1..=64)).changed();
+            changed |= number(ui, step, 1..=64);
         }
     });
     let remove = ui.small_button("×").on_hover_text("Remove this card").clicked();
@@ -75,7 +89,9 @@ fn card_row(ui: &mut egui::Ui, card: &mut PlcCard, at: (usize, usize)) -> (bool,
 pub fn show(ui: &mut egui::Ui, racks: &mut Vec<PlcRack>) -> bool {
     let mut changed = false;
     let mut drop_rack = None;
-    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+    // Room is left below for the overview's warnings and the OK and Cancel buttons.
+    let height = (ui.ctx().screen_rect().height() * 0.45).min(420.0);
+    egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
         if racks.is_empty() {
             ui.label("No PLC racks yet.");
         }
@@ -155,6 +171,8 @@ mod tests {
         });
         let card = new_card(&rack);
         assert_eq!((card.slot, card.channels), (5, 16));
+        rack.cards[0].slot = MAX_SLOT;
+        assert_eq!(new_card(&rack).slot, MAX_SLOT, "the form offers no slot past the last");
     }
 
     /// Run the form for one frame with `events`, as the app does.
@@ -168,6 +186,26 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| changed = show(ui, racks));
         });
         changed
+    }
+
+    #[test]
+    fn drawing_the_form_leaves_numbers_outside_its_ranges_alone() {
+        let card = PlcCard {
+            slot: 1000,
+            channels: MAX_CHANNELS + 1,
+            step: Some(65),
+            ..PlcCard::default()
+        };
+        let mut racks = vec![PlcRack {
+            name: "-A1".into(),
+            cards: vec![card.clone()],
+            ..PlcRack::default()
+        }];
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            assert!(!frame(&ctx, &mut racks, vec![]), "nothing changed by drawing it");
+        }
+        assert_eq!(racks[0].cards[0], card);
     }
 
     #[test]

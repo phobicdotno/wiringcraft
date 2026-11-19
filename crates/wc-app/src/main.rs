@@ -1722,9 +1722,17 @@ impl App {
                     }
                     let warnings = self.open.as_ref().map(rack_warnings).unwrap_or_default();
                     let t = theme::Theme::of(ui.ctx());
-                    for w in &warnings {
-                        ui.label(RichText::new(w).color(t.warning));
-                    }
+                    // Many cards can give many warnings: they scroll, so OK and Cancel stay
+                    // on screen.
+                    let height = (ui.ctx().screen_rect().height() * 0.15).min(140.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("rack-warnings")
+                        .max_height(height)
+                        .show(ui, |ui| {
+                            for w in &warnings {
+                                ui.label(RichText::new(w).color(t.warning));
+                            }
+                        });
                     ui.label(
                         RichText::new(
                             "The PLC cards report shows each change at once. The racks are kept \
