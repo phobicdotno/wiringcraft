@@ -109,8 +109,10 @@ impl Panel {
     }
 }
 
-/// A part's footprint (width, height) in millimetres from its `Width` and `Height` properties,
-/// else from the extents of its footprint drawing ([`crate::part::Footprint`]), if it has one.
+/// A part's footprint (width, height) in millimetres, if it has one. Each dimension comes from
+/// the part's `Width` or `Height` property, else from the extents of its footprint drawing
+/// ([`crate::part::Footprint`]); a part with one property and a drawing takes the other
+/// dimension from the drawing.
 pub fn part_size(part: &Part) -> Option<(f64, f64)> {
     let find = |keys: &[&str]| {
         part.properties
@@ -121,14 +123,12 @@ pub fn part_size(part: &Part) -> Option<(f64, f64)> {
     };
     let w = find(&["width", "width mm", "breite", "bredde"]);
     let h = find(&["height", "height mm", "höhe", "hoehe", "høyde", "hoyde"]);
-    match (w, h, &part.footprint) {
-        (Some(w), Some(h), _) => Some((w, h)),
-        // A part without a size takes it from its footprint drawing's extents.
-        (_, _, Some(f)) if f.width > 0.0 && f.height > 0.0 && f.width <= 5000.0 && f.height <= 5000.0 => {
-            Some((f.width, f.height))
-        }
-        _ => None,
-    }
+    // Each dimension: the part's own property first, else the footprint drawing's extent.
+    let drawn = part
+        .footprint
+        .as_ref()
+        .filter(|f| f.width > 0.0 && f.height > 0.0 && f.width <= 5000.0 && f.height <= 5000.0);
+    Some((w.or(drawn.map(|f| f.width))?, h.or(drawn.map(|f| f.height))?))
 }
 
 /// Whether a part goes in the cabinet door (push buttons, pilot lights, meters) rather than
@@ -379,6 +379,52 @@ mod tests {
         p.properties.insert("Width".into(), "45".into());
         p.properties.insert("Height".into(), "90".into());
         assert_eq!(part_size(&p), Some((45.0, 90.0)), "the part's own size wins");
+        p.properties.remove("Height");
+        assert_eq!(
+            part_size(&p),
+            Some((45.0, 100.0)),
+            "a missing height comes from the drawing"
+        );
+        p.footprint = None;
+        assert_eq!(part_size(&p), None, "one dimension alone is no size");
+        // A quarter arc spans its radius, not its whole circle.
+        let Some(arc) = Footprint::from_shapes(vec![crate::Shape::Arc {
+            center: Point::new(50.0, 50.0),
+            radius: 10.0,
+            start: 0.0,
+            end: 90.0,
+        }]) else {
+            unreachable!("a quarter arc has a size")
+        };
+        assert!(
+            (arc.width - 10.0).abs() < 1e-9 && (arc.height - 10.0).abs() < 1e-9,
+            "{arc:?}"
+        );
+        let Some(circle) = Footprint::from_shapes(vec![crate::Shape::Circle {
+            center: Point::new(5.0, 5.0),
+            radius: 5.0,
+            filled: false,
+        }]) else {
+            unreachable!("a circle has a size")
+        };
+        assert_eq!((circle.width, circle.height), (10.0, 10.0));
+        // An arc across a quarter point reaches it.
+        let Some(over) = Footprint::from_shapes(vec![crate::Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            start: 315.0,
+            end: 45.0,
+        }]) else {
+            unreachable!()
+        };
+        assert!(
+            (over.height - 2.0 * 10.0 * 45f64.to_radians().sin()).abs() < 1e-9,
+            "{over:?}"
+        );
+        assert!(
+            (over.width - 10.0 * (1.0 - 45f64.to_radians().cos())).abs() < 1e-9,
+            "{over:?}"
+        );
         // In a box of the drawing's size it is drawn as is; in a smaller box it shrinks evenly
         // and is centred; in a larger one it keeps its size and is centred.
         let at = Point::new(10.0, 20.0);

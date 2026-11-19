@@ -2382,19 +2382,44 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 wc_core::geom::format_length(w),
                 wc_core::geom::format_length(h)
             );
-            // The project's pinned copy follows, so its layouts draw the new footprint.
+            // The project's pinned copy follows, so its layouts draw the new footprint, but only
+            // from the file just written: when another of the project's sources wins for this
+            // id, that source's part is not the one that changed.
             if let Ok(p) = &mut project
                 && p.lock.parts.contains_key(&part)
             {
                 let library = wc_library::Library::open(dir, p).map_err(e)?;
-                match wc_library::take(dir, p, &library, ItemKind::Part, &part) {
-                    Ok(_) => {
+                let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+                let winner = library.locate(ItemKind::Part, &part);
+                let refreshed = match &winner {
+                    Some(loc) if same(&loc.path, &path) => wc_library::take(dir, p, &library, ItemKind::Part, &part)
+                        .map_err(|err| err.to_string())
+                        .and_then(|_| {
+                            let copy = store::read_vendored_part(dir, &part).map_err(|err| err.to_string())?;
+                            if copy.footprint == item.footprint {
+                                Ok(())
+                            } else {
+                                Err("the copy taken has another footprint".to_owned())
+                            }
+                        }),
+                    Some(loc) => Err(format!(
+                        "the project takes {part} from source {:?} ({}), not from the file written",
+                        loc.source,
+                        loc.path.display()
+                    )),
+                    None => Err(format!("{part} is in none of the project's library sources")),
+                };
+                match refreshed {
+                    Ok(()) => {
                         save(dir, p)?;
                         println!("updated the project's copy of {part}");
                     }
-                    Err(err) => eprintln!(
-                        "warning: the project's copy of {part} was not updated ({}); run `wiringcraft lib update {part}`",
-                        escape_field(&err.to_string())
+                    Err(why) => eprintln!(
+                        "warning: the project's copy of {part} was not updated: {}",
+                        escape_field(&why)
                     ),
                 }
             }
@@ -4733,6 +4758,27 @@ mod tests {
             })
             .collect();
         assert_eq!(sizes, [(22.5, 100.0)]);
+
+        // A folder that is not the source the project takes the part from leaves the pinned copy
+        // alone (the winning source's part did not change).
+        let other_lib = tmp.path().join("lib2");
+        wc_library::write_part(&other_lib, &part).unwrap();
+        let pinned = load(&dir).unwrap().lock.parts["maker.io-8"].hash.clone();
+        let other_arg = other_lib.to_str().unwrap();
+        cli(
+            &dir,
+            &[
+                "import",
+                "footprint-dxf",
+                file,
+                "--part",
+                "maker.io-8",
+                "--lib",
+                other_arg,
+            ],
+        )
+        .unwrap();
+        assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
 
         // A library folder can be named outside a project; a file holding another part is refused.
         let outside = tmp.path().join("elsewhere");

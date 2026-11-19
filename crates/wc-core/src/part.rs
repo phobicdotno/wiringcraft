@@ -47,13 +47,7 @@ impl Footprint {
     /// A footprint from shapes in any position: moved so their extents start at (0, 0).
     /// `None` when there is nothing to draw or the extents are not a usable size.
     pub fn from_shapes(shapes: Vec<crate::Shape>) -> Option<Self> {
-        let pts: Vec<crate::Point> = shapes
-            .iter()
-            .flat_map(|s| {
-                let (a, b) = s.bounds();
-                [a, b]
-            })
-            .collect();
+        let pts: Vec<crate::Point> = shapes.iter().flat_map(extent_points).collect();
         if pts.is_empty() {
             return None;
         }
@@ -83,6 +77,43 @@ impl Footprint {
         );
         self.shapes.iter().map(|s| s.scaled(k).translate(shift)).collect()
     }
+}
+
+/// Points that span a shape's extents. An arc counts by its end points and the quarter points
+/// its sweep passes, not its whole circle, so a quarter arc of radius 10 spans 10 x 10 mm.
+fn extent_points(s: &crate::Shape) -> Vec<crate::Point> {
+    let crate::Shape::Arc {
+        center,
+        radius,
+        start,
+        end,
+    } = s
+    else {
+        let (a, b) = s.bounds();
+        return vec![a, b];
+    };
+    // Angles run as the editor and the PDF draw them: from `start` to `end`, a point at `a`
+    // being centre + r (cos a, sin a) on the y-down page.
+    let mut sweep = end - start;
+    if sweep <= 0.0 {
+        sweep += 360.0;
+    }
+    if !(sweep.is_finite() && start.is_finite()) || sweep >= 360.0 {
+        let (a, b) = s.bounds();
+        return vec![a, b];
+    }
+    let at = |deg: f64| {
+        let t = deg.to_radians();
+        crate::Point::new(center.x + radius * t.cos(), center.y + radius * t.sin())
+    };
+    let mut out = vec![at(*start), at(start + sweep)];
+    let first = (start / 90.0).floor() as i64 + 1;
+    let mut k = first;
+    while (k as f64) * 90.0 < start + sweep && k - first < 4 {
+        out.push(at(k as f64 * 90.0));
+        k += 1;
+    }
+    out
 }
 
 /// How many contacts of each kind a part has, or a device draws.

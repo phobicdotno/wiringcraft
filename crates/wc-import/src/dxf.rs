@@ -156,6 +156,9 @@ fn parse(text: &str) -> Result<Drawing> {
             if let Some(p) = polyline.as_mut() {
                 p.codes.push((10, e.get(10).unwrap_or("0").into()));
                 p.codes.push((20, e.get(20).unwrap_or("0").into()));
+                if let Some(bulge) = e.get(42) {
+                    p.codes.push((42, bulge.into()));
+                }
             }
         }
         "SEQEND" => {
@@ -441,17 +444,30 @@ fn shapes(
                 })
             }
             "LWPOLYLINE" => {
-                let xs = e.all(10);
-                let ys = e.all(20);
-                let pts: Vec<Point> = xs
-                    .iter()
-                    .zip(&ys)
-                    .filter(|(x, y)| x.is_finite() && y.is_finite())
-                    .map(|(x, y)| q(*x, *y))
-                    .collect();
-                (pts.len() >= 2).then(|| Shape::Polyline {
+                // Vertices in order, each with the bulge (code 42) of the segment it starts: a
+                // bulged segment is an arc, sampled in the entity's own coordinates.
+                let mut vs: Vec<((f64, f64), f64)> = Vec::new();
+                for (code, v) in &e.codes {
+                    let n = v.trim().parse::<f64>().unwrap_or(f64::NAN);
+                    match (*code, vs.last_mut()) {
+                        (10, _) => vs.push(((n, f64::NAN), 0.0)),
+                        (20, Some(last)) => last.0.1 = n,
+                        (42, Some(last)) if n.is_finite() => last.1 = n,
+                        _ => {}
+                    }
+                }
+                vs.retain(|((x, y), _)| x.is_finite() && y.is_finite());
+                let closed = (e.f(70) as i64) & 1 == 1;
+                let raw = if vs.iter().any(|(_, b)| b.abs() >= 1e-9) {
+                    bulged(&vs, closed)
+                } else {
+                    Some(vs.iter().map(|(p, _)| *p).collect())
+                };
+                let pts: Vec<Point> = raw.unwrap_or_default().into_iter().map(|(x, y)| q(x, y)).collect();
+                let drawable = pts.len() >= 2 && pts.iter().all(|p| p.x.is_finite() && p.y.is_finite());
+                drawable.then_some(Shape::Polyline {
                     points: pts,
-                    closed: (e.f(70) as i64) & 1 == 1,
+                    closed,
                     filled: false,
                 })
             }
@@ -1834,10 +1850,16 @@ pub fn footprint(text: &str) -> Result<(wc_core::Footprint, Vec<String>)> {
         &mut { MAX_DRAWN },
     );
     let graphics: Vec<Shape> = raw.into_iter().map(|(_, s)| s).collect();
-    let footprint = wc_core::Footprint::from_shapes(graphics).ok_or_else(|| {
-        Error::Format("the drawing has no outline WiringCraft can read, or it is not a usable size".into())
-    })?;
-    Ok((footprint, skipped_warnings(skipped)))
+    let warnings = skipped_warnings(skipped);
+    let Some(footprint) = wc_core::Footprint::from_shapes(graphics) else {
+        // Say what was left out, which is often why nothing usable is left.
+        let mut why = "the drawing has no outline WiringCraft can read, or it is not a usable size".to_owned();
+        if !warnings.is_empty() {
+            why.push_str(&format!(" ({})", warnings.join("; ")));
+        }
+        return Err(Error::Format(why));
+    };
+    Ok((footprint, warnings))
 }
 
 /// The result of importing a drawing onto a page.
@@ -2019,6 +2041,25 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(footprint(&dxf("", "")).is_err(), "an empty drawing is refused");
+        // Only entities it cannot read: the error names them.
+        let Err(e) = footprint(&dxf("0\n3DFACE\n8\n0\n10\n0\n20\n0\n30\n0\n", "")) else {
+            unreachable!("nothing readable is refused")
+        };
+        assert!(e.to_string().contains("3DFACE"), "{e}");
+        // A bulged side is an arc: a half circle over a 10 mm chord stands 5 mm high.
+        let half = "0\nLWPOLYLINE\n8\n0\n90\n2\n70\n1\n10\n0\n20\n0\n42\n1\n10\n10\n20\n0\n";
+        let (f, _) = footprint(&dxf(half, ""))?;
+        assert!(
+            (f.width - 10.0).abs() < 1e-6 && (f.height - 5.0).abs() < 1e-6,
+            "{} x {}",
+            f.width,
+            f.height
+        );
+        // The old POLYLINE/VERTEX form keeps its bulges too.
+        let old_form = "0\nPOLYLINE\n8\n0\n70\n1\n0\nVERTEX\n8\n0\n10\n0\n20\n0\n42\n1\n\
+                        0\nVERTEX\n8\n0\n10\n10\n20\n0\n0\nSEQEND\n";
+        let (f, _) = footprint(&dxf(old_form, ""))?;
+        assert!((f.height - 5.0).abs() < 1e-6, "{}", f.height);
         assert!(footprint("not a dxf").is_err());
         Ok(())
     }
