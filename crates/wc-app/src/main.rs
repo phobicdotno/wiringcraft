@@ -1178,7 +1178,7 @@ impl App {
                 self.ed.finish_shape = true;
             }
             if i.key_pressed(Key::Escape) {
-                if self.ed.black_box.is_some() {
+                if self.ed.tool == Tool::BlackBox && self.ed.black_box.is_some() {
                     self.ed.black_box = None;
                     self.ed.message = black_box_tool::hint(None).into();
                 } else if !self.ed.shape_points.is_empty() {
@@ -3906,6 +3906,10 @@ impl App {
         };
         let id = o.add_black_box(page, a, b, &d.pins, tag)?;
         self.ed.black_box = None;
+        // The page the box went on is shown (the view may have moved meanwhile), so the
+        // selection names the new box and not an item of the same id elsewhere.
+        self.ed.page = page;
+        self.ed.panel = None;
         self.ed.select_only(Selection::Symbol(id));
         self.ed.message = format!(
             "Black box with {} connection point{} put on the page.",

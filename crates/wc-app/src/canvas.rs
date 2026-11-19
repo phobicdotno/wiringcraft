@@ -556,6 +556,10 @@ pub(crate) fn value_placeholder(
 /// changed.
 pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool, snap_step: f64) {
     drop_draft_of_other_page(open, ed);
+    // A black box being drawn belongs to its tool: another tool drops it.
+    if ed.tool != Tool::BlackBox {
+        ed.black_box = None;
+    }
     // An item on a layer that was just hidden or locked does not stay selected.
     let layers = ed.layers.clone();
     ed.selection.retain(|s| layers.may_select(s));
@@ -1026,7 +1030,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline | Tool::Dimension => {
             shape_tool(&painter, &resp, open, ed, &xf, &shown, &t, finish, snap_step)
         }
-        Tool::BlackBox => black_box_tool(&painter, &resp, ed, &page, &xf, &t, finish, tol),
+        Tool::BlackBox => black_box_tool(&painter, &resp, ed, &page, &xf, &t, finish, tol, snap_step),
     }
 }
 
@@ -1042,6 +1046,7 @@ fn black_box_tool(
     t: &theme::Theme,
     enter: bool,
     tol: f64,
+    snap_step: f64,
 ) {
     use crate::black_box_tool::{BoxDraft, edge_at, hint, inside};
     if ed.black_box.as_ref().is_some_and(|d| d.page_id != page.id) {
@@ -1053,9 +1058,19 @@ fn black_box_tool(
     let cur = ed.cursor;
     match ed.black_box.as_mut() {
         None if !asking => {
-            if (resp.drag_started_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary))
-                && let Some(at) = cur
-            {
+            // A drag is only seen once the pointer has moved: its corner is where the button
+            // went down, not where the pointer is by then.
+            let start = if resp.drag_started_by(egui::PointerButton::Primary) {
+                resp.ctx
+                    .input(|i| i.pointer.press_origin())
+                    .map(|p| snap(xf.mm(p), snap_step))
+                    .or(cur)
+            } else if resp.clicked_by(egui::PointerButton::Primary) {
+                cur
+            } else {
+                None
+            };
+            if let Some(at) = start {
                 ed.black_box = Some(BoxDraft::new(&page.id, at));
                 ed.message = hint(ed.black_box.as_ref()).into();
             }
@@ -2148,6 +2163,56 @@ mod tests {
             &open.project.pages[0].graphics[..],
             [Shape::Polyline { points, .. }] if points.len() == 2
         ));
+    }
+
+    #[test]
+    fn the_black_box_tool_takes_a_drag_edge_clicks_and_a_click_inside_through_egui_events() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::BlackBox,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (a, b) = (egui::pos2(300.0, 200.0), egui::pos2(500.0, 350.0));
+        // A first frame lays the canvas out, so the pointer is over it from then on.
+        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
+        painted(&ctx, &mut open, &mut ed, 1.0, vec![egui::Event::PointerMoved(a)]);
+        let corner = ed.cursor.unwrap();
+        painted(&ctx, &mut open, &mut ed, 1.01, vec![button(a, true)]);
+        // One move all the way: the drag is seen only now, with the pointer already at `b`.
+        painted(&ctx, &mut open, &mut ed, 1.05, vec![egui::Event::PointerMoved(b)]);
+        let other = ed.cursor.unwrap();
+        painted(&ctx, &mut open, &mut ed, 1.1, vec![button(b, false)]);
+        let d = ed.black_box.clone().unwrap();
+        assert_eq!(d.from, corner, "the drag's corner is where the button went down");
+        assert_eq!(d.to, Some(other));
+        assert!(ed.ask_box_pin.is_none() && !ed.ask_box_tag);
+
+        // A click on the top edge asks for a connection point there.
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 200.0), 2.0);
+        let Some((side, offset)) = ed.ask_box_pin.take() else {
+            unreachable!("a click on the edge asks for a point")
+        };
+        assert_eq!(side, wc_core::BoxSide::Top);
+        assert!(offset > 0.0 && offset < other.x - corner.x, "{offset}");
+        ed.black_box.as_mut().unwrap().add_pin(side, offset, "1").unwrap();
+        // A click inside asks for the tag; the page is not changed by any of it.
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 280.0), 3.0);
+        assert!(ed.ask_box_tag);
+        assert!(open.project.pages[0].symbols.is_empty());
+
+        // Another tool drops the box being drawn.
+        ed.ask_box_tag = false;
+        ed.tool = Tool::Line;
+        painted(&ctx, &mut open, &mut ed, 4.0, vec![]);
+        assert!(ed.black_box.is_none());
     }
 
     #[test]
