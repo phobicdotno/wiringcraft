@@ -556,18 +556,33 @@ mod tests {
     #[test]
     fn a_listing_cut_short_changes_nothing() -> Result<()> {
         let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
-        // On a folder that keeps case, both files are there; the listing fails before the new one.
-        for (name, body) in [("dxf-300.page.json", "old"), ("DXF-300.page.json", "new")] {
+        // Names that differ by more than case, so this holds on every folder: a complete listing
+        // would rename the first and remove the second.
+        let files = [("dxf-300.page.json", "old"), ("gone.page.json", "stale")];
+        for (name, body) in files {
             fs::write(dir.path().join(name), body).map_err(|e| Error::io(name, e))?;
         }
         let keep = names(&["DXF-300.page.json"]).into_iter().collect();
-        let names = vec![
+        let listing = vec![
             Ok("dxf-300.page.json".to_string()),
+            Ok("gone.page.json".to_string()),
             Err(std::io::Error::other("listing cut short")),
         ];
-        let out = clean_up_listed(dir.path(), names.into_iter(), &keep, PAGE_SUFFIX);
+        let out = clean_up_listed(dir.path(), listing.into_iter(), &keep, PAGE_SUFFIX);
         assert!(out.is_err_and(|e| e.to_string().contains("listing cut short")));
-        for (name, body) in [("dxf-300.page.json", "old"), ("DXF-300.page.json", "new")] {
+        let mut left = names(&[]);
+        for entry in fs::read_dir(dir.path()).map_err(|e| Error::io("tmp", e))? {
+            left.push(
+                entry
+                    .map_err(|e| Error::io("tmp", e))?
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        left.sort();
+        assert_eq!(left, names(&["dxf-300.page.json", "gone.page.json"]));
+        for (name, body) in files {
             let path = dir.path().join(name);
             assert_eq!(fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?, body);
         }
