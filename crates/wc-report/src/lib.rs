@@ -25,7 +25,7 @@ mod tests;
 pub mod xlsx;
 
 pub use aml::{AmlCounts, automationml};
-pub use check::{Finding, Severity, check, check_table, check_with};
+pub use check::{Finding, Severity, check, check_table, check_with, cloud_index, cloud_item};
 pub use configurator::{CONFIGURATOR_COLUMNS, Configurator, Target, configurator_list};
 pub use marking::{
     LEVEL_SEPARATOR, Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,

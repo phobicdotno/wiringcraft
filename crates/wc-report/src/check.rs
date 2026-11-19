@@ -54,6 +54,18 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
     check_with(i, &[])
 }
 
+/// The item a finding on a page's revision cloud names: `cloud <index>`, the cloud's index in
+/// the page's clouds.
+pub fn cloud_item(n: usize) -> String {
+    format!("cloud {n}")
+}
+
+/// The index in the page's clouds of the revision cloud a finding's item names, see
+/// [`cloud_item`].
+pub fn cloud_index(item: &str) -> Option<usize> {
+    item.strip_prefix("cloud ")?.parse().ok()
+}
+
 /// [`check`], with the check rules of the project's library sources (read by
 /// `wc_library::library_rules`): they run before the project's own, less the ones the project
 /// turns off.
@@ -68,7 +80,7 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
             if p.cloud_revision(&c.revision).is_none() {
                 out.push(at(
                     page,
-                    &format!("cloud {n}"),
+                    &cloud_item(n),
                     Severity::Warning,
                     format!(
                         "a cloud carries revision {}, which the project does not list",
