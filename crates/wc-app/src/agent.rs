@@ -2828,18 +2828,30 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         ));
     }
     let project = Guarded::new(dir);
-    // Run from inside the project folder, even a bare file name could land on a held page.
-    if project.holds(cwd) {
+    // Run from inside the project folder, even a bare file name could land on a held page: only
+    // a command with nothing after its own words (`check`, `page list`) runs there.
+    let words = match arg(0) {
+        Some("vcs") => 2,
+        _ if matches!(arg(1), Some("list" | "show")) => 2,
+        _ => 1,
+    };
+    let more = args.iter().skip(words).any(|a| !a.starts_with('-'));
+    if more && project.holds(cwd) {
         return Some(format!(
             "`wiringcraft {}` is not run while {who} has a page open in the shared session: this program runs \
              from inside the project folder, so an output file could land on a page. Start it from another folder.",
             args.join(" ")
         ));
     }
-    if let Some(a) = args.iter().find(|a| project.reached_by(cwd, split_flag(a).1)) {
+    for a in args {
+        let why = match project.reached_by(cwd, split_flag(a).1) {
+            Ok(false) => continue,
+            Ok(true) => "is in the project folder or links to a file in it".to_owned(),
+            Err(e) => format!("could not be looked through ({e})"),
+        };
         return Some(format!(
-            "`{a}` is in the project folder or links to a file in it, and {who} has a page open in the \
-             shared session: write the output to a folder of its own outside the project folder."
+            "`{a}` {why}, and {who} has a page open in the shared session: write the output to a folder of \
+             its own outside the project folder."
         ));
     }
     None
@@ -2916,8 +2928,9 @@ impl Guarded {
     /// Whether writing to `value` could land on a project file: it is a path into the project
     /// or a link to a file in it, or it is a folder with such a link in it (an export writes
     /// its own file names there). `value` counts as a path when it is absolute, clearly a
-    /// path (it has a separator or starts with a dot), or names something in `cwd`.
-    fn reached_by(&self, cwd: &Path, value: &str) -> bool {
+    /// path (it has a separator or starts with a dot), or names something in `cwd`. A folder
+    /// that cannot be listed is an error: what is in it is not known.
+    fn reached_by(&self, cwd: &Path, value: &str) -> std::io::Result<bool> {
         let p = Path::new(value);
         let path = if p.is_absolute() {
             p.to_path_buf()
@@ -2928,10 +2941,10 @@ impl Guarded {
         {
             cwd.join(p)
         } else {
-            return false;
+            return Ok(false);
         };
         if self.holds(&path) {
-            return true;
+            return Ok(true);
         }
         let mut todo = vec![real(&path)];
         let mut seen = 0;
@@ -2939,17 +2952,23 @@ impl Guarded {
             if !d.is_dir() {
                 continue;
             }
-            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let entries = match std::fs::read_dir(&d) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for e in entries {
+                let e = e?;
                 seen += 1;
                 if seen > OUTPUT_FOLDER_FILES || self.holds(&e.path()) {
-                    return true;
+                    return Ok(true);
                 }
-                if e.file_type().is_ok_and(|k| k.is_dir()) {
+                if e.file_type()?.is_dir() {
                     todo.push(e.path());
                 }
             }
         }
-        false
+        Ok(false)
     }
 }
 
@@ -5588,9 +5607,23 @@ mod tests {
         }
         // Run from inside the project folder, a bare file name is in it too.
         let held = a.open.as_ref().unwrap().held_by_others.clone();
-        let args: Vec<String> = ["plc-vars", "p0002.page.json"].map(String::from).to_vec();
+        let args: Vec<String> = ["plc-vars", "new.st"].map(String::from).to_vec();
         let e = writes_while_held(&args, &dir, &held, &dir.join("pages")).unwrap();
         assert!(e.contains("inside the project folder"), "{e}");
+        // Commands with nothing after their own words still run there.
+        for words in [
+            vec!["check"],
+            vec!["nets"],
+            vec!["page", "list"],
+            vec!["vcs", "log"],
+            vec!["find", "-K1"],
+        ] {
+            let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            assert!(
+                writes_while_held(&args, &dir, &held, &dir.join("pages")).is_none(),
+                "{args:?}"
+            );
+        }
         assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
         // An export writes its own file names into the folder it is given: a file there that
         // links to a held page, by name or as the same file, is a way onto the page.
@@ -5612,6 +5645,18 @@ mod tests {
             // Named bare, from the folder it is in.
             let args: Vec<String> = ["drawing", "deep"].map(String::from).to_vec();
             assert!(writes_while_held(&args, &dir, &held, hard.path()).is_some());
+            // A folder that cannot be listed could hide such a link.
+            let shut = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(shut.path(), std::os::unix::fs::PermissionsExt::from_mode(0o300)).unwrap();
+            let args = vec!["drawing".to_owned(), shut.path().display().to_string()];
+            let listed = std::fs::read_dir(shut.path()).is_ok();
+            let refused = writes_while_held(&args, &dir, &held, out.path());
+            std::fs::set_permissions(shut.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+            // Run as root the folder can still be listed, and then it is fine.
+            if !listed {
+                let e = refused.unwrap();
+                assert!(e.contains("could not be looked through"), "{e}");
+            }
             // A folder of its own is fine.
             let args = vec!["drawing".to_owned(), out.path().display().to_string()];
             assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
