@@ -339,8 +339,14 @@ pub struct Inputs<'a> {
 /// The report of `kind`, in the project's own layout for it if it has one
 /// ([`wc_core::report_layout`]), else in the built-in layout.
 pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
+    build_with(kind, i, layout_for(i.project, kind))
+}
+
+/// The report of `kind` in `layout`, or in the built-in layout when there is none: a layout
+/// being designed shows as it will print before it is kept in the project.
+pub fn build_with(kind: Kind, i: &Inputs<'_>, layout: Option<&ReportLayout>) -> Table {
     let mut table = build_builtin(kind, i);
-    match layout_for(i.project, kind) {
+    match layout {
         Some(layout) => {
             // The cable list names a cable only on its first core's row. A sort or a grouping
             // can move the other rows away from it, so each row then names its cable itself.

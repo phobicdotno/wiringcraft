@@ -5074,6 +5074,173 @@ mod tests {
     }
 
     #[test]
+    fn a_report_layout_made_in_the_dialog_is_kept_previewed_saved_and_undone() {
+        use wc_report::Kind;
+        let (_tmp, mut a) = app(vec![]);
+        let reports = |a: &App| a.open.as_ref().unwrap().project.meta.reports.clone();
+        let inputs_table = |a: &App| {
+            let o = a.open.as_ref().unwrap();
+            wc_report::build(
+                Kind::Parts,
+                &wc_report::Inputs {
+                    project: &o.project,
+                    symbols: &o.symbols,
+                    parts: &o.parts,
+                },
+            )
+        };
+        let builtin = inputs_table(&a).columns;
+        assert!(builtin.len() >= 2, "{builtin:?}");
+        let mark = a.open.as_ref().unwrap().undo_mark();
+
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { mut form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        assert_eq!(form.builtin, builtin);
+        // OK on the untouched form keeps no layout and changes nothing.
+        a.apply_report_layout(&form, &dir).unwrap();
+        assert!(reports(&a).is_empty());
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+        assert!(
+            matches!(a.dialog, Some(Dialog::Reports(Kind::Parts))),
+            "back to the report"
+        );
+
+        form.title = "Bill of materials".into();
+        form.move_column(1, -1);
+        form.columns[0].heading = "First".into();
+        let last = form.columns.len() - 1;
+        form.columns[last].shown = false;
+        form.sort.push(crate::report_layout_form::SortRow {
+            column: builtin[0].clone(),
+            descending: true,
+        });
+        a.apply_report_layout(&form, &dir).unwrap();
+        let kept = reports(&a);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].kind, "parts");
+        assert_eq!(kept[0].sort, [format!("-{}", builtin[0])]);
+        // The report shows in it.
+        let t = inputs_table(&a);
+        assert_eq!(t.title, "Bill of materials");
+        assert_eq!(t.columns[0], "First");
+        assert_eq!(t.columns.len(), builtin.len() - 1);
+        a.open.as_mut().unwrap().save().unwrap();
+        let toml = std::fs::read_to_string(a.open.as_ref().unwrap().dir.join("project.toml")).unwrap();
+        assert!(
+            toml.contains("[[report]]") && toml.contains("Bill of materials"),
+            "{toml}"
+        );
+
+        // One undo step takes it back.
+        assert!(a.open.as_mut().unwrap().undo());
+        assert!(reports(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().redo());
+        assert_eq!(reports(&a), kept);
+
+        // Edited while the project's layout changed: nothing is written and the draft stays open.
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { mut form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        a.open.as_mut().unwrap().project.meta.reports[0].title = Some("Theirs".into());
+        form.title = "Mine".into();
+        let err = a.apply_report_layout(&form, &dir).err().unwrap();
+        assert!(err.contains("changed while you edited"), "{err}");
+        assert_eq!(reports(&a)[0].title.as_deref(), Some("Theirs"));
+        let Some(Dialog::ReportLayout { form: again, .. }) = a.dialog.take() else {
+            unreachable!("the draft stays open");
+        };
+        assert_eq!(again.title, "Mine");
+        a.apply_report_layout(&again, &dir).unwrap();
+        assert_eq!(reports(&a)[0].title.as_deref(), Some("Mine"));
+
+        // Saved "Mine", draft "B", someone saves "Theirs", the draft goes back to "Mine": OK
+        // keeps "Mine", the layout shown, in place of "Theirs".
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { mut form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        form.title = "B".into();
+        a.open.as_mut().unwrap().project.meta.reports[0].title = Some("Theirs".into());
+        assert!(a.apply_report_layout(&form, &dir).is_err());
+        let Some(Dialog::ReportLayout { form: mut again, .. }) = a.dialog.take() else {
+            unreachable!("the draft stays open");
+        };
+        again.title = "Mine".into();
+        a.apply_report_layout(&again, &dir).unwrap();
+        assert_eq!(reports(&a)[0].title.as_deref(), Some("Mine"));
+
+        // Back to the built-in layout drops it; another project gets nothing.
+        let cleared = crate::report_layout_form::Form::new(Kind::Parts, builtin.clone(), reports(&a).first()).cleared();
+        let err = a.apply_report_layout(&cleared, Path::new("elsewhere")).err().unwrap();
+        assert!(err.contains("another project"), "{err}");
+        // A second layout for the kind (unused) and one of another kind: back to the built-in
+        // layout drops both of the kind, keeps the other, and one undo brings them back.
+        let mut second = reports(&a)[0].clone();
+        second.title = Some("Second".into());
+        let other = wc_core::report_layout::ReportLayout {
+            kind: "wires".into(),
+            title: Some("Wires".into()),
+            ..Default::default()
+        };
+        a.open
+            .as_mut()
+            .unwrap()
+            .project
+            .meta
+            .reports
+            .extend([second, other.clone()]);
+        let before = reports(&a);
+        // The preview shows a draft without keeping it.
+        let o = a.open.as_ref().unwrap();
+        let mut draft = before[0].clone();
+        draft.title = Some("Draft".into());
+        let preview = wc_report::build_with(
+            Kind::Parts,
+            &wc_report::Inputs {
+                project: &o.project,
+                symbols: &o.symbols,
+                parts: &o.parts,
+            },
+            Some(&draft),
+        );
+        assert_eq!(preview.title, "Draft");
+        assert_eq!(reports(&a), before);
+        a.apply_report_layout(&cleared, &dir).unwrap();
+        assert_eq!(reports(&a), [other]);
+        assert_eq!(inputs_table(&a).columns, builtin);
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), before);
+
+        // A saved layout listing every built-in column as built in: untouched OK keeps it,
+        // "Built-in layout" then OK drops it, and undo brings it back.
+        let explicit = wc_core::report_layout::ReportLayout {
+            kind: "parts".into(),
+            columns: builtin
+                .iter()
+                .map(|c| wc_core::report_layout::ReportColumn {
+                    from: c.clone(),
+                    heading: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        a.open.as_mut().unwrap().project.meta.reports = vec![explicit.clone()];
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        a.apply_report_layout(&form, &dir).unwrap();
+        assert_eq!(reports(&a), std::slice::from_ref(&explicit));
+        a.apply_report_layout(&form.cleared(), &dir).unwrap();
+        assert!(reports(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), [explicit]);
+    }
+
+    #[test]
     fn graphic_ids_from_the_screen_context_and_from_add_graphic_are_guarded() {
         let line = |x: f64| Shape::Line {
             a: Point::new(x, 0.0),
