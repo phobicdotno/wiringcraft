@@ -273,7 +273,13 @@ impl Xf {
     }
     /// How lengths grow (the mean of the two axes' scales): radii and text heights.
     fn len_scale(&self) -> f64 {
-        self.det().abs().sqrt()
+        // Normalized first, so a huge or tiny scale does not overflow or underflow when squared.
+        let big = self.m.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        if big == 0.0 || !big.is_finite() {
+            return self.det().abs().sqrt();
+        }
+        let [a, b, c, d] = self.m.map(|v| v / big);
+        big * (a * d - b * c).abs().sqrt()
     }
     /// Whether every direction grows alike (turns, mirrors and one scale), so a circle stays a
     /// circle. A placement scaled differently along x and y makes it an ellipse.
@@ -2110,6 +2116,18 @@ mod tests {
         )?;
         assert_eq!(shapes.len(), 1, "{shapes:?}");
         assert!((width(&shapes[0].1) - 2.0).abs() < 1e-9, "{shapes:?}");
+        // A uniform scale of 1e200 on a radius of 1e-200: a circle and an arc of radius 1.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n0\n20\n0\n40\n1e-200\n\
+             0\nARC\n10\n0\n20\n0\n40\n1e-200\n50\n0\n51\n90\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n1e200\n42\n1e200\n",
+        )?;
+        assert_eq!(shapes.len(), 2, "{shapes:?}");
+        assert!(
+            shapes.iter().all(|(_, s)| matches!(s,
+                Shape::Circle { radius, .. } | Shape::Arc { radius, .. } if (*radius - 1.0).abs() < 1e-9)),
+            "{shapes:?}"
+        );
         // An arc whose angles give no points is left out and said, next to a line that is drawn.
         let (shapes, skipped) = draw(
             "0\nBLOCK\n2\nB\n0\nARC\n10\n0\n20\n0\n40\n1\n50\n-1e308\n51\n1e308\n\
