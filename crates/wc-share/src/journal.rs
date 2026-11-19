@@ -277,24 +277,85 @@ pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
 }
 
 /// Put `picture` in place of the file of its name in the project folder `dir`, which must hold
-/// `was` still: anything else there is [`crate::Error::PictureNameTaken`] and stays. The new
-/// file is written whole beside it first and then moved over it in one step, so the name never
-/// holds a cut-off picture. Like [`write_picture`], never through a link out of the project.
+/// `was` still: anything else there is [`crate::Error::PictureNameTaken`] and stays. Nothing
+/// written there meanwhile is lost: the file is first moved aside in one step (a later write
+/// makes a new file under the name), compared there, and only then is the new file put under
+/// the name, without replacing anything. The name never holds a cut-off picture. Like
+/// [`write_picture`], never through a link out of the project.
 pub fn replace_picture(dir: &std::path::Path, picture: &Picture, was: &[u8]) -> Result<()> {
+    use std::io::ErrorKind;
     let (path, folder) = picture_place(dir, picture)?;
-    if std::fs::read(&path)? != was {
-        return Err(crate::Error::PictureNameTaken(format!(
-            "{} changed meanwhile",
-            picture.file
-        )));
-    }
+    let changed = || crate::Error::PictureNameTaken(format!("{} changed meanwhile", picture.file));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("picture");
-    let part = stage(&folder, name, &picture.data)?;
-    let moved = std::fs::rename(&part, &path);
-    if moved.is_err() {
-        let _ = std::fs::remove_file(&part);
+    let aside = free_part_name(&folder, "aside")?;
+    std::fs::rename(&path, &aside)?;
+    let held = std::fs::read(&aside);
+    if !held.as_ref().is_ok_and(|have| have == was) {
+        // Not the file it was: it goes back under its name, unless one was written there since;
+        // then both are kept, the moved one beside it.
+        return match publish(&aside, &path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&aside);
+                Err(held.err().map_or_else(changed, Into::into))
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(crate::Error::PictureNameTaken(format!(
+                "{} changed meanwhile; the earlier file is kept as {}",
+                picture.file,
+                aside.display()
+            ))),
+            Err(e) => Err(e.into()),
+        };
     }
-    Ok(moved?)
+    let part = match stage(&folder, name, &picture.data) {
+        Ok(part) => part,
+        Err(e) => {
+            // The file it was goes back.
+            if publish(&aside, &path).is_ok() {
+                let _ = std::fs::remove_file(&aside);
+            }
+            return Err(e.into());
+        }
+    };
+    let published = publish(&part, &path);
+    let _ = std::fs::remove_file(&part);
+    match published {
+        // What was there is the `was` the caller has a copy of.
+        Ok(()) => {
+            let _ = std::fs::remove_file(&aside);
+            Ok(())
+        }
+        // Written there since it was moved aside: that one stays.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&aside);
+            Err(changed())
+        }
+        Err(e) => {
+            if publish(&aside, &path).is_ok() {
+                let _ = std::fs::remove_file(&aside);
+            }
+            Err(e.into())
+        }
+    }
+}
+
+/// A name in `folder` no file has yet, for a file of this crate's own (`kind`).
+fn free_part_name(folder: &std::path::Path, kind: &str) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    for _ in 0..16 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = folder.join(format!(".wc-{}-{nanos}-{n}.{kind}", std::process::id()));
+        if std::fs::symlink_metadata(&path).is_err() {
+            return Ok(path);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free name for a {kind} file"),
+    ))
 }
 
 /// Where `picture` goes in the project folder `dir`, and its folder (made when missing), once

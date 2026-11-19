@@ -1510,8 +1510,8 @@ pub fn new_pictures(
 /// Copy the picture `file` of `open` under a new name in the same folder, one the session is not
 /// likely to have (the name with a mark of the moment), and make the project name it instead:
 /// only the references in `only` when given (the ones this copy picked it in), else every one.
-/// The old file stays. Returns the new name.
-fn rename_picture(open: &mut Open, file: &str, only: Option<&BTreeSet<PicRef>>) -> Result<String, String> {
+/// The old file stays. Returns the new name, and the content copied there.
+fn rename_picture(open: &mut Open, file: &str, only: Option<&BTreeSet<PicRef>>) -> Result<(String, Vec<u8>), String> {
     // Read as an export reads it: never through a link out of the project folder.
     let data = match wc_pdf::read_picture(&open.dir, file) {
         Ok(Some(data)) => data,
@@ -1574,7 +1574,7 @@ fn rename_picture(open: &mut Open, file: &str, only: Option<&BTreeSet<PicRef>>) 
         }
     }
     open.dirty = true;
-    Ok(new)
+    Ok((new, picture.data))
 }
 
 /// The picture state of [`Share`] that [`rename_pictures`] keeps.
@@ -1653,7 +1653,7 @@ fn rename_pictures(
         };
         let everywhere = only.is_none();
         match rename_picture(open, &file, only) {
-            Ok(new) => {
+            Ok((new, copied)) => {
                 pictures_out.remove(&file);
                 renames_due.remove(&file);
                 picks.remove(&file);
@@ -1661,21 +1661,30 @@ fn rename_pictures(
                 // The person's file has its own name now; what is left under the old one is no
                 // longer theirs: the session's file goes there, so a later use of the session's
                 // picture shows it here, and it is never taken for a replacement again.
-                if everywhere
-                    && let Some(theirs) = session.get(&file)
-                    && let Ok(Some(left)) = wc_pdf::read_picture(&open.dir, &file)
-                {
+                // Only while the file there is still what was copied: one changed since is the
+                // person's, and stays.
+                if everywhere && let Some(theirs) = session.get(&file) {
                     let picture = Picture {
                         file: file.clone(),
                         data: theirs.clone(),
                     };
-                    if wc_share::replace_picture(&open.dir, &picture, &left).is_ok() {
-                        replaced.remove(&file);
-                        open.underlays.remove(&file);
-                        open.picture_problems.remove(&file);
-                        if let Some(version) = picture_version(&open.dir, &file) {
-                            pictures_taken.insert(file.clone(), version);
+                    match wc_share::replace_picture(&open.dir, &picture, &copied) {
+                        Ok(()) => {
+                            replaced.remove(&file);
+                            open.underlays.remove(&file);
+                            open.picture_problems.remove(&file);
+                            // The version first: a write after it makes the next look read the
+                            // file again.
+                            let version = picture_version(&open.dir, &file);
+                            if matches!(wc_pdf::read_picture(&open.dir, &file), Ok(Some(data)) if data == *theirs)
+                                && let Some(version) = version
+                            {
+                                pictures_taken.insert(file.clone(), version);
+                            }
                         }
+                        Err(e) => notes.push(format!(
+                            "The session's {file} could not be put back here in place of your earlier file: {e}."
+                        )),
                     }
                 }
                 notes.push(format!(

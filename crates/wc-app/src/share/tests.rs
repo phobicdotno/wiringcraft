@@ -3355,7 +3355,7 @@ fn a_picture_renamed_for_some_references_leaves_the_others() -> TestResult {
         min: wc_core::Point::new(0.0, 0.0),
         max: wc_core::Point::new(10.0, 10.0),
     });
-    let new = rename_picture(&mut open, &file, Some(&[PicRef::Logo].into()))?;
+    let (new, _) = rename_picture(&mut open, &file, Some(&[PicRef::Logo].into()))?;
     assert_eq!(
         open.project.meta.logo.as_ref().map(|l| l.file.as_str()),
         Some(new.as_str())
@@ -5175,7 +5175,7 @@ fn a_picture_renamed_for_the_session_keeps_its_name_within_255_bytes() -> TestRe
         file: file.clone(),
         cover: None,
     });
-    let new = rename_picture(&mut open, &file, None)?;
+    let (new, _) = rename_picture(&mut open, &file, None)?;
     let name = new.rsplit('/').next().ok_or("no name")?;
     assert!(name.len() <= 255 && name.ends_with(".png"), "{name}");
     assert_eq!(std::fs::read(open.dir.join(&new))?, PNG);

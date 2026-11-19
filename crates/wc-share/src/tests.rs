@@ -3067,6 +3067,10 @@ fn a_picture_is_replaced_only_while_it_holds_what_it_held() -> TestResult {
         Err(Error::PictureNameTaken(_))
     ));
     assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"mine");
+    let names: Vec<_> = std::fs::read_dir(dir.join("pictures"))?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(names, ["logo.png"], "nothing is left aside");
     replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"mine")?;
     assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
     let names: Vec<_> = std::fs::read_dir(dir.join("pictures"))?
