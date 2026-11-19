@@ -336,11 +336,14 @@ mod at {
 
     impl Dir {
         /// Open the folder at `path` (links in it followed: what counts is the folder reached).
+        /// On Linux it is opened as a path only (`O_PATH`), so a folder that may be written
+        /// and searched but not listed still takes output files.
         pub(super) fn open(path: &Path) -> io::Result<Dir> {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-                .open(path)?;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
+            let file = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path)?;
             let m = file.metadata()?;
             if !m.is_dir() {
                 return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
@@ -846,6 +849,27 @@ mod tests {
         assert_eq!(std::fs::read_to_string(pages.join("p1.page.json"))?, "page one");
         assert_eq!(std::fs::read_to_string(moved.join("p1.page.json"))?, "exported");
         assert!(no_temp_left(&moved)?);
+        Ok(())
+    }
+
+    /// A folder that may be written and searched but not listed (mode 0300) still takes the
+    /// output file. Root reads any folder, so the check only means something for others.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_folder_that_cannot_be_listed_still_takes_the_output() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let sub = out.path().join("drop");
+        std::fs::create_dir(&sub)?;
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o300))?;
+        let file = sub.join("list.csv");
+        let done = g.write(&file, b"list");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700))?;
+        done?;
+        assert_eq!(std::fs::read_to_string(&file)?, "list");
+        assert!(no_temp_left(&sub)?);
         Ok(())
     }
 
