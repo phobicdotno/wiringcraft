@@ -275,6 +275,14 @@ impl Xf {
     fn len_scale(&self) -> f64 {
         self.det().abs().sqrt()
     }
+    /// Whether every direction grows alike (turns, mirrors and one scale), so a circle stays a
+    /// circle. A placement scaled differently along x and y makes it an ellipse.
+    fn keeps_circles(&self) -> bool {
+        let [a, b, c, d] = self.m;
+        let (x, y) = (a * a + c * c, b * b + d * d);
+        let tol = 1e-9 * x.max(y);
+        (x - y).abs() <= tol && (a * b + c * d).abs() <= tol
+    }
     /// Where the direction at angle 0 points once placed, in degrees, written as close to the
     /// sum of the turns as possible so plain turns keep their angles as written.
     fn x_angle(&self) -> f64 {
@@ -329,11 +337,20 @@ fn shapes(
                 a: p(e.f(10), e.f(20)),
                 b: p(e.f(11), e.f(21)),
             }),
+            // Scaled differently along x and y, a circle is an ellipse: drawn by its points.
+            "CIRCLE" if !xf.keeps_circles() => {
+                let (pts, closed) = ellipse_points((e.f(10), e.f(20)), (e.f(40), 0.0), 1.0, 0.0, std::f64::consts::TAU);
+                polyline(pts.into_iter().map(|(x, y)| q(x, y)).collect(), closed, false)
+            }
             "CIRCLE" => Some(Shape::Circle {
                 center: q(e.f(10), e.f(20)),
                 radius: e.f(40) * r_scale,
                 filled: false,
             }),
+            "ARC" if !xf.keeps_circles() => {
+                let pts = arc_points((e.f(10), e.f(20)), e.f(40), e.f(50), e.f(51), true);
+                polyline(pts.into_iter().map(|(x, y)| q(x, y)).collect(), false, false)
+            }
             "ARC" => {
                 // Mirrored in x, the arc from s to e runs from 180 - e to 180 - s.
                 let (s, en) = if flip {
@@ -1919,6 +1936,62 @@ mod tests {
         assert!(
             shapes.iter().any(|(_, s)| matches!(s, Shape::Arc { start, end, .. }
                 if (*start + 90.0).abs() < 1e-9 && end.abs() < 1e-9)),
+            "{shapes:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_circle_scaled_differently_along_x_and_y_is_an_ellipse() -> Result<()> {
+        // A radius-10 circle and a quarter arc, inserted at scale (4, 1) and at scale 2 (#307).
+        let blocks = "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n0\n20\n0\n40\n10\n\
+                      0\nARC\n10\n0\n20\n0\n40\n10\n50\n0\n51\n90\n0\nENDBLK\n";
+        let d = parse(&dxf(
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n0\nINSERT\n2\nB\n10\n100\n20\n0\n41\n2\n42\n2\n",
+            blocks,
+        ))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        let polylines: Vec<(&Vec<Point>, bool)> = shapes
+            .iter()
+            .filter_map(|(_, s)| match s {
+                Shape::Polyline { points, closed, .. } => Some((points, *closed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polylines.len(), 2, "{shapes:?}");
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // The circle: 80 x 20 around the insertion point, closed.
+        let (circle, closed) = polylines[0];
+        assert!(closed);
+        let (min_x, max_x) = circle
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.x), b.max(p.x)));
+        let (min_y, max_y) = circle
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.y), b.max(p.y)));
+        assert!(
+            near(min_x, -40.0) && near(max_x, 40.0) && near(min_y, -10.0) && near(max_y, 10.0),
+            "{circle:?}"
+        );
+        // The arc runs from (40, 0) to (0, 10), which is (0, -10) on the y-down page.
+        let (arc, closed) = polylines[1];
+        assert!(!closed);
+        let (first, last) = (arc[0], arc[arc.len() - 1]);
+        assert!(near(first.x, 40.0) && near(first.y, 0.0), "{first:?}");
+        assert!(near(last.x, 0.0) && near(last.y, -10.0), "{last:?}");
+        // A uniform scale keeps them a circle and an arc.
+        assert!(
+            shapes
+                .iter()
+                .any(|(_, s)| matches!(s, Shape::Circle { radius, .. } if near(*radius, 20.0))),
+            "{shapes:?}"
+        );
+        assert!(
+            shapes
+                .iter()
+                .any(|(_, s)| matches!(s, Shape::Arc { radius, .. } if near(*radius, 20.0))),
             "{shapes:?}"
         );
         Ok(())
