@@ -544,6 +544,22 @@ mod win {
         io::Error::from_raw_os_error(code as i32)
     }
 
+    /// `path` with a closing separator when it ends in a name, so Win32 keeps trailing dots
+    /// and spaces of that last name: they are dropped only at the very end of a path, and the
+    /// folder is the middle of the output path, where they stay (`exports \list.csv` is in
+    /// `exports `, not `exports`; #494 review). A drive alone (`C:`) or a root is left as it is.
+    pub(super) fn as_folder(path: &Path) -> std::borrow::Cow<'_, Path> {
+        let named = matches!(path.components().next_back(), Some(std::path::Component::Normal(_)));
+        let w: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let closed = matches!(w.last(), Some(&c) if c == u16::from(b'\\') || c == u16::from(b'/'));
+        if !named || closed {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        let mut s = path.as_os_str().to_owned();
+        s.push("\\");
+        std::borrow::Cow::Owned(PathBuf::from(s))
+    }
+
     /// The name the Win32 path calls give the file `name` of `path`: they drop trailing dots
     /// and spaces from it, and the native calls this writer makes do not, so `out.csv.` would
     /// otherwise make a new `out.csv.` and leave `out.csv` as it was (#494 review). A verbatim
@@ -593,7 +609,7 @@ mod win {
                 .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(path)?;
+                .open(as_folder(path))?;
             if !file.metadata()?.is_dir() {
                 return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
             }
@@ -1360,6 +1376,44 @@ mod tests {
         assert_eq!(names, vec![std::ffi::OsString::from("out.csv")]);
         assert!(g.write(&out.path().join(" ."), b"x").is_err());
         Ok(())
+    }
+
+    /// An output folder whose name ends in a space, next to one of the same name without it:
+    /// the file goes into the folder the path names, as a write to the whole path would, not
+    /// into the one Win32 would find for the folder's path alone (#494 review).
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_name_ending_in_a_space_is_kept() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        // Made through the verbatim form, which keeps the space.
+        let literal = out.path().canonicalize()?;
+        std::fs::create_dir(literal.join("exports"))?;
+        std::fs::create_dir(literal.join("exports "))?;
+        g.write(&out.path().join("exports ").join("list.csv"), b"spaced")?;
+        assert_eq!(
+            std::fs::read_to_string(literal.join("exports ").join("list.csv"))?,
+            "spaced"
+        );
+        assert!(!literal.join("exports").join("list.csv").exists());
+        assert!(no_temp_left(&literal.join("exports "))?);
+        std::fs::remove_file(literal.join("exports ").join("list.csv"))?;
+        std::fs::remove_dir(literal.join("exports "))?;
+        Ok(())
+    }
+
+    /// A folder path gets a closing separator only when it ends in a name.
+    #[cfg(windows)]
+    #[test]
+    fn only_a_named_folder_gets_a_closing_separator() {
+        let s = |p: &str| win::as_folder(Path::new(p)).as_os_str().to_string_lossy().into_owned();
+        assert_eq!(s(r"C:\x\exports "), r"C:\x\exports \");
+        assert_eq!(s(r"C:\x\"), r"C:\x\");
+        assert_eq!(s("C:"), "C:");
+        assert_eq!(s(r"C:\"), r"C:\");
+        assert_eq!(s("."), ".");
+        assert_eq!(s(r"\\?\C:\x"), r"\\?\C:\x\");
     }
 
     /// A verbatim path keeps its file name as written; any other loses trailing dots and spaces.
