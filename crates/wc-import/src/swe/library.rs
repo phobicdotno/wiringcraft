@@ -250,19 +250,29 @@ impl Table {
     /// The column for `fields`, or an error naming what is missing and the columns there are,
     /// so a report from an unknown layout says what to map.
     fn need(&self, fields: &[&str]) -> std::result::Result<&str, String> {
-        const SHOWN: usize = 16;
         self.field(fields).ok_or_else(|| {
-            let mut columns = self.columns.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
-            if self.columns.len() > SHOWN {
-                columns.push_str(&format!(", ... ({} in all)", self.columns.len()));
-            }
-            format!(
-                "{} has no {}_{} column (its columns: {columns})",
-                self.name,
+            self.missing(&format!(
+                "{}_{}",
                 self.prefix,
                 fields.first().copied().unwrap_or_default()
-            )
+            ))
         })
+    }
+
+    /// That this table has no `column`, with the columns it has (the first 16), so a report
+    /// from an unknown layout says what to map.
+    fn missing(&self, column: &str) -> String {
+        const SHOWN: usize = 16;
+        let mut columns = self.columns.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+        if self.columns.len() > SHOWN {
+            columns.push_str(&format!(", ... ({} in all)", self.columns.len()));
+        }
+        format!("{} has no {column} column (its columns: {columns})", self.name)
+    }
+
+    /// That this table has no column linking it to `other`, as [`Table::missing`].
+    fn missing_link(&self, other: &Table) -> String {
+        self.missing(&format!("{}_{}_id", self.prefix, other.prefix))
     }
 }
 
@@ -407,11 +417,11 @@ fn catalog_terminals(
         let el_id = elements.need(&["id"])?.to_owned();
         let el_ref = elements
             .link_from(refs, Some(&el_id))
-            .ok_or_else(|| format!("tew_catelement has no {}_{}_id column", elements.prefix, refs.prefix))?
+            .ok_or_else(|| elements.missing_link(refs))?
             .to_owned();
         let t_el = terms
             .link(&elements)
-            .ok_or_else(|| format!("tew_catterminal has no {}_{}_id column", terms.prefix, elements.prefix))?
+            .ok_or_else(|| terms.missing_link(&elements))?
             .to_owned();
         let t_mark = terms.need(&["txt", "name", "label", "tag", "mark"])?.to_owned();
         Ok((el_id, el_ref, t_el, t_mark))
@@ -547,8 +557,8 @@ pub fn read_cable_types(
         None => warnings.push("no tew_cablereferencewire table; cable types come without cores".into()),
         Some(wires) => match wires.link(&cables) {
             None => warnings.push(format!(
-                "cable types come without cores: tew_cablereferencewire has no {}_{}_id column",
-                wires.prefix, cables.prefix
+                "cable types come without cores: {}",
+                wires.missing_link(&cables)
             )),
             Some(link) => {
                 let no = wires.field(&["no", "number", "orderno"]);
@@ -682,7 +692,7 @@ fn read_named_blocks(
         let name = blocks.need(&["name", "blockname"])?.to_owned();
         let link = points
             .link(&blocks)
-            .ok_or_else(|| format!("tew_blockpt has no {}_{}_id column", points.prefix, blocks.prefix))?
+            .ok_or_else(|| points.missing_link(&blocks))?
             .to_owned();
         let x = points.need(&["dx", "x", "posx"])?.to_owned();
         let y = points.need(&["dy", "y", "posy"])?.to_owned();
