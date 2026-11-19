@@ -840,6 +840,139 @@ fn through_fit_points(fit: &[(f64, f64)], degree: usize, tangents: Tangents) -> 
     }
 }
 
+/// Points along the closed B-spline of degree `degree` (3 when 0) through `fit`, the way a CAD
+/// program draws a closed spline given by fit points: periodic interpolation (The NURBS Book,
+/// 9.2.4) with chord-length parameters around the loop, the closing chord included, and
+/// periodic knots (at the parameters for an odd degree, halfway between them for an even one),
+/// so the curve passes the start point without a corner. A last fit point that repeats the
+/// first is dropped. The points end where they start. `None` when there are fewer than three
+/// distinct points or the system cannot be solved.
+fn through_fit_points_closed(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f64, f64)>> {
+    if !fit.iter().all(|pt| pt.0.is_finite() && pt.1.is_finite()) {
+        return None;
+    }
+    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1) <= 1e-12;
+    let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
+    for &pt in fit {
+        if q.last().is_none_or(|&l| !near(l, pt)) {
+            q.push(pt);
+        }
+    }
+    while q.len() > 1 && near(*q.last()?, *q.first()?) {
+        q.pop();
+    }
+    let n = q.len();
+    if !(3..=MAX_FIT_POINTS).contains(&n) {
+        return None;
+    }
+    let p = if degree == 0 { 3 } else { degree }.min(MAX_SPLINE_DEGREE).min(n - 1);
+    if p == 1 {
+        let mut out = q.clone();
+        out.push(*q.first()?);
+        return Some(out);
+    }
+    // Chord-length parameters around the loop, period 1.
+    let mut params = Vec::with_capacity(n);
+    let mut total = 0.0;
+    for k in 0..n {
+        params.push(total);
+        let (a, b) = (q[k], q[(k + 1) % n]);
+        total += (b.0 - a.0).hypot(b.1 - a.1);
+    }
+    if !(total.is_finite() && total > 0.0) {
+        return None;
+    }
+    for t in &mut params {
+        *t /= total;
+    }
+    // The parameter of point j for any j, one period further for each loop.
+    let param = |j: i64| {
+        let k = j.rem_euclid(n as i64);
+        params[k as usize] + (j - k).div_euclid(n as i64) as f64
+    };
+    // Periodic knot j: at a parameter for an odd degree, halfway to the next for an even one.
+    let tau = |j: i64| {
+        if p % 2 == 1 {
+            param(j)
+        } else {
+            (param(j) + param(j + 1)) / 2.0
+        }
+    };
+    // n + p control points (the last p repeat the first p) over n + 2p + 1 knots; the curve's
+    // range [knot p, knot n + p] is one period, from the first point's parameter (odd degree)
+    // or from halfway to the second (even degree).
+    let knots: Vec<f64> = (0..n + 2 * p + 1).map(|m| tau(m as i64 - p as i64)).collect();
+    let (u0, u1) = (knots[p], knots[n + p]);
+    // One row per fit point: the basis functions at its parameter, folded onto the n
+    // control points.
+    let mut a = vec![0.0; n * n];
+    for (k, &u) in params.iter().enumerate() {
+        // Within the curve's range, which may start a little after 0 for an even degree.
+        let u = if u < u0 { u + 1.0 } else { u };
+        let u = u.min(u1 - (u1 - u0) * 1e-12);
+        let span = p + knots.get(p + 1..n + p)?.partition_point(|&t| t <= u);
+        for (r, v) in basis(&knots, span, u, p)?.into_iter().enumerate() {
+            *a.get_mut(k * n + (span - p + r) % n)? += v;
+        }
+    }
+    let ctrl = solve_dense(a, &q)?;
+    let ext: Vec<(f64, f64)> = (0..n + p).map(|i| ctrl[i % n]).collect();
+    let mut out = bspline_points(&ext, &knots, &[], p)?;
+    // The curve ends where it starts; snap the rounding away.
+    let first = *out.first()?;
+    if let Some(last) = out.last_mut()
+        && (last.0 - first.0).hypot(last.1 - first.1) < 1e-6
+    {
+        *last = first;
+    }
+    Some(out)
+}
+
+/// Solve the square system `a` (row by row, `n` x `n`) for two right-hand sides at once, by
+/// Gaussian elimination with partial pivoting. `None` when it is singular or the result is not
+/// numbers.
+fn solve_dense(mut a: Vec<f64>, rhs: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
+    let n = rhs.len();
+    if a.len() != n * n {
+        return None;
+    }
+    let mut b: Vec<(f64, f64)> = rhs.to_vec();
+    for j in 0..n {
+        let pivot = (j..n).max_by(|&x, &y| a[x * n + j].abs().total_cmp(&a[y * n + j].abs()))?;
+        if a[pivot * n + j].abs() < 1e-14 {
+            return None;
+        }
+        if pivot != j {
+            for c in 0..n {
+                a.swap(pivot * n + c, j * n + c);
+            }
+            b.swap(pivot, j);
+        }
+        let d = a[j * n + j];
+        for i in j + 1..n {
+            let f = a[i * n + j] / d;
+            if f == 0.0 {
+                continue;
+            }
+            for c in j..n {
+                a[i * n + c] -= f * a[j * n + c];
+            }
+            b[i].0 -= f * b[j].0;
+            b[i].1 -= f * b[j].1;
+        }
+    }
+    for j in (0..n).rev() {
+        let (mut x, mut y) = b[j];
+        for c in j + 1..n {
+            x -= a[j * n + c] * b[c].0;
+            y -= a[j * n + c] * b[c].1;
+        }
+        let d = a[j * n + j];
+        b[j] = (x / d, y / d);
+    }
+    b.iter().all(|(x, y)| x.is_finite() && y.is_finite()).then_some(b)
+}
+
 /// A spline's start and end tangents as given (either may be missing).
 type Tangents = (Option<(f64, f64)>, Option<(f64, f64)>);
 
@@ -939,7 +1072,14 @@ fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, bool) {
     };
     let tangent = |x: i32, y: i32| number(x).zip(number(y));
     let tangents = (tangent(12, 22), tangent(13, 23));
-    if let Some(pts) = through_fit_points(&fit, degree, tangents) {
+    // A closed spline goes round smoothly through its first point; its end tangents, if any,
+    // do not apply.
+    let through = if closed {
+        through_fit_points_closed(&fit, degree)
+    } else {
+        through_fit_points(&fit, degree, tangents)
+    };
+    if let Some(pts) = through {
         return (pts, closed, true);
     }
     let curve = knots.is_empty() || ctrl.is_empty();
@@ -1798,6 +1938,70 @@ mod tests {
         // Straight points stay on their line.
         let line = through_fit_points(&[(0.0, 0.0), (1.0, 1.0), (3.0, 3.0), (4.0, 4.0)], 3, (None, None));
         assert!(line.is_some_and(|l| l.iter().all(|q| (q.0 - q.1).abs() < 1e-9)));
+    }
+
+    #[test]
+    fn a_closed_spline_by_fit_points_closes_without_a_corner() -> Result<()> {
+        // Four points on a circle of radius 10, closed (70 bit 1): a round loop.
+        let ents = "0\nSPLINE\n70\n1\n71\n3\n74\n4\n11\n10\n21\n0\n11\n0\n21\n10\n11\n-10\n21\n0\n11\n0\n21\n-10\n";
+        let (g, _) = drawn(ents, "")?;
+        let (s, closed, _) = poly(&g[0]);
+        assert!(closed);
+        assert!(s.len() > 20, "{s:?}");
+        let near = |a: &Point, b: Point| a.distance(b) < 1e-6;
+        // It passes through all four points and ends where it starts.
+        for (x, y) in [(10.0, 0.0), (0.0, -10.0), (-10.0, 0.0), (0.0, 10.0)] {
+            assert!(s.iter().any(|q| near(q, Point::new(x, y))), "through ({x}, {y})");
+        }
+        let (first, last) = (s[0], s[s.len() - 1]);
+        assert!(near(&first, last), "{first:?} {last:?}");
+        // The direction turns at the start no more than between any two samples elsewhere:
+        // a smooth loop, not a corner (sampling alone turns a few degrees per step).
+        let dir = |a: Point, b: Point| (b.y - a.y).atan2(b.x - a.x);
+        let turn = |a: f64, b: f64| {
+            ((b - a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI)
+                .abs()
+                .to_degrees()
+        };
+        let seam = turn(dir(s[s.len() - 2], last), dir(first, s[1]));
+        let most = s
+            .windows(3)
+            .map(|w| turn(dir(w[0], w[1]), dir(w[1], w[2])))
+            .fold(0.0, f64::max);
+        assert!(
+            seam < most * 1.1 + 0.1 && seam < 6.0,
+            "{seam} degrees at the start, {most} elsewhere"
+        );
+        // Symmetric points give a round curve: never far from the circle.
+        assert!(s.iter().all(|q| (q.x.hypot(q.y) - 10.0).abs() < 0.6), "{s:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn closed_interpolation_in_any_degree() {
+        let square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        for degree in [0, 2, 3, 4, 5] {
+            // The first point repeated at the end is the same loop.
+            let mut repeated = square.to_vec();
+            repeated.push(square[0]);
+            let a = through_fit_points_closed(&square, degree).unwrap_or_default();
+            let b = through_fit_points_closed(&repeated, degree).unwrap_or_default();
+            assert!(a.len() > 10, "degree {degree}");
+            assert_eq!(a, b, "degree {degree}");
+            assert_eq!(a.first(), a.last(), "degree {degree}");
+            for f in square {
+                let d = a.iter().map(|q| (q.0 - f.0).hypot(q.1 - f.1)).fold(f64::MAX, f64::min);
+                assert!(d < 0.05, "degree {degree}: {f:?} is {d} away");
+            }
+        }
+        // Degree 1 is the closed polygon.
+        assert_eq!(
+            through_fit_points_closed(&square, 1),
+            Some(vec![square[0], square[1], square[2], square[3], square[0]])
+        );
+        // Too few distinct points, or points that are not numbers, give none.
+        assert!(through_fit_points_closed(&[(0.0, 0.0), (1.0, 1.0), (0.0, 0.0)], 3).is_none());
+        assert!(through_fit_points_closed(&[(0.0, 0.0), (f64::NAN, 1.0), (2.0, 0.0)], 3).is_none());
     }
 
     #[test]
