@@ -1077,6 +1077,22 @@ impl App {
         out
     }
 
+    /// [`App::agent_context`] for a message on its way: a selected free drawing is named by
+    /// position there, so the drawings of the page shown count as read from then on, unless
+    /// they changed since the assistant last read them.
+    pub(crate) fn agent_context_to_send(&mut self) -> String {
+        let context = self.agent_context();
+        if self.ed.panel.is_none()
+            && self.ed.selection.iter().any(|s| matches!(s, Selection::Graphic(_)))
+            && let Some(key) = self.graphics_key(&Value::Null, "page")
+            && self.graphics_as_read(&key)
+            && let Some(now) = self.graphics_now(&key).map(Arc::<[Shape]>::from)
+        {
+            self.assistant.graphics_read.insert(key, now);
+        }
+        context
+    }
+
     /// Drop selected items that no longer exist.
     pub(crate) fn prune_selection(&mut self) {
         let Some(open) = &self.open else {
@@ -1232,7 +1248,9 @@ impl App {
             });
         let edits = edits_page(name, v) || name == "copy_items" || toolbar;
         for (key, as_read) in keys {
-            if name == "get_page" || (edits && as_read && self.assistant.graphics_read.contains_key(&key)) {
+            // The id `add_graphic` answers with counts as read too.
+            let known = name == "add_graphic" || self.assistant.graphics_read.contains_key(&key);
+            if name == "get_page" || (edits && as_read && known) {
                 match self.graphics_now(&key).map(Arc::<[Shape]>::from) {
                     Some(now) => self.assistant.graphics_read.insert(key, now),
                     None => self.assistant.graphics_read.remove(&key),
@@ -4315,6 +4333,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(graphics(&a), vec![rect, line(2.0), line(4.0)]);
+    }
+
+    #[test]
+    fn graphic_ids_from_the_screen_context_and_from_add_graphic_are_guarded() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let graphics = |a: &App| a.open.as_ref().unwrap().project.pages[1].graphics.clone();
+        a.open.as_mut().unwrap().project.pages[1].graphics = vec![line(1.0), line(2.0)];
+        // The user selects the second line on the page shown and sends a message naming it.
+        a.ed.page = 1;
+        a.ed.selection = vec![Selection::Graphic(1)];
+        assert!(a.agent_context().contains("Selected: g1"));
+        a.prefs.assistant.backend = wc_agent::Backend::ApiKey;
+        a.assistant.input = "Make this line longer".into();
+        a.assistant_send(&eframe::egui::Context::default());
+        assert!(a.assistant.busy(), "the message is on its way");
+        // A sync puts another line in front before the assistant writes to g1.
+        a.open.as_mut().unwrap().project.pages[1].graphics.insert(0, line(0.0));
+        let err = call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g1", "shape": line(9.0)}),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        assert_eq!(graphics(&a), vec![line(0.0), line(1.0), line(2.0)], "nothing written");
+
+        // add_graphic on a page the assistant never read: the id it answers is guarded too.
+        let first = a.open.as_ref().unwrap().project.pages[0].id.clone();
+        a.open.as_mut().unwrap().project.pages[0].graphics = vec![line(1.0)];
+        let out = call(&mut a, "add_graphic", json!({"page": first, "shape": line(2.0)})).unwrap();
+        assert!(out.contains("g1"), "{out}");
+        a.open.as_mut().unwrap().project.pages[0].graphics.insert(0, line(0.0));
+        let err = call(
+            &mut a,
+            "update_graphic",
+            json!({"page": first, "id": "g1", "shape": line(9.0)}),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        // Unchanged since, the answered id can be used.
+        call(&mut a, "get_page", json!({"page": first})).unwrap();
+        call(&mut a, "add_graphic", json!({"page": first, "shape": line(3.0)})).unwrap();
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": first, "id": "g3", "shape": line(9.0)}),
+        )
+        .unwrap();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[0].graphics,
+            vec![line(0.0), line(1.0), line(2.0), line(9.0)]
+        );
     }
 
     #[test]
