@@ -1739,8 +1739,15 @@ fn run(cli: Cli) -> Res<()> {
                 StripCmd::Unspare { strip, terminal } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
                     let current = rail(&p, &strip);
-                    if !p.remove_spare(&strip, terminal.trim(), &current) {
-                        return Err(format!("{strip} has no spare terminal {}", terminal.trim()));
+                    let terminal = terminal.trim();
+                    if !p.remove_spare(&strip, terminal, &current) {
+                        // Not a spare (any more), but its device entry may be left behind.
+                        let no_spare = format!("{strip} has no spare terminal {terminal}");
+                        match p.remove_unused_terminal_entry(&strip, terminal, &current) {
+                            Ok(true) => println!("{no_spare}; removed its unused device entry"),
+                            Ok(false) => return Err(no_spare),
+                            Err(why) => return Err(format!("{no_spare}; {why}")),
+                        }
                     }
                     save(dir, &p)?;
                 }
@@ -5248,6 +5255,14 @@ mod tests {
         assert!(cli(&dir, &["strip", "move", "--", "-X1", "3", "0"]).is_err());
         cli(&dir, &["strip", "list"]).unwrap();
         cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).unwrap();
+        assert!(cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).is_err());
+        // A device entry left behind (restored by hand) goes on a second unspare.
+        let s2 = DeviceTag::parse("-X1.S2").unwrap();
+        let mut p = load(&dir).unwrap();
+        p.devices.entry(s2.clone()).or_default().part = Some("wago.2002-1201".into());
+        save(&dir, &p).unwrap();
+        cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).unwrap();
+        assert!(!load(&dir).unwrap().devices.contains_key(&s2));
         assert!(cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).is_err());
         cli(&dir, &["strip", "order", "--", "-X1", "2", "S1"]).unwrap();
         assert_eq!(rail(), ["2", "S1*", "1", "3"], "left out ones follow by number");
