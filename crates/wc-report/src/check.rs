@@ -391,6 +391,8 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
         }
     }
 
+    rules(i, &mut out);
+
     let page_order: BTreeMap<&str, usize> = p.pages.iter().enumerate().map(|(n, pg)| (pg.id.as_str(), n)).collect();
     out.sort_by(|a, b| {
         a.severity
@@ -414,6 +416,154 @@ pub fn check(i: &Inputs<'_>) -> Vec<Finding> {
     });
     out.dedup();
     out
+}
+
+/// The project's own check rules ([`wc_core::check_rule`]).
+fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
+    use wc_core::check_rule::{CheckRule, KINDS};
+
+    let p = i.project;
+    let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
+    let broken = |n: usize, why: String| Finding {
+        severity: Severity::Error,
+        page_id: None,
+        item: None,
+        message: format!("check rule {n} cannot run: {why}"),
+    };
+    for (k, rule) in p.meta.rules.iter().enumerate() {
+        let n = k + 1;
+        let kind = rule.kind.trim().to_ascii_lowercase();
+        if !KINDS.contains(&kind.as_str()) {
+            out.push(broken(
+                n,
+                format!("kind \"{}\" is not one of {}", rule.kind, KINDS.join(", ")),
+            ));
+            continue;
+        }
+        let rule_role = match rule.role() {
+            Ok(r) => r,
+            Err(bad) => {
+                out.push(broken(
+                    n,
+                    format!("role \"{bad}\" is not one of main, auxiliary, standalone, terminal, interruption"),
+                ));
+                continue;
+            }
+        };
+        let severity = match rule.severity.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            None => Severity::Warning,
+            Some(s) if s == "error" => Severity::Error,
+            Some(s) if s == "warning" => Severity::Warning,
+            Some(s) if s == "note" => Severity::Note,
+            Some(s) => {
+                out.push(broken(n, format!("severity \"{s}\" is not error, warning or note")));
+                continue;
+            }
+        };
+        let default_role = (kind == "max-wires").then_some(SymbolRole::Terminal);
+        // The placed symbols the rule looks at, in drawing order.
+        let picked: Vec<(&Page, &wc_core::project::PlacedSymbol, &DeviceTag)> = p
+            .pages
+            .iter()
+            .filter(|pg| !pg.overview)
+            .flat_map(|pg| pg.symbols.iter().map(move |s| (pg, s)))
+            .filter_map(|(pg, s)| {
+                let tag = s.tag.as_ref()?;
+                rule.picks(tag, role(&s.symbol), rule_role, default_role)
+                    .then_some((pg, s, tag))
+            })
+            .collect();
+        match kind.as_str() {
+            "cable" => cable_rule(n, rule, severity, &picked, p, out),
+            "tag" => {
+                let Some(pattern) = rule.pattern.as_deref().filter(|x| !x.trim().is_empty()) else {
+                    out.push(broken(n, "a tag rule needs a pattern".into()));
+                    continue;
+                };
+                let mut done: BTreeSet<&DeviceTag> = BTreeSet::new();
+                for (page, s, tag) in &picked {
+                    if done.insert(tag) && !wc_core::check_rule::tag_matches(pattern, tag) {
+                        out.push(at(
+                            page,
+                            &s.id,
+                            severity,
+                            rule.text(tag, format!("{tag} does not match {pattern} (check rule {n})")),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                let Some(max) = rule.max else {
+                    out.push(broken(n, "a max-wires rule needs max".into()));
+                    continue;
+                };
+                for (page, s, tag) in &picked {
+                    let mut ends: BTreeMap<&str, u32> = BTreeMap::new();
+                    for w in &page.wires {
+                        for e in [&w.from, &w.to] {
+                            if let Endpoint::Pin { item, pin } = e
+                                && *item == s.id
+                            {
+                                *ends.entry(pin.as_str()).or_default() += 1;
+                            }
+                        }
+                    }
+                    for (pin, count) in ends.into_iter().filter(|(_, c)| *c > max) {
+                        out.push(at(
+                            page,
+                            &s.id,
+                            severity,
+                            rule.text(
+                                tag,
+                                format!("{tag}:{pin} has {count} wires, at most {max} allowed (check rule {n})"),
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn cable_rule(
+        n: usize,
+        rule: &CheckRule,
+        severity: Severity,
+        picked: &[(&Page, &wc_core::project::PlacedSymbol, &DeviceTag)],
+        p: &wc_core::Project,
+        out: &mut Vec<Finding>,
+    ) {
+        // Every (page, symbol) a cabled wire ends on.
+        let cabled: BTreeSet<(&str, &str)> = p
+            .pages
+            .iter()
+            .flat_map(|pg| {
+                pg.wires
+                    .iter()
+                    .filter(|w| w.cable.is_some())
+                    .flat_map(|w| [&w.from, &w.to])
+                    .filter_map(move |e| match e {
+                        Endpoint::Pin { item, .. } => Some((pg.id.as_str(), item.as_str())),
+                        Endpoint::Point { .. } => None,
+                    })
+            })
+            .collect();
+        let mut devices: BTreeMap<&DeviceTag, (bool, &Page, &str)> = BTreeMap::new();
+        for (page, s, tag) in picked {
+            let has = cabled.contains(&(page.id.as_str(), s.id.as_str()));
+            let entry = devices.entry(tag).or_insert((false, page, &s.id));
+            entry.0 |= has;
+        }
+        for (tag, (has, page, item)) in devices {
+            if !has {
+                out.push(at(
+                    page,
+                    item,
+                    severity,
+                    rule.text(tag, format!("{tag} has no cable (check rule {n})")),
+                ));
+            }
+        }
+    }
 }
 
 fn end_pos(i: &Inputs<'_>, page: &Page, e: &Endpoint) -> Option<Point> {

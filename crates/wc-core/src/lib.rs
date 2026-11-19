@@ -5,6 +5,7 @@
 
 pub mod autowire;
 pub mod base;
+pub mod check_rule;
 pub mod connectivity;
 pub mod error;
 pub mod find;

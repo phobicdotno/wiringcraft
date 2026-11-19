@@ -64,6 +64,10 @@ pub struct ProjectMeta {
     /// sort ([`crate::report_layout`]).
     #[serde(default, rename = "report", skip_serializing_if = "Vec::is_empty")]
     pub reports: Vec<crate::report_layout::ReportLayout>,
+    /// Check rules the user wrote, run with the built-in project check
+    /// ([`crate::check_rule`]).
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::check_rule::CheckRule>,
 }
 
 /// The project's logo: a JPEG or PNG file in the project folder. The title block shows it in
@@ -738,6 +742,7 @@ impl ProjectMeta {
             template: crate::template::PageTemplate::default(),
             revisions: Vec::new(),
             reports: Vec::new(),
+            rules: Vec::new(),
         }
     }
 

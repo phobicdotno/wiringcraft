@@ -2121,3 +2121,84 @@ fn report_layouts_that_name_nothing_are_reported() {
     // The unknown column is left out; the report still builds.
     assert!(build(Kind::Wires, &i).columns.is_empty());
 }
+
+#[test]
+fn check_runs_the_projects_own_rules() {
+    let (mut p, s, parts) = fixture();
+    use wc_core::check_rule::CheckRule;
+    let rule = |kind: &str| CheckRule {
+        kind: kind.into(),
+        ..CheckRule::default()
+    };
+    p.meta.rules = vec![
+        CheckRule {
+            devices: Some("-P*".into()),
+            ..rule("cable")
+        },
+        CheckRule {
+            role: Some("terminal".into()),
+            pattern: Some("-X#.#".into()),
+            severity: Some("error".into()),
+            ..rule("tag")
+        },
+        CheckRule {
+            max: Some(1),
+            message: Some("{tag} is overcrowded".into()),
+            ..rule("max-wires")
+        },
+        rule("colour"),
+        CheckRule {
+            role: Some("coil".into()),
+            pattern: Some("-K#".into()),
+            ..rule("tag")
+        },
+        CheckRule {
+            devices: Some("-K*".into()),
+            ..rule("tag")
+        },
+    ];
+    // A second wire on terminal -X1.1 pin 1.
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s4", "1"), pin("s6", "X2"), Some("4"), None));
+    let run = |p: &Project| {
+        check(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+    };
+    let found = run(&p);
+    let has = |m: &str| found.iter().find(|f| f.message == m);
+    let cable = has("-P1 has no cable (check rule 1)").unwrap();
+    assert_eq!((cable.severity, cable.item.as_deref()), (Severity::Warning, Some("s6")));
+    let bad_tag = has("-X2 does not match -X#.# (check rule 2)").unwrap();
+    assert_eq!(
+        (bad_tag.severity, bad_tag.item.as_deref()),
+        (Severity::Error, Some("s5"))
+    );
+    assert!(!found.iter().any(|f| f.message.contains("-X1.1 does not match")));
+    // Only terminals count for max-wires without a role: the lamp's pin X2 is not checked.
+    assert!(has("-X1.1 is overcrowded").is_some(), "{found:?}");
+    assert_eq!(found.iter().filter(|f| f.message.contains("overcrowded")).count(), 1);
+    assert!(has("check rule 4 cannot run: kind \"colour\" is not one of cable, tag, max-wires").is_some());
+    assert!(
+        found
+            .iter()
+            .any(|f| f.message.starts_with("check rule 5 cannot run: role \"coil\""))
+    );
+    assert!(has("check rule 6 cannot run: a tag rule needs a pattern").is_some());
+
+    // A cable on the lamp's wire satisfies the cable rule.
+    p.pages[0].wires[2].cable = Some(wc_core::CableCore {
+        cable: DeviceTag::parse("-W1").unwrap(),
+        core: "1".into(),
+    });
+    assert!(!run(&p).iter().any(|f| f.message.contains("has no cable")));
+    // Overview pages do not count.
+    let mut overview = Page::new("p9", "9", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("s40", "lamp", 10.0, Some("-P7")));
+    p.pages.push(overview);
+    assert!(!run(&p).iter().any(|f| f.message.contains("has no cable")));
+}
