@@ -21,6 +21,9 @@ pub struct Clipboard {
     /// The device data above wins over the project's for the same tag: set for a macro, whose
     /// values were chosen when it was inserted. A copy within a project keeps the project's.
     pub own_devices: bool,
+    /// The folder of the project it was copied in; a paste into another project takes the
+    /// copied device data first.
+    pub from: Option<std::path::PathBuf>,
 }
 
 impl From<wc_core::macros::Macro> for Clipboard {
@@ -32,6 +35,7 @@ impl From<wc_core::macros::Macro> for Clipboard {
             graphics: m.graphics,
             anchor: m.anchor,
             own_devices: true,
+            from: None,
         }
     }
 }
@@ -667,6 +671,7 @@ impl Open {
             graphics,
             anchor,
             own_devices: false,
+            from: Some(self.dir.clone()),
         }
     }
 
@@ -689,7 +694,9 @@ impl Open {
             anchor: clip.anchor,
         };
         use wc_core::placement::{DeviceData, OutOfTags};
-        let data = if clip.own_devices {
+        // The copied data first for a macro or a copy from another project; within one project
+        // the project's own, which may have changed since the copy.
+        let data = if clip.own_devices || clip.from.as_deref() != Some(self.dir.as_path()) {
             DeviceData::GroupFirst
         } else {
             DeviceData::ProjectFirst
@@ -936,6 +943,29 @@ mod tests {
         // Undo removes the whole paste.
         assert!(o.undo());
         assert_eq!(o.project.pages[page].symbols.len(), 2);
+    }
+
+    #[test]
+    fn a_paste_into_another_project_keeps_the_copied_device_data() {
+        let (_tmp, mut o, page, a, _b) = setup();
+        let k = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        o.project.devices.entry(k.clone()).or_default().part = Some("part-a".into());
+        let clip = o.copy(page, &[Selection::Symbol(a)]);
+        let part_of_new = |o: &Open| {
+            let s = o.project.pages[page].symbols.last().unwrap();
+            o.project.devices[s.tag.as_ref().unwrap()].part.clone()
+        };
+
+        // Within the project, the project's data as it is now.
+        o.project.devices.entry(k.clone()).or_default().part = Some("part-b".into());
+        o.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert_eq!(part_of_new(&o).as_deref(), Some("part-b"));
+
+        // In another project whose device of that tag has another part, the copied one.
+        let (_tmp2, mut other, _, _, _) = setup();
+        other.project.devices.entry(k).or_default().part = Some("part-c".into());
+        other.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert_eq!(part_of_new(&other).as_deref(), Some("part-a"));
     }
 
     #[test]

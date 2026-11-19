@@ -712,7 +712,21 @@ mod tests {
 
     #[test]
     fn placing_fails_untouched_when_no_tag_like_a_device_is_left() -> Result<()> {
-        let m = starter()?.apply(Some("3 kW"), &BTreeMap::new())?;
+        let mut m = starter()?.apply(Some("3 kW"), &BTreeMap::new())?;
+        // A device with a free tag comes first: it is not placed either.
+        let x1 = DeviceTag::parse("-X1")?;
+        m.symbols.insert(
+            0,
+            PlacedSymbol {
+                id: "s0".into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0, 10.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(x1.clone()),
+            },
+        );
+        m.devices.insert(x1, Device::default());
         let mut p = Project::new("x");
         p.pages.push(crate::project::Page::new("p1", "1", "Motors"));
         for n in 1..10_000 {

@@ -81,8 +81,9 @@ pub fn place(
     data: DeviceData,
     out_of_tags: OutOfTags,
 ) -> Result<Placed> {
+    let no_page = || Error::Invalid(format!("no page {}", page.saturating_add(1)));
     if project.pages.get(page).is_none() {
-        return Err(Error::Invalid(format!("no page {}", page + 1)));
+        return Err(no_page());
     }
     // The new tag of each old one (`None`: placed without), and the devices to add.
     let mut used = used_tags(project);
@@ -117,10 +118,7 @@ pub fn place(
     project.devices.extend(devices);
 
     let d = Point::new(at.x - group.anchor.x, at.y - group.anchor.y);
-    let p = project
-        .pages
-        .get_mut(page)
-        .ok_or_else(|| Error::Invalid(format!("no page {}", page + 1)))?;
+    let p = project.pages.get_mut(page).ok_or_else(no_page)?;
     let mut placed = Placed::default();
     let mut ids: BTreeMap<&str, String> = BTreeMap::new();
     for s in group.symbols {
@@ -134,11 +132,16 @@ pub fn place(
     }
     for w in group.wires {
         let mut w = w.clone();
-        // A core of a cable the group holds runs in that cable under its new tag.
-        if let Some(c) = &mut w.cable
-            && let Some(Some(t)) = renamed.get(&c.cable)
+        // A core of a cable the group holds runs in that cable under its new tag; when the
+        // cable is placed without a tag, the core runs in no cable (not in the project's cable
+        // of the old tag).
+        if let Some(c) = &w.cable
+            && let Some(new) = renamed.get(&c.cable)
         {
-            c.cable = t.clone();
+            w.cable = new.clone().map(|t| crate::project::CableCore {
+                cable: t,
+                core: c.core.clone(),
+            });
         }
         w.id = p.next_id("w");
         w.number = None;
@@ -292,5 +295,57 @@ mod tests {
             .map(|id| page.symbol(id).unwrap().tag.as_ref().map(ToString::to_string))
             .collect();
         assert_eq!(tags, [None, Some("-X1".to_string())]);
+
+        // A core of a cable placed without a tag runs in no cable, not in the project's -W1.
+        for n in 1..10_000 {
+            p.devices.insert(tag(&format!("-W{n}")), Device::default());
+        }
+        let cable = [symbol("c", "-W1")];
+        let core = Wire {
+            id: "w1".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(5.0, 0.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: Some(crate::project::CableCore {
+                cable: tag("-W1"),
+                core: "BN".into(),
+            }),
+            route: Default::default(),
+            spec: Default::default(),
+        };
+        let wires = [core];
+        let group = Group {
+            symbols: &cable,
+            wires: &wires,
+            ..group
+        };
+        let placed = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Untagged,
+        )
+        .unwrap();
+        let w = p.pages[0].wires.iter().find(|w| w.id == placed.wires[0]).unwrap();
+        assert_eq!(w.cable, None);
+
+        // A page index past the end is an error, also the largest one.
+        let none = place(
+            &mut p,
+            usize::MAX,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        );
+        assert!(none.is_err());
     }
 }
