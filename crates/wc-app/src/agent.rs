@@ -3931,6 +3931,94 @@ mod tests {
     }
 
     #[test]
+    fn the_black_box_tool_puts_a_tagged_box_with_its_points_on_the_page() {
+        use crate::black_box_tool::BoxDraft;
+        use wc_core::BoxSide;
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.page = 1;
+        a.run(Action::BlackBoxTool);
+        assert_eq!(a.ed.tool, crate::state::Tool::BlackBox);
+        assert!(a.add_black_box("-A7").is_err(), "nothing drawn yet");
+
+        let page_id = a.open.as_ref().unwrap().project.pages[1].id.clone();
+        let mut d = BoxDraft::new(&page_id, Point::new(30.0, 30.0));
+        d.to = Some(Point::new(50.0, 40.0));
+        d.add_pin(BoxSide::Left, 5.0, "1").unwrap();
+        d.add_pin(BoxSide::Right, 5.0, "2").unwrap();
+        a.ed.black_box = Some(d);
+        let err = a.add_black_box("not a tag").unwrap_err();
+        assert!(!err.is_empty());
+        assert!(a.ed.black_box.is_some(), "a refused tag keeps the box being drawn");
+
+        a.add_black_box("-A7").unwrap();
+        assert!(a.ed.black_box.is_none());
+        let o = a.open.as_ref().unwrap();
+        let [crate::state::Selection::Symbol(id)] = a.ed.selection.as_slice() else {
+            unreachable!("the new box is selected: {:?}", a.ed.selection)
+        };
+        let placed = o.project.pages[1].symbol(id).unwrap();
+        assert_eq!(placed.tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-A7"));
+        let pins: Vec<&str> = o.symbols[&placed.symbol].pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(pins, ["1", "2"]);
+
+        // Undo takes the whole box away in one step.
+        a.run(Action::Undo);
+        let o = a.open.as_ref().unwrap();
+        assert!(o.project.pages[1].symbols.is_empty());
+
+        // The view moved to another page while the tag dialog was open: the box goes on the
+        // page it was drawn on, and that page is shown with the box selected.
+        let mut d = BoxDraft::new(&page_id, Point::new(30.0, 30.0));
+        d.to = Some(Point::new(50.0, 40.0));
+        a.ed.black_box = Some(d);
+        a.ed.page = 0;
+        a.add_black_box("").unwrap();
+        assert_eq!(a.ed.page, 1);
+        let o = a.open.as_ref().unwrap();
+        let [crate::state::Selection::Symbol(id)] = a.ed.selection.as_slice() else {
+            unreachable!("the new box is selected: {:?}", a.ed.selection)
+        };
+        assert!(o.project.pages[1].symbol(id).is_some());
+        assert!(o.project.pages[0].symbols.is_empty());
+    }
+
+    #[test]
+    fn escape_after_leaving_the_black_box_tool_cancels_the_new_tool_s_drawing() {
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let escape = |a: &mut App| {
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                let _ = a.shortcuts(ctx);
+            });
+        };
+        let page_id = a.open.as_ref().unwrap().project.pages[0].id.clone();
+        a.run(Action::BlackBoxTool);
+        a.ed.black_box = Some(crate::black_box_tool::BoxDraft::new(&page_id, Point::new(10.0, 10.0)));
+        escape(&mut a);
+        assert!(a.ed.black_box.is_none(), "Esc drops the box being drawn");
+        assert_eq!(a.ed.tool, crate::state::Tool::BlackBox, "and keeps the tool");
+
+        // Started a box, switched to Line and clicked its first point: Esc cancels the line.
+        a.ed.black_box = Some(crate::black_box_tool::BoxDraft::new(&page_id, Point::new(10.0, 10.0)));
+        a.run(Action::LineTool);
+        a.ed.shape_points = vec![Point::new(20.0, 20.0)];
+        escape(&mut a);
+        assert!(a.ed.shape_points.is_empty(), "the line's first point is dropped");
+    }
+
+    #[test]
     fn editing_actions_are_off_and_do_nothing_on_a_page_someone_else_holds() {
         use crate::chrome::Status;
         let (_tmp, mut a) = app(vec![]);
@@ -3969,6 +4057,7 @@ mod tests {
             Action::ArcTool,
             Action::PolylineTool,
             Action::DimensionTool,
+            Action::BlackBoxTool,
             Action::PageProps,
         ];
         for act in editing {
