@@ -1806,6 +1806,41 @@ fn a_network_gets_a_topology_page_with_its_devices_addresses_and_cables() {
 }
 
 #[test]
+fn a_topology_box_links_to_a_page_the_pdf_holds() {
+    use wc_core::network::{Link as NetLink, Network};
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "Power");
+    p1.symbols.push(place("s1", "coil", 50.0, "-K10"));
+    let mut p2 = Page::new("p2", "2", "Control");
+    p2.symbols.push(place("s2", "coil", 50.0, "-K10"));
+    project.pages = vec![p1, p2];
+    let net = Network {
+        name: "PN1".into(),
+        links: vec![NetLink {
+            from: "-K10:P1".into(),
+            to: "-A1:P1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    // Only the second page is exported: the box links there, not to the first page.
+    let opts = Options {
+        pages: vec!["p2".into()],
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &symbols, &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(
+        text.matches("/Subtype /Link").count(),
+        1,
+        "the -K10 box links to page 2"
+    );
+}
+
+#[test]
 fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about() {
     use wc_core::network::{Link as NetLink, Network, Node};
     let net = Network {

@@ -41,6 +41,16 @@ fn key(s: &str) -> String {
     }
 }
 
+/// The device a node names: its tag, or the trimmed text when it is not one. A node is a
+/// device, never a port, so `-K10:P1` as a node stays its own (warned about) box instead of
+/// joining `-K10`.
+fn node_key(s: &str) -> String {
+    match s.trim().parse::<wc_core::DeviceTag>() {
+        Ok(t) => t.to_string(),
+        Err(_) => s.trim().to_owned(),
+    }
+}
+
 /// Lay out `net`: devices in node order then in order of first mention by a link, placed by
 /// a breadth-first walk of the links from the first one.
 pub fn layout_network(net: &Network) -> Topology {
@@ -51,7 +61,7 @@ pub fn layout_network(net: &Network) -> Topology {
         }
     };
     for n in &net.nodes {
-        add(key(&n.device));
+        add(node_key(&n.device));
     }
     for l in &net.links {
         add(key(&l.from));
@@ -140,6 +150,8 @@ pub fn layout_network(net: &Network) -> Topology {
 
 const TEXT: f64 = 2.2;
 const LINE: f64 = 3.2;
+/// Smallest type an address is shrunk to so that it fits its box whole, in mm.
+const ADDRESS_MIN: f64 = 1.6;
 /// A box: four lines of text.
 const BOX_H: f64 = 4.0 * LINE + 2.0;
 /// The narrowest a box gets, and the room between two columns for a link's labels.
@@ -449,6 +461,7 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
 /// description, address and station, and each link once with its port names and cable tag.
 /// A box links to the first page its device is drawn on. A node or link end that does not
 /// read as a device tag is still drawn as written, and why is added to `warnings`.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_network_page(
     project: &Project,
     page: &Page,
@@ -456,6 +469,7 @@ pub fn draw_network_page(
     total: usize,
     net: &Network,
     date: &str,
+    exported: &std::collections::BTreeSet<&str>,
     warnings: &mut Vec<String>,
 ) -> Drawn {
     let (w, h) = page.size.mm();
@@ -527,6 +541,17 @@ pub fn draw_network_page(
         ];
         for (i, t) in lines.iter().enumerate() {
             let size = if i == 0 { TEXT + 0.4 } else { TEXT };
+            // An address is only useful whole: smaller type before it is cut.
+            let size = if i == 2 {
+                let room = g.box_w - 3.0;
+                let mut s = size;
+                while s > ADDRESS_MIN && crate::writer::text_width_mm(t, s) > room {
+                    s = (s - 0.05).max(ADDRESS_MIN);
+                }
+                s
+            } else {
+                size
+            };
             pen.text(
                 (bx + 1.5, by + 1.0 + LINE * (i as f64 + 1.0)),
                 size,
@@ -534,7 +559,12 @@ pub fn draw_network_page(
                 &fit_at(t, g.box_w - 3.0, size),
             );
         }
-        if let Some(target) = tag.as_ref().and_then(|t| tags.get(t)).and_then(|at| at.first()) {
+        // The first place the device is drawn on a page this PDF holds.
+        let target = tag
+            .as_ref()
+            .and_then(|t| tags.get(t))
+            .and_then(|at| at.iter().find(|a| exported.contains(a.0.as_str())));
+        if let Some(target) = target {
             links.push(Link {
                 min: (bx, by),
                 max: (bx + g.box_w, by + g.box_h),
@@ -688,6 +718,79 @@ mod tests {
         let mut drawn: Vec<usize> = t.tree.iter().chain(&t.under).map(|e| e.2).collect();
         drawn.sort_unstable();
         assert_eq!(drawn, [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_node_named_like_a_port_stays_its_own_box() {
+        let net = Network {
+            nodes: vec![node("-K10:P1")],
+            links: vec![link("-A1:P1", "-K10:P2")],
+            ..Network::default()
+        };
+        let t = layout_network(&net);
+        let names: Vec<&str> = t.boxes.iter().map(|b| b.0.as_str()).collect();
+        assert_eq!(names, ["-K10:P1", "-A1", "-K10"]);
+    }
+
+    #[test]
+    fn every_ring_link_is_stroked_not_only_labelled() {
+        let net = ring();
+        let t = layout_network(&net);
+        let g = grid(&t, 420.0, 297.0, 30.0);
+        let (paths, _) = link_drawing(&t, &g, &net, 420.0);
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        for p in &paths {
+            assert!(p.len() >= 2, "{p:?}");
+            let length: f64 = p.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum();
+            assert!(length > 1.0, "{p:?}");
+        }
+        // The page draws each of them: three open strokes besides the boxes and the frame.
+        let mut project = Project::new("x");
+        project.pages.clear();
+        let page = Page::new("network-n", "N1", "Network");
+        let mut warnings = Vec::new();
+        let drawn = draw_network_page(&project, &page, 0, 1, &net, "", &Default::default(), &mut warnings);
+        let strokes = drawn.ops.matches(" l\nS\n").count();
+        assert!(strokes >= 3, "{strokes} open strokes");
+        let plain = Network {
+            links: Vec::new(),
+            ..net.clone()
+        };
+        let none = draw_network_page(&project, &page, 0, 1, &plain, "", &Default::default(), &mut warnings);
+        assert_eq!(strokes - none.ops.matches(" l\nS\n").count(), 3, "one stroke per link");
+    }
+
+    #[test]
+    fn an_address_is_shrunk_to_fit_its_box_whole() {
+        let names: Vec<String> = (1..=30).map(|n| format!("-A{n}")).collect();
+        let mut net = Network {
+            nodes: names.iter().map(|n| node(n)).collect(),
+            links: names
+                .windows(2)
+                .map(|p| link(&format!("{}:P2", p[0]), &format!("{}:P1", p[1])))
+                .collect(),
+            ..Network::default()
+        };
+        net.nodes[0].address = "192.168.100.100".into();
+        net.nodes[1].address = "192.168.100.101".into();
+        let (size, g, _) = fits_its_sheet(&net);
+        assert!((g.box_w - MIN_BOX_W).abs() < 1e-9, "{g:?}");
+        let mut page = Page::new("network-n", "N1", "Network");
+        page.size = size;
+        let mut warnings = Vec::new();
+        let drawn = draw_network_page(
+            &Project::new("x"),
+            &page,
+            0,
+            1,
+            &net,
+            "",
+            &Default::default(),
+            &mut warnings,
+        );
+        for a in ["192.168.100.100", "192.168.100.101"] {
+            assert!(drawn.ops.contains(&crate::writer::pdf_text(a)), "{a} is drawn whole");
+        }
     }
 
     #[test]

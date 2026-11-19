@@ -267,6 +267,8 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     }
     add_reports(&mut doc, back_pages, &mut sheet);
     // Network topologies close the document, after the network list.
+    // A topology box links to a page this PDF holds.
+    let exported: std::collections::BTreeSet<&str> = pages.iter().map(|p| p.id.as_str()).collect();
     for (k, net) in options.networks.iter().enumerate() {
         // A sheet the whole topology fits on: the first page's size, or a larger one.
         let (size, warn) = topology::sheet(first_size, project.meta.template.band_height(), net);
@@ -277,8 +279,16 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             format!("Network {}", net.name),
         );
         page.size = size;
-        let mut drawn =
-            topology::draw_network_page(project, &page, sheet, total, net, &options.date, &mut report.warnings);
+        let mut drawn = topology::draw_network_page(
+            project,
+            &page,
+            sheet,
+            total,
+            net,
+            &options.date,
+            &exported,
+            &mut report.warnings,
+        );
         place_logo(&mut drawn, &page);
         doc.add_page(size.mm(), &format!("{} {}", page.number, page.title), drawn);
         sheet += 1;
