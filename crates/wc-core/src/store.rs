@@ -265,7 +265,12 @@ pub fn save_lock(dir: &Path, project: &Project) -> Result<bool> {
 }
 
 /// Save a project folder. Page files of deleted pages are removed. Returns the files written.
+///
+/// Ids that differ only in case are refused before anything is written: on a folder that ignores
+/// case (macOS and Windows by default) they would be one file.
 pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
+    unique_ignoring_case("page", project.pages.iter().map(|p| p.id.as_str()))?;
+    unique_ignoring_case("panel", project.panels.iter().map(|p| p.id.as_str()))?;
     let mut written = Vec::new();
     let mut put = |path: PathBuf, content: String| -> Result<()> {
         if write_if_changed(&path, &content)? {
@@ -285,15 +290,7 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
         put(pages_dir.join(&name), to_json(page)?)?;
         keep.insert(name);
     }
-    if pages_dir.exists() {
-        let entries = fs::read_dir(&pages_dir).map_err(|e| Error::io(&pages_dir, e))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(PAGE_SUFFIX) && !keep.contains(&name) {
-                fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
-            }
-        }
-    }
+    clean_up(&pages_dir, &keep, PAGE_SUFFIX)?;
     let panels_dir = dir.join(PANELS_DIR);
     let mut keep = std::collections::BTreeSet::new();
     for panel in &project.panels {
@@ -302,15 +299,7 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
         put(panels_dir.join(&name), to_json(panel)?)?;
         keep.insert(name);
     }
-    if panels_dir.exists() {
-        let entries = fs::read_dir(&panels_dir).map_err(|e| Error::io(&panels_dir, e))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(PANEL_SUFFIX) && !keep.contains(&name) {
-                fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
-            }
-        }
-    }
+    clean_up(&panels_dir, &keep, PANEL_SUFFIX)?;
     let comments_dir = dir.join(COMMENTS_DIR);
     let mut by_page: BTreeMap<&str, Vec<&crate::review::Comment>> = BTreeMap::new();
     // Comments on a page that was deleted go with it.
@@ -324,16 +313,91 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
         put(comments_dir.join(&name), to_json(list)?)?;
         keep.insert(name);
     }
-    if comments_dir.exists() {
-        let entries = fs::read_dir(&comments_dir).map_err(|e| Error::io(&comments_dir, e))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(COMMENTS_SUFFIX) && !keep.contains(&name) {
-                fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
+    clean_up(&comments_dir, &keep, COMMENTS_SUFFIX)?;
+    Ok(written)
+}
+
+/// Refuse two ids that differ only in case, naming both.
+fn unique_ignoring_case<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for id in ids {
+        if let Some(other) = seen.insert(id.to_ascii_lowercase(), id)
+            && other != id
+        {
+            return Err(Error::Invalid(format!(
+                "{kind} ids {other:?} and {id:?} differ only in case, so they would be one file on \
+                 macOS and Windows; rename one of them"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What to do with a file left in a folder after a save.
+#[derive(Debug, PartialEq, Eq)]
+enum Tidy {
+    /// Nothing uses it any more.
+    Remove(String),
+    /// It is a file just written, listed under the old case of its name: the folder ignores case.
+    Rename { from: String, to: String },
+}
+
+/// Which of the `listed` file names ending in `suffix` are not among the `keep` names written.
+///
+/// A name that differs from a kept one only in case is the same file on a folder that ignores
+/// case, which still lists it under its old name: it is renamed to the new name, never removed.
+/// When the folder lists both names, they are two files and the old one goes.
+fn tidy(listed: &[String], keep: &std::collections::BTreeSet<String>, suffix: &str) -> Vec<Tidy> {
+    let mut out = Vec::new();
+    for name in listed {
+        if !name.ends_with(suffix) || keep.contains(name) {
+            continue;
+        }
+        match keep.iter().find(|k| k.eq_ignore_ascii_case(name)) {
+            Some(k) if !listed.contains(k) => out.push(Tidy::Rename {
+                from: name.clone(),
+                to: k.clone(),
+            }),
+            _ => out.push(Tidy::Remove(name.clone())),
+        }
+    }
+    out
+}
+
+/// Remove the files in `dir` ending in `suffix` that the save did not write (see [`tidy`]).
+fn clean_up(dir: &Path, keep: &std::collections::BTreeSet<String>, suffix: &str) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir).map_err(|e| Error::io(dir, e))?;
+    let names = entries.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()));
+    clean_up_listed(dir, names, keep, suffix)
+}
+
+/// [`clean_up`] on the names a listing of `dir` gave.
+fn clean_up_listed(
+    dir: &Path,
+    names: impl Iterator<Item = std::io::Result<String>>,
+    keep: &std::collections::BTreeSet<String>,
+    suffix: &str,
+) -> Result<()> {
+    // A listing cut short would look like a folder without the file just written: stop instead.
+    let listed = names
+        .collect::<std::io::Result<Vec<String>>>()
+        .map_err(|e| Error::io(dir, e))?;
+    for step in tidy(&listed, keep, suffix) {
+        match step {
+            Tidy::Remove(name) => {
+                let path = dir.join(name);
+                fs::remove_file(&path).map_err(|e| Error::io(&path, e))?;
+            }
+            Tidy::Rename { from, to } => {
+                let to = dir.join(to);
+                fs::rename(dir.join(from), &to).map_err(|e| Error::io(&to, e))?;
             }
         }
     }
-    Ok(written)
+    Ok(())
 }
 
 /// Create a new, empty project folder. Refuses a folder that already holds a project.
@@ -459,6 +523,116 @@ mod tests {
         assert!(again.is_empty(), "unchanged project rewrote {again:?}");
         let back = load(dir.path())?;
         assert_eq!(back, p);
+        Ok(())
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_save_never_removes_a_file_it_wrote_under_another_case() {
+        let keep = names(&["DXF-300.page.json", "p1.page.json"]).into_iter().collect();
+        // A folder that ignores case lists the file just written under its old name.
+        let listed = names(&["dxf-300.page.json", "p1.page.json", "gone.page.json", "notes.txt"]);
+        assert_eq!(
+            tidy(&listed, &keep, PAGE_SUFFIX),
+            vec![
+                Tidy::Rename {
+                    from: "dxf-300.page.json".into(),
+                    to: "DXF-300.page.json".into()
+                },
+                Tidy::Remove("gone.page.json".into()),
+            ]
+        );
+        // A folder that keeps case lists both: two files, and the old one goes.
+        let listed = names(&["dxf-300.page.json", "DXF-300.page.json", "p1.page.json"]);
+        assert_eq!(
+            tidy(&listed, &keep, PAGE_SUFFIX),
+            vec![Tidy::Remove("dxf-300.page.json".into())]
+        );
+    }
+
+    #[test]
+    fn a_listing_cut_short_changes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        // Names that differ by more than case, so this holds on every folder: a complete listing
+        // would rename the first and remove the second.
+        let files = [("dxf-300.page.json", "old"), ("gone.page.json", "stale")];
+        for (name, body) in files {
+            fs::write(dir.path().join(name), body).map_err(|e| Error::io(name, e))?;
+        }
+        let keep = names(&["DXF-300.page.json"]).into_iter().collect();
+        let listing = vec![
+            Ok("dxf-300.page.json".to_string()),
+            Ok("gone.page.json".to_string()),
+            Err(std::io::Error::other("listing cut short")),
+        ];
+        let out = clean_up_listed(dir.path(), listing.into_iter(), &keep, PAGE_SUFFIX);
+        assert!(out.is_err_and(|e| e.to_string().contains("listing cut short")));
+        let mut left = names(&[]);
+        for entry in fs::read_dir(dir.path()).map_err(|e| Error::io("tmp", e))? {
+            left.push(
+                entry
+                    .map_err(|e| Error::io("tmp", e))?
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        left.sort();
+        assert_eq!(left, names(&["dxf-300.page.json", "gone.page.json"]));
+        for (name, body) in files {
+            let path = dir.path().join(name);
+            assert_eq!(fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?, body);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_renamed_only_in_case_is_saved_and_loads() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = sample()?;
+        save(dir.path(), &p)?;
+        let old = p.pages[0].id.clone();
+        p.pages[0].id = old.to_ascii_uppercase();
+        assert_ne!(p.pages[0].id, old);
+        for c in p.comments.iter_mut().filter(|c| c.page == old) {
+            c.page = p.pages[0].id.clone();
+        }
+        save(dir.path(), &p)?;
+        let back = load(dir.path())?;
+        assert_eq!(back, p);
+        Ok(())
+    }
+
+    fn refused<T>(r: Result<T>) -> Result<String> {
+        match r {
+            Ok(_) => Err(Error::Invalid("saved ids that differ only in case".into())),
+            Err(e) => Ok(e.to_string()),
+        }
+    }
+
+    #[test]
+    fn ids_that_differ_only_in_case_are_refused_before_anything_is_written() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = sample()?;
+        let mut twin = p.pages[0].clone();
+        twin.id = twin.id.to_ascii_uppercase();
+        let (a, b) = (p.pages[0].id.clone(), twin.id.clone());
+        p.pages.push(twin);
+        let err = refused(save(dir.path(), &p))?;
+        assert!(
+            err.contains(&format!("{a:?}")) && err.contains(&format!("{b:?}")),
+            "{err}"
+        );
+        assert!(!dir.path().join(PROJECT_FILE).exists());
+        p.pages.pop();
+        let mut twin = p.panels[0].clone();
+        twin.id = twin.id.to_ascii_uppercase();
+        p.panels.push(twin);
+        let err = refused(save(dir.path(), &p))?;
+        assert!(err.contains("panel ids"), "{err}");
         Ok(())
     }
 
