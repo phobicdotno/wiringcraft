@@ -37,7 +37,7 @@ pub struct Topology {
 fn key(s: &str) -> String {
     match Port::parse(s) {
         Ok(p) => p.device.to_string(),
-        Err(_) => s.trim().to_owned(),
+        Err(_) => as_text(s),
     }
 }
 
@@ -47,13 +47,19 @@ fn key(s: &str) -> String {
 fn node_key(s: &str) -> String {
     match s.trim().parse::<wc_core::DeviceTag>() {
         Ok(t) => t.to_string(),
-        Err(_) => s.trim().to_owned(),
+        Err(_) => as_text(s),
     }
 }
 
-/// Starts the box name of a node with a blank tag. Text from the project is trimmed and never
-/// starts with a control character, so such a name cannot collide with a tag, a link end or
-/// another node.
+/// Text that is not a tag, trimmed, with any [`BLANK`] replaced so that it can never be taken
+/// for the name of a blank-tag node.
+fn as_text(s: &str) -> String {
+    s.trim().replace(BLANK, "\u{FFFD}")
+}
+
+/// Starts the box name of a node with a blank tag. Tags never contain it and [`as_text`]
+/// replaces it in other text, so such a name cannot collide with a tag, a link end or another
+/// node.
 const BLANK: char = '\u{1}';
 
 /// The box name of node `i` (from 0): its [`node_key`], or [`BLANK`] and its number when its

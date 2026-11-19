@@ -2221,6 +2221,12 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
                 address: "10.0.0.1".into(),
                 ..Node::default()
             },
+            // Nor does text holding the marker of a blank node's internal name.
+            Node {
+                device: "\u{1}3".into(),
+                address: "10.0.0.3".into(),
+                ..Node::default()
+            },
             Node {
                 device: "  ".into(),
                 address: "192.168.0.2".into(),
@@ -2241,8 +2247,10 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
     };
     let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
     let text = String::from_utf8_lossy(&pdf);
-    assert_eq!(text.matches(&writer::pdf_text("(node 2)")).count(), 2, "two boxes");
+    assert_eq!(text.matches(&writer::pdf_text("(node 3)")).count(), 1);
+    assert!(text.contains(&writer::pdf_text("(node 2)")));
     assert!(text.contains(&writer::pdf_text("10.0.0.1")));
+    assert!(text.contains(&writer::pdf_text("10.0.0.3")));
     assert!(text.contains(&writer::pdf_text("192.168.0.2")));
     assert!(text.contains(&writer::pdf_text("drive-07")));
     assert!(!text.contains(&writer::pdf_text("No devices on this network.")));
@@ -2250,7 +2258,7 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
         report
             .warnings
             .iter()
-            .any(|w| w.starts_with("network PN3: node 2 is not a device tag")),
+            .any(|w| w.starts_with("network PN3: node 3 is not a device tag")),
         "{:?}",
         report.warnings
     );
