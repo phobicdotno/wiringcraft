@@ -4242,6 +4242,42 @@ fn undo_of_a_waiting_change_takes_it_back_here_and_not_an_older_one_there() -> T
 }
 
 #[test]
+fn a_waiting_placement_does_not_take_a_device_the_session_made_under_its_tag() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    let tag = guest_open
+        .project
+        .page("p0003")
+        .and_then(|p| p.symbols.iter().find(|s| s.id == item))
+        .and_then(|s| s.tag.clone())
+        .ok_or("the placement has no tag")?;
+    assert!(!host_open.project.devices.contains_key(&tag));
+    // The host makes a device of its own under the same tag while the placement waits.
+    let theirs = wc_core::Device {
+        description: "Theirs".into(),
+        ..Default::default()
+    };
+    host_open.project.devices.insert(tag.clone(), theirs.clone());
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(guest_open.project.devices.get(&tag), Some(&theirs));
+    assert!(
+        !has_placement(&guest_open, "p0003", &item),
+        "the placement is not kept naming the session's device"
+    );
+    let notes = g.take_notes();
+    assert!(notes.iter().any(|n| n.contains("was not kept")), "{notes:?}");
+    // Once the item could go, nothing of the placement reaches the session.
+    log.fail_vendor(false);
+    std::thread::sleep(ITEM_RETRY_LATER);
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert!(!has_placement(&host_open, "p0003", &item));
+    assert_eq!(host_open.project.devices.get(&tag), Some(&theirs));
+    Ok(())
+}
+
+#[test]
 fn undo_of_a_second_waiting_placement_takes_back_only_that_one() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let ((mut h, log, mut host_open, mut g, mut guest_open), first) = waiting_session(tmp.path())?;
@@ -4768,6 +4804,266 @@ fn a_new_page_that_waits_for_its_symbol_is_kept_while_others_changes_come_in() -
     session.pages.push(Page::new("p9", "9", "Theirs"));
     assert_eq!(held.put_back(&mut session), ["page 9"]);
     assert_eq!(session.page("p9").map(|p| p.title.as_str()), Some("Theirs"));
+    Ok(())
+}
+
+#[test]
+fn a_waiting_page_and_its_new_device_go_back_together_or_not_at_all() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    // A symbol the session does not have placed here, with the new device it made.
+    let mut local = base.clone();
+    local
+        .page_mut("p1")
+        .ok_or("no page")?
+        .symbols
+        .push(wc_core::PlacedSymbol {
+            tag: Some(k1.clone()),
+            ..symbol("s9", 40.0)
+        });
+    local.devices.insert(k1.clone(), wc_core::Device::default());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert!(held.now.devices.contains_key(&k1));
+    // The session made a device of its own under the same tag meanwhile: the placement must not
+    // come back naming it.
+    let theirs = wc_core::Device {
+        description: "Theirs".into(),
+        ..Default::default()
+    };
+    let mut session = base.clone();
+    session.devices.insert(k1.clone(), theirs.clone());
+    assert_eq!(held.put_back(&mut session), ["device -K1", "page 1"]);
+    assert_eq!(session.devices.get(&k1), Some(&theirs));
+    assert_eq!(session.page("p1"), base.page("p1"));
+    // The session changed the page meanwhile: the device does not stay without it.
+    let mut session = base.clone();
+    session.page_mut("p1").ok_or("no page")?.title = "Theirs".into();
+    assert_eq!(held.put_back(&mut session), ["page 1", "device -K1"]);
+    assert!(!session.devices.contains_key(&k1));
+    // Neither: both come back.
+    let mut session = base.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session, local);
+    Ok(())
+}
+
+#[test]
+fn a_new_device_s_footprint_goes_back_with_it_or_not_at_all() -> TestResult {
+    use wc_core::panel::{Panel, PanelItem};
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    base.panels.push(Panel::new("pn1", "Plate", 400.0, 300.0));
+    // A waiting placement made -K1 here, and -K1 was placed on the plate too.
+    let mut local = base.clone();
+    local
+        .page_mut("p1")
+        .ok_or("no page")?
+        .symbols
+        .push(wc_core::PlacedSymbol {
+            tag: Some(k1.clone()),
+            ..symbol("s9", 40.0)
+        });
+    local.devices.insert(k1.clone(), wc_core::Device::default());
+    local.panels[0].items.push(PanelItem::Device {
+        tag: k1.clone(),
+        at: wc_core::geom::Point::new(10.0, 10.0),
+        width: 20.0,
+        height: 40.0,
+    });
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert!(held.now.panels.contains_key("pn1"));
+    // The session changed the page meanwhile: neither the device nor its footprint stays.
+    let mut session = base.clone();
+    session.page_mut("p1").ok_or("no page")?.title = "Theirs".into();
+    assert_eq!(held.put_back(&mut session), ["page 1", "device -K1", "panel pn1"]);
+    assert!(!session.devices.contains_key(&k1));
+    assert_eq!(session.panels, base.panels);
+    Ok(())
+}
+
+#[test]
+fn a_new_strip_s_jumpers_go_back_with_it_or_not_at_all() -> TestResult {
+    let x1 = wc_core::DeviceTag::parse("-X1")?;
+    let base = Project::new("Test");
+    // A new terminal strip whose part waits, with jumpers on it; no page names it.
+    let mut local = base.clone();
+    local.devices.insert(
+        x1.clone(),
+        wc_core::Device {
+            part: Some("acme.strip".into()),
+            ..Default::default()
+        },
+    );
+    local.meta.jumpers.push(wc_core::project::Jumper {
+        strip: x1.clone(),
+        terminals: vec!["1".into(), "2".into()],
+        part: None,
+    });
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.strip")]));
+    assert!(held.now.devices.contains_key(&x1));
+    assert!(held.now.meta.is_some(), "the jumpers wait with their strip");
+    // The session made a device of its own under the same tag meanwhile: the jumpers must not
+    // come back on it.
+    let theirs = wc_core::Device {
+        description: "Theirs".into(),
+        ..Default::default()
+    };
+    let mut session = base.clone();
+    session.devices.insert(x1.clone(), theirs.clone());
+    assert_eq!(held.put_back(&mut session), ["device -X1", "the project properties"]);
+    assert_eq!(session.devices.get(&x1), Some(&theirs));
+    assert!(session.meta.jumpers.is_empty());
+    // Neither changed: both come back.
+    let mut session = base.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session, local);
+    Ok(())
+}
+
+#[test]
+fn a_new_device_lost_with_a_waiting_rename_is_named() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let k5 = wc_core::DeviceTag::parse("-K5")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    // On the same page: -K1 renamed to -K2, and a waiting placement that made -K5.
+    let mut local = base.clone();
+    let p1 = local.page_mut("p1").ok_or("no page")?;
+    p1.symbols[0].tag = Some(k2.clone());
+    p1.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k5.clone()),
+        ..symbol("s9", 40.0)
+    });
+    local.devices.remove(&k1);
+    local.devices.insert(k2.clone(), wc_core::Device::default());
+    local.devices.insert(k5.clone(), wc_core::Device::default());
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert_eq!(held.renames.len(), 1, "one group: the page joins them");
+    let mut session = base.clone();
+    session.page_mut("p1").ok_or("no page")?.title = "Theirs".into();
+    assert_eq!(
+        held.put_back(&mut session),
+        ["page 1", "the device rename that waited with it", "device -K5"]
+    );
+    assert!(!session.devices.contains_key(&k5));
+    assert!(!session.devices.contains_key(&k2));
+    Ok(())
+}
+
+#[test]
+fn jumpers_of_a_new_device_lost_with_a_waiting_rename_are_named() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let x5 = wc_core::DeviceTag::parse("-X5")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    // On one waiting page: -K1 renamed to -K2, and a placement that made the strip -X5, which
+    // has jumpers.
+    let mut local = base.clone();
+    let p1 = local.page_mut("p1").ok_or("no page")?;
+    p1.symbols[0].tag = Some(k2.clone());
+    p1.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(x5.clone()),
+        ..symbol("s9", 40.0)
+    });
+    local.devices.remove(&k1);
+    local.devices.insert(k2.clone(), wc_core::Device::default());
+    local.devices.insert(x5.clone(), wc_core::Device::default());
+    local.meta.jumpers.push(wc_core::project::Jumper {
+        strip: x5.clone(),
+        terminals: vec!["1".into(), "2".into()],
+        part: None,
+    });
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert_eq!(held.renames.len(), 1, "one group: the page joins them");
+    let mut session = base.clone();
+    session.page_mut("p1").ok_or("no page")?.title = "Theirs".into();
+    assert_eq!(
+        held.put_back(&mut session),
+        [
+            "page 1",
+            "the device rename that waited with it",
+            "device -X5",
+            "the project properties"
+        ]
+    );
+    assert!(session.meta.jumpers.is_empty());
+    Ok(())
+}
+
+#[test]
+fn pages_and_panels_of_a_new_device_lost_with_a_waiting_rename_are_named() -> TestResult {
+    use wc_core::panel::{Panel, PanelItem};
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let k5 = wc_core::DeviceTag::parse("-K5")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.pages.push(Page::new("p2", "2", "Two"));
+    base.panels.push(Panel::new("pn1", "Plate", 400.0, 300.0));
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    // On one waiting page: -K1 renamed to -K2, and a placement that made -K5, which page 2 and
+    // the plate name too.
+    let mut local = base.clone();
+    let p1 = local.page_mut("p1").ok_or("no page")?;
+    p1.symbols[0].tag = Some(k2.clone());
+    p1.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k5.clone()),
+        ..symbol("s9", 40.0)
+    });
+    local
+        .page_mut("p2")
+        .ok_or("no page")?
+        .symbols
+        .push(wc_core::PlacedSymbol {
+            tag: Some(k5.clone()),
+            ..symbol("s8", 60.0)
+        });
+    local.devices.remove(&k1);
+    local.devices.insert(k2.clone(), wc_core::Device::default());
+    local.devices.insert(k5.clone(), wc_core::Device::default());
+    local.panels[0].items.push(PanelItem::Device {
+        tag: k5.clone(),
+        at: wc_core::geom::Point::new(10.0, 10.0),
+        width: 20.0,
+        height: 40.0,
+    });
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert_eq!(held.renames.len(), 1, "one group: the pages join them");
+    let mut session = base.clone();
+    session.page_mut("p1").ok_or("no page")?.title = "Theirs".into();
+    assert_eq!(
+        held.put_back(&mut session),
+        [
+            "page 1",
+            "the device rename that waited with it",
+            "page 2",
+            "device -K5",
+            "panel pn1"
+        ]
+    );
+    assert_eq!(session.pages[1], base.pages[1]);
+    assert_eq!(session.panels, base.panels);
     Ok(())
 }
 
