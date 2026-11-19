@@ -4469,6 +4469,40 @@ mod tests {
         // A command that leaves the project alone is not.
         let r = through_tools(&mut a, &|_| {});
         assert!(!r.contains("Pending"), "{r}");
+        // Nor is one during which the user moved a jumpered terminal in the window: its jumper
+        // follows when the command ends, but that is the window's change, not the command's.
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0003").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut ids = Vec::new();
+        for at in [10.0, 20.0, 30.0] {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            o.project.pages[page]
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == id)
+                .unwrap()
+                .tag = Some(x1.clone());
+            ids.push(id);
+        }
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        let moved = ids[0].clone();
+        let r = through_tools(&mut a, &|a| {
+            let o = a.open.as_mut().unwrap();
+            o.checkpoint();
+            o.project.pages[page]
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == moved)
+                .unwrap()
+                .at = Point::new(40.0, 20.0);
+        });
+        assert_eq!(
+            a.open.as_ref().unwrap().project.meta.jumpers[0].terminals,
+            ["1", "3"],
+            "the jumper followed"
+        );
+        assert!(!r.contains("Pending"), "{r}");
     }
 
     #[test]
