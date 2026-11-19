@@ -92,7 +92,7 @@ For the other areas, the chapter to read in each help is:
 | Grid, snap, zoom, pan, fit page | yes | yes | yes | done |
 | Free graphics: lines, rectangles, texts | yes | yes | yes | done |
 | Circles, arcs and polylines in the editor | yes | yes | yes: drawn by hand (Graphics toolbar), picked, moved, deleted and exported like other drawings | done |
-| Dimensions in the editor | yes | yes | partly: kept from imports (drawn by their block), not drawn by hand | later |
+| Dimensions in the editor | yes | yes | yes: kept from imports (drawn by their block), and drawn by hand with the Dimension tool (Graphics toolbar: two points, then the dimension line); picked, moved, deleted, saved and exported to PDF, SVG and DXF like other drawings | done (#317) |
 | Find and replace texts, tags and wire numbers across the project | yes | yes | yes: Edit → Find (Ctrl+F), `wiringcraft find` | done (#109) |
 | Macros / window macros (save and insert groups) | yes | yes | yes | done |
 | Macro placeholders and value sets (one macro, several variants) | yes | partly | partly: `{{name}}` placeholders in a macro's device descriptions, parts, accessories and properties, wire cross-section, colour and type, and drawn texts, filled from a named value set chosen at insert (Insert > Macro, the assistant, `wiringcraft macro place --set`); placeholders and value sets are written in the macro file, not yet edited in the app | done (#272) |
