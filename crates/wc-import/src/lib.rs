@@ -12,6 +12,7 @@ pub mod edz;
 pub mod eplan;
 pub mod kicad;
 pub mod pdf;
+mod pdf_codecs;
 pub mod qet;
 pub mod raster;
 pub mod svg;

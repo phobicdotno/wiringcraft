@@ -2846,6 +2846,15 @@ fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str) -> Resul
                     "page {}: scanned sheet saved as {file}, shown under the page",
                     first_page + i
                 );
+                if let Some(warning) = &t.scan_warning {
+                    // The reason can quote the file: written so it cannot send control sequences.
+                    eprintln!(
+                        "warning: {} page {}: the scanned sheet was read only in part ({})",
+                        source,
+                        i + 1,
+                        escape_field(warning)
+                    );
+                }
                 Some(wc_core::Underlay {
                     file,
                     min: scan.min,
