@@ -39,6 +39,9 @@ pub struct Options {
     pub unreadable: BTreeMap<String, String>,
     /// Panel layouts printed after the schematic pages, one sheet each.
     pub panels: Vec<wc_core::panel::Panel>,
+    /// PLC cards drawn after the panel layouts, one card per sheet (more for a long card),
+    /// with a terminal per channel and the point drawn there (#437).
+    pub plc_cards: Vec<wc_report::PlcCardSheet>,
 }
 
 impl Default for Options {
@@ -51,6 +54,7 @@ impl Default for Options {
             underlays: BTreeMap::new(),
             unreadable: BTreeMap::new(),
             panels: Vec::new(),
+            plc_cards: Vec::new(),
         }
     }
 }
@@ -117,7 +121,19 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             .collect()
     };
     let (front_pages, back_pages) = (split(true), split(false));
-    let total = front_pages.len() + pages.len() + options.panels.len() + back_pages.len();
+    // Each drawn card sheet: (card, first row, part, parts).
+    let card_size = layout::card_size(first_size, project.meta.template.band_height());
+    let card_rows = layout::card_rows_per_page(card_size, project.meta.template.band_height());
+    let card_pages: Vec<(usize, usize, usize, usize)> = options
+        .plc_cards
+        .iter()
+        .enumerate()
+        .flat_map(|(ci, card)| {
+            let n = layout::card_rows_of(card).len().div_ceil(card_rows).max(1);
+            (0..n).map(move |k| (ci, k * card_rows, k + 1, n))
+        })
+        .collect();
+    let total = front_pages.len() + pages.len() + options.panels.len() + card_pages.len() + back_pages.len();
     report.pages = total;
     let mut doc = writer::Doc::new(&project.meta.name);
     let mut sheet = 0;
@@ -193,6 +209,22 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         let mut drawn = layout::draw_panel_page(project, &page, sheet, total, panel, &options.date);
         place_logo(&mut drawn, &page);
         doc.add_page(first_size.mm(), &format!("{} {}", page.number, panel.name), drawn);
+        sheet += 1;
+    }
+    // Drawn PLC cards follow the panel layouts.
+    for (k, &(ci, first, part, parts)) in card_pages.iter().enumerate() {
+        let Some(card) = options.plc_cards.get(ci) else {
+            continue;
+        };
+        let mut page = wc_core::Page::new(
+            format!("plc-card-{ci}-{part}"),
+            format!("C{}", k + 1),
+            format!("PLC card {}", card.card),
+        );
+        page.size = card_size;
+        let mut drawn = layout::draw_card_page(project, &page, sheet, total, card, first, (part, parts), &options.date);
+        place_logo(&mut drawn, &page);
+        doc.add_page(card_size.mm(), &format!("{} {}", page.number, page.title), drawn);
         sheet += 1;
     }
     add_reports(&mut doc, back_pages, &mut sheet);

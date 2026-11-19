@@ -1051,11 +1051,16 @@ fn column_widths(t: &wc_report::Table, avail: f64) -> Vec<f64> {
 
 /// Cut text to fit a width, marking the cut with "...".
 fn fit(s: &str, width: f64) -> String {
-    if text_width_mm(s, TABLE_TEXT) <= width {
+    fit_at(s, width, TABLE_TEXT)
+}
+
+/// `s` cut short with "..." so that, drawn `height` mm high, it is at most `width` mm wide.
+pub(crate) fn fit_at(s: &str, width: f64, height: f64) -> String {
+    if text_width_mm(s, height) <= width {
         return s.to_owned();
     }
     let mut out: String = s.to_owned();
-    while !out.is_empty() && text_width_mm(&format!("{out}..."), TABLE_TEXT) > width {
+    while !out.is_empty() && text_width_mm(&format!("{out}..."), height) > width {
         out.pop();
     }
     format!("{out}...")
@@ -1144,6 +1149,214 @@ pub fn draw_table_page(
     if table.rows.is_empty() {
         pen.colour(0.45, 0.45, 0.45);
         pen.text((x0 + CELL_PAD, y + ROW_H - 1.4), TABLE_TEXT, 0, "Nothing to list.");
+    }
+    Drawn {
+        ops: pen.ops,
+        links,
+        prims: pen.prims,
+        layers: pen.layers,
+        underlay: None,
+        pictures: Vec::new(),
+    }
+}
+
+/// Height of one channel row on a drawn PLC card sheet, in mm.
+const CARD_ROW: f64 = 6.0;
+/// Text height on a drawn PLC card sheet, in mm.
+const CARD_TEXT: f64 = 2.5;
+/// Where the channel rows start below the top of the drawing area, in mm (room for the heading).
+const CARD_TOP: f64 = 22.0;
+/// Width, in mm, of the page column of a drawn PLC card, right-aligned at its edge.
+pub const CARD_PAGE: f64 = 12.0;
+
+/// How many rows of a drawn PLC card fit on one sheet of `size` (at least one: use
+/// [`card_size`] for a sheet with room for one).
+pub fn card_rows_per_page(size: PageSize, band: f64) -> usize {
+    (card_rows(size, band).floor() as usize).max(1)
+}
+
+/// How many rows of a drawn PLC card the sheet height leaves room for, before rounding down.
+fn card_rows(size: PageSize, band: f64) -> f64 {
+    let (_, h) = size.mm();
+    (h - 2.0 * MARGIN - HEADER - band - CARD_TOP - 14.0) / CARD_ROW
+}
+
+/// The narrowest room, in mm, the device, description and connection columns of a drawn PLC
+/// card need beside the card box and its terminal leads.
+const CARD_MIN_ROOM: f64 = 100.0;
+
+/// Where a drawn PLC card's point columns start and end on a sheet `w` mm wide: past the card
+/// box and the lead to its terminal, up to the right margin.
+fn card_point_columns(w: f64) -> (f64, f64) {
+    let x0 = MARGIN + 6.0;
+    (x0 + 58.0 + 18.0, w - MARGIN - 6.0)
+}
+
+/// Where the device, description, connection and page fields of a drawn PLC card start on a
+/// sheet `w` mm wide; the page field is right-aligned at its position.
+pub fn card_field_x(w: f64) -> [f64; 4] {
+    let (lead, x1) = card_point_columns(w);
+    let room = x1 - lead;
+    [lead + 2.0, lead + room * 0.2, lead + room * 0.55, x1 - 2.0]
+}
+
+/// The sheet size for drawn PLC cards: `wanted` (the first schematic page's) when it has room
+/// for the heading and a card row above the title block and is wide enough for the point
+/// columns, else the smallest named size that is.
+pub fn card_size(wanted: PageSize, band: f64) -> PageSize {
+    std::iter::once(wanted)
+        .chain(PageSize::NAMED)
+        .find(|s| {
+            let (lead, x1) = card_point_columns(s.mm().0);
+            card_rows(*s, band) >= 1.0 && x1 - lead >= CARD_MIN_ROOM
+        })
+        .unwrap_or(PageSize::A3)
+}
+
+/// The rows of a drawn PLC card: each channel with the point drawn there (`None` for a spare),
+/// a channel with several points on one row each.
+pub fn card_rows_of(card: &wc_report::PlcCardSheet) -> Vec<(&wc_report::CardChannel, Option<&wc_report::CardPoint>)> {
+    card.channels
+        .iter()
+        .flat_map(|ch| {
+            let points: Vec<Option<&wc_report::CardPoint>> = if ch.points.is_empty() {
+                vec![None]
+            } else {
+                ch.points.iter().map(Some).collect()
+            };
+            points.into_iter().map(move |p| (ch, p))
+        })
+        .collect()
+}
+
+/// A drawn PLC card overview sheet (#437): the card as a box with a terminal per channel, its
+/// channel number and address inside, and the device, description, connection and page of the
+/// point drawn there beside it. Rows `first..` that fit, part `part.0` of `part.1`; a row with a
+/// drawn point links to its page.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_card_page(
+    project: &Project,
+    page: &Page,
+    index: usize,
+    total: usize,
+    card: &wc_report::PlcCardSheet,
+    first: usize,
+    part: (usize, usize),
+    date: &str,
+) -> Drawn {
+    let (w, h) = page.size.mm();
+    let mut pen = Pen::new(h);
+    pen.ops.push_str("1 J 1 j\n");
+    pen.colour(0.0, 0.0, 0.0);
+    frame(&mut pen, project, page, index, total, date);
+    let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
+    let top = MARGIN + HEADER + 10.0;
+    let mut heading = format!("PLC card {}", card.card);
+    if part.1 > 1 {
+        heading.push_str(&format!(" ({} / {})", part.0, part.1));
+    }
+    pen.text((x0, top), 4.0, 0, &heading);
+    let mut about = vec![];
+    if !card.rack.is_empty() {
+        about.push(format!("Rack {}", card.rack));
+    }
+    about.push(format!("slot {}", card.slot));
+    if !card.kind.is_empty() && card.kind != card.card {
+        about.push(card.kind.clone());
+    }
+    about.push(format!("{} channels", card.channels.len()));
+    pen.colour(0.35, 0.35, 0.35);
+    pen.text((x0, top + 6.0), CARD_TEXT, 0, &about.join(", "));
+    pen.colour(0.0, 0.0, 0.0);
+    let rows = card_rows_of(card);
+    let per = card_rows_per_page(page.size, project.meta.template.band_height());
+    let shown: Vec<_> = rows.iter().skip(first).take(per).collect();
+    // Column positions: the card box, the wire to the terminal, then the point's fields.
+    let (bx0, bx1) = (x0 + 8.0, x0 + 58.0);
+    let (lead, _) = card_point_columns(w);
+    let [dev_x, desc_x, conn_x, page_x] = card_field_x(w);
+    let y0 = top + CARD_TOP - CARD_ROW;
+    // Column heads.
+    pen.colour(0.35, 0.35, 0.35);
+    for (x, align, text) in [
+        (bx0 + 2.0, 0, "Channel"),
+        (bx1 - 4.0, 2, "Address"),
+        (dev_x, 0, "Device"),
+        (desc_x, 0, "Description"),
+        (conn_x, 0, "Connected to"),
+        (page_x, 2, "Page"),
+    ] {
+        pen.text((x, y0 - 2.0), TABLE_TEXT, align, text);
+    }
+    pen.colour(0.0, 0.0, 0.0);
+    let mut links = Vec::new();
+    let mut last_channel = None;
+    for (k, (ch, point)) in shown.iter().enumerate() {
+        let y = y0 + CARD_ROW * k as f64;
+        let mid = y + CARD_ROW / 2.0;
+        let base = mid + CARD_TEXT / 2.0 - 0.3;
+        // A channel with several points shows its number and terminal once.
+        if last_channel != Some(ch.channel) {
+            pen.text((bx0 + 2.0, base), CARD_TEXT, 0, &ch.channel.to_string());
+            pen.text((bx1 - 4.0, base), CARD_TEXT, 2, &ch.address);
+            pen.width(0.25);
+            pen.circle((bx1, mid), 1.2, false);
+            if k > 0 {
+                pen.colour(0.75, 0.75, 0.75);
+                pen.width(0.12);
+                pen.line((bx0, y), (bx1, y));
+                pen.colour(0.0, 0.0, 0.0);
+            }
+        }
+        last_channel = Some(ch.channel);
+        let Some(point) = point else {
+            pen.colour(0.55, 0.55, 0.55);
+            pen.text((dev_x, base), CARD_TEXT, 0, "spare");
+            pen.colour(0.0, 0.0, 0.0);
+            continue;
+        };
+        pen.width(0.25);
+        pen.line((bx1 + 1.2, mid), (lead, mid));
+        // Cut to fit at the height they are drawn at, so none runs into the next column.
+        pen.text(
+            (dev_x, base),
+            CARD_TEXT,
+            0,
+            &fit_at(&point.device, desc_x - dev_x - 2.0, CARD_TEXT),
+        );
+        pen.text(
+            (desc_x, base),
+            CARD_TEXT,
+            0,
+            &fit_at(&point.description, conn_x - desc_x - 2.0, CARD_TEXT),
+        );
+        pen.text(
+            (conn_x, base),
+            CARD_TEXT,
+            0,
+            &fit_at(&point.connected, page_x - CARD_PAGE - 2.0 - conn_x, CARD_TEXT),
+        );
+        pen.text(
+            (page_x, base),
+            CARD_TEXT,
+            2,
+            &fit_at(&point.page_number, CARD_PAGE, CARD_TEXT),
+        );
+        if !point.page_id.is_empty() {
+            links.push(Link {
+                min: (lead, y),
+                max: (x1, y + CARD_ROW),
+                target_page_id: point.page_id.clone(),
+            });
+        }
+    }
+    // The card itself: a box around its channel rows on this sheet.
+    let y1 = y0 + CARD_ROW * shown.len().max(1) as f64;
+    pen.width(0.5);
+    pen.rect((bx0, y0), (bx1, y1));
+    if card.channels.is_empty() {
+        pen.colour(0.45, 0.45, 0.45);
+        pen.text((dev_x, y0 + CARD_ROW - 1.4), CARD_TEXT, 0, "No channels.");
     }
     Drawn {
         ops: pen.ops,

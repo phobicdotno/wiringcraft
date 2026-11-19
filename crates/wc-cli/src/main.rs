@@ -1897,15 +1897,21 @@ fn run(cli: Cli) -> Res<()> {
             // list of one without networks, so it does not gain an empty page; naming
             // `plc-cards` or `networks` prints it anyway.
             let named = |k: wc_report::Kind| reports.iter().any(|r| r == k.name());
-            let tables = report_kinds(&reports)?
+            let kinds: Vec<wc_report::Kind> = report_kinds(&reports)?
                 .into_iter()
                 .filter(|k| match k {
                     wc_report::Kind::PlcCards => named(*k) || !p.meta.racks.is_empty(),
                     wc_report::Kind::Networks => named(*k) || !p.meta.networks.is_empty(),
                     _ => true,
                 })
-                .map(|k| wc_report::build(k, &inputs))
                 .collect();
+            // The PLC card overview is printed as a table and as a drawn sheet per card.
+            let plc_cards = if kinds.contains(&wc_report::Kind::PlcCards) {
+                wc_report::plc_card_sheets(&inputs)
+            } else {
+                Vec::new()
+            };
+            let tables = kinds.into_iter().map(|k| wc_report::build(k, &inputs)).collect();
             let pictures = wc_pdf::read_pictures(dir, &p);
             let (bytes, report) = wc_pdf::export(
                 &p,
@@ -1918,6 +1924,7 @@ fn run(cli: Cli) -> Res<()> {
                     underlays: pictures.files,
                     unreadable: pictures.unreadable,
                     panels: p.panels.clone(),
+                    plc_cards,
                 },
             );
             write_out(&out, bytes).map_err(e)?;
@@ -5181,6 +5188,18 @@ mod tests {
         save(&dir, &p).unwrap();
         assert_eq!(load(&dir).unwrap().meta.racks, p.meta.racks);
         assert!(has_overview("all"));
+        // The card is drawn on a sheet of its own too, but only with the PLC card overview.
+        let drawn: String = std::iter::once("<".to_string())
+            .chain("PLC card slot 1".bytes().map(|b| format!("{b:02X}")))
+            .chain(std::iter::once(">".to_string()))
+            .collect();
+        let pdf = |report: &str| {
+            let out = dir.join("out.pdf");
+            cli(&dir, &["pdf", out.to_str().unwrap(), "--report", report]).unwrap();
+            String::from_utf8_lossy(&std::fs::read(&out).unwrap()).into_owned()
+        };
+        assert!(pdf("plc-cards").contains(&drawn));
+        assert!(!pdf("parts").contains(&drawn));
     }
 
     #[test]

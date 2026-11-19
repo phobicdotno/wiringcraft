@@ -32,7 +32,10 @@ pub use marking::{
     marking_list_with, parse_kinds, parse_lines, terminal_strips, to_smartscript_csv,
 };
 pub use network::{network_list, network_warnings};
-pub use plc::{PlcVariables, plc_card_overview, plc_rack_warnings, plc_variables};
+pub use plc::{
+    CardChannel, CardPoint, PlcCardSheet, PlcVariables, plc_card_overview, plc_card_sheets, plc_rack_warnings,
+    plc_variables,
+};
 
 /// A finished report: a title, column headings and rows of text.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
