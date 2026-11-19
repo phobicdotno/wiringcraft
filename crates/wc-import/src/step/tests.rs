@@ -88,6 +88,19 @@ fn metres_and_inches_are_turned_into_millimetres() {
                  #990=SHAPE_REPRESENTATION('points',(#1,#2),#905);";
     let (s, _) = size(&step(inches, loose));
     assert!((s.width - 25.4).abs() < 1e-9 && (s.depth - 76.2).abs() < 1e-9, "{s:?}");
+    // A 2D vertex in the millimetre context is not measured, so it does not pick the unit.
+    let flat = loose
+        .replace(
+            "#882=SHAPE_REPRESENTATION('other',(#31),#880);",
+            "#4=CARTESIAN_POINT('',(0.,0.));#5=VERTEX_POINT('',#4);\n#882=SHAPE_REPRESENTATION('other',(#5),#880);",
+        )
+        .replace(
+            "GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNIT_ASSIGNED_CONTEXT((#881))",
+            "GEOMETRIC_REPRESENTATION_CONTEXT(2)GLOBAL_UNIT_ASSIGNED_CONTEXT((#881))",
+        );
+    assert!(flat.contains("#5=VERTEX_POINT") && flat.contains("CONTEXT(2)"));
+    let (s, _) = size(&step(inches, &flat));
+    assert!((s.width - 25.4).abs() < 1e-9 && (s.depth - 76.2).abs() < 1e-9, "{s:?}");
     // And the other way round: the shape in the millimetre context is read in millimetres.
     let shape_mm = "#990=ADVANCED_BREP_SHAPE_REPRESENTATION('part',(#2),#880);";
     let (s, _) = size(&step(

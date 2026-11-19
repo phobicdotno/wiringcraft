@@ -101,9 +101,6 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     if unread > 0 {
         warnings.push(format!("{unread} entities could not be read and were left out"));
     }
-    let (mm, unit_warning) = length_unit(text, &instances);
-    warnings.extend(unit_warning);
-
     let point = |id: u64| -> Option<[f64; 3]> {
         let (name, args) = simple(&instances, id)?;
         (name == "CARTESIAN_POINT").then_some(())?;
@@ -111,14 +108,17 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     };
 
     let mut pts: Vec<[f64; 3]> = Vec::new();
+    // The instances whose points are measured: their representations pick the length unit.
+    let mut measured: BTreeSet<u64> = BTreeSet::new();
     let mut vertices = 0usize;
-    for inst in instances.values() {
+    for (id, inst) in &instances {
         for (name, args) in inst {
             if name == "VERTEX_POINT"
                 && let Some(p) = args.get(1).and_then(Value::as_ref_id).and_then(point)
             {
                 pts.push(p);
                 vertices += 1;
+                measured.insert(*id);
             }
         }
     }
@@ -126,37 +126,46 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     // a B-rep's round edges, and are the geometry of a wireframe model without vertices.
     let mut curves: Vec<[f64; 3]> = Vec::new();
     let mut doubtful = 0usize;
-    for inst in instances.values() {
+    for (id, inst) in &instances {
         for (name, args) in inst {
-            match name.as_str() {
-                "CIRCLE" | "ELLIPSE" => {
-                    if let Some((extent, unsure)) = conic_extent(&instances, name, args, &point) {
-                        curves.extend(extent);
+            let found: Vec<[f64; 3]> = match name.as_str() {
+                "CIRCLE" | "ELLIPSE" => match conic_extent(&instances, name, args, &point) {
+                    Some((extent, unsure)) => {
                         doubtful += usize::from(unsure);
+                        extent.to_vec()
                     }
-                }
+                    None => Vec::new(),
+                },
                 // Simple instances name the curve first: (name, degree, points, ...); in a
                 // complex instance B_SPLINE_CURVE(degree, points, ...) has no name.
                 "B_SPLINE_CURVE_WITH_KNOTS" | "BEZIER_CURVE" | "UNIFORM_CURVE" | "QUASI_UNIFORM_CURVE"
                     if inst.len() == 1 =>
                 {
-                    curves.extend(curve_points(args.get(2), &point));
+                    curve_points(args.get(2), &point)
                 }
-                "B_SPLINE_CURVE" => curves.extend(curve_points(args.get(1), &point)),
+                "B_SPLINE_CURVE" => curve_points(args.get(1), &point),
                 // A wireframe's straight edges: its corner points.
-                "POLYLINE" => curves.extend(curve_points(args.get(1), &point)),
-                _ => {}
+                "POLYLINE" => curve_points(args.get(1), &point),
+                _ => Vec::new(),
+            };
+            if !found.is_empty() {
+                measured.insert(*id);
+                curves.extend(found);
             }
         }
     }
     if vertices == 0 {
         // Tessellated models (AP242) list their coordinates.
-        for inst in instances.values() {
+        for (id, inst) in &instances {
             for (name, args) in inst {
                 if name == "COORDINATES_LIST"
                     && let Some(list) = args.get(2).and_then(Value::as_list)
                 {
+                    let before = pts.len();
                     pts.extend(list.iter().filter_map(coords));
+                    if pts.len() > before {
+                        measured.insert(*id);
+                    }
                 }
             }
         }
@@ -176,18 +185,21 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
             .filter(|(name, _)| name == "AXIS2_PLACEMENT_3D")
             .filter_map(|(_, args)| args.get(1).and_then(Value::as_ref_id))
             .collect();
-        pts.extend(
-            instances
-                .iter()
-                .filter(|(id, _)| !origins.contains(id))
-                .filter_map(|(id, _)| point(*id)),
-        );
+        for id in instances.keys().filter(|id| !origins.contains(id)) {
+            if let Some(p) = point(*id) {
+                pts.push(p);
+                measured.insert(*id);
+            }
+        }
     }
     if pts.is_empty() {
         return Err(Error::Format(
             "the model has no 3D geometry WiringCraft can measure".into(),
         ));
     }
+
+    let (mm, unit_warning) = length_unit(text, &instances, &measured);
+    warnings.extend(unit_warning);
 
     let placed = instances
         .values()
@@ -347,7 +359,7 @@ fn unit(v: [f64; 3]) -> Option<[f64; 3]> {
 /// geometry's contexts assign (`GLOBAL_UNIT_ASSIGNED_CONTEXT`) count; only a file without such
 /// a context falls back to every length unit it defines (a conversion-based unit names its base
 /// unit too, so that would find both).
-fn length_unit(text: &str, instances: &BTreeMap<u64, Instance>) -> (f64, Option<String>) {
+fn length_unit(text: &str, instances: &BTreeMap<u64, Instance>, measured: &BTreeSet<u64>) -> (f64, Option<String>) {
     // The shape representations (with items) and the contexts they are drawn in; when none is
     // named, every context that assigns units.
     let representations: Vec<(Vec<u64>, u64)> = instances
@@ -392,7 +404,7 @@ fn length_unit(text: &str, instances: &BTreeMap<u64, Instance>) -> (f64, Option<
         .any(|w| w[0].len() != w[1].len() || w[0].iter().zip(&w[1]).any(|(a, b)| (a - b).abs() > a.abs() * 1e-9));
     if differ {
         // The contexts disagree: keep those whose representation reaches the measured geometry.
-        let reaching = geometry_contexts(text, instances, &representations);
+        let reaching = geometry_contexts(text, measured, &representations);
         if !reaching.is_empty() {
             used_contexts = reaching;
         }
@@ -430,47 +442,9 @@ fn length_unit(text: &str, instances: &BTreeMap<u64, Instance>) -> (f64, Option<
     }
 }
 
-/// The contexts of the representations whose items lead, by references, to the geometry that
-/// is measured. Only run when contexts disagree, as it scans every instance's references.
-fn geometry_contexts(text: &str, instances: &BTreeMap<u64, Instance>, representations: &[(Vec<u64>, u64)]) -> Vec<u64> {
-    let geometry: BTreeSet<u64> = instances
-        .iter()
-        .filter(|(_, inst)| {
-            inst.iter().any(|(name, _)| {
-                matches!(
-                    name.as_str(),
-                    "VERTEX_POINT"
-                        | "CIRCLE"
-                        | "ELLIPSE"
-                        | "POLYLINE"
-                        | "COORDINATES_LIST"
-                        | "B_SPLINE_CURVE"
-                        | "B_SPLINE_CURVE_WITH_KNOTS"
-                        | "BEZIER_CURVE"
-                        | "UNIFORM_CURVE"
-                        | "QUASI_UNIFORM_CURVE"
-                )
-            })
-        })
-        .map(|(id, _)| *id)
-        .collect();
-    // Loose points are measured too when nothing else is there: every point that is not the
-    // origin of a placement.
-    let origins: BTreeSet<u64> = instances
-        .values()
-        .flatten()
-        .filter(|(name, _)| name == "AXIS2_PLACEMENT_3D")
-        .filter_map(|(_, args)| args.get(1).and_then(Value::as_ref_id))
-        .collect();
-    let mut geometry = geometry;
-    if geometry.is_empty() {
-        geometry.extend(
-            instances
-                .iter()
-                .filter(|(id, inst)| !origins.contains(id) && inst.iter().any(|(name, _)| name == "CARTESIAN_POINT"))
-                .map(|(id, _)| *id),
-        );
-    }
+/// The contexts of the representations whose items lead, by references, to the instances that
+/// were measured (`geometry`). Only run when contexts disagree, as it scans every instance's references.
+fn geometry_contexts(text: &str, geometry: &BTreeSet<u64>, representations: &[(Vec<u64>, u64)]) -> Vec<u64> {
     let mut links: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for statement in statements(text) {
         let Some((id, body)) = statement.trim().strip_prefix('#').and_then(|r| r.split_once('=')) else {
