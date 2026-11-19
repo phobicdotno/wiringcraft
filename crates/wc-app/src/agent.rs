@@ -2911,11 +2911,17 @@ mod tests {
         let dir = tmp.path().join("broken");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".git"), "not a repository").unwrap();
+        let opening = crate::state::Open::load(&dir).err().map(|e| e.to_string());
         a.finish_new_project(&dir, false);
         let Some(Dialog::Message(m)) = &a.dialog else {
             unreachable!("no message")
         };
         assert!(m.contains("Could not open"), "{m}");
+        let opening = opening.unwrap_or_default();
+        assert!(
+            !opening.is_empty() && m.contains(&opening),
+            "the reason it did not open, {opening:?}: {m}"
+        );
         assert!(m.contains("could not be recorded"), "{m}");
         assert!(m.contains("invalid gitfile format"), "git's reason: {m}");
     }
