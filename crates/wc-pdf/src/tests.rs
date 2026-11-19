@@ -2221,10 +2221,16 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
                 address: "10.0.0.1".into(),
                 ..Node::default()
             },
-            // Nor does text holding the marker of a blank node's internal name.
+            // Nor does text holding the marker of a blank node's internal name, or text close
+            // to it: each keeps a box of its own.
             Node {
-                device: "\u{1}3".into(),
+                device: "\u{1}4".into(),
                 address: "10.0.0.3".into(),
+                ..Node::default()
+            },
+            Node {
+                device: "\u{FFFD}4".into(),
+                address: "10.0.0.4".into(),
                 ..Node::default()
             },
             Node {
@@ -2234,23 +2240,35 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
                 ..Node::default()
             },
         ],
-        links: vec![wc_core::network::Link {
-            from: "(node 2)".into(),
-            to: "-K1:P1".into(),
-            ..Default::default()
-        }],
+        links: vec![
+            wc_core::network::Link {
+                from: "(node 2)".into(),
+                to: "-K1:P1".into(),
+                ..Default::default()
+            },
+            wc_core::network::Link {
+                from: "\u{FFFD}4".into(),
+                to: "-K1:P2".into(),
+                ..Default::default()
+            },
+        ],
         ..Network::default()
     };
+    // Four nodes and -K1: five boxes, none merged, and both links drawn.
+    let topo = crate::topology::layout_network(&net);
+    assert_eq!(topo.boxes.len(), 5, "{:?}", topo.boxes);
+    assert!(topo.unplaced.is_empty());
     let opts = Options {
         networks: vec![net],
         ..Default::default()
     };
     let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
     let text = String::from_utf8_lossy(&pdf);
-    assert_eq!(text.matches(&writer::pdf_text("(node 3)")).count(), 1);
+    assert_eq!(text.matches(&writer::pdf_text("(node 4)")).count(), 1);
     assert!(text.contains(&writer::pdf_text("(node 2)")));
     assert!(text.contains(&writer::pdf_text("10.0.0.1")));
     assert!(text.contains(&writer::pdf_text("10.0.0.3")));
+    assert!(text.contains(&writer::pdf_text("10.0.0.4")));
     assert!(text.contains(&writer::pdf_text("192.168.0.2")));
     assert!(text.contains(&writer::pdf_text("drive-07")));
     assert!(!text.contains(&writer::pdf_text("No devices on this network.")));
@@ -2258,7 +2276,7 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
         report
             .warnings
             .iter()
-            .any(|w| w.starts_with("network PN3: node 3 is not a device tag")),
+            .any(|w| w.starts_with("network PN3: node 4 is not a device tag")),
         "{:?}",
         report.warnings
     );

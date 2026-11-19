@@ -51,10 +51,10 @@ fn node_key(s: &str) -> String {
     }
 }
 
-/// Text that is not a tag, trimmed, with any [`BLANK`] replaced so that it can never be taken
-/// for the name of a blank-tag node.
+/// Text that is not a tag, trimmed, with each [`BLANK`] doubled: distinct texts stay distinct,
+/// and none can be taken for the name of a blank-tag node (one [`BLANK`] then digits).
 fn as_text(s: &str) -> String {
-    s.trim().replace(BLANK, "\u{FFFD}")
+    s.trim().replace(BLANK, &format!("{BLANK}{BLANK}"))
 }
 
 /// Starts the box name of a node with a blank tag. Tags never contain it and [`as_text`]
@@ -72,8 +72,8 @@ fn node_name(i: usize, n: &wc_core::network::Node) -> String {
 /// How a box name is printed: a blank-tag node as `(node N)`.
 fn shown(name: &str) -> String {
     match name.strip_prefix(BLANK) {
-        Some(n) => format!("(node {n})"),
-        None => name.to_owned(),
+        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => format!("(node {n})"),
+        _ => name.replace(&format!("{BLANK}{BLANK}"), &BLANK.to_string()),
     }
 }
 
