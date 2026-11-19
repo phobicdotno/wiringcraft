@@ -896,6 +896,27 @@ impl AppTools<'_> {
     /// holds, and the state to go back to. `None` when nobody holds a page; for undo and redo
     /// (the tool, or the action), which the session's host carries out and checks itself; and
     /// for `open_project`, which replaces the project instead of changing it.
+    /// The open project's folder and undo mark, to tell after a tool whether it changed the
+    /// project.
+    fn undo_mark(&self) -> Option<(PathBuf, usize)> {
+        self.0.open.as_ref().map(|o| (o.dir.clone(), o.undo_mark()))
+    }
+
+    /// A guest's change is only kept once the host accepts it: the host refuses it when
+    /// someone else has its page open by then, which the guest may not know of yet. A tool
+    /// that changed the project (its undo mark moved since `before`) says so in its answer.
+    fn pending_note(&self, before: Option<(PathBuf, usize)>, r: Result<String, String>) -> Result<String, String> {
+        let changed = before.is_some_and(|b| self.undo_mark().is_some_and(|now| now.0 == b.0 && now.1 != b.1));
+        match r {
+            Ok(out) if changed && self.0.share.active() && !self.0.share.is_host() => Ok(format!(
+                "{out}\n\nPending: in this shared session the change is kept only once the host accepts it. \
+                 If someone else opened the page meanwhile, the host refuses it and it is taken back here; \
+                 read the page again before building on it."
+            )),
+            r => r,
+        }
+    }
+
     fn held_guard(&mut self, name: &str, input: &Value) -> Option<HeldGuard> {
         let undoes = match name {
             "undo" | "open_project" => true,
@@ -969,6 +990,7 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
+        let mark = self.undo_mark();
         let guard = self.held_guard(name, input);
         let read = self.0.assistant.graphics_read.clone();
         let r = self.0.agent_tool(name, input);
@@ -979,7 +1001,7 @@ impl wc_agent::Tools for AppTools<'_> {
         }
         // Items the assistant removed must not stay selected.
         self.0.prune_selection();
-        r
+        self.pending_note(mark, r)
     }
 
     fn start(&mut self, name: &str, input: &Value) -> Started {
@@ -987,6 +1009,7 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
+        let mark = self.undo_mark();
         let guard = self.held_guard(name, input);
         let read = self.0.assistant.graphics_read.clone();
         match self.0.agent_start(name, input) {
@@ -996,7 +1019,7 @@ impl wc_agent::Tools for AppTools<'_> {
                     self.0.assistant.graphics_read = read;
                 }
                 self.0.prune_selection();
-                Started::Done(r)
+                Started::Done(self.pending_note(mark, r))
             }
             running => {
                 // A tool that runs on in the background is not checked here (its result is
@@ -4278,6 +4301,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(graphics(&a), vec![rect, line(2.0), line(4.0)]);
+    }
+
+    #[test]
+    fn a_guests_tool_edit_says_it_waits_for_the_host_and_is_taken_back_when_refused() {
+        let line = Shape::Line {
+            a: Point::new(1.0, 0.0),
+            b: Point::new(1.0, 5.0),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut h, _log, mut host_open, mut g, mut guest_open) = crate::share::tests::session(tmp.path()).unwrap();
+        crate::share::tests::frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0001"));
+        let (_tmp, mut a) = app(vec![]);
+        a.open = Some(guest_open);
+        a.share = g;
+        a.ed.page = 0;
+        a.sync_session_now(false);
+        // Reading changes nothing, so nothing waits on the host.
+        let out = call(&mut a, "get_page", json!({"page": "p0003"})).unwrap();
+        assert!(!out.contains("Pending"), "{out}");
+        // The host opens page 3; before that reaches the guest, its assistant draws there.
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        let out = call(&mut a, "add_graphic", json!({"page": "p0003", "shape": line})).unwrap();
+        assert!(out.contains("Pending") && out.contains("host accepts"), "{out}");
+        for _ in 0..4 {
+            a.sync_session_now(false);
+            h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        }
+        let graphics = |o: &Open| o.project.page("p0003").unwrap().graphics.clone();
+        assert!(graphics(&host_open).is_empty(), "the host refused the edit");
+        assert!(
+            graphics(a.open.as_ref().unwrap()).is_empty(),
+            "and it is taken back here"
+        );
+        // Refused outright when the hold is known.
+        let err = call(&mut a, "add_graphic", json!({"page": "p0003", "shape": line})).unwrap_err();
+        assert!(err.contains("Hanna"), "{err}");
+    }
+
+    #[test]
+    fn a_hosts_tool_edit_is_not_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (h, _log, host_open, ..) = crate::share::tests::session(tmp.path()).unwrap();
+        let (_tmp, mut a) = app(vec![]);
+        a.open = Some(host_open);
+        a.share = h;
+        let out = call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        assert!(!out.contains("Pending"), "{out}");
     }
 
     #[test]
