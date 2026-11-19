@@ -3572,6 +3572,35 @@ fn a_page_undo_does_not_put_a_wire_back_on_a_pin_a_later_update_dropped() -> Tes
     Ok(())
 }
 
+#[test]
+fn a_redo_of_a_placement_undone_after_a_library_update_goes_through() -> TestResult {
+    let mut host = Host::new(
+        demo(),
+        "Hanna Host",
+        "hanna@example.com",
+        Box::new(MemoryJournal::default()),
+    );
+    let (v1, v2) = (coil_with(&["A1"]), coil_with(&["A1", "A2"]));
+    host.edit_project(ProjectEdit::AddItems {
+        symbols: vec![(v1.clone(), "starter".into())],
+        parts: vec![],
+    })?;
+    host.open(Some("p0002"))?;
+    let mut page = host.project().page("p0002").ok_or("page")?.clone();
+    place_symbol(&mut page, "k1", 10.0, "coil");
+    host.edit_page(page)?;
+    let placement = host.history().last().ok_or("recorded")?.id;
+    // The update leaves the page as it is: it is drawn with v2 from now on.
+    host.edit_project(update_symbol(&v1, &v2))?;
+    host.revert(placement)?;
+    let undo = host.history().last().ok_or("recorded")?.id;
+    // v2 stayed locked all along: the redo brings back what the undo took away.
+    host.revert(undo)?;
+    let page = host.project().page("p0002").ok_or("page")?;
+    assert_eq!(page.symbols.len(), 1);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn an_update_whose_commit_fails_leaves_the_old_version_saved_and_pinned() -> TestResult {

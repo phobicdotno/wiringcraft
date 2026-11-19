@@ -830,6 +830,7 @@ impl Host {
                 other.join(", ")
             ));
         }
+        let replaced_uses = entry.after.uses(&before.lock);
         // The message names the edit itself: a redo of "Undo X" is "Redo X".
         let what = match kind {
             ChangeKind::Redo => entry
@@ -936,7 +937,9 @@ impl Host {
             message,
             kind,
             Some(id),
-            (entry.after, entry.after_uses),
+            // What it replaced was drawn with the versions locked until now (a library update
+            // since may have moved them on); what it put back was checked against those above.
+            (entry.after, replaced_uses),
             (entry.before, entry.before_uses),
         );
         Ok(())
