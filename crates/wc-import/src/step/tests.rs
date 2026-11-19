@@ -580,3 +580,85 @@ fn a_placement_used_twice_does_not_hide_one_that_failed() {
         "{warnings:?}"
     );
 }
+
+#[test]
+fn geometry_two_representations_share_is_measured_in_both() {
+    // A second part representation (#310) lists the same box vertices as #300; each is placed
+    // once, at x 0 and 30.
+    let vertices: Vec<String> = (1..=8).map(|k| format!("#{}", 2 * k)).collect();
+    let text = assembly(
+        &["#410", "#420"],
+        &format!(
+            "{}{}#310=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#311,{}),#901);\n#311=AXIS2_PLACEMENT_3D('',#321,$,$);\n{}\
+             #510=(REPRESENTATION_RELATIONSHIP('','',#310,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#511) SHAPE_REPRESENTATION_RELATIONSHIP());\n\
+             #511=ITEM_DEFINED_TRANSFORMATION('','',#311,#420);\n",
+            axis(410, [0.0; 3], Z, X),
+            axis(420, [30.0, 0.0, 0.0], Z, X),
+            vertices.join(","),
+            placed_by_relationship(500, 320, 410),
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 40.0,
+            height: 20.0,
+            depth: 5.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_mapped_item_can_target_a_transformation_operator() {
+    // Two uses of the box through operators: one at x 0, one at x 30 turned a quarter about z
+    // (axis1 along y) and scaled by 2, so 40 wide and 20 deep from x 30 back to x -10.
+    let text = assembly(
+        &["#600", "#610"],
+        "#601=REPRESENTATION_MAP(#320,#300);\n\
+         #600=MAPPED_ITEM('',#601,#602);\n\
+         #602=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',$,$,#603,$,$);\n\
+         #603=CARTESIAN_POINT('',(0.,0.,0.));\n\
+         #610=MAPPED_ITEM('',#601,#612);\n\
+         #612=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',#614,$,#613,2.,$);\n\
+         #613=CARTESIAN_POINT('',(30.,0.,0.));\n\
+         #614=DIRECTION('',(0.,1.,0.));\n",
+        "",
+    );
+    let (s, warnings) = size(&text);
+    // x: 0..10 and 30-40..30, so -10..30; y: 0..20 and 0..20; z: 0..5 and 0..10.
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 40.0,
+            height: 20.0,
+            depth: 10.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn an_origin_both_representations_list_does_not_swap_the_placements() {
+    // The parent also lists the part's origin #320; the file keeps the standard order. The
+    // part's x, y and z go to the assembly's y, z and x: swapped, the turn would go the other
+    // way round and give 20 x 5 x 10.
+    let turned = axis(420, [100.0, 0.0, 0.0], X, [0.0, 1.0, 0.0]);
+    let text = assembly(
+        &["#420", "#320"],
+        &format!("{turned}{}", placed_by_relationship(510, 320, 420)),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 5.0,
+            height: 10.0,
+            depth: 20.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}

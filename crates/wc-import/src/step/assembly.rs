@@ -2,12 +2,12 @@
 //! coordinates and places it in its parent with a transformation: a
 //! `REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION` naming an `ITEM_DEFINED_TRANSFORMATION`
 //! between two axis placements, or a `MAPPED_ITEM` that maps a `REPRESENTATION_MAP` onto a
-//! target placement. Here every measured point is moved into the coordinates of the top of the
+//! target placement or transformation operator. Here every measured point is moved into the coordinates of the top of the
 //! assembly, once for every place its part is used, nested assemblies included.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Geom, Instance, NOISE, Value, coords, cross, refs_in, simple, square_to, statements, unit};
+use super::{Geom, Instance, NOISE, Value, coords, cross, dot, refs_in, simple, square_to, statements, unit};
 
 const WITH: &str = "REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION";
 
@@ -18,7 +18,9 @@ const MAX_USES: usize = 10_000;
 /// Most points moved in all; past it a part use counts by the corners of its own box.
 const MAX_POINTS: usize = 2_000_000;
 
-/// A rigid placement: `p' = r p + t`, the columns of `r` being the placed x, y and z axes.
+/// A placement: `p' = r p + t`, the columns of `r` being the placed x, y and z axes. It is
+/// rigid, except where a mapped item's transformation operator scales it; only rigid ones are
+/// inverted.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Placement {
     r: [[f64; 3]; 3],
@@ -111,15 +113,58 @@ pub(super) fn axis_placement(
     (kind == "AXIS2_PLACEMENT_3D").then_some(())?;
     let origin = point(args.get(1)?.as_ref_id()?)?;
     let z = unit(direction(instances, args.get(2))?.unwrap_or([0.0, 0.0, 1.0]))?;
-    let x = match direction(instances, args.get(3))?.and_then(|r| square_to(z, r)) {
-        Some((x, _)) => x,
+    let x = x_axis(z, direction(instances, args.get(3))?)?;
+    let y = cross(z, x);
+    Some(Placement {
+        r: [[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]],
+        t: origin,
+    })
+}
+
+/// The x axis square to the unit axis `z`: the reference direction made square, or, when it is
+/// not given or lies on the axis, the first of the world's x and y that does not.
+fn x_axis(z: [f64; 3], reference: Option<[f64; 3]>) -> Option<[f64; 3]> {
+    match reference.and_then(|r| square_to(z, r)) {
+        Some((x, _)) => Some(x),
         None => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
             .into_iter()
             .filter_map(|r| square_to(z, r))
             .find(|(_, len)| *len > NOISE)
-            .map(|(x, _)| x)?,
+            .map(|(x, _)| x),
+    }
+}
+
+/// The placement a `CARTESIAN_TRANSFORMATION_OPERATOR_3D` stands for, the other target a
+/// mapped item can have: its local origin, axes as the standard derives them (axis3 as z,
+/// axis1 made square to it as x, axis2 made square to both as y) and its scale. The operator's
+/// last five attributes are read, as writers differ in the names before them.
+pub(super) fn operator_placement(
+    instances: &BTreeMap<u64, Instance>,
+    id: u64,
+    point: &impl Fn(u64) -> Option<[f64; 3]>,
+) -> Option<Placement> {
+    let (kind, args) = simple(instances, id)?;
+    (kind == "CARTESIAN_TRANSFORMATION_OPERATOR_3D").then_some(())?;
+    let [axis1, axis2, origin, scale, axis3] = args.get(args.len().checked_sub(5)?..)? else {
+        return None;
     };
-    let y = cross(z, x);
+    let origin = point(origin.as_ref_id()?)?;
+    let scale = match scale {
+        Value::Num(s) if s.is_finite() && *s > 0.0 => *s,
+        Value::Unset => 1.0,
+        _ => return None,
+    };
+    let z = unit(direction(instances, Some(axis3))?.unwrap_or([0.0, 0.0, 1.0]))?;
+    let x = x_axis(z, direction(instances, Some(axis1))?)?;
+    let right = cross(z, x);
+    // A given axis2 keeps its side, so the operator can mirror.
+    let y = direction(instances, Some(axis2))?
+        .and_then(|v| {
+            let (vz, vx) = (dot(v, z), dot(v, x));
+            unit([0, 1, 2].map(|k| v[k] - vz * z[k] - vx * x[k]))
+        })
+        .unwrap_or(right);
+    let [x, y, z] = [x, y, z].map(|a| a.map(|c| c * scale));
     Some(Placement {
         r: [[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]],
         t: origin,
@@ -231,13 +276,20 @@ pub(super) fn place(
         }
         links.push((child, parent, transformation));
     }
-    let item_frame: BTreeMap<u64, u64> = items
-        .iter()
-        .flat_map(|(rep, list)| list.iter().map(move |i| (*i, *rep)))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|(i, rep)| (i, frames.find(rep)))
-        .collect();
+    // Every frame each item is listed in: an item may belong to more than one representation.
+    let mut item_frames: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for (rep, list) in &items {
+        let frame = frames.find(*rep);
+        for i in list {
+            item_frames.entry(*i).or_default().insert(frame);
+        }
+    }
+    // Item `i` is listed in frame `f` and not in `other`.
+    let only_in = |i: u64, f: u64, other: u64| {
+        item_frames
+            .get(&i)
+            .is_some_and(|fs| fs.contains(&f) && !fs.contains(&other))
+    };
 
     // Placements of child frames in their parents.
     let mut children: BTreeMap<u64, Vec<(u64, Placement)>> = BTreeMap::new();
@@ -259,8 +311,9 @@ pub(super) fn place(
             continue;
         };
         // The first item belongs to the child as the standard has it; some writers swap them,
-        // which shows by which representation lists each placement.
-        let swapped = item_frame.get(&a) == Some(&parent) || item_frame.get(&b) == Some(&child);
+        // which shows by which representation lists each placement. An item both list, such as
+        // a shared origin, tells nothing.
+        let swapped = only_in(a, parent, child) || only_in(b, child, parent);
         let (from, to) = if swapped { (b, a) } else { (a, b) };
         if let (Some(from), Some(to)) = (
             axis_placement(instances, from, point),
@@ -287,7 +340,9 @@ pub(super) fn place(
                 let from = axis_placement(instances, map.first()?.as_ref_id()?, point)?;
                 let mapped = map.get(1)?.as_ref_id()?;
                 items.contains_key(&mapped).then_some(())?;
-                let to = axis_placement(instances, args.get(2)?.as_ref_id()?, point)?;
+                let target = args.get(2)?.as_ref_id()?;
+                let to = axis_placement(instances, target, point)
+                    .or_else(|| operator_placement(instances, target, point))?;
                 Some((mapped, from.inverse().then(&to)))
             })();
             if let Some((mapped, placement)) = found {
@@ -317,19 +372,27 @@ pub(super) fn place(
             || named(id, "REPRESENTATION_MAP")
             || named(id, "ITEM_DEFINED_TRANSFORMATION")
     };
-    let mut owner: BTreeMap<u64, u64> = BTreeMap::new();
+    // An item can be listed by more than one representation, so each frame keeps its own
+    // geometry: once in a frame however many paths reach it, but in every frame that reaches it.
+    let mut seen: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
     let reps: Vec<u64> = items.keys().copied().collect();
     for rep in reps {
         let frame = frames.find(rep);
+        let seen = seen.entry(frame).or_default();
         let mut todo: Vec<u64> = items.get(&rep).cloned().unwrap_or_default();
         while let Some(id) = todo.pop() {
-            if stop(id) || owner.contains_key(&id) {
+            if stop(id) || !seen.insert(id) {
                 continue;
             }
-            owner.insert(id, frame);
             if let Some(next) = graph.get(&id) {
-                todo.extend(next.iter().filter(|n| !owner.contains_key(n)));
+                todo.extend(next.iter().filter(|n| !seen.contains(n)));
             }
+        }
+    }
+    let mut owner: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (frame, ids) in &seen {
+        for id in ids {
+            owner.entry(*id).or_default().push(*frame);
         }
     }
     let mut own: BTreeMap<u64, Vec<Geom>> = BTreeMap::new();
@@ -340,7 +403,11 @@ pub(super) fn place(
     };
     for (id, p) in pts {
         match owner.get(&id) {
-            Some(frame) => own.entry(*frame).or_default().push(p),
+            Some(owners) => {
+                for frame in owners {
+                    own.entry(*frame).or_default().push(p);
+                }
+            }
             // Geometry outside every representation stays where it is.
             None => out.points.push(p),
         }
