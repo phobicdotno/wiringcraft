@@ -22,27 +22,8 @@ pub const DEFAULT_DEPTH: f64 = 75.0;
 /// One axis-aligned box: name, min corner and max corner.
 type Block = (String, [f64; 3], [f64; 3]);
 
-/// A part's depth (out of the plate) from its `Depth` property.
-pub fn part_depth(part: &Part) -> Option<f64> {
-    part.properties
-        .iter()
-        .find(|(k, _)| {
-            matches!(
-                k.trim().to_lowercase().as_str(),
-                "depth" | "depth mm" | "tiefe" | "dybde"
-            )
-        })
-        .and_then(|(_, v)| {
-            let s: String = v
-                .trim()
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
-                .map(|c| if c == ',' { '.' } else { c })
-                .collect();
-            s.parse::<f64>().ok()
-        })
-        .filter(|d| d.is_finite() && *d > 0.0 && *d <= 2000.0)
-}
+/// A part's depth (out of the plate): its `Depth` property, else its 3D model's depth.
+pub use wc_core::panel::part_depth;
 
 /// The boxes of a panel layout: plate, rails, ducts and devices.
 fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> Vec<Block> {
