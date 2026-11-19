@@ -1906,6 +1906,8 @@ fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about
         name: "PN2".into(),
         nodes: vec![Node {
             device: "K 10?".into(),
+            address: "192.168.0.2".into(),
+            station: "drive-07".into(),
             ..Node::default()
         }],
         links: vec![
@@ -1940,6 +1942,9 @@ fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about
     assert!(text.contains(&writer::pdf_text("P3 - P4 -W8")));
     // Drawn as written; the warning names the node by number, not by its text.
     assert!(text.contains(&writer::pdf_text("K 10?")));
+    // Its address and station are still drawn in its box.
+    assert!(text.contains(&writer::pdf_text("192.168.0.2")));
+    assert!(text.contains(&writer::pdf_text("drive-07")));
     assert!(
         report.warnings.iter().any(|w| w.starts_with("network PN2: node ")
             && w.ends_with(" is not a device tag: only letters, digits, '.', '_' allowed")),

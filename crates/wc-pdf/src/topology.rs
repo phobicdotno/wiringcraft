@@ -527,7 +527,9 @@ pub fn draw_network_page(
         let (bx, by) = g.spot(*c, *r);
         pen.rect((bx, by), (bx + g.box_w, by + g.box_h));
         let tag = name.parse::<wc_core::DeviceTag>().ok();
-        let node = tag.as_ref().and_then(|t| net.node(t));
+        // Found by the key the box was laid out under, so a node whose tag is not valid
+        // still shows its address and station.
+        let node = net.nodes.iter().find(|n| node_key(&n.device) == *name);
         let description = tag
             .as_ref()
             .and_then(|t| project.devices.get(t))
