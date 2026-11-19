@@ -9,7 +9,7 @@
 //! `run_command` runs any `wiringcraft` command-line command (imports, PLC variable lists,
 //! STEP export, library sources, merges, ...) on the open project.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -2715,6 +2715,12 @@ impl App {
         let mut cmd = std::process::Command::new(&bin);
         self.assistant.command_base = None;
         if let Some(open) = self.open.as_mut() {
+            // In a shared session a page someone else has open is read-only here, and the
+            // command line writes the project folder directly: only commands that read it run.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Some(why) = writes_while_held(&args, &open.dir, &open.held_by_others, &cwd) {
+                return Err(why);
+            }
             if open.dirty {
                 open.save()
                     .map_err(|e| format!("Saving before the command failed: {e}"))?;
@@ -2845,6 +2851,260 @@ fn stem(p: &Path) -> String {
     p.file_stem()
         .map(|s| s.to_string_lossy().trim_end_matches(".macro").to_owned())
         .unwrap_or_default()
+}
+
+/// Why the `wiringcraft` command `args` does not run on the project folder `dir` while others
+/// hold pages (`held`, page id to name): it may change the project, or it names a path into the
+/// project folder (an export written over a page). `None` when it runs: nobody holds a page, or
+/// it only reads the project.
+///
+/// `cwd` is the folder the command runs in, which relative paths are taken from.
+fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String>, cwd: &Path) -> Option<String> {
+    if held.is_empty() {
+        return None;
+    }
+    let mut who: Vec<&str> = held.values().map(String::as_str).collect();
+    who.sort_unstable();
+    who.dedup();
+    let who = who.join(", ");
+    let arg = |i: usize| args.get(i).map(String::as_str);
+    let has = |flag: &str| args.iter().any(|a| a == flag || a.starts_with(&format!("{flag}=")));
+    // Commands that only read the project; their output goes to the screen or to a file.
+    let reads = match (arg(0), arg(1)) {
+        (Some("--help" | "-h" | "help" | "--version" | "nets" | "check" | "report" | "pdf" | "drawing" | "aml"), _)
+        | (Some("export" | "plc-vars" | "inspect"), _) => true,
+        (Some("find"), _) => !has("--replace"),
+        (Some("vcs"), Some("log" | "changes" | "page-log")) => true,
+        (
+            Some(
+                "page" | "panel" | "location" | "jumper" | "strip" | "macro" | "revision" | "template" | "lib"
+                | "comment",
+            ),
+            Some("list" | "show"),
+        ) => true,
+        _ => false,
+    };
+    if !reads || has("-C") || has("--project") {
+        return Some(format!(
+            "`wiringcraft {}` is not run while {who} has a page open in the shared session: the command line \
+             writes the project folder directly, also pages that are read-only here. Make the change with the \
+             drawing tools, or run it once they have left the page.",
+            args.join(" ")
+        ));
+    }
+    let project = Guarded::new(dir);
+    // Run from inside the project folder, even a bare file name could land on a held page: only
+    // a command with nothing after its own words (`check`, `page list`) runs there.
+    let words = match arg(0) {
+        Some("vcs") => 2,
+        _ if matches!(arg(1), Some("list" | "show")) => 2,
+        _ => 1,
+    };
+    let more = args.iter().skip(words).any(|a| !a.starts_with('-'));
+    if more && project.holds(cwd) {
+        return Some(format!(
+            "`wiringcraft {}` is not run while {who} has a page open in the shared session: this program runs \
+             from inside the project folder, so an output file could land on a page. Start it from another folder.",
+            args.join(" ")
+        ));
+    }
+    for a in args {
+        let why = match project.reached_by(cwd, split_flag(a).1) {
+            Ok(false) => continue,
+            Ok(true) => "is in the project folder or links to a file in it".to_owned(),
+            Err(e) => format!("could not be looked through ({e})"),
+        };
+        return Some(format!(
+            "`{a}` {why}, and {who} has a page open in the shared session: write the output to a folder of \
+             its own outside the project folder."
+        ));
+    }
+    None
+}
+
+/// `--name=value` split after its `=`; anything else is all value.
+fn split_flag(a: &str) -> (&str, &str) {
+    match a.find('=') {
+        Some(i) if a.starts_with("--") => a.split_at(i + 1),
+        _ => ("", a),
+    }
+}
+
+/// The project's files, to tell whether a command's output could land on one.
+struct Guarded {
+    /// See [`project_roots`].
+    roots: Vec<PathBuf>,
+    /// Device and file number of each project file, so a hard link to one is known too.
+    #[cfg(unix)]
+    files: std::collections::HashSet<(u64, u64)>,
+}
+
+/// How many files in an output folder are looked at; a bigger folder is not used while a
+/// page is held.
+const OUTPUT_FOLDER_FILES: usize = 10_000;
+
+impl Guarded {
+    fn new(project: &Path) -> Self {
+        let roots = project_roots(project);
+        #[cfg(unix)]
+        let files = {
+            use std::os::unix::fs::MetadataExt;
+            let mut files = std::collections::HashSet::new();
+            let mut todo = roots.clone();
+            while let Some(at) = todo.pop() {
+                let Ok(m) = std::fs::symlink_metadata(&at) else {
+                    continue;
+                };
+                if m.is_dir() {
+                    let entries = std::fs::read_dir(&at).into_iter().flatten().flatten();
+                    todo.extend(entries.filter(|e| e.file_name() != ".git").map(|e| e.path()));
+                } else if m.is_file() {
+                    files.insert((m.dev(), m.ino()));
+                }
+            }
+            files
+        };
+        Self {
+            roots,
+            #[cfg(unix)]
+            files,
+        }
+    }
+
+    /// Whether `path`, as the file system resolves it, is in the project or is one of its
+    /// files under another name.
+    fn holds(&self, path: &Path) -> bool {
+        inside(&self.roots, path) || self.same_file(path)
+    }
+
+    /// Whether `path` is a project file under another name (a hard link to it).
+    #[cfg(unix)]
+    fn same_file(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && self.files.contains(&(m.dev(), m.ino())))
+    }
+
+    /// Hard links are not told apart here.
+    #[cfg(not(unix))]
+    fn same_file(&self, _path: &Path) -> bool {
+        false
+    }
+
+    /// Whether writing to `value` could land on a project file: it is a path into the project
+    /// or a link to a file in it, or it is a folder with such a link in it (an export writes
+    /// its own file names there). `value` counts as a path when it is absolute, clearly a
+    /// path (it has a separator or starts with a dot), or names something in `cwd`. A folder
+    /// that cannot be listed is an error: what is in it is not known.
+    fn reached_by(&self, cwd: &Path, value: &str) -> std::io::Result<bool> {
+        let p = Path::new(value);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else if value.contains('/')
+            || value.contains('\\')
+            || value.starts_with('.')
+            || (!value.is_empty() && std::fs::symlink_metadata(cwd.join(p)).is_ok())
+        {
+            cwd.join(p)
+        } else {
+            return Ok(false);
+        };
+        if self.holds(&path) {
+            return Ok(true);
+        }
+        let mut todo = vec![real(&path)];
+        let mut seen = 0;
+        while let Some(d) = todo.pop() {
+            if !d.is_dir() {
+                continue;
+            }
+            let entries = match std::fs::read_dir(&d) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for e in entries {
+                let e = e?;
+                seen += 1;
+                if seen > OUTPUT_FOLDER_FILES || self.holds(&e.path()) {
+                    return Ok(true);
+                }
+                if e.file_type()?.is_dir() {
+                    todo.push(e.path());
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Whether `path`, as the file system resolves it, is in one of `roots`.
+fn inside(roots: &[PathBuf], path: &Path) -> bool {
+    let path = normalize(&real(path));
+    roots.iter().any(|r| path.starts_with(r))
+}
+
+/// Where the project's files really are: the project folder, and where each link in it
+/// points (a `pages` folder linked to elsewhere is the project's too), followed through
+/// further links. `.git` is left out.
+fn project_roots(project: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![real(project)];
+    let mut todo = vec![project.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            if e.file_name() == ".git" {
+                continue;
+            }
+            if kind.is_symlink() {
+                let Ok(to) = e.path().canonicalize() else { continue };
+                if roots.iter().any(|r| to.starts_with(r)) {
+                    continue;
+                }
+                if to.is_dir() {
+                    todo.push(to.clone());
+                }
+                roots.push(to);
+            } else if kind.is_dir() {
+                todo.push(e.path());
+            }
+        }
+    }
+    roots
+}
+
+/// `path` with links and `..` worked out as the file system does, as far as it exists (a link
+/// to the project folder is the project folder, and `link/..` is the folder above where the
+/// link points); the part that does not exist yet is kept by name.
+fn real(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(found) = at.canonicalize() {
+            return rest.iter().rev().fold(found, |p, name| p.join(name));
+        }
+        match (at.parent(), at.components().next_back()) {
+            (Some(up), Some(name)) => {
+                rest.push(name.as_os_str().to_owned());
+                at = up;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// `path` with `.` and `..` worked out by name (the folder need not exist).
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The `wiringcraft` command-line program: `WIRINGCRAFT_CLI`, then next to this program, then
@@ -5781,6 +6041,191 @@ mod tests {
         meanwhile(a);
         let r = p.wait();
         a.agent_finish("run_command", &args, r)
+    }
+
+    /// Start `run_command` with `args` through the tools, as the assistant does: whether it runs,
+    /// or the answer it is refused with straight away. A started command is waited for.
+    fn command_runs(a: &mut App, args: &[&str]) -> Result<(), String> {
+        let v = json!({ "args": args });
+        match wc_agent::Tools::start(&mut AppTools(a), "run_command", &v) {
+            Started::Running(p) => {
+                let r = p.wait();
+                let _ = wc_agent::Tools::finish(&mut AppTools(a), "run_command", &v, r);
+                Ok(())
+            }
+            Started::Done(r) => Err(r.err().unwrap_or_else(|| "answered at once".into())),
+        }
+    }
+
+    /// Every file under `dir` but `.git`, with its bytes.
+    fn folder_bytes(dir: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                if e.file_name() == ".git" {
+                    continue;
+                }
+                if e.path().is_dir() {
+                    todo.push(e.path());
+                } else {
+                    out.insert(e.path(), std::fs::read(e.path()).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_writing_command_is_refused_while_someone_else_holds_a_page() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let before = folder_bytes(&dir);
+        for args in [
+            vec!["place", "p0002", "wc.lamp", "--at", "100,50"],
+            vec!["page", "add", "Motors"],
+            vec!["find", "-K1", "--replace", "-K2"],
+            vec!["vcs", "commit", "-m", "x"],
+            vec!["check", "-C", "/elsewhere"],
+            vec!["check", "--project=/elsewhere"],
+        ] {
+            let e = command_runs(&mut a, &args).unwrap_err();
+            assert!(e.contains("Ola") && e.contains("shared session"), "{args:?}: {e}");
+        }
+        assert_eq!(folder_bytes(&dir), before, "nothing was written");
+        // Without a held page the same command runs.
+        a.open.as_mut().unwrap().held_by_others.clear();
+        assert!(command_runs(&mut a, &["place", "p0002", "wc.lamp", "--at", "100,50"]).is_ok());
+    }
+
+    #[test]
+    fn commands_that_read_the_project_still_run_while_a_page_is_held() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let out = tempfile::tempdir().unwrap();
+        let elsewhere = out.path().join("out.pdf").display().to_string();
+        for args in [
+            vec!["check"],
+            vec!["report", "parts"],
+            vec!["nets"],
+            vec!["page", "list"],
+            vec!["find", "-K1"],
+            vec!["vcs", "log"],
+            vec!["pdf", elsewhere.as_str()],
+        ] {
+            assert!(command_runs(&mut a, &args).is_ok(), "{args:?}");
+        }
+        // An output written into the project folder could land on a held page, also through
+        // a link to it.
+        #[cfg(unix)]
+        {
+            let link = dir.parent().unwrap().join("link-to-project");
+            std::os::unix::fs::symlink(&dir, &link).unwrap();
+            let through = link.join("pages").join("p0002.page.json").display().to_string();
+            let e = command_runs(&mut a, &["plc-vars", through.as_str()]).unwrap_err();
+            assert!(e.contains("project folder"), "{e}");
+            // `..` after a link goes up from where the link points, not from the link.
+            let to_pages = dir.parent().unwrap().join("link-to-pages");
+            std::os::unix::fs::symlink(dir.join("pages"), &to_pages).unwrap();
+            for name in ["p0002.page.json", "new.svg"] {
+                let up = to_pages.join("..").join("pages").join(name).display().to_string();
+                let e = command_runs(&mut a, &["vcs", "log", "--svg", up.as_str()]).unwrap_err();
+                assert!(e.contains("project folder"), "{up}: {e}");
+            }
+            // A folder of the project linked to elsewhere is still the project's: both the
+            // path through the project and the path where it really is are refused.
+            let shared = tempfile::tempdir().unwrap();
+            std::fs::write(shared.path().join("p0009.page.json"), "{}").unwrap();
+            std::os::unix::fs::symlink(shared.path(), dir.join("linked")).unwrap();
+            let deeper = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(deeper.path(), shared.path().join("deeper")).unwrap();
+            for to in [
+                dir.join("linked").join("p0009.page.json"),
+                shared.path().join("new.st"),
+                deeper.path().join("new.st"),
+            ] {
+                let to = to.display().to_string();
+                let e = command_runs(&mut a, &["plc-vars", to.as_str()]).unwrap_err();
+                assert!(e.contains("project folder"), "{to}: {e}");
+            }
+            std::fs::remove_file(dir.join("linked")).unwrap();
+        }
+        // Run from inside the project folder, a bare file name is in it too.
+        let held = a.open.as_ref().unwrap().held_by_others.clone();
+        let args: Vec<String> = ["plc-vars", "new.st"].map(String::from).to_vec();
+        let e = writes_while_held(&args, &dir, &held, &dir.join("pages")).unwrap();
+        assert!(e.contains("inside the project folder"), "{e}");
+        // Commands with nothing after their own words still run there.
+        for words in [
+            vec!["check"],
+            vec!["nets"],
+            vec!["page", "list"],
+            vec!["vcs", "log"],
+            vec!["find", "-K1"],
+        ] {
+            let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            assert!(
+                writes_while_held(&args, &dir, &held, &dir.join("pages")).is_none(),
+                "{args:?}"
+            );
+        }
+        assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
+        // An export writes its own file names into the folder it is given: a file there that
+        // links to a held page, by name or as the same file, is a way onto the page.
+        #[cfg(unix)]
+        {
+            let page = dir.join("pages").join("p0002.page.json");
+            let before = std::fs::read(&page).unwrap();
+            let linked = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(&page, linked.path().join("2.svg")).unwrap();
+            let hard = tempfile::tempdir().unwrap();
+            std::fs::create_dir(hard.path().join("deep")).unwrap();
+            std::fs::hard_link(&page, hard.path().join("deep").join("2.svg")).unwrap();
+            for to in [linked.path(), hard.path(), &hard.path().join("deep").join("2.svg")] {
+                let to = to.display().to_string();
+                let e = command_runs(&mut a, &["drawing", to.as_str()]).unwrap_err();
+                assert!(e.contains("links to a file in it"), "{to}: {e}");
+            }
+            assert_eq!(std::fs::read(&page).unwrap(), before);
+            // Named bare, from the folder it is in.
+            let args: Vec<String> = ["drawing", "deep"].map(String::from).to_vec();
+            assert!(writes_while_held(&args, &dir, &held, hard.path()).is_some());
+            // A folder that cannot be listed could hide such a link.
+            let shut = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(shut.path(), std::os::unix::fs::PermissionsExt::from_mode(0o300)).unwrap();
+            let args = vec!["drawing".to_owned(), shut.path().display().to_string()];
+            let listed = std::fs::read_dir(shut.path()).is_ok();
+            let refused = writes_while_held(&args, &dir, &held, out.path());
+            std::fs::set_permissions(shut.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+            // Run as root the folder can still be listed, and then it is fine.
+            if !listed {
+                let e = refused.unwrap();
+                assert!(e.contains("could not be looked through"), "{e}");
+            }
+            // A folder of its own is fine.
+            let args = vec!["drawing".to_owned(), out.path().display().to_string()];
+            assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
+        }
+        let page = dir.join("pages").join("p0002.page.json").display().to_string();
+        for args in [
+            vec!["vcs".to_owned(), "log".into(), "--svg".into(), page.clone()],
+            vec!["vcs".to_owned(), "log".into(), format!("--svg={page}")],
+            vec!["pdf".to_owned(), dir.join("out.pdf").display().to_string()],
+        ] {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let e = command_runs(&mut a, &args).unwrap_err();
+            assert!(e.contains("project folder") && e.contains("Ola"), "{args:?}: {e}");
+        }
     }
 
     fn customer(a: &App) -> Option<String> {
