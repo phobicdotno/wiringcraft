@@ -4959,6 +4959,11 @@ mod tests {
         assert!(pg.graphics.is_empty());
         assert_eq!((pg.clouds.len(), pg.revision_table.is_some()), (2, true));
         assert_eq!(a.ed.selection, [Selection::Cloud(0), Selection::RevisionTable]);
+        // Paste brings the drawing back; the cloud and the table were never gone.
+        a.run(Action::Paste);
+        let pg = &a.open.as_ref().unwrap().project.pages[1];
+        assert_eq!(pg.graphics.len(), 1, "the drawing is pasted back");
+        assert_eq!((pg.clouds.len(), pg.revision_table.is_some()), (2, true));
 
         // The assistant deletes the first cloud while both are selected on screen: the other
         // stays selected as itself, not as the cloud now in the first place.
