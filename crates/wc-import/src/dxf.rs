@@ -1112,6 +1112,35 @@ fn unit_direction((x, y): (f64, f64)) -> Option<(f64, f64)> {
     Some((x / l, y / l))
 }
 
+/// The fit points of a SPLINE (codes 11/21, each x followed by its y), and whether any was left
+/// out because a coordinate is missing, not a number or not finite.
+fn fit_pairs(e: &Entity) -> (Vec<(f64, f64)>, bool) {
+    let number = |v: &str| v.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+    let mut fit = Vec::new();
+    let mut invalid = false;
+    // The x of the point being read: `Some(None)` when it is not a number.
+    let mut x: Option<Option<f64>> = None;
+    for (c, v) in &e.codes {
+        match *c {
+            11 => {
+                if x.is_some() {
+                    invalid = true;
+                }
+                x = Some(number(v));
+            }
+            21 => match x.take() {
+                Some(Some(px)) => match number(v) {
+                    Some(py) => fit.push((px, py)),
+                    None => invalid = true,
+                },
+                _ => invalid = true,
+            },
+            _ => {}
+        }
+    }
+    (fit, invalid || x.is_some())
+}
+
 /// Points of a SPLINE entity: the curve through its control points, else through its fit
 /// points (with its end tangents, codes 12/22 and 13/23, when given); whether it is closed; and
 /// how its points were found.
@@ -1120,10 +1149,7 @@ fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, SplineShape) {
     // Whole pairs only, both coordinates finite: a NaN would make the project file unreadable.
     let finite = |(x, y): &(f64, f64)| x.is_finite() && y.is_finite();
     let ctrl: Vec<(f64, f64)> = e.all(10).into_iter().zip(e.all(20)).filter(finite).collect();
-    let fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).filter(finite).collect();
-    // Fit points in the file, counted before values that are not numbers are dropped.
-    let raw = |code: i32| e.codes.iter().filter(|(c, _)| *c == code).count();
-    let fit_given = raw(11).max(raw(21));
+    let (fit, fit_invalid) = fit_pairs(e);
     let degree = e.f_or(71, 3.0).max(0.0) as usize;
     let knots = e.all(40);
     if let Some(pts) = bspline_points(&ctrl, &knots, &e.all(41), degree) {
@@ -1139,7 +1165,10 @@ fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, SplineShape) {
     let tangents = (tangent(12, 22), tangent(13, 23));
     // A closed spline goes round smoothly through its first point; its end tangents, if any,
     // do not apply.
-    let through = if closed {
+    // A fit point that is not a pair of numbers leaves a gap: no curve is made through the rest.
+    let through = if fit_invalid {
+        None
+    } else if closed {
         through_fit_points_closed(&fit, degree)
     } else {
         through_fit_points(&fit, degree, tangents)
@@ -1149,7 +1178,7 @@ fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, SplineShape) {
     }
     let shape = if !(knots.is_empty() || ctrl.is_empty()) {
         SplineShape::KnotsNoCurve
-    } else if fit_makes_curve(&fit, closed, tangents) || (fit.len() >= 2 && fit.len() < fit_given) {
+    } else if fit_makes_curve(&fit, closed, tangents) || (fit_invalid && fit.len() >= 2) {
         // Enough points for a curve that could not be made, or points left out as not numbers
         // (as a hatch spline edge with such a point is said too).
         SplineShape::FitNotInterpolated
@@ -2432,6 +2461,15 @@ mod tests {
         let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nbad\n21\n1\n11\n10\n21\n0\n";
         let (g, skipped) = drawn(ents, "")?;
         assert_eq!(g.len(), 1);
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // Three points left: still joined straight, and each x keeps its own y.
+        let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nbad\n21\n9\n11\n10\n21\n0\n11\n10\n21\n10\n";
+        let (g, skipped) = drawn(ents, "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert_eq!(
+            s,
+            [Point::new(0.0, 0.0), Point::new(10.0, 0.0), Point::new(10.0, -10.0)]
+        );
         assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
         Ok(())
     }
