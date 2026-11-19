@@ -25,7 +25,7 @@ pub struct ProjectFiles {
     /// The identity of each project file ([`file_id`]), so a hard link to one is known too.
     pub files: HashSet<(u64, u64)>,
     /// The identity of each project folder, so an output folder opened through a link is
-    /// known to be the project's whatever name reached it.
+    /// known to be the project's whatever name reached it (unix; empty elsewhere).
     pub dirs: HashSet<(u64, u64)>,
     /// Why a project file's identity could not be read, if one could not: a hard link to that
     /// file would go unseen, so no output file is taken as safe then.
@@ -37,6 +37,7 @@ impl ProjectFiles {
     pub fn new(project: &Path) -> Self {
         let (roots, mut unknown) = project_roots(project);
         let mut files = HashSet::new();
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut dirs = HashSet::new();
         let mut todo = roots.clone();
         // A folder that cannot be listed, or an entry that cannot be looked at, hides files
@@ -54,6 +55,9 @@ impl ProjectFiles {
                 }
             };
             if m.is_dir() {
+                // Only unix opens the output folder and compares it by identity; Windows
+                // cannot open a folder through `file_id`.
+                #[cfg(unix)]
                 match file_id(&at) {
                     Ok(Some(id)) => {
                         dirs.insert(id);
