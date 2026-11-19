@@ -246,13 +246,14 @@ fn jbig2_retained_bytes(data: &[u8]) -> Result<u64, String> {
             total = total.saturating_add(bitmap(u64::from(w), u64::from(h)));
         } else if kind == PATTERNS {
             // Flags, pattern width, pattern height, GRAYMAX: GRAYMAX + 1 patterns, each kept
-            // as its own bitmap and in 32 shifted copies of two words per row, plus the
-            // collective bitmap they are cut from.
+            // as its own bitmap and, when it is at most 32 x 32, in 32 shifted copies of two
+            // words per row, plus the collective bitmap they are cut from.
             let (Some(&w), Some(&h), Some(gray_max)) = (data.get(pos + 1), data.get(pos + 2), be32(pos + 3)) else {
                 break;
             };
             let (w, h, n) = (u64::from(w), u64::from(h), u64::from(gray_max) + 1);
-            let each = bitmap(w, h).saturating_add(h.saturating_mul(64 * 4));
+            let shifted = if w <= 32 && h <= 32 { h * 64 * 4 } else { 0 };
+            let each = bitmap(w, h).saturating_add(shifted);
             total = total
                 .saturating_add(n.saturating_mul(each))
                 .saturating_add(bitmap(n.saturating_mul(w), h));
@@ -436,6 +437,10 @@ mod tests {
         // A small one is not.
         let small = segment(3, 16, &[0, 8, 8, 0, 0, 0, 15]);
         assert!(jbig2_retained_bytes(&small).is_ok_and(|n| n < 1 << 20));
+        // Patterns taller than 32 pixels get no shifted copies: 4096 of 8 x 255 take about
+        // 5 MiB.
+        let tall = segment(3, 16, &[0, 8, 255, 0, 0, 0x0F, 0xFF]);
+        assert!(jbig2_retained_bytes(&tall).is_ok_and(|n| n < 8 << 20));
 
         // Eight referred-to segments take the long form with two retain bytes; the region
         // after such a segment is still counted.
