@@ -1181,21 +1181,15 @@ impl Open {
             if let Err(e) = put_back {
                 unrestored.push(format!("{} ({e})", w.id));
                 let pin = pins.get(&w.id).map(|e| e.hash.clone());
-                // A file still waiting from an earlier failure under the same pin keeps that
-                // backup: this attempt's backup is of the file as the earlier failure left it.
-                if self.unrestored_files.get(&w.path).is_none_or(|known| known.pin != pin) {
-                    self.unrestored_files.insert(
-                        w.path,
-                        UnrestoredFile {
-                            kind: ItemKind::Part,
-                            id: w.id,
-                            was: w.was,
-                            pin,
-                        },
-                    );
-                }
-                // The file on disk now differs from the project: that is unsaved work.
-                self.edited();
+                self.register_unrestored(
+                    w.path,
+                    UnrestoredFile {
+                        kind: ItemKind::Part,
+                        id: w.id,
+                        was: w.was,
+                        pin,
+                    },
+                );
             }
         }
         unrestored
@@ -1568,19 +1562,15 @@ impl Open {
             self.symbols.insert(f.id.clone(), old);
             self.stale_symbol_files.insert(f.id.clone());
         }
-        // A file still waiting from an earlier failed update under the same pin keeps that
-        // backup: this update's backup is of the file as the earlier failure left it.
-        if self.unrestored_files.get(&f.path).is_none_or(|known| known.pin != pin) {
-            self.unrestored_files.insert(
-                f.path.clone(),
-                UnrestoredFile {
-                    kind: f.kind,
-                    id: f.id.clone(),
-                    was: f.was.clone(),
-                    pin,
-                },
-            );
-        }
+        self.register_unrestored(
+            f.path.clone(),
+            UnrestoredFile {
+                kind: f.kind,
+                id: f.id.clone(),
+                was: f.was.clone(),
+                pin,
+            },
+        );
         if f.kind == ItemKind::Part
             && let Some(old) = self
                 .unrestored_files
@@ -1590,7 +1580,20 @@ impl Open {
         {
             self.parts.insert(f.id.clone(), old);
         }
-        // The file still has to be written: unsaved work, so Save is offered and asked for.
+    }
+
+    /// Note a file that could not be put back, to be written before the next save. A file still
+    /// waiting from an earlier failure under the same pin keeps that backup: this one is of the
+    /// file as the earlier failure left it. The file still has to be written: unsaved work, so
+    /// Save is offered and asked for.
+    fn register_unrestored(&mut self, path: PathBuf, file: UnrestoredFile) {
+        if self
+            .unrestored_files
+            .get(&path)
+            .is_none_or(|known| known.pin != file.pin)
+        {
+            self.unrestored_files.insert(path, file);
+        }
         self.edited();
     }
 
