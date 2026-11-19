@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use wc_core::macros::{Macro, Placeholder, ValueSet};
+use wc_core::macros::{Macro, Placeholder, ValueSet, key};
 
 /// One placeholder as the dialog edits it.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -26,6 +26,12 @@ pub struct SetRow {
     pub description: String,
     /// Empty uses the placeholder's default.
     pub values: Vec<String>,
+    /// Which values were stored as an empty value when the dialog opened: an empty value is
+    /// a value (not the default), so one left empty is saved as it was.
+    pub stored_empty: Vec<bool>,
+    /// Values for names no placeholder declared when the dialog opened, kept so that saving
+    /// reports them rather than dropping them.
+    pub undeclared: BTreeMap<String, String>,
 }
 
 /// A project macro's placeholders and value sets, being edited.
@@ -55,17 +61,26 @@ impl Form {
         let value = |v: &ValueSet, name: &str| {
             v.values
                 .iter()
-                .find(|(k, _)| k.trim().eq_ignore_ascii_case(name.trim()))
+                .find(|(k, _)| key(k) == key(name))
                 .map(|(_, v)| v.clone())
-                .unwrap_or_default()
         };
         let sets = base
             .value_sets
             .iter()
-            .map(|v| SetRow {
-                name: v.name.clone(),
-                description: v.description.clone(),
-                values: placeholders.iter().map(|p| value(v, &p.name)).collect(),
+            .map(|v| {
+                let values: Vec<Option<String>> = placeholders.iter().map(|p| value(v, &p.name)).collect();
+                SetRow {
+                    name: v.name.clone(),
+                    description: v.description.clone(),
+                    stored_empty: values.iter().map(|v| v.as_deref() == Some("")).collect(),
+                    values: values.into_iter().map(Option::unwrap_or_default).collect(),
+                    undeclared: v
+                        .values
+                        .iter()
+                        .filter(|(k, _)| !placeholders.iter().any(|p| key(&p.name) == key(k)))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                }
             })
             .collect();
         Ok(Form {
@@ -81,6 +96,7 @@ impl Form {
         self.placeholders.push(PlaceholderRow::default());
         for s in &mut self.sets {
             s.values.push(String::new());
+            s.stored_empty.push(false);
         }
     }
 
@@ -92,6 +108,9 @@ impl Form {
                 if i < s.values.len() {
                     s.values.remove(i);
                 }
+                if i < s.stored_empty.len() {
+                    s.stored_empty.remove(i);
+                }
             }
         }
     }
@@ -100,19 +119,23 @@ impl Form {
     pub fn add_set(&mut self) {
         self.sets.push(SetRow {
             values: vec![String::new(); self.placeholders.len()],
+            stored_empty: vec![false; self.placeholders.len()],
             ..SetRow::default()
         });
     }
 
     /// The macro the form describes: placeholders renamed in its texts, the value sets filled
-    /// from the table (an empty cell keeps the default). Checked with [`Macro::check`].
+    /// from the table (an empty cell keeps the default, unless it was stored empty). Checked
+    /// with [`Macro::check`].
     pub fn to_macro(&self) -> Result<Macro, String> {
         let mut m = self.base.clone();
-        for p in &self.placeholders {
-            if !p.was.trim().is_empty() && !p.name.trim().is_empty() && p.was.trim() != p.name.trim() {
-                m.rename_placeholder(&p.was, &p.name);
-            }
-        }
+        let renames: Vec<(&str, &str)> = self
+            .placeholders
+            .iter()
+            .filter(|p| !p.was.trim().is_empty() && !p.name.trim().is_empty() && p.was.trim() != p.name.trim())
+            .map(|p| (p.was.as_str(), p.name.as_str()))
+            .collect();
+        m.rename_placeholders(&renames);
         m.placeholders = self
             .placeholders
             .iter()
@@ -124,9 +147,9 @@ impl Form {
             .collect();
         let mut sets = Vec::new();
         for s in &self.sets {
-            let mut values = BTreeMap::new();
-            for (p, v) in self.placeholders.iter().zip(&s.values) {
-                if v.is_empty() {
+            let mut values = s.undeclared.clone();
+            for (i, (p, v)) in self.placeholders.iter().zip(&s.values).enumerate() {
+                if v.is_empty() && !s.stored_empty.get(i).copied().unwrap_or(false) {
                     continue;
                 }
                 if p.name.trim().is_empty() {
@@ -148,9 +171,17 @@ impl Form {
         Ok(m)
     }
 
-    /// Check the macro and write it back to its file.
+    /// Check the macro and write it back to its file. A file changed since the dialog opened
+    /// is not written over: the form stays as it is and the change is reported.
     pub fn save(&self) -> Result<PathBuf, String> {
         let m = self.to_macro()?;
+        if wc_core::macros::read_macro(&self.path).ok().as_ref() != Some(&self.base) {
+            return Err(format!(
+                "{} was changed outside this dialog since it opened. Close the dialog and open it \
+                 again to edit the file as it is now.",
+                self.path.display()
+            ));
+        }
         let id = self
             .path
             .file_stem()
@@ -165,8 +196,9 @@ impl Form {
     }
 }
 
-fn field(ui: &mut egui::Ui, value: &mut String, width: f32, hint: &str) {
-    ui.add(egui::TextEdit::singleline(value).desired_width(width).hint_text(hint));
+fn field(ui: &mut egui::Ui, value: &mut String, width: f32, hint: &str) -> bool {
+    ui.add(egui::TextEdit::singleline(value).desired_width(width).hint_text(hint))
+        .changed()
 }
 
 /// Draw the form.
@@ -227,8 +259,14 @@ pub fn show(ui: &mut egui::Ui, form: &mut Form) {
                     field(ui, &mut s.name, 100.0, "3 kW");
                     field(ui, &mut s.description, 140.0, "");
                     s.values.resize(form.placeholders.len(), String::new());
-                    for (v, p) in s.values.iter_mut().zip(&form.placeholders) {
-                        field(ui, v, 90.0, p.default.as_str());
+                    s.stored_empty.resize(form.placeholders.len(), false);
+                    for ((v, empty), p) in s.values.iter_mut().zip(&mut s.stored_empty).zip(&form.placeholders) {
+                        // A value stored empty stays empty until it is edited; cleared, a cell
+                        // uses the default.
+                        let hint = if *empty { "(empty)" } else { p.default.as_str() };
+                        if field(ui, v, 90.0, hint) {
+                            *empty = false;
+                        }
                     }
                     if ui.small_button("×").on_hover_text("Remove this value set").clicked() {
                         drop = Some(i);

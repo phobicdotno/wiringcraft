@@ -1301,7 +1301,7 @@ impl App {
                                 ui.label(m.source.as_str());
                                 // A project macro's placeholders and variants are edited here; a
                                 // library's macros belong to the library.
-                                if m.source == "project" {
+                                if m.project {
                                     if ui
                                         .button("Placeholders…")
                                         .on_hover_text("Declare its placeholders and the value sets of its variants")

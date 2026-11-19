@@ -4936,6 +4936,116 @@ mod tests {
     }
 
     #[test]
+    fn the_placeholders_dialog_keeps_what_it_does_not_edit_and_renames_together() {
+        use wc_core::macros::{Macro, Placeholder, ValueSet};
+        let (tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let text = |t: &str| wc_core::Shape::Text {
+            at: Point::new(0.0, 0.0),
+            text: t.into(),
+            height: 2.5,
+            align: Default::default(),
+            angle: 0.0,
+        };
+        let declare = |name: &str, default: &str| Placeholder {
+            name: name.into(),
+            description: String::new(),
+            default: default.into(),
+        };
+        let m = Macro {
+            name: "Swap".into(),
+            graphics: vec![text("{{a}}"), text("{{b}}"), text("{{Ø}}")],
+            placeholders: vec![declare("a", "1"), declare("b", "2"), declare("Ø", "fallback")],
+            value_sets: vec![ValueSet {
+                name: "One".into(),
+                description: String::new(),
+                // Stored under a name that differs only in case (not ASCII), and empty.
+                values: [("ø", ""), ("a", "x")]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect(),
+            }],
+            ..Default::default()
+        };
+        let path = wc_core::macros::write_macro(&open.dir, "swap", &m).unwrap();
+
+        // Opened and saved untouched, the empty value stays a value, not the default.
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        assert_eq!(form.sets[0].values, ["x", "", ""]);
+        form.save().unwrap();
+        let saved = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(
+            saved.value_set("one").unwrap().values.get("Ø").map(String::as_str),
+            Some("")
+        );
+        let placed = saved.apply(Some("One"), &Default::default()).unwrap();
+        assert!(
+            placed
+                .graphics
+                .iter()
+                .all(|g| !matches!(g, wc_core::Shape::Text { text, .. } if text == "fallback"))
+        );
+        // Cleared by hand, a cell uses the default again.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.sets[0].stored_empty[2] = false;
+        form.save().unwrap();
+        let saved = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(saved.value_set("one").unwrap().values.get("Ø"), None);
+
+        // Two placeholders swapped: each use takes the other's name, once.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.placeholders[0].name = "b".into();
+        form.placeholders[1].name = "a".into();
+        form.save().unwrap();
+        let saved = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(saved.used_placeholders(), ["b", "a", "Ø"]);
+        assert_eq!(
+            saved.value_set("one").unwrap().values.get("b").map(String::as_str),
+            Some("x")
+        );
+
+        // A value for a name no placeholder declares is reported, not dropped.
+        let mut m = saved.clone();
+        m.value_sets[0].values.insert("voltage".into(), "400".into());
+        wc_core::macros::write_macro(&open.dir, "swap", &m).unwrap();
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        assert!(form.save().is_err(), "the undeclared value is reported");
+        assert_eq!(
+            wc_core::macros::read_macro(&path).unwrap(),
+            m,
+            "and the file is left as it was"
+        );
+
+        // A file changed outside the dialog after it opened is not written over.
+        wc_core::macros::write_macro(&open.dir, "swap", &saved).unwrap();
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        let mut changed = saved.clone();
+        changed.description = "Edited elsewhere".into();
+        wc_core::macros::write_macro(&open.dir, "swap", &changed).unwrap();
+        let err = form.save().unwrap_err();
+        assert!(err.contains("changed outside"), "{err}");
+        assert_eq!(wc_core::macros::read_macro(&path).unwrap(), changed);
+
+        // A library source named "project" is still a library: its macros are not the project's.
+        let lib = tmp.path().join("lib");
+        wc_core::macros::write_macro(&lib, "lamp", &saved).unwrap();
+        open.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "project".into(),
+            kind: "folder".into(),
+            location: lib.display().to_string(),
+            reference: None,
+        });
+        let list = open.macros();
+        let of = |p: &std::path::Path| {
+            list.iter()
+                .find(|e| e.path.starts_with(p))
+                .map(|e| (e.source.as_str(), e.project))
+        };
+        assert_eq!(of(&path), Some(("project", true)));
+        assert_eq!(of(&lib), Some(("project", false)));
+    }
+
+    #[test]
     fn translations_edited_in_the_dialog_are_saved_and_the_pdf_is_exported_in_the_language_chosen() {
         use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
         let hex = |s: &str| {

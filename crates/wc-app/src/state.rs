@@ -97,8 +97,11 @@ impl SpecPart {
 /// A macro found in the project or a library source.
 #[derive(Debug, Clone)]
 pub struct MacroEntry {
-    /// `project` or the library source's name.
+    /// `project` or the library source's name, as shown.
     pub source: String,
+    /// Whether it is the project's own macro (a library's belongs to the library), whatever
+    /// the library source is called.
+    pub project: bool,
     pub path: PathBuf,
     pub name: String,
     pub description: String,
@@ -1834,16 +1837,16 @@ impl Open {
     /// per original device, keeping description and part) and wire numbers are cleared.
     /// Macros of the project (`macros/`) and of its library sources, project first.
     pub fn macros(&self) -> Vec<MacroEntry> {
-        let mut found: Vec<(String, String, PathBuf)> = wc_core::macros::list_macros(&self.dir)
+        let mut found: Vec<(bool, String, String, PathBuf)> = wc_core::macros::list_macros(&self.dir)
             .into_iter()
-            .map(|(id, path)| ("project".to_owned(), id, path))
+            .map(|(id, path)| (true, "project".to_owned(), id, path))
             .collect();
         if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
-            found.extend(lib.macros());
+            found.extend(lib.macros().into_iter().map(|(s, id, path)| (false, s, id, path)));
         }
         found
             .into_iter()
-            .map(|(source, id, path)| {
+            .map(|(project, source, id, path)| {
                 let (name, description, value_sets, error) = match wc_core::macros::read_macro(&path) {
                     Ok(m) => {
                         let error = m.check().err().map(|e| e.to_string());
@@ -1854,6 +1857,7 @@ impl Open {
                 };
                 MacroEntry {
                     source,
+                    project,
                     path,
                     name,
                     description,
