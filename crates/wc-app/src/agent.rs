@@ -2852,10 +2852,27 @@ fn in_project(project: &Path, value: &str) -> Option<PathBuf> {
     } else {
         return None;
     };
-    normalize(&path)
-        .strip_prefix(normalize(project))
-        .ok()
-        .map(Path::to_path_buf)
+    let (path, project) = (real(&normalize(&path)), real(project));
+    path.strip_prefix(&project).ok().map(Path::to_path_buf)
+}
+
+/// `path` with links worked out as far as it exists (a link to the project folder is the
+/// project folder); the part that does not exist yet is kept by name.
+fn real(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(found) = at.canonicalize() {
+            return rest.iter().rev().fold(found, |p, name| p.join(name));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(up), Some(name)) => {
+                rest.push(name.to_owned());
+                at = up;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// `path` with `.` and `..` worked out by name (the folder need not exist).
@@ -5401,7 +5418,16 @@ mod tests {
         ] {
             assert!(command_runs(&mut a, &args).is_ok(), "{args:?}");
         }
-        // An output written into the project folder could land on a held page.
+        // An output written into the project folder could land on a held page, also through
+        // a link to it.
+        #[cfg(unix)]
+        {
+            let link = dir.parent().unwrap().join("link-to-project");
+            std::os::unix::fs::symlink(&dir, &link).unwrap();
+            let through = link.join("pages").join("p0002.page.json").display().to_string();
+            let e = command_runs(&mut a, &["plc-vars", through.as_str()]).unwrap_err();
+            assert!(e.contains("project folder"), "{e}");
+        }
         let page = dir.join("pages").join("p0002.page.json").display().to_string();
         for args in [
             vec!["vcs".to_owned(), "log".into(), "--svg".into(), page.clone()],
