@@ -41,6 +41,10 @@ pub struct Dictionary {
     /// The language the project is drawn in, such as `en`. Empty means `en`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
+    /// Languages to translate into before any text has a translation in them, so a language
+    /// just added is kept: `languages = ["de"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
     /// One entry per text: language code to text.
     #[serde(default, rename = "text", skip_serializing_if = "Vec::is_empty")]
     pub texts: Vec<BTreeMap<String, String>>,
@@ -71,6 +75,7 @@ impl Dictionary {
     pub fn parse(text: &str) -> std::result::Result<Self, String> {
         let mut d: Dictionary = toml::from_str(text).map_err(|e| e.message().to_owned())?;
         d.source = normalize(&d.source);
+        d.languages = d.languages.iter().map(|l| normalize(l)).collect();
         for entry in &mut d.texts {
             *entry = std::mem::take(entry)
                 .into_iter()
@@ -88,7 +93,7 @@ impl Dictionary {
     /// Every language the dictionary has a text in, the source language first.
     pub fn languages(&self) -> Vec<String> {
         let mut out = vec![self.source().to_owned()];
-        for lang in self.texts.iter().flat_map(|e| e.keys()) {
+        for lang in self.languages.iter().chain(self.texts.iter().flat_map(|e| e.keys())) {
             if !out.contains(lang) {
                 out.push(lang.clone());
             }
@@ -110,6 +115,44 @@ impl Dictionary {
             .filter(|e| e.get(source).is_some_and(|s| s.trim() == key))
             .find_map(|e| e.get(&lang).map(|t| t.trim()).filter(|t| !t.is_empty()))
             .map(str::to_owned)
+    }
+
+    /// Set the translation of `text` (in the source language) into `lang`; a blank one clears
+    /// it. A text the dictionary has no entry for gets one. The source language is not changed.
+    pub fn set(&mut self, text: &str, lang: &str, translation: &str) {
+        let lang = normalize(lang);
+        let source = self.source().to_owned();
+        let (key, value) = (text.trim(), translation.trim());
+        if lang.is_empty() || lang == source || key.is_empty() {
+            return;
+        }
+        let matches = |e: &BTreeMap<String, String>| e.get(&source).is_some_and(|s| s.trim() == key);
+        if value.is_empty() {
+            // Every entry for the text, so a second one does not answer for it afterwards.
+            for e in self.texts.iter_mut().filter(|e| matches(e)) {
+                e.remove(&lang);
+            }
+            return;
+        }
+        match self.texts.iter_mut().find(|e| matches(e)) {
+            Some(e) => {
+                e.insert(lang, value.to_owned());
+            }
+            None => self
+                .texts
+                .push(BTreeMap::from([(source, key.to_owned()), (lang, value.to_owned())])),
+        }
+    }
+
+    /// Write the dictionary to `translations.toml` in a project folder, as a whole (a failed
+    /// write leaves the file as it was). Returns whether the file changed.
+    pub fn save(&self, dir: &Path) -> Result<bool> {
+        let path = dir.join(TRANSLATIONS_FILE);
+        let text = toml::to_string_pretty(self).map_err(|e| Error::Toml {
+            path: path.clone(),
+            message: e.to_string(),
+        })?;
+        crate::store::write_if_changed(&path, &text)
     }
 }
 
@@ -145,10 +188,7 @@ pub fn parse_languages(spec: &str) -> Option<Vec<String>> {
 pub fn translate(project: &Project, dict: &Dictionary, langs: &[String]) -> (Project, Vec<Missing>) {
     let mut out = project.clone();
     let mut missing: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut tr = |text: &mut String, used: String| {
-        if text.trim().is_empty() {
-            return;
-        }
+    each_text(&mut out, |text, used| {
         let mut parts = Vec::new();
         for lang in langs {
             match dict.lookup(text, lang) {
@@ -169,8 +209,34 @@ pub fn translate(project: &Project, dict: &Dictionary, langs: &[String]) -> (Pro
             parts.dedup();
         }
         *text = parts.join(SEPARATOR);
+    });
+    let missing = missing.into_iter().map(|(text, used)| Missing { text, used }).collect();
+    (out, missing)
+}
+
+/// Every text of the project that can need a translation (one with a word of two letters),
+/// trimmed, with where it is used, sorted by text: the rows of a translation table.
+pub fn texts(project: &Project) -> Vec<Missing> {
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    each_text(&mut project.clone(), |text, used| {
+        if has_word(text) {
+            let uses = found.entry(text.trim().to_owned()).or_default();
+            if !uses.contains(&used) {
+                uses.push(used);
+            }
+        }
+    });
+    found.into_iter().map(|(text, used)| Missing { text, used }).collect()
+}
+
+/// Call `f` with each non-blank text [`translate`] translates and where it is used.
+fn each_text(project: &mut Project, mut f: impl FnMut(&mut String, String)) {
+    let mut tr = |text: &mut String, used: String| {
+        if !text.trim().is_empty() {
+            f(text, used);
+        }
     };
-    for page in &mut out.pages {
+    for page in &mut project.pages {
         tr(&mut page.title, format!("page {} title", page.number));
         for g in &mut page.graphics {
             if let Shape::Text { text, .. } = g {
@@ -178,14 +244,12 @@ pub fn translate(project: &Project, dict: &Dictionary, langs: &[String]) -> (Pro
             }
         }
     }
-    for (tag, device) in &mut out.devices {
+    for (tag, device) in &mut project.devices {
         tr(&mut device.description, format!("{tag} description"));
     }
-    for loc in &mut out.meta.locations {
+    for loc in &mut project.meta.locations {
         tr(&mut loc.description, format!("+{} description", loc.path));
     }
-    let missing = missing.into_iter().map(|(text, used)| Missing { text, used }).collect();
-    (out, missing)
 }
 
 #[cfg(test)]
@@ -320,6 +384,56 @@ nb = ""
         assert_eq!(Dictionary::load(dir.path())?, Dictionary::default());
         std::fs::write(dir.path().join(TRANSLATIONS_FILE), "[[text]\n")?;
         assert!(matches!(Dictionary::load(dir.path()), Err(Error::Toml { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn lists_the_project_texts_and_saves_set_translations() -> R {
+        let p = project()?;
+        let rows: Vec<(String, Vec<String>)> = super::texts(&p).into_iter().map(|m| (m.text, m.used)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("Cabinet".to_owned(), vec!["+L1 description".to_owned()]),
+                (
+                    "Main switch".to_owned(),
+                    vec!["page 1 text".to_owned(), "-Q1 description".to_owned()]
+                ),
+                ("Pumps".to_owned(), vec!["page 1 title".to_owned()]),
+                ("Spare".to_owned(), vec!["page 1 text".to_owned()]),
+            ]
+        );
+        let mut d = Dictionary::parse(DICT)?;
+        d.set("Spare ", "NB", " Reserve");
+        d.set("Cabinet", "nb", "Skap");
+        d.set("Pumps", "nb", "");
+        d.set("Pumps", "en", "Changed");
+        d.set("Nowhere", "de", "");
+        let dir = tempfile::tempdir()?;
+        assert!(d.save(dir.path())?);
+        assert!(!d.save(dir.path())?);
+        let again = Dictionary::load(dir.path())?;
+        assert_eq!(again, d);
+        assert_eq!(again.lookup("Spare", "nb").as_deref(), Some("Reserve"));
+        assert_eq!(again.lookup("Cabinet", "nb").as_deref(), Some("Skap"));
+        assert_eq!(again.lookup("Pumps", "nb"), None);
+        assert_eq!(again.lookup("Pumps", "en").as_deref(), Some("Pumps"));
+        assert_eq!(again.texts.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn clearing_a_translation_clears_it_from_every_entry_of_the_text_and_languages_are_kept() -> R {
+        let mut d = Dictionary::parse(
+            "source = \"en\"\nlanguages = [\"DE\"]\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n[[text]]\nen = \"Pumps \"\nnb = \"Pumpene\"\n",
+        )?;
+        assert_eq!(d.languages(), ["en", "de", "nb"]);
+        d.set("Pumps", "nb", "");
+        assert_eq!(d.lookup("Pumps", "nb"), None);
+        let dir = tempfile::tempdir()?;
+        d.save(dir.path())?;
+        // nb is gone with its last translation; de stays, declared.
+        assert_eq!(Dictionary::load(dir.path())?.languages(), ["en", "de"]);
         Ok(())
     }
 }
