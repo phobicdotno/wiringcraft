@@ -896,25 +896,42 @@ impl AppTools<'_> {
     /// holds, and the state to go back to. `None` when nobody holds a page; for undo and redo
     /// (the tool, or the action), which the session's host carries out and checks itself; and
     /// for `open_project`, which replaces the project instead of changing it.
-    /// The open project's folder and undo mark, to tell after a tool whether it changed the
-    /// project.
-    fn undo_mark(&self) -> Option<(PathBuf, usize)> {
-        self.0.open.as_ref().map(|o| (o.dir.clone(), o.undo_mark()))
+    /// In a guest's window, the open project's folder and project, to tell after a tool
+    /// whether it changed the project (a tool can take an undo step and change nothing).
+    fn guest_snapshot(&self) -> Option<(PathBuf, wc_core::Project)> {
+        if !self.0.share.active() || self.0.share.is_host() {
+            return None;
+        }
+        self.0.open.as_ref().map(|o| (o.dir.clone(), o.project.clone()))
     }
 
     /// A guest's change is only kept once the host accepts it: the host refuses it when
     /// someone else has its page open by then, which the guest may not know of yet. A tool
-    /// that changed the project (its undo mark moved since `before`) says so in its answer.
-    fn pending_note(&self, before: Option<(PathBuf, usize)>, r: Result<String, String>) -> Result<String, String> {
-        let changed = before.is_some_and(|b| self.undo_mark().is_some_and(|now| now.0 == b.0 && now.1 != b.1));
-        match r {
-            Ok(out) if changed && self.0.share.active() && !self.0.share.is_host() => Ok(format!(
-                "{out}\n\nPending: in this shared session the change is kept only once the host accepts it. \
+    /// that changed the project (since the [`AppTools::guest_snapshot`] `before`) says so in
+    /// its answer.
+    fn pending_note(
+        &self,
+        before: Option<(PathBuf, wc_core::Project)>,
+        r: Result<String, String>,
+    ) -> Result<String, String> {
+        let changed = before.is_some_and(|(dir, project)| {
+            self.0
+                .open
+                .as_ref()
+                .is_some_and(|o| o.dir == dir && o.project != project)
+        });
+        if !changed {
+            return r;
+        }
+        // Also on an error that left a change behind (a command that failed partway).
+        let note = |t: String| {
+            format!(
+                "{t}\n\nPending: in this shared session the change is kept only once the host accepts it. \
                  If someone else opened the page meanwhile, the host refuses it and it is taken back here; \
                  read the page again before building on it."
-            )),
-            r => r,
-        }
+            )
+        };
+        r.map(note).map_err(note)
     }
 
     fn held_guard(&mut self, name: &str, input: &Value) -> Option<HeldGuard> {
@@ -990,7 +1007,7 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
-        let mark = self.undo_mark();
+        let mark = self.guest_snapshot();
         let guard = self.held_guard(name, input);
         let read = self.0.assistant.graphics_read.clone();
         let r = self.0.agent_tool(name, input);
@@ -1009,7 +1026,7 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
-        let mark = self.undo_mark();
+        let mark = self.guest_snapshot();
         let guard = self.held_guard(name, input);
         let read = self.0.assistant.graphics_read.clone();
         match self.0.agent_start(name, input) {
@@ -1035,9 +1052,11 @@ impl wc_agent::Tools for AppTools<'_> {
     }
 
     fn finish(&mut self, name: &str, input: &Value, result: Result<String, String>) -> Result<String, String> {
+        // Only what the finish itself changes: what the tool did when it started was told then.
+        let mark = self.guest_snapshot();
         let r = self.0.agent_finish(name, input, result);
         self.0.prune_selection();
-        r
+        self.pending_note(mark, r)
     }
 
     fn describe(&self, name: &str, input: &Value) -> String {
@@ -4374,6 +4393,59 @@ mod tests {
         // Refused outright when the hold is known.
         let err = call(&mut a, "add_graphic", json!({"page": "p0003", "shape": line})).unwrap_err();
         assert!(err.contains("Hanna"), "{err}");
+    }
+
+    /// A guest's window in a session with the host showing page 2 and the guest page 1.
+    fn guest_app(tmp: &std::path::Path) -> (tempfile::TempDir, App) {
+        let (mut h, _log, mut host_open, mut g, mut guest_open) = crate::share::tests::session(tmp).unwrap();
+        crate::share::tests::frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0001"));
+        let (dir, mut a) = app(vec![]);
+        a.open = Some(guest_open);
+        a.share = g;
+        a.ed.page = 0;
+        a.sync_session_now(false);
+        (dir, a)
+    }
+
+    #[test]
+    fn a_guests_tool_call_that_changes_nothing_is_not_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        let out = call(
+            &mut a,
+            "place_symbol",
+            json!({"symbol": "wc.coil", "x": 50, "y": 50, "page": "3"}),
+        )
+        .unwrap();
+        assert!(out.contains("Pending"), "{out}");
+        let id = a.open.as_ref().unwrap().project.page("p0003").unwrap().symbols[0]
+            .id
+            .clone();
+        // An update that names only the symbol takes an undo step but changes nothing.
+        let out = call(&mut a, "update_symbol", json!({"page": "3", "id": id})).unwrap();
+        assert!(!out.contains("Pending"), "{out}");
+    }
+
+    #[test]
+    fn a_guests_command_that_changes_the_project_is_pending_when_it_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        // As the assistant runs it: started, then finished through the tools.
+        let through_tools = |a: &mut App, meanwhile: &dyn Fn(&mut App)| {
+            let args = json!({"args": ["--help"]});
+            let Started::Running(p) = wc_agent::Tools::start(&mut AppTools(a), "run_command", &args) else {
+                return "not started".to_owned();
+            };
+            meanwhile(a);
+            let r = p.wait();
+            wc_agent::Tools::finish(&mut AppTools(a), "run_command", &args, r).unwrap_or_else(|e| e)
+        };
+        let r = through_tools(&mut a, &|a| command_writes_customer(a, "Disk"));
+        assert_eq!(customer(&a).as_deref(), Some("Disk"));
+        assert!(r.contains("Pending"), "{r}");
+        // A command that leaves the project alone is not.
+        let r = through_tools(&mut a, &|_| {});
+        assert!(!r.contains("Pending"), "{r}");
     }
 
     #[test]
