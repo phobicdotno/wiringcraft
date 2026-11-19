@@ -2134,10 +2134,10 @@ pub struct Share {
     /// Pictures whose name the session has for another file and that could not be given a new
     /// name here, with when: tried again after [`ITEM_RETRY_LATER`] while the project uses them.
     renames_due: BTreeMap<String, std::time::Instant>,
-    /// Devices renamed here and not in the session yet: old tag to new, a rename of a rename
-    /// followed to its last tag ([`note_renames`]). [`Held::hold_renames`] pairs them even when
+    /// Devices renamed here and not in the session yet, each with the tags it was renamed to
+    /// ([`note_renames`]). [`Held::hold_renames`] pairs them ([`renames_now`]) even when
     /// nothing draws the device.
-    device_renames: BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>,
+    device_renames: RenamePaths,
     /// Pictures picked here under a name the session has for another file, found while taking
     /// the session's pictures: they get a name of their own at the next sync, before what goes
     /// out is worked out.
@@ -2184,15 +2184,19 @@ impl RenameGroup {
     }
 }
 
+/// Devices renamed here and not in the session yet: each first tag with the tags it was
+/// renamed to since, in order ([`note_renames`]).
+type RenamePaths = BTreeMap<wc_core::DeviceTag, Vec<wc_core::DeviceTag>>;
+
 /// Add the device renames made here (`made`: old tag to new, one map per change, in order) to
-/// `renames`: a rename of a renamed device goes on from its first tag, and one back to it is no
-/// rename; the renames of one change are taken together, so `-K1` -> `-K11` and `-K11` ->
-/// `-K111` at once stay two renames. Renames the session has (`base` has the new tag, or no
-/// longer the old one) are dropped first, so a later rename never goes on from one of those.
-/// So are those whose new tag this copy (`local`) no longer has, undone or removed since: a
-/// device that later gets that tag is another device.
+/// `renames`: a rename of a renamed device goes on from its first tag (also from a tag between,
+/// which Undo brought back), and one back to it is no rename; the renames of one change are
+/// taken together, so `-K1` -> `-K11` and `-K11` -> `-K111` at once stay two renames. Renames
+/// the session has (`base` has the last tag, or no longer the first) are dropped first, so a
+/// later rename never goes on from one of those. So are those of which this copy (`local`)
+/// has no tag any more, undone or removed since: a device that later gets one is another.
 fn note_renames(
-    renames: &mut BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>,
+    renames: &mut RenamePaths,
     made: Vec<BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>>,
     base: &Project,
     local: &Project,
@@ -2200,28 +2204,51 @@ fn note_renames(
     // The new tag may be in the session still as the old tag of another rename (`-K1` ->
     // `-K11` while `-K11` -> `-K111`): that is no sign the session has this rename.
     let olds: BTreeSet<wc_core::DeviceTag> = renames.keys().cloned().collect();
-    renames
-        .retain(|old, new| base.devices.contains_key(old) && !(base.devices.contains_key(new) && !olds.contains(new)));
+    renames.retain(|first, path| {
+        base.devices.contains_key(first)
+            && !path
+                .last()
+                .is_some_and(|last| base.devices.contains_key(last) && !olds.contains(last))
+    });
     for change in made {
         // Each new tag is set once all of the change's renames are looked up, so one never
         // goes on from another made at the same time.
-        let mut next: Vec<(wc_core::DeviceTag, wc_core::DeviceTag)> = Vec::new();
+        let mut next: Vec<(wc_core::DeviceTag, Vec<wc_core::DeviceTag>)> = Vec::new();
         for (from, to) in change {
-            let first = renames
+            let found = renames
                 .iter()
-                .find(|(_, n)| **n == from)
-                .map(|(o, _)| o.clone())
-                .unwrap_or_else(|| from.clone());
-            renames.remove(&first);
-            next.push((first, to));
+                .find(|(_, path)| path.contains(&from))
+                .map(|(first, _)| first.clone());
+            let (first, mut path) = match found.and_then(|f| renames.remove_entry(&f)) {
+                Some((first, mut path)) => {
+                    let at = path.iter().rposition(|t| *t == from).map_or(path.len(), |i| i + 1);
+                    path.truncate(at);
+                    (first, path)
+                }
+                None => (from, Vec::new()),
+            };
+            path.push(to);
+            next.push((first, path));
         }
-        for (first, to) in next {
-            if first != to {
-                renames.insert(first, to);
+        for (first, path) in next {
+            if path.last() != Some(&first) {
+                renames.insert(first, path);
             }
         }
     }
-    renames.retain(|_, new| local.devices.contains_key(new));
+    renames.retain(|_, path| path.iter().any(|t| local.devices.contains_key(t)));
+}
+
+/// Each recorded rename as it stands in `local`: its first tag and the latest of its tags this
+/// copy has (an Undo may have brought back one between).
+fn renames_now(renames: &RenamePaths, local: &Project) -> BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag> {
+    renames
+        .iter()
+        .filter_map(|(first, path)| {
+            let now = path.iter().rev().find(|t| local.devices.contains_key(*t))?;
+            Some((first.clone(), now.clone()))
+        })
+        .collect()
 }
 
 impl Held {
@@ -3340,7 +3367,8 @@ impl Share {
             self.base.as_ref()?,
             &open.project,
         );
-        let held = Held::find_renamed(&open.project, self.base.as_ref()?, &waiting, &self.device_renames);
+        let renamed = renames_now(&self.device_renames, &open.project);
+        let held = Held::find_renamed(&open.project, self.base.as_ref()?, &waiting, &renamed);
         if undo && !held.is_empty() {
             // Undo of a change that never reached the session: taken back here only, and only
             // the latest action. What waited before it waits still.

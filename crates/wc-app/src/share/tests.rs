@@ -4302,7 +4302,7 @@ fn renames_made_here_are_followed_to_their_last_tag_until_the_session_has_them()
     let mut local = base.clone();
     local.rename_device(&k1, &k3);
     note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &local);
-    assert_eq!(renames, one(&k1, &k3));
+    assert_eq!(renames_now(&renames, &local), one(&k1, &k3));
     // Renamed back: no rename.
     note_renames(&mut renames, vec![one(&k3, &k1)], &base, &base);
     assert!(renames.is_empty());
@@ -4328,16 +4328,20 @@ fn a_rename_of_a_rename_the_session_has_is_a_rename_of_its_own() -> TestResult {
     let mut base = Project::new("Test");
     base.devices.insert(k1.clone(), wc_core::Device::default());
     let mut renames = BTreeMap::new();
+    let mut renamed = base.clone();
+    renamed.rename_device(&k1, &k2);
     note_renames(
         &mut renames,
         vec![[(k1.clone(), k2.clone())].into_iter().collect()],
         &base,
-        &base,
+        &renamed,
+    );
+    assert_eq!(
+        renames_now(&renames, &renamed),
+        [(k1.clone(), k2.clone())].into_iter().collect()
     );
     // The session takes -K1 -> -K2; then -K2 is renamed -K3 here.
-    let mut synced = base.clone();
-    synced.devices.remove(&k1);
-    synced.devices.insert(k2.clone(), wc_core::Device::default());
+    let synced = renamed;
     note_renames(
         &mut renames,
         vec![[(k2.clone(), k3.clone())].into_iter().collect()],
@@ -4348,13 +4352,14 @@ fn a_rename_of_a_rename_the_session_has_is_a_rename_of_its_own() -> TestResult {
             l
         },
     );
-    assert_eq!(renames, [(k2.clone(), k3.clone())].into_iter().collect());
     // And it waits as a pair while the undrawn -K3 waits for its part.
     let mut local = synced.clone();
     local.rename_device(&k2, &k3);
     local.devices.get_mut(&k3).ok_or("no -K3")?.part = Some("acme.relay".into());
+    let now = renames_now(&renames, &local);
+    assert_eq!(now, [(k2.clone(), k3.clone())].into_iter().collect());
     let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
-    let held = Held::find_renamed(&local, &synced, &parts, &renames);
+    let held = Held::find_renamed(&local, &synced, &parts, &now);
     assert_eq!(held.now.devices.get(&k2), Some(&None));
     assert!(held.now.devices.contains_key(&k3));
     Ok(())
@@ -4381,7 +4386,7 @@ fn undo_of_a_rename_of_a_waiting_rename_brings_the_device_between_back() -> Test
     };
     note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &open.project);
     let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
-    let held = Held::find_renamed(&open.project, &base, &parts, &renames);
+    let held = Held::find_renamed(&open.project, &base, &parts, &renames_now(&renames, &open.project));
     assert_eq!(held.renames.len(), 1);
     // Undo of the latest action brings -K2 back as it was before it.
     let step = latest_waiting_step(&open, &base, &held).ok_or("a step")?;
@@ -4392,6 +4397,12 @@ fn undo_of_a_rename_of_a_waiting_rename_brings_the_device_between_back() -> Test
         Some("acme.relay")
     );
     assert!(!open.project.devices.contains_key(&k1));
+    // At the next sync -K1's removal still waits with -K2: the rename is -K1 -> -K2 now.
+    note_renames(&mut renames, Vec::new(), &base, &open.project);
+    assert_eq!(renames_now(&renames, &open.project), one(&k1, &k2));
+    let held = Held::find_renamed(&open.project, &base, &parts, &renames_now(&renames, &open.project));
+    assert_eq!(held.now.devices.get(&k1), Some(&None));
+    assert!(held.now.devices.contains_key(&k2));
     Ok(())
 }
 
@@ -4445,7 +4456,7 @@ fn renamed_onto_each_other(waits: &str) -> TestResult {
     note_renames(&mut renames, Vec::new(), &base, &local);
     assert_eq!(renames.len(), 2, "{renames:?}");
     let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
-    let held = Held::find_renamed(&local, &base, &parts, &renames);
+    let held = Held::find_renamed(&local, &base, &parts, &renames_now(&renames, &local));
     // What goes out meanwhile: both devices, and the page retagged to -K11, as the session
     // has them.
     let mut sendable = local.clone();
