@@ -149,6 +149,8 @@ const GAP_X: f64 = 40.0;
 const GAP_Y: f64 = 8.0;
 /// Room for each lane under the boxes.
 const LANE: f64 = 4.0;
+/// A lane at least this long has a label at each end and one in the middle.
+const LONG_LANE: f64 = 24.0;
 
 /// Where the boxes go on a sheet: the top left of column 0, row 0, the steps between columns
 /// and rows, and the size of a box.
@@ -381,23 +383,25 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
             continue;
         };
         let path = under_path(g, (ba.1, ba.2), (bb.1, bb.2), bottom, lane);
-        if let (Some(&s), Some(&(xa, _)), Some(&(lx, ly)), Some(&(rx, _)), Some(&(xb, _)), Some(&e)) = (
-            path.first(),
-            path.get(1),
-            path.get(2),
-            path.get(3),
-            path.get(4),
-            path.get(5),
-        ) {
-            // Each port name sits between its box and the run down beside it.
-            labels.push(Label::new((s.0 - 1.0, s.1 - 0.6), 2, &from_port, s.0 - xa - 2.0));
-            labels.push(Label::new((e.0 - 1.0, e.1 - 0.6), 2, &to_port, e.0 - xb - 2.0));
-            // The cable over its lane: as wide as the lane, or a gap when that is shorter.
-            let c = (lx + rx) / 2.0;
-            let half = ((rx - lx).abs().max(g.step_x - g.box_w) / 2.0 - 1.0)
-                .min(c - left)
-                .min(right - c);
-            labels.push(Label::new((c, ly - 0.8), 1, &cable, 2.0 * half));
+        // The labels go over the link's own lane, so links that leave one box apart from
+        // each other (and share the run beside it) are told apart by their lanes.
+        if let (Some(&(lx, ly)), Some(&(rx, _))) = (path.get(2), path.get(3)) {
+            let (len, y) = ((rx - lx).abs(), ly - 0.8);
+            if len >= LONG_LANE {
+                // Each port name at its own end of the lane, the cable between them.
+                let (from_align, to_align, dir) = if lx <= rx { (0, 2, 1.0) } else { (2, 0, -1.0) };
+                let quarter = len / 4.0 - 1.0;
+                labels.push(Label::new((lx + dir, y), from_align, &from_port, quarter));
+                labels.push(Label::new((rx - dir, y), to_align, &to_port, quarter));
+                labels.push(Label::new(((lx + rx) / 2.0, y), 1, &cable, len / 2.0 - 2.0));
+            } else {
+                // A short lane: one label over it, as wide as a gap.
+                let c = (lx + rx) / 2.0;
+                let half = (g.step_x - g.box_w) / 2.0 - 1.0;
+                let half = half.min(c - left).min(right - c);
+                let label = format!("{from_port} - {to_port} {cable}");
+                labels.push(Label::new((c, y), 1, &label, 2.0 * half));
+            }
         }
         paths.push(path);
     }
@@ -690,7 +694,9 @@ mod tests {
         assert_eq!((topo.under.len(), topo.own.len()), (1, 2));
         let (w, _) = size.mm();
         let (_, labels) = link_drawing(&topo, &g, &net, w);
-        assert_eq!(labels.len(), 3 * 4 + 2);
+        // Three tree links with three labels each; the ring link joins two devices of one
+        // column, so its short lane has one label; and a label per loop.
+        assert_eq!(labels.len(), 3 * 3 + 1 + 2);
         for l in &labels {
             assert!(l.text.ends_with("..."), "{l:?} is cut");
             let (x0, x1) = l.span();
@@ -703,7 +709,11 @@ mod tests {
                 assert!(apart, "{l:?} overlaps {}", b.0);
             }
         }
-        // No two labels overlap.
+        apart(&labels);
+    }
+
+    /// No two labels overlap.
+    fn apart(labels: &[Label]) {
         for (i, a) in labels.iter().enumerate() {
             for b in labels.iter().skip(i + 1) {
                 let ((a0, a1), (b0, b1)) = (a.span(), b.span());
@@ -711,6 +721,61 @@ mod tests {
                 assert!(apart, "{a:?} overlaps {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn ring_links_leaving_one_device_are_labelled_apart() {
+        let net = Network {
+            links: vec![
+                link("-A1:P1", "-B1:P1"),
+                link("-A1:P2", "-C1:P1"),
+                link("-A1:P3", "-D1:P1"),
+                link("-B1:P2", "-C1:P2"),
+                link("-B1:P3", "-D1:P2"),
+            ],
+            ..Network::default()
+        };
+        let (size, g, topo) = fits_its_sheet(&net);
+        assert_eq!(topo.under.len(), 2);
+        let (_, labels) = link_drawing(&topo, &g, &net, size.mm().0);
+        // B1's two ring ports are each on a label of their own lane, under the boxes.
+        let bottom = bottom_of(&topo, &g);
+        let with = |t: &str| {
+            labels
+                .iter()
+                .filter(|l| l.text.split(' ').next() == Some(t) && l.at.1 > bottom)
+                .count()
+        };
+        assert_eq!((with("P2"), with("P3")), (1, 1), "{labels:?}");
+        apart(&labels);
+
+        // A ring link across columns has a lane long enough for a label at each end and the
+        // cable between them.
+        let mut net = Network {
+            links: vec![
+                link("-A1:P1", "-B1:P1"),
+                link("-B1:P2", "-C1:P1"),
+                link("-C1:P2", "-D1:P1"),
+                link("-D1:P2", "-E1:P1"),
+                link("-E1:P2", "-B1:P3"),
+            ],
+            ..Network::default()
+        };
+        for (i, l) in net.links.iter_mut().enumerate() {
+            l.cable = format!("-W{}", i + 1);
+        }
+        let (size, g, topo) = fits_its_sheet(&net);
+        assert_eq!(topo.under.len(), 1);
+        let (_, labels) = link_drawing(&topo, &g, &net, size.mm().0);
+        let bottom = bottom_of(&topo, &g);
+        let mut lane: Vec<&str> = labels
+            .iter()
+            .filter(|l| l.at.1 > bottom)
+            .map(|l| l.text.as_str())
+            .collect();
+        lane.sort_unstable();
+        assert_eq!(lane, ["-W4", "P1", "P2"]);
+        apart(&labels);
     }
 
     #[test]

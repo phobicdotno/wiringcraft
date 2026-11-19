@@ -1720,9 +1720,12 @@ fn a_network_gets_a_topology_page_with_its_devices_addresses_and_cables() {
     ] {
         assert!(text.contains(&writer::pdf_text(t)), "{t}");
     }
-    // Every link of the ring is drawn once, each with its cable tag.
+    // Every link of the ring is drawn once, each with its cable tag (alone, or after the
+    // port names over a short lane).
     for w in ["-W51", "-W52", "-W53"] {
-        assert_eq!(text.matches(&writer::pdf_text(w)).count(), 1, "{w}");
+        let hex = writer::pdf_text(w);
+        let hex = hex.trim_start_matches('<').trim_end_matches('>');
+        assert_eq!(text.matches(hex).count(), 1, "{w}");
     }
     // The switch's box links to the page it is drawn on; the others are on no page.
     assert_eq!(text.matches("/Subtype /Link").count(), 1);
