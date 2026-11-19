@@ -278,21 +278,18 @@ fn conic_extent(
     // the curve's plane (the standard's own default).
     let along = |r: [f64; 3]| {
         let r = unit(r)?;
-        let d = dot(r, n);
-        let square = [r[0] - d * n[0], r[1] - d * n[1], r[2] - d * n[2]];
-        // Along the axis itself: no direction in the plane.
-        (dot(square, square).sqrt() > 1e-9).then_some(())?;
-        unit(square)
+        // (n x r) x n is r's part square to the axis, of length sin(angle), with no
+        // cancellation of the large along-axis part; any nearly parallel direction keeps its way.
+        let side = cross(n, r);
+        // Along the axis itself: only rounding noise is left, so no direction in the plane.
+        (dot(side, side).sqrt() > 64.0 * f64::EPSILON).then_some(())?;
+        unit(cross(side, n))
     };
     let u = direction(placement.get(3))?
         .and_then(along)
         .or_else(|| along([1.0, 0.0, 0.0]))
         .or_else(|| along([0.0, 1.0, 0.0]))?;
-    let v = [
-        n[1] * u[2] - n[2] * u[1],
-        n[2] * u[0] - n[0] * u[2],
-        n[0] * u[1] - n[1] * u[0],
-    ];
+    let v = cross(n, u);
     let mut lo = centre;
     let mut hi = centre;
     for k in 0..3 {
@@ -301,6 +298,14 @@ fn conic_extent(
         hi[k] += e;
     }
     Some([lo, hi])
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }
 
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
