@@ -332,6 +332,43 @@ struct Doc {
 
 const MAX_INFLATE: usize = 64 * 1024 * 1024;
 
+/// Undo PDF's run-length compression (`RunLengthDecode`): a length byte 0 to 127 copies the
+/// next 1 to 128 bytes, 129 to 255 repeats the next byte 2 to 128 times, and 128 ends the data.
+/// Returns the bytes and whether the end marker was found. Fails with the reason for a run
+/// that goes past the end of the data, or for output over [`MAX_INFLATE`].
+fn run_length_decode(data: &[u8]) -> std::result::Result<(Vec<u8>, bool), String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(&len) = data.get(i) {
+        i += 1;
+        let add = match len {
+            128 => return Ok((out, true)),
+            0..=127 => usize::from(len) + 1,
+            _ => 257 - usize::from(len),
+        };
+        if out.len() + add > MAX_INFLATE {
+            return Err(format!(
+                "the run-length data unpacks to more than {} MiB",
+                MAX_INFLATE / (1024 * 1024)
+            ));
+        }
+        if len < 128 {
+            let run = data
+                .get(i..i + add)
+                .ok_or("the run-length data is damaged (a run goes past its end)")?;
+            out.extend_from_slice(run);
+            i += add;
+        } else {
+            let b = *data
+                .get(i)
+                .ok_or("the run-length data is damaged (a run goes past its end)")?;
+            out.resize(out.len() + add, b);
+            i += 1;
+        }
+    }
+    Ok((out, false))
+}
+
 /// Undo PDF's LZW compression (`LZWDecode`): codes of 9 to 12 bits, most significant bit
 /// first, 256 clears the table and 257 ends the data. With `early_change` (the default) the
 /// code length grows one code early. Fails with the reason for a code that is not in the table,
@@ -609,6 +646,7 @@ fn decode_stream(d: &BTreeMap<String, Obj>, data: &[u8]) -> Option<Vec<u8>> {
     for f in filters {
         cur = match f.as_str() {
             "FlateDecode" | "Fl" => inflate(&cur)?,
+            "RunLengthDecode" | "RL" => run_length_decode(&cur).ok()?.0,
             _ => return None,
         };
     }
@@ -913,6 +951,13 @@ impl Interp<'_> {
                         .unwrap_or(1.0)
                         != 0.0;
                     bytes = unpredict(lzw_decode(&bytes, early)?, parms)?;
+                }
+                "RunLengthDecode" | "RL" => {
+                    let (out, ended) = run_length_decode(&bytes)?;
+                    if !ended {
+                        warning = Some("the run-length picture data has no end marker; it may be cut short".into());
+                    }
+                    bytes = out;
                 }
                 "DCTDecode" | "DCT" if i + 1 == filters.len() => {
                     return Ok((
@@ -1813,6 +1858,107 @@ mod tests {
         assert_eq!(lzw_decode(&clears, true), Ok(vec![]));
     }
 
+    /// Run-length-compress `data` as PDF's `RunLengthDecode` reads it: repeats of three or
+    /// more bytes as repeat runs, the rest as literal runs, then the end marker.
+    fn run_length_encode(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut literal: Vec<u8> = Vec::new();
+        let flush = |out: &mut Vec<u8>, literal: &mut Vec<u8>| {
+            for chunk in literal.chunks(128) {
+                out.push((chunk.len() - 1) as u8);
+                out.extend_from_slice(chunk);
+            }
+            literal.clear();
+        };
+        let mut i = 0;
+        while i < data.len() {
+            let run = data[i..].iter().take(128).take_while(|b| **b == data[i]).count();
+            if run >= 3 {
+                flush(&mut out, &mut literal);
+                out.extend_from_slice(&[(257 - run) as u8, data[i]]);
+                i += run;
+            } else {
+                literal.push(data[i]);
+                i += 1;
+            }
+        }
+        flush(&mut out, &mut literal);
+        out.push(128);
+        out
+    }
+
+    #[test]
+    fn run_length_data_unpacks_and_damage_is_named() {
+        let data: Vec<u8> = [vec![7u8; 300], vec![1, 2, 3], vec![9; 2]].concat();
+        assert_eq!(run_length_decode(&run_length_encode(&data)), Ok((data.clone(), true)));
+        // Without the end marker the data is kept, and said to be unended.
+        let mut open = run_length_encode(&data);
+        open.pop();
+        assert_eq!(run_length_decode(&open), Ok((data, false)));
+        // Bytes after the end marker are ignored.
+        assert_eq!(run_length_decode(&[0, 5, 128, 0, 6]), Ok((vec![5], true)));
+        // A literal run or a repeat run past the end.
+        for cut in [&[4u8, 1, 2][..], &[200u8][..]] {
+            assert!(
+                run_length_decode(cut).is_err_and(|e| e.contains("past its end")),
+                "{cut:?}"
+            );
+        }
+        assert_eq!(run_length_decode(&[]), Ok((vec![], false)));
+    }
+
+    #[test]
+    fn run_length_pictures_are_read_alone_and_chained() -> Result<()> {
+        let full = "q 595 0 0 842 0 0 cm /Im Do Q";
+        let grey = [10u8, 10, 10, 10, 50, 60];
+        let gray = "/Width 3 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8";
+        let want = Some((3, 2, grey.to_vec()));
+        for (dict, data) in [
+            (format!("{gray} /Filter /RunLengthDecode"), run_length_encode(&grey)),
+            (format!("{gray} /Filter [/RL]"), run_length_encode(&grey)),
+            // Run-length first, then LZW.
+            (
+                format!("{gray} /Filter [/RunLengthDecode /LZWDecode]"),
+                run_length_encode(&lzw_encode(&grey, true)),
+            ),
+            // LZW first, then run-length.
+            (
+                format!("{gray} /Filter [/LZWDecode /RunLengthDecode]"),
+                lzw_encode(&run_length_encode(&grey), true),
+            ),
+        ] {
+            let p = pages(&picture_pdf(0, &dict, &data, full))?;
+            assert!(p[0].scan_problem.is_none(), "{dict}: {:?}", p[0].scan_problem);
+            assert!(p[0].scan_warning.is_none(), "{dict}: {:?}", p[0].scan_warning);
+            assert_eq!(p[0].scan.as_ref().and_then(luma), want, "{dict}");
+        }
+        // No end marker: read, with a warning.
+        let mut open = run_length_encode(&grey);
+        open.pop();
+        let p = pages(&picture_pdf(
+            0,
+            &format!("{gray} /Filter /RunLengthDecode"),
+            &open,
+            full,
+        ))?;
+        assert_eq!(p[0].scan.as_ref().and_then(luma), want);
+        assert!(p[0].scan_warning.as_deref().is_some_and(|w| w.contains("end marker")));
+        // A run past the end: refused with the reason, no panic.
+        let p = pages(&picture_pdf(
+            0,
+            &format!("{gray} /Filter /RunLengthDecode"),
+            &[5, 10, 10],
+            full,
+        ))?;
+        assert!(p[0].scan.is_none());
+        assert!(
+            p[0].scan_problem.as_deref().is_some_and(|m| m.contains("past its end")),
+            "{:?}",
+            p[0].scan_problem
+        );
+        Ok(())
+    }
+
     #[test]
     fn lzw_cmyk_and_16_bit_pictures_are_read() -> Result<()> {
         let full = "q 595 0 0 842 0 0 cm /Im Do Q";
@@ -2169,18 +2315,9 @@ mod tests {
         let p = pages(&picture_pdf(0, "/Width 3 /Height 2 /Filter /DCTDecode", &jpeg, full))?;
         assert_eq!(p[0].scan.as_ref().map(|s| s.raster.bytes.clone()), Some(jpeg.to_vec()));
         // A filter the reader does not know is reported, not guessed at.
-        let p = pages(&picture_pdf(
-            0,
-            "/Width 3 /Height 2 /Filter /RunLengthDecode",
-            &jpeg,
-            full,
-        ))?;
+        let p = pages(&picture_pdf(0, "/Width 3 /Height 2 /Filter /MadeUpDecode", &jpeg, full))?;
         assert!(p[0].scan.is_none());
-        assert!(
-            p[0].scan_problem
-                .as_deref()
-                .is_some_and(|m| m.contains("RunLengthDecode"))
-        );
+        assert!(p[0].scan_problem.as_deref().is_some_and(|m| m.contains("MadeUpDecode")));
 
         // Short sample data never panics.
         let p = pages(&picture_pdf(0, grey, &samples[..2], full))?;
