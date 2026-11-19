@@ -271,19 +271,25 @@ impl Xf {
     fn det(&self) -> f64 {
         self.m[0] * self.m[3] - self.m[1] * self.m[2]
     }
-    /// How lengths grow (the mean of the two axes' scales): radii and text heights.
-    fn len_scale(&self) -> f64 {
-        // Each axis normalized on its own, so a huge or tiny scale does not overflow or underflow
-        // when multiplied, and a tiny axis next to a huge one is not lost.
+    /// Each axis's largest entry and the determinant of the matrix with each axis divided by
+    /// it, so a huge or tiny scale does not overflow or underflow when multiplied, and a tiny axis
+    /// next to a huge one is not lost. None when an entry is not a number.
+    fn normalized_det(&self) -> Option<(f64, f64, f64)> {
         let [a, b, c, d] = self.m;
         let (nx, ny) = (a.abs().max(c.abs()), b.abs().max(d.abs()));
-        if nx == 0.0 || ny == 0.0 {
-            return 0.0;
-        }
         if !nx.is_finite() || !ny.is_finite() {
-            return self.det().abs().sqrt();
+            return None;
         }
-        let det = (a / nx) * (d / ny) - (b / ny) * (c / nx);
+        if nx == 0.0 || ny == 0.0 {
+            return Some((nx, ny, 0.0));
+        }
+        Some((nx, ny, (a / nx) * (d / ny) - (b / ny) * (c / nx)))
+    }
+    /// How lengths grow (the mean of the two axes' scales): radii and text heights.
+    fn len_scale(&self) -> f64 {
+        let Some((nx, ny, det)) = self.normalized_det() else {
+            return self.det().abs().sqrt();
+        };
         // Multiplied first where that stays in range, so a plain scale of 2 gives exactly 2.
         let both = nx * ny;
         if both.is_normal() {
@@ -291,6 +297,12 @@ impl Xf {
         } else {
             nx.sqrt() * ny.sqrt() * det.abs().sqrt()
         }
+    }
+    /// Whether the placement mirrors, so arcs run the other way round; read from the normalized
+    /// matrix so a tiny mirrored scale does not underflow to a determinant of -0.
+    fn mirrors(&self) -> bool {
+        self.normalized_det()
+            .map_or_else(|| self.det() < 0.0, |(_, _, det)| det < 0.0)
     }
     /// Whether every direction grows alike (turns, mirrors and one scale), so a circle stays a
     /// circle. A placement scaled differently along x and y makes it an ellipse.
@@ -416,7 +428,7 @@ fn shapes(
                 // A mirroring placement turns the angle a into x_angle - a, so the arc runs the
                 // other way round; any other placement turns it by x_angle.
                 let turn = xf.x_angle();
-                let (s, en) = if xf.det() < 0.0 {
+                let (s, en) = if xf.mirrors() {
                     (turn - en, turn - s)
                 } else {
                     (s + turn, en + turn)
@@ -2147,6 +2159,23 @@ mod tests {
         assert!(
             matches!(&shapes[..], [(_, Shape::Text { height, .. })] if (*height - 2.5).abs() < 1e-9),
             "{shapes:?}"
+        );
+        // Mirrored at scales (-1e-200, 1e-200), a quarter arc of radius 1e200 runs like one of
+        // radius 1 mirrored at (-1, 1), not the other way round.
+        let arc = |r: &str, sx: &str, sy: &str| {
+            draw(
+                &format!("0\nBLOCK\n2\nB\n0\nARC\n10\n0\n20\n0\n40\n{r}\n50\n0\n51\n90\n0\nENDBLK\n"),
+                &format!("0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n{sx}\n42\n{sy}\n"),
+            )
+            .map(|(s, _)| s)
+        };
+        let (tiny, plain) = (arc("1e200", "-1e-200", "1e-200")?, arc("1", "-1", "1")?);
+        assert!(
+            matches!((&tiny[..], &plain[..]), (
+                [(_, Shape::Arc { radius: r1, start: s1, end: e1, .. })],
+                [(_, Shape::Arc { radius: r2, start: s2, end: e2, .. })],
+            ) if (r1 - r2).abs() < 1e-9 && (s1 - s2).abs() < 1e-9 && (e1 - e2).abs() < 1e-9),
+            "{tiny:?} {plain:?}"
         );
         // An arc whose angles give no points is left out and said, next to a line that is drawn.
         let (shapes, skipped) = draw(
