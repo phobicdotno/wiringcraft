@@ -2995,7 +2995,7 @@ fn a_picture_picked_here_under_a_session_name_is_kept_and_shared_under_a_name_of
 }
 
 #[test]
-fn a_picked_picture_whose_change_the_session_refused_is_neither_renamed_nor_shared() -> TestResult {
+fn a_picked_picture_whose_change_the_session_refused_leaves_the_sessions_picture_alone() -> TestResult {
     let tmp = tempfile::tempdir()?;
     // The session has a picture brand.png that its drawings do not use.
     let (mut h, log, mut host_open, mut g, mut guest_open) = session_sharing(
@@ -3004,8 +3004,8 @@ fn a_picked_picture_whose_change_the_session_refused_is_neither_renamed_nor_shar
         [("pictures/brand.png".to_owned(), PNG.to_vec())].into(),
     )?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
-    // The guest picks its own picture of that name as the logo, and sends that; the session
-    // will refuse it.
+    // The guest picks its own picture of that name as the logo: it gets a name of its own here
+    // first, and the change then goes out under that name; the session will refuse it.
     log.fail_guests(true);
     let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
     std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
@@ -3029,10 +3029,13 @@ fn a_picked_picture_whose_change_the_session_refused_is_neither_renamed_nor_shar
     assert_eq!(guest_open.project.meta.logo, theirs, "not renamed: {:?}", g.notes);
     assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, mine, "kept");
     assert_eq!(
-        h.role.as_ref().map(|r| r.pictures().len()),
-        Some(1),
-        "nothing of this copy's was shared"
+        h.role
+            .as_ref()
+            .and_then(|r| r.pictures().get("pictures/brand.png").cloned()),
+        Some(PNG.to_vec()),
+        "the session's picture is not replaced"
     );
+    assert_eq!(file_bytes(&host_open.dir, "pictures/brand.png")?, PNG);
     Ok(())
 }
 
@@ -5988,6 +5991,87 @@ fn a_guest_logo_named_like_an_unused_file_of_the_host_gets_a_name_of_its_own() -
         "{notes:?}"
     );
     Ok(())
+}
+
+/// A GitJournal session whose pictures include a brand.png its drawings do not use; the guest
+/// picks a file of its own of that name (`pick`), and once it has a name of its own, takes the
+/// pick back with one undo. `used` reads the picked file from a copy.
+fn renamed_pick_then_one_undo(
+    pick: impl Fn(&mut Open, &str) -> TestResult,
+    used: impl Fn(&Open) -> Option<String>,
+) -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    host_open.save()?;
+    let mut h = host_with(&host_open, Box::new(GitJournal::open(&host_open.dir)?));
+    if let Some(Role::Host(hosting)) = h.role.as_mut() {
+        let mut all = hosting.host.pictures().clone();
+        all.insert("pictures/brand.png".into(), PNG.to_vec());
+        hosting.host.share_pictures(all);
+    }
+    let mut g = guest(&mut h, "Ola", &tmp.path().join("Ola"));
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    let ids = pending(&h);
+    approve(&mut h, ids[0], true);
+    let mut guest_open = g.frame(None, None, false).ok_or("no project")?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(used(&host_open), None);
+
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    pick(&mut guest_open, "pictures/brand.png")?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let file = used(&host_open).ok_or("not picked")?;
+    assert_ne!(file, "pictures/brand.png", "renamed for the session: {:?}", g.notes);
+    assert_eq!(used(&guest_open), Some(file.clone()));
+    assert_eq!(file_bytes(&host_open.dir, &file)?, mine);
+
+    // The pick was one change, so one undo takes it back whole, not just the rename (which
+    // would leave the session's brand.png in use).
+    g.undo()?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(used(&host_open), None, "host: {:?}", g.notes);
+    assert_eq!(used(&guest_open), None, "guest");
+    Ok(())
+}
+
+#[test]
+fn one_undo_takes_back_a_guest_logo_that_was_renamed_for_the_session() -> TestResult {
+    renamed_pick_then_one_undo(
+        |open, file| {
+            open.project.meta.logo = Some(wc_core::Logo {
+                file: file.into(),
+                cover: None,
+            });
+            Ok(())
+        },
+        |open| open.project.meta.logo.as_ref().map(|l| l.file.clone()),
+    )
+}
+
+#[test]
+fn one_undo_takes_back_a_guest_underlay_that_was_renamed_for_the_session() -> TestResult {
+    renamed_pick_then_one_undo(
+        |open, file| {
+            open.project.page_mut("p0003").ok_or("no page")?.underlay = Some(wc_core::Underlay {
+                file: file.into(),
+                min: wc_core::Point::new(0.0, 0.0),
+                max: wc_core::Point::new(10.0, 10.0),
+            });
+            Ok(())
+        },
+        |open| {
+            open.project
+                .page("p0003")
+                .and_then(|p| p.underlay.as_ref())
+                .map(|u| u.file.clone())
+        },
+    )
 }
 
 #[test]
