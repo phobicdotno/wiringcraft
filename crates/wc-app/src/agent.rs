@@ -2852,12 +2852,13 @@ fn in_project(project: &Path, value: &str) -> Option<PathBuf> {
     } else {
         return None;
     };
-    let (path, project) = (real(&normalize(&path)), real(project));
+    let (path, project) = (normalize(&real(&path)), real(project));
     path.strip_prefix(&project).ok().map(Path::to_path_buf)
 }
 
-/// `path` with links worked out as far as it exists (a link to the project folder is the
-/// project folder); the part that does not exist yet is kept by name.
+/// `path` with links and `..` worked out as the file system does, as far as it exists (a link
+/// to the project folder is the project folder, and `link/..` is the folder above where the
+/// link points); the part that does not exist yet is kept by name.
 fn real(path: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut at = path;
@@ -2865,9 +2866,9 @@ fn real(path: &Path) -> PathBuf {
         if let Ok(found) = at.canonicalize() {
             return rest.iter().rev().fold(found, |p, name| p.join(name));
         }
-        match (at.parent(), at.file_name()) {
+        match (at.parent(), at.components().next_back()) {
             (Some(up), Some(name)) => {
-                rest.push(name.to_owned());
+                rest.push(name.as_os_str().to_owned());
                 at = up;
             }
             _ => return path.to_path_buf(),
@@ -5427,6 +5428,14 @@ mod tests {
             let through = link.join("pages").join("p0002.page.json").display().to_string();
             let e = command_runs(&mut a, &["plc-vars", through.as_str()]).unwrap_err();
             assert!(e.contains("project folder"), "{e}");
+            // `..` after a link goes up from where the link points, not from the link.
+            let to_pages = dir.parent().unwrap().join("link-to-pages");
+            std::os::unix::fs::symlink(dir.join("pages"), &to_pages).unwrap();
+            for name in ["p0002.page.json", "new.svg"] {
+                let up = to_pages.join("..").join("pages").join(name).display().to_string();
+                let e = command_runs(&mut a, &["vcs", "log", "--svg", up.as_str()]).unwrap_err();
+                assert!(e.contains("project folder"), "{up}: {e}");
+            }
         }
         let page = dir.join("pages").join("p0002.page.json").display().to_string();
         for args in [
