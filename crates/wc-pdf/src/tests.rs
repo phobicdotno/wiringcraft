@@ -2214,11 +2214,24 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
     use wc_core::network::{Network, Node};
     let net = Network {
         name: "PN3".into(),
-        nodes: vec![Node {
-            device: "  ".into(),
-            address: "192.168.0.2".into(),
-            station: "drive-07".into(),
-            ..Node::default()
+        nodes: vec![
+            // Text that reads like the name a blank node is shown under does not take its box.
+            Node {
+                device: "(node 2)".into(),
+                address: "10.0.0.1".into(),
+                ..Node::default()
+            },
+            Node {
+                device: "  ".into(),
+                address: "192.168.0.2".into(),
+                station: "drive-07".into(),
+                ..Node::default()
+            },
+        ],
+        links: vec![wc_core::network::Link {
+            from: "(node 2)".into(),
+            to: "-K1:P1".into(),
+            ..Default::default()
         }],
         ..Network::default()
     };
@@ -2228,7 +2241,8 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
     };
     let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
     let text = String::from_utf8_lossy(&pdf);
-    assert!(text.contains(&writer::pdf_text("(node 1)")));
+    assert_eq!(text.matches(&writer::pdf_text("(node 2)")).count(), 2, "two boxes");
+    assert!(text.contains(&writer::pdf_text("10.0.0.1")));
     assert!(text.contains(&writer::pdf_text("192.168.0.2")));
     assert!(text.contains(&writer::pdf_text("drive-07")));
     assert!(!text.contains(&writer::pdf_text("No devices on this network.")));
@@ -2236,7 +2250,7 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
         report
             .warnings
             .iter()
-            .any(|w| w.starts_with("network PN3: node 1 is not a device tag")),
+            .any(|w| w.starts_with("network PN3: node 2 is not a device tag")),
         "{:?}",
         report.warnings
     );

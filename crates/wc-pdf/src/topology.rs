@@ -51,12 +51,24 @@ fn node_key(s: &str) -> String {
     }
 }
 
-/// The box name of node `i` (from 0): its [`node_key`], or `(node N)` when its tag is blank,
-/// so a declared node keeps a box for its address and station. Never a link end's key: those
-/// are blank-free and a tag never starts with `(`.
+/// Starts the box name of a node with a blank tag. Text from the project is trimmed and never
+/// starts with a control character, so such a name cannot collide with a tag, a link end or
+/// another node.
+const BLANK: char = '\u{1}';
+
+/// The box name of node `i` (from 0): its [`node_key`], or [`BLANK`] and its number when its
+/// tag is blank, so a declared node keeps a box for its address and station.
 fn node_name(i: usize, n: &wc_core::network::Node) -> String {
     let k = node_key(&n.device);
-    if k.is_empty() { format!("(node {})", i + 1) } else { k }
+    if k.is_empty() { format!("{BLANK}{}", i + 1) } else { k }
+}
+
+/// How a box name is printed: a blank-tag node as `(node N)`.
+fn shown(name: &str) -> String {
+    match name.strip_prefix(BLANK) {
+        Some(n) => format!("(node {n})"),
+        None => name.to_owned(),
+    }
 }
 
 /// Lay out `net`: devices in node order then in order of first mention by a link, placed by
@@ -549,7 +561,7 @@ pub fn draw_network_page(
             .map(|d| d.description.trim().to_owned())
             .unwrap_or_default();
         let lines = [
-            name.clone(),
+            shown(name),
             description,
             node.map(|n| n.address.trim().to_owned()).unwrap_or_default(),
             node.map(|n| n.station.trim().to_owned()).unwrap_or_default(),
