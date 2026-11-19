@@ -122,13 +122,14 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     };
     let (front_pages, back_pages) = (split(true), split(false));
     // Each drawn card sheet: (card, first row, part, parts).
-    let card_rows = layout::card_rows_per_page(first_size, project.meta.template.band_height());
+    let card_size = layout::card_size(first_size, project.meta.template.band_height());
+    let card_rows = layout::card_rows_per_page(card_size, project.meta.template.band_height());
     let card_pages: Vec<(usize, usize, usize, usize)> = options
         .plc_cards
         .iter()
         .enumerate()
         .flat_map(|(ci, card)| {
-            let n = layout::card_rows(card).len().div_ceil(card_rows).max(1);
+            let n = layout::card_rows_of(card).len().div_ceil(card_rows).max(1);
             (0..n).map(move |k| (ci, k * card_rows, k + 1, n))
         })
         .collect();
@@ -220,10 +221,10 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             format!("C{}", k + 1),
             format!("PLC card {}", card.card),
         );
-        page.size = first_size;
+        page.size = card_size;
         let mut drawn = layout::draw_card_page(project, &page, sheet, total, card, first, (part, parts), &options.date);
         place_logo(&mut drawn, &page);
-        doc.add_page(first_size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        doc.add_page(card_size.mm(), &format!("{} {}", page.number, page.title), drawn);
         sheet += 1;
     }
     add_reports(&mut doc, back_pages, &mut sheet);

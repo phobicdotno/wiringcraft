@@ -1714,7 +1714,7 @@ fn plc_cards_are_drawn_one_per_sheet_with_their_points_linked() {
     assert!(at("C3 PLC card -K3") < usize::MAX);
     // Each drawn point links to its page: -S1 to page 1, -M1 and -H1 to page 2.
     assert_eq!(text.matches("/Subtype /Link").count(), 3);
-    let rows = |c: &PlcCardSheet| layout::card_rows(c).len();
+    let rows = |c: &PlcCardSheet| layout::card_rows_of(c).len();
     assert_eq!((rows(&cards[0]), rows(&cards[1]), rows(&cards[2])), (8, 9, 8));
 }
 
@@ -1743,4 +1743,21 @@ fn a_long_plc_card_goes_on_over_several_sheets() {
     assert_eq!(report.pages, 3);
     let text = String::from_utf8_lossy(&pdf);
     assert!(text.contains(&writer::pdf_text("PLC card -K9 (2 / 2)")));
+}
+
+#[test]
+fn plc_card_sheets_move_to_a_larger_sheet_and_fit_their_fields() {
+    let short = PageSize::Custom {
+        width: 300,
+        height: 100,
+    };
+    // A 60 mm title block leaves no card row on the short sheet: a larger one is used.
+    assert_eq!(layout::card_size(short, 60.0), PageSize::A4);
+    assert_eq!(layout::card_size(PageSize::A3, 60.0), PageSize::A3);
+    // A field cut for its column is measured at the height it is drawn at.
+    let long = "-K100 motor protection relay for the main pump in the north basin";
+    for width in [10.0, 25.0, 60.0] {
+        let cut = layout::fit_at(long, width, 2.5);
+        assert!(writer::text_width_mm(&cut, 2.5) <= width, "{cut:?} fits {width} mm");
+    }
 }

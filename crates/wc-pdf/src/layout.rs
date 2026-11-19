@@ -1046,11 +1046,16 @@ fn column_widths(t: &wc_report::Table, avail: f64) -> Vec<f64> {
 
 /// Cut text to fit a width, marking the cut with "...".
 fn fit(s: &str, width: f64) -> String {
-    if text_width_mm(s, TABLE_TEXT) <= width {
+    fit_at(s, width, TABLE_TEXT)
+}
+
+/// `s` cut short with "..." so that, drawn `height` mm high, it is at most `width` mm wide.
+pub(crate) fn fit_at(s: &str, width: f64, height: f64) -> String {
+    if text_width_mm(s, height) <= width {
         return s.to_owned();
     }
     let mut out: String = s.to_owned();
-    while !out.is_empty() && text_width_mm(&format!("{out}..."), TABLE_TEXT) > width {
+    while !out.is_empty() && text_width_mm(&format!("{out}..."), height) > width {
         out.pop();
     }
     format!("{out}...")
@@ -1157,16 +1162,30 @@ const CARD_TEXT: f64 = 2.5;
 /// Where the channel rows start below the top of the drawing area, in mm (room for the heading).
 const CARD_TOP: f64 = 22.0;
 
-/// How many rows of a drawn PLC card fit on one sheet of `size`.
+/// How many rows of a drawn PLC card fit on one sheet of `size` (at least one: use
+/// [`card_size`] for a sheet with room for one).
 pub fn card_rows_per_page(size: PageSize, band: f64) -> usize {
+    (card_rows(size, band).floor() as usize).max(1)
+}
+
+/// How many rows of a drawn PLC card the sheet height leaves room for, before rounding down.
+fn card_rows(size: PageSize, band: f64) -> f64 {
     let (_, h) = size.mm();
-    let usable = h - 2.0 * MARGIN - HEADER - band - CARD_TOP - 14.0;
-    ((usable / CARD_ROW).floor() as usize).max(1)
+    (h - 2.0 * MARGIN - HEADER - band - CARD_TOP - 14.0) / CARD_ROW
+}
+
+/// The sheet size for drawn PLC cards: `wanted` (the first schematic page's) when it has room
+/// for the heading and a card row above the title block, else the smallest named size that has.
+pub fn card_size(wanted: PageSize, band: f64) -> PageSize {
+    std::iter::once(wanted)
+        .chain(PageSize::NAMED)
+        .find(|s| card_rows(*s, band) >= 1.0)
+        .unwrap_or(PageSize::A3)
 }
 
 /// The rows of a drawn PLC card: each channel with the point drawn there (`None` for a spare),
 /// a channel with several points on one row each.
-pub fn card_rows(card: &wc_report::PlcCardSheet) -> Vec<(&wc_report::CardChannel, Option<&wc_report::CardPoint>)> {
+pub fn card_rows_of(card: &wc_report::PlcCardSheet) -> Vec<(&wc_report::CardChannel, Option<&wc_report::CardPoint>)> {
     card.channels
         .iter()
         .flat_map(|ch| {
@@ -1219,7 +1238,7 @@ pub fn draw_card_page(
     pen.colour(0.35, 0.35, 0.35);
     pen.text((x0, top + 6.0), CARD_TEXT, 0, &about.join(", "));
     pen.colour(0.0, 0.0, 0.0);
-    let rows = card_rows(card);
+    let rows = card_rows_of(card);
     let per = card_rows_per_page(page.size, project.meta.template.band_height());
     let shown: Vec<_> = rows.iter().skip(first).take(per).collect();
     // Column positions: the card box, the wire to the terminal, then the point's fields.
@@ -1269,18 +1288,24 @@ pub fn draw_card_page(
         };
         pen.width(0.25);
         pen.line((bx1 + 1.2, mid), (lead, mid));
-        pen.text((dev_x, base), CARD_TEXT, 0, &fit(&point.device, desc_x - dev_x - 2.0));
+        // Cut to fit at the height they are drawn at, so none runs into the next column.
+        pen.text(
+            (dev_x, base),
+            CARD_TEXT,
+            0,
+            &fit_at(&point.device, desc_x - dev_x - 2.0, CARD_TEXT),
+        );
         pen.text(
             (desc_x, base),
             CARD_TEXT,
             0,
-            &fit(&point.description, conn_x - desc_x - 2.0),
+            &fit_at(&point.description, conn_x - desc_x - 2.0, CARD_TEXT),
         );
         pen.text(
             (conn_x, base),
             CARD_TEXT,
             0,
-            &fit(&point.connected, page_x - conn_x - 14.0),
+            &fit_at(&point.connected, page_x - conn_x - 14.0, CARD_TEXT),
         );
         pen.text((page_x, base), CARD_TEXT, 2, &point.page_number);
         if !point.page_id.is_empty() {
