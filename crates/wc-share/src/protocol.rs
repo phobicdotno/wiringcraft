@@ -848,6 +848,11 @@ pub(crate) fn check_edit(
             }
             Ok(())
         }
+        // The host opens the library locations whenever it looks something up, so only the host
+        // chooses them: a guest could otherwise make the host's machine reach a folder or share.
+        ProjectEdit::SetMeta { meta, .. } if by != crate::host::HOST && meta.libraries != project.meta.libraries => {
+            invalid("only the host can change the project's library locations".into())
+        }
         ProjectEdit::SetMeta { .. } => Ok(()),
         ProjectEdit::AddPicture { picture } => match picture.problem() {
             Some(why) => invalid(why),
