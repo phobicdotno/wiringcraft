@@ -267,6 +267,21 @@ INSERT INTO tew_catterminal VALUES (10, 1, 'A1');
     let mut warnings = Vec::new();
     let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
     assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1", "{warnings:?}");
+
+    // The same with the element table's other columns under `ele`: its id `ref_id` is found
+    // only under another prefix, and the link is still `x_ref_id`.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ref_id INTEGER, x_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT,
+  ele_description TEXT);
+CREATE TABLE tew_catterminal (ter_ref_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil', '');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1", "{warnings:?}");
 }
 
 #[test]

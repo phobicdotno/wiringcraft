@@ -194,9 +194,12 @@ impl Table {
 
     /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`. The other prefix
     /// is the one the other table's id column carries, then the other table's own when that
-    /// differs. The table's own id column (`<prefix>_id` or a bare `id`) is never taken for a
-    /// link: when both tables share a prefix, the bare `<other prefix>_id` would be it. A
-    /// column with another prefix stays a candidate, so a bare foreign key is still found.
+    /// differs.
+    ///
+    /// The table's own id is never taken for a link: when both tables share a prefix, the bare
+    /// `<other prefix>_id` would be it. Its own `<prefix>_id` (or bare `id`) is always left out.
+    /// An id found only under another prefix may as well be a bare foreign key (`ele_id` in a
+    /// terminal table), so it is left out only while another candidate is there to take.
     fn link(&self, other: &Table) -> Option<&str> {
         let mut prefixes = Vec::new();
         if let Some((p, _)) = other.field(&["id"]).and_then(|c| c.split_once('_')) {
@@ -206,11 +209,24 @@ impl Table {
             prefixes.push(other.prefix.as_str());
         }
         let own_id = self.own_field("id");
-        let wanted: Vec<String> = prefixes.iter().map(|p| format!("{p}_id")).collect();
-        wanted
+        let maybe_own_id = self.field(&["id"]);
+        let mut candidates: Vec<&str> = Vec::new();
+        for p in &prefixes {
+            let f = format!("{p}_id");
+            for c in [self.own_field(&f), self.other_prefix_field_except(&f, own_id)]
+                .into_iter()
+                .flatten()
+            {
+                if Some(c) != own_id && !candidates.contains(&c) {
+                    candidates.push(c);
+                }
+            }
+        }
+        candidates
             .iter()
-            .find_map(|f| self.own_field(f).filter(|c| Some(*c) != own_id))
-            .or_else(|| wanted.iter().find_map(|f| self.other_prefix_field_except(f, own_id)))
+            .find(|c| Some(**c) != maybe_own_id)
+            .or_else(|| candidates.first())
+            .copied()
     }
 
     /// The column for `fields`, or an error naming what is missing and the columns there are,
