@@ -3080,6 +3080,37 @@ fn a_picture_is_replaced_only_while_it_holds_what_it_held() -> TestResult {
     Ok(())
 }
 
+// Unix only: elsewhere a file another program holds open is not moved at all.
+#[cfg(unix)]
+#[test]
+fn a_picture_written_to_while_it_is_replaced_is_kept() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    write_picture(dir, &picture("pictures/logo.png", b"mine"))?;
+    // A program that had the file open writes to it once it was compared.
+    let mut open = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("pictures/logo.png"))?;
+    crate::journal::AFTER_COMPARE.with(|f| {
+        *f.borrow_mut() = Some(Box::new(move |_: &std::path::Path| {
+            use std::io::Write;
+            let _ = open.write_all(b"edit");
+            let _ = open.sync_all();
+        }));
+    });
+    let r = replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"mine");
+    assert!(matches!(r, Err(Error::PictureNameTaken(_))), "{r:?}");
+    assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
+    // The edit is kept beside it.
+    let kept: Vec<Vec<u8>> = std::fs::read_dir(dir.join("pictures"))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name() != "logo.png")
+        .map(|e| std::fs::read(e.path()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(kept, [b"edit".to_vec()]);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn a_picture_is_never_replaced_through_a_link() -> TestResult {

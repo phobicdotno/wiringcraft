@@ -306,25 +306,51 @@ pub fn replace_picture(dir: &std::path::Path, picture: &Picture, was: &[u8]) -> 
             Err(e) => Err(e.into()),
         };
     }
+    #[cfg(test)]
+    AFTER_COMPARE.with(|f| {
+        if let Some(f) = f.borrow_mut().take() {
+            f(&aside);
+        }
+    });
     let part = match stage(&folder, name, &picture.data) {
         Ok(part) => part,
         Err(e) => return Err(restore_aside(&aside, &path, e)),
     };
     let published = publish(&part, &path);
     let _ = std::fs::remove_file(&part);
+    // The moved file is dropped only while it still holds `was` (the caller's copy): a program
+    // that had it open may have written to it since it was compared. Then it is kept beside the
+    // name, and the error says where.
+    let drop_aside = || -> std::result::Result<(), crate::Error> {
+        match std::fs::read(&aside) {
+            Ok(have) if have == was => {
+                let _ = std::fs::remove_file(&aside);
+                Ok(())
+            }
+            _ => Err(crate::Error::PictureNameTaken(format!(
+                "{} was written to while it was replaced; that version is kept as {}",
+                picture.file,
+                aside.display()
+            ))),
+        }
+    };
     match published {
-        // What was there is the `was` the caller has a copy of.
-        Ok(()) => {
-            let _ = std::fs::remove_file(&aside);
-            Ok(())
-        }
+        Ok(()) => drop_aside(),
         // Written there since it was moved aside: that one stays.
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(&aside);
-            Err(changed())
-        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => drop_aside().and(Err(changed())),
         Err(e) => Err(restore_aside(&aside, &path, e)),
     }
+}
+
+/// Tests: see [`AFTER_COMPARE`].
+#[cfg(test)]
+pub(crate) type AfterCompare = Option<Box<dyn FnOnce(&std::path::Path)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: run once by [`replace_picture`] on the moved file, right after it was compared.
+    pub(crate) static AFTER_COMPARE: std::cell::RefCell<AfterCompare> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// After `failed`, put the file moved `aside` back at `path`. When that fails too, the error
