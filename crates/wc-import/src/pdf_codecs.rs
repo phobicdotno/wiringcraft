@@ -78,8 +78,10 @@ pub(crate) struct FaxParms {
     pub black_is_1: bool,
 }
 
-/// Decodes CCITT fax data into `parms.rows` rows of `parms.columns` 1-bit samples.
-pub(crate) fn ccitt(data: &[u8], parms: &FaxParms) -> Result<Vec<u8>, String> {
+/// Decodes CCITT fax data into `parms.rows` rows of `parms.columns` 1-bit samples. A picture
+/// damaged part way is kept with the rows before the damage (the rest white), and the second
+/// value says so.
+pub(crate) fn ccitt(data: &[u8], parms: &FaxParms) -> Result<(Vec<u8>, Option<String>), String> {
     if !fits(parms.columns, parms.rows) {
         return Err("the fax picture has no size or is too large".into());
     }
@@ -114,18 +116,25 @@ pub(crate) fn ccitt(data: &[u8], parms: &FaxParms) -> Result<Vec<u8>, String> {
     }
     // Black is a 0 sample unless the picture says BlackIs1.
     let mut rows = Rows(Packer::new(parms.columns, parms.black_is_1));
-    guarded("fax", || {
+    let damage = guarded("fax", || {
         let mut ctx = hayro_ccitt::DecoderContext::new(settings);
         let result = hayro_ccitt::decode(data, &mut rows, &mut ctx);
         // A damaged tail still leaves the rows before it; only a picture with no row at all is
-        // refused. Missing rows stay white.
-        if rows.0.rows == 0 {
-            return Err(match result {
-                Err(e) => format!("the fax picture could not be decoded ({e})"),
-                Ok(_) => "the fax picture holds no rows".into(),
-            });
+        // refused. Missing rows stay white, and the reason goes with the picture.
+        let got = rows.0.rows;
+        match result {
+            Err(e) if got == 0 => Err(format!("the fax picture could not be decoded ({e})")),
+            Ok(_) if got == 0 => Err("the fax picture holds no rows".into()),
+            Err(e) => Ok(Some(format!(
+                "the fax picture is damaged after row {got} of {} ({e}); the rest is left white",
+                parms.rows
+            ))),
+            Ok(_) if got < parms.rows => Ok(Some(format!(
+                "the fax picture ends after row {got} of {}; the rest is left white",
+                parms.rows
+            ))),
+            Ok(_) => Ok(None),
         }
-        Ok(())
     })?;
     let mut packer = rows.0;
     while packer.rows < parms.rows {
@@ -133,12 +142,18 @@ pub(crate) fn ccitt(data: &[u8], parms: &FaxParms) -> Result<Vec<u8>, String> {
     }
     let stride = parms.columns.div_ceil(8) as usize;
     packer.out.truncate(stride * parms.rows as usize);
-    Ok(packer.out)
+    Ok((packer.out, damage))
 }
 
 /// Decodes a JBIG2 picture in the embedded organization PDF uses, with the segments of its
 /// `JBIG2Globals` stream if it has one. Returns its width, height and 1-bit samples (0 black).
 pub(crate) fn jbig2(data: &[u8], globals: Option<&[u8]>) -> Result<(u32, u32, Vec<u8>), String> {
+    // The decoder keeps every intermediate region of a page until the page is done and checks
+    // each only against its own size limit, so the regions are added up here before it runs.
+    let regions = jbig2_region_area(data)?.saturating_add(globals.map_or(Ok(0), jbig2_region_area)?);
+    if regions > MAX_PIXELS {
+        return Err("the JBIG2 picture's regions are too large".into());
+    }
     guarded("JBIG2", || {
         let settings = hayro_jbig2::DecodeSettings::default();
         let globals = globals
@@ -176,6 +191,57 @@ pub(crate) fn jbig2(data: &[u8], globals: Option<&[u8]>) -> Result<(u32, u32, Ve
     })
 }
 
+/// The pixels of all region segments (T.88 7.4.1: generic, refinement, text and halftone
+/// regions, intermediate or immediate) in JBIG2 data in the embedded organization, read from
+/// their segment headers. Data the headers do not describe is left to the decoder.
+fn jbig2_region_area(data: &[u8]) -> Result<u64, String> {
+    const REGIONS: [u8; 12] = [4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43];
+    let be32 = |at: usize| -> Option<u32> {
+        data.get(at..at.checked_add(4)?)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_be_bytes)
+    };
+    let mut total: u64 = 0;
+    let mut at = 0usize;
+    while at < data.len() {
+        let Some(number) = be32(at) else { break };
+        let Some(&flags) = data.get(at + 4) else { break };
+        let Some(&refs) = data.get(at + 5) else { break };
+        let mut pos = at + 6;
+        let count = if refs >> 5 == 7 {
+            let Some(long) = be32(at + 5) else { break };
+            let count = (long & 0x1FFF_FFFF) as usize;
+            pos = at + 9 + count.div_ceil(8).max(1);
+            count
+        } else {
+            usize::from(refs >> 5)
+        };
+        let ref_size = if number <= 256 {
+            1
+        } else if number <= 65536 {
+            2
+        } else {
+            4
+        };
+        pos = pos.saturating_add(count.saturating_mul(ref_size));
+        pos = pos.saturating_add(if flags & 0x40 != 0 { 4 } else { 1 });
+        let Some(length) = be32(pos) else { break };
+        pos = pos.saturating_add(4);
+        if REGIONS.contains(&(flags & 0x3F)) {
+            let (Some(w), Some(h)) = (be32(pos), be32(pos + 4)) else {
+                break;
+            };
+            total = total.saturating_add(u64::from(w) * u64::from(h));
+        }
+        if length == u32::MAX {
+            // An immediate generic region of unknown length runs to the end of the stripe.
+            break;
+        }
+        at = pos.saturating_add(length as usize);
+    }
+    Ok(total)
+}
+
 /// A decoded JPEG 2000 picture: 8-bit samples, one to four channels interleaved.
 pub(crate) struct Jpx {
     pub width: u32,
@@ -184,9 +250,47 @@ pub(crate) struct Jpx {
     pub samples: Vec<u8>,
 }
 
+/// The component count of a JPEG 2000 picture from its SIZ marker (ISO 15444-1 A.5.1): what
+/// the decoder allocates a full-size buffer for each of.
+fn jpx_components(data: &[u8]) -> Option<u16> {
+    const CODESTREAM: [u8; 4] = [0xFF, 0x4F, 0xFF, 0x51];
+    let mut at = 0usize;
+    if !data.starts_with(&CODESTREAM) {
+        // A JP2 file: find the contiguous codestream box.
+        loop {
+            let len = u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?);
+            let kind = data.get(at + 4..at + 8)?;
+            let (header, size) = match len {
+                0 => (8, data.len() - at),
+                1 => (
+                    16,
+                    usize::try_from(u64::from_be_bytes(data.get(at + 8..at + 16)?.try_into().ok()?)).ok()?,
+                ),
+                n => (8, n as usize),
+            };
+            if kind == b"jp2c" {
+                at += header;
+                break;
+            }
+            if size < header {
+                return None;
+            }
+            at = at.checked_add(size)?;
+        }
+    }
+    if data.get(at..at + 4)? != CODESTREAM {
+        return None;
+    }
+    // SOC, SIZ marker, Lsiz, Rsiz, eight 32-bit sizes, then Csiz.
+    let c = at + 2 + 2 + 2 + 2 + 32;
+    Some(u16::from_be_bytes(data.get(c..c + 2)?.try_into().ok()?))
+}
+
 /// Decodes a JPEG 2000 picture (a JP2 file or a bare codestream). An alpha channel is dropped:
-/// a scanned sheet is drawn opaque.
-pub(crate) fn jpx(data: &[u8]) -> Result<Jpx, String> {
+/// a scanned sheet is drawn opaque. `declared` is the channel count of the picture's PDF
+/// colour space, if it names one: a bare codestream does not say CMYK, and the decoder would
+/// take its fourth channel for alpha.
+pub(crate) fn jpx(data: &[u8], declared: Option<u8>) -> Result<Jpx, String> {
     guarded("JPEG 2000", || {
         let image = hayro_jpeg2000::Image::new(data, &hayro_jpeg2000::DecodeSettings::default())
             .map_err(|e| format!("the JPEG 2000 picture could not be read ({e})"))?;
@@ -194,13 +298,26 @@ pub(crate) fn jpx(data: &[u8]) -> Result<Jpx, String> {
         if !fits(width, height) {
             return Err("the JPEG 2000 picture has no size or is too large".into());
         }
+        // Each component gets a buffer of the full picture before anything is checked: refuse
+        // more than a picture can use, or more samples than the pixel limit, first.
+        let stored = jpx_components(data).ok_or("the JPEG 2000 picture has no readable header")?;
+        let shown = u16::from(image.color_space().num_channels()) + u16::from(image.has_alpha());
+        let most = stored.max(shown);
+        if !(1..=5).contains(&most) || u64::from(width) * u64::from(height) * u64::from(most) > MAX_PIXELS {
+            return Err(format!(
+                "the JPEG 2000 picture has too many channels ({most}) for its size"
+            ));
+        }
         let has_alpha = image.has_alpha();
         let mut ctx = hayro_jpeg2000::DecoderContext::default();
         let decoded = image
             .decode(&mut ctx)
             .map_err(|e| format!("the JPEG 2000 picture could not be decoded ({e})"))?;
         let all = decoded.components().len();
-        let channels = all - usize::from(has_alpha && all > 1);
+        // Four components in a picture the PDF calls CMYK are C, M, Y and K, whatever the
+        // codestream left the decoder to guess.
+        let cmyk = declared == Some(4) && all == 4;
+        let channels = all - usize::from(has_alpha && all > 1 && !cmyk);
         if !matches!(channels, 1 | 3 | 4) {
             return Err(format!(
                 "JPEG 2000 pictures with {channels} colour channel(s) are not supported yet"
@@ -222,4 +339,50 @@ pub(crate) fn jpx(data: &[u8]) -> Result<Jpx, String> {
             samples,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_component_count_comes_from_the_siz_marker() {
+        // A bare codestream: SOC, SIZ with one component.
+        let mut cs = vec![0xFF, 0x4F, 0xFF, 0x51, 0x00, 0x29];
+        cs.extend_from_slice(&[0; 34]);
+        cs.extend_from_slice(&[0x00, 0x03, 0x07, 0x01, 0x01]);
+        assert_eq!(jpx_components(&cs), Some(3));
+        // The same inside a JP2 file: a signature box, then the codestream box.
+        let mut jp2 = vec![0, 0, 0, 12, b'j', b'P', b' ', b' ', 0x0D, 0x0A, 0x87, 0x0A];
+        jp2.extend_from_slice(&(8 + cs.len() as u32).to_be_bytes());
+        jp2.extend_from_slice(b"jp2c");
+        jp2.extend_from_slice(&cs);
+        assert_eq!(jpx_components(&jp2), Some(3));
+        // Cut short or not JPEG 2000: none.
+        assert_eq!(jpx_components(&cs[..30]), None);
+        assert_eq!(jpx_components(b"%PDF"), None);
+    }
+
+    #[test]
+    fn jbig2_regions_are_added_up_from_their_headers() {
+        let segment = |number: u32, kind: u8, data: &[u8]| {
+            let mut b = number.to_be_bytes().to_vec();
+            b.extend_from_slice(&[kind, 0, 1]);
+            b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            b.extend_from_slice(data);
+            b
+        };
+        let region = |w: u32, h: u32| {
+            let mut d = w.to_be_bytes().to_vec();
+            d.extend_from_slice(&h.to_be_bytes());
+            d.extend_from_slice(&[0; 10]);
+            d
+        };
+        let mut data = segment(0, 48, &[0; 19]);
+        data.extend(segment(1, 36, &region(100, 200)));
+        data.extend(segment(2, 38, &region(10, 10)));
+        assert_eq!(jbig2_region_area(&data), Ok(20_100));
+        // A cut-off header stops the count without an error.
+        assert_eq!(jbig2_region_area(&data[..30]), Ok(0));
+    }
 }
