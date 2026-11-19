@@ -100,6 +100,10 @@ pub struct Guest {
     /// by whoever shows the project.
     pub refused_pages: std::collections::BTreeSet<String>,
     pub refused_meta: bool,
+    /// The `seq` of each project edit of this guest's the host refused: a picture pick that
+    /// edit carried is dropped, and one an edit the host took carried is kept. Taken with
+    /// `refused_pages`.
+    pub refused_edits: std::collections::BTreeSet<u64>,
 }
 
 impl Default for Guest {
@@ -137,6 +141,7 @@ impl Guest {
             retaken_numbers: BTreeMap::new(),
             refused_pages: std::collections::BTreeSet::new(),
             refused_meta: false,
+            refused_edits: std::collections::BTreeSet::new(),
         }
     }
 
@@ -444,6 +449,7 @@ impl Guest {
                 }
                 whole.extend(own.iter().cloned());
                 self.refused_pages.extend(whole.iter().cloned());
+                self.refused_edits.extend(edit);
                 if let Some(parts) = &put_back {
                     // A page this guest holds keeps its content (only its number comes back),
                     // unless it is one of `whole`, recorded above.
