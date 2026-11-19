@@ -1721,6 +1721,46 @@ fn project_properties_go_through_the_host() -> TestResult {
 }
 
 #[test]
+fn only_the_host_changes_the_library_locations() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let libraries = s.host.project().meta.libraries.clone();
+    // A guest points the project at a share of its choosing: the host would open it.
+    let mut meta = s.host.project().meta.clone();
+    meta.name = "Pump station".into();
+    meta.libraries.insert(
+        0,
+        wc_core::project::LibrarySource {
+            name: "shared".into(),
+            kind: "folder".into(),
+            location: r"\\guest-pc\symbols".into(),
+            reference: None,
+        },
+    );
+    a_link.send(a.edit_project(ProjectEdit::SetMeta {
+        meta: Box::new(meta.clone()),
+        before: None,
+    }))?;
+    s.pump(&mut [(&a_link, &mut a)]);
+    assert_eq!(a.refusals.len(), 1, "{:?}", a.refusals);
+    assert!(format!("{:?}", a.refusals[0]).contains("library locations"));
+    assert_eq!(
+        s.host.project().meta.libraries,
+        libraries,
+        "the host's libraries are kept"
+    );
+    assert_ne!(s.host.project().meta.name, "Pump station", "the whole edit is refused");
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    // The host itself still can.
+    s.host.edit_project(ProjectEdit::SetMeta {
+        meta: Box::new(meta.clone()),
+        before: None,
+    })?;
+    assert_eq!(s.host.project().meta, meta);
+    Ok(())
+}
+
+#[test]
 fn several_pages_change_in_one_commit_unless_someone_else_has_one_open() -> TestResult {
     let mut s = Session::new();
     let (_, a_link, mut a) = s.join("Ola")?;
