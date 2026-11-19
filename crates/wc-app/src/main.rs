@@ -4354,14 +4354,14 @@ fn confirm_page_props(
 /// After a shared-session sync: show panel `id` and pick the device `tag` on it again, wherever
 /// they are now; a panel or device that is gone is no longer shown or picked.
 fn follow_panel_pick(ed: &mut Editor, project: &wc_core::Project, id: &str, tag: Option<&wc_core::DeviceTag>) {
-    let Some(pi) = project.panels.iter().position(|p| p.id == id) else {
+    let Some((pi, panel)) = project.panels.iter().enumerate().find(|(_, p)| p.id == id) else {
         ed.panel = None;
         ed.panel_pick = None;
         return;
     };
     ed.panel = Some(pi);
     ed.panel_pick = tag.and_then(|tag| {
-        project.panels[pi]
+        panel
             .items
             .iter()
             .position(|i| matches!(i, wc_core::panel::PanelItem::Device { tag: t, .. } if t == tag))
