@@ -405,14 +405,15 @@ pub(super) fn place(
         }
     }
     // Per frame: its instances with geometry and how many pieces they hold.
-    let own: BTreeMap<u64, (Vec<&[Geom]>, usize)> = seen
+    let own: BTreeMap<u64, (Vec<u64>, usize)> = seen
         .iter()
         .filter_map(|(frame, ids)| {
-            let list: Vec<&[Geom]> = ids.iter().filter_map(|id| geom_of.get(id)).map(Vec::as_slice).collect();
-            let count = list.iter().map(|g| g.len()).sum();
+            let list: Vec<u64> = ids.iter().copied().filter(|id| geom_of.contains_key(id)).collect();
+            let count = list.iter().filter_map(|id| geom_of.get(id)).map(Vec::len).sum();
             (count > 0).then_some((*frame, (list, count)))
         })
         .collect();
+    let pieces = |list: &[u64]| -> Vec<&Geom> { list.iter().filter_map(|id| geom_of.get(id)).flatten().collect() };
 
     // Walk down from the frames no one places.
     let placed: BTreeSet<u64> = children.values().flatten().map(|(c, _)| *c).collect();
@@ -438,7 +439,7 @@ pub(super) fn place(
         reached.insert(frame);
         if let Some((list, count)) = own.get(&frame) {
             if out.points.len() + count <= MAX_POINTS {
-                out.points.extend(list.iter().copied().flatten().map(|g| at.place(g)));
+                out.points.extend(pieces(list).into_iter().map(|g| at.place(g)));
             } else {
                 // The corners of the part's own box: the same size at quarter turns, a little
                 // more at others.
@@ -446,7 +447,7 @@ pub(super) fn place(
                 let [lo, hi] = *boxes.entry(frame).or_insert_with(|| {
                     let mut lo = [f64::INFINITY; 3];
                     let mut hi = [f64::NEG_INFINITY; 3];
-                    for g in list.iter().copied().flatten() {
+                    for g in pieces(list) {
                         let [a, b] = g.bounds();
                         for k in 0..3 {
                             lo[k] = lo[k].min(a[k]);
@@ -470,11 +471,17 @@ pub(super) fn place(
         }
     }
     // Parts only placed in a loop of placements: as drawn.
-    for (frame, (list, _)) in &own {
-        if !reached.contains(frame) {
-            out.cut = true;
-            out.points.extend(list.iter().copied().flatten());
-        }
+    // Each piece once, however many unreached frames share it: as drawn, they would only
+    // repeat it.
+    let unreached: BTreeSet<u64> = own
+        .iter()
+        .filter(|(frame, _)| !reached.contains(frame))
+        .flat_map(|(_, (list, _))| list.iter().copied())
+        .collect();
+    if !unreached.is_empty() {
+        out.cut = true;
+        out.points
+            .extend(unreached.iter().filter_map(|id| geom_of.get(id)).flatten());
     }
     out
 }
