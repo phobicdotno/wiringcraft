@@ -4878,6 +4878,67 @@ fn jumpers_of_a_new_device_lost_with_a_waiting_rename_are_named() -> TestResult 
 }
 
 #[test]
+fn pages_and_panels_of_a_new_device_lost_with_a_waiting_rename_are_named() -> TestResult {
+    use wc_core::panel::{Panel, PanelItem};
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let k5 = wc_core::DeviceTag::parse("-K5")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.pages.push(Page::new("p2", "2", "Two"));
+    base.panels.push(Panel::new("pn1", "Plate", 400.0, 300.0));
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    // On one waiting page: -K1 renamed to -K2, and a placement that made -K5, which page 2 and
+    // the plate name too.
+    let mut local = base.clone();
+    let p1 = local.page_mut("p1").ok_or("no page")?;
+    p1.symbols[0].tag = Some(k2.clone());
+    p1.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k5.clone()),
+        ..symbol("s9", 40.0)
+    });
+    local
+        .page_mut("p2")
+        .ok_or("no page")?
+        .symbols
+        .push(wc_core::PlacedSymbol {
+            tag: Some(k5.clone()),
+            ..symbol("s8", 60.0)
+        });
+    local.devices.remove(&k1);
+    local.devices.insert(k2.clone(), wc_core::Device::default());
+    local.devices.insert(k5.clone(), wc_core::Device::default());
+    local.panels[0].items.push(PanelItem::Device {
+        tag: k5.clone(),
+        at: wc_core::geom::Point::new(10.0, 10.0),
+        width: 20.0,
+        height: 40.0,
+    });
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert_eq!(held.renames.len(), 1, "one group: the pages join them");
+    let mut session = base.clone();
+    session.page_mut("p1").ok_or("no page")?.title = "Theirs".into();
+    assert_eq!(
+        held.put_back(&mut session),
+        [
+            "page 1",
+            "the device rename that waited with it",
+            "page 2",
+            "device -K5",
+            "panel pn1"
+        ]
+    );
+    assert_eq!(session.pages[1], base.pages[1]);
+    assert_eq!(session.panels, base.panels);
+    Ok(())
+}
+
+#[test]
 fn a_rename_to_a_device_with_a_waiting_part_waits_whole() -> TestResult {
     let k1 = wc_core::DeviceTag::parse("-K1")?;
     let k2 = wc_core::DeviceTag::parse("-K2")?;
