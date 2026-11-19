@@ -95,3 +95,20 @@ fn an_output_path_into_the_project_is_refused() -> TestResult {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     Ok(())
 }
+
+#[test]
+fn a_drawing_folder_in_the_project_is_refused_before_it_is_made() -> TestResult {
+    let tmp = new_project()?;
+    let project = tmp.path().join("p");
+    let out_dir = project.join("exports").join("dxf");
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&project)
+        .args(["drawing"])
+        .arg(&out_dir)
+        .env(wc_core::guard::GUARD_ENV, &project)
+        .output()?;
+    assert!(!out.status.success());
+    assert!(!project.join("exports").exists());
+    Ok(())
+}

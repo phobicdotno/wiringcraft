@@ -898,14 +898,40 @@ fn parse_box_pin(s: &str) -> Res<wc_core::BoxPin> {
     })
 }
 
-/// Write an output file the user named. While someone else holds a page of the project in a
-/// shared session the app names the project ([`wc_core::guard::GUARD_ENV`]); the file is then
-/// opened so that it cannot land on a project file, a link swapped in after the app's own look
-/// included (#458).
-fn write_out(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+/// The project to keep output off while someone else holds one of its pages in a shared
+/// session: the app names it ([`wc_core::guard::GUARD_ENV`]), else none.
+fn output_guard() -> Option<&'static wc_core::guard::ProjectFiles> {
     static GUARD: std::sync::OnceLock<Option<wc_core::guard::ProjectFiles>> = std::sync::OnceLock::new();
-    let guard = GUARD.get_or_init(wc_core::guard::ProjectFiles::from_env);
-    wc_core::guard::write_output(guard.as_ref(), path.as_ref(), bytes)
+    GUARD.get_or_init(wc_core::guard::ProjectFiles::from_env).as_ref()
+}
+
+/// Write an output file the user named. Under [`output_guard`] the file is written so that it
+/// cannot land on a project file, a link swapped in after the app's own look included (#458).
+fn write_out(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    wc_core::guard::write_output(output_guard(), path.as_ref(), bytes)
+}
+
+/// Make the output folder `out`; under [`output_guard`] a folder in the project is refused
+/// before any folder is made.
+fn make_out_dir(out: &Path) -> Res<()> {
+    if let Some(g) = output_guard() {
+        match g.holds(out) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(format!(
+                    "{} is in the project folder, and someone else has a page of the project open in the shared session",
+                    out.display()
+                ));
+            }
+            Err(why) => {
+                return Err(format!(
+                    "{} could not be told apart from the project's files ({why})",
+                    out.display()
+                ));
+            }
+        }
+    }
+    std::fs::create_dir_all(out).map_err(e)
 }
 
 fn e<E: std::fmt::Display>(err: E) -> String {
@@ -1947,7 +1973,7 @@ fn run(cli: Cli) -> Res<()> {
                 };
                 wc_pdf::page_lines(&p, &symbols, &options)
             };
-            std::fs::create_dir_all(&out).map_err(e)?;
+            make_out_dir(&out)?;
             let mut used = std::collections::BTreeSet::new();
             for d in &drawings {
                 let mut stem = file_stem(&d.number, &d.id);
