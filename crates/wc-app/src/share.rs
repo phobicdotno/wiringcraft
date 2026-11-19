@@ -1682,9 +1682,13 @@ fn rename_pictures(
                                 pictures_taken.insert(file.clone(), version);
                             }
                         }
-                        Err(e) => notes.push(format!(
-                            "The session's {file} could not be put back here in place of your earlier file: {e}."
-                        )),
+                        Err(e) => {
+                            // The name may hold the session's file now: what is there is read again.
+                            open.underlays.remove(&file);
+                            notes.push(format!(
+                                "The session's {file} could not be put back here in place of your earlier file: {e}."
+                            ));
+                        }
                     }
                 }
                 notes.push(format!(

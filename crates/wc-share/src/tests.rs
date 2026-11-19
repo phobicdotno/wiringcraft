@@ -3091,19 +3091,22 @@ fn a_picture_written_to_while_it_is_replaced_is_kept() -> TestResult {
     let mut open = std::fs::OpenOptions::new()
         .write(true)
         .open(dir.join("pictures/logo.png"))?;
+    let wrote = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let result = wrote.clone();
     crate::journal::AFTER_COMPARE.with(|f| {
         *f.borrow_mut() = Some(Box::new(move |_: &std::path::Path| {
             use std::io::Write;
-            let _ = open.write_all(b"edit");
-            let _ = open.sync_all();
+            *result.borrow_mut() = Some(open.write_all(b"edit").and_then(|()| open.sync_all()));
         }));
     });
     let r = replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"mine");
+    wrote.borrow_mut().take().ok_or("the hook did not run")??;
     assert!(matches!(r, Err(Error::PictureNameTaken(_))), "{r:?}");
     assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
     // The edit is kept beside it.
-    let kept: Vec<Vec<u8>> = std::fs::read_dir(dir.join("pictures"))?
-        .filter_map(|e| e.ok())
+    let entries = std::fs::read_dir(dir.join("pictures"))?.collect::<std::io::Result<Vec<_>>>()?;
+    let kept: Vec<Vec<u8>> = entries
+        .iter()
         .filter(|e| e.file_name() != "logo.png")
         .map(|e| std::fs::read(e.path()))
         .collect::<std::io::Result<_>>()?;
@@ -3799,4 +3802,22 @@ fn a_shared_file_holding_another_symbol_is_the_file_of_neither() {
     assert!(missing.contains(&(ItemKind::Symbol, "a".into())), "{missing:?}");
     assert!(missing.contains(&(ItemKind::Symbol, "b".into())), "{missing:?}");
     assert!(host.files().0.is_empty());
+}
+
+#[test]
+fn a_moved_picture_that_cannot_be_read_again_says_why() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    write_picture(dir, &picture("pictures/logo.png", b"mine"))?;
+    // Once compared, the moved file becomes something that cannot be read as a file.
+    crate::journal::AFTER_COMPARE.with(|f| {
+        *f.borrow_mut() = Some(Box::new(|aside: &std::path::Path| {
+            let _ = std::fs::remove_file(aside).and_then(|()| std::fs::create_dir(aside));
+        }));
+    });
+    let r = replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"mine");
+    let message = r.err().map(|e| e.to_string()).ok_or("no error")?;
+    assert!(message.contains("could not be read again"), "{message}");
+    assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
+    Ok(())
 }

@@ -327,11 +327,20 @@ pub fn replace_picture(dir: &std::path::Path, picture: &Picture, was: &[u8]) -> 
                 let _ = std::fs::remove_file(&aside);
                 Ok(())
             }
-            _ => Err(crate::Error::PictureNameTaken(format!(
+            Ok(_) => Err(crate::Error::PictureNameTaken(format!(
                 "{} was written to while it was replaced; that version is kept as {}",
                 picture.file,
                 aside.display()
             ))),
+            Err(e) => Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "the earlier {} could not be read again ({e}); it is kept as {}",
+                    picture.file,
+                    aside.display()
+                ),
+            )
+            .into()),
         }
     };
     match published {
