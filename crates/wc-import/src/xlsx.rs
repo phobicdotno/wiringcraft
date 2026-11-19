@@ -987,6 +987,35 @@ mod tests {
     }
 
     #[test]
+    fn a_parts_workbook_gives_its_parts_their_contacts() -> Result<()> {
+        let t = wc_report::Table {
+            title: "Parts".into(),
+            columns: vec!["Order number".into(), "Main contacts".into(), "Contacts".into()],
+            rows: vec![
+                vec!["LC1D09".into(), "3".into(), "1NO+1NC".into()],
+                vec!["X".into(), "three".into(), String::new()],
+            ],
+            ..wc_report::Table::default()
+        };
+        let bytes = t.to_xlsx().map_err(|e| Error::Format(e.to_string()))?;
+        let (parts, warnings) = crate::csv::parts_from_rows(&crate::csv::file_rows(&bytes)?)?;
+        let lc = parts.iter().find(|p| p.order_number == "LC1D09");
+        assert_eq!(
+            lc.and_then(|p| p.contacts),
+            Some(wc_core::Contacts {
+                main: 3,
+                no: 1,
+                nc: 1,
+                co: 0
+            })
+        );
+        assert_eq!(parts.len(), 2);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("row 3: contacts not read"), "{warnings:?}");
+        Ok(())
+    }
+
+    #[test]
     fn a_plc_report_workbook_reads_back_as_addresses() -> Result<()> {
         let t = wc_report::Table {
             title: "PLC".into(),
