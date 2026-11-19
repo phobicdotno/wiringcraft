@@ -73,6 +73,23 @@ impl Placement {
         }
     }
 
+    /// A scaling by `k` about the origin.
+    fn scaling(k: f64) -> Placement {
+        Placement {
+            r: [[k, 0.0, 0.0], [0.0, k, 0.0], [0.0, 0.0, k]],
+            t: [0.0; 3],
+        }
+    }
+
+    /// The same placement with its translation in another length unit, `k` of the old per new:
+    /// the turn is kept, the move scaled.
+    fn moved_in(&self, k: f64) -> Placement {
+        Placement {
+            r: self.r,
+            t: self.t.map(|c| c * k),
+        }
+    }
+
     /// The inverse; `r` is a rotation, so its transpose.
     fn inverse(&self) -> Placement {
         let mut r = [[0.0; 3]; 3];
@@ -211,16 +228,26 @@ pub(super) struct Placed {
     pub missed: usize,
     /// The assembly was cut short: too deep, too many part uses or too many points.
     pub cut: bool,
+    /// Some geometry was converted by the file's length unit, as its own context's unit was not
+    /// known (or there are no placements, and the whole file is in the file's unit).
+    pub file_unit_used: bool,
 }
 
 /// Move each point, given with the instance it was measured from, into the coordinates of the
-/// top of the assembly. A file without placements keeps its points as they are.
+/// top of the assembly, in millimetres. Each representation's geometry and the moves of the
+/// placements drawn in it are converted by its context's length unit (`context_mm`, millimetres
+/// per unit) before placements are composed, so an inch part placed in a millimetre assembly
+/// keeps its size; geometry whose context's unit is not known takes `file_mm`. A file without
+/// placements keeps its points where they are, in `file_mm`.
 pub(super) fn place(
     text: &str,
     instances: &BTreeMap<u64, Instance>,
     pts: Vec<(u64, Geom)>,
     point: &impl Fn(u64) -> Option<[f64; 3]>,
+    file_mm: f64,
+    context_mm: &impl Fn(u64) -> Option<f64>,
 ) -> Placed {
+    let in_file_unit = Placement::scaling(file_mm);
     let named = |id: u64, name: &str| instances.get(&id).is_some_and(|i| i.iter().any(|(n, _)| n == name));
     // A relationship with a transformation names it in its ..._WITH_TRANSFORMATION record:
     // alone in a complex instance, last of five attributes in a simple one.
@@ -247,7 +274,8 @@ pub(super) fn place(
             .count();
     if placements == 0 {
         return Placed {
-            points: pts.into_iter().map(|(_, p)| p).collect(),
+            points: pts.into_iter().map(|(_, p)| in_file_unit.place(&p)).collect(),
+            file_unit_used: true,
             ..Placed::default()
         };
     }
@@ -271,6 +299,8 @@ pub(super) fn place(
             }
         }
     }
+    // Millimetres per unit of a representation's context, when known.
+    let rep_mm = |rep: u64| context.get(&rep).and_then(|c| context_mm(*c));
     let mut frames = Frames(items.keys().map(|id| (*id, *id)).collect());
     // Relationships: (child, parent, transformation), the transformation absent when both are
     // drawn in the same coordinates.
@@ -320,6 +350,9 @@ pub(super) fn place(
     let mut applied: BTreeSet<u64> = BTreeSet::new();
     for (child, parent, transformation) in links {
         let Some(t) = transformation else { continue };
+        // Each placement's move in its own representation's unit; a frame only joins
+        // representations of one context, so the representation's unit is its frame's.
+        let (child_mm, parent_mm) = (rep_mm(child).unwrap_or(file_mm), rep_mm(parent).unwrap_or(file_mm));
         let (child, parent) = (frames.find(child), frames.find(parent));
         let Some((kind, args)) = simple(instances, t) else {
             continue;
@@ -343,6 +376,7 @@ pub(super) fn place(
             axis_placement(instances, to, point),
         ) && child != parent
         {
+            let (from, to) = (from.moved_in(child_mm), to.moved_in(parent_mm));
             children
                 .entry(parent)
                 .or_default()
@@ -360,12 +394,14 @@ pub(super) fn place(
             let found = (|| {
                 let (kind, map) = simple(instances, args.get(1)?.as_ref_id()?)?;
                 (kind == "REPRESENTATION_MAP").then_some(())?;
-                let from = axis_placement(instances, map.first()?.as_ref_id()?, point)?;
                 let mapped = map.get(1)?.as_ref_id()?;
                 items.contains_key(&mapped).then_some(())?;
+                let from = axis_placement(instances, map.first()?.as_ref_id()?, point)?
+                    .moved_in(rep_mm(mapped).unwrap_or(file_mm));
                 let target = args.get(2)?.as_ref_id()?;
                 let to = axis_placement(instances, target, point)
-                    .or_else(|| operator_placement(instances, target, point))?;
+                    .or_else(|| operator_placement(instances, target, point))?
+                    .moved_in(rep_mm(*rep).unwrap_or(file_mm));
                 Some((mapped, from.inverse().then(&to)))
             })();
             if let Some((mapped, placement)) = found {
@@ -435,8 +471,9 @@ pub(super) fn place(
         if owned.contains(&id) {
             geom_of.entry(id).or_default().push(p);
         } else {
-            // Geometry outside every representation stays where it is.
-            out.points.push(p);
+            // Geometry outside every representation stays where it is, in the file's unit.
+            out.points.push(in_file_unit.place(&p));
+            out.file_unit_used = true;
         }
     }
     // Per frame: its instances with geometry and how many pieces they hold.
@@ -449,6 +486,16 @@ pub(super) fn place(
         })
         .collect();
     let pieces = |list: &[u64]| -> Vec<&Geom> { list.iter().filter_map(|id| geom_of.get(id)).flatten().collect() };
+    // Each frame's geometry in millimetres; the file's unit when its own is not known.
+    let frame_mm: BTreeMap<u64, f64> = own
+        .keys()
+        .map(|frame| {
+            let mm = rep_mm(*frame);
+            out.file_unit_used |= mm.is_none();
+            (*frame, mm.unwrap_or(file_mm))
+        })
+        .collect();
+    let to_mm = |frame: u64| Placement::scaling(frame_mm.get(&frame).copied().unwrap_or(file_mm));
 
     // Walk down from the frames no one places.
     let placed: BTreeSet<u64> = children.values().flatten().map(|(c, _)| *c).collect();
@@ -473,6 +520,7 @@ pub(super) fn place(
         uses += 1;
         reached.insert(frame);
         if let Some((list, count)) = own.get(&frame) {
+            let at = to_mm(frame).then(&at);
             if out.points.len() + count <= MAX_POINTS {
                 out.points.extend(pieces(list).into_iter().map(|g| at.place(g)));
             } else {
@@ -516,15 +564,20 @@ pub(super) fn place(
     // Parts only placed in a loop of placements: as drawn.
     // Each piece once, however many unreached frames share it: as drawn, they would only
     // repeat it.
-    let unreached: BTreeSet<u64> = own
-        .iter()
-        .filter(|(frame, _)| !reached.contains(frame))
-        .flat_map(|(_, (list, _))| list.iter().copied())
-        .collect();
+    // Each piece in the unit of the first unreached frame that holds it.
+    let mut unreached: BTreeMap<u64, u64> = BTreeMap::new();
+    for (frame, (list, _)) in own.iter().filter(|(frame, _)| !reached.contains(frame)) {
+        for id in list {
+            unreached.entry(*id).or_insert(*frame);
+        }
+    }
     if !unreached.is_empty() {
         out.cut = true;
-        out.points
-            .extend(unreached.iter().filter_map(|id| geom_of.get(id)).flatten());
+        for (id, frame) in &unreached {
+            let scale = to_mm(*frame);
+            out.points
+                .extend(geom_of.get(id).into_iter().flatten().map(|g| scale.place(g)));
+        }
     }
     out
 }

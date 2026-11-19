@@ -7,7 +7,8 @@
 //! tessellated coordinates, else by its loose points. B-spline surfaces are not measured: their
 //! control nets often reach far past the trimmed faces.
 //!
-//! The length unit is read from the file (millimetre, metre, inch, ...). The model's axes are
+//! The length unit is read from the file (millimetre, metre, inch, ...); in an assembly each
+//! part is converted by the unit of its own representation's context. The model's axes are
 //! taken as they are: x across the plate, y up it and z out of it.
 //!
 //! In an assembly each part is measured where it is placed, nested assemblies included (see
@@ -272,10 +273,19 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     }
 
     let (mm, unit_warning) = length_unit(text, &instances, &measured);
-    warnings.extend(unit_warning);
 
-    // An assembly's parts, each moved to where it is placed.
-    let placed = assembly::place(text, &instances, pts, &point);
+    // An assembly's parts, each moved to where it is placed, in millimetres: each part by the
+    // length unit of its own representation's context when that context assigns exactly one,
+    // else by the file's.
+    let context_mm = |context: u64| match context_units(&instances, context).as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    };
+    let placed = assembly::place(text, &instances, pts, &point, mm, &context_mm);
+    // The file's unit is only a guess for geometry not measured in its own context's unit.
+    if placed.file_unit_used {
+        warnings.extend(unit_warning);
+    }
     if placed.missed > 0 {
         warnings.push(format!(
             "the model is an assembly ({} placed parts); {} of its placements could not be applied, so its size may be off",
@@ -301,9 +311,9 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
         }
     }
     let size = ModelSize {
-        width: (max[0] - min[0]) * mm,
-        height: (max[1] - min[1]) * mm,
-        depth: (max[2] - min[2]) * mm,
+        width: max[0] - min[0],
+        height: max[1] - min[1],
+        depth: max[2] - min[2],
     };
     if !size.is_usable() {
         return Err(Error::Format(format!(
@@ -460,17 +470,7 @@ fn length_unit(text: &str, instances: &BTreeMap<u64, Instance>, measured: &BTree
             .flat_map(|units| units.iter().filter_map(Value::as_ref_id))
             .collect()
     };
-    let context_mm = |context: u64| -> Vec<f64> {
-        let mut mm: Vec<f64> = Vec::new();
-        for unit in units_of(&context) {
-            if let Some(v) = unit_mm(instances, unit, 0)
-                && !mm.iter().any(|f| (f - v).abs() <= f.abs() * 1e-9)
-            {
-                mm.push(v);
-            }
-        }
-        mm
-    };
+    let context_mm = |context: u64| context_units(instances, context);
     let mut used_contexts: Vec<u64> = representations.iter().map(|(_, c)| *c).collect();
     used_contexts.sort_unstable();
     used_contexts.dedup();
@@ -518,6 +518,27 @@ fn length_unit(text: &str, instances: &BTreeMap<u64, Instance>, measured: &BTree
             )),
         ),
     }
+}
+
+/// The length units a context assigns (`GLOBAL_UNIT_ASSIGNED_CONTEXT`), in millimetres each,
+/// without repeats.
+fn context_units(instances: &BTreeMap<u64, Instance>, context: u64) -> Vec<f64> {
+    let mut mm: Vec<f64> = Vec::new();
+    let units = instances
+        .get(&context)
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| name == "GLOBAL_UNIT_ASSIGNED_CONTEXT")
+        .filter_map(|(_, args)| args.first().and_then(Value::as_list))
+        .flat_map(|units| units.iter().filter_map(Value::as_ref_id));
+    for unit in units {
+        if let Some(v) = unit_mm(instances, unit, 0)
+            && !mm.iter().any(|f| (f - v).abs() <= f.abs() * 1e-9)
+        {
+            mm.push(v);
+        }
+    }
+    mm
 }
 
 /// The contexts of the representations whose items lead, by references, to the instances that

@@ -801,7 +801,7 @@ fn geometry_shared_by_parts_placed_only_in_a_loop_is_kept_once() {
         .filter_map(|k| point(2 * k - 1).map(|p| (2 * k, Geom::Point(p))))
         .collect();
     assert_eq!(pts.len(), 8);
-    let placed = assembly::place(&text, &instances, pts, &point);
+    let placed = assembly::place(&text, &instances, pts, &point, 1.0, &|_| Some(1.0));
     assert!(placed.cut);
     assert_eq!(placed.points.len(), 8);
 }
@@ -888,5 +888,60 @@ fn an_operator_axis2_all_but_along_its_axes_keeps_y_square() {
     assert!((s.width - diagonal).abs() < 1e-6, "{s:?}");
     assert!((s.height - diagonal).abs() < 1e-6, "{s:?}");
     assert!((s.depth - 20.0).abs() < 1e-6, "{s:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn an_inch_part_placed_in_a_millimetre_assembly_is_converted_before_it_is_placed() {
+    // The part, 1 x 2 x 3 inches, is drawn in an inch context and placed twice, at x 0 and 50 mm,
+    // in a millimetre assembly: 50 + 25.4 = 75.4 mm across.
+    let part = box_vertices([0.0; 3], [1.0, 2.0, 3.0]);
+    let vertices: Vec<String> = (1..=8).map(|k| format!("#{}", 2 * k)).collect();
+    let text = step(
+        MM,
+        &format!(
+            "{part}#321=CARTESIAN_POINT('',(0.,0.,0.));\n#320=AXIS2_PLACEMENT_3D('',#321,$,$);\n\
+             #901=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#900)) REPRESENTATION_CONTEXT('',''));\n\
+             #910=LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(25.4),#900);\n\
+             #911=DIMENSIONAL_EXPONENTS(1.,0.,0.,0.,0.,0.,0.);\n\
+             #912=(CONVERSION_BASED_UNIT('INCH',#910)LENGTH_UNIT()NAMED_UNIT(#911));\n\
+             #905=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#912)) REPRESENTATION_CONTEXT('',''));\n\
+             #300=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#320,{}),#905);\n\
+             #400=SHAPE_REPRESENTATION('',(#410,#420),#901);\n{}{}{}{}",
+            vertices.join(","),
+            axis(410, [0.0; 3], Z, X),
+            axis(420, [50.0, 0.0, 0.0], Z, X),
+            placed_by_relationship(500, 320, 410),
+            placed_by_relationship(510, 320, 420)
+        ),
+    );
+    let (s, warnings) = size(&text);
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    assert!(
+        near(s.width, 75.4) && near(s.height, 50.8) && near(s.depth, 76.2),
+        "{s:?}"
+    );
+    // Each part had its own unit: nothing was guessed.
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // The same through mapped items: the map's origin is in the part's inches, the target in
+    // the assembly's millimetres.
+    let mapped = text.replace(
+        "#400=SHAPE_REPRESENTATION('',(#410,#420),#901);",
+        "#400=SHAPE_REPRESENTATION('',(#600,#610),#901);\n#601=REPRESENTATION_MAP(#320,#300);\n\
+         #600=MAPPED_ITEM('',#601,#410);\n#610=MAPPED_ITEM('',#601,#420);",
+    );
+    let mapped = mapped
+        .lines()
+        .filter(|l| {
+            !l.starts_with("#500=") && !l.starts_with("#510=") && !l.starts_with("#501=") && !l.starts_with("#511=")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (s, warnings) = size(&mapped);
+    assert!(
+        near(s.width, 75.4) && near(s.height, 50.8) && near(s.depth, 76.2),
+        "{s:?}"
+    );
     assert!(warnings.is_empty(), "{warnings:?}");
 }
