@@ -2277,6 +2277,10 @@ pub struct Share {
     /// Pictures whose name the session has for another file and that could not be given a new
     /// name here, with when: tried again after [`ITEM_RETRY_LATER`] while the project uses them.
     renames_due: BTreeMap<String, std::time::Instant>,
+    /// Devices renamed here and not in the session yet, each with the tags it was renamed to
+    /// ([`note_renames`]). [`Held::hold_renames`] pairs them ([`renames_now`]) even when
+    /// nothing draws the device.
+    device_renames: RenamePaths,
     /// Pictures picked here under a name the session has for another file, found while taking
     /// the session's pictures: they get a name of their own at the next sync, before what goes
     /// out is worked out.
@@ -2333,10 +2337,100 @@ impl RenameGroup {
     }
 }
 
+/// Devices renamed here and not in the session yet: each first tag with the tags it was
+/// renamed to since, in order ([`note_renames`]).
+type RenamePaths = BTreeMap<wc_core::DeviceTag, Vec<wc_core::DeviceTag>>;
+
+/// Add the device renames made here (`made`: old tag to new, one map per change, in order) to
+/// `renames`: a rename of a renamed device (from its tag now) goes on from its first tag, and
+/// one back to it is no rename; the renames of one change are taken together, so `-K1` ->
+/// `-K11` and `-K11` -> `-K111` at once stay two renames. Renames the session has (`base` has
+/// the last tag, or no longer the first) are dropped first, so a later rename never goes on
+/// from one of those. A device that went back to an earlier tag here (Undo) keeps its tags up
+/// to that one; one of which this copy has no tag any more (undone or removed) is dropped: a
+/// device that later gets one of those tags is another device.
+fn note_renames(
+    renames: &mut RenamePaths,
+    made: Vec<BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>>,
+    base: &Project,
+    local: &Project,
+) {
+    // The new tag may be in the session still as the old tag of another rename (`-K1` ->
+    // `-K11` while `-K11` -> `-K111`): that is no sign the session has this rename.
+    let olds: BTreeSet<wc_core::DeviceTag> = renames.keys().cloned().collect();
+    renames.retain(|first, path| {
+        base.devices.contains_key(first)
+            && !path
+                .last()
+                .is_some_and(|last| base.devices.contains_key(last) && !olds.contains(last))
+    });
+    for change in made {
+        // Each new tag is set once all of the change's renames are looked up, so one never
+        // goes on from another made at the same time.
+        let mut next: Vec<(wc_core::DeviceTag, Vec<wc_core::DeviceTag>)> = Vec::new();
+        for (from, to) in change {
+            // Only the device's tag now goes on: a tag it had before may be another device's.
+            let found = renames
+                .iter()
+                .find(|(_, path)| path.last() == Some(&from))
+                .map(|(first, _)| first.clone());
+            let (first, mut path) = match found.and_then(|f| renames.remove_entry(&f)) {
+                Some(entry) => entry,
+                None => (from, Vec::new()),
+            };
+            path.push(to);
+            next.push((first, path));
+        }
+        for (first, path) in next {
+            if path.last() != Some(&first) {
+                renames.insert(first, path);
+            }
+        }
+    }
+    cut_renames(renames, local);
+}
+
+/// A device whose latest tag this copy (`local`) no longer has went back to an earlier one
+/// (Undo): the tags after it are no longer its own, so a device that takes one later is
+/// another. One with none of its tags here (undone or removed since) is dropped.
+fn cut_renames(renames: &mut RenamePaths, local: &Project) {
+    renames.retain(|_, path| {
+        let Some(at) = path.iter().rposition(|t| local.devices.contains_key(t)) else {
+            return false;
+        };
+        path.truncate(at + 1);
+        true
+    });
+}
+
+/// Each recorded rename as it stands in `local`: its first tag and its tag now (after an Undo,
+/// the one between it went back to, [`note_renames`]).
+fn renames_now(renames: &RenamePaths, local: &Project) -> BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag> {
+    renames
+        .iter()
+        .filter_map(|(first, path)| {
+            let now = path.last().filter(|t| local.devices.contains_key(*t))?;
+            Some((first.clone(), now.clone()))
+        })
+        .collect()
+}
+
 impl Held {
-    /// The targets of `local` that use, for the first time since `base`, an item named in
-    /// `waiting`.
+    /// [`Held::find_renamed`] with no renames recorded.
+    #[cfg(test)]
     fn find(local: &Project, base: &Project, waiting: &BTreeSet<String>) -> Held {
+        Held::find_renamed(local, base, waiting, &BTreeMap::new())
+    }
+
+    /// The targets of `local` that use, for the first time since `base`, an item named in
+    /// `waiting`. A device rename made here (`renamed`, old tag to new) that waits, or whose
+    /// new tag a waiting target names, waits whole.
+    fn find_renamed(
+        local: &Project,
+        base: &Project,
+        waiting: &BTreeSet<String>,
+        renamed: &BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>,
+    ) -> Held {
         let waits = |kind: ItemKind, id: &str| waiting.contains(&item_name(kind, id));
         let fresh = FreshUses::find(local, base);
         let mut held = Held::default();
@@ -2374,7 +2468,7 @@ impl Held {
             .collect();
         held.now.devices.extend(new_devices);
         // After those, so a rename to a tag only a waiting page names is held as a pair.
-        held.hold_renames(local, base);
+        held.hold_renames(local, base, renamed);
         // A new page's comments wait with it, however it came to wait: the session has no page
         // to put them on.
         let new_pages: Vec<String> = held
@@ -2396,7 +2490,44 @@ impl Held {
     /// A held device the base does not have may be a rename: the old device going away and
     /// what was retagged to the new tag wait with it, so the session never has the new tag
     /// without its device, nor loses the old one first.
-    fn hold_renames(&mut self, local: &Project, base: &Project) {
+    fn hold_renames(
+        &mut self,
+        local: &Project,
+        base: &Project,
+        renamed: &BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>,
+    ) {
+        // Renames made here that this copy still has and the session does not: the new tag
+        // also waits when a waiting page or the waiting jumpers name it, so the session never
+        // has the new tag while that target still names the old one.
+        // The old tag may be here still, and the new one in the session, as the new and the old
+        // tag of another rename made at the same time (`-K1` -> `-K11`, `-K11` -> `-K111`).
+        let recorded: Vec<(&wc_core::DeviceTag, &wc_core::DeviceTag)> = renamed
+            .iter()
+            .filter(|(old, new)| {
+                base.devices.contains_key(*old)
+                    && local.devices.contains_key(*new)
+                    && (!local.devices.contains_key(*old) || renamed.values().any(|n| n == *old))
+                    && (!base.devices.contains_key(*new) || renamed.contains_key(*new))
+            })
+            .collect();
+        for (_, new) in &recorded {
+            let named_by_waiting = self
+                .now
+                .pages
+                .values()
+                .flatten()
+                .any(|p| page_mentions(p, &|t| t == *new))
+                || self
+                    .now
+                    .meta
+                    .as_ref()
+                    .is_some_and(|m| m.jumpers.iter().any(|j| &j.strip == *new));
+            if named_by_waiting && !self.now.devices.contains_key(*new) {
+                self.now
+                    .devices
+                    .insert((*new).clone(), local.devices.get(*new).cloned());
+            }
+        }
         let new_tags: Vec<wc_core::DeviceTag> = self
             .now
             .devices
@@ -2404,10 +2535,13 @@ impl Held {
             .filter(|t| !base.devices.contains_key(*t))
             .cloned()
             .collect();
-        if new_tags.is_empty() {
+        if new_tags.is_empty() && recorded.is_empty() {
             return;
         }
         let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
+        // A recorded rename's tags that wait now: its new tag may be in the session already as
+        // the old tag of another rename made with it, and wait for its own part.
+        let waits_now: BTreeSet<wc_core::DeviceTag> = self.now.devices.keys().cloned().collect();
         let gone: Vec<wc_core::DeviceTag> = base
             .devices
             .keys()
@@ -2498,6 +2632,26 @@ impl Held {
                 pairs.insert((old.clone(), new.clone()));
             }
         }
+        // A rename recorded here is a pair also when nothing draws the device. Renames that
+        // share a tag go together: when one's new tag waits, all of them wait.
+        let mut chained: Vec<BTreeSet<&wc_core::DeviceTag>> = Vec::new();
+        for (old, new) in &recorded {
+            let (hit, rest): (Vec<_>, Vec<_>) = chained.drain(..).partition(|c| c.contains(*old) || c.contains(*new));
+            let mut c: BTreeSet<&wc_core::DeviceTag> = hit.into_iter().flatten().collect();
+            c.extend([*old, *new]);
+            chained = rest;
+            chained.push(c);
+        }
+        pairs.extend(
+            recorded
+                .iter()
+                .filter(|(old, _)| {
+                    chained
+                        .iter()
+                        .any(|c| c.contains(*old) && c.iter().any(|t| waits_now.contains(*t)))
+                })
+                .map(|(old, new)| ((*old).clone(), (*new).clone())),
+        );
         // Each rename is its own group; renames that share a tag or a target wait as one.
         let mut groups: Vec<RenameGroup> = Vec::new();
         let join = |groups: &mut Vec<RenameGroup>, tags: &[&wc_core::DeviceTag]| -> usize {
@@ -2522,10 +2676,17 @@ impl Held {
             into
         };
         for (old, new) in &pairs {
-            self.now.devices.insert(old.clone(), None);
+            // Gone here, or (renamed onto at the same time) as this copy has it now.
+            self.now.devices.insert(old.clone(), local.devices.get(old).cloned());
+            if !self.now.devices.contains_key(new) {
+                self.now.devices.insert(new.clone(), local.devices.get(new).cloned());
+            }
             join(&mut groups, &[old, new]);
         }
         let paired: Vec<wc_core::DeviceTag> = pairs.iter().map(|(_, n)| n.clone()).collect();
+        // What a waiting rename retags waits with it, also under a new tag the session has as
+        // another device's.
+        let named = |t: &wc_core::DeviceTag| named(t) || paired.contains(t);
         // The paired new tags among those a target names.
         let renamed_in = |names: &dyn Fn(&wc_core::DeviceTag) -> bool| -> Vec<&wc_core::DeviceTag> {
             paired.iter().filter(|t| names(t)).collect()
@@ -2685,7 +2846,27 @@ fn latest_waiting_step(open: &Open, base: &Project, held: &Held) -> Option<wc_sh
         .collect();
     keys.devices.extend(named_before);
     let step = wc_share::Parts::read(prev, &keys);
-    (step != wc_share::Parts::read(&open.project, &keys)).then_some(step)
+    if step == wc_share::Parts::read(&open.project, &keys) {
+        return None;
+    }
+    // A waiting rename of a rename (`-K1` -> `-K2`, then `-K2` -> `-K3` here) waits as one
+    // pair, `-K1` to `-K3`: taking back the second brings `-K2` back too, though nothing
+    // draws it. Only a device the action took away that the session never had.
+    if held.renames.is_empty() {
+        return Some(step);
+    }
+    let taken_away: Vec<_> = prev
+        .devices
+        .keys()
+        .filter(|tag| {
+            !keys.devices.contains_key(*tag)
+                && !base.devices.contains_key(*tag)
+                && !open.project.devices.contains_key(*tag)
+        })
+        .map(|tag| (tag.clone(), None))
+        .collect();
+    keys.devices.extend(taken_away);
+    Some(wc_share::Parts::read(prev, &keys))
 }
 
 /// Whether a symbol or cable on `page` names a device `tag` picks.
@@ -2976,6 +3157,7 @@ impl Share {
         self.holding.clear();
         self.drop_held = false;
         self.renames_due.clear();
+        self.device_renames.clear();
         self.clashes.clear();
         self.picks.clear();
         self.withdrawn_picks.clear();
@@ -3384,7 +3566,14 @@ impl Share {
         if undo {
             waiting.extend(self.holding.iter().cloned());
         }
-        let held = Held::find(&open.project, self.base.as_ref()?, &waiting);
+        note_renames(
+            &mut self.device_renames,
+            open.take_device_renames(),
+            self.base.as_ref()?,
+            &open.project,
+        );
+        let renamed = renames_now(&self.device_renames, &open.project);
+        let held = Held::find_renamed(&open.project, self.base.as_ref()?, &waiting, &renamed);
         if undo && !held.is_empty() {
             // Undo of a change that never reached the session: taken back here only, and only
             // the latest action. What waited before it waits still.
@@ -3400,6 +3589,9 @@ impl Share {
                 // Also after a save: the copy on disk still has the change.
                 open.dirty = true;
             }
+            // A rename taken back now ends at the tag it went back to, before anything else
+            // can take the tag it left.
+            cut_renames(&mut self.device_renames, &open.project);
             self.holding.clear();
             self.notes.push(format!(
                 "Your change that waited for {} was undone here; it had not reached the session.",
