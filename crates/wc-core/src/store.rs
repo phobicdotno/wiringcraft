@@ -370,10 +370,11 @@ fn clean_up(dir: &Path, keep: &std::collections::BTreeSet<String>, suffix: &str)
         return Ok(());
     }
     let entries = fs::read_dir(dir).map_err(|e| Error::io(dir, e))?;
-    let listed: Vec<String> = entries
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
+    // A listing cut short would look like a folder without the file just written: stop instead.
+    let listed = entries
+        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<String>>>()
+        .map_err(|e| Error::io(dir, e))?;
     for step in tidy(&listed, keep, suffix) {
         match step {
             Tidy::Remove(name) => {
