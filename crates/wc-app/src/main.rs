@@ -18,6 +18,7 @@ mod live_check;
 mod panel_view;
 mod panels;
 mod prefs;
+mod report_layout_form;
 mod rules_form;
 mod screenshot;
 mod share;
@@ -113,6 +114,13 @@ enum Dialog {
     },
     /// Reports (parts, devices, wires, nets, terminals, cables, PLC I/O, contents, locations) as tables.
     Reports(wc_report::Kind),
+    /// One report's layout, edited next to a preview of the report in it.
+    ReportLayout {
+        form: report_layout_form::Form,
+        /// The folder of the project the layout is of: another project opened meanwhile
+        /// does not get it.
+        dir: PathBuf,
+    },
     /// Write a new text at this point on the current page.
     Text(wc_core::geom::Point, String, bool),
     /// Pin a review comment at this point on the current page.
@@ -1121,6 +1129,7 @@ impl App {
             Dialog::Comment(..) => "Comment",
             Dialog::PageHistory(..) => "Page history",
             Dialog::Reports(_) => "Reports",
+            Dialog::ReportLayout { .. } => "Report layout",
             Dialog::Check(_) => "Project check",
             Dialog::Rules { .. } => "Check rules",
             Dialog::Commit(_) => "Record a version",
@@ -1135,7 +1144,10 @@ impl App {
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
-        let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_));
+        let wide = matches!(
+            dialog,
+            Dialog::Reports(_) | Dialog::ReportLayout { .. } | Dialog::Check(_)
+        );
         let screen = ctx.screen_rect();
         egui::Window::new(title)
             .collapsible(false)
@@ -1895,6 +1907,15 @@ impl App {
                                     Err(e) => format!("Could not save {}: {e}", path.display()),
                                 };
                             }
+                            if ui
+                                .button("Layout…")
+                                .on_hover_text("Pick, order and rename the columns, sort and group the rows")
+                                .clicked()
+                            {
+                                let k = *kind;
+                                then = Some(Box::new(move |app: &mut App| app.edit_report_layout(k)));
+                                keep = false;
+                            }
                             if ui.button("Close").clicked() {
                                 keep = false;
                             }
@@ -1902,6 +1923,50 @@ impl App {
                                 RichText::new(format!("{} rows", table.rows.len()))
                                     .color(theme::Theme::of(ui.ctx()).faint),
                             );
+                        });
+                    } else {
+                        keep = false;
+                    }
+                }
+                Dialog::ReportLayout { form, dir } => {
+                    if let Some(o) = self.open.as_ref() {
+                        report_layout_form::show(ui, form);
+                        ui.separator();
+                        let inputs = wc_report::Inputs {
+                            project: &o.project,
+                            symbols: &o.symbols,
+                            parts: &o.parts,
+                        };
+                        let draft = form.layout();
+                        let table = wc_report::build_with(form.kind, &inputs, draft.as_ref());
+                        ui.label(RichText::new(&table.title).strong());
+                        report_table(ui, &table);
+                        let bad = form.problem();
+                        if let Some(why) = &bad {
+                            ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
+                                let (form, dir) = (form.clone(), dir.clone());
+                                then = Some(Box::new(move |app: &mut App| {
+                                    if let Err(e) = app.apply_report_layout(&form, &dir) {
+                                        app.ed.message = e;
+                                    }
+                                }));
+                                keep = false;
+                            }
+                            if ui.button("Built-in layout").on_hover_text("Clear the form to the report's own columns").clicked() {
+                                *form = report_layout_form::Form {
+                                    loaded: form.loaded.clone(),
+                                    ..report_layout_form::Form::new(form.kind, form.builtin.clone(), None)
+                                };
+                            }
+                            if ui.button("Cancel").clicked() {
+                                let k = form.kind;
+                                then = Some(Box::new(move |app: &mut App| app.dialog = Some(Dialog::Reports(k))));
+                                keep = false;
+                            }
                         });
                     } else {
                         keep = false;
@@ -2295,6 +2360,54 @@ impl App {
                 dir: o.dir.clone(),
             });
         }
+    }
+
+    /// Open the layout dialog for report `kind` on the project's layout for it.
+    fn edit_report_layout(&mut self, kind: wc_report::Kind) {
+        if let Some(o) = self.open.as_ref() {
+            let inputs = wc_report::Inputs {
+                project: &o.project,
+                symbols: &o.symbols,
+                parts: &o.parts,
+            };
+            let builtin = wc_report::build_builtin(kind, &inputs).columns;
+            self.dialog = Some(Dialog::ReportLayout {
+                form: report_layout_form::Form::new(kind, builtin, wc_report::layout_for(&o.project, kind)),
+                dir: o.dir.clone(),
+            });
+        }
+    }
+
+    /// Keep the layout dialog's layout (one undo step) and show the report in it. As with
+    /// [`App::apply_rules`], a layout changed in the project while the dialog was open keeps
+    /// the dialog open on the draft, and another project open now gets nothing.
+    fn apply_report_layout(&mut self, form: &report_layout_form::Form, dir: &std::path::Path) -> Result<(), String> {
+        if let Some(why) = form.problem() {
+            return Err(why);
+        }
+        let Some(o) = self.open.as_mut().filter(|o| o.dir == dir) else {
+            return Err("The report layout was not kept: another project was opened while it was edited.".into());
+        };
+        let now = wc_report::layout_for(&o.project, form.kind).cloned();
+        let draft = form.layout();
+        if draft != form.loaded {
+            if now != form.loaded {
+                self.dialog = Some(Dialog::ReportLayout {
+                    form: report_layout_form::Form {
+                        loaded: now,
+                        ..form.clone()
+                    },
+                    dir: dir.to_path_buf(),
+                });
+                return Err(
+                    "The report layout changed while you edited it. Your edits are still open: OK keeps them in place of the new layout, Cancel keeps the new one."
+                        .into(),
+                );
+            }
+            o.set_report_layout(form.kind, draft);
+        }
+        self.dialog = Some(Dialog::Reports(form.kind));
+        Ok(())
     }
 
     /// Show the project check, run now.
