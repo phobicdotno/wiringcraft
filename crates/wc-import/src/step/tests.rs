@@ -771,3 +771,37 @@ fn a_direction_that_is_not_one_fails_its_placement() {
         "{warnings:?}"
     );
 }
+
+#[test]
+fn geometry_shared_by_parts_placed_only_in_a_loop_is_kept_once() {
+    // The loop of `placements_in_a_loop_end_with_a_warning`, and a second part (#310) listing
+    // the same box vertices placed in the looping assembly too: neither part is reached, so
+    // both are measured as drawn, and the eight vertices they share count once, not twice.
+    let vertices: Vec<String> = (1..=8).map(|k| format!("#{}", 2 * k)).collect();
+    let text = assembly(
+        &["#410", "#430"],
+        &format!(
+            "{}{}{}#530=(REPRESENTATION_RELATIONSHIP('','',#400,#300) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#531) SHAPE_REPRESENTATION_RELATIONSHIP());\n#531=ITEM_DEFINED_TRANSFORMATION('','',#410,#320);\n\
+             #310=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#311,{}),#901);\n#311=AXIS2_PLACEMENT_3D('',#321,$,$);\n\
+             #540=(REPRESENTATION_RELATIONSHIP('','',#310,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#541) SHAPE_REPRESENTATION_RELATIONSHIP());\n#541=ITEM_DEFINED_TRANSFORMATION('','',#311,#430);\n",
+            axis(410, [5.0, 0.0, 0.0], Z, X),
+            axis(430, [0.0; 3], Z, X),
+            placed_by_relationship(500, 320, 410),
+            vertices.join(","),
+        ),
+        "",
+    );
+    let (instances, _) = parse(&text);
+    let point = |id: u64| -> Option<[f64; 3]> {
+        let (name, args) = simple(&instances, id)?;
+        (name == "CARTESIAN_POINT").then_some(())?;
+        coords(args.get(1)?)
+    };
+    let pts: Vec<(u64, Geom)> = (1..=8u64)
+        .filter_map(|k| point(2 * k - 1).map(|p| (2 * k, Geom::Point(p))))
+        .collect();
+    assert_eq!(pts.len(), 8);
+    let placed = assembly::place(&text, &instances, pts, &point);
+    assert!(placed.cut);
+    assert_eq!(placed.points.len(), 8);
+}
