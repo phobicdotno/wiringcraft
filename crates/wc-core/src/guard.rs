@@ -142,23 +142,34 @@ impl ProjectFiles {
         }
         let (staged, file) = stage_next_to(path)?;
         let id = handle_id(&file).ok().flatten();
-        let checked = self.check_staged(&staged, &file, id).and_then(|()| {
-            use std::io::Write;
-            let mut file = file;
-            file.write_all(bytes)
-                .and_then(|()| file.sync_all())
-                .map_err(|e| format!("could not be written ({e})"))
-        });
-        let done =
-            checked.and_then(|()| std::fs::rename(&staged, path).map_err(|e| format!("could not take its name ({e})")));
-        done.map_err(|why| {
+        // A refusal says why the file must not be written; any other failure (a full disk, a
+        // rename across devices) is the plain I/O error with its path.
+        let done = match self.check_staged(&staged, &file, id) {
+            Err(why) => {
+                // Closed first, so Windows can remove it.
+                drop(file);
+                Err(refuse(&why))
+            }
+            Ok(()) => {
+                use std::io::Write;
+                let mut file = file;
+                file.write_all(bytes)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+                    .and_then(|()| {
+                        std::fs::rename(&staged, path)
+                            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+                    })
+            }
+        };
+        if done.is_err() {
             // The name may lead elsewhere by now; only the file this call made goes.
             let at = real(&staged);
             if id.is_some() && file_id(&at).ok().flatten() == id {
                 let _ = std::fs::remove_file(&at);
             }
-            refuse(&why)
-        })
+        }
+        done
     }
 
     /// Why the new file `file` (identity `id`), just made at `staged`, must not be written, if
