@@ -414,6 +414,62 @@ INSERT INTO tew_catterminal VALUES (1, 1, 'A1');
 }
 
 #[test]
+fn a_missing_link_column_lists_the_tables_columns() {
+    let has = |warnings: &[String], w: &str| assert!(warnings.iter().any(|x| x.contains(w)), "{w}\n{warnings:?}");
+    let mut report = LibraryReport::default();
+
+    // Circuits that name no part.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ter_ele_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+");
+    let mut warnings = Vec::new();
+    read_catalog(&c, &mut report, &mut warnings).unwrap();
+    has(
+        &warnings,
+        "tew_catelement has no ele_ref_id column (its columns: ele_id, ele_orderno, ele_name)",
+    );
+
+    // Terminals that name no circuit.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+");
+    let mut warnings = Vec::new();
+    read_catalog(&c, &mut report, &mut warnings).unwrap();
+    has(
+        &warnings,
+        "tew_catterminal has no ter_ele_id column (its columns: ter_no, ter_txt)",
+    );
+
+    // Cores that name no cable type, and block points that name no block.
+    let c = db("
+CREATE TABLE tew_cablereference (cbr_id INTEGER, cbr_reference TEXT, cbr_manufacturer TEXT);
+CREATE TABLE tew_cablereferencewire (crw_no TEXT, crw_color TEXT, crw_section TEXT);
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT);
+CREATE TABLE tew_blockpt (bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_cablereference VALUES (1, 'CBL-3G1', 'Maker C');
+INSERT INTO tew_block VALUES (1, 'Coil');
+");
+    let mut warnings = Vec::new();
+    read_cable_types(&c, &mut report, &mut warnings).unwrap();
+    has(
+        &warnings,
+        "cable types come without cores: tew_cablereferencewire has no crw_cbr_id column (its columns: crw_no, crw_color, crw_section)",
+    );
+    let mut warnings = Vec::new();
+    read_blocks(&c, None, &mut report, &mut warnings).unwrap();
+    has(
+        &warnings,
+        "tew_blockpt has no bpt_blk_id column (its columns: bpt_no, bpt_txt, bpt_dx, bpt_dy)",
+    );
+}
+
+#[test]
 fn a_field_two_columns_could_be_is_not_guessed() {
     // Neither `a_reference` nor `b_reference` has the table's prefix `c`: no guess, and the
     // warning lists the columns so the layout can be mapped.
