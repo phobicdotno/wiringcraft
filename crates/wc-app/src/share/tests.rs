@@ -6318,3 +6318,20 @@ fn a_refusal_that_comes_in_late_is_seen_at_once_and_kept_for_the_picks() -> Resu
     assert!(g.refused_later.0.is_empty(), "the picks took it");
     Ok(())
 }
+
+#[test]
+fn a_refusal_that_comes_with_the_end_of_the_session_is_still_told() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The pump that sees the session end carries a refusal of the guest's.
+    let Some(Role::Guest(j)) = g.role.as_mut() else {
+        return Err("not a guest".into());
+    };
+    j.guest.refused_pages.insert("p0003".into());
+    h.stop();
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(g.role.is_none(), "the session ended");
+    assert!(g.take_refused_pages().contains("p0003"));
+    Ok(())
+}

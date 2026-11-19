@@ -3535,6 +3535,9 @@ impl Share {
             {
                 drain_retaken(role, open, None, &mut self.notes);
             }
+            // So is one the window has not been told of: it still ends what waits for the page.
+            let (pages, _, _) = role.refused_targets();
+            self.refused_pages.extend(pages);
             // A join that was turned away goes back to the Join dialog, which says why: always
             // for another version (the person has to update one side), for a plain decline only
             // while the status window is still open (the note says it otherwise).
