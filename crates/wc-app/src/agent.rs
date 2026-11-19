@@ -2934,8 +2934,7 @@ fn split_flag(a: &str) -> (&str, &str) {
 struct Guarded {
     /// See [`project_roots`].
     roots: Vec<PathBuf>,
-    /// Device and file number of each project file, so a hard link to one is known too.
-    #[cfg(unix)]
+    /// The identity of each project file ([`file_id`]), so a hard link to one is known too.
     files: std::collections::HashSet<(u64, u64)>,
 }
 
@@ -2946,9 +2945,7 @@ const OUTPUT_FOLDER_FILES: usize = 10_000;
 impl Guarded {
     fn new(project: &Path) -> Self {
         let roots = project_roots(project);
-        #[cfg(unix)]
         let files = {
-            use std::os::unix::fs::MetadataExt;
             let mut files = std::collections::HashSet::new();
             let mut todo = roots.clone();
             while let Some(at) = todo.pop() {
@@ -2958,17 +2955,15 @@ impl Guarded {
                 if m.is_dir() {
                     let entries = std::fs::read_dir(&at).into_iter().flatten().flatten();
                     todo.extend(entries.filter(|e| e.file_name() != ".git").map(|e| e.path()));
-                } else if m.is_file() {
-                    files.insert((m.dev(), m.ino()));
+                } else if m.is_file()
+                    && let Some(id) = file_id(&at)
+                {
+                    files.insert(id);
                 }
             }
             files
         };
-        Self {
-            roots,
-            #[cfg(unix)]
-            files,
-        }
+        Self { roots, files }
     }
 
     /// Whether `path`, as the file system resolves it, is in the project or is one of its
@@ -2978,16 +2973,8 @@ impl Guarded {
     }
 
     /// Whether `path` is a project file under another name (a hard link to it).
-    #[cfg(unix)]
     fn same_file(&self, path: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).is_ok_and(|m| m.is_file() && self.files.contains(&(m.dev(), m.ino())))
-    }
-
-    /// Hard links are not told apart here.
-    #[cfg(not(unix))]
-    fn same_file(&self, _path: &Path) -> bool {
-        false
+        std::fs::metadata(path).is_ok_and(|m| m.is_file()) && file_id(path).is_some_and(|id| self.files.contains(&id))
     }
 
     /// Whether writing to `value` could land on a project file: it is a path into the project
@@ -3035,6 +3022,47 @@ impl Guarded {
         }
         Ok(false)
     }
+}
+
+/// What names one file on this machine whatever path reaches it, links followed: device and
+/// file number on unix.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// What names one file on this machine whatever path reaches it, links followed: the volume
+/// serial number and the file index on Windows (#459). The file is opened without read or
+/// write access, which only lets its attributes be read.
+#[cfg(windows)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+        .ok()?;
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value (plain integers).
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the whole call and `info` is a valid place to write to.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    (ok != 0).then(|| {
+        (
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        )
+    })
+}
+
+/// Elsewhere hard links are not told apart.
+#[cfg(not(any(unix, windows)))]
+fn file_id(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// Whether `path`, as the file system resolves it, is in one of `roots`.
@@ -6182,16 +6210,14 @@ mod tests {
         assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
         // An export writes its own file names into the folder it is given: a file there that
         // links to a held page, by name or as the same file, is a way onto the page.
-        #[cfg(unix)]
+        // A hard link is the same file under another name, on unix and on Windows alike (#459).
         {
             let page = dir.join("pages").join("p0002.page.json");
             let before = std::fs::read(&page).unwrap();
-            let linked = tempfile::tempdir().unwrap();
-            std::os::unix::fs::symlink(&page, linked.path().join("2.svg")).unwrap();
             let hard = tempfile::tempdir().unwrap();
             std::fs::create_dir(hard.path().join("deep")).unwrap();
             std::fs::hard_link(&page, hard.path().join("deep").join("2.svg")).unwrap();
-            for to in [linked.path(), hard.path(), &hard.path().join("deep").join("2.svg")] {
+            for to in [hard.path(), &hard.path().join("deep").join("2.svg")] {
                 let to = to.display().to_string();
                 let e = command_runs(&mut a, &["drawing", to.as_str()]).unwrap_err();
                 assert!(e.contains("links to a file in it"), "{to}: {e}");
@@ -6200,6 +6226,22 @@ mod tests {
             // Named bare, from the folder it is in.
             let args: Vec<String> = ["drawing", "deep"].map(String::from).to_vec();
             assert!(writes_while_held(&args, &dir, &held, hard.path()).is_some());
+            // A copy of the page is another file.
+            let copied = tempfile::tempdir().unwrap();
+            std::fs::copy(&page, copied.path().join("2.svg")).unwrap();
+            let args = vec!["drawing".to_owned(), copied.path().display().to_string()];
+            assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
+        }
+        #[cfg(unix)]
+        {
+            let page = dir.join("pages").join("p0002.page.json");
+            let before = std::fs::read(&page).unwrap();
+            let linked = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(&page, linked.path().join("2.svg")).unwrap();
+            let to = linked.path().display().to_string();
+            let e = command_runs(&mut a, &["drawing", to.as_str()]).unwrap_err();
+            assert!(e.contains("links to a file in it"), "{to}: {e}");
+            assert_eq!(std::fs::read(&page).unwrap(), before);
             // A folder that cannot be listed could hide such a link.
             let shut = tempfile::tempdir().unwrap();
             std::fs::set_permissions(shut.path(), std::os::unix::fs::PermissionsExt::from_mode(0o300)).unwrap();

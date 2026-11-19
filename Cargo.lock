@@ -3779,6 +3779,7 @@ dependencies = [
  "wc-share",
  "wc-vcs",
  "wgpu",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
