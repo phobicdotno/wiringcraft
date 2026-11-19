@@ -3824,3 +3824,18 @@ fn a_moved_picture_that_cannot_be_read_again_says_why() -> TestResult {
     assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
     Ok(())
 }
+
+#[test]
+fn a_refused_edit_is_named_by_its_seq() {
+    let mut g = Guest::new();
+    let refused = |edit| HostMsg::Refused {
+        refusal: Refusal::Invalid { reason: "no".into() },
+        take_back: false,
+        edit,
+        put_back: None,
+    };
+    g.handle(refused(Some(3)));
+    g.handle(refused(None));
+    g.handle(refused(Some(7)));
+    assert_eq!(g.refused_edits, [3, 7].into());
+}
