@@ -432,7 +432,20 @@ fn rules(i: &Inputs<'_>, out: &mut Vec<Finding>) {
     };
     for (k, rule) in p.meta.rules.iter().enumerate() {
         let n = k + 1;
+        if let Some(key) = rule.unknown.keys().next() {
+            out.push(broken(
+                n,
+                format!(
+                    "it has a key \"{key}\" it does not know (kind, devices, role, pattern, max, severity and message are known)"
+                ),
+            ));
+            continue;
+        }
         let kind = rule.kind.trim().to_ascii_lowercase();
+        if kind.is_empty() {
+            out.push(broken(n, format!("it has no kind ({})", KINDS.join(", "))));
+            continue;
+        }
         if !KINDS.contains(&kind.as_str()) {
             out.push(broken(
                 n,

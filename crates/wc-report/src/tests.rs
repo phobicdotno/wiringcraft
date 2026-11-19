@@ -2156,6 +2156,15 @@ fn check_runs_the_projects_own_rules() {
             devices: Some("-K*".into()),
             ..rule("tag")
         },
+        CheckRule {
+            devices: Some("-M*".into()),
+            ..rule("")
+        },
+        CheckRule {
+            pattern: Some("-K#".into()),
+            unknown: [("severty".to_owned(), "error".into())].into_iter().collect(),
+            ..rule("tag")
+        },
     ];
     // A second wire on terminal -X1.1 pin 1.
     p.pages[0]
@@ -2188,6 +2197,13 @@ fn check_runs_the_projects_own_rules() {
             .any(|f| f.message.starts_with("check rule 5 cannot run: role \"coil\""))
     );
     assert!(has("check rule 6 cannot run: a tag rule needs a pattern").is_some());
+    assert!(has("check rule 7 cannot run: it has no kind (cable, tag, max-wires)").is_some());
+    assert!(
+        found.iter().any(|f| f.severity == Severity::Error
+            && f.message
+                .starts_with("check rule 8 cannot run: it has a key \"severty\"")),
+        "{found:?}"
+    );
 
     // A cable on the lamp's wire satisfies the cable rule.
     p.pages[0].wires[2].cable = Some(wc_core::CableCore {
