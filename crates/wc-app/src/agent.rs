@@ -6157,6 +6157,47 @@ mod tests {
     }
 
     #[test]
+    fn a_file_whose_identity_cannot_be_read_is_refused_with_the_reason() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("project.toml"), "x").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(out.path().join("a.svg"), "y").unwrap();
+        let out_path = out.path().display().to_string();
+        // A project file whose identity could not be read: a hard link to it would go unseen,
+        // so an output folder with a file in it is refused, with the reason.
+        let mut guarded = Guarded::new(project.path());
+        assert!(guarded.unknown.is_none());
+        assert!(!guarded.reached_by(out.path(), &out_path).unwrap());
+        guarded.unknown = Some("project.toml: access denied".into());
+        let e = guarded.reached_by(out.path(), &out_path).unwrap_err();
+        assert!(e.to_string().contains("project.toml: access denied"), "{e}");
+        // A folder with nothing in it, or a path not there yet, is still fine.
+        let empty = tempfile::tempdir().unwrap();
+        let empty_path = empty.path().display().to_string();
+        assert!(!guarded.reached_by(empty.path(), &empty_path).unwrap());
+        let new_file = empty.path().join("new.svg").display().to_string();
+        assert!(!guarded.reached_by(empty.path(), &new_file).unwrap());
+        // An output file that cannot be looked at (its folder can be listed but not entered)
+        // is an error with the system's reason, not "no match". Run as root it can be.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let guarded = Guarded::new(project.path());
+            let shut = out.path().join("shut");
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(shut.join("b.svg"), "z").unwrap();
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let looked = std::fs::metadata(shut.join("b.svg")).is_ok();
+            let r = guarded.reached_by(out.path(), &out_path);
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !looked {
+                let e = r.unwrap_err();
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            }
+        }
+    }
+
+    #[test]
     fn commands_that_read_the_project_still_run_while_a_page_is_held() {
         let (_tmp, mut a) = app(vec![]);
         let dir = a.open.as_ref().unwrap().dir.clone();
