@@ -2430,12 +2430,29 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
                     Err(err) => Err(err.to_string()),
                 };
-                let refused = kept.or_else(|| {
-                    before
-                        .as_ref()
-                        .err()
-                        .map(|err| format!("it cannot be read ({err}); fix or remove it, then take {part} again"))
-                });
+                // The lock too, before `take`: if saving the new pin fails, it goes back to these
+                // bytes. A lock that exists but cannot be read is never removed or replaced.
+                let lock_path = dir.join(store::LOCK_FILE);
+                let lock_before: Result<Option<Vec<u8>>, String> = match std::fs::read(&lock_path) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                };
+                let refused = kept
+                    .or_else(|| {
+                        before
+                            .as_ref()
+                            .err()
+                            .map(|err| format!("it cannot be read ({err}); fix or remove it, then take {part} again"))
+                    })
+                    .or_else(|| {
+                        lock_before.as_ref().err().map(|err| {
+                            format!(
+                                "{} cannot be read ({err}); fix it, then take {part} again",
+                                store::LOCK_FILE
+                            )
+                        })
+                    });
                 // Whether `take` ran, so only its own writes are undone.
                 let mut tried = false;
                 let refreshed = match (&refused, &winner) {
@@ -2464,14 +2481,15 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     Ok(()) => {
                         // The new pin must reach the disk with the copy, or both go back: `save`
                         // can fail after it wrote the lock.
-                        let lock_path = dir.join(store::LOCK_FILE);
-                        let lock_before = std::fs::read(&lock_path).ok();
                         if let Err(err) = save(dir, p) {
                             let back = match &before {
                                 Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
                                 Err(_) => Ok(()),
                             }
-                            .and(put_file_back(&lock_path, lock_before.as_deref()));
+                            .and(match &lock_before {
+                                Ok(bytes) => put_file_back(&lock_path, bytes.as_deref()),
+                                Err(_) => Ok(()),
+                            });
                             return Err(match back {
                                 Ok(()) => format!("the project's copy of {part} was not updated: {err}"),
                                 Err(why) => format!(
@@ -4878,6 +4896,23 @@ mod tests {
             copy_before
         );
         assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+        // The same when `save` fails after it wrote the lock: a panel file that has to be
+        // rewritten cannot be, and both the lock and the copy go back to their bytes.
+        let panel_file = dir.join("panels").join("main.panel.json");
+        let panel_text = std::fs::read_to_string(&panel_file).unwrap();
+        std::fs::write(&panel_file, format!("{panel_text}\n\n")).unwrap();
+        let panel_tmp = dir.join("panels").join("main.panel.json.tmp");
+        std::fs::create_dir(&panel_tmp).unwrap();
+        let lock_bytes = std::fs::read(dir.join(store::LOCK_FILE)).unwrap();
+        let err = cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).unwrap_err();
+        std::fs::remove_dir(&panel_tmp).unwrap();
+        assert!(err.contains("main.panel.json"), "{err}");
+        assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).unwrap(), lock_bytes);
+        assert_eq!(
+            std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap()).unwrap(),
+            copy_before
+        );
+        std::fs::write(&panel_file, &panel_text).unwrap();
 
         // A pinned copy changed in the project is not overwritten by a new footprint.
         let mut edited = store::read_vendored_part(&dir, "maker.io-8").unwrap();
