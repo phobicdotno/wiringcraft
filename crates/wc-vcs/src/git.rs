@@ -244,6 +244,34 @@ impl Git {
                 }
             }
         }
+        // What staging left to record under the paths, against the last commit: a file added
+        // and removed again is gone, and one changed back to its committed content has nothing
+        // left. Nothing left is no commit.
+        let selected = match only {
+            None => None,
+            Some(changed) => {
+                let head = self.head();
+                let mut diff = vec![
+                    "--literal-pathspecs",
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                ];
+                if let Some(h) = &head {
+                    diff.push(h);
+                }
+                diff.push("--");
+                diff.extend(changed.commit.iter().map(String::as_str));
+                let out = self.run(&diff)?;
+                let paths: Vec<String> = out.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect();
+                if paths.is_empty() {
+                    return Ok(None);
+                }
+                Some(paths)
+            }
+        };
         let author_arg = author.map(|a| format!("--author={a}"));
         let mut args: Vec<&str> = Vec::new();
         // Commit as the configured user; fall back to a neutral identity so a fresh machine works.
@@ -258,10 +286,10 @@ impl Git {
             args.push(a);
         }
         // Only these paths' changes, whatever else is staged.
-        if let Some(changed) = only {
+        if let Some(paths) = &selected {
             args.push("--only");
             args.push("--");
-            args.extend(changed.commit.iter().map(String::as_str));
+            args.extend(paths.iter().map(String::as_str));
         }
         if let Err(e) = self.run(&args) {
             let undo = match &index_before {

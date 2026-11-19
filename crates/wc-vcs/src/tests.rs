@@ -285,6 +285,27 @@ fn a_commit_of_some_paths_leaves_every_other_change() -> Result<()> {
     assert_eq!(files.trim(), "D\tpages/p2.json");
     let left = git.run(&["status", "--porcelain"])?;
     assert!(left.contains("stray [x].txt"), "{left}");
+    // A file added and removed again, beside a changed one: the changed one is recorded.
+    write("pages/temp.json", "t")?;
+    git.run(&["add", "--", "pages/temp.json"])?;
+    std::fs::remove_file(dir.join("pages/temp.json")).map_err(|e| wc_core::Error::io("temp", e))?;
+    write("pages/p1.json", "1b")?;
+    assert!(
+        git.commit_paths_as("Edit page 1", "Guest <guest@example.com>", &["pages"])?
+            .is_some()
+    );
+    let files = git.run(&["show", "--name-status", "--format=", "HEAD"])?;
+    assert_eq!(files.trim(), "M\tpages/p1.json");
+    // A change staged and then undone in the folder leaves nothing to record: no commit.
+    write("pages/p1.json", "1c")?;
+    git.run(&["add", "--", "pages/p1.json"])?;
+    write("pages/p1.json", "1b")?;
+    let head = git.head();
+    assert!(
+        git.commit_paths_as("Nothing", "Guest <guest@example.com>", &["pages"])?
+            .is_none()
+    );
+    assert_eq!(git.head(), head);
     // A name with glob characters is taken as it is written.
     assert!(
         git.commit_paths_as("Stray", "Guest <guest@example.com>", &["stray [x].txt"])?
