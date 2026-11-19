@@ -285,6 +285,25 @@ fn bottom_of(topo: &Topology, g: &Grid) -> f64 {
         .fold(g.y0, f64::max)
 }
 
+/// A point on the sheet, in mm.
+type Pt = (f64, f64);
+
+/// The path of a tree link from the box at `a` to the box at `b` (top left corners), and where
+/// its `from` port, `to` port and cable labels go. Links fanning out of one box share its
+/// right edge, so both port labels sit on the link's own branch, at the height of `b`.
+fn tree_path(g: &Grid, a: Pt, b: Pt) -> (Vec<Pt>, [Pt; 3]) {
+    let start = (a.0 + g.box_w, a.1 + g.box_h / 2.0);
+    let end = (b.0, b.1 + g.box_h / 2.0);
+    let mid = (start.0 + end.0) / 2.0;
+    let path = vec![start, (mid, start.1), (mid, end.1), end];
+    let labels = [
+        (mid + 1.0, end.1 - 1.0),
+        (end.0 - 1.0, end.1 - 1.0),
+        (mid + 1.0, (start.1 + end.1) / 2.0 + LINE),
+    ];
+    (path, labels)
+}
+
 /// One topology page for `net`: frame and title block, a box per device with its tag,
 /// description, address and station, and each link once with its port names and cable tag.
 /// A box links to the first page its device is drawn on. A node or link end that does not
@@ -399,13 +418,11 @@ pub fn draw_network_page(
         let (Some((pa, pb)), Some((qa, qb)), Some((from_port, to_port, cable))) = (at(a), at(b), ends(a, k)) else {
             continue;
         };
-        let start = (pa + g.box_w, pb + g.box_h / 2.0);
-        let end = (qa, qb + g.box_h / 2.0);
-        let mid = (start.0 + end.0) / 2.0;
-        pen.polyline(&[start, (mid, start.1), (mid, end.1), end], false);
-        pen.text((start.0 + 1.0, start.1 - 1.0), TEXT, 0, &from_port);
-        pen.text((end.0 - 1.0, end.1 - 1.0), TEXT, 2, &to_port);
-        pen.text((mid + 1.0, (start.1 + end.1) / 2.0 + LINE), TEXT, 0, &cable);
+        let (path, [from_at, to_at, cable_at]) = tree_path(&g, (pa, pb), (qa, qb));
+        pen.polyline(&path, false);
+        pen.text(from_at, TEXT, 0, &from_port);
+        pen.text(to_at, TEXT, 2, &to_port);
+        pen.text(cable_at, TEXT, 0, &cable);
     }
     let bottom = bottom_of(&topo, &g);
     for (lane, &(a, b, k)) in topo.under.iter().enumerate() {
@@ -547,6 +564,26 @@ mod tests {
         );
         assert_eq!(t.tree.len(), 3);
         assert!(t.under.is_empty());
+        // The switch's two ports are labelled on their own branches, not on top of each other.
+        let g = grid(&t, 420.0, 297.0, 30.0);
+        let spot = |i: usize| g.spot(t.boxes[i].1, t.boxes[i].2);
+        let from_labels: Vec<(f64, f64)> = t
+            .tree
+            .iter()
+            .filter(|e| t.boxes[e.0].0 == "-K10")
+            .map(|&(a, b, _)| {
+                let (path, labels) = tree_path(&g, spot(a), spot(b));
+                let end = path[path.len() - 1];
+                assert!(
+                    (labels[0].1 - (end.1 - 1.0)).abs() < 1e-9,
+                    "on the branch to {}",
+                    t.boxes[b].0
+                );
+                labels[0]
+            })
+            .collect();
+        assert_eq!(from_labels.len(), 2);
+        assert!((from_labels[0].1 - from_labels[1].1).abs() >= LINE, "{from_labels:?}");
 
         // A ring: the last device links back to the first. Every link is drawn once.
         let t = layout_network(&ring());
