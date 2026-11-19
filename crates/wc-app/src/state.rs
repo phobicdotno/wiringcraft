@@ -2408,19 +2408,16 @@ fn snapshot_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
 }
 
 /// Put a file back as [`snapshot_file`] found it: untouched when it already holds those bytes,
-/// otherwise replaced whole (written next to it, then renamed over it), so a failed write
-/// leaves the file as it was rather than cut short.
+/// otherwise replaced whole ([`wc_core::store::replace_whole`]: written next to it, never
+/// through a link there, then renamed over it), so a failed write leaves the file as it was
+/// rather than cut short.
 fn restore_file(path: &Path, was: Option<&[u8]>) -> std::io::Result<()> {
     match was {
         Some(bytes) => {
             if std::fs::read(path).is_ok_and(|now| now == bytes) {
                 return Ok(());
             }
-            let mut tmp = path.as_os_str().to_owned();
-            tmp.push(".tmp");
-            let tmp = PathBuf::from(tmp);
-            std::fs::write(&tmp, bytes)?;
-            std::fs::rename(&tmp, path)
+            wc_core::store::replace_whole(path, bytes).map_err(std::io::Error::other)
         }
         None => match std::fs::remove_file(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2493,6 +2490,21 @@ pub(crate) mod tests {
         super::restore_file(&path, None).unwrap();
         assert!(!path.exists());
         super::restore_file(&path, None).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_part_file_is_never_put_back_through_a_link_at_its_staging_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("part.json");
+        std::fs::write(&path, b"new").unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join("part.json.tmp")).unwrap();
+        super::restore_file(&path, Some(b"old")).unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep me");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(std::fs::symlink_metadata(tmp.path().join("part.json.tmp")).is_err());
     }
 
     #[test]
