@@ -4125,7 +4125,9 @@ fn device_part_size(dir: &Path, p: &wc_core::Project, tag: &DeviceTag) -> Result
     };
     match store::read_vendored_part(dir, part) {
         Ok(read) => Ok(wc_core::panel::part_size(&read)),
-        Err(err) => Err(format!("cannot read part {part} of {tag}: {err}")),
+        // The part id and the reason come from the project file: escaped, so they cannot steer
+        // the terminal.
+        Err(err) => Err(escape_field(&format!("cannot read part {part} of {tag}: {err}"))),
     }
 }
 
@@ -5117,6 +5119,14 @@ mod tests {
         assert!(err.starts_with(prefix) && err.len() > prefix.len(), "{err}");
         cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--at", "100,200"]).unwrap();
         assert_eq!(on_plate(), Some((Point::new(100.0, 200.0), 18.0, 90.0, Rotation::R0)));
+
+        // A part id with control characters, as a hand-edited project may hold, is escaped.
+        let mut p = load(&dir).unwrap();
+        if let Some(d) = p.devices.get_mut(&k1) {
+            d.part = Some("bad\u{1b}]52;c;x\u{7}".into());
+        }
+        let err = device_part_size(&dir, &p, &k1).unwrap_err();
+        assert!(!err.contains('\u{1b}') && err.contains("\\u{1b}"), "{err}");
     }
 
     #[test]
