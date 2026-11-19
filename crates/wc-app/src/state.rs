@@ -406,6 +406,16 @@ impl Open {
             .into_iter()
             .filter_map(|id| store::read_vendored_part(&self.dir, &id).ok().map(|p| (id, p)))
             .collect();
+        // A part file a failed update could not put back may hold another version, or none:
+        // the version the lock pins stays loaded until the file is written again.
+        for f in self.unrestored_files.values() {
+            if f.kind == ItemKind::Part
+                && self.project.lock.get(f.kind, &f.id).map(|e| &e.hash) == f.pin.as_ref()
+                && let Some(old) = f.was.as_deref().and_then(|b| serde_json::from_slice::<Part>(b).ok())
+            {
+                self.parts.insert(f.id.clone(), old);
+            }
+        }
         let mut parts: BTreeMap<String, String> = self.parts.iter().map(|(k, p)| (k.clone(), part_label(p))).collect();
         if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
             for id in lib.index(ItemKind::Part).into_keys() {
@@ -1223,28 +1233,36 @@ impl Open {
     /// may hold the library's new one), and the file waits to be written before the next save.
     fn keep_unrestored(&mut self, f: &KeptFile) {
         let pin = self.project.lock.get(f.kind, &f.id).map(|e| e.hash.clone());
-        match f.kind {
-            ItemKind::Symbol => {
-                if let Some(old) = pin.as_ref().and_then(|h| self.symbol_versions.get(h)).cloned() {
-                    self.symbols.insert(f.id.clone(), old);
-                    self.stale_symbol_files.insert(f.id.clone());
-                }
-            }
-            ItemKind::Part => {
-                if let Some(old) = f.was.as_deref().and_then(|b| serde_json::from_slice::<Part>(b).ok()) {
-                    self.parts.insert(f.id.clone(), old);
-                }
-            }
+        if f.kind == ItemKind::Symbol
+            && let Some(old) = pin.as_ref().and_then(|h| self.symbol_versions.get(h)).cloned()
+        {
+            self.symbols.insert(f.id.clone(), old);
+            self.stale_symbol_files.insert(f.id.clone());
         }
-        self.unrestored_files.insert(
-            f.path.clone(),
-            UnrestoredFile {
-                kind: f.kind,
-                id: f.id.clone(),
-                was: f.was.clone(),
-                pin,
-            },
-        );
+        // A file still waiting from an earlier failed update under the same pin keeps that
+        // backup: this update's backup is of the file as the earlier failure left it.
+        if self.unrestored_files.get(&f.path).is_none_or(|known| known.pin != pin) {
+            self.unrestored_files.insert(
+                f.path.clone(),
+                UnrestoredFile {
+                    kind: f.kind,
+                    id: f.id.clone(),
+                    was: f.was.clone(),
+                    pin,
+                },
+            );
+        }
+        if f.kind == ItemKind::Part
+            && let Some(old) = self
+                .unrestored_files
+                .get(&f.path)
+                .and_then(|u| u.was.as_deref())
+                .and_then(|b| serde_json::from_slice::<Part>(b).ok())
+        {
+            self.parts.insert(f.id.clone(), old);
+        }
+        // The file still has to be written: unsaved work, so Save is offered and asked for.
+        self.dirty = true;
     }
 
     /// Write again every file a failed library update could not put back. One whose item the
@@ -3414,6 +3432,37 @@ pub(crate) mod tests {
         std::fs::remove_dir(&part_file).unwrap();
         o.save().unwrap();
         assert_eq!(std::fs::read(&part_file).unwrap(), before);
+    }
+
+    #[test]
+    fn a_part_waiting_to_be_put_back_marks_the_project_unsaved_and_survives_a_refresh_and_a_second_failure() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        let old = o.parts[pid].clone();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.save().unwrap();
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let before = std::fs::read(&part_file).unwrap();
+        o.block_after_snapshot = Some(part_file.clone());
+        assert!(o.update_library(&lib, None).is_err());
+        assert!(o.dirty, "the file still has to be written");
+        // A refresh reads the parts from disk again: the old version stays loaded.
+        o.refresh_library();
+        assert_eq!(o.parts[pid], old);
+        // The folder goes, but the file is still missing; a second update fails the same way
+        // and snapshots that absence. The first backup is kept.
+        std::fs::remove_dir(&part_file).unwrap();
+        o.block_after_snapshot = Some(part_file.clone());
+        assert!(o.update_library(&lib, None).is_err());
+        assert_eq!(o.parts[pid], old);
+        std::fs::remove_dir(&part_file).unwrap();
+        o.save().unwrap();
+        assert_eq!(std::fs::read(&part_file).unwrap(), before);
+        assert!(o.unrestored_files.is_empty());
     }
 
     #[test]
