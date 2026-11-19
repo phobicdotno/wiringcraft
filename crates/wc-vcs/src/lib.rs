@@ -27,6 +27,9 @@ pub enum Error {
     Git { args: String, message: String },
     #[error(transparent)]
     Core(#[from] wc_core::Error),
+    /// Stopped on request (see [`base::create_from_base_until`]).
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

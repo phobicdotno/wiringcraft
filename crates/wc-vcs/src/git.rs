@@ -40,6 +40,69 @@ impl Git {
         Self { dir: dir.into() }
     }
 
+    /// [`Git::run`] that stops git and returns [`Error::Cancelled`] once `cancel` is set,
+    /// checked a few times a second while it runs (a clone from a slow server, say).
+    pub(crate) fn run_until(&self, args: &[&str], cancel: &std::sync::atomic::AtomicBool) -> Result<String> {
+        use std::io::Read;
+        use std::process::Stdio;
+        use std::sync::atomic::Ordering;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(&self.dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(Error::Spawn)?;
+        // Read both streams as they come, so a full pipe never holds git up.
+        // Bytes, read to the end even when they are not UTF-8, as [`Git::run`] does.
+        let read = |s: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || -> std::io::Result<String> {
+                let mut bytes = Vec::new();
+                if let Some(mut s) = s {
+                    s.read_to_end(&mut bytes)?;
+                }
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            })
+        };
+        let out = read(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+        let err = read(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(Error::Spawn)? {
+                break status;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Cancelled);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        let joined = |t: std::thread::JoinHandle<std::io::Result<String>>| {
+            t.join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the reader stopped")))
+                .map_err(Error::Spawn)
+        };
+        let out = joined(out)?;
+        let err = joined(err)?;
+        if status.success() {
+            Ok(out)
+        } else {
+            let mut message = err.trim().to_owned();
+            if message.is_empty() {
+                message = out.trim().to_owned();
+            }
+            Err(Error::Git {
+                args: args.join(" "),
+                message,
+            })
+        }
+    }
+
     pub(crate) fn run(&self, args: &[&str]) -> Result<String> {
         let out = Command::new("git")
             .args(args)

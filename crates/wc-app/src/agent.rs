@@ -2733,8 +2733,333 @@ mod tests {
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
+            fetch: None,
         };
         (tmp, app)
+    }
+
+    /// A `file://` URL for a local folder, also with a Windows drive letter.
+    fn file_url(p: &std::path::Path) -> String {
+        let path = p.to_string_lossy().replace('\\', "/");
+        if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        }
+    }
+
+    /// Frames until the base project fetch is over (at most a few seconds).
+    fn until_fetched(a: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..500 {
+            a.poll_fetch(&ctx);
+            if a.fetch.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(a.fetch.is_none(), "the fetch did not end");
+    }
+
+    #[test]
+    fn a_base_project_from_a_repository_is_fetched_off_the_window_thread() {
+        let (tmp, mut a) = app(vec![]);
+        let base = tmp.path().join("base");
+        wc_core::store::create(&base, "ACME base").unwrap();
+        wc_vcs::Git::new(&base).init().unwrap();
+        let dir = tmp.path().join("pump");
+        a.start_new_project(&dir, "Pump station", Some(&file_url(&base)));
+        // The window goes on while it runs: a note with Cancel, and the old project still open.
+        assert!(matches!(a.dialog, Some(Dialog::Fetching(_))));
+        assert!(a.fetch.is_some());
+        until_fetched(&mut a);
+        assert!(a.dialog.is_none(), "{:?}", a.dialog.as_ref().map(|_| ()));
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.dir, dir);
+        assert_eq!(open.project.meta.name, "Pump station");
+        assert!(dir.join(".git").exists(), "recorded as a first version");
+        // A repository that cannot be fetched says why, and makes nothing.
+        let missing = tmp.path().join("missing");
+        a.start_new_project(&missing, "X", Some(&file_url(&tmp.path().join("nowhere"))));
+        until_fetched(&mut a);
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("Could not create")));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_cancelled_fetch_opens_nothing() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        let (tx, done) = std::sync::mpsc::channel();
+        a.fetch = Some(crate::BaseFetch {
+            dir: tmp.path().join("new"),
+            source: "file:///slow".into(),
+            was_open: Some(before.clone()),
+            made: false,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        a.dialog = Some(Dialog::Fetching("file:///slow".into()));
+        // Cancel sets the flag the fetch stops on.
+        a.cancel_fetch();
+        assert!(
+            a.fetch
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        // Still running: nothing changes.
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        tx.send(Err(None)).unwrap();
+        until_fetched(&mut a);
+        assert!(a.dialog.is_none());
+        assert!(a.ed.message.contains("not made"), "{}", a.ed.message);
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+    }
+
+    #[test]
+    fn a_second_fetch_keeps_the_first_ones_cancel() {
+        let (tmp, mut a) = app(vec![]);
+        let (_tx, done) = std::sync::mpsc::channel();
+        a.fetch = Some(crate::BaseFetch {
+            dir: tmp.path().join("new"),
+            source: "file:///slow".into(),
+            was_open: None,
+            made: false,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        a.start_new_project(&tmp.path().join("other"), "X", Some("file:///other"));
+        assert!(matches!(&a.dialog, Some(Dialog::Fetching(s)) if s == "file:///slow"));
+        assert!(a.ed.message.contains("already"), "{}", a.ed.message);
+    }
+
+    #[test]
+    fn a_fetched_project_keeps_the_unsaved_work_of_the_open_one() {
+        let (tmp, mut a) = app(vec![]);
+        let base = tmp.path().join("base");
+        wc_core::store::create(&base, "ACME base").unwrap();
+        wc_vcs::Git::new(&base).init().unwrap();
+        let old = a.open.as_ref().unwrap().dir.clone();
+        let o = a.open.as_mut().unwrap();
+        o.project.meta.name = "Unsaved name".into();
+        o.dirty = true;
+        let dir = tmp.path().join("pump");
+        a.start_new_project(&dir, "Pump station", Some(&file_url(&base)));
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+        assert_eq!(wc_core::store::load(&old).unwrap().meta.name, "Unsaved name");
+    }
+
+    #[test]
+    fn a_fetched_project_waits_for_a_running_command_and_an_open_dialog() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        // The fetch is in and the project made.
+        let dir = tmp.path().join("pump");
+        wc_core::store::create(&dir, "Pump station").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        a.fetch = Some(crate::BaseFetch {
+            dir: dir.clone(),
+            source: "file:///base".into(),
+            was_open: Some(before.clone()),
+            made: false,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        // A command works on the open project's files while the window edits it too: neither
+        // is saved over nor replaced until the command is done and reconciled.
+        let open = a.open.as_mut().unwrap();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut by_command = open.project.clone();
+        by_command.meta.name = "Named by the command".into();
+        wc_core::store::save(&before, &by_command).unwrap();
+        open.project.meta.name = "Named in the window".into();
+        open.dirty = true;
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+        assert_eq!(
+            wc_core::store::load(&before).unwrap().meta.name,
+            "Named by the command",
+            "not saved over the command"
+        );
+        let _ = a.command_finish(Ok("done".into()));
+        assert!(!a.assistant.command_running());
+        // Reconciled: the window's edit is kept, still unsaved.
+        assert_eq!(a.open.as_ref().unwrap().project.meta.name, "Named in the window");
+        assert!(a.open.as_ref().unwrap().dirty);
+        // A dialog open on the project: the same, until it is closed.
+        a.dialog = Some(Dialog::Message("about the open project".into()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+        a.dialog = None;
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+        // The handoff saved the reconciled project: the window's edit is on disk.
+        assert_eq!(wc_core::store::load(&before).unwrap().meta.name, "Named in the window");
+    }
+
+    #[test]
+    fn a_new_project_that_cannot_be_recorded_or_opened_says_both() {
+        let (tmp, mut a) = app(vec![]);
+        // Not a project, and a `.git` git cannot use.
+        let dir = tmp.path().join("broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".git"), "not a repository").unwrap();
+        let opening = crate::state::Open::load(&dir).err().map(|e| e.to_string());
+        a.finish_new_project(&dir, false);
+        let Some(Dialog::Message(m)) = &a.dialog else {
+            unreachable!("no message")
+        };
+        assert!(m.contains("Could not open"), "{m}");
+        let opening = opening.unwrap_or_default();
+        assert!(
+            !opening.is_empty() && m.contains(&opening),
+            "the reason it did not open, {opening:?}: {m}"
+        );
+        assert!(m.contains("could not be recorded"), "{m}");
+        assert!(m.contains("invalid gitfile format"), "git's reason: {m}");
+    }
+
+    #[test]
+    fn a_new_project_that_cannot_be_recorded_while_the_open_one_cannot_be_saved_says_both() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        // The open project has unsaved work and its folder is gone: a file stands in its place.
+        a.open.as_mut().unwrap().dirty = true;
+        std::fs::remove_dir_all(&before).unwrap();
+        std::fs::write(&before, "not a folder").unwrap();
+        let dir = tmp.path().join("broken");
+        wc_core::store::create(&dir, "New").unwrap();
+        std::fs::write(dir.join(".git"), "not a repository").unwrap();
+        a.finish_new_project(&dir, false);
+        let Some(Dialog::Message(m)) = &a.dialog else {
+            unreachable!("no message")
+        };
+        assert!(m.contains("could not be saved first"), "{m}");
+        assert!(m.contains("i/o error"), "the save's reason: {m}");
+        assert!(m.contains("could not be recorded either"), "{m}");
+        assert!(m.contains("invalid gitfile format"), "git's reason: {m}");
+        assert_eq!(a.open.as_ref().unwrap().dir, before, "the open project stays open");
+    }
+
+    #[test]
+    fn a_fetched_project_waits_for_an_assistant_turn_and_the_symbol_editor() {
+        let answers = vec![json!({
+            "model": "claude-opus-5-5", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "Done."}]
+        })];
+        let (tmp, mut a) = app(answers);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        let dir = tmp.path().join("pump");
+        wc_core::store::create(&dir, "Pump station").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        a.fetch = Some(crate::BaseFetch {
+            dir: dir.clone(),
+            source: "file:///base".into(),
+            was_open: Some(before.clone()),
+            made: false,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        // A turn asked about the open project: its answer is for that project.
+        let ctx = eframe::egui::Context::default();
+        a.prefs.assistant.backend = wc_agent::Backend::ApiKey;
+        a.assistant.input = "What is on page 2?".into();
+        a.assistant_send(&ctx);
+        assert!(a.assistant.busy());
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        for _ in 0..500 {
+            a.assistant_poll(&ctx);
+            if !a.assistant.busy() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!a.assistant.busy());
+        // A symbol draft open: it is not dropped under the user.
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        assert!(a.symbol_editor.is_some());
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+        a.symbol_editor = None;
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+    }
+
+    #[test]
+    fn a_fetch_outcome_is_taken_in_while_the_symbol_editor_is_open() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        let fetch = |a: &mut App, outcome: Result<(), Option<String>>| {
+            let (tx, done) = std::sync::mpsc::channel();
+            tx.send(outcome).unwrap();
+            a.fetch = Some(crate::BaseFetch {
+                dir: tmp.path().join("pump"),
+                source: "file:///base".into(),
+                was_open: Some(before.clone()),
+                made: false,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                done,
+            });
+            a.dialog = Some(Dialog::Fetching("file:///base".into()));
+        };
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        // Cancelled and failed fetches are said at once, and a new one can start.
+        fetch(&mut a, Err(None));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_none());
+        assert!(a.ed.message.contains("not made"), "{}", a.ed.message);
+        fetch(&mut a, Err(Some("no such server".into())));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_none());
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("no such server")));
+        // A made project waits for the editor, without a Cancel that would do nothing.
+        wc_core::store::create(&tmp.path().join("pump"), "Pump station").unwrap();
+        fetch(&mut a, Ok(()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.as_ref().unwrap().made);
+        assert!(a.dialog.is_none(), "the Fetching note with Cancel is gone");
+        a.cancel_fetch();
+        assert!(
+            !a.fetch
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(a.ed.message.contains("made already"), "{}", a.ed.message);
+        a.symbol_editor = None;
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, tmp.path().join("pump"));
+    }
+
+    #[test]
+    fn a_project_opened_while_fetching_stays_open() {
+        let (tmp, mut a) = app(vec![]);
+        let base = tmp.path().join("base");
+        wc_core::store::create(&base, "ACME base").unwrap();
+        wc_vcs::Git::new(&base).init().unwrap();
+        let dir = tmp.path().join("pump");
+        a.start_new_project(&dir, "Pump station", Some(&file_url(&base)));
+        // Another project is opened before the fetch is in.
+        a.fetch.as_mut().unwrap().was_open = Some(tmp.path().join("before"));
+        until_fetched(&mut a);
+        assert_ne!(a.open.as_ref().map(|o| o.dir.clone()), Some(dir.clone()));
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("ready")));
+        assert!(dir.join(".git").exists(), "made and recorded all the same");
+    }
+
+    fn until_fetched_once(a: &mut App) {
+        a.poll_fetch(&egui::Context::default());
     }
 
     #[test]

@@ -114,6 +114,8 @@ enum Dialog {
     History(Vec<wc_vcs::subway::Row>),
     Library(Vec<wc_library::ItemStatus>),
     Message(String),
+    /// A base project being fetched from this git URL for a new project ([`App::fetch`]).
+    Fetching(String),
     /// Help, Report a problem: the masked log to look at before anything is sent.
     Report {
         log: String,
@@ -185,6 +187,32 @@ struct App {
     show_layers: bool,
     /// The project check that runs after each edit (Check while drawing).
     live: live_check::LiveCheck,
+    /// A base project being fetched from a git URL for a new project, off the window thread.
+    fetch: Option<BaseFetch>,
+}
+
+/// Make a new project's folder a repository with its first version.
+fn record_new_project(dir: &std::path::Path) -> Result<(), wc_vcs::Error> {
+    let git = wc_vcs::Git::new(dir);
+    git.init()?;
+    git.commit("New project").map(|_| ())
+}
+
+/// A new project's base project being fetched from a git repository on a thread of its own
+/// ([`App::start_new_project`]), so a slow server does not hold the window up.
+struct BaseFetch {
+    /// Where the new project goes.
+    dir: PathBuf,
+    /// The repository it comes from, shown while it is fetched.
+    source: String,
+    /// The project that was open when the fetch started: the new one replaces only that one.
+    was_open: Option<PathBuf>,
+    /// The project is made and waits to be opened: Cancel no longer applies.
+    made: bool,
+    /// Set to stop the fetch: nothing is made then.
+    cancel: std::sync::Arc<AtomicBool>,
+    /// The outcome: made, why not, or `None` when it was cancelled.
+    done: std::sync::mpsc::Receiver<Result<(), Option<String>>>,
 }
 
 struct StatusView<'a> {
@@ -384,6 +412,7 @@ impl App {
             show_layers: false,
             strip_editor: None,
             live: Default::default(),
+            fetch: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -1034,6 +1063,7 @@ impl App {
             Dialog::History(_) => "History",
             Dialog::Library(_) => "Library status",
             Dialog::Message(_) => "WiringCraft",
+            Dialog::Fetching(_) => "New project",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
             Dialog::ImportSymbols { .. } => "Import symbols",
@@ -1211,6 +1241,16 @@ impl App {
                         }
                     });
                 }
+                Dialog::Fetching(source) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Fetching the base project from\n{source}…"));
+                    });
+                    if ui.button("Cancel").clicked() {
+                        then = Some(Box::new(|app: &mut App| app.cancel_fetch()));
+                        keep = false;
+                    }
+                }
                 Dialog::Message(m) => {
                     // A long message (an import listing every symbol) scrolls; OK stays in view.
                     egui::ScrollArea::vertical()
@@ -1339,7 +1379,7 @@ impl App {
                         {
                             let n = name.trim().to_owned();
                             let b = Some(base.trim().to_owned()).filter(|b| !b.is_empty());
-                            then = Some(Box::new(move |app: &mut App| app.new_project(&d, &n, b.as_deref())));
+                            then = Some(Box::new(move |app: &mut App| app.start_new_project(&d, &n, b.as_deref())));
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() {
@@ -2149,15 +2189,156 @@ impl App {
         }
     }
 
-    /// Create a project in `dir`: blank, or from the base project (folder or git URL) `base`.
-    fn new_project(&mut self, dir: &std::path::Path, name: &str, base: Option<&str>) {
-        let name = if name.is_empty() {
+    /// The name for a new project in `dir`: `name`, or the folder's name when it is blank.
+    fn project_name(dir: &std::path::Path, name: &str) -> String {
+        if name.is_empty() {
             dir.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Project".into())
         } else {
             name.to_owned()
+        }
+    }
+
+    /// New project, Create: as [`App::new_project`], except that a base project in a git
+    /// repository is fetched on a thread of its own ([`App::fetch`]), with a note and Cancel,
+    /// and the project opens once it is there.
+    fn start_new_project(&mut self, dir: &std::path::Path, name: &str, base: Option<&str>) {
+        let Some(source) = base.filter(|b| wc_vcs::base::is_url(b)) else {
+            self.new_project(dir, name, base);
+            return;
         };
+        if let Some(f) = &self.fetch {
+            if f.made {
+                self.dialog = None;
+                self.ed.message = "The last new project is made and opens once the open project's work is done; create this one after that.".into();
+            } else {
+                // The running fetch keeps its note and Cancel.
+                self.dialog = Some(Dialog::Fetching(f.source.clone()));
+                self.ed.message = "A base project is being fetched already; wait for it or cancel it first.".into();
+            }
+            return;
+        }
+        let name = Self::project_name(dir, name);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, done) = std::sync::mpsc::channel();
+        let (to, from, stop) = (dir.to_path_buf(), source.to_owned(), cancel.clone());
+        std::thread::spawn(move || {
+            let made = wc_vcs::base::create_from_base_until(&from, &to, &name, &wc_core::base::today(), &stop);
+            let _ = tx.send(made.map(|_| ()).map_err(|e| match e {
+                wc_vcs::Error::Cancelled => None,
+                e => Some(e.to_string()),
+            }));
+        });
+        self.fetch = Some(BaseFetch {
+            dir: dir.to_path_buf(),
+            source: source.to_owned(),
+            was_open: self.open.as_ref().map(|o| o.dir.clone()),
+            made: false,
+            cancel,
+            done,
+        });
+        self.dialog = Some(Dialog::Fetching(source.to_owned()));
+    }
+
+    /// Stop the base project being fetched: nothing is made.
+    fn cancel_fetch(&mut self) {
+        match &self.fetch {
+            Some(f) if f.made => {
+                self.ed.message =
+                    "The new project is made already; it opens once the open project's work is done.".into();
+            }
+            Some(f) => {
+                f.cancel.store(true, Ordering::Relaxed);
+                self.ed.message = "Cancelling the new project…".into();
+            }
+            None => {}
+        }
+    }
+
+    /// Take in the base project fetched for a new project, once it is there: the project opens,
+    /// or the reason it could not be made shows. Until then the window keeps drawing.
+    fn poll_fetch(&mut self, ctx: &egui::Context) {
+        let Some(f) = self.fetch.as_mut() else { return };
+        if !f.made {
+            let failed = match f.done.try_recv() {
+                Ok(Ok(())) => {
+                    f.made = true;
+                    None
+                }
+                Ok(Err(e)) => Some(e),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Some("the fetch stopped without an answer".into()))
+                }
+            };
+            // Cancelled or failed: said at once, whatever else is open.
+            if let Some(why) = failed {
+                let Some(f) = self.fetch.take() else { return };
+                let fetching = matches!(self.dialog, Some(Dialog::Fetching(_)));
+                if fetching {
+                    self.dialog = None;
+                }
+                match why {
+                    None => self.ed.message = "Cancelled: the new project was not made.".into(),
+                    Some(e) => {
+                        let m = format!("Could not create the project in\n{}:\n{e}", f.dir.display());
+                        if fetching || self.dialog.is_none() {
+                            self.dialog = Some(Dialog::Message(m));
+                        } else {
+                            self.ed.message = m.replace('\n', " ");
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        // Made. The open project is not saved or replaced while something still works on it:
+        // an assistant turn or command, an open dialog, or the symbol or terminal strip editor.
+        // The new project waits until they are done, and Cancel is no longer offered.
+        if self.assistant.busy()
+            || self.assistant.command_running()
+            || self.symbol_editor.is_some()
+            || self.strip_editor.is_some()
+            || self.dialog.as_ref().is_some_and(|d| !matches!(d, Dialog::Fetching(_)))
+        {
+            if matches!(self.dialog, Some(Dialog::Fetching(_))) {
+                self.dialog = None;
+            }
+            self.ed.message = "The new project is made; it opens once the open project's work is done.".into();
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        let Some(f) = self.fetch.take() else { return };
+        if matches!(self.dialog, Some(Dialog::Fetching(_))) {
+            self.dialog = None;
+        }
+        if self.open.as_ref().map(|o| &o.dir) != f.was_open.as_ref() {
+            // Another project was opened meanwhile: it stays, and the new one waits.
+            let recorded = record_new_project(&f.dir);
+            self.prefs.remember(f.dir.clone());
+            self.prefs.save();
+            self.dialog = Some(Dialog::Message(match recorded {
+                Ok(()) => format!(
+                    "The new project is ready in\n{}\nOpen it from File, Open when you want it.",
+                    f.dir.display()
+                ),
+                Err(e) => format!(
+                    "The new project is in\n{}\nbut its first version could not be recorded:\n{e}",
+                    f.dir.display()
+                ),
+            }));
+        } else {
+            self.finish_new_project(&f.dir, false);
+        }
+    }
+
+    /// Create a project in `dir`: blank, or from the base project (folder or git URL) `base`.
+    fn new_project(&mut self, dir: &std::path::Path, name: &str, base: Option<&str>) {
+        let name = Self::project_name(dir, name);
         let made = match base {
             Some(b) => {
                 wc_vcs::base::create_from_base(b, dir, &name, &wc_core::base::today()).map_err(|e| e.to_string())
@@ -2171,9 +2352,15 @@ impl App {
             )));
             return;
         }
+        self.finish_new_project(dir, base.is_none());
+    }
+
+    /// After a project was made in `dir`: a blank one gets the starter library, then it is
+    /// recorded as a first version and opened.
+    fn finish_new_project(&mut self, dir: &std::path::Path, blank: bool) {
         // A starter library next to the app, when there is one, so the symbol picker is not
         // empty. A base project brings its own library sources.
-        if base.is_none()
+        if blank
             && let Some(lib) = starter_library()
             && let Ok(mut p) = wc_core::store::load(dir)
         {
@@ -2185,11 +2372,34 @@ impl App {
             });
             let _ = wc_core::store::save(dir, &p);
         }
-        let git = wc_vcs::Git::new(dir);
-        let _ = git.init().and_then(|()| git.commit("New project").map(|_| ()));
+        let recorded = record_new_project(dir);
+        // The new project replaces the open one: keep its unsaved work first.
+        if let Some(o) = self.open.as_mut()
+            && o.dirty
+            && let Err(e) = o.save()
+        {
+            let mut m = format!(
+                "The new project is in\n{}\nbut the open project could not be saved first, so it stays open:\n{e}",
+                dir.display()
+            );
+            if let Err(e) = recorded {
+                m.push_str(&format!(
+                    "\nThe new project's first version could not be recorded either:\n{e}"
+                ));
+            }
+            self.dialog = Some(Dialog::Message(m));
+            return;
+        }
         let mut prefs = std::mem::take(&mut self.prefs);
         self.open_dir(dir, &mut prefs);
         self.prefs = prefs;
+        if let Err(e) = recorded {
+            self.dialog = Some(Dialog::Message(match self.dialog.take() {
+                // Opening it failed too: both reasons show.
+                Some(Dialog::Message(m)) => format!("{m}\nIts first version could not be recorded either:\n{e}"),
+                _ => format!("The new project is open, but its first version could not be recorded:\n{e}"),
+            }));
+        }
     }
 
     /// Insert a macro on the current page, selected so it can be dragged into place.
@@ -2830,6 +3040,7 @@ impl eframe::App for App {
             o.follow_terminals();
         }
         self.live_check(ctx);
+        self.poll_fetch(ctx);
         self.log_messages();
         self.assistant_poll(ctx);
         if self.applied_theme != self.prefs.theme {
