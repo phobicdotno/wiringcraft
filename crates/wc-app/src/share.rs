@@ -1457,7 +1457,18 @@ fn waiting_pictures(
         let unchanged = taken
             .get(&file)
             .is_some_and(|was| still_taken(picture_version(&open.dir, &file).as_ref(), was));
-        let waits = !unchanged && matches!(wc_pdf::read_picture(&open.dir, &file), Ok(Some(data)) if data != *theirs);
+        // One that cannot be shared (empty, too big) is never renamed nor sent: it waits for
+        // nothing either.
+        let waits = !unchanged
+            && match wc_pdf::read_picture(&open.dir, &file) {
+                Ok(Some(data)) if data != *theirs => Picture {
+                    file: file.clone(),
+                    data,
+                }
+                .problem()
+                .is_none(),
+                _ => false,
+            };
         if waits {
             out.insert(picture_name(&file));
         }
@@ -3775,6 +3786,7 @@ impl Share {
         note_withdrawn(&mut self.withdrawn_picks, &self.pictures_sent, withdrawn);
         let mut taken = names_to_rename(role.picture_names_taken(), &self.pictures_sent, &self.withdrawn_picks);
         taken.append(&mut self.clashes);
+        let refs_before: BTreeMap<PicRef, String> = pic_refs(&open.project).into_iter().collect();
         let renamed = rename_pictures(
             open,
             taken,
@@ -3792,6 +3804,15 @@ impl Share {
         // picture sent twice) renames nothing, not even a reference to the session's file of
         // that name that came in since.
         note_withdrawn(&mut self.withdrawn_picks, &self.pictures_sent, renamed);
+        // A pick that waited under the old name is held under the new one: an Undo asked for
+        // meanwhile still takes it back.
+        for (r, new) in pic_refs(&open.project) {
+            if let Some(old) = refs_before.get(&r).filter(|old| **old != new)
+                && let Some(i) = self.holding.iter().position(|h| *h == picture_name(old))
+            {
+                self.holding[i] = picture_name(&new);
+            }
+        }
         // Pictures used for the first time go out before the change that names them. Changes do
         // not wait for them: without its picture a page still works, it just shows a gap.
         let session_pictures = role.pictures();

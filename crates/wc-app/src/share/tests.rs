@@ -5993,6 +5993,81 @@ fn a_guest_logo_named_like_an_unused_file_of_the_host_gets_a_name_of_its_own() -
     Ok(())
 }
 
+/// A host recording into git, as a real session does, whose session has a picture brand.png
+/// its drawings do not use, and a guest Ola that joined: host, its copy, guest, its copy.
+fn git_session_with_brand(tmp: &Path) -> std::result::Result<(Share, Open, Share, Open), Box<dyn std::error::Error>> {
+    let mut host_open = project(&tmp.join("host"))?;
+    host_open.save()?;
+    let mut h = host_with(&host_open, Box::new(GitJournal::open(&host_open.dir)?));
+    if let Some(Role::Host(hosting)) = h.role.as_mut() {
+        let mut all = hosting.host.pictures().clone();
+        all.insert("pictures/brand.png".into(), PNG.to_vec());
+        hosting.host.share_pictures(all);
+    }
+    let mut g = guest(&mut h, "Ola", &tmp.join("Ola"));
+    h.frame(Some(&mut host_open), Some("p0002".into()), false);
+    let ids = pending(&h);
+    approve(&mut h, ids[0], true);
+    let mut guest_open = g.frame(None, None, false).ok_or("no project")?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    Ok((h, host_open, g, guest_open))
+}
+
+#[test]
+fn an_undo_asked_for_while_a_clashing_pick_waits_takes_it_back_after_the_rename() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, mut host_open, mut g, mut guest_open) = git_session_with_brand(tmp.path())?;
+    let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), &mine)?;
+    guest_open.checkpoint();
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    // One frame: the pick waits under the clashing name, and is renamed at the next.
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(!g.holding.is_empty(), "the pick waits");
+    // Undo before that next frame.
+    g.undo()?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(guest_open.project.meta.logo, None, "taken back here: {:?}", g.notes);
+    assert_eq!(host_open.project.meta.logo, None, "never sent");
+    assert!(g.holding.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_clashing_pick_of_a_picture_that_cannot_be_shared_does_not_wait() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, mut host_open, mut g, mut guest_open) = git_session_with_brand(tmp.path())?;
+    // The host's page 2 shows brand.png, so the guest takes the session's file.
+    host_open.project.page_mut("p0002").ok_or("no page")?.underlay = Some(wc_core::Underlay {
+        file: "pictures/brand.png".into(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(10.0, 10.0),
+    });
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert_eq!(file_bytes(&guest_open.dir, "pictures/brand.png")?, PNG);
+    // The guest empties that file: it cannot be shared, so nothing would ever let a pick of it
+    // go if it waited.
+    std::fs::write(guest_open.dir.join("pictures/brand.png"), b"")?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/brand.png".into(),
+        cover: None,
+    });
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    assert!(g.holding.is_empty(), "{:?}", g.holding);
+    assert_eq!(host_open.project.meta.logo, guest_open.project.meta.logo);
+    Ok(())
+}
+
 /// A GitJournal session whose pictures include a brand.png its drawings do not use; the guest
 /// picks a file of its own of that name (`pick`), and once it has a name of its own, takes the
 /// pick back with one undo. `used` reads the picked file from a copy.
@@ -6001,20 +6076,7 @@ fn renamed_pick_then_one_undo(
     used: impl Fn(&Open) -> Option<String>,
 ) -> TestResult {
     let tmp = tempfile::tempdir()?;
-    let mut host_open = project(&tmp.path().join("host"))?;
-    host_open.save()?;
-    let mut h = host_with(&host_open, Box::new(GitJournal::open(&host_open.dir)?));
-    if let Some(Role::Host(hosting)) = h.role.as_mut() {
-        let mut all = hosting.host.pictures().clone();
-        all.insert("pictures/brand.png".into(), PNG.to_vec());
-        hosting.host.share_pictures(all);
-    }
-    let mut g = guest(&mut h, "Ola", &tmp.path().join("Ola"));
-    h.frame(Some(&mut host_open), Some("p0002".into()), false);
-    let ids = pending(&h);
-    approve(&mut h, ids[0], true);
-    let mut guest_open = g.frame(None, None, false).ok_or("no project")?;
-    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let (mut h, mut host_open, mut g, mut guest_open) = git_session_with_brand(tmp.path())?;
     assert_eq!(used(&host_open), None);
 
     let mine = b"\x89PNG\r\n\x1a\nmine".to_vec();
