@@ -16,9 +16,17 @@ thiserror.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# File identity (volume serial and file index) for telling a hard link to a project file apart (`guard`).
+# File identity (volume serial and file index) for telling a hard link to a project file apart, and
+# output files made and renamed relative to an opened folder (`guard`).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

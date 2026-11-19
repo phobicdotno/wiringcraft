@@ -25,7 +25,7 @@ pub struct ProjectFiles {
     /// The identity of each project file ([`file_id`]), so a hard link to one is known too.
     pub files: HashSet<(u64, u64)>,
     /// The identity of each project folder, so an output folder opened through a link is
-    /// known to be the project's whatever name reached it (unix; empty elsewhere).
+    /// known to be the project's whatever name reached it (unix and Windows; empty elsewhere).
     pub dirs: HashSet<(u64, u64)>,
     /// Why a project file's identity could not be read, if one could not: a hard link to that
     /// file would go unseen, so no output file is taken as safe then.
@@ -37,7 +37,7 @@ impl ProjectFiles {
     pub fn new(project: &Path) -> Self {
         let (roots, mut unknown) = project_roots(project);
         let mut files = HashSet::new();
-        #[cfg_attr(not(unix), allow(unused_mut))]
+        #[cfg_attr(not(any(unix, windows)), allow(unused_mut))]
         let mut dirs = HashSet::new();
         let mut todo = roots.clone();
         // A folder that cannot be listed, or an entry that cannot be looked at, hides files
@@ -55,9 +55,8 @@ impl ProjectFiles {
                 }
             };
             if m.is_dir() {
-                // Only unix opens the output folder and compares it by identity; Windows
-                // cannot open a folder through `file_id`.
-                #[cfg(unix)]
+                // Unix and Windows open the output folder and compare it by identity.
+                #[cfg(any(unix, windows))]
                 match file_id(&at) {
                     Ok(Some(id)) => {
                         dirs.insert(id);
@@ -138,11 +137,11 @@ impl ProjectFiles {
     /// Nothing already at `path` is opened or changed: the bytes go to a new file of their
     /// own next to it, which then takes the name. A link or a hard link at `path`, also one
     /// made after the look before, loses only its name there; the file behind it stays as it
-    /// was. The output folder must not be the project's: on unix it is opened once and known
-    /// by its identity, and the new file is made and renamed relative to it, so a folder above
-    /// swapped for a link into the project after the checks changes nothing (#471). Elsewhere
-    /// the new file is checked by where its name leads before it takes the name. A refused
-    /// file is removed again.
+    /// was. The output folder must not be the project's: on unix and Windows it is opened once
+    /// and known by its identity, and the new file is made and renamed relative to it, so a
+    /// folder above swapped for a link into the project after the checks changes nothing
+    /// (#471, #476). Elsewhere the new file is checked by where its name leads before it takes
+    /// the name. A refused file is removed again.
     pub fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         let refuse = |why: &str| {
             io::Error::new(
@@ -188,7 +187,9 @@ impl ProjectFiles {
         let opened = dir
             .path()
             .map_err(|e| Fail::Refused(format!("could not be told apart from the project's files ({e})")))?;
-        if self.dirs.contains(&dir.id) || inside(&self.roots, &opened) {
+        #[cfg(test)]
+        tests::hook("resolved", folder, std::ffi::OsStr::new(""));
+        if self.dirs.contains(&dir.id) || opened_inside(&self.roots, &opened) {
             return Err(Fail::Refused("is in the project folder".into()));
         }
         let (staged, mut file) = dir.create_new(&name)?;
@@ -212,9 +213,63 @@ impl ProjectFiles {
         done
     }
 
+    /// Write `bytes` as a new file in the folder of `path` and give it the name (#476), as on
+    /// unix: the folder is opened once and checked by its identity, and the file is made
+    /// (`NtCreateFile`) and renamed (`FileRenameInformation`) relative to that open folder, so
+    /// a folder above swapped for a junction or link afterwards changes nothing.
+    #[cfg(windows)]
+    fn put(&self, path: &Path, bytes: &[u8]) -> Result<(), Fail> {
+        let (folder, name) = folder_and_name(path)?;
+        let name = win::win32_name(path, name)?;
+        #[cfg(test)]
+        tests::hook("open", folder, std::ffi::OsStr::new(""));
+        let dir = win::Dir::open(folder)?;
+        #[cfg(test)]
+        tests::hook("opened", folder, std::ffi::OsStr::new(""));
+        let opened = dir
+            .path()
+            .map_err(|e| Fail::Refused(format!("could not be told apart from the project's files ({e})")))?;
+        #[cfg(test)]
+        tests::hook("resolved", folder, std::ffi::OsStr::new(""));
+        if self.dirs.contains(&dir.id) || opened_inside(&self.roots, &opened) {
+            return Err(Fail::Refused("is in the project folder".into()));
+        }
+        #[cfg(test)]
+        tests::hook("checked", folder, std::ffi::OsStr::new(""));
+        let (staged, mut file) = dir.create_new(&name)?;
+        let done = (|| {
+            use std::io::Write;
+            if !file.metadata()?.is_file() {
+                return Err(Fail::Refused("is not a plain file".into()));
+            }
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            tests::hook("rename", folder, &staged);
+            dir.rename(&file, &name)?;
+            Ok(())
+        })();
+        // Only the file this call made goes: it is removed through its own handle, by no name
+        // at all. A removal that fails too is named after the first failure.
+        match done {
+            Err(fail) => Err(match (fail, win::remove(&file)) {
+                (fail, Ok(())) => fail,
+                (Fail::Refused(why), Err(e)) => Fail::Refused(format!(
+                    "{why} (its new file {} is left: {e})",
+                    staged.to_string_lossy()
+                )),
+                (Fail::Io(first), Err(e)) => Fail::Io(io::Error::new(
+                    first.kind(),
+                    format!("{first} (the new file {} is left: {e})", staged.to_string_lossy()),
+                )),
+            }),
+            Ok(()) => Ok(()),
+        }
+    }
+
     /// Write `bytes` as a new file next to `path`, checked by where its name leads, and give it
     /// the name.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn put(&self, path: &Path, bytes: &[u8]) -> Result<(), Fail> {
         let (staged, file) = stage_next_to(path)?;
         let id = handle_id(&file).ok().flatten();
@@ -245,7 +300,7 @@ impl ProjectFiles {
 
     /// Why the new file `file` (identity `id`), just made at `staged`, must not be written, if
     /// it must not.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn check_staged(&self, staged: &Path, file: &File, id: Option<(u64, u64)>) -> Result<(), String> {
         let meta = file.metadata().map_err(|e| format!("could not be looked at ({e})"))?;
         if !meta.is_file() {
@@ -288,7 +343,7 @@ impl From<io::Error> for Fail {
 }
 
 /// The folder `path` is in (`.` for a bare name) and its file name.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn folder_and_name(path: &Path) -> io::Result<(&Path, std::ffi::OsString)> {
     let folder = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -449,9 +504,263 @@ mod at {
     }
 }
 
+/// Files made, renamed and removed relative to an opened folder on Windows (#476): the file is
+/// made with `NtCreateFile` and renamed with `FileRenameInformation`, both with the open folder
+/// as their root, so that no folder name is looked up again after the folder was checked.
+#[cfg(windows)]
+mod win {
+    use std::ffi::{OsStr, OsString};
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::path::{Path, PathBuf};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+        FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile, NtSetInformationFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_WRITE,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,
+        GetFinalPathNameByHandleW, SYNCHRONIZE, SetFileInformationByHandle,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    /// An opened folder and its identity (volume serial and file index).
+    pub(super) struct Dir {
+        file: File,
+        pub(super) id: (u64, u64),
+    }
+
+    /// The I/O error for an `NTSTATUS` that is not a success.
+    fn nt_error(status: NTSTATUS) -> io::Error {
+        // SAFETY: a plain conversion of a status code, with no pointers.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        io::Error::from_raw_os_error(code as i32)
+    }
+
+    /// `path` with a closing separator when it ends in a name, so Win32 keeps trailing dots
+    /// and spaces of that last name: they are dropped only at the very end of a path, and the
+    /// folder is the middle of the output path, where they stay (`exports \list.csv` is in
+    /// `exports `, not `exports`; #494 review). A drive alone (`C:`) or a root is left as it is.
+    pub(super) fn as_folder(path: &Path) -> std::borrow::Cow<'_, Path> {
+        let named = matches!(path.components().next_back(), Some(std::path::Component::Normal(_)));
+        let w: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let closed = matches!(w.last(), Some(&c) if c == u16::from(b'\\') || c == u16::from(b'/'));
+        if !named || closed {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        let mut s = path.as_os_str().to_owned();
+        s.push("\\");
+        std::borrow::Cow::Owned(PathBuf::from(s))
+    }
+
+    /// The name the Win32 path calls give the file `name` of `path`: they drop trailing dots
+    /// and spaces from it, and the native calls this writer makes do not, so `out.csv.` would
+    /// otherwise make a new `out.csv.` and leave `out.csv` as it was (#494 review). A verbatim
+    /// `\\?\` path keeps its name as written, as Win32 does.
+    pub(super) fn win32_name(path: &Path, name: OsString) -> io::Result<OsString> {
+        use std::path::{Component, Prefix};
+        let verbatim = matches!(
+            path.components().next(),
+            Some(Component::Prefix(p))
+                if matches!(p.kind(), Prefix::Verbatim(_) | Prefix::VerbatimUNC(..) | Prefix::VerbatimDisk(_))
+        );
+        if verbatim {
+            return Ok(name);
+        }
+        let mut w: Vec<u16> = name.encode_wide().collect();
+        while matches!(w.last(), Some(&c) if c == u16::from(b'.') || c == u16::from(b' ')) {
+            w.pop();
+        }
+        if w.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the output path names no file",
+            ));
+        }
+        Ok(OsString::from_wide(&w))
+    }
+
+    /// `name` as UTF-16, refused when it is too long for a `UNICODE_STRING` or names more
+    /// than one entry.
+    fn wide(name: &OsStr) -> io::Result<Vec<u16>> {
+        let w: Vec<u16> = name.encode_wide().collect();
+        if w.is_empty()
+            || w.len() > usize::from(u16::MAX / 2)
+            || w.iter()
+                .any(|&c| c == u16::from(b'\\') || c == u16::from(b'/') || c == 0)
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a plain file name"));
+        }
+        Ok(w)
+    }
+
+    impl Dir {
+        /// Open the folder at `path` (junctions and links in it followed: what counts is the
+        /// folder reached), with access only to pass through it and read its attributes.
+        pub(super) fn open(path: &Path) -> io::Result<Dir> {
+            let file = std::fs::OpenOptions::new()
+                .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(as_folder(path))?;
+            if !file.metadata()?.is_dir() {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
+            }
+            let id =
+                super::handle_id(&file)?.ok_or_else(|| io::Error::other("the folder's identity could not be read"))?;
+            Ok(Dir { file, id })
+        }
+
+        /// Where this open folder is now, links worked out, found from the open folder itself
+        /// (not by looking its old name up again).
+        pub(super) fn path(&self) -> io::Result<PathBuf> {
+            let handle = self.file.as_raw_handle() as HANDLE;
+            let mut buf = vec![0u16; 512];
+            loop {
+                let cap = u32::try_from(buf.len()).map_err(io::Error::other)?;
+                // SAFETY: the handle is open and `buf` holds `cap` UTF-16 units.
+                let n = unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), cap, 0) } as usize;
+                if n == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if n < buf.len() {
+                    buf.truncate(n);
+                    return Ok(PathBuf::from(OsString::from_wide(&buf)));
+                }
+                // Too small: `n` is the size needed, with the closing NUL.
+                buf.resize(n + 1, 0);
+            }
+        }
+
+        /// A new, empty file in this folder with an unused name made from `name`: a name
+        /// already there, a link or junction too, is never opened. The file may be written,
+        /// renamed and removed through its handle.
+        pub(super) fn create_new(&self, name: &OsStr) -> io::Result<(OsString, File)> {
+            let mut last = None;
+            for _ in 0..16 {
+                let staged = OsString::from(super::staging_name(&name.to_string_lossy()));
+                let w = wide(&staged)?;
+                let bytes = (w.len() * 2) as u16;
+                let object = UNICODE_STRING {
+                    Length: bytes,
+                    MaximumLength: bytes,
+                    Buffer: w.as_ptr().cast_mut(),
+                };
+                let attributes = OBJECT_ATTRIBUTES {
+                    Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                    RootDirectory: self.file.as_raw_handle() as HANDLE,
+                    ObjectName: &object,
+                    Attributes: OBJ_CASE_INSENSITIVE,
+                    SecurityDescriptor: std::ptr::null(),
+                    SecurityQualityOfService: std::ptr::null(),
+                };
+                let mut handle: HANDLE = std::ptr::null_mut();
+                // SAFETY: an all-zero IO_STATUS_BLOCK is a valid value.
+                let mut io_status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+                // SAFETY: every pointer is to a live value of the right type for the whole call:
+                // `object` and `w` outlive it, and the folder's handle is open.
+                let status = unsafe {
+                    NtCreateFile(
+                        &mut handle,
+                        FILE_GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                        &attributes,
+                        &mut io_status,
+                        std::ptr::null(),
+                        FILE_ATTRIBUTE_NORMAL,
+                        FILE_SHARE_READ,
+                        FILE_CREATE,
+                        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+                        std::ptr::null(),
+                        0,
+                    )
+                };
+                if status >= 0 {
+                    // SAFETY: `handle` was just opened (for synchronous I/O, as `File` needs) and
+                    // is owned by nothing else.
+                    return Ok((staged, unsafe { File::from_raw_handle(handle as _) }));
+                }
+                let e = nt_error(status);
+                if e.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+                last = Some(e);
+            }
+            Err(last.unwrap_or_else(|| io::Error::other("no free name for the output file")))
+        }
+
+        /// Give the open file `file`, made in this folder, the name `to` in this folder,
+        /// replacing what has that name.
+        pub(super) fn rename(&self, file: &File, to: &OsStr) -> io::Result<()> {
+            let w = wide(to)?;
+            let head = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+            // At least the whole structure: for a one-letter name the name ends before the
+            // structure's padding does, and a shorter record is refused.
+            let size = (head + w.len() * 2).max(std::mem::size_of::<FILE_RENAME_INFORMATION>());
+            // u64 words, so the structure (which holds a handle) is aligned.
+            let mut buf = vec![0u64; size.div_ceil(8)];
+            let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+            // SAFETY: `buf` is zeroed, aligned for the structure and holds `size` bytes: the
+            // structure's fixed part and the name right after it.
+            unsafe {
+                (*info).Anonymous.ReplaceIfExists = true;
+                (*info).RootDirectory = self.file.as_raw_handle() as HANDLE;
+                (*info).FileNameLength = (w.len() * 2) as u32;
+                std::ptr::copy_nonoverlapping(
+                    w.as_ptr(),
+                    std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+                    w.len(),
+                );
+            }
+            // SAFETY: an all-zero IO_STATUS_BLOCK is a valid value.
+            let mut io_status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+            // SAFETY: both handles are open, `info` points to `size` initialised bytes and
+            // `io_status` is a valid place to write to.
+            let status = unsafe {
+                NtSetInformationFile(
+                    file.as_raw_handle() as HANDLE,
+                    &mut io_status,
+                    info.cast(),
+                    size as u32,
+                    FileRenameInformation,
+                )
+            };
+            if status < 0 {
+                return Err(nt_error(status));
+            }
+            Ok(())
+        }
+    }
+
+    /// Remove the open file `file` (made with delete access) through its handle: whatever its
+    /// name or folder by now, only this file goes.
+    pub(super) fn remove(file: &File) -> io::Result<()> {
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the handle is open and `info` is a valid FILE_DISPOSITION_INFO of the size given.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                std::ptr::addr_of!(info).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 /// A new, empty file in the folder of `path`, with a name nothing had: a name already there,
 /// a link too, is never opened.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn stage_next_to(path: &Path) -> io::Result<(PathBuf, File)> {
     let folder = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -489,14 +798,17 @@ fn handle_id(file: &File) -> io::Result<Option<(u64, u64)>> {
 
 /// What names one file on this machine whatever path reaches it, links followed: the volume
 /// serial number and the file index on Windows (#459). The file is opened without read or
-/// write access, which only lets its attributes be read.
+/// write access, which only lets its attributes be read; a folder can be opened too (#476).
 #[cfg(windows)]
 pub fn file_id(path: &Path) -> io::Result<Option<(u64, u64)>> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
     let file = std::fs::OpenOptions::new()
         .access_mode(0)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
     handle_id(&file)
 }
@@ -527,6 +839,17 @@ pub fn file_id(_path: &Path) -> io::Result<Option<(u64, u64)>> {
 #[cfg(not(any(unix, windows)))]
 fn handle_id(_file: &File) -> io::Result<Option<(u64, u64)>> {
     Ok(None)
+}
+
+/// Whether the open folder found at `opened` (read from its handle, so links are already
+/// worked out) is in one of `roots`. The path is taken as found, not looked up again: a folder
+/// moved and replaced by a link outside the project after the handle was read must not pass
+/// (#494 review). It is also looked up, in case the found path is not in the roots' form; a
+/// project folder found either way is refused.
+#[cfg(any(unix, windows))]
+fn opened_inside(roots: &[PathBuf], opened: &Path) -> bool {
+    let found = normalize(opened);
+    roots.iter().any(|r| found.starts_with(r)) || inside(roots, opened)
 }
 
 /// Whether `path`, as the file system resolves it, is in one of `roots`.
@@ -683,7 +1006,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn no_temp_left(folder: &Path) -> io::Result<bool> {
         Ok(std::fs::read_dir(folder)?
             .filter_map(Result::ok)
@@ -754,24 +1077,26 @@ mod tests {
     }
 
     /// What to do in the next write at one of its steps, on this thread.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     type Swap = Box<dyn FnOnce(&Path, &std::ffi::OsStr) -> io::Result<()>>;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     thread_local! {
         static SWAPS: std::cell::RefCell<Vec<(&'static str, Swap)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// Run `swap` when the next write on this thread reaches `step`: `open` (before the output
-    /// folder is opened), `opened` (right after) or `rename` (after every check, before the
-    /// rename; it is given the staging file's name).
-    #[cfg(unix)]
+    /// folder is opened), `opened` (right after), `resolved` (after where the opened folder is
+    /// was read, before it is checked), `checked` (Windows: after the opened folder was
+    /// checked, before the new file is made) or `rename` (after every check, before the rename;
+    /// it is given the staging file's name).
+    #[cfg(any(unix, windows))]
     fn on(step: &'static str, swap: impl FnOnce(&Path, &std::ffi::OsStr) -> io::Result<()> + 'static) {
         SWAPS.with(|s| s.borrow_mut().push((step, Box::new(swap))));
     }
 
     /// Called by [`ProjectFiles::put`] at each `step`.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn hook(step: &str, folder: &Path, staged: &std::ffi::OsStr) {
         let swap = SWAPS.with(|s| {
             let mut s = s.borrow_mut();
@@ -824,6 +1149,46 @@ mod tests {
         Ok(())
     }
 
+    /// A project folder made after the look is opened as the output folder through a swapped
+    /// parent; after where the opened folder is was read, it moves within the project and a
+    /// link to a folder outside takes its old name: the write is still refused, by the place that was read, not by where that name
+    /// leads now, and the project's file is unchanged (#494 review).
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn a_project_folder_swapped_for_a_link_out_after_it_was_found_is_refused() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let new = p.path().join("new");
+        std::fs::create_dir(&new)?;
+        std::fs::write(new.join("page.json"), "new page")?;
+        let parent = out.path().join("parent");
+        std::fs::create_dir_all(parent.join("sub"))?;
+        let file = parent.join("sub").join("page.json");
+        assert!(!g.holds(&file)?);
+        let aside = out.path().join("parent-aside");
+        let (parent2, aside2, project2) = (parent.clone(), aside.clone(), p.path().to_path_buf());
+        on("open", move |_, _| {
+            std::fs::rename(&parent2, &aside2)?;
+            std::os::unix::fs::symlink(&project2, &parent2)?;
+            std::fs::rename(project2.join("new"), project2.join("sub"))
+        });
+        let (aside3, project3) = (aside.clone(), p.path().to_path_buf());
+        on("resolved", move |_, _| {
+            std::fs::rename(project3.join("sub"), project3.join("new"))?;
+            std::os::unix::fs::symlink(aside3.join("sub"), project3.join("sub"))
+        });
+        let e = g
+            .write(&file, b"exported")
+            .err()
+            .ok_or("written into a project folder")?;
+        assert!(e.to_string().contains("project folder"), "{e}");
+        assert_eq!(std::fs::read_to_string(new.join("page.json"))?, "new page");
+        assert!(no_temp_left(&new)?);
+        assert!(!aside.join("sub").join("page.json").exists());
+        Ok(())
+    }
+
     /// The output folder swapped for a link into the project after every check, with an entry
     /// of the staging file's name planted there: the rename still happens in the folder that
     /// was opened and checked, and the project's files stay as they were (#471).
@@ -849,6 +1214,265 @@ mod tests {
         assert_eq!(std::fs::read_to_string(pages.join("p1.page.json"))?, "page one");
         assert_eq!(std::fs::read_to_string(moved.join("p1.page.json"))?, "exported");
         assert!(no_temp_left(&moved)?);
+        Ok(())
+    }
+
+    /// A junction at `link` to the folder `to` (no special rights needed, unlike a symbolic
+    /// link).
+    #[cfg(windows)]
+    fn junction(link: &Path, to: &Path) -> io::Result<()> {
+        use std::os::windows::process::CommandExt;
+        // The paths reach cmd through variables, quoted: cmd expands a variable once and does
+        // not parse its value again, so `&` and `%` in a path are taken literally (a path
+        // cannot hold a `"`).
+        let done = std::process::Command::new("cmd")
+            .arg("/C")
+            .raw_arg(r#"mklink /J "%WC_JUNCTION_LINK%" "%WC_JUNCTION_TO%""#)
+            .env("WC_JUNCTION_LINK", link)
+            .env("WC_JUNCTION_TO", to)
+            .output()?;
+        if done.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(String::from_utf8_lossy(&done.stderr).into_owned()))
+        }
+    }
+
+    /// The junction helper takes paths with `&` and `%` in them literally.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_made_for_paths_cmd_would_parse() -> TestResult {
+        let out = tempfile::tempdir()?;
+        let to = out.path().join("a&b %TEMP% c");
+        std::fs::create_dir(&to)?;
+        std::fs::write(to.join("x.txt"), "x")?;
+        let link = out.path().join("l&k %TEMP%");
+        junction(&link, &to)?;
+        assert_eq!(std::fs::read_to_string(link.join("x.txt"))?, "x");
+        std::fs::remove_dir(&link)?;
+        Ok(())
+    }
+
+    /// The output folder's parent swapped for a junction into the project after the look,
+    /// right before the output folder is opened: the opened folder is the project's, so the
+    /// write is refused and the project's files are unchanged (#476).
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_opened_through_a_junction_into_the_project_is_refused() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let parent = out.path().join("parent");
+        std::fs::create_dir_all(parent.join("pages"))?;
+        let file = parent.join("pages").join("p1.page.json");
+        assert!(!g.holds(&file)?);
+        let (parent2, aside, project2) = (parent.clone(), out.path().join("parent-aside"), p.path().to_path_buf());
+        on("open", move |_, _| {
+            std::fs::rename(&parent2, &aside)?;
+            junction(&parent2, &project2)
+        });
+        let e = g
+            .write(&file, b"exported")
+            .err()
+            .ok_or("written into a project folder")?;
+        assert!(e.to_string().contains("project folder"), "{e}");
+        let pages = p.path().join("pages");
+        assert_eq!(std::fs::read_to_string(pages.join("p1.page.json"))?, "page one");
+        assert!(no_temp_left(&pages)?);
+        // The junction goes before the temporary folder does.
+        std::fs::remove_dir(&parent)?;
+        Ok(())
+    }
+
+    /// The output folder swapped for a junction into the project's `pages` folder after it was
+    /// opened and checked, before the new file is made (only the open folder is held then, so
+    /// Windows lets it move): the file is made and renamed in the folder that was checked, and
+    /// the project's page stays as it was (#476).
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_swapped_for_a_junction_after_the_check_gets_nothing() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let sub = out.path().join("exports");
+        std::fs::create_dir(&sub)?;
+        let file = sub.join("p1.page.json");
+        let pages = p.path().join("pages");
+        let moved = out.path().join("exports-old");
+        let (pages2, moved2, sub2) = (pages.clone(), moved.clone(), sub.clone());
+        on("checked", move |_, _| {
+            std::fs::rename(&sub2, &moved2)?;
+            junction(&sub2, &pages2)
+        });
+        g.write(&file, b"exported")?;
+        assert_eq!(std::fs::read_to_string(pages.join("p1.page.json"))?, "page one");
+        assert!(no_temp_left(&pages)?);
+        assert_eq!(std::fs::read_to_string(moved.join("p1.page.json"))?, "exported");
+        assert!(no_temp_left(&moved)?);
+        // The junction goes before the temporary folder does.
+        std::fs::remove_dir(&sub)?;
+        Ok(())
+    }
+
+    /// As on unix: a project folder made after the look is opened as the output folder through
+    /// a swapped parent; after where the opened folder is was read, it moves within the project and a junction to a folder
+    /// outside takes its old name. The write is refused and the project's file is unchanged
+    /// (#494 review).
+    #[cfg(windows)]
+    #[test]
+    fn a_project_folder_swapped_for_a_junction_out_after_it_was_found_is_refused() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let new = p.path().join("new");
+        std::fs::create_dir(&new)?;
+        std::fs::write(new.join("page.json"), "new page")?;
+        let parent = out.path().join("parent");
+        std::fs::create_dir_all(parent.join("sub"))?;
+        let file = parent.join("sub").join("page.json");
+        assert!(!g.holds(&file)?);
+        let aside = out.path().join("parent-aside");
+        let (parent2, aside2, project2) = (parent.clone(), aside.clone(), p.path().to_path_buf());
+        on("open", move |_, _| {
+            std::fs::rename(&parent2, &aside2)?;
+            junction(&parent2, &project2)?;
+            std::fs::rename(project2.join("new"), project2.join("sub"))
+        });
+        let (aside3, project3) = (aside.clone(), p.path().to_path_buf());
+        on("resolved", move |_, _| {
+            std::fs::rename(project3.join("sub"), project3.join("new"))?;
+            junction(&project3.join("sub"), &aside3.join("sub"))
+        });
+        let e = g
+            .write(&file, b"exported")
+            .err()
+            .ok_or("written into a project folder")?;
+        assert!(e.to_string().contains("project folder"), "{e}");
+        assert_eq!(std::fs::read_to_string(new.join("page.json"))?, "new page");
+        assert!(no_temp_left(&new)?);
+        assert!(!aside.join("sub").join("page.json").exists());
+        // The junctions go before the temporary folders do.
+        std::fs::remove_dir(p.path().join("sub"))?;
+        std::fs::remove_dir(&parent)?;
+        Ok(())
+    }
+
+    /// Win32 drops trailing dots and spaces from a file name: `out.csv.` replaces `out.csv`,
+    /// and no entry named `out.csv.` is made (#494 review).
+    #[cfg(windows)]
+    #[test]
+    fn a_trailing_dot_names_the_file_win32_would() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let file = out.path().join("out.csv");
+        g.write(&file, b"first")?;
+        g.write(&out.path().join("out.csv. ."), b"second")?;
+        assert_eq!(std::fs::read_to_string(&file)?, "second");
+        let names: Vec<_> = std::fs::read_dir(out.path())?
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("out.csv")]);
+        assert!(g.write(&out.path().join(" ."), b"x").is_err());
+        Ok(())
+    }
+
+    /// An output folder whose name ends in a space, next to one of the same name without it:
+    /// the file goes into the folder the path names, as a write to the whole path would, not
+    /// into the one Win32 would find for the folder's path alone (#494 review).
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_name_ending_in_a_space_is_kept() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        // Made through the verbatim form, which keeps the space.
+        let literal = out.path().canonicalize()?;
+        std::fs::create_dir(literal.join("exports"))?;
+        std::fs::create_dir(literal.join("exports "))?;
+        g.write(&out.path().join("exports ").join("list.csv"), b"spaced")?;
+        assert_eq!(
+            std::fs::read_to_string(literal.join("exports ").join("list.csv"))?,
+            "spaced"
+        );
+        assert!(!literal.join("exports").join("list.csv").exists());
+        assert!(no_temp_left(&literal.join("exports "))?);
+        std::fs::remove_file(literal.join("exports ").join("list.csv"))?;
+        std::fs::remove_dir(literal.join("exports "))?;
+        Ok(())
+    }
+
+    /// A folder path gets a closing separator only when it ends in a name.
+    #[cfg(windows)]
+    #[test]
+    fn only_a_named_folder_gets_a_closing_separator() {
+        let s = |p: &str| win::as_folder(Path::new(p)).as_os_str().to_string_lossy().into_owned();
+        assert_eq!(s(r"C:\x\exports "), r"C:\x\exports \");
+        assert_eq!(s(r"C:\x\"), r"C:\x\");
+        assert_eq!(s("C:"), "C:");
+        assert_eq!(s(r"C:\"), r"C:\");
+        assert_eq!(s("."), ".");
+        assert_eq!(s(r"\\?\C:\x"), r"\\?\C:\x\");
+    }
+
+    /// A verbatim path keeps its file name as written; any other loses trailing dots and spaces.
+    #[cfg(windows)]
+    #[test]
+    fn only_a_verbatim_path_keeps_a_trailing_dot() -> TestResult {
+        let name = || std::ffi::OsString::from("a. ");
+        assert_eq!(win::win32_name(Path::new(r"\\?\C:\x\a. "), name())?, "a. ");
+        assert_eq!(win::win32_name(Path::new(r"C:\x\a. "), name())?, "a");
+        assert_eq!(win::win32_name(Path::new("a. "), name())?, "a");
+        Ok(())
+    }
+
+    /// The output folder swapped for a junction into the project after every check, with an
+    /// entry of the staging file's name planted there: the rename still happens in the folder
+    /// that was opened and checked, and the project's files stay as they were (#476). Windows
+    /// may refuse to move a folder that holds an open file; then the folder stays and takes
+    /// the output, and the planted file is still left alone.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_swapped_for_a_junction_after_the_checks_does_not_redirect_the_rename() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let sub = out.path().join("exports");
+        std::fs::create_dir(&sub)?;
+        let file = sub.join("p1.page.json");
+        let pages = p.path().join("pages");
+        let moved = out.path().join("exports-old");
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (pages2, moved2, sub2, swapped2) = (pages.clone(), moved.clone(), sub.clone(), swapped.clone());
+        let planted = std::rc::Rc::new(std::cell::RefCell::new(std::ffi::OsString::new()));
+        let planted2 = planted.clone();
+        on("rename", move |_folder: &Path, staged: &std::ffi::OsStr| {
+            match std::fs::rename(&sub2, &moved2) {
+                Ok(()) => {
+                    junction(&sub2, &pages2)?;
+                    swapped2.set(true);
+                }
+                // Only the refusal to move a folder that holds an open file (access denied or
+                // a sharing violation) lets the test go on without the swap.
+                Err(e) if matches!(e.raw_os_error(), Some(5 | 32)) => {}
+                Err(e) => return Err(e),
+            }
+            std::fs::write(pages2.join(staged), "planted")?;
+            *planted2.borrow_mut() = staged.to_owned();
+            Ok(())
+        });
+        g.write(&file, b"exported")?;
+        assert_eq!(std::fs::read_to_string(pages.join("p1.page.json"))?, "page one");
+        let staged = planted.borrow().clone();
+        assert_eq!(std::fs::read_to_string(pages.join(&staged))?, "planted");
+        let landed = if swapped.get() { &moved } else { &sub };
+        assert_eq!(std::fs::read_to_string(landed.join("p1.page.json"))?, "exported");
+        assert!(no_temp_left(landed)?);
+        if swapped.get() {
+            // The junction goes before the temporary folder does, so the project is not emptied.
+            std::fs::remove_dir(&sub)?;
+        }
         Ok(())
     }
 
@@ -909,6 +1533,20 @@ mod tests {
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().ends_with(".wc-tmp"));
         assert!(!left);
+        Ok(())
+    }
+
+    /// A one-letter output name is written and replaced (the shortest rename record, #494
+    /// review).
+    #[test]
+    fn a_one_letter_name_is_written_and_replaced() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let file = out.path().join("x");
+        g.write(&file, b"first")?;
+        g.write(&file, b"second")?;
+        assert_eq!(std::fs::read_to_string(&file)?, "second");
         Ok(())
     }
 
