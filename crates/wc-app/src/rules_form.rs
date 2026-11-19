@@ -29,7 +29,8 @@ impl RuleRow {
     pub fn of(rule: &CheckRule) -> Self {
         let text = |v: &Option<String>| v.clone().unwrap_or_default();
         RuleRow {
-            kind: rule.kind.clone(),
+            // As the check reads it, so the row shows that kind's fields.
+            kind: rule.kind.trim().to_ascii_lowercase(),
             role: text(&rule.role),
             devices: text(&rule.devices),
             pattern: text(&rule.pattern),
@@ -351,6 +352,12 @@ mod tests {
             ..CheckRule::default()
         };
         assert_eq!(RuleRow::of(&rule).rule(1).map(|r| r.kind), Ok("tag".into()));
+        let row = RuleRow::of(&CheckRule {
+            kind: " MAX-WIRES".into(),
+            ..CheckRule::default()
+        });
+        assert_eq!(row.kind, "max-wires", "the row shows the maximum field");
+        assert!(unset_role(&row).starts_with("terminal"));
     }
 
     #[test]
