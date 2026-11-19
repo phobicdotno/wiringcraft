@@ -1990,6 +1990,57 @@ mod tests {
         0x18, 0x05, 0xA2, 0xDD, 0xFF, 0xD9,
     ];
 
+    /// `codestream` in a JP2 file: signature, file type, a header (image header, grey colour,
+    /// then `extra` boxes) and the codestream box, its length raised by `overrun`.
+    fn jp2(codestream: &[u8], extra: &[u8], overrun: u32) -> Vec<u8> {
+        let boxed = |kind: &[u8], body: &[u8]| {
+            let mut b = (8 + body.len() as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(kind);
+            b.extend_from_slice(body);
+            b
+        };
+        let mut header = boxed(b"ihdr", &[0, 0, 0, 2, 0, 0, 0, 3, 0, 1, 7, 7, 0, 0]);
+        header.extend(boxed(b"colr", &[1, 0, 0, 0, 0, 0, 17]));
+        header.extend_from_slice(extra);
+        let mut out = vec![0, 0, 0, 12, b'j', b'P', b' ', b' ', 0x0D, 0x0A, 0x87, 0x0A];
+        out.extend(boxed(b"ftyp", b"jp2 \0\0\0\0jp2 "));
+        out.extend(boxed(b"jp2h", &header));
+        out.extend_from_slice(&(8 + codestream.len() as u32 + overrun).to_be_bytes());
+        out.extend_from_slice(b"jp2c");
+        out.extend_from_slice(codestream);
+        out
+    }
+
+    #[test]
+    fn jp2_files_with_ambiguous_boxes_are_refused_before_decoding() {
+        use crate::pdf_codecs::jpx;
+        // A plain JP2 file decodes.
+        let plain = jpx(&jp2(&JPX_GREY, &[], 0), Some(1)).map(|p| (p.width, p.height, p.channels, p.samples));
+        assert_eq!(plain, Ok((3, 2, 1, vec![10, 20, 30, 40, 50, 60])));
+        // A codestream box longer than the file (the decoder would read what is there).
+        let over = jpx(&jp2(&JPX_GREY, &[], 100), Some(1));
+        assert!(
+            over.as_ref().is_err_and(|e| e.contains("cut short")),
+            "{:?}",
+            over.err()
+        );
+        // A valid nine-column palette, then an invalid one the decoder skips: the nine count.
+        let mut pclr = vec![0, 0, 0, 38];
+        pclr.extend_from_slice(b"pclr");
+        pclr.extend_from_slice(&[0, 2, 9]);
+        pclr.extend_from_slice(&[7; 9]);
+        pclr.extend_from_slice(&[0; 18]);
+        pclr.extend_from_slice(&[0, 0, 0, 10]);
+        pclr.extend_from_slice(b"pclr");
+        pclr.extend_from_slice(&[0, 0]);
+        let wide = jpx(&jp2(&JPX_GREY, &pclr, 0), Some(1));
+        assert!(
+            wide.as_ref().is_err_and(|e| e.contains("too many channels")),
+            "{:?}",
+            wide.err()
+        );
+    }
+
     #[test]
     fn scanner_pictures_in_fax_jbig2_and_jpeg_2000_are_read() -> Result<()> {
         let full = "q 595 0 0 842 0 0 cm /Im Do Q";
