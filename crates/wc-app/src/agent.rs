@@ -4859,6 +4859,83 @@ mod tests {
     }
 
     #[test]
+    fn a_macros_placeholders_and_value_sets_are_edited_in_the_dialog_and_each_variant_inserted() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut clip = open.copy(1, &[Selection::Symbol(id)]);
+        clip.graphics.push(wc_core::Shape::Text {
+            at: Point::new(20.0, 40.0),
+            text: "{{kW}} kW".into(),
+            height: 2.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        // Saved with an undeclared placeholder, it cannot be inserted yet.
+        let path = open.save_macro(&clip, "Starter", "").unwrap();
+        assert!(open.insert_macro(1, &path, None).is_err());
+
+        a.run(Action::InsertMacro);
+        let Some(Dialog::Macros(list)) = &a.dialog else {
+            unreachable!("the macros are listed");
+        };
+        assert!(list[0].error.is_some(), "the undeclared placeholder is shown");
+        a.edit_macro(&path);
+        let Some(Dialog::MacroEdit { mut form, .. }) = a.dialog.take() else {
+            unreachable!("the placeholders dialog opens");
+        };
+        form.add_placeholder();
+        form.placeholders[0].name = "kW".into();
+        form.placeholders[0].description = "Motor power".into();
+        // A second placeholder of the same name is refused.
+        form.add_placeholder();
+        form.placeholders[1].name = "KW".into();
+        let err = form.save().unwrap_err();
+        assert!(err.contains("declared twice"), "{err}");
+        form.remove_placeholder(1);
+        form.add_set();
+        form.sets[0].name = "Small".into();
+        form.sets[0].values[0] = "0.75".into();
+        form.add_set();
+        form.sets[1].name = "Large".into();
+        // A value for a placeholder without a name is refused.
+        form.add_placeholder();
+        form.sets[1].values[1] = "x".into();
+        let err = form.save().unwrap_err();
+        assert!(err.contains("without a name"), "{err}");
+        form.remove_placeholder(1);
+        form.sets[1].values[0] = "3".into();
+        form.save().unwrap();
+
+        // Renamed in the dialog, the placeholder is renamed in the macro's text.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        assert_eq!(form.sets.len(), 2);
+        assert_eq!(form.sets[1].values, ["3"]);
+        form.placeholders[0].name = "power".into();
+        form.save().unwrap();
+        let m = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(m.used_placeholders(), ["power"]);
+        assert_eq!(m.value_set("small").unwrap().values["power"], "0.75");
+
+        let open = a.open.as_mut().unwrap();
+        let entry = open.macros().into_iter().find(|e| e.path == path).unwrap();
+        assert_eq!(
+            (entry.error, entry.value_sets),
+            (None, vec!["Small".to_owned(), "Large".to_owned()])
+        );
+        for (set, text) in [("Small", "0.75 kW"), ("Large", "3 kW")] {
+            open.insert_macro(1, &path, Some(set)).unwrap();
+            assert!(
+                open.project.pages[1]
+                    .graphics
+                    .iter()
+                    .any(|g| matches!(g, wc_core::Shape::Text { text: t, .. } if t == text)),
+                "{set} is inserted with {text}"
+            );
+        }
+    }
+
+    #[test]
     fn translations_edited_in_the_dialog_are_saved_and_the_pdf_is_exported_in_the_language_chosen() {
         use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
         let hex = |s: &str| {

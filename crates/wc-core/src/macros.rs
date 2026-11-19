@@ -226,6 +226,33 @@ impl Macro {
         Ok(out)
     }
 
+    /// Write `{{new}}` for each `{{old}}` in its texts (names matched without regard to case),
+    /// so a renamed placeholder keeps its uses. The placeholder and value sets are left to
+    /// the caller.
+    pub fn rename_placeholder(&mut self, old: &str, new: &str) {
+        let (old, new) = (key(old), new.trim().to_owned());
+        self.for_each_text_mut(|t| {
+            if !placeholder_names(t).iter().any(|n| key(n) == old) {
+                return;
+            }
+            let mut out = String::with_capacity(t.len());
+            let mut rest = t.as_str();
+            while let Some(start) = rest.find("{{") {
+                let after = &rest[start + 2..];
+                let Some(end) = after.find("}}") else { break };
+                out.push_str(&rest[..start]);
+                if key(&after[..end]) == old {
+                    out.push_str(&format!("{{{{{new}}}}}"));
+                } else {
+                    out.push_str(&rest[start..start + 2 + end + 2]);
+                }
+                rest = &after[end + 2..];
+            }
+            out.push_str(rest);
+            *t = out;
+        });
+    }
+
     fn for_each_text(&self, mut f: impl FnMut(&str)) {
         let mut copy = self.clone();
         copy.for_each_text_mut(|t| f(t));
@@ -586,6 +613,18 @@ mod tests {
         assert_eq!(d.properties["Setting"], "5.5 A");
         let wrong: BTreeMap<String, String> = [("voltage".to_owned(), "400".to_owned())].into_iter().collect();
         assert!(m.apply(Some("3 kW"), &wrong).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_placeholder_keeps_its_uses() -> Result<()> {
+        let mut m = starter()?;
+        m.rename_placeholder(" KW ", "power");
+        assert_eq!(m.used_placeholders(), ["power", "part", "current", "section"]);
+        let d = &m.devices[&DeviceTag::parse("-Q1")?];
+        assert_eq!(d.description, "Motor starter {{power}} kW");
+        // Other placeholders and plain braces are left as written.
+        assert_eq!(d.properties["Setting"], "{{ current }} A");
         Ok(())
     }
 
