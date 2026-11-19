@@ -1069,8 +1069,8 @@ enum SplineShape {
     /// Its knots make no curve: its points are joined straight.
     KnotsNoCurve,
     /// It has no knots, and its fit points were enough for a curve but could not be
-    /// interpolated (a system that cannot be solved, parameters that round to the same value):
-    /// they are joined straight.
+    /// interpolated (a system that cannot be solved, parameters that round to the same value),
+    /// or some were left out as not numbers: they are joined straight.
     FitNotInterpolated,
 }
 
@@ -1120,7 +1120,8 @@ fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, SplineShape) {
     // Whole pairs only, both coordinates finite: a NaN would make the project file unreadable.
     let finite = |(x, y): &(f64, f64)| x.is_finite() && y.is_finite();
     let ctrl: Vec<(f64, f64)> = e.all(10).into_iter().zip(e.all(20)).filter(finite).collect();
-    let fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).filter(finite).collect();
+    let all_fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).collect();
+    let fit: Vec<(f64, f64)> = all_fit.iter().copied().filter(finite).collect();
     let degree = e.f_or(71, 3.0).max(0.0) as usize;
     let knots = e.all(40);
     if let Some(pts) = bspline_points(&ctrl, &knots, &e.all(41), degree) {
@@ -1146,7 +1147,9 @@ fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, SplineShape) {
     }
     let shape = if !(knots.is_empty() || ctrl.is_empty()) {
         SplineShape::KnotsNoCurve
-    } else if fit_makes_curve(&fit, closed, tangents) {
+    } else if fit_makes_curve(&fit, closed, tangents) || (fit.len() >= 2 && fit.len() < all_fit.len()) {
+        // Enough points for a curve that could not be made, or points left out as not numbers
+        // (as a hatch spline edge with such a point is said too).
         SplineShape::FitNotInterpolated
     } else {
         SplineShape::Curve
@@ -2418,9 +2421,11 @@ mod tests {
     #[test]
     fn spline_points_that_are_not_numbers_are_left_out() -> Result<()> {
         let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nNaN\n21\n1\n11\n5\n21\n1e999\n11\n10\n21\n0\n";
-        let (g, _) = drawn(ents, "")?;
+        let (g, skipped) = drawn(ents, "")?;
         let (s, _, _) = poly(&g[0]);
         assert_eq!(s, [Point::new(0.0, 0.0), Point::new(10.0, 0.0)]);
+        // Joined straight because points were left out: said.
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
         Ok(())
     }
 
