@@ -747,6 +747,23 @@ impl Open {
         });
     }
 
+    /// Turn device `item` of panel layout `panel` a quarter clockwise, in one undo step.
+    pub fn rotate_panel_device(&mut self, panel: usize, item: usize) {
+        let is_device = self
+            .project
+            .panels
+            .get(panel)
+            .and_then(|p| p.items.get(item))
+            .is_some_and(|i| matches!(i, wc_core::panel::PanelItem::Device { .. }));
+        if !is_device {
+            return;
+        }
+        self.checkpoint();
+        if let Some(p) = self.project.panels.get_mut(panel) {
+            p.rotate_device(item);
+        }
+    }
+
     /// Mirror the selected symbols left to right, in one undo step.
     pub fn mirror_many(&mut self, page: usize, sel: &[Selection]) {
         self.change_symbols(page, sel, |s| s.mirror = !s.mirror);

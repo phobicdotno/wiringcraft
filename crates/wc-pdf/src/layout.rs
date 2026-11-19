@@ -1529,8 +1529,17 @@ pub fn draw_panel_page(
     pen.colour(0.0, 0.0, 0.0);
     pen.width(0.35);
     for item in &panel.items {
-        if let PanelItem::Device { tag, at, width, height } = item {
-            let (width, height) = (*width, *height);
+        if let PanelItem::Device {
+            tag,
+            at,
+            width: upright_w,
+            height: upright_h,
+            rotation,
+        } = item
+        {
+            // The box on the plate is the turned outline; a footprint drawing is fitted into the
+            // upright part and turned with it.
+            let (width, height) = wc_core::panel::turned_size(*upright_w, *upright_h, *rotation);
             pen.colour(1.0, 1.0, 1.0);
             pen.fill_rect(p(at.x, at.y), p(at.x + width, at.y + height));
             let footprint = project
@@ -1546,7 +1555,7 @@ pub fn draw_panel_page(
                 pen.rect(p(at.x, at.y), p(at.x + width, at.y + height));
                 pen.colour(0.0, 0.0, 0.0);
                 pen.width(0.18);
-                for s in f.placed(*at, width, height) {
+                for s in f.placed_turned(*at, *upright_w, *upright_h, *rotation) {
                     draw_shape(&mut pen, &s.scaled(k).translate(Point::new(ox, oy)));
                 }
                 pen.width(0.35);

@@ -352,6 +352,8 @@ impl chrome::Status for StatusView<'_> {
             Action::Redo => self.open.is_some_and(Open::can_redo),
             Action::Delete if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
             Action::Delete | Action::Copy | Action::Cut | Action::SaveMacro => has && !self.ed.selection.is_empty(),
+            Action::Rotate if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
+            Action::Mirror if self.ed.panel.is_some() => false,
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
             }
@@ -855,6 +857,11 @@ impl App {
             Action::Delete => {
                 let sel = std::mem::take(&mut self.ed.selection);
                 open.delete_many(page, &sel);
+            }
+            Action::Rotate if self.ed.panel.is_some() => {
+                if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick) {
+                    open.rotate_panel_device(pi, item);
+                }
             }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),
             Action::Mirror => open.mirror_many(page, &self.ed.selection),

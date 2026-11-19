@@ -109,6 +109,22 @@ impl Footprint {
         );
         self.shapes.iter().map(|s| s.scaled(k).translate(shift)).collect()
     }
+
+    /// [`Self::placed`] for a device turned on the plate: the drawing fitted into the upright
+    /// `width` x `height` box, then turned with it so the turned outline's top-left corner is at
+    /// `at` (see [`crate::panel::turn_into_place`]).
+    pub fn placed_turned(
+        &self,
+        at: crate::Point,
+        width: f64,
+        height: f64,
+        rotation: crate::geom::Rotation,
+    ) -> Vec<crate::Shape> {
+        self.placed(crate::Point::new(0.0, 0.0), width, height)
+            .iter()
+            .map(|s| crate::panel::turn_into_place(s, at, width, height, rotation))
+            .collect()
+    }
 }
 
 /// Points that span a shape's extents. An arc counts by its end points and the quarter points
