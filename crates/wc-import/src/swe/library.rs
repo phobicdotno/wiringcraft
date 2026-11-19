@@ -178,18 +178,25 @@ impl Table {
 
     /// The one column named `<any prefix>_<field>`; `None` when none or several are.
     fn other_prefix_field(&self, field: &str) -> Option<&str> {
-        let mut found = self.columns.iter().filter(|c| {
-            c.split_once('_')
-                .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(field))
+        self.other_prefix_field_except(field, None)
+    }
+
+    /// Like [`Table::other_prefix_field`], leaving the column `except` out.
+    fn other_prefix_field_except(&self, field: &str, except: Option<&str>) -> Option<&str> {
+        let mut found = self.columns.iter().map(String::as_str).filter(|c| {
+            Some(*c) != except
+                && c.split_once('_')
+                    .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(field))
         });
         let first = found.next()?;
-        found.next().is_none().then_some(first.as_str())
+        found.next().is_none().then_some(first)
     }
 
     /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`. The other prefix
     /// is the one the other table's id column carries, then the other table's own when that
-    /// differs. The table's own id column is never taken for a link: when both tables share a
-    /// prefix, the bare `<other prefix>_id` would be it.
+    /// differs. The table's own id column (`<prefix>_id` or a bare `id`) is never taken for a
+    /// link: when both tables share a prefix, the bare `<other prefix>_id` would be it. A
+    /// column with another prefix stays a candidate, so a bare foreign key is still found.
     fn link(&self, other: &Table) -> Option<&str> {
         let mut prefixes = Vec::new();
         if let Some((p, _)) = other.field(&["id"]).and_then(|c| c.split_once('_')) {
@@ -198,11 +205,12 @@ impl Table {
         if !prefixes.iter().any(|q| q.eq_ignore_ascii_case(&other.prefix)) {
             prefixes.push(other.prefix.as_str());
         }
-        let own_id = self.field(&["id"]);
-        prefixes
+        let own_id = self.own_field("id");
+        let wanted: Vec<String> = prefixes.iter().map(|p| format!("{p}_id")).collect();
+        wanted
             .iter()
-            .filter_map(|p| self.field(&[&format!("{p}_id")]))
-            .find(|c| Some(*c) != own_id)
+            .find_map(|f| self.own_field(f).filter(|c| Some(*c) != own_id))
+            .or_else(|| wanted.iter().find_map(|f| self.other_prefix_field_except(f, own_id)))
     }
 
     /// The column for `fields`, or an error naming what is missing and the columns there are,

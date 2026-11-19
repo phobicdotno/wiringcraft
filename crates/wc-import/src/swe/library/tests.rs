@@ -239,6 +239,37 @@ INSERT INTO tew_catterminal VALUES (1, 1, 'A1');
 }
 
 #[test]
+fn a_bare_foreign_key_or_one_past_the_own_id_is_a_link() {
+    // Terminals whose only `id` column is the link to the element (`ele_id`): it is a link,
+    // not the terminal table's own id.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ele_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2');
+");
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1 A2");
+    assert!(!warnings.iter().any(|w| w.contains("has no")), "{warnings:?}");
+
+    // Elements whose own id is the bare `ref_id`: the link is the one other `*_ref_id` column.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ref_id INTEGER, x_ref_id INTEGER, ref_orderno INTEGER, ref_name TEXT);
+CREATE TABLE tew_catterminal (ter_ref_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1", "{warnings:?}");
+}
+
+#[test]
 fn a_field_two_columns_could_be_is_not_guessed() {
     // Neither `a_reference` nor `b_reference` has the table's prefix `c`: no guess, and the
     // warning lists the columns so the layout can be mapped.
