@@ -3368,6 +3368,7 @@ fn export_pdf_in(open: &Open, langs: &[String]) -> String {
         underlays: pictures.files,
         unreadable: pictures.unreadable,
         panels: project.panels.clone(),
+        footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };
     let (bytes, report) = wc_pdf::export(project, &open.symbols, &options);

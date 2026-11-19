@@ -39,9 +39,20 @@ pub struct Options {
     pub unreadable: BTreeMap<String, String>,
     /// Panel layouts printed after the schematic pages, one sheet each.
     pub panels: Vec<wc_core::panel::Panel>,
+    /// Footprint drawings by part id ([`footprints`]): a device whose part has one is drawn
+    /// with it on panel layouts instead of a plain box.
+    pub footprints: BTreeMap<String, wc_core::Footprint>,
     /// PLC cards drawn after the panel layouts, one card per sheet (more for a long card),
     /// with a terminal per channel and the point drawn there (#437).
     pub plc_cards: Vec<wc_report::PlcCardSheet>,
+}
+
+/// The footprint drawings of `parts` by part id, for [`Options::footprints`].
+pub fn footprints<'a>(parts: impl IntoIterator<Item = &'a wc_core::Part>) -> BTreeMap<String, wc_core::Footprint> {
+    parts
+        .into_iter()
+        .filter_map(|p| p.footprint.clone().map(|f| (p.id.clone(), f)))
+        .collect()
 }
 
 impl Default for Options {
@@ -54,6 +65,7 @@ impl Default for Options {
             underlays: BTreeMap::new(),
             unreadable: BTreeMap::new(),
             panels: Vec::new(),
+            footprints: BTreeMap::new(),
             plc_cards: Vec::new(),
         }
     }
@@ -235,7 +247,8 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     for (k, panel) in options.panels.iter().enumerate() {
         let mut page = wc_core::Page::new(format!("panel-{}", panel.id), format!("P{}", k + 1), panel.name.clone());
         page.size = first_size;
-        let mut drawn = layout::draw_panel_page(project, &page, sheet, total, panel, &options.date);
+        let mut drawn =
+            layout::draw_panel_page(project, &page, sheet, total, panel, &options.footprints, &options.date);
         place_logo(&mut drawn, &page);
         doc.add_page(first_size.mm(), &format!("{} {}", page.number, panel.name), drawn);
         sheet += 1;

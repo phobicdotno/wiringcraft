@@ -2,7 +2,7 @@
 //! devices placed on them, in millimetres with y pointing down from the plate's top-left corner.
 //!
 //! Each layout is a file `panels/<id>.panel.json`. Device footprints come from the part's
-//! `Width` and `Height` properties; [`arrange`] puts devices that are not on the plate yet onto
+//! `Width` and `Height` properties, or the extents of its footprint drawing; [`arrange`] puts devices that are not on the plate yet onto
 //! the rails, left to right and top to bottom.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -109,7 +109,10 @@ impl Panel {
     }
 }
 
-/// A part's footprint (width, height) in millimetres from its properties, if it has one.
+/// A part's footprint (width, height) in millimetres, if it has one. Each dimension comes from
+/// the part's `Width` or `Height` property, else from the extents of its footprint drawing
+/// ([`crate::part::Footprint`]); a part with one property and a drawing takes the other
+/// dimension from the drawing.
 pub fn part_size(part: &Part) -> Option<(f64, f64)> {
     let find = |keys: &[&str]| {
         part.properties
@@ -118,9 +121,14 @@ pub fn part_size(part: &Part) -> Option<(f64, f64)> {
             .and_then(|(_, v)| leading_number(v))
             .filter(|v| *v > 0.0 && *v <= 5000.0)
     };
-    let w = find(&["width", "width mm", "breite", "bredde"])?;
-    let h = find(&["height", "height mm", "höhe", "hoehe", "høyde", "hoyde"])?;
-    Some((w, h))
+    let w = find(&["width", "width mm", "breite", "bredde"]);
+    let h = find(&["height", "height mm", "höhe", "hoehe", "høyde", "hoyde"]);
+    // Each dimension: the part's own property first, else the footprint drawing's extent.
+    let drawn = part
+        .footprint
+        .as_ref()
+        .filter(|f| f.width > 0.0 && f.height > 0.0 && f.width <= 5000.0 && f.height <= 5000.0);
+    Some((w.or(drawn.map(|f| f.width))?, h.or(drawn.map(|f| f.height))?))
 }
 
 /// Whether a part goes in the cabinet door (push buttons, pilot lights, meters) rather than
@@ -345,6 +353,107 @@ mod tests {
         let done = arrange(&mut small, &project, &parts, None);
         assert_eq!(done.placed, vec!["+CAB1-K1"]);
         assert_eq!(done.did_not_fit.len(), 3);
+    }
+
+    #[test]
+    fn a_part_without_a_size_takes_its_footprint_extents() {
+        use crate::part::Footprint;
+        let outline = |w: f64, h: f64| crate::Shape::Rect {
+            min: Point::new(100.0, 50.0),
+            max: Point::new(100.0 + w, 50.0 + h),
+        };
+        let Some(f) = Footprint::from_shapes(vec![outline(22.5, 100.0)]) else {
+            unreachable!("a 22.5 x 100 outline is a footprint")
+        };
+        assert_eq!((f.width, f.height), (22.5, 100.0));
+        assert_eq!(
+            f.shapes[0],
+            outline(22.5, 100.0).translate(Point::new(-100.0, -50.0)),
+            "moved to the origin"
+        );
+        let mut p = Part {
+            footprint: Some(f.clone()),
+            ..Part::default()
+        };
+        assert_eq!(part_size(&p), Some((22.5, 100.0)));
+        p.properties.insert("Width".into(), "45".into());
+        p.properties.insert("Height".into(), "90".into());
+        assert_eq!(part_size(&p), Some((45.0, 90.0)), "the part's own size wins");
+        p.properties.remove("Height");
+        assert_eq!(
+            part_size(&p),
+            Some((45.0, 100.0)),
+            "a missing height comes from the drawing"
+        );
+        p.footprint = None;
+        assert_eq!(part_size(&p), None, "one dimension alone is no size");
+        // A quarter arc spans its radius, not its whole circle.
+        let Some(arc) = Footprint::from_shapes(vec![crate::Shape::Arc {
+            center: Point::new(50.0, 50.0),
+            radius: 10.0,
+            start: 0.0,
+            end: 90.0,
+        }]) else {
+            unreachable!("a quarter arc has a size")
+        };
+        assert!(
+            (arc.width - 10.0).abs() < 1e-9 && (arc.height - 10.0).abs() < 1e-9,
+            "{arc:?}"
+        );
+        let Some(circle) = Footprint::from_shapes(vec![crate::Shape::Circle {
+            center: Point::new(5.0, 5.0),
+            radius: 5.0,
+            filled: false,
+        }]) else {
+            unreachable!("a circle has a size")
+        };
+        assert_eq!((circle.width, circle.height), (10.0, 10.0));
+        // An arc across a quarter point reaches it.
+        let Some(over) = Footprint::from_shapes(vec![crate::Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            start: 315.0,
+            end: 45.0,
+        }]) else {
+            unreachable!()
+        };
+        assert!(
+            (over.height - 2.0 * 10.0 * 45f64.to_radians().sin()).abs() < 1e-9,
+            "{over:?}"
+        );
+        assert!(
+            (over.width - 10.0 * (1.0 - 45f64.to_radians().cos())).abs() < 1e-9,
+            "{over:?}"
+        );
+        // Angles far out of range (an imported ARC with 50=0, 51=-1e21) do not overflow.
+        let far = Footprint::from_shapes(vec![crate::Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            start: 1e21,
+            end: -0.0,
+        }]);
+        assert!(far.is_some_and(|f| f.width <= 20.0 && f.height <= 20.0));
+        // In a box of the drawing's size it is drawn as is; in a smaller box it shrinks evenly
+        // and is centred; in a larger one it keeps its size and is centred.
+        let at = Point::new(10.0, 20.0);
+        assert_eq!(
+            f.placed(at, 22.5, 100.0),
+            vec![outline(22.5, 100.0).translate(Point::new(-90.0, -30.0))]
+        );
+        let crate::Shape::Rect { min, max } = &f.placed(at, 22.5, 50.0)[0] else {
+            unreachable!()
+        };
+        assert!((max.y - min.y - 50.0).abs() < 1e-9 && (max.x - min.x - 11.25).abs() < 1e-9);
+        assert!((min.x - (10.0 + 5.625)).abs() < 1e-9 && (min.y - 20.0).abs() < 1e-9);
+        let crate::Shape::Rect { min, .. } = &f.placed(at, 45.0, 100.0)[0] else {
+            unreachable!()
+        };
+        assert!((min.x - (10.0 + 11.25)).abs() < 1e-9);
+        assert!(Footprint::from_shapes(Vec::new()).is_none());
+        assert!(
+            Footprint::from_shapes(vec![outline(0.0, 10.0)]).is_none(),
+            "a flat drawing has no size"
+        );
     }
 
     #[test]

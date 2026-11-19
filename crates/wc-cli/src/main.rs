@@ -640,6 +640,20 @@ enum ImportCmd {
         #[arg(long, default_value = "")]
         letter_code: String,
     },
+    /// A maker's outline drawing (DXF, the front view, in mm at 1:1) as a part's footprint on
+    /// cabinet layouts: stored in the library with the part, and drawn on layout pages instead
+    /// of a box. A part without `Width` and `Height` takes its size from the drawing. When the
+    /// project uses the part, its copy in the project is updated too.
+    FootprintDxf {
+        file: PathBuf,
+        /// The part's library id.
+        #[arg(long)]
+        part: String,
+        /// The library folder that holds the part (default: the project's library source that
+        /// has it).
+        #[arg(long)]
+        lib: Option<PathBuf>,
+    },
     /// A symbol from an SVG drawing. Pins: elements with `id="pin:NAME"` or `data-pin="NAME"`.
     SymbolSvg {
         file: PathBuf,
@@ -1924,6 +1938,7 @@ fn run(cli: Cli) -> Res<()> {
                     underlays: pictures.files,
                     unreadable: pictures.unreadable,
                     panels: p.panels.clone(),
+                    footprints: wc_pdf::footprints(vendored_parts(dir, &p).values()),
                     plc_cards,
                 },
             );
@@ -2327,6 +2342,194 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 s.pins.len(),
                 s.graphics.len()
             );
+        }
+        ImportCmd::FootprintDxf { file, part, lib } => {
+            let text = std::fs::read(&file).map_err(e)?;
+            let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text)).map_err(e)?;
+            for w in &warnings {
+                eprintln!("warning: {}", escape_field(w));
+            }
+            // A library folder can be given outside a project; without one the project is needed.
+            let mut project = load(dir);
+            if lib.is_some()
+                && dir.join(store::PROJECT_FILE).exists()
+                && let Err(err) = &project
+            {
+                eprintln!(
+                    "warning: the project could not be read, so its copy of {part} is not updated: {}",
+                    escape_field(err)
+                );
+            }
+            let path = match &lib {
+                Some(root) => {
+                    store::check_id(&part).map_err(e)?;
+                    root.join("parts").join(format!("{part}.json"))
+                }
+                None => {
+                    let p = project.as_ref().map_err(Clone::clone)?;
+                    let library = wc_library::Library::open(dir, p).map_err(e)?;
+                    library
+                        .locate(ItemKind::Part, &part)
+                        .ok_or_else(|| {
+                            format!("no part {part:?} in the project's libraries; name its folder with --lib")
+                        })?
+                        .path
+                }
+            };
+            let mut item: wc_core::Part =
+                store::read_json(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+            if item.id != part {
+                return Err(format!("{} holds part {:?}, not {part:?}", path.display(), item.id));
+            }
+            let (w, h) = (footprint.width, footprint.height);
+            let shapes = footprint.shapes.len();
+            item.footprint = Some(footprint);
+            store::write_if_changed(&path, &store::to_json(&item).map_err(e)?).map_err(e)?;
+            println!(
+                "wrote the footprint of {part} to {} ({} x {} mm, {shapes} shapes)",
+                path.display(),
+                wc_core::geom::format_length(w),
+                wc_core::geom::format_length(h)
+            );
+            // The project's pinned copy follows, so its layouts draw the new footprint, but only
+            // from the file just written: when another of the project's sources wins for this
+            // id, that source's part is not the one that changed.
+            if let Ok(p) = &mut project
+                && p.lock.parts.contains_key(&part)
+            {
+                let library = wc_library::Library::open(dir, p).map_err(e)?;
+                let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+                let winner = library.locate(ItemKind::Part, &part);
+                // A copy changed in the project since it was pinned is not overwritten: those
+                // edits must be removed or merged first.
+                // A copy that is there but cannot be read is not overwritten either.
+                let vendored = store::vendor_path(dir, ItemKind::Part, &part).map_err(e)?;
+                let kept: Option<String> = if vendored.exists() {
+                    match store::read_vendored_part(dir, &part) {
+                        Ok(copy) if p.lock.parts.get(&part).is_some_and(|pin| pin.hash != copy.hash()) => {
+                            Some(format!(
+                                "it has local changes since it was pinned; remove or merge them, then take {part} again"
+                            ))
+                        }
+                        Ok(_) => None,
+                        Err(err) => Some(format!(
+                            "it cannot be read ({err}); fix or remove it, then take {part} again"
+                        )),
+                    }
+                } else {
+                    None
+                };
+                // Read first, so a failed refresh puts the copy back as it was: the lock on disk
+                // is only saved after a refresh that worked, and must keep matching the copy. A
+                // copy whose bytes cannot be read is refused, never replaced or removed.
+                // A link that points nowhere is there, not missing, and is refused like the rest.
+                let before: Result<Option<Vec<u8>>, String> = match std::fs::read(&vendored) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::NotFound
+                            && std::fs::symlink_metadata(&vendored).is_err() =>
+                    {
+                        Ok(None)
+                    }
+                    Err(err) => Err(err.to_string()),
+                };
+                // The lock too, before `take`: if saving the new pin fails, it goes back to these
+                // bytes. A lock that exists but cannot be read is never removed or replaced.
+                let lock_path = dir.join(store::LOCK_FILE);
+                let lock_before: Result<Option<Vec<u8>>, String> = match std::fs::read(&lock_path) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                };
+                let refused = kept
+                    .or_else(|| {
+                        before
+                            .as_ref()
+                            .err()
+                            .map(|err| format!("it cannot be read ({err}); fix or remove it, then take {part} again"))
+                    })
+                    .or_else(|| {
+                        lock_before.as_ref().err().map(|err| {
+                            format!(
+                                "{} cannot be read ({err}); fix it, then take {part} again",
+                                store::LOCK_FILE
+                            )
+                        })
+                    });
+                // Whether `take` ran, so only its own writes are undone.
+                let mut tried = false;
+                let refreshed = match (&refused, &winner) {
+                    (Some(why), _) => Err(why.clone()),
+                    (None, Some(loc)) if same(&loc.path, &path) => {
+                        tried = true;
+                        wc_library::take(dir, p, &library, ItemKind::Part, &part)
+                            .map_err(|err| err.to_string())
+                            .and_then(|_| {
+                                let copy = store::read_vendored_part(dir, &part).map_err(|err| err.to_string())?;
+                                if copy.footprint == item.footprint {
+                                    Ok(())
+                                } else {
+                                    Err("the copy taken has another footprint".to_owned())
+                                }
+                            })
+                    }
+                    (None, Some(loc)) => Err(format!(
+                        "the project takes {part} from source {:?} ({}), not from the file written",
+                        loc.source,
+                        loc.path.display()
+                    )),
+                    (None, None) => Err(format!("{part} is in none of the project's library sources")),
+                };
+                match refreshed {
+                    Ok(()) => {
+                        // The new pin must reach the disk with the copy, or both go back: `save`
+                        // can fail after it wrote the lock.
+                        if let Err(err) = save(dir, p) {
+                            // Both are tried, and every failure is named.
+                            let copy_back = match &before {
+                                Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
+                                Err(_) => Ok(()),
+                            };
+                            let lock_back = match &lock_before {
+                                Ok(bytes) => put_file_back(&lock_path, bytes.as_deref()),
+                                Err(_) => Ok(()),
+                            };
+                            let back = match (copy_back, lock_back) {
+                                (Ok(()), Ok(())) => Ok(()),
+                                (Err(a), Ok(())) => Err(a),
+                                (Ok(()), Err(b)) => Err(b),
+                                (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+                            };
+                            return Err(match back {
+                                Ok(()) => format!("the project's copy of {part} was not updated: {err}"),
+                                Err(why) => format!(
+                                    "the project's copy of {part} was not updated ({err}) and could not be put back: {why}; run `lib status`"
+                                ),
+                            });
+                        }
+                        println!("updated the project's copy of {part}");
+                    }
+                    Err(why) => {
+                        let restored = match &before {
+                            _ if !tried => Ok(()),
+                            Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
+                            Err(_) => Ok(()),
+                        };
+                        eprintln!(
+                            "warning: the project's copy of {part} was not updated: {}",
+                            escape_field(&why)
+                        );
+                        if let Err(err) = restored {
+                            return Err(format!(
+                                "the project's copy of {part} could not be put back: {err}; run `lib status`"
+                            ));
+                        }
+                    }
+                }
+            }
         }
         ImportCmd::SymbolSvg {
             file,
@@ -3282,8 +3485,23 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
     Ok(())
 }
 
+/// Stack for the thread the command is parsed and run on. Argument parsing and the command
+/// dispatch keep large frames in debug builds, and Windows gives the main thread only 1 MiB,
+/// which overflowed there once one more import command was added (#312).
+const STACK: usize = 16 * 1024 * 1024;
+
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    // Parsing runs there too: clap's derived parser builds every subcommand on the stack.
+    let worker = std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| run(Cli::parse()));
+    let result = match worker {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| Err("the command stopped unexpectedly".into())),
+        Err(err) => Err(format!("could not start the command: {err}")),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -4594,6 +4812,247 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_maker_dxf_becomes_the_footprint_of_a_library_part_and_sizes_it_on_the_plate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let lib = tmp.path().join("lib");
+        let part = wc_core::Part {
+            id: "maker.io-8".into(),
+            manufacturer: "Maker".into(),
+            order_number: "IO-8".into(),
+            ..wc_core::Part::default()
+        };
+        wc_library::write_part(&lib, &part).unwrap();
+        cli(&dir, &["lib", "add", "shop", "folder", lib.to_str().unwrap()]).unwrap();
+        cli(&dir, &["device", "--part", "maker.io-8", "--", "+CAB1-A1"]).unwrap();
+        cli(&dir, &["lib", "lock"]).unwrap();
+        let before = load(&dir).unwrap().lock.parts["maker.io-8"].hash.clone();
+
+        // A 22.5 x 100 mm outline drawn away from the origin.
+        let dxf = tmp.path().join("io-8.dxf");
+        std::fs::write(
+            &dxf,
+            "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\n0\n90\n4\n70\n1\n\
+             10\n200\n20\n50\n10\n222.5\n20\n50\n10\n222.5\n20\n150\n10\n200\n20\n150\n\
+             0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+        let file = dxf.to_str().unwrap();
+        assert!(cli(&dir, &["import", "footprint-dxf", file, "--part", "no.such"]).is_err());
+        cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+        let in_lib: wc_core::Part = store::read_json(&lib.join("parts").join("maker.io-8.json")).unwrap();
+        let Some(f) = in_lib.footprint.as_ref() else {
+            unreachable!("stored in the library with the part")
+        };
+        assert_eq!((f.width, f.height), (22.5, 100.0));
+        // The project's pinned copy follows.
+        let p = load(&dir).unwrap();
+        assert_ne!(p.lock.parts["maker.io-8"].hash, before);
+        assert_eq!(store::read_vendored_part(&dir, "maker.io-8").unwrap(), in_lib);
+
+        // The part has no Width/Height: arranging the plate sizes the device from the drawing.
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        cli(&dir, &["panel", "arrange", "main"]).unwrap();
+        let p = load(&dir).unwrap();
+        let sizes: Vec<(f64, f64)> = p.panels[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                wc_core::panel::PanelItem::Device { width, height, .. } => Some((*width, *height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, [(22.5, 100.0)]);
+
+        // A folder that is not the source the project takes the part from leaves the pinned copy
+        // alone (the winning source's part did not change).
+        let other_lib = tmp.path().join("lib2");
+        wc_library::write_part(&other_lib, &part).unwrap();
+        let pinned = load(&dir).unwrap().lock.parts["maker.io-8"].hash.clone();
+        let other_arg = other_lib.to_str().unwrap();
+        cli(
+            &dir,
+            &[
+                "import",
+                "footprint-dxf",
+                file,
+                "--part",
+                "maker.io-8",
+                "--lib",
+                other_arg,
+            ],
+        )
+        .unwrap();
+        assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+
+        // When the new pin cannot be saved, the copy goes back as it was, so copy and pin agree.
+        let wider = tmp.path().join("io-8-wide.dxf");
+        std::fs::write(
+            &wider,
+            "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\n0\n90\n4\n70\n1\n\
+             10\n0\n20\n0\n10\n45\n20\n0\n10\n45\n20\n100\n10\n0\n20\n100\n\
+             0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+        let copy_before = std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap()).unwrap();
+        let blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&blocker).unwrap();
+        let wide = wider.to_str().unwrap();
+        assert!(cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(
+            std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap()).unwrap(),
+            copy_before
+        );
+        assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+        // The same when `save` fails after it wrote the lock: a panel file that has to be
+        // rewritten cannot be, and both the lock and the copy go back to their bytes.
+        let panel_file = dir.join("panels").join("main.panel.json");
+        let panel_text = std::fs::read_to_string(&panel_file).unwrap();
+        std::fs::write(&panel_file, format!("{panel_text}\n\n")).unwrap();
+        let panel_tmp = dir.join("panels").join("main.panel.json.tmp");
+        std::fs::create_dir(&panel_tmp).unwrap();
+        let lock_bytes = std::fs::read(dir.join(store::LOCK_FILE)).unwrap();
+        let err = cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).unwrap_err();
+        std::fs::remove_dir(&panel_tmp).unwrap();
+        assert!(err.contains("main.panel.json"), "{err}");
+        assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).unwrap(), lock_bytes);
+        assert_eq!(
+            std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap()).unwrap(),
+            copy_before
+        );
+        // When neither can be put back (every staging name is taken), the error names both.
+        let copy_file = store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap();
+        let lock_file = dir.join(store::LOCK_FILE);
+        let staged = |f: &Path| -> Vec<PathBuf> {
+            (0..100)
+                .map(|n| {
+                    let mut name = f.as_os_str().to_owned();
+                    name.push(format!(".restore-{}-{n}", std::process::id()));
+                    PathBuf::from(name)
+                })
+                .collect()
+        };
+        let taken: Vec<PathBuf> = staged(&copy_file).into_iter().chain(staged(&lock_file)).collect();
+        for t in &taken {
+            std::fs::write(t, "").unwrap();
+        }
+        std::fs::create_dir(&panel_tmp).unwrap();
+        let err = cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).unwrap_err();
+        std::fs::remove_dir(&panel_tmp).unwrap();
+        for t in &taken {
+            std::fs::remove_file(t).unwrap();
+        }
+        assert!(err.contains("could not be put back"), "{err}");
+        assert!(err.contains(&copy_file.display().to_string()), "{err}");
+        assert!(err.contains(&lock_file.display().to_string()), "{err}");
+        std::fs::write(&copy_file, &copy_before).unwrap();
+        std::fs::write(&lock_file, &lock_bytes).unwrap();
+        std::fs::write(&panel_file, &panel_text).unwrap();
+        // And when `take` itself fails (its staged write is blocked): the import still
+        // succeeds with a warning, and the copy and its pin are as they were.
+        let copy_file = store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap();
+        let copy_tmp = copy_file.with_file_name(format!(
+            "{}.tmp",
+            copy_file.file_name().and_then(|n| n.to_str()).unwrap_or_default()
+        ));
+        std::fs::create_dir(&copy_tmp).unwrap();
+        cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).unwrap();
+        std::fs::remove_dir(&copy_tmp).unwrap();
+        assert_eq!(std::fs::read(&copy_file).unwrap(), copy_before);
+        assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+
+        // A pinned copy changed in the project is not overwritten by a new footprint.
+        let mut edited = store::read_vendored_part(&dir, "maker.io-8").unwrap();
+        edited.description = "changed in the project".into();
+        store::write_vendored_part(&dir, &edited).unwrap();
+        cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+        assert_eq!(store::read_vendored_part(&dir, "maker.io-8").unwrap(), edited);
+        assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+        // Nor is a copy that cannot be read.
+        let copy_path = store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap();
+        std::fs::write(&copy_path, "{ broken").unwrap();
+        cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&copy_path).unwrap(), "{ broken");
+        // Nor one whose bytes cannot be read at all (here a folder in its place).
+        std::fs::remove_file(&copy_path).unwrap();
+        std::fs::create_dir(&copy_path).unwrap();
+        cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+        assert!(copy_path.is_dir(), "left as it was");
+        std::fs::remove_dir(&copy_path).unwrap();
+        // Nor a link that points nowhere: it stays a link, and the pin is kept.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.path().join("gone.json"), &copy_path).unwrap();
+            cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+            assert!(std::fs::symlink_metadata(&copy_path).unwrap().file_type().is_symlink());
+            assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+            std::fs::remove_file(&copy_path).unwrap();
+        }
+        store::write_vendored_part(&dir, &edited).unwrap();
+        // An unreadable project does not stop an import into a named library folder.
+        let broken = tmp.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join(store::PROJECT_FILE), "not = [valid").unwrap();
+        let lib_dir = lib.to_str().unwrap();
+        cli(
+            &broken,
+            &[
+                "import",
+                "footprint-dxf",
+                file,
+                "--part",
+                "maker.io-8",
+                "--lib",
+                lib_dir,
+            ],
+        )
+        .unwrap();
+
+        // A library folder can be named outside a project; a file holding another part is refused.
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        let lib_arg = lib.to_str().unwrap();
+        cli(
+            &outside,
+            &[
+                "import",
+                "footprint-dxf",
+                file,
+                "--part",
+                "maker.io-8",
+                "--lib",
+                lib_arg,
+            ],
+        )
+        .unwrap();
+        let other = wc_core::Part {
+            id: "maker.other".into(),
+            ..wc_core::Part::default()
+        };
+        std::fs::write(
+            lib.join("parts").join("maker.wrong.json"),
+            store::to_json(&other).unwrap(),
+        )
+        .unwrap();
+        let err = cli(
+            &outside,
+            &[
+                "import",
+                "footprint-dxf",
+                file,
+                "--part",
+                "maker.wrong",
+                "--lib",
+                lib_arg,
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("holds part"), "{err}");
     }
 
     #[test]

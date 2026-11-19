@@ -317,6 +317,58 @@ impl Shape {
     pub fn translate(&self, d: Point) -> Shape {
         self.placed(d, Rotation::R0, false)
     }
+
+    /// Scaled by `k` about (0, 0); radii, text heights and dimension offsets scale too.
+    pub fn scaled(&self, k: f64) -> Shape {
+        let p = |p: &Point| Point::new(p.x * k, p.y * k);
+        match self {
+            Shape::Line { a, b } => Shape::Line { a: p(a), b: p(b) },
+            Shape::Polyline { points, closed, filled } => Shape::Polyline {
+                points: points.iter().map(p).collect(),
+                closed: *closed,
+                filled: *filled,
+            },
+            Shape::Rect { min, max } => Shape::Rect {
+                min: p(min),
+                max: p(max),
+            },
+            Shape::Circle { center, radius, filled } => Shape::Circle {
+                center: p(center),
+                radius: radius * k,
+                filled: *filled,
+            },
+            Shape::Arc {
+                center,
+                radius,
+                start,
+                end,
+            } => Shape::Arc {
+                center: p(center),
+                radius: radius * k,
+                start: *start,
+                end: *end,
+            },
+            Shape::Text {
+                at,
+                text,
+                height,
+                align,
+                angle,
+            } => Shape::Text {
+                at: p(at),
+                text: text.clone(),
+                height: height * k,
+                align: *align,
+                angle: *angle,
+            },
+            Shape::Dimension { a, b, offset, height } => Shape::Dimension {
+                a: p(a),
+                b: p(b),
+                offset: offset * k,
+                height: height * k,
+            },
+        }
+    }
 }
 
 /// Gap between a measured point and its extension line, in mm.

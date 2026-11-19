@@ -195,6 +195,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes | done |
 | Place devices onto rails from the schematic | add-on | yes | yes | done |
+| Maker outline drawings as device footprints | yes (2D macros of the part) | yes (2D footprint) | partly: `import footprint-dxf` stores a maker DXF with the part; layout pages in the app and the PDF draw it at real size (shrunk to fit a smaller device box), and a part without a `Width` or `Height` takes it from the drawing. Not yet: attaching it from the app (#484), turning it with a rotated device (#485) | partly (#312) |
 | 3D model export (STEP) | add-on | yes | yes | done |
 | 3D cabinet design with wire routing | add-on (Pro Panel) | yes (Electrical 3D) | no | later: one-way export to SolidCraft (phase 5) |
 | Drilling and NC data for plates | add-on | partly | no | not planned for now: belongs to the 3D side (SolidCraft) |
