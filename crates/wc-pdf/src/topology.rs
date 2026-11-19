@@ -188,12 +188,30 @@ fn top() -> f64 {
     MARGIN + layout::HEADER + 18.0
 }
 
+/// The room over a box its same-device loops take beyond the first: one line each.
+fn loop_room(topo: &Topology) -> f64 {
+    let most = (0..topo.boxes.len())
+        .map(|b| topo.own.iter().filter(|o| o.0 == b).count())
+        .max()
+        .unwrap_or(0);
+    most.saturating_sub(1) as f64 * LINE
+}
+
+/// The `nth` same-device loop over a box at `(bx, by)` `box_w` wide, and where its label goes:
+/// each one wider and higher than the one before, so they nest without touching.
+pub fn own_path(bx: f64, by: f64, box_w: f64, nth: usize) -> ([(f64, f64); 4], (f64, f64)) {
+    let spread = 1.5 * nth as f64;
+    let (l, r) = (bx + box_w * 0.3 - spread, bx + box_w * 0.7 + spread);
+    let y = by - 3.0 - LINE * nth as f64;
+    ([(l, by), (l, y), (r, y), (r, by)], ((l + r) / 2.0, y - 0.8))
+}
+
 /// The space `topo` needs on a sheet, in millimetres, with a title block `band` high.
 fn needed(topo: &Topology, band: f64) -> (f64, f64) {
     let (cols, rows) = extent(topo);
     let w = 2.0 * (MARGIN + 10.0) + cols as f64 * (MIN_BOX_W + GAP_X);
     let lanes = (topo.under.len() + 1) as f64 * LANE;
-    let h = top() + rows as f64 * (BOX_H + GAP_Y) + lanes + 6.0 + band + MARGIN;
+    let h = top() + rows as f64 * (BOX_H + GAP_Y + loop_room(topo)) + lanes + 6.0 + band + MARGIN;
     (w, h)
 }
 
@@ -229,11 +247,13 @@ pub fn sheet(wanted: PageSize, band: f64, net: &Network) -> (PageSize, Option<St
 pub fn grid(topo: &Topology, w: f64, h: f64, band: f64) -> Grid {
     let (cols, rows) = extent(topo);
     let (x0, x1) = (MARGIN + 10.0, w - MARGIN - 10.0);
-    let (y0, y1) = (top(), h - MARGIN - band - 6.0);
+    let extra = loop_room(topo);
+    let (y0, y1) = (top() + extra, h - MARGIN - band - 6.0);
     let lanes = (topo.under.len() + 1) as f64 * LANE;
     let step_x = ((x1 - x0) / cols as f64).clamp(MIN_BOX_W + GAP_X, 70.0);
     let box_w = (step_x - GAP_X).clamp(MIN_BOX_W, 48.0);
-    let step_y = ((y1 - y0 - lanes) / rows as f64).clamp(BOX_H + GAP_Y, BOX_H + 16.0);
+    let low = BOX_H + GAP_Y + extra;
+    let step_y = ((y1 - y0 - lanes) / rows as f64).clamp(low, low + 8.0);
     Grid {
         x0,
         y0,
@@ -404,14 +424,16 @@ pub fn draw_network_page(
             pen.text(((lx + rx) / 2.0, ly - 0.8), TEXT, 1, &cable);
         }
     }
-    for &(a, k) in &topo.own {
+    for (n, &(a, k)) in topo.own.iter().enumerate() {
         let (Some((bx, by)), Some((from_port, to_port, cable))) = (at(a), ends(a, k)) else {
             continue;
         };
-        let (l, r) = (bx + g.box_w * 0.3, bx + g.box_w * 0.7);
-        pen.polyline(&[(l, by), (l, by - 3.0), (r, by - 3.0), (r, by)], false);
+        // Loops over the same box nest, one above the other.
+        let nth = topo.own.iter().take(n).filter(|o| o.0 == a).count();
+        let (path, label_at) = own_path(bx, by, g.box_w, nth);
+        pen.polyline(&path, false);
         let label = format!("{from_port} - {to_port} {cable}");
-        pen.text(((l + r) / 2.0, by - 3.8), TEXT, 1, label.trim());
+        pen.text(label_at, TEXT, 1, label.trim());
     }
     if topo.boxes.is_empty() {
         pen.colour(0.45, 0.45, 0.45);
@@ -591,5 +613,26 @@ mod tests {
         let t = layout_network(&net);
         assert_eq!(t.own, [(0, 0)]);
         assert!(t.tree.is_empty() && t.under.is_empty());
+
+        // Two loops on one box nest apart, each label over its own loop and under the next.
+        let two = Network {
+            links: vec![link("-K10:P1", "-K10:P2"), link("-K10:P3", "-K10:P4")],
+            ..Network::default()
+        };
+        let (_, g, t) = fits_its_sheet(&two);
+        assert_eq!(t.own, [(0, 0), (0, 1)]);
+        let (bx, by) = g.spot(0, 0);
+        let (inner, inner_label) = own_path(bx, by, g.box_w, 0);
+        let (outer, outer_label) = own_path(bx, by, g.box_w, 1);
+        assert!(
+            outer[0].0 < inner[0].0 && outer[3].0 > inner[3].0,
+            "the outer loop is wider"
+        );
+        assert!(
+            outer[1].1 + TEXT < inner_label.1,
+            "the inner label is under the outer loop"
+        );
+        assert!(inner_label.1 < inner[1].1 && outer_label.1 < outer[1].1);
+        assert!(outer_label.1 - TEXT > MARGIN + layout::HEADER + 10.0, "below the title");
     }
 }

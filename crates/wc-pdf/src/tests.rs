@@ -1737,12 +1737,20 @@ fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about
             device: "K 10?".into(),
             ..Node::default()
         }],
-        links: vec![NetLink {
-            from: "-K10:P1".into(),
-            to: "-K10:P2".into(),
-            cable: "-W9".into(),
-            ..NetLink::default()
-        }],
+        links: vec![
+            NetLink {
+                from: "-K10:P1".into(),
+                to: "-K10:P2".into(),
+                cable: "-W9".into(),
+                ..NetLink::default()
+            },
+            NetLink {
+                from: "-K10:P3".into(),
+                to: "-K10:P4".into(),
+                cable: "-W8".into(),
+                ..NetLink::default()
+            },
+        ],
         ..Network::default()
     };
     let opts = Options {
@@ -1752,6 +1760,7 @@ fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about
     let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
     let text = String::from_utf8_lossy(&pdf);
     assert!(text.contains(&writer::pdf_text("P1 - P2 -W9")));
+    assert!(text.contains(&writer::pdf_text("P3 - P4 -W8")));
     // Drawn as written, and why it is not a tag is a warning.
     assert!(text.contains(&writer::pdf_text("K 10?")));
     assert!(
