@@ -269,12 +269,12 @@ const UNDO_STEPS: usize = 200;
 pub fn held_change_in(project: &Project, held_by_others: &BTreeMap<String, String>, before: &[Page]) -> Option<String> {
     before.iter().find_map(|old| {
         let who = held_by_others.get(&old.id).map_or("Someone", String::as_str);
-        match project.pages.iter().position(|p| p.id == old.id) {
+        match project.pages.iter().find(|p| p.id == old.id) {
             None => Some(format!(
                 "it would remove page {}, which {who} has open; it is read-only here until they leave it.",
                 old.number
             )),
-            Some(i) if project.pages[i] != *old => Some(format!(
+            Some(page) if page != old => Some(format!(
                 "it would change page {}, which {who} has open; it is read-only here until they leave it.",
                 old.number
             )),

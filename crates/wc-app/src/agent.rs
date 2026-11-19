@@ -9,7 +9,7 @@
 //! `run_command` runs any `wiringcraft` command-line command (imports, PLC variable lists,
 //! STEP export, library sources, merges, ...) on the open project.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -108,29 +108,172 @@ pub struct Assistant {
 }
 
 /// A copy of a project folder (without its `.git`) that a command runs on, removed when
-/// dropped.
+/// dropped. It sits next to the project folder when it can, so relative library locations
+/// (`../library`) find the same folders from the copy.
 struct Staging {
     dir: PathBuf,
     held: Vec<Page>,
+    /// Each copied file (path inside the folder) and a digest of what it held when copied: the
+    /// command's changes are the files that differ from it.
+    baseline: Files,
 }
+
+/// Files of a folder by path inside it, with a digest of their bytes.
+type Files = BTreeMap<PathBuf, (u64, u64)>;
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            crate::applog::warn(&format!(
+                "Could not remove the command's copy {}: {e}",
+                self.dir.display()
+            ));
+        }
     }
 }
 
 impl Staging {
-    /// Copy `project` into a new folder of its own.
+    /// Copy `project` into a new folder of its own, made for this copy only (readable by
+    /// this user only).
     fn of(project: &Path, held: Vec<Page>) -> Result<Self, String> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("wiringcraft-command-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let me = Self { dir, held };
+        let places = [project.parent().map(Path::to_path_buf), Some(std::env::temp_dir())];
+        let mut last = None;
+        let mut made = None;
+        'places: for place in places.into_iter().flatten() {
+            for _ in 0..100 {
+                let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let dir = place.join(format!(".wiringcraft-command-{}-{n}", std::process::id()));
+                let mut b = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+                match b.create(&dir) {
+                    Ok(()) => {
+                        made = Some(dir);
+                        break 'places;
+                    }
+                    // Never anything already there: it is not ours.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => {
+                        last = Some(e);
+                        continue 'places;
+                    }
+                }
+            }
+        }
+        let Some(dir) = made else {
+            return Err(format!(
+                "Could not make a folder for the command's copy of the project: {}",
+                last.map_or_else(|| "every name was taken".to_owned(), |e| e.to_string())
+            ));
+        };
+        let mut me = Self {
+            dir,
+            held,
+            baseline: Files::new(),
+        };
         copy_tree(project, &me.dir).map_err(|e| format!("Could not copy the project for the command: {e}"))?;
+        me.baseline = files(&me.dir).map_err(|e| format!("Could not read the command's copy: {e}"))?;
         Ok(me)
     }
+
+    /// The command's arguments, with paths into the project folder moved into the copy, so a
+    /// file the command writes there (an export, a drawing) is checked and written back with
+    /// the rest. A `--name=path` value counts too.
+    fn args(&self, project: &Path, args: &[String]) -> Vec<String> {
+        args.iter()
+            .map(|a| {
+                let (flag, value) = split_flag(a);
+                match in_project(project, value) {
+                    Some(rel) => format!("{flag}{}", self.dir.join(rel).display()),
+                    None => a.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Write what the command changed in the copy into the project folder `to`: files it
+    /// changed or added, and the removal of files it removed. Files it left alone stay as
+    /// they are in `to`, also ones written there meanwhile. A file it changed that also changed
+    /// in `to` meanwhile refuses the whole result, before anything is written.
+    fn write_back(&self, to: &Path) -> Result<(), String> {
+        let read = |e: std::io::Error| format!("Could not read the command's result: {e}");
+        let now = files(&self.dir).map_err(read)?;
+        let live = files(to).map_err(read)?;
+        let changed: Vec<&PathBuf> = now
+            .iter()
+            .filter(|(p, d)| self.baseline.get(*p) != Some(d))
+            .map(|(p, _)| p)
+            .collect();
+        let removed: Vec<&PathBuf> = self.baseline.keys().filter(|p| !now.contains_key(*p)).collect();
+        let clash: Vec<String> = changed
+            .iter()
+            .chain(&removed)
+            .filter(|p| live.get(**p) != self.baseline.get(**p))
+            .map(|p| p.display().to_string())
+            .collect();
+        if !clash.is_empty() {
+            return Err(format!(
+                "The command's result was not kept: these files also changed in the project folder while it ran: {}",
+                clash.join(", ")
+            ));
+        }
+        let write = |p: &Path, e: String| format!("The command's result could not be written to {}: {e}", p.display());
+        for rel in changed {
+            let dst = to.join(rel);
+            let bytes = std::fs::read(self.dir.join(rel)).map_err(read)?;
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| write(&dst, e.to_string()))?;
+            }
+            wc_core::store::replace_whole(&dst, &bytes).map_err(|e| write(&dst, e.to_string()))?;
+        }
+        for rel in removed {
+            let dst = to.join(rel);
+            match std::fs::remove_file(&dst) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(write(&dst, e.to_string())),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `--name=value` split after its `=`; anything else is all value.
+fn split_flag(a: &str) -> (&str, &str) {
+    match a.find('=') {
+        Some(i) if a.starts_with("--") => a.split_at(i + 1),
+        _ => ("", a),
+    }
+}
+
+/// Where in the project folder `value` points, when it is a path into it: an absolute path,
+/// or a relative one that is clearly a path (it has a separator or starts with a dot).
+fn in_project(project: &Path, value: &str) -> Option<PathBuf> {
+    let p = Path::new(value);
+    let path = if p.is_absolute() {
+        p.to_path_buf()
+    } else if value.contains('/') || value.contains('\\') || value.starts_with('.') {
+        std::env::current_dir().ok()?.join(p)
+    } else {
+        return None;
+    };
+    let path = normalize(&path);
+    path.strip_prefix(normalize(project)).ok().map(Path::to_path_buf)
+}
+
+/// `path` with `.` and `..` worked out by name (the folder need not exist).
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The folders a command's copy of a project leaves out and never writes back.
@@ -149,51 +292,37 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         let (src, dst) = (e.path(), to.join(e.file_name()));
         if e.file_type()?.is_dir() {
             copy_tree(&src, &dst)?;
-        } else {
+        } else if e.file_type()?.is_file() {
             std::fs::copy(&src, &dst)?;
         }
     }
     Ok(())
 }
 
-/// Make `to` hold what `from` holds: files new or changed there are written, files gone there
-/// are removed (what [`staged`] leaves out is left alone).
-fn sync_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    let mut seen = std::collections::BTreeSet::new();
-    for e in std::fs::read_dir(from)? {
-        let e = e?;
-        if !staged(&e.file_name()) {
-            continue;
-        }
-        seen.insert(e.file_name());
-        let (src, dst) = (e.path(), to.join(e.file_name()));
-        if e.file_type()?.is_dir() {
-            if dst.is_file() {
-                std::fs::remove_file(&dst)?;
+/// The files in `dir` (what [`staged`] leaves out left out), with a digest of each.
+fn files(dir: &Path) -> std::io::Result<Files> {
+    fn walk(root: &Path, dir: &Path, out: &mut Files) -> std::io::Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            if !staged(&e.file_name()) {
+                continue;
             }
-            sync_tree(&src, &dst)?;
-        } else {
-            if dst.is_dir() {
-                std::fs::remove_dir_all(&dst)?;
-            }
-            let new = std::fs::read(&src)?;
-            if std::fs::read(&dst).ok().as_deref() != Some(new.as_slice()) {
-                std::fs::write(&dst, new)?;
+            let t = e.file_type()?;
+            if t.is_dir() {
+                walk(root, &e.path(), out)?;
+            } else if t.is_file() {
+                let bytes = std::fs::read(e.path())?;
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&bytes, &mut h);
+                let rel = e.path().strip_prefix(root).map(Path::to_path_buf).unwrap_or_default();
+                out.insert(rel, (std::hash::Hasher::finish(&h), bytes.len() as u64));
             }
         }
+        Ok(())
     }
-    for e in std::fs::read_dir(to)? {
-        let e = e?;
-        if staged(&e.file_name()) && !seen.contains(&e.file_name()) {
-            if e.file_type()?.is_dir() {
-                std::fs::remove_dir_all(e.path())?;
-            } else {
-                std::fs::remove_file(e.path())?;
-            }
-        }
-    }
-    Ok(())
+    let mut out = Files::new();
+    walk(dir, dir, &mut out)?;
+    Ok(out)
 }
 
 impl Default for Assistant {
@@ -2744,12 +2873,16 @@ impl App {
         let mut cmd = std::process::Command::new(&bin);
         self.assistant.command_base = None;
         self.assistant.command_staging = None;
+        let mut args = args;
         if let Some(open) = self.open.as_mut() {
             let held = open.held_pages();
             // The project's history: it has no copy to work on, and changes no drawing.
             if !held.is_empty() && args.first().is_some_and(|a| a == "vcs") {
+                // A path into the project folder could have it write there (`log --svg`).
                 let read_only = ["log", "changes", "page-log"];
-                if !args.get(1).is_some_and(|a| read_only.contains(&a.as_str())) {
+                if !args.get(1).is_some_and(|a| read_only.contains(&a.as_str()))
+                    || args.iter().any(|a| in_project(&open.dir, split_flag(a).1).is_some())
+                {
                     return Err(format!(
                         "`wiringcraft {}` is not run while someone else has a page open in the shared session.",
                         args.join(" ")
@@ -2766,6 +2899,7 @@ impl App {
                 open.dir.clone()
             } else {
                 let staging = Staging::of(&open.dir, held)?;
+                args = staging.args(&open.dir, &args);
                 let dir = staging.dir.clone();
                 self.assistant.command_staging = Some(staging);
                 dir
@@ -2821,8 +2955,7 @@ impl App {
                     "The command's result was not kept, and nothing of it reached the project: {why}\n\n{said}"
                 ));
             }
-            sync_tree(&staging.dir, &open.dir)
-                .map_err(|e| format!("The command's result could not be written to the project: {e}"))?;
+            staging.write_back(&open.dir)?;
         }
         let fresh = Open::load(&open.dir)?;
         // Pending window changes follow their terminals under the roles they were made with.
@@ -5459,6 +5592,118 @@ mod tests {
         };
         let r = p.wait();
         let _ = a.agent_finish("run_command", &v, r);
+    }
+
+    #[test]
+    fn a_command_on_a_copy_writes_back_only_what_it_changed() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let r = command_with(&mut a, &["--help"], |a| {
+            let staging = staging_dir(a);
+            // Next to the project, so `../library` finds the same folder; this user's only.
+            assert_eq!(staging.parent(), dir.parent());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&staging).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700);
+            }
+            // A file written into the project meanwhile (a symbol placed from the library).
+            std::fs::write(dir.join("written-meanwhile.txt"), "kept").unwrap();
+            let mut disk = Open::load(&staging).unwrap();
+            disk.project.meta.title_block.insert("customer".into(), "Disk".into());
+            disk.dirty = true;
+            disk.save().unwrap();
+        });
+        assert!(!format!("{r:?}").contains("not kept"), "{r:?}");
+        assert_eq!(customer(&a).as_deref(), Some("Disk"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("written-meanwhile.txt")).unwrap(),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn a_command_whose_files_also_changed_in_the_project_meanwhile_is_not_kept() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        std::fs::write(dir.join("notes.txt"), "before").unwrap();
+        let r = command_with(&mut a, &["--help"], |a| {
+            std::fs::write(staging_dir(a).join("notes.txt"), "command").unwrap();
+            std::fs::write(dir.join("notes.txt"), "window").unwrap();
+        });
+        let e = r.unwrap_err();
+        assert!(e.contains("not kept") && e.contains("notes.txt"), "{e}");
+        assert_eq!(std::fs::read_to_string(dir.join("notes.txt")).unwrap(), "window");
+    }
+
+    #[test]
+    fn paths_into_the_project_go_to_the_copy_while_a_page_is_held() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let page = dir.join("pages").join("p0002.page.json");
+        // The history's map written over a held page is refused before anything runs.
+        let v = json!({"args": ["vcs", "log", "--svg", page.display().to_string()]});
+        let started = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &v);
+        assert!(
+            matches!(&started, Started::Done(Err(e)) if e.contains("shared session")),
+            "a history map written into the project is refused"
+        );
+        let v = json!({"args": ["vcs", "log", format!("--svg={}", page.display())]});
+        let started = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &v);
+        assert!(matches!(&started, Started::Done(Err(_))));
+        // Elsewhere it may be written.
+        let out = std::env::temp_dir().join("history.svg");
+        let v = json!({"args": ["vcs", "log", "--svg", out.display().to_string()]});
+        let started = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &v);
+        assert!(matches!(started, Started::Running(_)));
+        if let Started::Running(p) = started {
+            let r = p.wait();
+            let _ = a.agent_finish("run_command", &v, r);
+        }
+        // A staged command's output into the project lands in the copy, and is written back.
+        let staging = Staging::of(&dir, Vec::new()).unwrap();
+        let export = dir.join("export").join("vars.st");
+        let args = staging.args(
+            &dir,
+            &[
+                "plc-vars".into(),
+                export.display().to_string(),
+                format!("--out={}", page.display()),
+                "p0002".into(),
+            ],
+        );
+        assert_eq!(
+            args[1],
+            staging.dir.join("export").join("vars.st").display().to_string()
+        );
+        assert_eq!(
+            args[2],
+            format!("--out={}", staging.dir.join("pages").join("p0002.page.json").display())
+        );
+        assert_eq!(args[3], "p0002", "a page id is not a path");
+        std::fs::create_dir_all(staging.dir.join("export")).unwrap();
+        std::fs::write(staging.dir.join("export").join("vars.st"), "VAR").unwrap();
+        staging.write_back(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&export).unwrap(), "VAR");
+        let copy = staging.dir.clone();
+        drop(staging);
+        assert!(!copy.exists());
     }
 
     fn customer(a: &App) -> Option<String> {
