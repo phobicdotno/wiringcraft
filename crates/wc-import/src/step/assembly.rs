@@ -136,7 +136,8 @@ fn x_axis(z: [f64; 3], reference: Option<[f64; 3]>) -> Option<[f64; 3]> {
 
 /// The placement a `CARTESIAN_TRANSFORMATION_OPERATOR_3D` stands for, the other target a
 /// mapped item can have: its local origin, axes as the standard derives them (axis3 as z,
-/// axis1 made square to it as x, axis2 made square to both as y) and its scale. The operator's
+/// axis1 made square to it as x, axis2 or the world's y made square to both as y) and its
+/// scale. The operator's
 /// last five attributes are read, as writers differ in the names before them.
 pub(super) fn operator_placement(
     instances: &BTreeMap<u64, Instance>,
@@ -156,14 +157,11 @@ pub(super) fn operator_placement(
     };
     let z = unit(direction(instances, Some(axis3))?.unwrap_or([0.0, 0.0, 1.0]))?;
     let x = x_axis(z, direction(instances, Some(axis1))?)?;
-    let right = cross(z, x);
-    // A given axis2 keeps its side, so the operator can mirror.
-    let y = direction(instances, Some(axis2))?
-        .and_then(|v| {
-            let (vz, vx) = (dot(v, z), dot(v, x));
-            unit([0, 1, 2].map(|k| v[k] - vz * z[k] - vx * x[k]))
-        })
-        .unwrap_or(right);
+    // axis2, or the world's y when it is not given, made square to both: it keeps its side,
+    // so the operator can mirror. Only when it lies along them is y taken to the right of x.
+    let v = direction(instances, Some(axis2))?.unwrap_or([0.0, 1.0, 0.0]);
+    let (vz, vx) = (dot(v, z), dot(v, x));
+    let y = unit([0, 1, 2].map(|k| v[k] - vz * z[k] - vx * x[k])).unwrap_or_else(|| cross(z, x));
     let [x, y, z] = [x, y, z].map(|a| a.map(|c| c * scale));
     Some(Placement {
         r: [[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]],
@@ -389,29 +387,32 @@ pub(super) fn place(
             }
         }
     }
-    let mut owner: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for (frame, ids) in &seen {
-        for id in ids {
-            owner.entry(*id).or_default().push(*frame);
-        }
-    }
-    let mut own: BTreeMap<u64, Vec<Geom>> = BTreeMap::new();
     let mut out = Placed {
         placements,
         missed: placements.saturating_sub(applied.len()),
         ..Placed::default()
     };
+    // Each instance's geometry is kept once; a frame lists the instances it holds, and the
+    // geometry is placed only as each use of the frame is walked, within the point budget.
+    let owned: BTreeSet<u64> = seen.values().flatten().copied().collect();
+    let mut geom_of: BTreeMap<u64, Vec<Geom>> = BTreeMap::new();
     for (id, p) in pts {
-        match owner.get(&id) {
-            Some(owners) => {
-                for frame in owners {
-                    own.entry(*frame).or_default().push(p);
-                }
-            }
+        if owned.contains(&id) {
+            geom_of.entry(id).or_default().push(p);
+        } else {
             // Geometry outside every representation stays where it is.
-            None => out.points.push(p),
+            out.points.push(p);
         }
     }
+    // Per frame: its instances with geometry and how many pieces they hold.
+    let own: BTreeMap<u64, (Vec<&[Geom]>, usize)> = seen
+        .iter()
+        .filter_map(|(frame, ids)| {
+            let list: Vec<&[Geom]> = ids.iter().filter_map(|id| geom_of.get(id)).map(Vec::as_slice).collect();
+            let count = list.iter().map(|g| g.len()).sum();
+            (count > 0).then_some((*frame, (list, count)))
+        })
+        .collect();
 
     // Walk down from the frames no one places.
     let placed: BTreeSet<u64> = children.values().flatten().map(|(c, _)| *c).collect();
@@ -435,9 +436,9 @@ pub(super) fn place(
         }
         uses += 1;
         reached.insert(frame);
-        if let Some(list) = own.get(&frame) {
-            if out.points.len() + list.len() <= MAX_POINTS {
-                out.points.extend(list.iter().map(|g| at.place(g)));
+        if let Some((list, count)) = own.get(&frame) {
+            if out.points.len() + count <= MAX_POINTS {
+                out.points.extend(list.iter().copied().flatten().map(|g| at.place(g)));
             } else {
                 // The corners of the part's own box: the same size at quarter turns, a little
                 // more at others.
@@ -445,7 +446,7 @@ pub(super) fn place(
                 let [lo, hi] = *boxes.entry(frame).or_insert_with(|| {
                     let mut lo = [f64::INFINITY; 3];
                     let mut hi = [f64::NEG_INFINITY; 3];
-                    for g in list {
+                    for g in list.iter().copied().flatten() {
                         let [a, b] = g.bounds();
                         for k in 0..3 {
                             lo[k] = lo[k].min(a[k]);
@@ -469,10 +470,10 @@ pub(super) fn place(
         }
     }
     // Parts only placed in a loop of placements: as drawn.
-    for (frame, list) in &own {
+    for (frame, (list, _)) in &own {
         if !reached.contains(frame) {
             out.cut = true;
-            out.points.extend(list);
+            out.points.extend(list.iter().copied().flatten());
         }
     }
     out

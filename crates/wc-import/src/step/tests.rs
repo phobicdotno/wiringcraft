@@ -662,3 +662,31 @@ fn an_origin_both_representations_list_does_not_swap_the_placements() {
     );
     assert!(warnings.is_empty(), "{warnings:?}");
 }
+
+#[test]
+fn an_operator_without_axis2_takes_the_world_y() {
+    // axis1 along -x and no axis2: y stays the world's y (a mirror), as the standard's default
+    // has it. The box at (0, 30, 0) then spans x -10..0 and y 30..50, next to a copy as drawn.
+    let text = assembly(
+        &["#600", "#610"],
+        "#601=REPRESENTATION_MAP(#320,#300);\n\
+         #600=MAPPED_ITEM('',#601,#602);\n\
+         #602=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',$,$,#603,$,$);\n\
+         #603=CARTESIAN_POINT('',(0.,0.,0.));\n\
+         #610=MAPPED_ITEM('',#601,#612);\n\
+         #612=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',#614,$,#613,$,$);\n\
+         #613=CARTESIAN_POINT('',(0.,30.,0.));\n\
+         #614=DIRECTION('',(-1.,0.,0.));\n",
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 20.0,
+            height: 50.0,
+            depth: 5.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
