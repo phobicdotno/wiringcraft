@@ -4465,6 +4465,51 @@ fn a_tag_an_undone_rename_left_is_another_devices_once_reused() -> TestResult {
 }
 
 #[test]
+fn a_tag_a_waiting_rename_left_on_undo_is_another_devices_at_once() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let ((mut h, _log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (q5, k9, k3) = (tag("-Q5")?, tag("-K9")?, tag("-K3")?);
+    host_open.project.devices.insert(q5.clone(), wc_core::Device::default());
+    host_open.project.devices.insert(k9.clone(), wc_core::Device::default());
+    let sync = |h: &mut Share, ho: &mut Open, g: &mut Share, go: &mut Open| {
+        for _ in 0..2 {
+            frames((h, ho, "p0002"), (g, go, "p0003"));
+        }
+    };
+    sync(&mut h, &mut host_open, &mut g, &mut guest_open);
+    let opts = wc_core::find::FindOptions::default();
+    let replace = |o: &mut Open, from: &str, to: &str| -> Result<usize, String> {
+        let hits = wc_core::find::find(&o.project, from, opts);
+        o.replace_found(&hits, from, to, opts)
+    };
+    // The undrawn -Q5 is renamed -K2 and the waiting placement given that tag; then -K2 is
+    // renamed -K3. The rename waits with the placement.
+    assert_eq!(replace(&mut guest_open, "Q5", "K2"), Ok(1));
+    guest_open.checkpoint();
+    guest_open
+        .project
+        .page_mut("p0003")
+        .and_then(|p| p.symbols.iter_mut().find(|s| s.id == item))
+        .ok_or("no placement")?
+        .tag = Some(tag("-K2")?);
+    sync(&mut h, &mut host_open, &mut g, &mut guest_open);
+    assert_eq!(replace(&mut guest_open, "K2", "K3"), Ok(1));
+    sync(&mut h, &mut host_open, &mut g, &mut guest_open);
+    assert!(host_open.project.devices.contains_key(&q5), "{:?}", g.notes);
+    // Undo takes -K3 back to -K2; before the next sync -K9 takes the free -K3.
+    g.undo()?;
+    g.frame(Some(&mut guest_open), Some("p0003".to_owned()), false);
+    assert!(guest_open.project.devices.contains_key(&tag("-K2")?), "{:?}", g.notes);
+    assert_eq!(replace(&mut guest_open, "K9", "K3"), Ok(1));
+    sync(&mut h, &mut host_open, &mut g, &mut guest_open);
+    // -Q5 stays in the session while -K2 waits with the placement.
+    assert!(host_open.project.devices.contains_key(&q5), "{:?}", g.notes);
+    assert!(!host_open.project.devices.contains_key(&tag("-K2")?));
+    Ok(())
+}
+
+#[test]
 fn devices_renamed_onto_each_other_at_once_wait_together() -> TestResult {
     renamed_onto_each_other("-K111")
 }

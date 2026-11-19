@@ -2234,9 +2234,13 @@ fn note_renames(
             }
         }
     }
-    // A device whose latest tag this copy no longer has went back to an earlier one (Undo):
-    // the tags after it are no longer its own, so a device that takes one later is another.
-    // None of them here: undone or removed since.
+    cut_renames(renames, local);
+}
+
+/// A device whose latest tag this copy (`local`) no longer has went back to an earlier one
+/// (Undo): the tags after it are no longer its own, so a device that takes one later is
+/// another. One with none of its tags here (undone or removed since) is dropped.
+fn cut_renames(renames: &mut RenamePaths, local: &Project) {
     renames.retain(|_, path| {
         let Some(at) = path.iter().rposition(|t| local.devices.contains_key(t)) else {
             return false;
@@ -3391,6 +3395,9 @@ impl Share {
                 // Also after a save: the copy on disk still has the change.
                 open.dirty = true;
             }
+            // A rename taken back now ends at the tag it went back to, before anything else
+            // can take the tag it left.
+            cut_renames(&mut self.device_renames, &open.project);
             self.holding.clear();
             self.notes.push(format!(
                 "Your change that waited for {} was undone here; it had not reached the session.",
