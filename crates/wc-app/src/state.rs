@@ -1086,6 +1086,11 @@ impl Open {
             let unrestored = self.undo_part_writes(writes, left);
             return Err(with_unrestored(e, &unrestored));
         }
+        // The files written now hold the version the lock names: a backup still waiting from
+        // an earlier failure is done with, and a later save must not write it over the copy.
+        for w in &writes {
+            self.unrestored_files.remove(&w.path);
+        }
         Ok(())
     }
 
@@ -4164,6 +4169,35 @@ pub(crate) mod tests {
         o.save().unwrap();
         assert_eq!(store::read_vendored_part(&o.dir, ids[0]).unwrap(), new[0]);
         assert_eq!(o.parts[ids[0]], new[0]);
+    }
+
+    #[test]
+    fn a_backup_a_later_step_made_right_is_not_written_by_a_save() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let ids = ["example.ex-ct-9-24dc", "example.ex-tb-2-5"];
+        let mut new = Vec::new();
+        for (n, id) in ids.iter().enumerate() {
+            let tag = DeviceTag::parse(&format!("-K{}", n + 1)).unwrap();
+            o.set_device_part(&tag, Some(id)).unwrap();
+            new.push(changed_part_in_mine(&o, tmp.path(), id));
+        }
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.update_library(&lib, None).unwrap();
+        // A failed Undo leaves a backup of the first part's file; Undo and Redo then succeed
+        // and write that file themselves.
+        o.fail_part_writes = [false, true, true].into();
+        assert!(!o.undo());
+        let _ = o.take_undo_error();
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        // The project copy changed afterwards keeps its change through a save.
+        let mut edited = new[0].clone();
+        edited.description = "Changed in the project".into();
+        store::write_vendored_part(&o.dir, &edited).unwrap();
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, ids[0]).unwrap(), edited);
     }
 
     #[test]
