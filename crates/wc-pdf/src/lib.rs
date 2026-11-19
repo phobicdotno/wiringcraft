@@ -7,6 +7,7 @@
 
 mod layout;
 mod picture;
+mod topology;
 mod vector;
 mod writer;
 
@@ -39,6 +40,8 @@ pub struct Options {
     pub unreadable: BTreeMap<String, String>,
     /// Panel layouts printed after the schematic pages, one sheet each.
     pub panels: Vec<wc_core::panel::Panel>,
+    /// Fieldbus networks drawn as topology pages at the end, one sheet each.
+    pub networks: Vec<wc_core::network::Network>,
     /// Footprint drawings by part id ([`footprints`]): a device whose part has one is drawn
     /// with it on panel layouts instead of a plain box.
     pub footprints: BTreeMap<String, wc_core::Footprint>,
@@ -65,6 +68,7 @@ impl Default for Options {
             underlays: BTreeMap::new(),
             unreadable: BTreeMap::new(),
             panels: Vec::new(),
+            networks: Vec::new(),
             footprints: BTreeMap::new(),
             plc_cards: Vec::new(),
         }
@@ -173,7 +177,12 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             (0..n).map(move |k| (ci, k * card_rows, k + 1, n))
         })
         .collect();
-    let total = front_pages.len() + pages.len() + options.panels.len() + card_pages.len() + back_pages.len();
+    let total = front_pages.len()
+        + pages.len()
+        + options.panels.len()
+        + card_pages.len()
+        + back_pages.len()
+        + options.networks.len();
     report.pages = total;
     let mut doc = writer::Doc::new(&project.meta.name);
     let mut sheet = 0;
@@ -270,6 +279,33 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         sheet += 1;
     }
     add_reports(&mut doc, back_pages, &mut sheet);
+    // Network topologies close the document, after the network list.
+    // A topology box links to a page this PDF holds.
+    let exported: std::collections::BTreeSet<&str> = pages.iter().map(|p| p.id.as_str()).collect();
+    for (k, net) in options.networks.iter().enumerate() {
+        // A sheet the whole topology fits on: the first page's size, or a larger one.
+        let (size, warn) = topology::sheet(first_size, project.meta.template.band_height(), net);
+        report.warnings.extend(warn);
+        let mut page = wc_core::Page::new(
+            format!("network-{}", net.name),
+            format!("N{}", k + 1),
+            format!("Network {}", net.name),
+        );
+        page.size = size;
+        let mut drawn = topology::draw_network_page(
+            project,
+            &page,
+            sheet,
+            total,
+            net,
+            &options.date,
+            &exported,
+            &mut report.warnings,
+        );
+        place_logo(&mut drawn, &page);
+        doc.add_page(size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        sheet += 1;
+    }
     // Links resolve against the exported page list, so links to pages left out are dropped.
     let index: BTreeMap<String, usize> = pages
         .iter()

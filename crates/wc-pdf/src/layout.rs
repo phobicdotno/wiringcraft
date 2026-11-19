@@ -10,8 +10,8 @@ use crate::Options;
 use crate::writer::{Drawn, Layer, Link, Pen, text_width_mm};
 
 pub use wc_core::project::FRAME_COLUMNS;
-const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
-const HEADER: f64 = 6.0;
+pub(crate) const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
+pub(crate) const HEADER: f64 = 6.0;
 #[cfg(test)]
 const TITLE_H: f64 = wc_core::template::TITLE_HEIGHT;
 
@@ -723,7 +723,7 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     }
 }
 
-fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
+pub(crate) fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
     for m in frame_marks(project, page, index, total, date) {
         match m.ink {
             Ink::Thick => {

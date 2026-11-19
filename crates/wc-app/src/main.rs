@@ -3435,6 +3435,7 @@ fn export_pdf_in(open: &Open, langs: &[String]) -> String {
         underlays: pictures.files,
         unreadable: pictures.unreadable,
         panels: project.panels.clone(),
+        networks: project.meta.networks.clone(),
         footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };

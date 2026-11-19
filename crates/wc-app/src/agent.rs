@@ -4948,6 +4948,33 @@ mod tests {
     }
 
     #[test]
+    fn the_pdf_export_draws_a_topology_page_per_network() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.meta.networks.push(wc_core::network::Network {
+            name: "PN1".into(),
+            links: vec![wc_core::network::Link {
+                from: "-A1:X1".into(),
+                to: "-K10:P1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let m = crate::export_pdf(a.open.as_ref().unwrap());
+        assert!(m.starts_with("Exported"), "{m}");
+        let dir = a.open.as_ref().unwrap().dir.join("export");
+        let pdf = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "pdf"))
+            .unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(pdf).unwrap()).into_owned();
+        let title: String = "N1 Network PN1".bytes().map(|b| format!("{b:02X}")).collect();
+        assert!(text.contains(&format!("/Title <{title}>")));
+    }
+
+    #[test]
     fn a_macros_placeholders_and_value_sets_are_edited_in_the_dialog_and_each_variant_inserted() {
         let (_tmp, mut a) = app(vec![]);
         let open = a.open.as_mut().unwrap();

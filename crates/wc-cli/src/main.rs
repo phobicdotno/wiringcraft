@@ -1919,6 +1919,12 @@ fn run(cli: Cli) -> Res<()> {
                     _ => true,
                 })
                 .collect();
+            // The network list is followed by a topology page per network.
+            let networks = if kinds.contains(&wc_report::Kind::Networks) {
+                p.meta.networks.clone()
+            } else {
+                Vec::new()
+            };
             // The PLC card overview is printed as a table and as a drawn sheet per card.
             let plc_cards = if kinds.contains(&wc_report::Kind::PlcCards) {
                 wc_report::plc_card_sheets(&inputs)
@@ -1938,6 +1944,7 @@ fn run(cli: Cli) -> Res<()> {
                     underlays: pictures.files,
                     unreadable: pictures.unreadable,
                     panels: p.panels.clone(),
+                    networks,
                     footprints: wc_pdf::footprints(vendored_parts(dir, &p).values()),
                     plc_cards,
                 },
@@ -5707,6 +5714,30 @@ mod tests {
         assert!(all.contains(&hex("Networks")));
         assert!(all.contains(&hex("192.168.0.10")));
         assert!(all.contains(&hex("-A1:X1P1")));
+        // The network list is followed by a topology page per network; another report has none.
+        let topology = format!("/Title {}", hex("N1 Network PN1"));
+        assert!(all.contains(&topology));
+        assert!(pdf("networks").contains(&topology));
+        assert!(!pdf("parts").contains(&topology));
+        // The list comes first: its bookmark is before the topology page's.
+        let titles = |text: &str| -> Vec<String> {
+            text.split("/Title <")
+                .skip(1)
+                .filter_map(|s| s.split_once('>'))
+                .map(|(h, _)| {
+                    (0..h.len() / 2)
+                        .filter_map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok())
+                        .map(char::from)
+                        .collect()
+                })
+                .collect()
+        };
+        let networks = titles(&pdf("networks"));
+        let at = |t: &str| networks.iter().position(|x| x.ends_with(t));
+        let (Some(list), Some(page)) = (at(" Networks"), at("N1 Network PN1")) else {
+            unreachable!("both bookmarks are there: {networks:?}");
+        };
+        assert!(list < page, "{networks:?}");
     }
 
     #[test]
