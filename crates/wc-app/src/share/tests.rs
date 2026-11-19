@@ -4720,6 +4720,41 @@ fn a_waiting_page_and_its_new_device_go_back_together_or_not_at_all() -> TestRes
 }
 
 #[test]
+fn a_new_device_s_footprint_goes_back_with_it_or_not_at_all() -> TestResult {
+    use wc_core::panel::{Panel, PanelItem};
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let mut base = Project::new("Test");
+    base.pages.push(Page::new("p1", "1", "One"));
+    base.panels.push(Panel::new("pn1", "Plate", 400.0, 300.0));
+    // A waiting placement made -K1 here, and -K1 was placed on the plate too.
+    let mut local = base.clone();
+    local
+        .page_mut("p1")
+        .ok_or("no page")?
+        .symbols
+        .push(wc_core::PlacedSymbol {
+            tag: Some(k1.clone()),
+            ..symbol("s9", 40.0)
+        });
+    local.devices.insert(k1.clone(), wc_core::Device::default());
+    local.panels[0].items.push(PanelItem::Device {
+        tag: k1.clone(),
+        at: wc_core::geom::Point::new(10.0, 10.0),
+        width: 20.0,
+        height: 40.0,
+    });
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert!(held.now.panels.contains_key("pn1"));
+    // The session changed the page meanwhile: neither the device nor its footprint stays.
+    let mut session = base.clone();
+    session.page_mut("p1").ok_or("no page")?.title = "Theirs".into();
+    assert_eq!(held.put_back(&mut session), ["page 1", "device -K1", "panel pn1"]);
+    assert!(!session.devices.contains_key(&k1));
+    assert_eq!(session.panels, base.panels);
+    Ok(())
+}
+
+#[test]
 fn a_rename_to_a_device_with_a_waiting_part_waits_whole() -> TestResult {
     let k1 = wc_core::DeviceTag::parse("-K1")?;
     let k2 = wc_core::DeviceTag::parse("-K2")?;
