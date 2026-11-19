@@ -2462,7 +2462,19 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 };
                 match refreshed {
                     Ok(()) => {
-                        save(dir, p)?;
+                        // The new pin must reach the disk with the copy, or the copy goes back.
+                        if let Err(err) = save(dir, p) {
+                            let back = match &before {
+                                Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
+                                Err(_) => Ok(()),
+                            };
+                            return Err(match back {
+                                Ok(()) => format!("the project's copy of {part} was not updated: {err}"),
+                                Err(why) => format!(
+                                    "the project's copy of {part} was not updated ({err}) and could not be put back: {why}; run `lib status`"
+                                ),
+                            });
+                        }
                         println!("updated the project's copy of {part}");
                     }
                     Err(why) => {
@@ -4840,6 +4852,27 @@ mod tests {
             ],
         )
         .unwrap();
+        assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+
+        // When the new pin cannot be saved, the copy goes back as it was, so copy and pin agree.
+        let wider = tmp.path().join("io-8-wide.dxf");
+        std::fs::write(
+            &wider,
+            "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\n0\n90\n4\n70\n1\n\
+             10\n0\n20\n0\n10\n45\n20\n0\n10\n45\n20\n100\n10\n0\n20\n100\n\
+             0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+        let copy_before = std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap()).unwrap();
+        let blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&blocker).unwrap();
+        let wide = wider.to_str().unwrap();
+        assert!(cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(
+            std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap()).unwrap(),
+            copy_before
+        );
         assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
 
         // A pinned copy changed in the project is not overwritten by a new footprint.
