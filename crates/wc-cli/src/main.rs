@@ -4925,6 +4925,33 @@ mod tests {
             std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap()).unwrap(),
             copy_before
         );
+        // When neither can be put back (every staging name is taken), the error names both.
+        let copy_file = store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap();
+        let lock_file = dir.join(store::LOCK_FILE);
+        let staged = |f: &Path| -> Vec<PathBuf> {
+            (0..100)
+                .map(|n| {
+                    let mut name = f.as_os_str().to_owned();
+                    name.push(format!(".restore-{}-{n}", std::process::id()));
+                    PathBuf::from(name)
+                })
+                .collect()
+        };
+        let taken: Vec<PathBuf> = staged(&copy_file).into_iter().chain(staged(&lock_file)).collect();
+        for t in &taken {
+            std::fs::write(t, "").unwrap();
+        }
+        std::fs::create_dir(&panel_tmp).unwrap();
+        let err = cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).unwrap_err();
+        std::fs::remove_dir(&panel_tmp).unwrap();
+        for t in &taken {
+            std::fs::remove_file(t).unwrap();
+        }
+        assert!(err.contains("could not be put back"), "{err}");
+        assert!(err.contains(&copy_file.display().to_string()), "{err}");
+        assert!(err.contains(&lock_file.display().to_string()), "{err}");
+        std::fs::write(&copy_file, &copy_before).unwrap();
+        std::fs::write(&lock_file, &lock_bytes).unwrap();
         std::fs::write(&panel_file, &panel_text).unwrap();
         // And when `take` itself fails (its staged write is blocked): the import still
         // succeeds with a warning, and the copy and its pin are as they were.
