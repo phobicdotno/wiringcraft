@@ -183,10 +183,18 @@ impl Table {
 
     /// A Markdown table under a level-2 heading.
     pub fn to_markdown(&self) -> String {
-        let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+        // One line of text: line ends (LF, CR or CRLF) become spaces, and `<` and `>` are
+        // written as entities so a value is never read as HTML.
+        let line = |s: &str| {
+            s.replace("\r\n", " ")
+                .replace(['\r', '\n'], " ")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let cell = |s: &str| line(s).replace('|', "\\|");
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
-            self.title.replace('\n', " "),
+            line(&self.title),
             self.columns.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | "),
             "---|".repeat(self.columns.len())
         );

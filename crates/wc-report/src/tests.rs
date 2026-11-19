@@ -2075,6 +2075,13 @@ fn layout_headings_with_a_pipe_or_a_line_break_keep_the_markdown_table_whole() {
         t.to_markdown(),
         "## Two lines\n\n| Part \\| number | Long text |\n|---|---|\n| -K1 | Relay |\n"
     );
+    // Carriage returns end a line too, and angle brackets are not read as HTML.
+    let mut t = Table::new("A\r\nB\rC", &["<b>Tag</b>"]);
+    t.rows.push(vec!["x\r\ny <script>".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## A B C\n\n| &lt;b&gt;Tag&lt;/b&gt; |\n|---|\n| x y &lt;script&gt; |\n"
+    );
 }
 
 #[test]
