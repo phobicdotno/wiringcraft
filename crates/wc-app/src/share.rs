@@ -2325,8 +2325,18 @@ struct RenameGroup {
     meta: bool,
     /// Whether a device rename is among them, for the note when they are lost.
     rename: bool,
-    /// The new devices among them that are no part of a rename, named in that note.
-    new_devices: BTreeSet<wc_core::DeviceTag>,
+    /// The targets among them that are no part of a rename (they joined through a new device
+    /// sharing a target with one), each named in that note.
+    extra: Box<Extra>,
+}
+
+/// See [`RenameGroup::extra`].
+#[derive(Debug, Default)]
+struct Extra {
+    pages: BTreeSet<String>,
+    devices: BTreeSet<wc_core::DeviceTag>,
+    panels: BTreeSet<String>,
+    meta: bool,
 }
 
 impl RenameGroup {
@@ -2336,7 +2346,10 @@ impl RenameGroup {
         self.panels.extend(other.panels);
         self.meta |= other.meta;
         self.rename |= other.rename;
-        self.new_devices.extend(other.new_devices);
+        self.extra.pages.extend(other.extra.pages);
+        self.extra.devices.extend(other.extra.devices);
+        self.extra.panels.extend(other.extra.panels);
+        self.extra.meta |= other.extra.meta;
     }
 
     fn overlaps(&self, other: &RenameGroup) -> bool {
@@ -2412,7 +2425,14 @@ impl Held {
         // (tags are chosen from this copy alone), and none of them may then name the session's
         // device.
         let mut groups = std::mem::take(&mut held.renames);
-        let renamed: BTreeSet<wc_core::DeviceTag> = groups.iter().flat_map(|g| g.devices.iter().cloned()).collect();
+        // What the renames hold, to tell what a new device brings to them.
+        let mut in_renames = RenameGroup::default();
+        for g in &groups {
+            in_renames.pages.extend(g.pages.iter().cloned());
+            in_renames.devices.extend(g.devices.iter().cloned());
+            in_renames.panels.extend(g.panels.iter().cloned());
+            in_renames.meta |= g.meta;
+        }
         for (tag, device) in &held.now.devices {
             if device.is_none() || base.devices.contains_key(tag) {
                 continue;
@@ -2437,12 +2457,19 @@ impl Held {
                 .as_ref()
                 .is_some_and(|m| m.jumpers.iter().any(|j| &j.strip == tag));
             if !pages.is_empty() || !panels.is_empty() || meta {
+                let devices: BTreeSet<wc_core::DeviceTag> = [tag.clone()].into_iter().collect();
+                let extra = Extra {
+                    pages: pages.difference(&in_renames.pages).cloned().collect(),
+                    devices: devices.difference(&in_renames.devices).cloned().collect(),
+                    panels: panels.difference(&in_renames.panels).cloned().collect(),
+                    meta: meta && !in_renames.meta,
+                };
                 groups.push(RenameGroup {
                     pages,
                     panels,
                     meta,
-                    devices: [tag.clone()].into_iter().collect(),
-                    new_devices: [tag.clone()].into_iter().filter(|t| !renamed.contains(t)).collect(),
+                    devices,
+                    extra: Box::new(extra),
                     ..Default::default()
                 });
             }
@@ -2714,12 +2741,26 @@ impl Held {
             }
             if group.rename {
                 lost.push("the device rename that waited with it".into());
-                // A new device that went with the rename (through a page, panel or the jumpers
+                // What a new device brought to the rename (through a page, panel or the jumpers
                 // they share) is named too.
-                for tag in group.new_devices.iter().filter(|t| !gone.devices.contains(*t)) {
+                let extra = &group.extra;
+                for id in extra.pages.iter().filter(|id| !gone.pages.contains(*id)) {
+                    if let Some(Some(page)) = keep.pages.get(id) {
+                        lost.push(format!("page {}", page.number));
+                    }
+                }
+                for tag in extra.devices.iter().filter(|t| !gone.devices.contains(*t)) {
                     if keep.devices.contains_key(tag) {
                         lost.push(format!("device {tag}"));
                     }
+                }
+                for id in extra.panels.iter().filter(|id| !gone.panels.contains(*id)) {
+                    if keep.panels.contains_key(id) {
+                        lost.push(format!("panel {id}"));
+                    }
+                }
+                if extra.meta && !gone.meta && keep.meta.is_some() {
+                    lost.push("the project properties".into());
                 }
             } else {
                 // A new device and what names it: each one not lost itself is named.

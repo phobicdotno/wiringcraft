@@ -4831,6 +4831,53 @@ fn a_new_device_lost_with_a_waiting_rename_is_named() -> TestResult {
 }
 
 #[test]
+fn jumpers_of_a_new_device_lost_with_a_waiting_rename_are_named() -> TestResult {
+    let k1 = wc_core::DeviceTag::parse("-K1")?;
+    let k2 = wc_core::DeviceTag::parse("-K2")?;
+    let x5 = wc_core::DeviceTag::parse("-X5")?;
+    let mut base = Project::new("Test");
+    let mut page = Page::new("p1", "1", "One");
+    page.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(k1.clone()),
+        ..symbol("s1", 10.0)
+    });
+    base.pages.push(page);
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    // On one waiting page: -K1 renamed to -K2, and a placement that made the strip -X5, which
+    // has jumpers.
+    let mut local = base.clone();
+    let p1 = local.page_mut("p1").ok_or("no page")?;
+    p1.symbols[0].tag = Some(k2.clone());
+    p1.symbols.push(wc_core::PlacedSymbol {
+        tag: Some(x5.clone()),
+        ..symbol("s9", 40.0)
+    });
+    local.devices.remove(&k1);
+    local.devices.insert(k2.clone(), wc_core::Device::default());
+    local.devices.insert(x5.clone(), wc_core::Device::default());
+    local.meta.jumpers.push(wc_core::project::Jumper {
+        strip: x5.clone(),
+        terminals: vec!["1".into(), "2".into()],
+        part: None,
+    });
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Symbol, "coil")]));
+    assert_eq!(held.renames.len(), 1, "one group: the page joins them");
+    let mut session = base.clone();
+    session.page_mut("p1").ok_or("no page")?.title = "Theirs".into();
+    assert_eq!(
+        held.put_back(&mut session),
+        [
+            "page 1",
+            "the device rename that waited with it",
+            "device -X5",
+            "the project properties"
+        ]
+    );
+    assert!(session.meta.jumpers.is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_rename_to_a_device_with_a_waiting_part_waits_whole() -> TestResult {
     let k1 = wc_core::DeviceTag::parse("-K1")?;
     let k2 = wc_core::DeviceTag::parse("-K2")?;
