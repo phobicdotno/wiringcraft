@@ -278,7 +278,12 @@ impl Xf {
     /// Whether every direction grows alike (turns, mirrors and one scale), so a circle stays a
     /// circle. A placement scaled differently along x and y makes it an ellipse.
     fn keeps_circles(&self) -> bool {
-        let [a, b, c, d] = self.m;
+        // Normalized first, so a tiny or huge scale does not underflow or overflow when squared.
+        let big = self.m.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        if big == 0.0 || !big.is_finite() {
+            return true;
+        }
+        let [a, b, c, d] = self.m.map(|v| v / big);
         let (x, y) = (a * a + c * c, b * b + d * d);
         let tol = 1e-9 * x.max(y);
         (x - y).abs() <= tol && (a * b + c * d).abs() <= tol
@@ -338,7 +343,8 @@ fn shapes(
             .iter()
             .map(|(c, s)| Point::new(center.x + c * u.0 + s * v.0, center.y + c * u.1 + s * v.1))
             .collect();
-        if !pts.iter().all(|q| q.x.is_finite() && q.y.is_finite()) {
+        // Angles that are not numbers give no points at all.
+        if pts.len() < 2 || !pts.iter().all(|q| q.x.is_finite() && q.y.is_finite()) {
             *skipped.entry(STRETCHED_NOT_NUMBERS.to_owned()).or_default() += 1;
             return None;
         }
@@ -364,9 +370,8 @@ fn shapes(
                 a: p(e.f(10), e.f(20)),
                 b: p(e.f(11), e.f(21)),
             }),
-            // Scaled differently along x and y, a circle is an ellipse: drawn by its points. A
-            // circle on a pin layer only marks a pin (its centre), so it stays a circle.
-            "CIRCLE" if !xf.keeps_circles() && !is_pin_layer(&layer) => {
+            // Scaled differently along x and y, a circle is an ellipse: drawn by its points.
+            "CIRCLE" if !xf.keeps_circles() => {
                 let (unit, closed) = ellipse_points((0.0, 0.0), (1.0, 0.0), 1.0, 0.0, std::f64::consts::TAU);
                 stretched(e, &unit, closed, skipped)
             }
@@ -714,9 +719,9 @@ const SPLINE_NOT_NUMBERS: &str = "SPLINE whose points are not numbers once place
 /// The key under which splines with too few points to draw are counted.
 const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 
-/// The key under which circles and arcs of a stretched block whose points are not numbers once
-/// placed are counted.
-const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC whose points are not numbers once placed";
+/// The key under which circles and arcs of a stretched block are counted when their angles or
+/// their placed points are not numbers.
+const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
@@ -1753,6 +1758,24 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
     for (layer, s) in raw {
         match (is_pin_layer(&layer), &s) {
             (true, Shape::Circle { center, .. }) => pins.push((None, *center)),
+            // A pin circle in a block stretched along one axis comes as its closed outline.
+            (
+                true,
+                Shape::Polyline {
+                    points, closed: true, ..
+                },
+            ) if !points.is_empty() => {
+                let (lo, hi) = points.iter().fold(
+                    (Point::new(f64::MAX, f64::MAX), Point::new(f64::MIN, f64::MIN)),
+                    |(lo, hi), p| {
+                        (
+                            Point::new(lo.x.min(p.x), lo.y.min(p.y)),
+                            Point::new(hi.x.max(p.x), hi.y.max(p.y)),
+                        )
+                    },
+                );
+                pins.push((None, Point::new(lo.x / 2.0 + hi.x / 2.0, lo.y / 2.0 + hi.y / 2.0)));
+            }
             (true, Shape::Text { at, text, .. }) => labels.push((*at, text.clone())),
             (true, _) => {}
             (false, _) => graphics.push(s),
@@ -2064,6 +2087,48 @@ mod tests {
         let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
         assert!(shapes.is_empty(), "{shapes:?}");
         assert_eq!(skipped.get(STRETCHED_NOT_NUMBERS), Some(&2), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn stretched_circles_on_a_page_tiny_scales_and_lost_arcs() -> Result<()> {
+        type Drawn = (Vec<(String, Shape)>, BTreeMap<String, usize>);
+        let draw = |blocks: &str, insert: &str| -> Result<Drawn> {
+            let d = parse(&dxf(insert, blocks))?;
+            let mut skipped = BTreeMap::new();
+            let mut budget = MAX_DRAWN;
+            let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+            Ok((shapes, skipped))
+        };
+        // On a page, a circle on a pin layer is drawn like any other: stretched to 80 x 20.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nCIRCLE\n8\nPIN\n10\n0\n20\n0\n40\n10\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n",
+        )?;
+        let width = |s: &Shape| match s {
+            Shape::Polyline { points, .. } => {
+                let xs = points.iter().map(|p| p.x);
+                xs.clone().fold(f64::MIN, f64::max) - xs.fold(f64::MAX, f64::min)
+            }
+            _ => 0.0,
+        };
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert!((width(&shapes[0].1) - 80.0).abs() < 1e-9, "{shapes:?}");
+        // Scales (1e-200, 2e-200) on a radius of 1e200: an ellipse 2 x 4, not a circle of radius 0.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n0\n20\n0\n40\n1e200\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n1e-200\n42\n2e-200\n",
+        )?;
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert!((width(&shapes[0].1) - 2.0).abs() < 1e-9, "{shapes:?}");
+        // An arc whose angles give no points is left out and said, next to a line that is drawn.
+        let (shapes, skipped) = draw(
+            "0\nBLOCK\n2\nB\n0\nARC\n10\n0\n20\n0\n40\n1\n50\n-1e308\n51\n1e308\n\
+             0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n",
+        )?;
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert_eq!(skipped.get(STRETCHED_NOT_NUMBERS), Some(&1), "{skipped:?}");
         Ok(())
     }
 
