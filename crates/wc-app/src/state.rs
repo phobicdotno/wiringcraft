@@ -1181,15 +1181,21 @@ impl Open {
             if let Err(e) = put_back {
                 unrestored.push(format!("{} ({e})", w.id));
                 let pin = pins.get(&w.id).map(|e| e.hash.clone());
-                self.unrestored_files.insert(
-                    w.path,
-                    UnrestoredFile {
-                        kind: ItemKind::Part,
-                        id: w.id,
-                        was: w.was,
-                        pin,
-                    },
-                );
+                // A file still waiting from an earlier failure under the same pin keeps that
+                // backup: this attempt's backup is of the file as the earlier failure left it.
+                if self.unrestored_files.get(&w.path).is_none_or(|known| known.pin != pin) {
+                    self.unrestored_files.insert(
+                        w.path,
+                        UnrestoredFile {
+                            kind: ItemKind::Part,
+                            id: w.id,
+                            was: w.was,
+                            pin,
+                        },
+                    );
+                }
+                // The file on disk now differs from the project: that is unsaved work.
+                self.edited();
             }
         }
         unrestored
@@ -4109,10 +4115,13 @@ pub(crate) mod tests {
         let coil = o.symbols["wc.coil"].clone();
         let lib = library_first(&mut o, tmp.path(), &coil);
         o.update_library(&lib, None).unwrap();
+        o.save().unwrap();
+        assert!(!o.dirty);
         let lock = o.project.lock.clone();
         // Undo writes the first part, fails on the second, and cannot put the first back.
         o.fail_part_writes = [false, true, true].into();
         assert!(!o.undo());
+        assert!(o.dirty, "the file left to put back is unsaved work");
         let err = o.take_undo_error().unwrap_or_default();
         assert!(err.contains("could not be put back: example.ex-ct-9-24dc"), "{err}");
         assert_eq!(o.project.lock, lock, "the step stays where it was");
@@ -4125,6 +4134,33 @@ pub(crate) mod tests {
         o.save().unwrap();
         assert_eq!(store::read_vendored_part(&o.dir, ids[0]).unwrap(), new[0]);
         assert_eq!(store::read_vendored_part(&o.dir, ids[1]).unwrap(), new[1]);
+    }
+
+    #[test]
+    fn a_second_failed_undo_keeps_the_first_backup_of_a_part_file() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let ids = ["example.ex-ct-9-24dc", "example.ex-tb-2-5"];
+        let mut new = Vec::new();
+        for (n, id) in ids.iter().enumerate() {
+            let tag = DeviceTag::parse(&format!("-K{}", n + 1)).unwrap();
+            o.set_device_part(&tag, Some(id)).unwrap();
+            new.push(changed_part_in_mine(&o, tmp.path(), id));
+        }
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.update_library(&lib, None).unwrap();
+        // Two failed Undos under the same pin: the second one's backup is of the file as the
+        // first left it, so the first backup (the pinned version) is the one kept.
+        for _ in 0..2 {
+            o.fail_part_writes = [false, true, true].into();
+            assert!(!o.undo());
+            let _ = o.take_undo_error();
+        }
+        o.refresh_library();
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, ids[0]).unwrap(), new[0]);
+        assert_eq!(o.parts[ids[0]], new[0]);
     }
 
     #[test]
