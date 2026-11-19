@@ -1052,6 +1052,11 @@ impl wc_agent::Tools for AppTools<'_> {
     }
 
     fn finish(&mut self, name: &str, input: &Value, result: Result<String, String>) -> Result<String, String> {
+        // As in `run`: the window's pending change is followed first, so the jumpers it moves
+        // are not taken for the finish's own change.
+        if let Some(o) = self.0.open.as_mut() {
+            o.follow_terminals();
+        }
         // Only what the finish itself changes: what the tool did when it started was told then.
         let mark = self.guest_snapshot();
         let r = self.0.agent_finish(name, input, result);
