@@ -676,6 +676,28 @@ fn clip_text(t: String, max: usize) -> String {
     out
 }
 
+/// The id the assistant is given for a revision cloud: what it is (its revision and corners),
+/// not where it is in the page's list, so an id read before someone else removed a cloud
+/// cannot name another one.
+fn cloud_id(c: &wc_core::revision::RevisionCloud) -> String {
+    format!(
+        "cloud {} at {},{} to {},{}",
+        c.revision.trim(),
+        c.min.x,
+        c.min.y,
+        c.max.x,
+        c.max.y
+    )
+}
+
+/// [`selection_id`] for an item on `page`, a revision cloud by [`cloud_id`].
+fn item_id(page: Option<&Page>, sel: &Selection) -> String {
+    match (sel, page) {
+        (Selection::Cloud(i), Some(p)) => p.clouds.get(*i).map(cloud_id).unwrap_or_else(|| selection_id(sel)),
+        _ => selection_id(sel),
+    }
+}
+
 fn selection_id(sel: &Selection) -> String {
     match sel {
         Selection::Symbol(id) | Selection::Wire(id) => id.clone(),
@@ -702,10 +724,8 @@ impl Open {
     }
 
     /// Item ids on a page as selections; unknown ids are an error. A revision cloud is named by
-    /// its position on the page, so only one selected on the user's screen (`selected_clouds`,
-    /// which follow their clouds through a merge) is taken: a position read earlier may name
-    /// another cloud by now.
-    fn selections(&self, page: usize, ids: &[String], selected_clouds: &[usize]) -> Result<Vec<Selection>, String> {
+    /// what it is ([`cloud_id`]); two clouds alike cannot be told apart, so neither is taken.
+    fn selections(&self, page: usize, ids: &[String]) -> Result<Vec<Selection>, String> {
         let p = self.project.pages.get(page).ok_or("No such page.")?;
         if ids.is_empty() {
             return Err("`ids` is empty.".into());
@@ -722,16 +742,22 @@ impl Open {
                     Ok(Selection::Graphic(i))
                 } else if id.trim() == selection_id(&Selection::RevisionTable) && p.revision_table.is_some() {
                     Ok(Selection::RevisionTable)
-                } else if let Some(i) = wc_report::cloud_index(id.trim())
-                    && i < p.clouds.len()
+                } else if id.trim().starts_with("cloud ")
+                    && let matching = p
+                        .clouds
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| cloud_id(c) == id.trim())
+                        .map(|(i, _)| i)
+                        .collect::<Vec<_>>()
+                    && let Some(&i) = matching.first()
                 {
-                    if selected_clouds.contains(&i) {
+                    if matching.len() == 1 {
                         Ok(Selection::Cloud(i))
                     } else {
                         Err(format!(
-                            "{id:?} is not selected on the user's screen now: a cloud is named by its \
-                             place on the page, which a change by someone else can move. Ask the user \
-                             to select it."
+                            "{id:?}: {} clouds are alike, so which one is not known.",
+                            matching.len()
                         ))
                     }
                 } else {
@@ -1136,7 +1162,12 @@ impl App {
             out.push_str(&format!(". Showing page {} ({}, id {})", p.number, p.title, p.id));
         }
         if !self.ed.selection.is_empty() {
-            let ids: Vec<String> = self.ed.selection.iter().map(selection_id).collect();
+            let page = if self.ed.panel.is_none() {
+                open.project.pages.get(self.ed.page)
+            } else {
+                None
+            };
+            let ids: Vec<String> = self.ed.selection.iter().map(|s| item_id(page, s)).collect();
             out.push_str(&format!(". Selected: {}", ids.join(", ")));
         }
         out.push('.');
@@ -1157,21 +1188,6 @@ impl App {
             self.assistant.graphics_read.insert(key, now);
         }
         context
-    }
-
-    /// The revision clouds selected on `page`, if it is the page shown.
-    fn selected_clouds(&self, page: usize) -> Vec<usize> {
-        if page != self.ed.page || self.ed.panel.is_some() {
-            return Vec::new();
-        }
-        self.ed
-            .selection
-            .iter()
-            .filter_map(|s| match s {
-                Selection::Cloud(i) => Some(*i),
-                _ => None,
-            })
-            .collect()
     }
 
     /// Drop selected items that no longer exist.
@@ -1428,7 +1444,7 @@ impl App {
                     Ok(format!("Added {}.", selection_id(&sel)))
                 } else {
                     let id = need_s(v, "id")?;
-                    let sel = open.selections(page, &[id.to_owned()], &[])?;
+                    let sel = open.selections(page, &[id.to_owned()])?;
                     let Some(Selection::Graphic(i)) = sel.first() else {
                         return Err(format!("{id} is not a free drawing."));
                     };
@@ -1443,9 +1459,8 @@ impl App {
             "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "select_items" => {
                 let page = self.page_of(v, "page")?;
                 let ids = strings(v, "ids");
-                let clouds = self.selected_clouds(page);
                 let open = need_open(self.open.as_mut())?;
-                let sel = open.selections(page, &ids, &clouds)?;
+                let sel = open.selections(page, &ids)?;
                 match name {
                     "delete_items" => {
                         let before = open.project.pages.get(page).map(|p| p.clouds.clone());
@@ -1484,7 +1499,7 @@ impl App {
                 if let Some(why) = open.held_reason(to) {
                     return Err(why);
                 }
-                let sel = open.selections(page, &strings(v, "ids"), &[])?;
+                let sel = open.selections(page, &strings(v, "ids"))?;
                 let clip = open.copy(page, &sel);
                 let at = match (num(v, "x"), num(v, "y")) {
                     (Some(x), Some(y)) => Point::new(x, y),
@@ -2513,7 +2528,7 @@ impl App {
                 Ok(format!("Inserted {} as {}.", entry.name, ids.join(", ")))
             }
             "save" => {
-                let sel = open.selections(page, &strings(v, "ids"), &[])?;
+                let sel = open.selections(page, &strings(v, "ids"))?;
                 let clip = open.copy(page, &sel);
                 let path = open.save_macro(&clip, need_s(v, "name")?, s(v, "description").unwrap_or_default())?;
                 Ok(format!("Saved the macro to {}.", path.display()))
@@ -4922,7 +4937,7 @@ mod tests {
         open.project.pages[1].graphics = vec![line.clone()];
         a.ed.page = 1;
 
-        // The ids the state gives are taken back: the table at once, a cloud while selected.
+        // The ids the state gives are taken back.
         let page = a.open.as_ref().unwrap().project.pages[1].number.clone();
         call(
             &mut a,
@@ -4934,22 +4949,26 @@ mod tests {
             a.open.as_ref().unwrap().project.pages[1].revision_table,
             Some(p(210.0, 150.0))
         );
-        let err = call(
-            &mut a,
-            "move_items",
-            json!({"page": page, "ids": ["cloud 1"], "dx": 1, "dy": 0}),
-        )
-        .unwrap_err();
-        assert!(err.contains("not selected"), "{err}");
+        // A cloud is named by what it is, as the state shows it when selected.
         a.ed.selection = vec![Selection::Cloud(1)];
-        assert!(a.agent_context().contains("cloud 1"));
+        let second = cloud_id(&a.open.as_ref().unwrap().project.pages[1].clouds[1]);
+        assert_eq!(second, "cloud A at 100,20 to 140,40");
+        assert!(a.agent_context().contains(&second), "{}", a.agent_context());
         call(
             &mut a,
             "move_items",
-            json!({"page": page, "ids": ["cloud 1"], "dx": 1, "dy": 0}),
+            json!({"page": page, "ids": [second], "dx": 1, "dy": 0}),
         )
         .unwrap();
         assert_eq!(a.open.as_ref().unwrap().project.pages[1].clouds[1].min, p(101.0, 20.0));
+        // An id read before the cloud changed names nothing now, rather than another cloud.
+        let err = call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": [second], "dx": 1, "dy": 0}),
+        )
+        .unwrap_err();
+        assert!(err.contains("No item"), "{err}");
 
         // Cut of a drawing with a cloud and the table: the drawing goes to the clipboard, the
         // cloud and the table (which Paste cannot bring back) stay, selected.
@@ -4965,20 +4984,26 @@ mod tests {
         assert_eq!(pg.graphics.len(), 1, "the drawing is pasted back");
         assert_eq!((pg.clouds.len(), pg.revision_table.is_some()), (2, true));
 
-        // The assistant deletes the first cloud while both are selected on screen: the other
-        // stays selected as itself, not as the cloud now in the first place.
+        // The assistant deletes the first cloud while it is selected on screen: the other, now
+        // in the first place, does not become selected.
         let page = a.open.as_ref().unwrap().project.pages[1].number.clone();
         let second = a.open.as_ref().unwrap().project.pages[1].clouds[1].clone();
         a.ed.selection = vec![Selection::Cloud(0)];
-        call(&mut a, "delete_items", json!({"page": page, "ids": ["cloud 0"]})).unwrap();
+        let pg = &a.open.as_ref().unwrap().project.pages[1];
+        let first = cloud_id(&pg.clouds[0]);
+        call(&mut a, "delete_items", json!({"page": page, "ids": [first]})).unwrap();
+        assert!(
+            a.ed.selection.is_empty(),
+            "the other cloud is not selected: {:?}",
+            a.ed.selection
+        );
+        // The deleted cloud's id, used again, does not name the cloud now in its place.
+        let err = call(&mut a, "delete_items", json!({"page": page, "ids": [first]})).unwrap_err();
+        assert!(err.contains("No item"), "{err}");
+        a.ed.selection.clear();
         assert_eq!(
             a.open.as_ref().unwrap().project.pages[1].clouds,
             std::slice::from_ref(&second)
-        );
-        assert!(
-            a.ed.selection.is_empty(),
-            "the remaining cloud is not selected: {:?}",
-            a.ed.selection
         );
         a.open.as_mut().unwrap().undo();
 
