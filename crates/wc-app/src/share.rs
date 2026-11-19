@@ -2189,12 +2189,13 @@ impl RenameGroup {
 type RenamePaths = BTreeMap<wc_core::DeviceTag, Vec<wc_core::DeviceTag>>;
 
 /// Add the device renames made here (`made`: old tag to new, one map per change, in order) to
-/// `renames`: a rename of a renamed device goes on from its first tag (also from a tag between,
-/// which Undo brought back), and one back to it is no rename; the renames of one change are
-/// taken together, so `-K1` -> `-K11` and `-K11` -> `-K111` at once stay two renames. Renames
-/// the session has (`base` has the last tag, or no longer the first) are dropped first, so a
-/// later rename never goes on from one of those. So are those of which this copy (`local`)
-/// has no tag any more, undone or removed since: a device that later gets one is another.
+/// `renames`: a rename of a renamed device (from its tag now) goes on from its first tag, and
+/// one back to it is no rename; the renames of one change are taken together, so `-K1` ->
+/// `-K11` and `-K11` -> `-K111` at once stay two renames. Renames the session has (`base` has
+/// the last tag, or no longer the first) are dropped first, so a later rename never goes on
+/// from one of those. A device that went back to an earlier tag here (Undo) keeps its tags up
+/// to that one; one of which this copy has no tag any more (undone or removed) is dropped: a
+/// device that later gets one of those tags is another device.
 fn note_renames(
     renames: &mut RenamePaths,
     made: Vec<BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>>,
@@ -2215,16 +2216,13 @@ fn note_renames(
         // goes on from another made at the same time.
         let mut next: Vec<(wc_core::DeviceTag, Vec<wc_core::DeviceTag>)> = Vec::new();
         for (from, to) in change {
+            // Only the device's tag now goes on: a tag it had before may be another device's.
             let found = renames
                 .iter()
-                .find(|(_, path)| path.contains(&from))
+                .find(|(_, path)| path.last() == Some(&from))
                 .map(|(first, _)| first.clone());
             let (first, mut path) = match found.and_then(|f| renames.remove_entry(&f)) {
-                Some((first, mut path)) => {
-                    let at = path.iter().rposition(|t| *t == from).map_or(path.len(), |i| i + 1);
-                    path.truncate(at);
-                    (first, path)
-                }
+                Some(entry) => entry,
                 None => (from, Vec::new()),
             };
             path.push(to);
@@ -2236,16 +2234,25 @@ fn note_renames(
             }
         }
     }
-    renames.retain(|_, path| path.iter().any(|t| local.devices.contains_key(t)));
+    // A device whose latest tag this copy no longer has went back to an earlier one (Undo):
+    // the tags after it are no longer its own, so a device that takes one later is another.
+    // None of them here: undone or removed since.
+    renames.retain(|_, path| {
+        let Some(at) = path.iter().rposition(|t| local.devices.contains_key(t)) else {
+            return false;
+        };
+        path.truncate(at + 1);
+        true
+    });
 }
 
-/// Each recorded rename as it stands in `local`: its first tag and the latest of its tags this
-/// copy has (an Undo may have brought back one between).
+/// Each recorded rename as it stands in `local`: its first tag and its tag now (after an Undo,
+/// the one between it went back to, [`note_renames`]).
 fn renames_now(renames: &RenamePaths, local: &Project) -> BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag> {
     renames
         .iter()
         .filter_map(|(first, path)| {
-            let now = path.iter().rev().find(|t| local.devices.contains_key(*t))?;
+            let now = path.last().filter(|t| local.devices.contains_key(*t))?;
             Some((first.clone(), now.clone()))
         })
         .collect()

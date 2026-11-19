@@ -4407,6 +4407,64 @@ fn undo_of_a_rename_of_a_waiting_rename_brings_the_device_between_back() -> Test
 }
 
 #[test]
+fn a_tag_a_renamed_device_had_before_is_another_devices_once_reused() -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3, k4, k9) = (tag("-K1")?, tag("-K2")?, tag("-K3")?, tag("-K4")?, tag("-K9")?);
+    let one = |a: &wc_core::DeviceTag, b: &wc_core::DeviceTag| -> BTreeMap<_, _> {
+        [(a.clone(), b.clone())].into_iter().collect()
+    };
+    let mut base = Project::new("Test");
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k9.clone(), wc_core::Device::default());
+    // -K1 renamed -K2, then -K3; then -K9 takes the free -K2 and goes on to -K4.
+    let mut local = base.clone();
+    local.rename_device(&k1, &k3);
+    let mut renames = BTreeMap::new();
+    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &local);
+    local.rename_device(&k9, &k2);
+    note_renames(&mut renames, vec![one(&k9, &k2)], &base, &local);
+    local.rename_device(&k2, &k4);
+    note_renames(&mut renames, vec![one(&k2, &k4)], &base, &local);
+    let pairs: BTreeMap<_, _> = [(k1.clone(), k3.clone()), (k9.clone(), k4.clone())]
+        .into_iter()
+        .collect();
+    assert_eq!(renames_now(&renames, &local), pairs);
+    Ok(())
+}
+
+#[test]
+fn a_tag_an_undone_rename_left_is_another_devices_once_reused() -> TestResult {
+    let tag = |t: &str| wc_core::DeviceTag::parse(t);
+    let (k1, k2, k3, k9) = (tag("-K1")?, tag("-K2")?, tag("-K3")?, tag("-K9")?);
+    let one = |a: &wc_core::DeviceTag, b: &wc_core::DeviceTag| -> BTreeMap<_, _> {
+        [(a.clone(), b.clone())].into_iter().collect()
+    };
+    let mut base = Project::new("Test");
+    base.devices.insert(k1.clone(), wc_core::Device::default());
+    base.devices.insert(k9.clone(), wc_core::Device::default());
+    let mut local = base.clone();
+    local.rename_device(&k1, &k3);
+    let mut renames = BTreeMap::new();
+    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &local);
+    // Undo takes -K3 back to -K2; at the next sync -K9 takes the free -K3.
+    local.rename_device(&k3, &k2);
+    note_renames(&mut renames, Vec::new(), &base, &local);
+    local.rename_device(&k9, &k3);
+    note_renames(&mut renames, vec![one(&k9, &k3)], &base, &local);
+    let pairs: BTreeMap<_, _> = [(k1.clone(), k2.clone()), (k9.clone(), k3.clone())]
+        .into_iter()
+        .collect();
+    assert_eq!(renames_now(&renames, &local), pairs);
+    // So -K1's removal waits with -K2 while only -K2 waits for its part.
+    local.devices.get_mut(&k2).ok_or("no -K2")?.part = Some("acme.relay".into());
+    let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
+    let held = Held::find_renamed(&local, &base, &parts, &pairs);
+    assert_eq!(held.now.devices.get(&k1), Some(&None));
+    assert!(held.now.devices.contains_key(&k2));
+    Ok(())
+}
+
+#[test]
 fn devices_renamed_onto_each_other_at_once_wait_together() -> TestResult {
     renamed_onto_each_other("-K111")
 }
