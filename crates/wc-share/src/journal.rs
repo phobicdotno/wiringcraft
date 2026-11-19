@@ -246,6 +246,60 @@ impl Journal for GitJournal {
 /// show it, or the person picked it here) and is [`crate::Error::PictureNameTaken`]. The file
 /// always lands inside the project, even when a folder on the way is a link.
 pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
+    use std::io::ErrorKind;
+    let (path, folder) = picture_place(dir, picture)?;
+    let existing = || -> Result<()> {
+        match std::fs::read(&path) {
+            Ok(have) if have == picture.data => Ok(()),
+            Ok(_) => Err(crate::Error::PictureNameTaken(format!(
+                "the project already has another picture named {}",
+                picture.file
+            ))),
+            Err(e) => Err(e.into()),
+        }
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return existing(),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    // The whole file is written beside it first and then put in place without replacing
+    // anything, so a failed write never leaves a cut-off picture under the name.
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("picture");
+    let part = stage(&folder, name, &picture.data)?;
+    let published = publish(&part, &path);
+    let _ = std::fs::remove_file(&part);
+    match published {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => existing(),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Put `picture` in place of the file of its name in the project folder `dir`, which must hold
+/// `was` still: anything else there is [`crate::Error::PictureNameTaken`] and stays. The new
+/// file is written whole beside it first and then moved over it in one step, so the name never
+/// holds a cut-off picture. Like [`write_picture`], never through a link out of the project.
+pub fn replace_picture(dir: &std::path::Path, picture: &Picture, was: &[u8]) -> Result<()> {
+    let (path, folder) = picture_place(dir, picture)?;
+    if std::fs::read(&path)? != was {
+        return Err(crate::Error::PictureNameTaken(format!(
+            "{} changed meanwhile",
+            picture.file
+        )));
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("picture");
+    let part = stage(&folder, name, &picture.data)?;
+    let moved = std::fs::rename(&part, &path);
+    if moved.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    Ok(moved?)
+}
+
+/// Where `picture` goes in the project folder `dir`, and its folder (made when missing), once
+/// both are known to be inside the project and the place is no link.
+fn picture_place(dir: &std::path::Path, picture: &Picture) -> Result<(PathBuf, PathBuf)> {
     use std::io::{Error, ErrorKind};
     if let Some(why) = picture.problem() {
         return Err(Error::new(ErrorKind::InvalidInput, why).into());
@@ -276,35 +330,11 @@ pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
     if !folder.canonicalize()?.starts_with(&root) {
         return Err(outside());
     }
-    let existing = || -> Result<()> {
-        match std::fs::read(&path) {
-            Ok(have) if have == picture.data => Ok(()),
-            Ok(_) => Err(crate::Error::PictureNameTaken(format!(
-                "the project already has another picture named {}",
-                picture.file
-            ))),
-            Err(e) => Err(e.into()),
-        }
-    };
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(outside());
     }
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => return existing(),
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    // The whole file is written beside it first and then put in place without replacing
-    // anything, so a failed write never leaves a cut-off picture under the name.
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("picture");
-    let part = stage(folder, name, &picture.data)?;
-    let published = publish(&part, &path);
-    let _ = std::fs::remove_file(&part);
-    match published {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => existing(),
-        Err(e) => Err(e.into()),
-    }
+    let folder = folder.to_path_buf();
+    Ok((path, folder))
 }
 
 /// Write `data` to a part file in `folder` that this call makes new, under a name no other

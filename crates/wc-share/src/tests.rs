@@ -3057,6 +3057,40 @@ fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
 }
 
 #[test]
+fn a_picture_is_replaced_only_while_it_holds_what_it_held() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    write_picture(dir, &picture("pictures/logo.png", b"mine"))?;
+    // Something else there meanwhile: refused, and left as it is.
+    assert!(matches!(
+        replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"other"),
+        Err(Error::PictureNameTaken(_))
+    ));
+    assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"mine");
+    replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"mine")?;
+    assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
+    let names: Vec<_> = std::fs::read_dir(dir.join("pictures"))?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(names, ["logo.png"], "no part file is left");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_picture_is_never_replaced_through_a_link() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("logo.png"), b"mine")?;
+    std::fs::create_dir(tmp.path().join("pictures"))?;
+    std::os::unix::fs::symlink(outside.path().join("logo.png"), tmp.path().join("pictures/logo.png"))?;
+    let r = replace_picture(tmp.path(), &picture("pictures/logo.png", b"theirs"), b"mine");
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(std::fs::read(outside.path().join("logo.png"))?, b"mine");
+    Ok(())
+}
+
+#[test]
 fn a_file_in_the_way_of_a_pictures_folder_is_a_storage_failure_and_not_a_taken_name() -> TestResult {
     let tmp = tempfile::tempdir()?;
     // `create_dir_all` fails with `AlreadyExists` here, which is no other picture's name.

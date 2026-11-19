@@ -1594,7 +1594,8 @@ struct Pictures<'a> {
 /// A picture whose file here is the session's again (put back since it was sent) is not
 /// renamed: it is taken as the session's (into `pictures_taken`, no longer `replaced`), and
 /// nothing is sent. A picture this copy picked (in `picks`) is renamed only in the references
-/// it was picked in, unless its file replaced the session's (`replaced`): then in all.
+/// it was picked in, unless its file replaced the session's (`replaced`): then in all, and the
+/// session's file is put back under the old name here, taken as the session's.
 /// Returns the pictures renamed.
 fn rename_pictures(
     open: &mut Open,
@@ -1650,12 +1651,33 @@ fn rename_pictures(
         } else {
             picks.get(&file)
         };
+        let everywhere = only.is_none();
         match rename_picture(open, &file, only) {
             Ok(new) => {
                 pictures_out.remove(&file);
                 renames_due.remove(&file);
                 picks.remove(&file);
                 renamed.insert(file.clone());
+                // The person's file has its own name now; what is left under the old one is no
+                // longer theirs: the session's file goes there, so a later use of the session's
+                // picture shows it here, and it is never taken for a replacement again.
+                if everywhere
+                    && let Some(theirs) = session.get(&file)
+                    && let Ok(Some(left)) = wc_pdf::read_picture(&open.dir, &file)
+                {
+                    let picture = Picture {
+                        file: file.clone(),
+                        data: theirs.clone(),
+                    };
+                    if wc_share::replace_picture(&open.dir, &picture, &left).is_ok() {
+                        replaced.remove(&file);
+                        open.underlays.remove(&file);
+                        open.picture_problems.remove(&file);
+                        if let Some(version) = picture_version(&open.dir, &file) {
+                            pictures_taken.insert(file.clone(), version);
+                        }
+                    }
+                }
                 notes.push(format!(
                     "The session already has another file named {file}; your picture is renamed {new} here and sent again under that name."
                 ));
